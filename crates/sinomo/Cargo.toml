@@ -1,0 +1,14 @@
+[package]
+name = "sinomo"
+version.workspace = true
+description = "Sinomo"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[features]
+
+
+[dependencies]
+
