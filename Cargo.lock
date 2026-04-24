@@ -224,11 +224,13 @@ dependencies = [
  "sinomo-agent",
  "sinomo-audio",
  "sinomo-core",
+ "sinomo-deliberation",
  "sinomo-device",
  "sinomo-dfs",
  "sinomo-events",
  "sinomo-fusion",
  "sinomo-gateway",
+ "sinomo-memory",
  "sinomo-module",
  "sinomo-network",
  "sinomo-node",
@@ -263,6 +265,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-deliberation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-events",
+ "sinomo-memory",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "sinomo-device"
 version = "0.1.0"
 dependencies = [
@@ -278,6 +293,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-network",
  "thiserror",
  "time",
 ]
@@ -309,6 +325,18 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-device",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "sinomo-memory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-events",
  "thiserror",
  "time",
 ]

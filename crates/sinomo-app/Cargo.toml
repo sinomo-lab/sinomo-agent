@@ -20,6 +20,8 @@ sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-fusion = { path = "../sinomo-fusion" }
 sinomo-gateway = { path = "../sinomo-gateway" }
+sinomo-deliberation = { path = "../sinomo-deliberation" }
+sinomo-memory = { path = "../sinomo-memory" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }

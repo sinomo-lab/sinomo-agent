@@ -10,6 +10,9 @@ use sinomo_core::{
     RoutingMetadata, RoutingScope, Salience, ScorecardId, SessionId, Source, SyncPolicy, TrustRing,
     WorkspaceId,
 };
+use sinomo_deliberation::{
+    DeliberationJobRecord, DeliberationQueue, DeliberationWorker, WorkspaceSnapshot,
+};
 use sinomo_device::{DevicePermission, DeviceProfile};
 use sinomo_dfs::{
     DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, MountKind, Workspace, WorkspaceMount,
@@ -17,6 +20,7 @@ use sinomo_dfs::{
 use sinomo_events::{EventSequence, EventStore, InMemoryEventStore, ReplayQuery, StoredEvent};
 use sinomo_fusion::FusionWorker;
 use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
+use sinomo_memory::{MemoryManager, MemoryPolicy};
 use sinomo_module::{LoadRequest, ModuleLoader};
 use sinomo_network::{InProcessRouter, PeerRegistry};
 use sinomo_node::{HostedService, NodeProfile};
@@ -246,7 +250,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .action_request
         .as_ref()
         .and_then(|request| request.target_node_id.clone());
-    store.append(turn.trace_event.clone())?;
+    let agent_trace_receipt = store.append(turn.trace_event.clone())?;
+
+    let mut memory = MemoryManager::new(MemoryPolicy {
+        hot_event_limit: 16,
+        warm_salience_threshold: 0.7,
+    });
+    for stored in store.replay(ReplayQuery::by_session(session_id.clone()))? {
+        memory.ingest(stored);
+    }
+    let memory_packet = memory.context_packet(&session_id);
+    let mut deliberation_queue = DeliberationQueue::new();
+    let deliberation_job = DeliberationJobRecord::new(
+        trigger_decision.trigger_event_id.clone(),
+        Some(session_id.clone()),
+        "Review the visible alert, preserve context, and prepare a slower follow-up.",
+        memory_packet.clone(),
+        Some(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            object_ids: vec![candidate_object_id.clone()],
+            source_event_id: Some(agent_trace_receipt.event_id.clone()),
+        }),
+    );
+    deliberation_queue.enqueue(deliberation_job);
+    let running_job = deliberation_queue
+        .next_job()
+        .expect("queued deliberation job should run");
+    let worker = DeliberationWorker::new(home_server.node_id.clone());
+    let completed_job = worker.summarize(running_job);
+    let summary_event = worker.summary_event(&completed_job)?;
+    let summary_receipt = store.append(summary_event.clone())?;
+    deliberation_queue.complete(
+        completed_job,
+        summary_event
+            .payload
+            .get("summary")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .expect("summary event contains deliberation summary"),
+    );
+    let summary_stored = store
+        .replay(ReplayQuery::all().after(EventSequence(summary_receipt.sequence.0 - 1)))?
+        .pop()
+        .expect("summary event should replay");
+    memory.ingest(summary_stored);
     let replayed = store.replay(ReplayQuery::by_session(session_id.clone()))?;
     let stored_event = store
         .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))?
@@ -336,6 +383,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "sinomo-app: trigger action={:?}; agent response={}; action target={:?}",
         trigger_decision.action, turn.response.text, action_target
+    );
+    println!(
+        "sinomo-app: hot memory={} warm memory={} deliberation completed={}",
+        memory.hot().len(),
+        memory.warm().entries().len(),
+        deliberation_queue.completed().len()
     );
     println!(
         "sinomo-app: dfs write route={:?}; loader action={:?}",

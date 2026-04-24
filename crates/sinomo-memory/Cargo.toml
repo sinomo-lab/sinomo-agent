@@ -1,0 +1,17 @@
+[package]
+name = "sinomo-memory"
+version.workspace = true
+description = "Sinomo hot and warm memory policy skeleton"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-events = { path = "../sinomo-events" }

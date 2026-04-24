@@ -10,11 +10,11 @@ include = ["**/*.rs", "Cargo.toml"]
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-node = { path = "../sinomo-node" }
 
 [dev-dependencies]
-serde_json.workspace = true
 time.workspace = true

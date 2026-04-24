@@ -335,6 +335,23 @@ pub enum MeshMessageBody {
     },
     Ack(DeliveryAck),
     Heartbeat(Heartbeat),
+    Protocol(ProtocolMessage),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProtocolMessage {
+    pub protocol: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+impl ProtocolMessage {
+    pub fn new(protocol: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            protocol: protocol.into(),
+            payload,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -608,6 +625,12 @@ impl<T: NetworkTransport> NetworkService<T> {
                         requeued,
                     });
                 }
+                MeshMessageBody::Protocol(protocol_message) => {
+                    outcomes.push(InboundOutcome::ProtocolIgnored {
+                        protocol: protocol_message.protocol,
+                        source_node_id: inbound.frame.source_node_id,
+                    });
+                }
             }
         }
 
@@ -708,6 +731,10 @@ pub enum InboundOutcome {
         node_id: NodeId,
         status: PeerStatus,
         requeued: usize,
+    },
+    ProtocolIgnored {
+        protocol: String,
+        source_node_id: NodeId,
     },
 }
 
