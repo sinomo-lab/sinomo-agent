@@ -331,7 +331,7 @@ pub struct MeshMessage {
 pub enum MeshMessageBody {
     Event {
         delivery_id: RouteDeliveryId,
-        event: EventEnvelope,
+        event: Box<EventEnvelope>,
     },
     Ack(DeliveryAck),
     Heartbeat(Heartbeat),
@@ -555,7 +555,7 @@ impl<T: NetworkTransport> NetworkService<T> {
                     let duplicate = self.seen_events.contains(&key);
 
                     if !duplicate {
-                        match store.append(event.clone()) {
+                        match store.append((*event).clone()) {
                             Ok(_) => {
                                 self.seen_events.insert(key);
                                 outcomes.push(InboundOutcome::EventAccepted {
@@ -638,7 +638,7 @@ impl<T: NetworkTransport> NetworkService<T> {
                 target_node_id: record.delivery.target_node_id.clone(),
                 body: MeshMessageBody::Event {
                     delivery_id: record.delivery.delivery_id,
-                    event: record.event.clone(),
+                    event: Box::new(record.event.clone()),
                 },
             },
         };
@@ -1020,7 +1020,7 @@ mod tests {
                 target_node_id: node_b.clone(),
                 body: MeshMessageBody::Event {
                     delivery_id: RouteDeliveryId(1),
-                    event: event.clone(),
+                    event: Box::new(event.clone()),
                 },
             },
         };
@@ -1056,7 +1056,7 @@ mod tests {
                         target_node_id: node_missing.clone(),
                         body: MeshMessageBody::Event {
                             delivery_id: RouteDeliveryId(1),
-                            event,
+                            event: Box::new(event),
                         },
                     },
                 },
@@ -1182,7 +1182,7 @@ mod tests {
                     target_node_id: service_b.transport.local_node_id().clone(),
                     body: MeshMessageBody::Event {
                         delivery_id: RouteDeliveryId(1),
-                        event: event.clone(),
+                        event: Box::new(event.clone()),
                     },
                 },
             };

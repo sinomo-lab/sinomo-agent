@@ -1,3 +1,4 @@
+use sinomo_audio::AudioPerceptionWorker;
 use sinomo_core::{
     ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
     CapabilityName, Confidence, DeviceCapability, DfsObjectId, DfsObjectPolicy, DfsVersion,
@@ -13,12 +14,15 @@ use sinomo_dfs::{
     DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, MountKind, Workspace, WorkspaceMount,
 };
 use sinomo_events::{EventSequence, EventStore, InMemoryEventStore, ReplayQuery};
+use sinomo_fusion::FusionWorker;
+use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
 use sinomo_module::{LoadRequest, ModuleLoader};
 use sinomo_network::{InProcessRouter, PeerRegistry};
 use sinomo_node::{HostedService, NodeProfile};
 use sinomo_policy::{PolicyEngine, PolicyInput};
 use sinomo_registry::{ArtifactRegistry, RegistryEntry, RegistryStatus};
 use sinomo_sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncRegistry};
+use sinomo_video::VideoPerceptionWorker;
 use time::OffsetDateTime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,13 +52,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "storage.workspace.local",
     )?))
     .with_permission(DevicePermission::Observe);
+    let microphone = DeviceProfile::mock_microphone(workstation.node_id.clone())
+        .with_capability(DeviceCapability::new(CapabilityName::new(
+            "input.audio.synthetic",
+        )?))
+        .with_permission(DevicePermission::Observe);
+    let screen = DeviceProfile::mock_screen(workstation.node_id.clone())
+        .with_capability(DeviceCapability::new(CapabilityName::new(
+            "input.video.screen_ocr",
+        )?))
+        .with_permission(DevicePermission::Observe);
 
     let session_id = SessionId::generate();
     let mut sync_registry = SyncRegistry::new();
     let mut sync_state = SessionSyncState::new(session_id.clone(), SyncPolicy::Session);
     sync_state.add_participant(SessionParticipant {
         node_id: workstation.node_id.clone(),
-        active_devices: vec![workspace_device.device_id.clone()],
+        active_devices: vec![
+            workspace_device.device_id.clone(),
+            microphone.device_id.clone(),
+            screen.device_id.clone(),
+        ],
         role: ParticipantRole::Origin,
         joined_at: OffsetDateTime::now_utc(),
     });
@@ -175,6 +193,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut store = InMemoryEventStore::new();
     let receipt = store.append(event)?;
+    let mut audio_adapter = SyntheticInputAdapter::audio_transcript(
+        &microphone,
+        stored_session(&store, &receipt)?,
+        "Please check the alert and tell me if it is urgent",
+    )?;
+    let mut screen_adapter = SyntheticInputAdapter::screen_observation(
+        &screen,
+        stored_session(&store, &receipt)?,
+        "Alert dialog visible in the deployment dashboard",
+    )?;
+    let audio_chunk = audio_adapter
+        .next_chunk()?
+        .expect("synthetic audio adapter has one chunk");
+    let screen_chunk = screen_adapter
+        .next_chunk()?
+        .expect("synthetic screen adapter has one chunk");
+    let audio_events = AudioPerceptionWorker::new().process_chunk(&audio_chunk);
+    let video_events = VideoPerceptionWorker::new().process_chunk(&screen_chunk);
+    let mut perception_events = Vec::new();
+    perception_events.extend(audio_events);
+    perception_events.extend(video_events);
+    let fused_event = FusionWorker::new()
+        .align(&perception_events)
+        .expect("audio and screen observations fuse");
+    let perception_count = perception_events.len();
+    for perception_event in perception_events {
+        store.append(perception_event)?;
+    }
+    store.append(fused_event)?;
     let replayed = store.replay(ReplayQuery::by_session(session_id.clone()))?;
     let stored_event = store
         .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))?
@@ -253,9 +300,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         receipt.event_id, receipt.sequence.0
     );
     println!(
-        "sinomo-app: replayed {} self-evolution event(s), routed {} delivery record(s)",
+        "sinomo-app: replayed {} session event(s), routed {} delivery record(s)",
         replayed.len(),
         deliveries.len()
+    );
+    println!(
+        "sinomo-app: appended {} perception event(s) plus 1 fusion event",
+        perception_count
     );
     println!(
         "sinomo-app: dfs write route={:?}; loader action={:?}",
@@ -263,4 +314,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+fn stored_session(
+    store: &InMemoryEventStore,
+    receipt: &sinomo_events::AppendReceipt,
+) -> Result<SessionId, Box<dyn std::error::Error>> {
+    let event = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))?
+        .pop()
+        .expect("stored event");
+    Ok(event
+        .event
+        .session_id
+        .expect("phase smoke event has session"))
 }

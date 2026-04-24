@@ -13,12 +13,16 @@ serde_json.workspace = true
 time.workspace = true
 tracing.workspace = true
 sinomo-core = { path = "../sinomo-core" }
+sinomo-audio = { path = "../sinomo-audio" }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-events = { path = "../sinomo-events" }
+sinomo-fusion = { path = "../sinomo-fusion" }
+sinomo-gateway = { path = "../sinomo-gateway" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-sync = { path = "../sinomo-sync" }
+sinomo-video = { path = "../sinomo-video" }
