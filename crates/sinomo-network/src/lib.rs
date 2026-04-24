@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sinomo_core::{EventEnvelope, EventId, LatencyClass, NodeId, RoutingScope, SessionId};
 use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
-use sinomo_node::NodeProfile;
+use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
@@ -12,6 +12,7 @@ use thiserror::Error;
 #[derive(Clone, Debug, Default)]
 pub struct PeerRegistry {
     nodes: BTreeMap<NodeId, NodeProfile>,
+    peer_states: BTreeMap<NodeId, PeerState>,
     sessions: BTreeMap<SessionId, BTreeSet<NodeId>>,
 }
 
@@ -21,7 +22,11 @@ impl PeerRegistry {
     }
 
     pub fn register_node(&mut self, profile: NodeProfile) -> Option<NodeProfile> {
-        self.nodes.insert(profile.node_id.clone(), profile)
+        let node_id = profile.node_id.clone();
+        self.peer_states
+            .entry(node_id.clone())
+            .or_insert_with(|| PeerState::new(NodeEndpoint::in_process(node_id.clone())));
+        self.nodes.insert(node_id, profile)
     }
 
     pub fn join_session(
@@ -39,6 +44,67 @@ impl PeerRegistry {
 
     pub fn node(&self, node_id: &NodeId) -> Option<&NodeProfile> {
         self.nodes.get(node_id)
+    }
+
+    pub fn peer_state(&self, node_id: &NodeId) -> Option<&PeerState> {
+        self.peer_states.get(node_id)
+    }
+
+    pub fn record_heartbeat(
+        &mut self,
+        node_id: &NodeId,
+        tick: u64,
+    ) -> Result<PeerStatus, NetworkError> {
+        let Some(profile) = self.nodes.get_mut(node_id) else {
+            return Err(NetworkError::UnknownNode {
+                node_id: node_id.clone(),
+            });
+        };
+        let state = self
+            .peer_states
+            .entry(node_id.clone())
+            .or_insert_with(|| PeerState::new(NodeEndpoint::in_process(node_id.clone())));
+
+        state.status = PeerStatus::Healthy;
+        state.link.last_seen_tick = Some(tick);
+        state.link.missed_heartbeats = 0;
+        profile.set_health(NodeHealth::available());
+        Ok(state.status.clone())
+    }
+
+    pub fn record_missed_heartbeat(
+        &mut self,
+        node_id: &NodeId,
+        policy: HeartbeatPolicy,
+    ) -> Result<PeerStatus, NetworkError> {
+        let Some(profile) = self.nodes.get_mut(node_id) else {
+            return Err(NetworkError::UnknownNode {
+                node_id: node_id.clone(),
+            });
+        };
+        let state = self
+            .peer_states
+            .entry(node_id.clone())
+            .or_insert_with(|| PeerState::new(NodeEndpoint::in_process(node_id.clone())));
+
+        state.link.missed_heartbeats = state.link.missed_heartbeats.saturating_add(1);
+        state.status = if state.link.missed_heartbeats >= policy.offline_after_missed {
+            profile.set_health(NodeHealth {
+                availability: NodeAvailability::Offline,
+                message: Some("network heartbeat missed offline threshold".to_string()),
+            });
+            PeerStatus::Offline
+        } else if state.link.missed_heartbeats >= policy.suspect_after_missed {
+            profile.set_health(NodeHealth::degraded(
+                "network heartbeat missed suspect threshold",
+            ));
+            PeerStatus::Suspect
+        } else {
+            profile.set_health(NodeHealth::degraded("network heartbeat missed"));
+            PeerStatus::Degraded
+        };
+
+        Ok(state.status.clone())
     }
 
     pub fn session_nodes(&self, session_id: &SessionId) -> Vec<NodeId> {
@@ -200,6 +266,27 @@ impl LinkState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct HeartbeatPolicy {
+    pub suspect_after_missed: u16,
+    pub offline_after_missed: u16,
+}
+
+impl Default for HeartbeatPolicy {
+    fn default() -> Self {
+        Self {
+            suspect_after_missed: 2,
+            offline_after_missed: 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct Heartbeat {
+    pub node_id: NodeId,
+    pub tick: u64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct MeshMessageId(pub u64);
 
@@ -219,6 +306,7 @@ pub enum MeshMessageBody {
         event: EventEnvelope,
     },
     Ack(DeliveryAck),
+    Heartbeat(Heartbeat),
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -473,10 +561,35 @@ impl<T: NetworkTransport> NetworkService<T> {
                         target_node_id: ack.target_node_id,
                     });
                 }
+                MeshMessageBody::Heartbeat(heartbeat) => {
+                    let status = self
+                        .router
+                        .registry_mut()
+                        .record_heartbeat(&heartbeat.node_id, heartbeat.tick)?;
+                    let requeued = self.ledger.requeue_target(&heartbeat.node_id);
+                    outcomes.push(InboundOutcome::HeartbeatReceived {
+                        node_id: heartbeat.node_id,
+                        status,
+                        requeued,
+                    });
+                }
             }
         }
 
         Ok(outcomes)
+    }
+
+    pub fn send_heartbeat(
+        &mut self,
+        target_node_id: &NodeId,
+        tick: u64,
+    ) -> Result<(), NetworkError> {
+        let heartbeat = Heartbeat {
+            node_id: self.transport.local_node_id().clone(),
+            tick,
+        };
+        let frame = self.heartbeat_frame(target_node_id.clone(), heartbeat);
+        self.transport.send(target_node_id, frame)
     }
 
     fn event_frame(&mut self, record: &DeliveryRecord) -> NetworkFrame {
@@ -515,6 +628,23 @@ impl<T: NetworkTransport> NetworkService<T> {
         self.next_message_id += 1;
         frame
     }
+
+    fn heartbeat_frame(&mut self, target_node_id: NodeId, heartbeat: Heartbeat) -> NetworkFrame {
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(self.next_frame_id),
+            source_node_id: self.transport.local_node_id().clone(),
+            target_node_id: target_node_id.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(self.next_message_id),
+                origin_node_id: self.transport.local_node_id().clone(),
+                target_node_id,
+                body: MeshMessageBody::Heartbeat(heartbeat),
+            },
+        };
+        self.next_frame_id += 1;
+        self.next_message_id += 1;
+        frame
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -538,6 +668,11 @@ pub enum InboundOutcome {
     AckAccepted {
         delivery_id: RouteDeliveryId,
         target_node_id: NodeId,
+    },
+    HeartbeatReceived {
+        node_id: NodeId,
+        status: PeerStatus,
+        requeued: usize,
     },
 }
 
@@ -648,6 +783,19 @@ impl DeliveryLedger {
             record.delivery.status = DeliveryStatus::Retrying;
         }
         Ok(())
+    }
+
+    pub fn requeue_target(&mut self, target_node_id: &NodeId) -> usize {
+        let mut requeued = 0;
+        for record in self.records.values_mut() {
+            if &record.delivery.target_node_id == target_node_id
+                && record.delivery.status != DeliveryStatus::Delivered
+            {
+                record.delivery.status = DeliveryStatus::Retrying;
+                requeued += 1;
+            }
+        }
+        requeued
     }
 
     pub fn ack(
@@ -1092,5 +1240,132 @@ mod tests {
                 .target_node_id,
             node_b
         );
+    }
+
+    #[test]
+    fn heartbeat_marks_peer_healthy_and_updates_node_health() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+
+        let status = registry.record_heartbeat(&node_a, 7).expect("heartbeat");
+
+        assert_eq!(status, PeerStatus::Healthy);
+        assert_eq!(
+            registry
+                .peer_state(&node_a)
+                .expect("peer state")
+                .link
+                .last_seen_tick,
+            Some(7)
+        );
+        assert_eq!(
+            registry.node(&node_a).expect("node").health.availability,
+            NodeAvailability::Available
+        );
+    }
+
+    #[test]
+    fn missed_heartbeats_degrade_then_mark_offline_without_removing_session() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let session_id = SessionId::new("sess_heartbeat").expect("session");
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry
+            .join_session(session_id.clone(), node_a.clone())
+            .expect("join");
+
+        assert_eq!(
+            registry
+                .record_missed_heartbeat(&node_a, HeartbeatPolicy::default())
+                .expect("missed one"),
+            PeerStatus::Degraded
+        );
+        assert_eq!(
+            registry
+                .record_missed_heartbeat(&node_a, HeartbeatPolicy::default())
+                .expect("missed two"),
+            PeerStatus::Suspect
+        );
+        assert_eq!(
+            registry
+                .record_missed_heartbeat(&node_a, HeartbeatPolicy::default())
+                .expect("missed three"),
+            PeerStatus::Offline
+        );
+        assert_eq!(
+            registry.node(&node_a).expect("node").health.availability,
+            NodeAvailability::Offline
+        );
+        assert_eq!(registry.session_nodes(&session_id), vec![node_a]);
+    }
+
+    #[test]
+    fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let network = InProcessNetwork::new();
+        let transport_a = network.add_node(node_a.clone());
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry.register_node(node("node_b"));
+        let mut service_a = NetworkService::new(registry.clone(), transport_a)
+            .with_retry_policy(RetryPolicy { max_attempts: 2 });
+        let mut store_a = InMemoryEventStore::new();
+        let event =
+            fixture_event("evt_recovery_requeue", node_a.clone()).with_target_node(node_b.clone());
+        let receipt = store_a.append(event).expect("append");
+        let stored = store_a
+            .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+            .expect("replay")
+            .pop()
+            .expect("stored");
+        let delivery_id = service_a.enqueue_event(&stored).expect("enqueue")[0].delivery_id;
+
+        assert_eq!(service_a.pump_outbound().expect("first attempt"), 0);
+        assert!(service_a.pump_outbound().is_err());
+        assert_eq!(
+            service_a
+                .ledger()
+                .record(&delivery_id)
+                .expect("record")
+                .delivery
+                .status,
+            DeliveryStatus::Failed
+        );
+
+        let transport_b = network.add_node(node_b.clone());
+        let mut service_b = NetworkService::new(registry, transport_b);
+        let mut store_b = InMemoryEventStore::new();
+        service_b
+            .send_heartbeat(&node_a, 42)
+            .expect("send heartbeat");
+
+        let outcomes = service_a
+            .process_incoming(&mut store_a)
+            .expect("process heartbeat");
+        assert!(matches!(
+            outcomes.as_slice(),
+            [InboundOutcome::HeartbeatReceived {
+                status: PeerStatus::Healthy,
+                requeued: 1,
+                ..
+            }]
+        ));
+        assert_eq!(
+            service_a
+                .ledger()
+                .record(&delivery_id)
+                .expect("record")
+                .delivery
+                .status,
+            DeliveryStatus::Retrying
+        );
+
+        assert_eq!(service_a.pump_outbound().expect("drain recovered"), 1);
+        service_b
+            .process_incoming(&mut store_b)
+            .expect("receive recovered event");
+        assert_eq!(store_b.len(), 1);
     }
 }
