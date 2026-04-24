@@ -1,0 +1,16 @@
+[package]
+name = "sinomo-node"
+version.workspace = true
+description = "Sinomo node identity, profile, health, and capability metadata"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+
+[dev-dependencies]
+serde_json.workspace = true
