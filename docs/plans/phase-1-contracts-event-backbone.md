@@ -11,10 +11,11 @@ Architecture source of truth: [../architecture.md](../architecture.md).
 By the end of Phase 1:
 
 - `sinomo-core` owns shared IDs, event schemas, routing metadata, capability contracts, provenance, evidence, and serialization.
+- `sinomo-core` owns placeholder trust-ring, module, artifact, policy decision, evaluation scorecard, and rollout contracts needed for R1-ready self-evolution.
 - `sinomo-node` owns node identity/profile contracts and local node metadata.
 - `sinomo-device` owns device profile contracts and node/device attachment metadata.
 - `sinomo-events` owns event validation, append/replay interfaces, and a first in-memory event store.
-- `sinomo-app` can wire a local node, a local device, a synthetic event, validation, append, and replay.
+- `sinomo-app` can wire a local node, a local evolution workspace device, a scoped self-evolution job event, validation, append, and replay.
 - `cargo test --workspace` passes with focused contract tests.
 
 ## Non-Goals
@@ -25,6 +26,11 @@ Do not implement these in Phase 1:
 - peer discovery or network routing,
 - PostgreSQL migrations or durable database adapters,
 - DFS content storage or write routing,
+- dynamic module loading,
+- sandboxed mutation execution,
+- artifact registry behavior,
+- evaluation harness execution,
+- rollout or rollback behavior,
 - memory promotion and retrieval,
 - trigger policy,
 - agent dialogue loop,
@@ -53,12 +59,8 @@ Add only dependencies needed for contracts and tests:
 - `serde_json`
 - `thiserror`
 - `time` with serde support
-- `ulid` or `uuid` for generated IDs
+- `ulid` for generated IDs
 - `tracing`
-
-Optional only if immediately useful:
-
-- `async-trait` if event store traits are async from the beginning.
 
 Avoid database, broker, web server, and model-client dependencies in this phase.
 
@@ -103,6 +105,9 @@ Implement strongly typed ID newtypes:
 - `WorkspaceId`
 - `DfsObjectId`
 - `DfsVersion`
+- `ModuleId`
+- `ArtifactId`
+- `EvolutionJobId`
 
 Each ID should support:
 
@@ -126,6 +131,8 @@ Recommended prefixes:
 | `TaskId` | `task_` |
 | `WorkspaceId` | `workspace_` |
 | `DfsObjectId` | `obj_` |
+| `ModuleId` | `module_` |
+| `ArtifactId` | `artifact_` |
 
 Also define common scalar/value types:
 
@@ -199,6 +206,11 @@ Initial event families:
 - `notification.*`
 - `dfs.*`
 - `workspace.*`
+- `evolution.*`
+- `module.*`
+- `artifact.*`
+- `eval.*`
+- `rollout.*`
 
 Keep `EventKind` open and string-backed. Validate shape, not a closed enum. A good first rule is namespace-like dotted segments with at least two non-empty segments, for example `speech.transcript.final`.
 
@@ -207,6 +219,7 @@ Acceptance:
 - the documented event JSON shape serializes and deserializes.
 - optional distributed fields are represented without creating a separate remote event type.
 - event kind validation allows future event families without code changes.
+- evolution/module/artifact/eval/rollout event families validate as open namespaced events.
 
 ## Milestone 4: `sinomo-core` Domain Placeholders
 
@@ -229,8 +242,25 @@ Add lightweight domain contracts that later crates can use without behavior:
 - `HotStateSnapshot`
 - `ContextPacket`
 - `JobCancellation`
+- `TrustRing`
+- `ModuleManifest`
+- `ArtifactManifest`
+- `ArtifactProvenance`
+- `CapabilityDiff`
+- `PolicyDecision`
+- `EvaluationScorecard`
+- `EvolutionJob`
+- `RolloutPlan`
+- `RollbackPolicy`
 
 These should be intentionally small. The goal is stable shapes and names, not full domain implementation.
+
+R0/R1-sensitive placeholders should make the trust boundary explicit:
+
+- R0/R1 changes require stronger autonomous gates, continuity checks, and rollback records by default.
+- R3 modules may be future auto-evolution targets.
+- capability diffs and policy decisions must be represented as data, not implicit code paths.
+- rollout and rollback records should point to immutable artifact IDs.
 
 Acceptance:
 
@@ -349,16 +379,6 @@ pub trait EventStore {
 }
 ```
 
-If async is adopted immediately:
-
-```rust
-#[async_trait]
-pub trait EventStore {
-    async fn append(&self, event: EventEnvelope) -> Result<AppendReceipt, EventStoreError>;
-    async fn replay(&self, query: ReplayQuery) -> Result<Vec<StoredEvent>, EventStoreError>;
-}
-```
-
 Supporting types:
 
 - `AppendReceipt`
@@ -412,29 +432,32 @@ Acceptance:
 - replay after cursor excludes earlier records.
 - event append order is stable.
 
-## Milestone 10: `sinomo-app` Smoke Path
+## Milestone 10: `sinomo-app` Self-Evolution Smoke Path
 
 Implement a minimal local binary that:
 
 1. creates a local node profile,
-2. creates one mock device,
-3. builds a synthetic `speech.transcript.final` event,
-4. validates it,
-5. appends it to `InMemoryEventStore`,
-6. replays events for the session,
-7. logs or prints a compact summary.
+2. creates one local evolution workspace device,
+3. builds a synthetic R3 module manifest for `module.trigger.silence_policy`,
+4. builds a scoped `EvolutionJob`,
+5. builds a placeholder scorecard, policy decision, and rollout plan,
+6. wraps those records in an `evolution.job.scoped` event,
+7. validates and appends the event to `InMemoryEventStore`,
+8. replays events for the session,
+9. logs or prints a compact summary.
 
 Example output:
 
 ```text
-sinomo-app: appended evt_... kind=speech.transcript.final session=sess_...
-sinomo-app: replayed 1 event(s)
+sinomo-app: appended evt_... kind=evolution.job.scoped
+sinomo-app: replayed 1 self-evolution event(s)
 ```
 
 Acceptance:
 
 - `cargo run -p sinomo-app` completes successfully.
 - the smoke path uses public crate APIs rather than test-only helpers.
+- the smoke event payload serializes the Phase 1 self-evolution placeholder contracts.
 
 ## Testing Plan
 
@@ -450,10 +473,13 @@ Add focused unit tests:
 - device profile serialization and capability lookup.
 - event append/replay filters.
 - duplicate event ID rejection.
+- trust-ring classification for R0/R1 continuity gates and R3 auto-evolution target status.
+- R3 module manifest JSON round trip.
+- policy decision shape with capability diff represented as data.
 
 Add one integration-style test if useful:
 
-- local node + device + event + in-memory append + replay.
+- local node + evolution workspace device + `evolution.job.scoped` event + in-memory append + replay.
 
 Avoid snapshot tests for unstable debug formatting. Prefer explicit JSON assertions for stable schema fields.
 
@@ -475,23 +501,20 @@ Phase 1 is complete when:
 - `cargo fmt --all --check` passes,
 - `cargo clippy --workspace --all-targets` passes or has documented exceptions,
 - `cargo test --workspace` passes,
-- `cargo run -p sinomo-app` runs the local event smoke path,
+- `cargo run -p sinomo-app` runs the local self-evolution event smoke path,
 - event schemas serialize to the architecture's documented shape,
+- self-evolution placeholder contracts serialize to the architecture's documented trust-ring/module/artifact/eval/policy/rollout shape,
 - the proposal remains concise and non-conflicting with the architecture.
 
 ## Risks and Decisions
 
 ### ID generator choice
 
-Use `ulid` if time-sortable IDs are preferred for event/debug workflows. Use `uuid` if ecosystem familiarity matters more. Either is acceptable behind the ID newtypes.
-
-Decision needed before implementation: choose one ID generation crate.
+Use `ulid` for generated IDs. Time-sortable IDs are useful for event/debug workflows, and the ID newtypes keep the choice behind stable contracts.
 
 ### Sync versus async event store traits
 
-Synchronous traits are simpler for Phase 1 and the in-memory store. Async traits may reduce churn when PostgreSQL arrives.
-
-Recommended Phase 1 default: synchronous traits unless the implementation immediately introduces async runtime dependencies elsewhere.
+Use synchronous event store traits for Phase 1. They are simpler for contract tests and the in-memory store; durable PostgreSQL adapters can introduce async boundaries later without changing the core event envelope.
 
 ### Closed enums versus open strings
 
@@ -512,5 +535,5 @@ Do not start with PostgreSQL migrations in Phase 1. Add the durable adapter in a
 7. Implement device profile and capability lookup.
 8. Implement event validator.
 9. Implement event store traits and in-memory store.
-10. Implement `sinomo-app` smoke path.
+10. Implement `sinomo-app` self-evolution smoke path.
 11. Run fmt, clippy, tests, and app smoke command.

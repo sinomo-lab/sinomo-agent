@@ -4,7 +4,7 @@ This proposal captures the high-level design intent for Sinomo. The detailed, cu
 
 ## Vision
 
-Sinomo should be built as an individual AI entity runtime, not as a single monolithic model loop or a thin chat surface. The runtime should support continuous perception, durable memory, situated action, and slower reflection without letting any one path block the others.
+Sinomo should be built as an individual AI entity runtime, not as a single monolithic model loop or a thin chat surface. The runtime should support continuous perception, durable memory, situated action, slower reflection, and controlled self-evolution without letting any one path block the others.
 
 The core design idea is a three-speed, event-centric multimodal system:
 
@@ -13,6 +13,7 @@ The core design idea is a three-speed, event-centric multimodal system:
 - let a fast reactive loop handle timing-sensitive decisions,
 - let an interactive loop handle ordinary conversation and small actions,
 - escalate only selected work into a slower deliberative loop,
+- improve running behavior through scoped mutation jobs, evaluation gates, policy decisions, artifact registration, rollout, and rollback,
 - store memory through explicit promotion policies rather than dumping whole streams into context.
 
 ## Runtime Shape
@@ -27,7 +28,7 @@ The core runtime should be realistic for self-hosted hardware:
 - node-local sandbox and action enforcement,
 - optional use of local or remote model backends behind stable interfaces.
 
-Model providers can change over time. The event contract, memory policy, node/device provenance, and runtime supervision model should remain stable.
+Model providers and module implementations can change over time. The event contract, memory policy, node/device provenance, artifact provenance, rollout state, and runtime supervision model should remain stable.
 
 ## Design Principles
 
@@ -38,7 +39,8 @@ Model providers can change over time. The event contract, memory policy, node/de
 5. **Memory is hierarchical.** Hot, warm, cold, and procedural memory are managed explicitly, with selective promotion from events.
 6. **Distribution is native.** Nodes, devices, sessions, workspaces, events, and memory should carry identity and locality from the beginning.
 7. **Safety is enforced by the runtime.** Sandboxes, policy checks, resource limits, and incident events protect action paths without putting human approval on the hot path.
-8. **Implementation stays local-first.** Early versions should avoid unnecessary infrastructure and prove the contracts before adding heavier distributed services.
+8. **Evolution is evidence-gated.** Self-evolution moves through scoped workspaces, manifests, scorecards, policy decisions, signed artifacts, shadow/canary rollout, and rollback.
+9. **Implementation stays local-first.** Early versions should avoid unnecessary infrastructure and prove the contracts before adding heavier distributed services.
 
 ## Conceptual Planes
 
@@ -49,11 +51,26 @@ Inputs
   -> Perception Plane
   -> Event / World-State Plane
   -> Agent Control Plane
+  -> Evolution / Delivery Plane
   -> Action / Generation Plane
   -> Outputs
 ```
 
-The event/world-state plane is the architectural center. Perception produces events; memory, triggers, agents, deliberation, actions, and supervision consume and emit events. This keeps live behavior, replay, debugging, and long-horizon memory grounded in the same substrate.
+The event/world-state plane is the architectural center. Perception produces events; memory, triggers, agents, deliberation, actions, supervision, and self-evolution consume and emit events. This keeps live behavior, replay, debugging, long-horizon memory, and autonomous improvement grounded in the same substrate.
+
+## Self-Evolution Direction
+
+Sinomo should improve herself through controlled live mutation rather than direct rewriting of trusted runtime code. The first auto-evolution target should be low-risk R3 modules, while R0/R1 contracts are designed from the beginning for continuity checks, standby handoff, and rollback.
+
+The evolution loop should be explicit:
+
+- detect an opportunity from traces, incidents, metrics, replay failures, or user corrections,
+- create a scoped evolution job with an allowed write set and rollback policy,
+- produce a candidate manifest and artifact,
+- run evaluation scorecards and replay gates,
+- pass through a trusted policy decision,
+- register immutable artifact metadata,
+- shadow, canary, promote, pause, or roll back through events.
 
 ## Control Loops
 
@@ -87,6 +104,7 @@ The runtime should record both successful and blocked actions as structured even
 The first useful MVP should prove the event-centric, three-speed runtime on local-first infrastructure:
 
 - shared contracts for IDs, events, routing, node/device provenance, and capabilities,
+- trust-ring, module manifest, artifact, policy decision, scorecard, rollout, and rollback contracts,
 - event validation, persistence interfaces, and replay,
 - basic local node/device metadata,
 - simulated perception events,

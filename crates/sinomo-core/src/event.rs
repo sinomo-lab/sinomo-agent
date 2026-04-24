@@ -268,4 +268,17 @@ mod tests {
         assert!(CapabilityName::new("input.audio.vad").is_ok());
         assert!(CapabilityName::new("input").is_err());
     }
+
+    #[test]
+    fn self_evolution_event_families_are_open_namespaced_events() {
+        for kind in [
+            "evolution.job.scoped",
+            "module.shadow.decision",
+            "artifact.registered",
+            "eval.completed",
+            "rollout.promoted",
+        ] {
+            assert!(EventKind::new(kind).is_ok(), "{kind} should validate");
+        }
+    }
 }

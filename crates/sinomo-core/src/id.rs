@@ -112,6 +112,90 @@ macro_rules! define_id {
     };
 }
 
+macro_rules! define_open_id {
+    ($name:ident, $generated_prefix:literal) => {
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            pub const GENERATED_PREFIX: &'static str = $generated_prefix;
+
+            pub fn new(value: impl Into<String>) -> Result<Self, IdError> {
+                let value = value.into();
+                validate_open_id(stringify!($name), &value)?;
+                Ok(Self(value))
+            }
+
+            pub fn generate() -> Self {
+                let generated = Ulid::new().to_string().to_ascii_lowercase();
+                Self(format!("{}{}", Self::GENERATED_PREFIX, generated))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = IdError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+fn validate_open_id(type_name: &'static str, value: &str) -> Result<(), IdError> {
+    if value.trim().is_empty() {
+        return Err(IdError::EmptyValue {
+            type_name,
+            prefix: "",
+        });
+    }
+
+    for character in value.chars() {
+        if !(character.is_ascii_alphanumeric()
+            || character == '_'
+            || character == '-'
+            || character == '.'
+            || character == ':')
+        {
+            return Err(IdError::InvalidCharacter {
+                type_name,
+                character,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 define_id!(EventId, "evt_");
 define_id!(NodeId, "node_");
 define_id!(DeviceId, "device_");
@@ -121,6 +205,13 @@ define_id!(TaskId, "task_");
 define_id!(WorkspaceId, "workspace_");
 define_id!(DfsObjectId, "obj_");
 define_id!(DfsVersion, "version_");
+define_id!(ArtifactId, "artifact_");
+define_id!(EvolutionJobId, "evojob_");
+define_id!(ScorecardId, "score_");
+define_id!(RolloutPlanId, "rollout_");
+define_id!(PolicyDecisionId, "policy_");
+
+define_open_id!(ModuleId, "module_");
 
 #[cfg(test)]
 mod tests {
@@ -149,5 +240,12 @@ mod tests {
                 .as_str()
                 .starts_with(SessionId::PREFIX)
         );
+    }
+
+    #[test]
+    fn module_ids_allow_capsule_style_names() {
+        let id = ModuleId::new("module.trigger.silence_policy").expect("module id");
+        assert_eq!(id.as_str(), "module.trigger.silence_policy");
+        assert!(ModuleId::generate().as_str().starts_with("module_"));
     }
 }

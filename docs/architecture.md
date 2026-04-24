@@ -8,7 +8,7 @@ The foundation is a network of cooperating nodes. Each node may have one or more
 
 The initial architecture favors a Rust workspace with small, focused crates that can run together on one machine first, then distribute across desktops, phones, small servers, and LAN devices as workload, privacy, latency, and hardware needs grow.
 
-Self-evolution is treated as a controlled background delivery loop rather than live in-place self-modification. The detailed design for sandboxed mutation, evaluation, progressive rollout, and rollback lives in [self-evolution-architecture.md](self-evolution-architecture.md).
+Self-evolution is treated as controlled live mutation: Sinomo should be able to change running behavior autonomously without bringing down the system. The detailed design for sandboxed mutation, evaluation, hot-swap, progressive rollout, and rollback lives in [self-evolution-architecture.md](self-evolution-architecture.md).
 
 ## Core Principles
 
@@ -21,6 +21,7 @@ Self-evolution is treated as a controlled background delivery loop rather than l
 7. **Locality is a first-class policy.** Computation should happen as close as practical to the device, signal, data, or action it affects.
 8. **Distribution is native.** Nodes, devices, sessions, events, world-state, and memory must be identity-aware and synchronization-aware from the beginning.
 9. **Workspaces are distributed objects.** Agent workspaces, staging areas, and artifacts should be local-first but addressable across nodes through explicit ownership, replication, and write policies.
+10. **Evolution is live and continuity-preserving.** Self-evolution must move through scoped workspaces, evaluation gates, signed artifacts, node-local policy checks, hot-swap, progressive rollout, and rollback without requiring human approval or stopping the system.
 
 ## Distributed Foundation
 
@@ -252,6 +253,84 @@ Mounts may point to:
 
 Mount metadata should define policy inheritance, sandbox scope, allowed actions, and cleanup behavior.
 
+## Self-Evolution Foundation
+
+Sinomo should support R1-ready live self-evolution from the beginning. The runtime should treat evolution as an autonomous software delivery loop that consumes events, traces, incidents, scorecards, workspaces, and policy state, then mutates running behavior through versioned artifacts, hot-swap, rollout events, and automatic rollback.
+
+The detailed design lives in [self-evolution-architecture.md](self-evolution-architecture.md). This architecture reserves the foundation contracts and trust boundaries needed to support it.
+
+### Trust Rings
+
+The system should separate immutable foundation code from evolvable modules.
+
+| Ring | Contents | Evolution rule |
+|---|---|---|
+| R0 continuity root | Event envelope, ID contracts, artifact verifier, policy verifier, rollback loader, emergency stop | Autonomous mutation only through dual-root/standby handoff and strongest gates |
+| R1 trusted runtime | Node supervisor, event store, DFS metadata, sandbox host, module loader, rollout controller | Autonomous live mutation with redundancy, shadowing, local health checks, and rollback |
+| R2 trusted services | Perception, memory, trigger, agent, deliberation, action services | Autonomous live mutation after evaluation and rollout gates |
+| R3 sandboxed modules | Skills, tools, evaluators, adapters, prompts, planners, local policies | Primary auto-evolution target |
+| R4 disposable workspaces | Mutation branches, test sandboxes, generated fixtures, traces | Fully automated but isolated |
+| R5 model providers | Local or remote LLMs used for proposal, implementation, review, critique | No authority; produce artifacts or judgments only |
+
+R0 should remain tiny and continuity-focused. R1 should be boring in behavior but mutable in deployment: it must be designed for autonomous replacement through redundant supervisors, shadow instances, atomic desired-state changes, and fast rollback.
+
+### Evolution Delivery Model
+
+Self-evolution should flow through explicit artifacts:
+
+```text
+events / metrics / incidents / traces / workspaces
+  -> evolution job
+  -> scoped mutation workspace
+  -> candidate bundle
+  -> sandbox build and test
+  -> evaluation scorecard
+  -> policy decision
+  -> signed artifact registry entry
+  -> node-local load check
+  -> shadow / hot-swap / canary / promotion
+  -> rollback or stable version
+```
+
+No coding worker or LLM should be able to directly overwrite a live module, trusted runtime crate, registry entry, policy verifier, or rollback path. Live mutation happens only when the autonomous evolution controller publishes a verified desired-state change that node-local loaders can accept or reject under local policy.
+
+### Module Capsules
+
+Every evolvable module should eventually be packaged as a capsule.
+
+Capsule contents:
+
+- Module manifest.
+- Code artifact or prompt/config artifact.
+- Capability imports and exports.
+- Resource limits.
+- API version and compatibility constraints.
+- Source workspace and source revision.
+- Content hash and signature.
+- Evaluation scorecard references.
+- Provenance and attestation records.
+- Rollout and rollback policy.
+
+The manifest is part of the artifact. A candidate cannot grant itself new powers by editing code; capability requests are manifest changes and must pass policy.
+
+### R1 Support Requirements
+
+The initial foundation should support these R1 requirements even if their first implementation is skeletal:
+
+- Stable trust ring metadata on modules, jobs, policies, and artifacts.
+- Module manifest and artifact identity types in `sinomo-core`.
+- A policy decision boundary that candidate code cannot bypass.
+- An artifact registry model backed by PostgreSQL metadata and DFS/local content storage.
+- Node-local module loader state with current, previous, shadow, and candidate versions.
+- Hot-swap state with activation, drain, quiesce, and rollback checkpoints.
+- Rollout desired-state records that can be evaluated per node.
+- Rollback events that point to known-good artifacts.
+- Evaluation scorecards that are machine-readable and replayable.
+- Sandboxed mutation workspaces using DFS snapshots and object policies.
+- Event families for `evolution.*`, `module.*`, `artifact.*`, `eval.*`, and `rollout.*`.
+
+R1 services may be implemented as ordinary Rust crates at first, but their contracts should assume they are trusted runtime components that must support autonomous live replacement without taking down the node.
+
 ## Runtime Planes
 
 ```text
@@ -261,6 +340,7 @@ Inputs
   -> Perception Plane
   -> Event / World-State Plane
   -> Agent Control Plane
+  -> Evolution / Delivery Plane
   -> Action / Generation Plane
   -> Outputs
 
@@ -270,6 +350,8 @@ Shared stores:
   - Semantic memory tables/indexes
   - Local media/evidence stores
   - Distributed workspace filesystem
+  - Artifact registry metadata
+  - Evaluation scorecards
   - Skill/procedure store
 ```
 
@@ -346,6 +428,23 @@ Decides what Sinomo should do next. This plane is split into three loops:
 
 Primary crates: `sinomo-trigger`, `sinomo-agent`, `sinomo-deliberation`.
 
+### Evolution / Delivery Plane
+
+Controls self-evolution as a gated delivery pipeline.
+
+Responsibilities:
+
+- Detect improvement opportunities from events, metrics, incidents, user corrections, replay failures, and stale scorecards.
+- Create scoped evolution jobs with target ring, allowed write set, required gates, and rollback policy.
+- Prepare DFS mutation workspaces and candidate bundles.
+- Run sandboxed builds, tests, replay suites, and scorecards.
+- Verify manifests, capability diffs, artifacts, signatures, and provenance.
+- Register approved artifacts.
+- Coordinate shadow, hot-swap, canary, rolling promotion, and rollback across nodes.
+- Support autonomous R1 mutation with stronger gates than R2/R3 and continuity checks before activation.
+
+Primary crates: `sinomo-evolution`, `sinomo-eval`, `sinomo-sandbox`, `sinomo-registry`, `sinomo-policy`, `sinomo-rollout`, `sinomo-module`.
+
 ### Action / Generation Plane
 
 Executes decisions and emits outputs.
@@ -382,6 +481,13 @@ sinomo-agent/
     sinomo-network/       # Peer discovery, transport, authentication, routing
     sinomo-sync/          # Session, world-state, event, and memory synchronization
     sinomo-dfs/           # Local-first distributed workspace filesystem
+    sinomo-policy/        # Trusted policy decision contracts and verifier
+    sinomo-registry/      # Module artifact registry and provenance metadata
+    sinomo-module/        # Module manifests, interfaces, and node-local loader state
+    sinomo-sandbox/       # Sandboxed candidate execution and test jobs
+    sinomo-eval/          # Evaluation definitions, replay suites, and scorecards
+    sinomo-evolution/     # Evolution job orchestration
+    sinomo-rollout/       # Progressive rollout and rollback controller
     sinomo-gateway/       # Ingress adapters and session wiring
     sinomo-audio/         # Audio orchestration and audio event production
     sinomo-video/         # Video/screen orchestration and visual event production
@@ -431,6 +537,18 @@ Early types:
 - `DfsVersion`
 - `DfsWriteRequest`
 - `DfsWriteReceipt`
+- `TrustRing`
+- `ModuleId`
+- `ArtifactId`
+- `ModuleManifest`
+- `ArtifactManifest`
+- `ArtifactProvenance`
+- `CapabilityDiff`
+- `PolicyDecision`
+- `EvolutionJob`
+- `EvaluationScorecard`
+- `RolloutPlan`
+- `RollbackPolicy`
 
 This crate should avoid service-specific dependencies. It owns stable schemas, IDs, serialization, error types, and shared time/source abstractions.
 
@@ -497,6 +615,84 @@ Responsibilities:
 - Coordinate confirmed replication for selected objects.
 - Emit `dfs.*` events for writes, reads, conflicts, replication, promotion, and cleanup.
 - Provide workspace snapshots to action, coding, and generation workflows.
+
+### `sinomo-policy`
+
+Trusted policy decision boundary.
+
+Responsibilities:
+
+- Evaluate structured policy inputs for actions, DFS writes, module loads, artifact promotion, and rollout.
+- Separate policy decisions from candidate or evolvable code.
+- Represent allow, deny, defer, quarantine, require-more-evidence, and emergency-stop decisions.
+- Treat new filesystem, network, process, secret, device, policy, registry, verifier, sandbox, or rollback capabilities as explicit review points.
+
+### `sinomo-registry`
+
+Module artifact registry and provenance metadata.
+
+Responsibilities:
+
+- Track module artifacts, manifests, versions, hashes, signatures, source revisions, compatibility constraints, and rollout state.
+- Store provenance and attestation metadata.
+- Expose immutable artifact references to node-local loaders.
+- Keep previous stable artifact references available for rollback.
+
+### `sinomo-module`
+
+Module interface and node-local loader state.
+
+Responsibilities:
+
+- Define module manifests and API compatibility contracts.
+- Track stable, previous, shadow, candidate, and rolled-back versions per node.
+- Verify manifests and artifact compatibility before load.
+- Support activation, drain, quiesce, hot-swap, and rollback state transitions.
+- Emit module load, unload, shadow decision, crash, timeout, and policy-blocked events.
+
+### `sinomo-sandbox`
+
+Sandbox host for candidate builds, tests, and R3 modules.
+
+Responsibilities:
+
+- Run candidate jobs in constrained process/container sandboxes initially.
+- Provide a path toward Wasm Component Model modules for R3 capsules.
+- Enforce CPU, memory, wall-clock, filesystem, network, secret, and device limits.
+- Normalize logs and artifacts before they are reviewed by models or operators.
+
+### `sinomo-eval`
+
+Evaluation definitions and scorecards.
+
+Responsibilities:
+
+- Run static checks, unit tests, integration tests, replay tests, private regression suites, adversarial probes, shadow analysis, and canary analysis.
+- Produce machine-readable scorecards.
+- Keep generated tests as evidence, not sole authority.
+- Build private rotating evals from Sinomo's own traces and failure cases.
+
+### `sinomo-evolution`
+
+Evolution job orchestrator.
+
+Responsibilities:
+
+- Detect improvement opportunities.
+- Scope jobs with target module, trust ring, objective, allowed write set, required gates, and rollback policy.
+- Coordinate proposal, implementation, autonomous review, build, evaluation, policy decision, artifact registration, rollout, rollback, and archival.
+- Emit `evolution.*` events for every state transition.
+
+### `sinomo-rollout`
+
+Progressive delivery and rollback controller.
+
+Responsibilities:
+
+- Represent desired artifact state by module, node, role, trust domain, device class, session, or opt-in group.
+- Support shadow, hot-swap, canary, blue/green, rolling promotion, pause, and rollback.
+- Stop promotion when scorecards, incidents, latency, crash rate, or user corrections regress.
+- Keep rollback to known-good artifacts fast and replayable.
 
 ### `sinomo-gateway`
 
@@ -704,6 +900,11 @@ Initial event families:
 - `notification.*`
 - `dfs.*`
 - `workspace.*`
+- `evolution.*`
+- `module.*`
+- `artifact.*`
+- `eval.*`
+- `rollout.*`
 
 The event envelope should live in `sinomo-core`; persistence, replay, and reducers should live in `sinomo-events`.
 
@@ -719,6 +920,8 @@ Distributed event fields:
 - `routing.hints`: capability and placement hints for routers and schedulers.
 
 Filesystem-related events should include workspace ID, object ID, path, object policy, version, owner node, content hash when available, and write receipt metadata when the operation modifies state.
+
+Evolution-related events should include trust ring, target module, artifact ID, source workspace, policy decision, scorecard ID, rollout plan, affected nodes, and rollback target when applicable.
 
 ## Memory Architecture
 
@@ -748,6 +951,8 @@ Use cases:
 - Entity/world-state tables.
 - Memory records.
 - DFS workspace, object, version, and policy metadata.
+- Module manifests, artifact registry metadata, provenance, signatures, and attestations.
+- Evolution jobs, evaluation scorecards, policy decisions, rollout desired state, and rollback records.
 - Job queues and long-running task state.
 - Node/device registry.
 - Routing inbox/outbox tables.
@@ -800,6 +1005,23 @@ The DFS should expose a small API to the rest of the runtime:
 - Garbage collect unneeded local copies.
 
 For coding tasks, the DFS should support repository workspaces that can be mounted as ordinary local directories on the executing node. Git remains the source-control layer; the DFS manages workspace locality, staging, replication, and handoff between nodes.
+
+### Artifact Registry and Provenance
+
+Use PostgreSQL for registry metadata and DFS/local content storage for artifact bytes.
+
+PostgreSQL tables should track:
+
+- Module manifests and API versions.
+- Artifact IDs, content hashes, signatures, and compatibility constraints.
+- Source workspace, source revision, and mutation job.
+- Build, test, eval, and policy attestations.
+- Current, previous, candidate, shadow, draining, and rollback artifact state per node.
+- Rollout plans, rollout progress, rollback records, and affected nodes.
+
+Artifact content should be immutable. A rollback should point to a known-good artifact rather than mutating the failed artifact in place.
+
+The registry is R1 infrastructure. Candidate code may produce a candidate bundle, but only trusted registry and policy paths can make it loadable.
 
 ### Semantic Retrieval
 
@@ -858,6 +1080,7 @@ Default behavior:
 - Summaries, embeddings, and derived observations can move more freely than raw streams.
 - Blocked actions and safety incidents replicate to the supervision home node.
 - DFS metadata events replicate according to workspace/object policy.
+- Evolution, artifact, module, eval, and rollout events replicate to the registry/supervision home node and to affected rollout nodes.
 
 ### World-State Merge
 
@@ -900,6 +1123,20 @@ Default behavior:
 
 The synchronization layer should keep enough metadata for an agent to know whether a file is local, stale, pending replication, conflicted, or unavailable because another node is offline.
 
+### Artifact and Rollout Synchronization
+
+Artifact and rollout synchronization should be desired-state based.
+
+Default behavior:
+
+- The registry records approved artifacts and desired rollout state.
+- Nodes do not blindly load new artifacts; they verify signature, manifest compatibility, local policy, resource limits, and trust ring.
+- Disconnected nodes keep running their last stable approved artifact.
+- Reconnected nodes reconcile desired state through the same checks as online nodes.
+- Shadow and canary decisions emit events that feed scorecards before promotion advances.
+- Rollbacks are signed desired-state events pointing to known-good artifacts.
+- R1 hot-swap uses a standby candidate instance, health probes, state handoff, activation checkpoint, and rollback checkpoint before replacing the active instance.
+
 ### Capability Discovery
 
 Nodes should advertise capabilities in a way that planning and routing can use.
@@ -919,6 +1156,12 @@ Capability examples:
 - `storage.workspace.replicated`
 - `dfs.policy.local_owned`
 - `dfs.policy.replicated_confirmed`
+- `module.loader.local`
+- `module.runtime.wasm`
+- `module.runtime.process_sandbox`
+- `evolution.eval.replay`
+- `evolution.rollout.canary`
+- `registry.artifact.durable`
 
 Capability discovery allows Sinomo to defer exact placement decisions while keeping the architecture ready for local execution.
 
@@ -969,6 +1212,29 @@ Capability discovery allows Sinomo to defer exact placement decisions while keep
 7. Scratch build outputs remain `ephemeral-local` and are garbage collected by policy.
 8. If a node disconnects mid-task, PostgreSQL metadata and DFS version state allow another capable node to resume from the latest confirmed workspace state.
 
+### R3 Module Evolution With R1 Rollout
+
+1. `sinomo-evolution` detects an opportunity from incidents, metrics, replay failures, or user corrections.
+2. It creates an `EvolutionJob` with target ring, target module, objective, allowed DFS workspace paths, required gates, and rollback policy.
+3. A mutation worker edits only an isolated DFS snapshot or branch workspace.
+4. `sinomo-sandbox` builds and tests the candidate under resource and capability limits.
+5. `sinomo-eval` runs scorecards, including replay/private regression suites.
+6. `sinomo-policy` approves, denies, quarantines, or requests more autonomous evidence based on the manifest diff, capability diff, scorecard, and target ring.
+7. `sinomo-registry` records the immutable artifact, provenance, and approved rollout plan.
+8. A node-local loader verifies the artifact and runs it in shadow mode beside the stable module.
+9. `sinomo-rollout` advances canary or rolls back based on module events, scorecards, incidents, and user correction signals.
+
+### R1 Live Foundation Mutation
+
+1. An improvement opportunity targets an R1 component such as the event store, DFS metadata layer, sandbox host, policy verifier, module loader, or rollout controller.
+2. `sinomo-evolution` creates a candidate workspace with a narrower allowed write set, stronger replay requirements, and explicit continuity tests.
+3. The candidate must produce build logs, test logs, replay evidence, scorecards, manifest diffs, provenance, rollback notes, and a state-handoff plan.
+4. `sinomo-sandbox` runs the candidate against synthetic and replayed control-plane workloads before any live activation.
+5. The node starts a standby R1 candidate beside the active R1 component and feeds it shadow traffic where possible.
+6. The loader performs an activation checkpoint, drains compatible in-flight work, swaps traffic to the candidate, and keeps the previous version hot.
+7. Rollout remains node-local-authority-first; each node can reject, quarantine, activate, or roll back the candidate based on local health and policy.
+8. If the candidate regresses, the rollback loader restores the previous artifact without stopping unrelated services.
+
 ## Safety and Supervision
 
 Sinomo should act freely inside explicitly enforced runtime envelopes. Human approval should not sit on the low-latency path.
@@ -983,6 +1249,9 @@ The runtime must enforce:
 - Process spawning restrictions.
 - Device access restrictions.
 - Secret/material access boundaries.
+- Module capability imports and resource limits.
+- Artifact signature, manifest, and provenance verification.
+- Rollout policy, shadow/canary limits, and rollback triggers.
 - Rate limits and resource ceilings.
 - Kill-switch and cancellation propagation.
 
@@ -998,6 +1267,17 @@ Distributed safety requirements:
 - Incident events should include origin node, requesting node, target node, target device, and policy decision.
 - Emergency stop and cancellation must propagate across active session participants.
 
+Self-evolution safety requirements:
+
+- R0 and R1 changes are autonomous but require the strongest evidence, redundant execution, and continuity checks.
+- Candidate code cannot approve its own artifact, modify policy decisions, alter registry trust, bypass the sandbox host, or replace rollback logic.
+- New filesystem, network, process, secret, device, policy, registry, verifier, sandbox, or rollback capabilities require explicit autonomous policy review and additional evidence gates.
+- R3 modules should run in sandboxed module boundaries when feasible, with Wasm Component Model as the preferred long-term interface.
+- Node-local loaders must verify artifact signature, manifest compatibility, capability grants, trust ring, and local resource limits before loading.
+- Shadow mode should be available before canary for any module whose behavior can be compared without taking action.
+- Rollback must remain available even when the failed artifact caused crashes, timeouts, or policy incidents.
+- A failed self-mutation must degrade to the last stable artifact or a reduced-capability safe mode rather than bringing down the node.
+
 ## Observability
 
 Track at minimum:
@@ -1011,8 +1291,14 @@ Track at minimum:
 - Action success/failure rates.
 - Sandbox block rates.
 - Replay trace completeness.
+- Module crash, timeout, and policy-block rates.
+- Evaluation gate pass/fail and scorecard deltas.
+- Artifact promotion, rollback, and node adoption rates.
+- Shadow/canary regressions and user correction spikes.
 
 The system should support event replay, decision trace inspection, memory promotion audits, trigger decision audits, and branch comparison for deliberative jobs.
+
+For self-evolution, observability must also support artifact provenance inspection, manifest diff review, capability diff review, evaluation scorecard comparison, rollout timeline inspection, and rollback evidence review.
 
 ## MVP Scope
 
@@ -1022,6 +1308,7 @@ Build first:
 
 - `sinomo-core` event and domain contracts.
 - `sinomo-node`, `sinomo-device`, `sinomo-network`, `sinomo-sync`, and `sinomo-dfs` foundation contracts.
+- R0/R1 trust ring contracts, module manifests, artifact IDs, policy decisions, evaluation scorecards, and rollout plan placeholders.
 - `sinomo-events` persistence and replay.
 - DFS metadata tables and local content storage for one-node and simulated two-node workspaces.
 - `sinomo-gateway` for text plus one audio input and one screen/video input.
@@ -1032,6 +1319,7 @@ Build first:
 - Minimal `sinomo-api` health, debug, and event inspection endpoints.
 - A two-node local development mode that simulates mobile-to-desktop routing on one machine.
 - A coding workspace simulation where writes route to the owning node.
+- An autonomous live evolution harness shape: scoped candidate workspace, scorecard record, policy decision, registry metadata, shadow activation, hot-swap state, and automatic rollback.
 
 Defer:
 
@@ -1042,13 +1330,16 @@ Defer:
 - Sophisticated multi-agent societies.
 - Fully automatic placement optimization.
 - Complex cross-internet federation.
+- Cross-fleet high-speed R1 rollout.
+- Mutation of the continuity root without a standby/dual-root mechanism.
+- Full Wasm component conversion for all modules.
 
 ## Implementation Phases
 
 ### Phase 1: Contracts and Event Backbone
 
 - Create `sinomo-core`.
-- Define shared IDs, node/device IDs, event envelope, domain types, routing metadata, and serialization.
+- Define shared IDs, node/device IDs, event envelope, domain types, routing metadata, trust rings, module/artifact IDs, policy decisions, scorecards, rollout placeholders, and serialization.
 - Create `sinomo-node` and `sinomo-device`.
 - Define node/device capability contracts.
 - Create `sinomo-events`.
@@ -1060,11 +1351,13 @@ Defer:
 - Create `sinomo-network`.
 - Create `sinomo-sync`.
 - Create `sinomo-dfs`.
+- Create skeletons for `sinomo-policy`, `sinomo-registry`, and `sinomo-module`.
 - Add local peer registry and static node configuration.
 - Support routing events between simulated nodes in one process or one workstation.
 - Add session membership and basic handoff metadata.
 - Add workspace/object metadata, policy definitions, and local content storage.
 - Support owner-routed writes in simulated nodes.
+- Add manifest, artifact, policy, and loader-state metadata with no dynamic loading yet.
 
 ### Phase 3: Ingestion and Perception Skeletons
 
@@ -1100,6 +1393,19 @@ Defer:
 - Add health checks, replay endpoints, policy incident views, and operator controls.
 - Add distributed incident traces across requesting and executing nodes.
 - Add DFS policy violation events and workspace audit views.
+- Add module policy violation events and artifact/rollout audit views.
+
+### Phase 7: Self-Evolution Harness
+
+- Create `sinomo-evolution`.
+- Create `sinomo-eval`.
+- Create `sinomo-sandbox`.
+- Create `sinomo-rollout`.
+- Add autonomous evolution jobs scoped to DFS snapshots.
+- Add local command-based scorecards and replay fixture references.
+- Add registry candidate records and provenance metadata.
+- Add policy decisions that allow, deny, defer, quarantine, or request more evidence.
+- Add shadow, hot-swap, canary, and rollback state models with automatic promotion for low-risk modules and guarded R1 trials.
 
 ## Near-Term Repository Setup
 
@@ -1112,11 +1418,18 @@ The next structural step should be to add the crates in dependency order:
 5. `sinomo-network`
 6. `sinomo-sync`
 7. `sinomo-dfs`
-8. `sinomo-gateway`
-9. `sinomo-trigger`
-10. `sinomo-agent`
-11. `sinomo-memory`
-12. perception/action/support crates as skeletons
-13. `sinomo-app`
+8. `sinomo-policy`
+9. `sinomo-registry`
+10. `sinomo-module`
+11. `sinomo-gateway`
+12. `sinomo-trigger`
+13. `sinomo-agent`
+14. `sinomo-memory`
+15. `sinomo-eval`
+16. `sinomo-sandbox`
+17. `sinomo-evolution`
+18. `sinomo-rollout`
+19. perception/action/support crates as skeletons
+20. `sinomo-app`
 
-Start with compileable crate skeletons, shared workspace dependencies, and lightweight tests around the event schema, node/device provenance, routing metadata, and DFS object policy behavior. Avoid introducing external services beyond PostgreSQL until the contracts and in-process distributed flow are stable.
+Start with compileable crate skeletons, shared workspace dependencies, and lightweight tests around the event schema, node/device provenance, routing metadata, DFS object policy behavior, trust-ring classification, module manifest validation, policy decision shapes, and rollout state transitions. Avoid introducing external services beyond PostgreSQL until the contracts and in-process distributed flow are stable.
