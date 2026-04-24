@@ -1,8 +1,8 @@
 //! Peer registry, mesh contracts, and event routing skeletons.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{EventEnvelope, LatencyClass, NodeId, RoutingScope, SessionId};
-use sinomo_events::{EventSequence, StoredEvent};
+use sinomo_core::{EventEnvelope, EventId, LatencyClass, NodeId, RoutingScope, SessionId};
+use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
 use sinomo_node::NodeProfile;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -214,7 +214,11 @@ pub struct MeshMessage {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum MeshMessageBody {
-    Event(EventEnvelope),
+    Event {
+        delivery_id: RouteDeliveryId,
+        event: EventEnvelope,
+    },
+    Ack(DeliveryAck),
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -324,6 +328,363 @@ impl NetworkTransport for InProcessTransport {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct NetworkService<T> {
+    router: InProcessRouter,
+    transport: T,
+    ledger: DeliveryLedger,
+    seen_events: BTreeSet<(NodeId, EventId)>,
+    next_frame_id: u64,
+    next_message_id: u64,
+}
+
+impl<T: NetworkTransport> NetworkService<T> {
+    pub fn new(registry: PeerRegistry, transport: T) -> Self {
+        Self {
+            router: InProcessRouter::new(registry),
+            transport,
+            ledger: DeliveryLedger::new(RetryPolicy::default()),
+            seen_events: BTreeSet::new(),
+            next_frame_id: 1,
+            next_message_id: 1,
+        }
+    }
+
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.ledger.retry_policy = retry_policy;
+        self
+    }
+
+    pub fn registry(&self) -> &PeerRegistry {
+        self.router.registry()
+    }
+
+    pub fn registry_mut(&mut self) -> &mut PeerRegistry {
+        self.router.registry_mut()
+    }
+
+    pub fn ledger(&self) -> &DeliveryLedger {
+        &self.ledger
+    }
+
+    pub fn enqueue_event(
+        &mut self,
+        stored_event: &StoredEvent,
+    ) -> Result<Vec<RouteDelivery>, NetworkError> {
+        let deliveries = self.router.route_event(stored_event)?;
+        let mut accepted = Vec::new();
+
+        for delivery in deliveries {
+            if self
+                .ledger
+                .enqueue(delivery.clone(), stored_event.event.clone())
+                .is_some()
+            {
+                accepted.push(delivery);
+            }
+        }
+
+        Ok(accepted)
+    }
+
+    pub fn pump_outbound(&mut self) -> Result<usize, NetworkError> {
+        let mut sent = 0;
+        let delivery_ids = self.ledger.ready_delivery_ids();
+
+        for delivery_id in delivery_ids {
+            let Some(record) = self.ledger.record(&delivery_id).cloned() else {
+                continue;
+            };
+
+            let frame = self.event_frame(&record);
+            match self.transport.send(&record.delivery.target_node_id, frame) {
+                Ok(()) => {
+                    self.ledger.mark_sent(delivery_id)?;
+                    sent += 1;
+                }
+                Err(error) => {
+                    self.ledger.mark_attempt_failed(delivery_id)?;
+                    if self
+                        .ledger
+                        .record(&delivery_id)
+                        .is_some_and(|record| record.delivery.status == DeliveryStatus::Failed)
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        Ok(sent)
+    }
+
+    pub fn process_incoming<S: EventStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<Vec<InboundOutcome>, NetworkError> {
+        let inbound_frames = self.transport.drain_incoming()?;
+        let mut outcomes = Vec::with_capacity(inbound_frames.len());
+
+        for inbound in inbound_frames {
+            match inbound.frame.message.body {
+                MeshMessageBody::Event { delivery_id, event } => {
+                    let key = (event.origin_node_id.clone(), event.event_id.clone());
+                    let duplicate = self.seen_events.contains(&key);
+
+                    if !duplicate {
+                        match store.append(event.clone()) {
+                            Ok(_) => {
+                                self.seen_events.insert(key);
+                                outcomes.push(InboundOutcome::EventAccepted {
+                                    delivery_id,
+                                    event_id: event.event_id.clone(),
+                                });
+                            }
+                            Err(EventStoreError::DuplicateEventId { .. }) => {
+                                self.seen_events.insert(key);
+                                outcomes.push(InboundOutcome::EventDuplicate {
+                                    delivery_id,
+                                    event_id: event.event_id.clone(),
+                                });
+                            }
+                            Err(error) => return Err(NetworkError::EventStore(error)),
+                        }
+                    } else {
+                        outcomes.push(InboundOutcome::EventDuplicate {
+                            delivery_id,
+                            event_id: event.event_id.clone(),
+                        });
+                    }
+
+                    let ack = DeliveryAck {
+                        delivery_id,
+                        event_id: event.event_id,
+                        target_node_id: self.transport.local_node_id().clone(),
+                    };
+                    let ack_frame = self.ack_frame(inbound.frame.source_node_id.clone(), ack);
+                    self.transport
+                        .send(&inbound.frame.source_node_id, ack_frame)?;
+                }
+                MeshMessageBody::Ack(ack) => {
+                    self.ledger
+                        .ack(ack.delivery_id, &inbound.frame.source_node_id)?;
+                    outcomes.push(InboundOutcome::AckAccepted {
+                        delivery_id: ack.delivery_id,
+                        target_node_id: ack.target_node_id,
+                    });
+                }
+            }
+        }
+
+        Ok(outcomes)
+    }
+
+    fn event_frame(&mut self, record: &DeliveryRecord) -> NetworkFrame {
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(self.next_frame_id),
+            source_node_id: self.transport.local_node_id().clone(),
+            target_node_id: record.delivery.target_node_id.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(self.next_message_id),
+                origin_node_id: self.transport.local_node_id().clone(),
+                target_node_id: record.delivery.target_node_id.clone(),
+                body: MeshMessageBody::Event {
+                    delivery_id: record.delivery.delivery_id,
+                    event: record.event.clone(),
+                },
+            },
+        };
+        self.next_frame_id += 1;
+        self.next_message_id += 1;
+        frame
+    }
+
+    fn ack_frame(&mut self, target_node_id: NodeId, ack: DeliveryAck) -> NetworkFrame {
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(self.next_frame_id),
+            source_node_id: self.transport.local_node_id().clone(),
+            target_node_id: target_node_id.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(self.next_message_id),
+                origin_node_id: self.transport.local_node_id().clone(),
+                target_node_id,
+                body: MeshMessageBody::Ack(ack),
+            },
+        };
+        self.next_frame_id += 1;
+        self.next_message_id += 1;
+        frame
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DeliveryAck {
+    pub delivery_id: RouteDeliveryId,
+    pub event_id: EventId,
+    pub target_node_id: NodeId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InboundOutcome {
+    EventAccepted {
+        delivery_id: RouteDeliveryId,
+        event_id: EventId,
+    },
+    EventDuplicate {
+        delivery_id: RouteDeliveryId,
+        event_id: EventId,
+    },
+    AckAccepted {
+        delivery_id: RouteDeliveryId,
+        target_node_id: NodeId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RetryPolicy {
+    pub max_attempts: u16,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self { max_attempts: 3 }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeliveryLedger {
+    retry_policy: RetryPolicy,
+    records: BTreeMap<RouteDeliveryId, DeliveryRecord>,
+    active_by_event_target: BTreeMap<(EventId, NodeId), RouteDeliveryId>,
+}
+
+impl DeliveryLedger {
+    pub fn new(retry_policy: RetryPolicy) -> Self {
+        Self {
+            retry_policy,
+            records: BTreeMap::new(),
+            active_by_event_target: BTreeMap::new(),
+        }
+    }
+
+    pub fn enqueue(
+        &mut self,
+        delivery: RouteDelivery,
+        event: EventEnvelope,
+    ) -> Option<RouteDeliveryId> {
+        let key = (delivery.event_id.clone(), delivery.target_node_id.clone());
+        if self.active_by_event_target.contains_key(&key) {
+            return None;
+        }
+
+        let delivery_id = delivery.delivery_id;
+        self.active_by_event_target.insert(key, delivery_id);
+        self.records.insert(
+            delivery_id,
+            DeliveryRecord {
+                delivery,
+                event,
+                attempts: 0,
+            },
+        );
+        Some(delivery_id)
+    }
+
+    pub fn record(&self, delivery_id: &RouteDeliveryId) -> Option<&DeliveryRecord> {
+        self.records.get(delivery_id)
+    }
+
+    pub fn records(&self) -> Vec<&DeliveryRecord> {
+        self.records.values().collect()
+    }
+
+    pub fn ready_delivery_ids(&self) -> Vec<RouteDeliveryId> {
+        self.records
+            .iter()
+            .filter_map(|(delivery_id, record)| {
+                matches!(
+                    record.delivery.status,
+                    DeliveryStatus::Queued | DeliveryStatus::Retrying
+                )
+                .then_some(*delivery_id)
+            })
+            .collect()
+    }
+
+    pub fn mark_sent(&mut self, delivery_id: RouteDeliveryId) -> Result<(), NetworkError> {
+        let record = self
+            .records
+            .get_mut(&delivery_id)
+            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+        record.attempts += 1;
+        record.delivery.status = DeliveryStatus::Sent;
+        Ok(())
+    }
+
+    pub fn mark_for_retry(&mut self, delivery_id: RouteDeliveryId) -> Result<(), NetworkError> {
+        let record = self
+            .records
+            .get_mut(&delivery_id)
+            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+        if record.delivery.status != DeliveryStatus::Delivered {
+            record.delivery.status = DeliveryStatus::Retrying;
+        }
+        Ok(())
+    }
+
+    pub fn mark_attempt_failed(
+        &mut self,
+        delivery_id: RouteDeliveryId,
+    ) -> Result<(), NetworkError> {
+        let record = self
+            .records
+            .get_mut(&delivery_id)
+            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+        record.attempts += 1;
+        if record.attempts >= self.retry_policy.max_attempts {
+            record.delivery.status = DeliveryStatus::Failed;
+        } else {
+            record.delivery.status = DeliveryStatus::Retrying;
+        }
+        Ok(())
+    }
+
+    pub fn ack(
+        &mut self,
+        delivery_id: RouteDeliveryId,
+        acking_node_id: &NodeId,
+    ) -> Result<(), NetworkError> {
+        let record = self
+            .records
+            .get_mut(&delivery_id)
+            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+        if &record.delivery.target_node_id != acking_node_id {
+            return Err(NetworkError::AckTargetMismatch {
+                delivery_id,
+                expected_target_node_id: record.delivery.target_node_id.clone(),
+                acking_node_id: acking_node_id.clone(),
+            });
+        }
+
+        record.delivery.status = DeliveryStatus::Delivered;
+        Ok(())
+    }
+}
+
+impl Default for DeliveryLedger {
+    fn default() -> Self {
+        Self::new(RetryPolicy::default())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DeliveryRecord {
+    pub delivery: RouteDelivery,
+    pub event: EventEnvelope,
+    pub attempts: u16,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct RouteDeliveryId(pub u64);
 
@@ -341,6 +702,8 @@ pub struct RouteDelivery {
 #[serde(rename_all = "kebab-case")]
 pub enum DeliveryStatus {
     Queued,
+    Sent,
+    Retrying,
     Delivered,
     Failed,
 }
@@ -361,6 +724,18 @@ pub enum NetworkError {
         requested_target_node_id: NodeId,
         frame_target_node_id: NodeId,
     },
+    #[error("unknown delivery: {delivery_id:?}")]
+    UnknownDelivery { delivery_id: RouteDeliveryId },
+    #[error(
+        "delivery {delivery_id:?} acked by {acking_node_id}, expected {expected_target_node_id}"
+    )]
+    AckTargetMismatch {
+        delivery_id: RouteDeliveryId,
+        expected_target_node_id: NodeId,
+        acking_node_id: NodeId,
+    },
+    #[error(transparent)]
+    EventStore(#[from] EventStoreError),
 }
 
 #[cfg(test)]
@@ -460,7 +835,10 @@ mod tests {
                 message_id: MeshMessageId(1),
                 origin_node_id: node_a,
                 target_node_id: node_b.clone(),
-                body: MeshMessageBody::Event(event.clone()),
+                body: MeshMessageBody::Event {
+                    delivery_id: RouteDeliveryId(1),
+                    event: event.clone(),
+                },
             },
         };
 
@@ -493,7 +871,10 @@ mod tests {
                         message_id: MeshMessageId(1),
                         origin_node_id: node_a,
                         target_node_id: node_missing.clone(),
-                        body: MeshMessageBody::Event(event),
+                        body: MeshMessageBody::Event {
+                            delivery_id: RouteDeliveryId(1),
+                            event,
+                        },
                     },
                 },
             )
@@ -504,6 +885,212 @@ mod tests {
             NetworkError::UnknownNode {
                 node_id: node_missing
             }
+        );
+    }
+
+    #[test]
+    fn network_service_delivers_event_and_processes_ack() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let session_id = SessionId::new("sess_network").expect("session");
+        let network = InProcessNetwork::new();
+        let transport_a = network.add_node(node_a.clone());
+        let transport_b = network.add_node(node_b.clone());
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry.register_node(node("node_b"));
+        registry
+            .join_session(session_id.clone(), node_a.clone())
+            .expect("join a");
+        registry
+            .join_session(session_id.clone(), node_b.clone())
+            .expect("join b");
+        let mut service_a = NetworkService::new(registry.clone(), transport_a);
+        let mut service_b = NetworkService::new(registry, transport_b);
+        let mut store_a = InMemoryEventStore::new();
+        let mut store_b = InMemoryEventStore::new();
+        let event = fixture_event("evt_service_delivery", node_a.clone()).with_session(session_id);
+        let receipt = store_a.append(event).expect("append");
+        let stored = store_a
+            .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+            .expect("replay")
+            .pop()
+            .expect("stored");
+
+        let deliveries = service_a.enqueue_event(&stored).expect("enqueue");
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(service_a.pump_outbound().expect("send"), 2);
+
+        let outcomes = service_b
+            .process_incoming(&mut store_b)
+            .expect("process event");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(store_b.len(), 1);
+
+        let ack_outcomes = service_a
+            .process_incoming(&mut store_a)
+            .expect("process ack");
+        assert_eq!(ack_outcomes.len(), 2);
+        assert_eq!(store_a.len(), 1);
+        assert_eq!(
+            ack_outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, InboundOutcome::AckAccepted { .. }))
+                .count(),
+            1
+        );
+        let delivered = service_a
+            .ledger()
+            .records()
+            .into_iter()
+            .filter(|record| record.delivery.status == DeliveryStatus::Delivered)
+            .count();
+        assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn delivery_ledger_suppresses_duplicate_event_targets() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let network = InProcessNetwork::new();
+        let transport_a = network.add_node(node_a.clone());
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry.register_node(node("node_b"));
+        let mut service = NetworkService::new(registry, transport_a);
+        let mut store = InMemoryEventStore::new();
+        let event =
+            fixture_event("evt_duplicate_delivery", node_a.clone()).with_target_node(node_b);
+        let receipt = store.append(event).expect("append");
+        let stored = store
+            .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+            .expect("replay")
+            .pop()
+            .expect("stored");
+
+        assert_eq!(service.enqueue_event(&stored).expect("first").len(), 1);
+        assert_eq!(service.enqueue_event(&stored).expect("duplicate").len(), 0);
+        assert_eq!(service.ledger().records().len(), 1);
+    }
+
+    #[test]
+    fn inbound_duplicate_event_is_acked_without_duplicate_append() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let network = InProcessNetwork::new();
+        let transport_a = network.add_node(node_a.clone());
+        let transport_b = network.add_node(node_b.clone());
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry.register_node(node("node_b"));
+        let mut service_a = NetworkService::new(registry.clone(), transport_a);
+        let mut service_b = NetworkService::new(registry, transport_b);
+        let event = fixture_event("evt_duplicate_inbound", node_a.clone()).with_target_node(node_b);
+        let mut store_b = InMemoryEventStore::new();
+
+        for frame_id in [1, 2] {
+            let frame = NetworkFrame {
+                frame_id: NetworkFrameId(frame_id),
+                source_node_id: node_a.clone(),
+                target_node_id: service_b.transport.local_node_id().clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(frame_id),
+                    origin_node_id: node_a.clone(),
+                    target_node_id: service_b.transport.local_node_id().clone(),
+                    body: MeshMessageBody::Event {
+                        delivery_id: RouteDeliveryId(1),
+                        event: event.clone(),
+                    },
+                },
+            };
+            service_a
+                .transport
+                .send(service_b.transport.local_node_id(), frame)
+                .expect("send duplicate");
+        }
+
+        let outcomes = service_b
+            .process_incoming(&mut store_b)
+            .expect("process duplicates");
+        assert!(matches!(outcomes[0], InboundOutcome::EventAccepted { .. }));
+        assert!(matches!(outcomes[1], InboundOutcome::EventDuplicate { .. }));
+        assert_eq!(store_b.len(), 1);
+    }
+
+    #[test]
+    fn retry_policy_marks_delivery_failed_after_max_attempts() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let network = InProcessNetwork::new();
+        let transport_a = network.add_node(node_a.clone());
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry.register_node(node("node_b"));
+        let mut service = NetworkService::new(registry, transport_a)
+            .with_retry_policy(RetryPolicy { max_attempts: 2 });
+        let mut store = InMemoryEventStore::new();
+        let event = fixture_event("evt_retry_failed", node_a.clone()).with_target_node(node_b);
+        let receipt = store.append(event).expect("append");
+        let stored = store
+            .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+            .expect("replay")
+            .pop()
+            .expect("stored");
+        let delivery = service.enqueue_event(&stored).expect("enqueue")[0].clone();
+
+        assert!(service.pump_outbound().is_ok());
+        assert_eq!(
+            service
+                .ledger()
+                .record(&delivery.delivery_id)
+                .unwrap()
+                .delivery
+                .status,
+            DeliveryStatus::Retrying
+        );
+        let error = service
+            .pump_outbound()
+            .expect_err("final attempt should return send failure");
+        assert!(matches!(error, NetworkError::UnknownNode { .. }));
+        assert_eq!(
+            service
+                .ledger()
+                .record(&delivery.delivery_id)
+                .unwrap()
+                .delivery
+                .status,
+            DeliveryStatus::Failed
+        );
+    }
+
+    #[test]
+    fn ack_rejects_wrong_target_node() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let node_c = NodeId::new("node_c").expect("node");
+        let mut ledger = DeliveryLedger::new(RetryPolicy::default());
+        let event = fixture_event("evt_wrong_ack", node_a);
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(1),
+            event_sequence: EventSequence(1),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class: LatencyClass::Interactive,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+
+        let error = ledger
+            .ack(RouteDeliveryId(1), &node_c)
+            .expect_err("wrong target should fail");
+        assert!(matches!(error, NetworkError::AckTargetMismatch { .. }));
+        assert_eq!(
+            ledger
+                .record(&RouteDeliveryId(1))
+                .unwrap()
+                .delivery
+                .target_node_id,
+            node_b
         );
     }
 }
