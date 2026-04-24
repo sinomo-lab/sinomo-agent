@@ -12,6 +12,7 @@ include = ["**/*.rs", "Cargo.toml"]
 serde_json.workspace = true
 time.workspace = true
 tracing.workspace = true
+sinomo-agent = { path = "../sinomo-agent" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-audio = { path = "../sinomo-audio" }
 sinomo-device = { path = "../sinomo-device" }
@@ -25,4 +26,5 @@ sinomo-node = { path = "../sinomo-node" }
 sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-sync = { path = "../sinomo-sync" }
+sinomo-trigger = { path = "../sinomo-trigger" }
 sinomo-video = { path = "../sinomo-video" }

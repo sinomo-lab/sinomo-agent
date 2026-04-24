@@ -1,0 +1,17 @@
+[package]
+name = "sinomo-trigger"
+version.workspace = true
+description = "Sinomo rule-based trigger timing policy skeleton"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde_json.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-events = { path = "../sinomo-events" }
+
+[dev-dependencies]
+time.workspace = true

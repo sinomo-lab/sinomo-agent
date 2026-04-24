@@ -1,3 +1,4 @@
+use sinomo_agent::{BoundedContextBuilder, InteractiveAgent};
 use sinomo_audio::AudioPerceptionWorker;
 use sinomo_core::{
     ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
@@ -13,7 +14,7 @@ use sinomo_device::{DevicePermission, DeviceProfile};
 use sinomo_dfs::{
     DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, MountKind, Workspace, WorkspaceMount,
 };
-use sinomo_events::{EventSequence, EventStore, InMemoryEventStore, ReplayQuery};
+use sinomo_events::{EventSequence, EventStore, InMemoryEventStore, ReplayQuery, StoredEvent};
 use sinomo_fusion::FusionWorker;
 use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
 use sinomo_module::{LoadRequest, ModuleLoader};
@@ -22,6 +23,7 @@ use sinomo_node::{HostedService, NodeProfile};
 use sinomo_policy::{PolicyEngine, PolicyInput};
 use sinomo_registry::{ArtifactRegistry, RegistryEntry, RegistryStatus};
 use sinomo_sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncRegistry};
+use sinomo_trigger::RuleBasedTrigger;
 use sinomo_video::VideoPerceptionWorker;
 use time::OffsetDateTime;
 
@@ -218,10 +220,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .align(&perception_events)
         .expect("audio and screen observations fuse");
     let perception_count = perception_events.len();
+    let mut trigger_source = None;
     for perception_event in perception_events {
-        store.append(perception_event)?;
+        let is_transcript = perception_event.kind.as_str() == "speech.transcript.final";
+        let perception_receipt = store.append(perception_event.clone())?;
+        if is_transcript {
+            trigger_source = Some(StoredEvent {
+                sequence: perception_receipt.sequence,
+                appended_at: perception_receipt.appended_at,
+                event: perception_event,
+            });
+        }
     }
     store.append(fused_event)?;
+    let trigger_source = trigger_source.expect("synthetic audio produced transcript event");
+    let trigger = RuleBasedTrigger::default();
+    let trigger_decision = trigger.evaluate(&trigger_source);
+    let trigger_event = trigger.decision_event(&trigger_decision, &trigger_source.event);
+    store.append(trigger_event)?;
+
+    let context = BoundedContextBuilder::new(8).build(&store, session_id.clone())?;
+    let turn = InteractiveAgent::new(workstation.node_id.clone(), vec![screen.clone()])
+        .handle_trigger(&trigger_decision, &context);
+    let action_target = turn
+        .action_request
+        .as_ref()
+        .and_then(|request| request.target_node_id.clone());
+    store.append(turn.trace_event.clone())?;
     let replayed = store.replay(ReplayQuery::by_session(session_id.clone()))?;
     let stored_event = store
         .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))?
@@ -307,6 +332,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "sinomo-app: appended {} perception event(s) plus 1 fusion event",
         perception_count
+    );
+    println!(
+        "sinomo-app: trigger action={:?}; agent response={}; action target={:?}",
+        trigger_decision.action, turn.response.text, action_target
     );
     println!(
         "sinomo-app: dfs write route={:?}; loader action={:?}",
