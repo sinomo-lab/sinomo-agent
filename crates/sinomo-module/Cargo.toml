@@ -1,0 +1,17 @@
+[package]
+name = "sinomo-module"
+version.workspace = true
+description = "Sinomo module manifest and node-local loader skeleton"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+
+[dev-dependencies]
+serde_json.workspace = true

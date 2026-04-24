@@ -14,5 +14,11 @@ time.workspace = true
 tracing.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-device = { path = "../sinomo-device" }
+sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-events = { path = "../sinomo-events" }
+sinomo-module = { path = "../sinomo-module" }
+sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
+sinomo-policy = { path = "../sinomo-policy" }
+sinomo-registry = { path = "../sinomo-registry" }
+sinomo-sync = { path = "../sinomo-sync" }

@@ -210,8 +210,14 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-device",
+ "sinomo-dfs",
  "sinomo-events",
+ "sinomo-module",
+ "sinomo-network",
  "sinomo-node",
+ "sinomo-policy",
+ "sinomo-registry",
+ "sinomo-sync",
  "time",
  "tracing",
 ]
@@ -237,11 +243,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-dfs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "sinomo-events"
 version = "0.1.0"
 dependencies = [
  "serde",
  "sinomo-core",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "sinomo-module"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "thiserror",
+]
+
+[[package]]
+name = "sinomo-network"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-events",
+ "sinomo-node",
  "thiserror",
  "time",
 ]
@@ -253,6 +293,36 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+]
+
+[[package]]
+name = "sinomo-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sinomo-core",
+]
+
+[[package]]
+name = "sinomo-registry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "sinomo-sync"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "thiserror",
+ "time",
 ]
 
 [[package]]

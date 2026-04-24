@@ -1,0 +1,20 @@
+[package]
+name = "sinomo-network"
+version.workspace = true
+description = "In-process Sinomo peer registry and event routing skeleton"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-events = { path = "../sinomo-events" }
+sinomo-node = { path = "../sinomo-node" }
+
+[dev-dependencies]
+serde_json.workspace = true
+time.workspace = true
