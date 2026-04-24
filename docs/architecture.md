@@ -8,6 +8,8 @@ The foundation is a network of cooperating nodes. Each node may have one or more
 
 The initial architecture favors a Rust workspace with small, focused crates that can run together on one machine first, then distribute across desktops, phones, small servers, and LAN devices as workload, privacy, latency, and hardware needs grow.
 
+Self-evolution is treated as a controlled background delivery loop rather than live in-place self-modification. The detailed design for sandboxed mutation, evaluation, progressive rollout, and rollback lives in [self-evolution-architecture.md](self-evolution-architecture.md).
+
 ## Core Principles
 
 1. **Perception is always on.** Audio, video, screen, text, telemetry, and external events are ingested continuously without waiting for reasoning or generation to finish.
