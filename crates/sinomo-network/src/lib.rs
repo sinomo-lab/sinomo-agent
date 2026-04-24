@@ -50,6 +50,13 @@ impl PeerRegistry {
         self.peer_states.get(node_id)
     }
 
+    pub fn is_routable(&self, node_id: &NodeId) -> bool {
+        self.peer_states
+            .get(node_id)
+            .map(|state| state.status.can_route_reactive())
+            .unwrap_or(true)
+    }
+
     pub fn record_heartbeat(
         &mut self,
         node_id: &NodeId,
@@ -113,6 +120,27 @@ impl PeerRegistry {
             .map(|nodes| nodes.iter().cloned().collect())
             .unwrap_or_default()
     }
+
+    pub fn routable_session_nodes(&self, session_id: &SessionId) -> Vec<NodeId> {
+        self.sessions
+            .get(session_id)
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter(|node_id| self.is_routable(node_id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn routable_network_nodes(&self) -> Vec<NodeId> {
+        self.nodes
+            .keys()
+            .filter(|node_id| self.is_routable(node_id))
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -174,7 +202,7 @@ impl InProcessRouter {
             RoutingScope::Local => Ok(vec![event.origin_node_id.clone()]),
             RoutingScope::Session => {
                 if let Some(session_id) = &event.session_id {
-                    let nodes = self.registry.session_nodes(session_id);
+                    let nodes = self.registry.routable_session_nodes(session_id);
                     if nodes.is_empty() {
                         Ok(vec![event.origin_node_id.clone()])
                     } else {
@@ -185,7 +213,7 @@ impl InProcessRouter {
                 }
             }
             RoutingScope::TrustedNetwork | RoutingScope::DurableGlobal => {
-                Ok(self.registry.nodes.keys().cloned().collect())
+                Ok(self.registry.routable_network_nodes())
             }
         }
     }
@@ -483,6 +511,13 @@ impl<T: NetworkTransport> NetworkService<T> {
             let Some(record) = self.ledger.record(&delivery_id).cloned() else {
                 continue;
             };
+
+            if record.delivery.target_node_id != *self.transport.local_node_id()
+                && !self.registry().is_routable(&record.delivery.target_node_id)
+            {
+                self.ledger.mark_for_retry(delivery_id)?;
+                continue;
+            }
 
             let frame = self.event_frame(&record);
             match self.transport.send(&record.delivery.target_node_id, frame) {
@@ -1367,5 +1402,120 @@ mod tests {
             .process_incoming(&mut store_b)
             .expect("receive recovered event");
         assert_eq!(store_b.len(), 1);
+    }
+
+    #[test]
+    fn session_routing_excludes_offline_participants() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let session_id = SessionId::new("sess_offline_route").expect("session");
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry.register_node(node("node_b"));
+        registry
+            .join_session(session_id.clone(), node_a.clone())
+            .expect("join a");
+        registry
+            .join_session(session_id.clone(), node_b.clone())
+            .expect("join b");
+        for _ in 0..3 {
+            registry
+                .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+                .expect("miss heartbeat");
+        }
+        let mut store = InMemoryEventStore::new();
+        let event = fixture_event("evt_skip_offline", node_a.clone()).with_session(session_id);
+        let receipt = store.append(event).expect("append");
+        let stored = store
+            .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+            .expect("replay")
+            .pop()
+            .expect("stored");
+
+        let mut router = InProcessRouter::new(registry);
+        let deliveries = router.route_event(&stored).expect("route");
+
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].target_node_id, node_a);
+    }
+
+    #[test]
+    fn direct_target_offline_buffers_instead_of_sending() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let network = InProcessNetwork::new();
+        let transport_a = network.add_node(node_a.clone());
+        let mut transport_b = network.add_node(node_b.clone());
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry.register_node(node("node_b"));
+        for _ in 0..3 {
+            registry
+                .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+                .expect("miss heartbeat");
+        }
+        let mut service = NetworkService::new(registry, transport_a);
+        let mut store = InMemoryEventStore::new();
+        let event =
+            fixture_event("evt_direct_offline", node_a.clone()).with_target_node(node_b.clone());
+        let receipt = store.append(event).expect("append");
+        let stored = store
+            .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+            .expect("replay")
+            .pop()
+            .expect("stored");
+        let delivery_id = service.enqueue_event(&stored).expect("enqueue")[0].delivery_id;
+
+        assert_eq!(service.pump_outbound().expect("buffer offline"), 0);
+        assert_eq!(transport_b.drain_incoming().expect("drain").len(), 0);
+        assert_eq!(
+            service
+                .ledger()
+                .record(&delivery_id)
+                .expect("record")
+                .delivery
+                .status,
+            DeliveryStatus::Retrying
+        );
+    }
+
+    #[test]
+    fn trusted_network_routing_skips_offline_peers() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let node_c = NodeId::new("node_c").expect("node");
+        let mut registry = PeerRegistry::new();
+        registry.register_node(node("node_a"));
+        registry.register_node(node("node_b"));
+        registry.register_node(node("node_c"));
+        for _ in 0..3 {
+            registry
+                .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+                .expect("miss heartbeat");
+        }
+        registry
+            .record_heartbeat(&node_c, 1)
+            .expect("mark c healthy");
+        let mut event = fixture_event("evt_trusted_network", node_a);
+        event.routing.scope = RoutingScope::TrustedNetwork;
+        let mut store = InMemoryEventStore::new();
+        let receipt = store.append(event).expect("append");
+        let stored = store
+            .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+            .expect("replay")
+            .pop()
+            .expect("stored");
+
+        let mut router = InProcessRouter::new(registry);
+        let deliveries = router.route_event(&stored).expect("route");
+        let targets: BTreeSet<NodeId> = deliveries
+            .into_iter()
+            .map(|delivery| delivery.target_node_id)
+            .collect();
+
+        assert_eq!(
+            targets,
+            BTreeSet::from([stored.event.origin_node_id, node_c])
+        );
     }
 }
