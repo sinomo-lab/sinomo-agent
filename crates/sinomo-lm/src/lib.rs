@@ -8,7 +8,6 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -253,7 +252,6 @@ impl Default for GitHubCopilotConfig {
 pub struct GitHubCopilotProvider {
     config: GitHubCopilotConfig,
     http: Client,
-    copilot_token: Arc<Mutex<Option<CopilotApiToken>>>,
 }
 
 impl GitHubCopilotProvider {
@@ -263,7 +261,6 @@ impl GitHubCopilotProvider {
         Self {
             config,
             http: Client::new(),
-            copilot_token: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -385,24 +382,37 @@ impl GitHubCopilotProvider {
     }
 
     pub fn copilot_api_token(&self) -> Result<String, LanguageModelError> {
-        let now = unix_timestamp();
-        if let Some(cached) = self
-            .copilot_token
-            .lock()
-            .expect("copilot token lock")
-            .as_ref()
-            .filter(|token| token.expires_at > now + 60)
-        {
-            return Ok(cached.token.clone());
-        }
-
-        let github_token = self.github_token()?;
-        let token = self.exchange_copilot_api_token(&github_token)?;
-        let value = token.token.clone();
-        *self.copilot_token.lock().expect("copilot token lock") = Some(token);
-        Ok(value)
+        self.github_token()
     }
 
+    pub fn test_connection(&self) -> Result<(), LanguageModelError> {
+        let token = self.github_token()?;
+        let url = format!("{}/models", self.config.api_base_url.trim_end_matches('/'));
+        let response = self
+            .http
+            .get(url)
+            .headers(copilot_api_headers(&token)?)
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: self.config.default_model.clone(),
+                detail: source.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: self.config.default_model.clone(),
+                detail: format!("Copilot models check failed: HTTP {status}: {body}"),
+            });
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn exchange_copilot_api_token(
         &self,
         github_token: &str,
@@ -433,6 +443,7 @@ impl GitHubCopilotProvider {
         })
     }
 
+    #[allow(dead_code)]
     fn try_copilot_token_endpoint(
         &self,
         url: &str,
@@ -760,7 +771,10 @@ fn github_oauth_headers() -> HeaderMap {
         CONTENT_TYPE,
         HeaderValue::from_static("application/x-www-form-urlencoded"),
     );
-    headers.insert(USER_AGENT, HeaderValue::from_static("Sinomo/0.1"));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("GitHubCopilotChat/0.26.7"),
+    );
     headers
 }
 
@@ -795,7 +809,7 @@ fn copilot_api_headers(copilot_token: &str) -> Result<HeaderMap, LanguageModelEr
         "Openai-Intent",
         HeaderValue::from_static("conversation-edits"),
     );
-    headers.insert("x-initiator", HeaderValue::from_static("agent"));
+    headers.insert("x-initiator", HeaderValue::from_static("user"));
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {copilot_token}")).map_err(|source| {

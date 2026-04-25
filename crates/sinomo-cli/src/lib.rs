@@ -3,6 +3,7 @@
 use sinomo_lm::{GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError};
 use sinomo_local::SinomoDataDir;
 use std::env;
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,11 @@ pub fn run(args: Vec<String>) -> Result<(), CliError> {
             if providers == "providers" && github_copilot == "github-copilot" && auth == "auth" =>
         {
             auth_github_copilot()
+        }
+        [providers, github_copilot, test]
+            if providers == "providers" && github_copilot == "github-copilot" && test == "test" =>
+        {
+            test_github_copilot()
         }
         [help] if help == "help" || help == "--help" || help == "-h" => {
             print_usage();
@@ -26,16 +32,7 @@ pub fn run(args: Vec<String>) -> Result<(), CliError> {
 }
 
 pub fn auth_github_copilot() -> Result<(), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_provider_dir(GitHubCopilotProvider::PROVIDER_ID)?;
-    let credentials_path = data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
-    let client_id = env::var("SINOMO_COPILOT_CLIENT_ID")
-        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id);
-    let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
-        client_id,
-        token_store_path: Some(credentials_path.clone()),
-        ..GitHubCopilotConfig::default()
-    });
+    let (provider, credentials_path) = github_copilot_provider()?;
     let device = provider.device_login_start()?;
 
     println!("Open this URL in your browser:");
@@ -62,7 +59,7 @@ pub fn auth_github_copilot() -> Result<(), CliError> {
         thread::sleep(interval);
         let poll = provider.device_login_poll(&device.device_code)?;
         if poll.access_token.is_some() {
-            provider.copilot_api_token()?;
+            provider.test_connection()?;
             println!(
                 "GitHub Copilot credentials saved to {}",
                 credentials_path.display()
@@ -86,10 +83,40 @@ pub fn auth_github_copilot() -> Result<(), CliError> {
     }
 }
 
+pub fn test_github_copilot() -> Result<(), CliError> {
+    let (provider, credentials_path) = github_copilot_provider()?;
+    println!(
+        "Testing GitHub Copilot credentials at {}",
+        credentials_path.display()
+    );
+    provider.github_token()?;
+    println!("GitHub token: ok");
+    provider.test_connection()?;
+    println!("Copilot API models endpoint: ok");
+    println!("GitHub Copilot provider connection: ok");
+    Ok(())
+}
+
+fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_provider_dir(GitHubCopilotProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
+    let client_id = env::var("SINOMO_COPILOT_CLIENT_ID")
+        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id);
+    let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
+        client_id,
+        token_store_path: Some(credentials_path.clone()),
+        ..GitHubCopilotConfig::default()
+    });
+    Ok((provider, credentials_path))
+}
+
 pub fn print_usage() {
     println!("Usage:");
     println!("  sinomo providers github-copilot auth");
+    println!("  sinomo providers github-copilot test");
     println!("  sinomo-app providers github-copilot auth");
+    println!("  sinomo-app providers github-copilot test");
     println!();
     println!("Environment:");
     println!("  SINOMO_DATA_DIR             Defaults to ~/.sinomo");
