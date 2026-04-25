@@ -25,6 +25,7 @@ sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-fusion = { path = "../sinomo-fusion" }
 sinomo-gateway = { path = "../sinomo-gateway" }
 sinomo-deliberation = { path = "../sinomo-deliberation" }
+sinomo-lm = { path = "../sinomo-lm" }
 sinomo-memory = { path = "../sinomo-memory" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-network = { path = "../sinomo-network" }

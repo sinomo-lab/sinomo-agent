@@ -22,6 +22,10 @@ use sinomo_events::{EventSequence, EventStore, InMemoryEventStore, ReplayQuery, 
 use sinomo_evolution::{EvolutionOpportunity, EvolutionPlanner};
 use sinomo_fusion::FusionWorker;
 use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
+use sinomo_lm::{
+    CommandLanguageModelProvider, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
+    GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelProvider, PROVIDER_DEFAULT_MODEL,
+};
 use sinomo_memory::{MemoryManager, MemoryPolicy};
 use sinomo_module::{LoadRequest, ModuleLoader};
 use sinomo_network::{InProcessRouter, PeerRegistry};
@@ -34,6 +38,7 @@ use sinomo_sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncReg
 use sinomo_trigger::RuleBasedTrigger;
 use sinomo_video::VideoPerceptionWorker;
 use sinomo_voice::{SpeechOutputRequest, VoiceOutputService};
+use std::env;
 use time::OffsetDateTime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -337,7 +342,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next_job()
         .expect("queued deliberation job should run");
     let worker = DeliberationWorker::new(home_server.node_id.clone());
-    let completed_job = worker.summarize(running_job);
+    let completed_job = if let Some(configured_model) = configured_deliberation_model()? {
+        worker.summarize_with_model(
+            running_job,
+            configured_model.provider_client.as_ref(),
+            configured_model.provider,
+            configured_model.model,
+        )?
+    } else {
+        worker.summarize(running_job)
+    };
     let summary_event = worker.summary_event(&completed_job)?;
     let summary_receipt = store.append(summary_event.clone())?;
     deliberation_queue.complete(
@@ -495,6 +509,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+struct ConfiguredDeliberationModel {
+    provider_client: Box<dyn LanguageModelProvider>,
+    provider: String,
+    model: String,
+}
+
+fn configured_deliberation_model()
+-> Result<Option<ConfiguredDeliberationModel>, Box<dyn std::error::Error>> {
+    let provider =
+        env::var("SINOMO_DELIBERATION_LM_PROVIDER").unwrap_or_else(|_| "command".to_string());
+    if provider == GitHubCopilotProvider::PROVIDER_ID {
+        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
+            .unwrap_or_else(|_| GitHubCopilotConfig::default().default_model);
+        let api_base_url = env::var("SINOMO_COPILOT_API_BASE_URL")
+            .unwrap_or_else(|_| GitHubCopilotConfig::default().api_base_url);
+        let github_host = env::var("SINOMO_COPILOT_GITHUB_HOST")
+            .unwrap_or_else(|_| GitHubCopilotConfig::default().github_host);
+        let client_id = env::var("SINOMO_COPILOT_CLIENT_ID")
+            .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id);
+        let provider_client = GitHubCopilotProvider::new(GitHubCopilotConfig {
+            client_id,
+            github_host,
+            api_base_url,
+            default_model: model.clone(),
+            token_store_path: GitHubCopilotConfig::default().token_store_path,
+        });
+
+        return Ok(Some(ConfiguredDeliberationModel {
+            provider_client: Box::new(provider_client),
+            provider,
+            model,
+        }));
+    }
+
+    if provider == GitHubCopilotCliProvider::PROVIDER_ID {
+        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
+            .unwrap_or_else(|_| PROVIDER_DEFAULT_MODEL.into());
+        let program = env::var("SINOMO_DELIBERATION_LM_PROGRAM")
+            .unwrap_or_else(|_| GitHubCopilotCliConfig::default().program);
+        let extra_args: Vec<String> = match env::var("SINOMO_DELIBERATION_LM_ARGS_JSON") {
+            Ok(value) => serde_json::from_str(&value)?,
+            Err(_) => Vec::new(),
+        };
+        let config_model = if model == PROVIDER_DEFAULT_MODEL {
+            GitHubCopilotCliConfig::default().model
+        } else {
+            model.clone()
+        };
+        let provider_client = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
+            program,
+            model: config_model,
+            extra_args,
+            ..GitHubCopilotCliConfig::default()
+        });
+
+        return Ok(Some(ConfiguredDeliberationModel {
+            provider_client: Box::new(provider_client),
+            provider,
+            model,
+        }));
+    }
+
+    let Ok(program) = env::var("SINOMO_DELIBERATION_LM_PROGRAM") else {
+        return Ok(None);
+    };
+    let args: Vec<String> = match env::var("SINOMO_DELIBERATION_LM_ARGS_JSON") {
+        Ok(value) => serde_json::from_str(&value)?,
+        Err(_) => Vec::new(),
+    };
+    let model = env::var("SINOMO_DELIBERATION_LM_MODEL").unwrap_or_else(|_| program.clone());
+    let mode = env::var("SINOMO_DELIBERATION_LM_MODE").unwrap_or_else(|_| "plain".to_string());
+    let provider_client = match mode.as_str() {
+        "json" => CommandLanguageModelProvider::json_request(
+            program,
+            args,
+            provider.clone(),
+            model.clone(),
+        ),
+        _ => CommandLanguageModelProvider::plain_prompt(
+            program,
+            args,
+            provider.clone(),
+            model.clone(),
+        ),
+    };
+
+    Ok(Some(ConfiguredDeliberationModel {
+        provider_client: Box::new(provider_client),
+        provider,
+        model,
+    }))
 }
 
 fn stored_session(
