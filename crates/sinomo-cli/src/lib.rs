@@ -1,8 +1,12 @@
 //! Shared Sinomo command-line handlers.
 
-use sinomo_lm::{GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError};
+use sinomo_lm::{
+    AnthropicConfig, AnthropicProvider, GitHubCopilotConfig, GitHubCopilotProvider,
+    LanguageModelError, OpenAiConfig, OpenAiProvider,
+};
 use sinomo_local::SinomoDataDir;
 use std::env;
+use std::io;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,6 +22,26 @@ pub fn run(args: Vec<String>) -> Result<(), CliError> {
             if providers == "providers" && github_copilot == "github-copilot" && test == "test" =>
         {
             test_github_copilot()
+        }
+        [providers, anthropic, auth]
+            if providers == "providers" && anthropic == "anthropic" && auth == "auth" =>
+        {
+            auth_anthropic()
+        }
+        [providers, anthropic, test]
+            if providers == "providers" && anthropic == "anthropic" && test == "test" =>
+        {
+            test_anthropic()
+        }
+        [providers, openai, auth]
+            if providers == "providers" && openai == "openai" && auth == "auth" =>
+        {
+            auth_openai()
+        }
+        [providers, openai, test]
+            if providers == "providers" && openai == "openai" && test == "test" =>
+        {
+            test_openai()
         }
         [help] if help == "help" || help == "--help" || help == "-h" => {
             print_usage();
@@ -97,6 +121,71 @@ pub fn test_github_copilot() -> Result<(), CliError> {
     Ok(())
 }
 
+pub fn auth_anthropic() -> Result<(), CliError> {
+    let (provider, credentials_path) = anthropic_provider()?;
+    let (api_key, source) = api_key_from_env_or_prompt(
+        "Anthropic",
+        &[
+            "SINOMO_ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_API_KEY",
+            "SINOMO_CLAUDE_API_KEY",
+        ],
+    )?;
+    provider.save_api_key(&api_key, &source)?;
+    println!("Testing Anthropic provider connection...");
+    provider.test_connection()?;
+    println!(
+        "Anthropic credentials saved to {}",
+        credentials_path.display()
+    );
+    Ok(())
+}
+
+pub fn test_anthropic() -> Result<(), CliError> {
+    let (provider, credentials_path) = anthropic_provider()?;
+    println!(
+        "Testing Anthropic credentials at {}",
+        credentials_path.display()
+    );
+    provider.api_key()?;
+    println!("Anthropic API key: ok");
+    provider.test_connection()?;
+    println!("Anthropic provider connection: ok");
+    Ok(())
+}
+
+pub fn auth_openai() -> Result<(), CliError> {
+    let (provider, credentials_path) = openai_provider()?;
+    let (api_key, source) = api_key_from_env_or_prompt(
+        "OpenAI",
+        &[
+            "SINOMO_OPENAI_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "SINOMO_CODEX_API_KEY",
+        ],
+    )?;
+    provider.save_api_key(&api_key, &source)?;
+    println!("Testing OpenAI provider connection...");
+    provider.test_connection()?;
+    println!("OpenAI credentials saved to {}", credentials_path.display());
+    Ok(())
+}
+
+pub fn test_openai() -> Result<(), CliError> {
+    let (provider, credentials_path) = openai_provider()?;
+    println!(
+        "Testing OpenAI credentials at {}",
+        credentials_path.display()
+    );
+    provider.api_key()?;
+    println!("OpenAI API key: ok");
+    provider.test_connection()?;
+    println!("OpenAI provider connection: ok");
+    Ok(())
+}
+
 fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_provider_dir(GitHubCopilotProvider::PROVIDER_ID)?;
@@ -111,15 +200,95 @@ fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), CliErro
     Ok((provider, credentials_path))
 }
 
+fn anthropic_provider() -> Result<(AnthropicProvider, PathBuf), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_provider_dir(AnthropicProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(AnthropicProvider::PROVIDER_ID);
+    let provider = AnthropicProvider::new(AnthropicConfig {
+        api_base_url: env::var("SINOMO_ANTHROPIC_API_BASE_URL")
+            .or_else(|_| env::var("SINOMO_CLAUDE_API_BASE_URL"))
+            .unwrap_or_else(|_| AnthropicConfig::default().api_base_url),
+        default_model: env::var("SINOMO_ANTHROPIC_MODEL")
+            .or_else(|_| env::var("SINOMO_CLAUDE_MODEL"))
+            .unwrap_or_else(|_| AnthropicConfig::default().default_model),
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
+fn openai_provider() -> Result<(OpenAiProvider, PathBuf), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_provider_dir(OpenAiProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
+    let provider = OpenAiProvider::new(OpenAiConfig {
+        api_base_url: env::var("SINOMO_OPENAI_API_BASE_URL")
+            .or_else(|_| env::var("SINOMO_CODEX_API_BASE_URL"))
+            .unwrap_or_else(|_| OpenAiConfig::default().api_base_url),
+        default_model: env::var("SINOMO_OPENAI_MODEL")
+            .or_else(|_| env::var("SINOMO_CODEX_MODEL"))
+            .unwrap_or_else(|_| OpenAiConfig::default().default_model),
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
+fn api_key_from_env_or_prompt(
+    provider_name: &str,
+    env_vars: &[&str],
+) -> Result<(String, String), CliError> {
+    for env_var in env_vars {
+        if let Ok(api_key) = env::var(env_var) {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                return Ok((api_key.to_string(), format!("env:{env_var}")));
+            }
+        }
+    }
+
+    println!("No {provider_name} API key found in environment. Paste an API key to store locally.");
+    println!("Input will be visible in this terminal.");
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|source| CliError::AuthProvider {
+            detail: format!("failed to read API key: {source}"),
+        })?;
+    let api_key = line.trim();
+    if api_key.is_empty() {
+        return Err(CliError::AuthProvider {
+            detail: format!("{provider_name} API key was empty"),
+        });
+    }
+    Ok((api_key.to_string(), "prompt".to_string()))
+}
+
 pub fn print_usage() {
     println!("Usage:");
     println!("  sinomo providers github-copilot auth");
     println!("  sinomo providers github-copilot test");
+    println!("  sinomo providers anthropic auth");
+    println!("  sinomo providers anthropic test");
+    println!("  sinomo providers openai auth");
+    println!("  sinomo providers openai test");
     println!("  sinomo-app providers github-copilot auth");
     println!("  sinomo-app providers github-copilot test");
+    println!("  sinomo-app providers anthropic auth");
+    println!("  sinomo-app providers anthropic test");
+    println!("  sinomo-app providers openai auth");
+    println!("  sinomo-app providers openai test");
     println!();
     println!("Environment:");
     println!("  SINOMO_DATA_DIR             Defaults to ~/.sinomo");
+    println!("  ANTHROPIC_API_KEY           Used by `providers anthropic auth/test`");
+    println!("  OPENAI_API_KEY              Used by `providers openai auth/test`");
+    println!(
+        "  SINOMO_ANTHROPIC_MODEL      Defaults to {}",
+        AnthropicConfig::default().default_model
+    );
+    println!(
+        "  SINOMO_OPENAI_MODEL         Defaults to {}",
+        OpenAiConfig::default().default_model
+    );
     println!(
         "  SINOMO_COPILOT_CLIENT_ID    Defaults to {}",
         GitHubCopilotConfig::default().client_id
@@ -157,7 +326,7 @@ impl std::fmt::Display for CliError {
             Self::Usage => write!(formatter, "unknown command; run `sinomo help`"),
             Self::AuthDenied => write!(formatter, "GitHub device authorization was denied"),
             Self::AuthExpired => write!(formatter, "GitHub device authorization expired"),
-            Self::AuthProvider { detail } => write!(formatter, "GitHub auth failed: {detail}"),
+            Self::AuthProvider { detail } => write!(formatter, "provider auth failed: {detail}"),
             Self::LocalData(error) => write!(formatter, "{error}"),
             Self::LanguageModel(error) => write!(formatter, "{error}"),
         }

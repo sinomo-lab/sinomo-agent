@@ -1,5 +1,12 @@
 //! Language model provider contracts and integrations.
 
+mod anthropic;
+mod api_key;
+mod openai;
+
+pub use anthropic::{AnthropicConfig, AnthropicProvider};
+pub use openai::{OpenAiConfig, OpenAiProvider};
+
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -754,7 +761,7 @@ impl LanguageModelProvider for GitHubCopilotCliProvider {
     }
 }
 
-fn selected_model(default_model: &str, request: &LanguageModelRequest) -> String {
+pub(crate) fn selected_model(default_model: &str, request: &LanguageModelRequest) -> String {
     if request.model.trim().is_empty() || request.model == PROVIDER_DEFAULT_MODEL {
         default_model.to_string()
     } else {
@@ -917,7 +924,7 @@ fn default_copilot_credentials_path() -> Option<PathBuf> {
         .map(|data| data.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID))
 }
 
-fn unix_timestamp() -> u64 {
+pub(crate) fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)

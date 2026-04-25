@@ -23,8 +23,9 @@ use sinomo_evolution::{EvolutionOpportunity, EvolutionPlanner};
 use sinomo_fusion::FusionWorker;
 use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
 use sinomo_lm::{
-    CommandLanguageModelProvider, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
-    GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelProvider, PROVIDER_DEFAULT_MODEL,
+    AnthropicConfig, AnthropicProvider, CommandLanguageModelProvider, GitHubCopilotCliConfig,
+    GitHubCopilotCliProvider, GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelProvider,
+    OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL,
 };
 use sinomo_memory::{MemoryManager, MemoryPolicy};
 use sinomo_module::{LoadRequest, ModuleLoader};
@@ -575,6 +576,44 @@ fn configured_deliberation_model()
         return Ok(Some(ConfiguredDeliberationModel {
             provider_client: Box::new(provider_client),
             provider,
+            model,
+        }));
+    }
+
+    if provider == AnthropicProvider::PROVIDER_ID || provider == "claude" {
+        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
+            .unwrap_or_else(|_| AnthropicConfig::default().default_model);
+        let api_base_url = env::var("SINOMO_ANTHROPIC_API_BASE_URL")
+            .or_else(|_| env::var("SINOMO_CLAUDE_API_BASE_URL"))
+            .unwrap_or_else(|_| AnthropicConfig::default().api_base_url);
+        let provider_client = AnthropicProvider::new(AnthropicConfig {
+            api_base_url,
+            default_model: model.clone(),
+            credentials_path: AnthropicConfig::default().credentials_path,
+        });
+
+        return Ok(Some(ConfiguredDeliberationModel {
+            provider_client: Box::new(provider_client),
+            provider: AnthropicProvider::PROVIDER_ID.to_string(),
+            model,
+        }));
+    }
+
+    if provider == OpenAiProvider::PROVIDER_ID || provider == "codex" {
+        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
+            .unwrap_or_else(|_| OpenAiConfig::default().default_model);
+        let api_base_url = env::var("SINOMO_OPENAI_API_BASE_URL")
+            .or_else(|_| env::var("SINOMO_CODEX_API_BASE_URL"))
+            .unwrap_or_else(|_| OpenAiConfig::default().api_base_url);
+        let provider_client = OpenAiProvider::new(OpenAiConfig {
+            api_base_url,
+            default_model: model.clone(),
+            credentials_path: OpenAiConfig::default().credentials_path,
+        });
+
+        return Ok(Some(ConfiguredDeliberationModel {
+            provider_client: Box::new(provider_client),
+            provider: OpenAiProvider::PROVIDER_ID.to_string(),
             model,
         }));
     }
