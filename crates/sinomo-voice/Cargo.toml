@@ -1,0 +1,16 @@
+[package]
+name = "sinomo-voice"
+version.workspace = true
+description = "Sinomo speech output and duplex control skeleton"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-device = { path = "../sinomo-device" }

@@ -1,0 +1,18 @@
+[package]
+name = "sinomo-supervision"
+version.workspace = true
+description = "Sinomo supervision incident and audit view skeleton"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-events = { path = "../sinomo-events" }
+
+[dev-dependencies]
+serde_json.workspace = true
+time.workspace = true

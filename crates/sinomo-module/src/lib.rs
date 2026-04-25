@@ -2,10 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactManifest, HotSwapState, ModuleId, ModuleLoaderState, NodeId, PolicyAction,
-    PolicyDecision, RolloutPlan, TrustRing,
+    ArtifactId, ArtifactManifest, Confidence, EventEnvelope, EventId, EventKind, HotSwapState,
+    LatencyClass, ModuleId, ModuleLoaderState, NodeId, PolicyAction, PolicyDecision, PrivacyClass,
+    RolloutPlan, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
 };
 use thiserror::Error;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LoadRequest {
@@ -32,6 +34,43 @@ pub enum LoaderAction {
     Reject,
     Quarantine,
     RollBack,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModulePolicyViolation {
+    pub node_id: NodeId,
+    pub module_id: ModuleId,
+    pub artifact_id: ArtifactId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_plan_id: Option<sinomo_core::RolloutPlanId>,
+    pub reason: String,
+}
+
+impl ModulePolicyViolation {
+    pub fn event(&self) -> EventEnvelope {
+        EventEnvelope::new(
+            EventId::generate(),
+            OffsetDateTime::now_utc(),
+            self.node_id.clone(),
+            Source::new("module.loader").expect("valid source"),
+            EventKind::new("module.policy.violation").expect("valid event kind"),
+            Salience::new(0.9).expect("valid salience"),
+            Confidence::new(0.96).expect("valid confidence"),
+            RoutingMetadata::new(
+                RoutingScope::TrustedNetwork,
+                LatencyClass::Background,
+                PrivacyClass::Derived,
+            ),
+        )
+        .with_target_node(self.node_id.clone())
+        .with_payload(serde_json::json!({
+            "node_id": self.node_id,
+            "module_id": self.module_id,
+            "artifact_id": self.artifact_id,
+            "rollout_plan_id": self.rollout_plan_id,
+            "reason": self.reason,
+        }))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -165,5 +204,22 @@ mod tests {
             .evaluate_load(request)
             .expect("load");
         assert_eq!(decision.action, LoaderAction::AcceptShadow);
+    }
+
+    #[test]
+    fn module_policy_violation_event_is_structured_for_audit() {
+        let node_id = NodeId::new("node_desktop").expect("node");
+        let event = ModulePolicyViolation {
+            node_id: node_id.clone(),
+            module_id: ModuleId::new("module.trigger.silence_policy").expect("module"),
+            artifact_id: ArtifactId::new("artifact_candidate").expect("artifact"),
+            rollout_plan_id: Some(RolloutPlanId::new("rollout_candidate").expect("rollout")),
+            reason: "policy denied candidate load".to_string(),
+        }
+        .event();
+
+        assert_eq!(event.kind.as_str(), "module.policy.violation");
+        assert_eq!(event.target_node_id, Some(node_id));
+        assert_eq!(event.payload["artifact_id"], "artifact_candidate");
     }
 }

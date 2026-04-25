@@ -2,8 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteReceipt, DfsWriteRequest, EventId, NodeId,
-    WorkspaceId,
+    Confidence, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteReceipt, DfsWriteRequest,
+    EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source, WorkspaceId,
 };
 use sinomo_network::{
     MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, NetworkTransport,
@@ -87,6 +88,44 @@ pub enum WriteIntentStatus {
     Committed,
     Rejected,
     Conflict,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPolicyViolation {
+    pub requesting_node_id: NodeId,
+    pub executing_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<DfsObjectId>,
+    pub reason: String,
+}
+
+impl DfsPolicyViolation {
+    pub fn event(&self) -> EventEnvelope {
+        EventEnvelope::new(
+            EventId::generate(),
+            OffsetDateTime::now_utc(),
+            self.executing_node_id.clone(),
+            Source::new("dfs.policy").expect("valid source"),
+            EventKind::new("dfs.policy.violation").expect("valid event kind"),
+            Salience::new(0.9).expect("valid salience"),
+            Confidence::new(0.96).expect("valid confidence"),
+            RoutingMetadata::new(
+                RoutingScope::TrustedNetwork,
+                LatencyClass::Background,
+                PrivacyClass::Derived,
+            ),
+        )
+        .with_target_node(self.executing_node_id.clone())
+        .with_payload(serde_json::json!({
+            "requesting_node_id": self.requesting_node_id,
+            "executing_node_id": self.executing_node_id,
+            "workspace_id": self.workspace_id,
+            "object_id": self.object_id,
+            "reason": self.reason,
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -956,5 +995,23 @@ mod tests {
                 .version,
             target_version
         );
+    }
+
+    #[test]
+    fn dfs_policy_violation_event_is_structured_for_supervision() {
+        let owner = NodeId::new("node_desktop").expect("node");
+        let remote = NodeId::new("node_mobile").expect("node");
+        let event = DfsPolicyViolation {
+            requesting_node_id: remote,
+            executing_node_id: owner.clone(),
+            workspace_id: Some(WorkspaceId::new("workspace_repo").expect("workspace")),
+            object_id: Some(DfsObjectId::new("obj_file").expect("object")),
+            reason: "write attempted against non-owner".to_string(),
+        }
+        .event();
+
+        assert_eq!(event.kind.as_str(), "dfs.policy.violation");
+        assert_eq!(event.target_node_id, Some(owner));
+        assert_eq!(event.payload["workspace_id"], "workspace_repo");
     }
 }

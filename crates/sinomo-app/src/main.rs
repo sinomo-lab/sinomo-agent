@@ -1,4 +1,6 @@
+use sinomo_actions::{ActionExecutor, ActionSandboxPolicy};
 use sinomo_agent::{BoundedContextBuilder, InteractiveAgent};
+use sinomo_api::ApiService;
 use sinomo_audio::AudioPerceptionWorker;
 use sinomo_core::{
     ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
@@ -7,8 +9,8 @@ use sinomo_core::{
     EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob, EvolutionJobId,
     EvolutionJobStatus, EvolutionScope, LatencyClass, MetricValue, ModuleId, ModuleManifest,
     NodeCapability, PrivacyClass, RolloutPlan, RolloutPlanId, RolloutStrategy, RoutingHint,
-    RoutingMetadata, RoutingScope, Salience, ScorecardId, SessionId, Source, SyncPolicy, TrustRing,
-    WorkspaceId,
+    RoutingMetadata, RoutingScope, Salience, ScorecardId, SessionId, Source, SyncPolicy, TaskId,
+    TrustRing, WorkspaceId,
 };
 use sinomo_deliberation::{
     DeliberationJobRecord, DeliberationQueue, DeliberationWorker, WorkspaceSnapshot,
@@ -29,6 +31,7 @@ use sinomo_registry::{ArtifactRegistry, RegistryEntry, RegistryStatus};
 use sinomo_sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncRegistry};
 use sinomo_trigger::RuleBasedTrigger;
 use sinomo_video::VideoPerceptionWorker;
+use sinomo_voice::{SpeechOutputRequest, VoiceOutputService};
 use time::OffsetDateTime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,11 +39,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let evolution_capability = CapabilityName::new("evolution.job.scoped")?;
     let module_loader_capability = CapabilityName::new("module.loader.local")?;
     let registry_capability = CapabilityName::new("registry.artifact.durable")?;
+    let action_capability = CapabilityName::new("action.desktop.local")?;
+    let voice_capability = CapabilityName::new("voice.output.local")?;
+    let api_capability = CapabilityName::new("api.operator.local")?;
 
     let mut workstation = NodeProfile::local("local workstation")?
         .with_capability(NodeCapability::new(event_service_capability.clone()))
         .with_capability(NodeCapability::new(evolution_capability))
         .with_capability(NodeCapability::new(module_loader_capability.clone()))
+        .with_capability(NodeCapability::new(action_capability.clone()))
+        .with_capability(NodeCapability::new(voice_capability.clone()))
+        .with_capability(NodeCapability::new(api_capability.clone()))
         .with_service(HostedService::new(event_service_capability));
     workstation.node_id = sinomo_core::NodeId::new("node_desktop")?;
 
@@ -67,7 +76,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_capability(DeviceCapability::new(CapabilityName::new(
             "input.video.screen_ocr",
         )?))
-        .with_permission(DevicePermission::Observe);
+        .with_permission(DevicePermission::Observe)
+        .with_permission(DevicePermission::ExecuteAction);
+    let speaker = DeviceProfile::new(
+        workstation.node_id.clone(),
+        "local speaker",
+        sinomo_device::DeviceKind::Speaker,
+    )
+    .with_capability(DeviceCapability::new(CapabilityName::new(
+        "voice.output.synthetic",
+    )?))
+    .with_permission(DevicePermission::EmitOutput);
 
     let session_id = SessionId::generate();
     let mut sync_registry = SyncRegistry::new();
@@ -78,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             workspace_device.device_id.clone(),
             microphone.device_id.clone(),
             screen.device_id.clone(),
+            speaker.device_id.clone(),
         ],
         role: ParticipantRole::Origin,
         joined_at: OffsetDateTime::now_utc(),
@@ -251,6 +271,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .and_then(|request| request.target_node_id.clone());
     let agent_trace_receipt = store.append(turn.trace_event.clone())?;
+    let action_executor = ActionExecutor::new(
+        ActionSandboxPolicy::local(workstation.node_id.clone()).allow_kind("ui.inspect.alert"),
+    )
+    .with_device(screen.clone());
+    let action_record = turn
+        .action_request
+        .clone()
+        .map(|request| {
+            let record = action_executor.execute(request);
+            let event = action_executor.execution_event(&record, Some(context.session_id.clone()));
+            store.append(event)?;
+            Ok::<_, sinomo_events::EventStoreError>(record)
+        })
+        .transpose()?;
+    let mut voice =
+        VoiceOutputService::new(workstation.node_id.clone()).with_speaker(speaker.clone());
+    let voice_record = voice.speak(SpeechOutputRequest {
+        request_id: TaskId::generate(),
+        origin_node_id: workstation.node_id.clone(),
+        target_node_id: workstation.node_id.clone(),
+        target_device_id: speaker.device_id.clone(),
+        session_id: Some(context.session_id.clone()),
+        text: turn.response.text.clone(),
+        allow_barge_in: true,
+    });
+    store.append(voice.output_event(&voice_record))?;
 
     let mut memory = MemoryManager::new(MemoryPolicy {
         hot_event_limit: 16,
@@ -366,6 +412,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             policy_decision,
             rollout_plan,
         })?;
+    let api = ApiService::new(workstation.node_id.clone());
+    let health = api.health(&[workstation.clone(), home_server.clone()]);
+    let api_replay = api.replay(
+        &store,
+        ReplayQuery::by_session(stored_event.event.session_id.clone().expect("session id"))
+            .limit(5),
+    )?;
+    let supervision_snapshot = api.supervision_snapshot(&store)?;
 
     println!(
         "sinomo-app: appended {} sequence={} kind=evolution.job.scoped",
@@ -385,14 +439,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         trigger_decision.action, turn.response.text, action_target
     );
     println!(
+        "sinomo-app: action status={:?}; voice status={:?}; api health={:?}; api replay={}",
+        action_record.as_ref().map(|record| record.status.clone()),
+        voice_record.status,
+        health.status,
+        api_replay.len()
+    );
+    println!(
         "sinomo-app: hot memory={} warm memory={} deliberation completed={}",
         memory.hot().len(),
         memory.warm().entries().len(),
         deliberation_queue.completed().len()
     );
     println!(
-        "sinomo-app: dfs write route={:?}; loader action={:?}",
-        write_route.action, load_decision.action
+        "sinomo-app: dfs write route={:?}; loader action={:?}; incidents={}",
+        write_route.action,
+        load_decision.action,
+        supervision_snapshot.incidents.len()
     );
 
     Ok(())
