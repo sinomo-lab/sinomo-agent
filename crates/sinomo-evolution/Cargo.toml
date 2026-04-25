@@ -1,0 +1,15 @@
+[package]
+name = "sinomo-evolution"
+version.workspace = true
+description = "Sinomo autonomous self-evolution job planner skeleton"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+sinomo-core = { path = "../sinomo-core" }

@@ -1,7 +1,10 @@
 //! Artifact registry metadata skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{ArtifactId, ArtifactManifest, ModuleId, PolicyDecision, RolloutPlan};
+use sinomo_core::{
+    ArtifactId, ArtifactManifest, EvaluationScorecard, EvolutionJobId, ModuleId, PolicyDecision,
+    RolloutPlan,
+};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -13,6 +16,19 @@ pub struct RegistryEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_plan: Option<RolloutPlan>,
     pub status: RegistryStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    pub registered_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CandidateRecord {
+    pub artifact: ArtifactManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_job_id: Option<EvolutionJobId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorecard: Option<EvaluationScorecard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub registered_at: OffsetDateTime,
 }
@@ -30,6 +46,7 @@ pub enum RegistryStatus {
 
 #[derive(Clone, Debug, Default)]
 pub struct ArtifactRegistry {
+    candidate_records: BTreeMap<ArtifactId, CandidateRecord>,
     entries: BTreeMap<ArtifactId, RegistryEntry>,
     latest_by_module: BTreeMap<ModuleId, ArtifactId>,
 }
@@ -59,6 +76,19 @@ impl ArtifactRegistry {
         Ok(())
     }
 
+    pub fn register_candidate(&mut self, record: CandidateRecord) -> Result<(), RegistryError> {
+        let artifact_id = record.artifact.artifact_id.clone();
+        if self.candidate_records.contains_key(&artifact_id) {
+            return Err(RegistryError::DuplicateCandidate { artifact_id });
+        }
+        self.candidate_records.insert(artifact_id, record);
+        Ok(())
+    }
+
+    pub fn candidate(&self, artifact_id: &ArtifactId) -> Option<&CandidateRecord> {
+        self.candidate_records.get(artifact_id)
+    }
+
     pub fn entry(&self, artifact_id: &ArtifactId) -> Option<&RegistryEntry> {
         self.entries.get(artifact_id)
     }
@@ -74,6 +104,8 @@ impl ArtifactRegistry {
 pub enum RegistryError {
     #[error("duplicate artifact: {artifact_id}")]
     DuplicateArtifact { artifact_id: ArtifactId },
+    #[error("duplicate candidate artifact: {artifact_id}")]
+    DuplicateCandidate { artifact_id: ArtifactId },
 }
 
 #[cfg(test)]
@@ -110,12 +142,21 @@ mod tests {
 
         let mut registry = ArtifactRegistry::new();
         registry
+            .register_candidate(CandidateRecord {
+                artifact: artifact.clone(),
+                source_job_id: Some(EvolutionJobId::new("evojob_candidate").expect("job")),
+                scorecard: None,
+                evidence_refs: vec!["sandbox://run/local".to_string()],
+                registered_at: OffsetDateTime::now_utc(),
+            })
+            .expect("candidate");
+        registry
             .register(RegistryEntry {
                 artifact,
                 policy_decision: PolicyDecision {
                     decision_id: PolicyDecisionId::new("policy_ok").expect("policy"),
                     target_ring: TrustRing::R3SandboxedModule,
-                    target_artifact_id: artifact_id,
+                    target_artifact_id: artifact_id.clone(),
                     action: PolicyAction::Allow,
                     capability_diff: CapabilityDiff::default(),
                     required_additional_evals: Vec::new(),
@@ -129,5 +170,6 @@ mod tests {
             .expect("register");
 
         assert!(registry.latest_for_module(&module_id).is_some());
+        assert!(registry.candidate(&artifact_id).is_some());
     }
 }

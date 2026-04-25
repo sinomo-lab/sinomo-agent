@@ -4,13 +4,9 @@ use sinomo_api::ApiService;
 use sinomo_audio::AudioPerceptionWorker;
 use sinomo_core::{
     ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
-    CapabilityName, Confidence, DeviceCapability, DfsObjectId, DfsObjectPolicy, DfsVersion,
-    DfsWriteRequest, EvaluationGate, EvaluationGateResult, EvaluationMetric, EvaluationOutcome,
-    EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob, EvolutionJobId,
-    EvolutionJobStatus, EvolutionScope, LatencyClass, MetricValue, ModuleId, ModuleManifest,
-    NodeCapability, PrivacyClass, RolloutPlan, RolloutPlanId, RolloutStrategy, RoutingHint,
-    RoutingMetadata, RoutingScope, Salience, ScorecardId, SessionId, Source, SyncPolicy, TaskId,
-    TrustRing, WorkspaceId,
+    CapabilityName, DeviceCapability, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteRequest,
+    EvaluationGate, ModuleId, ModuleManifest, ModuleResourceLimits, NodeCapability, RolloutPlan,
+    RolloutPlanId, RolloutStrategy, SessionId, SyncPolicy, TaskId, TrustRing, WorkspaceId,
 };
 use sinomo_deliberation::{
     DeliberationJobRecord, DeliberationQueue, DeliberationWorker, WorkspaceSnapshot,
@@ -19,7 +15,11 @@ use sinomo_device::{DevicePermission, DeviceProfile};
 use sinomo_dfs::{
     DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, MountKind, Workspace, WorkspaceMount,
 };
+use sinomo_eval::{
+    CommandEvaluationSpec, CommandEvaluationSuite, LocalEvalHarness, ReplayFixtureRef,
+};
 use sinomo_events::{EventSequence, EventStore, InMemoryEventStore, ReplayQuery, StoredEvent};
+use sinomo_evolution::{EvolutionOpportunity, EvolutionPlanner};
 use sinomo_fusion::FusionWorker;
 use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
 use sinomo_memory::{MemoryManager, MemoryPolicy};
@@ -27,7 +27,9 @@ use sinomo_module::{LoadRequest, ModuleLoader};
 use sinomo_network::{InProcessRouter, PeerRegistry};
 use sinomo_node::{HostedService, NodeProfile};
 use sinomo_policy::{PolicyEngine, PolicyInput};
-use sinomo_registry::{ArtifactRegistry, RegistryEntry, RegistryStatus};
+use sinomo_registry::{ArtifactRegistry, CandidateRecord, RegistryEntry, RegistryStatus};
+use sinomo_rollout::{RolloutController, RolloutObservation};
+use sinomo_sandbox::{SandboxCommand, SandboxHarness, SandboxRunRequest, SandboxWorkspaceSnapshot};
 use sinomo_sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncRegistry};
 use sinomo_trigger::RuleBasedTrigger;
 use sinomo_video::VideoPerceptionWorker;
@@ -140,22 +142,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module_id = ModuleId::new("module.trigger.silence_policy")?;
     let module_manifest = ModuleManifest::r3_wasm(module_id.clone(), "0.3.7", "sinomo-trigger");
     let candidate_artifact_id = ArtifactId::generate();
-    let scorecard = EvaluationScorecard {
-        scorecard_id: ScorecardId::generate(),
+    let planner = EvolutionPlanner::new(workstation.node_id.clone());
+    let (evolution_job, candidate_workspace) = planner.scope_job(EvolutionOpportunity {
+        observed_event_id: None,
+        target_ring: TrustRing::R3SandboxedModule,
+        target_module_id: Some(module_id.clone()),
+        objective: "Reduce false positive interruptions during low-salience screen changes"
+            .to_string(),
+        workspace_id: workspace_id.clone(),
+        allowed_paths: vec![
+            "crates/sinomo-trigger/**".to_string(),
+            "modules/trigger/**".to_string(),
+        ],
+        forbidden_paths: vec![
+            "crates/sinomo-core/**".to_string(),
+            "docs/security/**".to_string(),
+        ],
+        priority: 0.86,
+    });
+    let sandbox = SandboxHarness::new(workstation.node_id.clone());
+    let sandbox_result = sandbox.run(SandboxRunRequest {
+        job: evolution_job.clone(),
+        candidate_artifact_id: candidate_artifact_id.clone(),
+        workspace_snapshot: SandboxWorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            object_ids: vec![candidate_object_id.clone()],
+            source_event_id: None,
+        },
+        limits: ModuleResourceLimits::default(),
+        commands: vec![SandboxCommand {
+            name: "trigger replay unit tests".to_string(),
+            command: "cargo test -p sinomo-trigger".to_string(),
+            expected_exit_code: 0,
+            observed_exit_code: 0,
+        }],
+    });
+    let eval_harness = LocalEvalHarness::new(home_server.node_id.clone());
+    let scorecard = eval_harness.run(CommandEvaluationSuite {
+        candidate_artifact_id: candidate_artifact_id.clone(),
         baseline_artifact_id: None,
-        candidate_artifact_id: Some(candidate_artifact_id.clone()),
-        outcome: EvaluationOutcome::Passed,
-        gates: vec![EvaluationGateResult {
-            gate: EvaluationGate::ManifestValidation,
-            outcome: EvaluationOutcome::Passed,
-            summary: "candidate manifest is compatible with R3 sandbox constraints".to_string(),
-        }],
-        metrics: vec![EvaluationMetric {
-            name: "latency_p95_ms".to_string(),
-            value: MetricValue::Integer(41),
-            sample_count: Some(120),
-        }],
-    };
+        specs: vec![
+            CommandEvaluationSpec {
+                gate: EvaluationGate::ManifestValidation,
+                command: "validate module manifest".to_string(),
+                expected_exit_code: 0,
+                observed_exit_code: 0,
+                replay_fixtures: Vec::new(),
+                log_excerpt: Some("manifest compatible with R3 sandbox constraints".to_string()),
+            },
+            CommandEvaluationSpec {
+                gate: EvaluationGate::ReplayTests,
+                command: "cargo test -p sinomo-trigger".to_string(),
+                expected_exit_code: 0,
+                observed_exit_code: 0,
+                replay_fixtures: vec![ReplayFixtureRef {
+                    name: "low salience alert replay".to_string(),
+                    fixture_uri: "fixtures/replay/low-salience-alert.jsonl".to_string(),
+                    query: ReplayQuery::by_session(session_id.clone()),
+                }],
+                log_excerpt: Some("trigger replay passed".to_string()),
+            },
+        ],
+    })?;
     let rollout_plan = RolloutPlan {
         rollout_plan_id: RolloutPlanId::generate(),
         artifact_id: candidate_artifact_id.clone(),
@@ -167,58 +215,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         promotion_steps_bps: vec![500, 2_500, 10_000],
         rollback_policy: module_manifest.rollout.rollback_policy.clone(),
     };
-    let evolution_job = EvolutionJob {
-        job_id: EvolutionJobId::generate(),
-        target_ring: TrustRing::R3SandboxedModule,
-        target_module_id: Some(module_id.clone()),
-        objective: "Reduce false positive interruptions during low-salience screen changes"
-            .to_string(),
-        scope: EvolutionScope {
-            allowed_paths: vec![
-                "crates/sinomo-trigger/**".to_string(),
-                "modules/trigger/**".to_string(),
-            ],
-            forbidden_paths: vec![
-                "crates/sinomo-core/**".to_string(),
-                "docs/security/**".to_string(),
-            ],
-            workspace_id: Some(workspace_id.clone()),
-        },
-        status: EvolutionJobStatus::Scoped,
-        required_gates: vec![
-            EvaluationGate::ManifestValidation,
-            EvaluationGate::ReplayTests,
-        ],
-        rollback_policy: rollout_plan.rollback_policy.clone(),
-    };
 
-    let event = EventEnvelope::new(
-        EventId::generate(),
-        OffsetDateTime::now_utc(),
-        workstation.node_id.clone(),
-        Source::new("evolution.local.orchestrator")?,
-        EventKind::new("evolution.job.scoped")?,
-        Salience::new(0.86)?,
-        Confidence::new(0.97)?,
-        RoutingMetadata::new(
-            RoutingScope::Session,
-            LatencyClass::Background,
-            PrivacyClass::Derived,
-        )
-        .with_hint(RoutingHint::new("target:ring:r3")?)
-        .with_hint(RoutingHint::new("requires:replay-eval")?),
-    )
-    .with_origin_device(workspace_device.device_id.clone())
-    .with_session(session_id.clone())
-    .with_payload(serde_json::json!({
-        "job": evolution_job,
-        "module_manifest": module_manifest,
-        "scorecard": scorecard,
-        "rollout_plan": rollout_plan
-    }));
+    let event = planner
+        .job_event(&evolution_job, &candidate_workspace)
+        .with_origin_device(workspace_device.device_id.clone())
+        .with_session(session_id.clone())
+        .with_payload(serde_json::json!({
+            "job": evolution_job,
+            "candidate_workspace": candidate_workspace,
+            "module_manifest": module_manifest,
+            "sandbox_result": sandbox_result,
+            "scorecard": scorecard,
+            "rollout_plan": rollout_plan
+        }));
 
     let mut store = InMemoryEventStore::new();
     let receipt = store.append(event)?;
+    store.append(sandbox.result_event(&sandbox_result))?;
+    store.append(eval_harness.scorecard_event(Some(evolution_job.job_id.clone()), &scorecard))?;
     let mut audio_adapter = SyntheticInputAdapter::audio_transcript(
         &microphone,
         stored_session(&store, &receipt)?,
@@ -397,6 +411,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut registry = ArtifactRegistry::new();
+    registry.register_candidate(CandidateRecord {
+        artifact: artifact.clone(),
+        source_job_id: Some(evolution_job.job_id.clone()),
+        scorecard: Some(scorecard.clone()),
+        evidence_refs: vec![format!("sandbox:{:?}", sandbox_result.status)],
+        registered_at: OffsetDateTime::now_utc(),
+    })?;
     registry.register(RegistryEntry {
         artifact: artifact.clone(),
         policy_decision: policy_decision.clone(),
@@ -410,8 +431,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_id: workstation.node_id.clone(),
             artifact,
             policy_decision,
-            rollout_plan,
+            rollout_plan: rollout_plan.clone(),
         })?;
+    let rollout_controller = RolloutController::new(workstation.node_id.clone());
+    let rollout_state = rollout_controller.initial_state(
+        rollout_plan.clone(),
+        ArtifactId::new("artifact_active_trigger").expect("artifact"),
+    );
+    let rollout_decision = rollout_controller.advance(
+        rollout_state,
+        RolloutObservation {
+            scorecard: Some(scorecard.clone()),
+            incident_event_ids: Vec::new(),
+            user_correction_count: 0,
+        },
+    );
+    store.append(rollout_controller.decision_event(&rollout_decision))?;
     let api = ApiService::new(workstation.node_id.clone());
     let health = api.health(&[workstation.clone(), home_server.clone()]);
     let api_replay = api.replay(
@@ -452,9 +487,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         deliberation_queue.completed().len()
     );
     println!(
-        "sinomo-app: dfs write route={:?}; loader action={:?}; incidents={}",
+        "sinomo-app: dfs write route={:?}; loader action={:?}; rollout={:?}; incidents={}",
         write_route.action,
         load_decision.action,
+        rollout_decision.action,
         supervision_snapshot.incidents.len()
     );
 
@@ -467,7 +503,8 @@ fn stored_session(
 ) -> Result<SessionId, Box<dyn std::error::Error>> {
     let event = store
         .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))?
-        .pop()
+        .into_iter()
+        .find(|stored| stored.sequence == receipt.sequence)
         .expect("stored event");
     Ok(event
         .event

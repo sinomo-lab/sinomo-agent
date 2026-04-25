@@ -1,0 +1,15 @@
+[package]
+name = "sinomo-rollout"
+version.workspace = true
+description = "Sinomo rollout advancement and rollback skeleton"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+sinomo-core = { path = "../sinomo-core" }

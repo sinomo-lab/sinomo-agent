@@ -255,7 +255,9 @@ dependencies = [
  "sinomo-deliberation",
  "sinomo-device",
  "sinomo-dfs",
+ "sinomo-eval",
  "sinomo-events",
+ "sinomo-evolution",
  "sinomo-fusion",
  "sinomo-gateway",
  "sinomo-memory",
@@ -264,6 +266,8 @@ dependencies = [
  "sinomo-node",
  "sinomo-policy",
  "sinomo-registry",
+ "sinomo-rollout",
+ "sinomo-sandbox",
  "sinomo-supervision",
  "sinomo-sync",
  "sinomo-trigger",
@@ -329,12 +333,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-eval"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-events",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "sinomo-events"
 version = "0.1.0"
 dependencies = [
  "serde",
  "sinomo-core",
  "thiserror",
+ "time",
+]
+
+[[package]]
+name = "sinomo-evolution"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
  "time",
 ]
 
@@ -414,6 +440,27 @@ dependencies = [
 
 [[package]]
 name = "sinomo-registry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "sinomo-rollout"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "time",
+]
+
+[[package]]
+name = "sinomo-sandbox"
 version = "0.1.0"
 dependencies = [
  "serde",

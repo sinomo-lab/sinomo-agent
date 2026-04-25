@@ -19,7 +19,9 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-audio = { path = "../sinomo-audio" }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-eval = { path = "../sinomo-eval" }
 sinomo-events = { path = "../sinomo-events" }
+sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-fusion = { path = "../sinomo-fusion" }
 sinomo-gateway = { path = "../sinomo-gateway" }
 sinomo-deliberation = { path = "../sinomo-deliberation" }
@@ -29,6 +31,8 @@ sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
+sinomo-rollout = { path = "../sinomo-rollout" }
+sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-supervision = { path = "../sinomo-supervision" }
 sinomo-sync = { path = "../sinomo-sync" }
 sinomo-trigger = { path = "../sinomo-trigger" }
