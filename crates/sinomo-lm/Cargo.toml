@@ -12,4 +12,5 @@ include = ["**/*.rs", "Cargo.toml"]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
+sinomo-local = { path = "../sinomo-local" }
 thiserror.workspace = true

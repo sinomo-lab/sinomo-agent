@@ -11,4 +11,5 @@ include = ["**/*.rs", "Cargo.toml"]
 
 
 [dependencies]
+sinomo-cli = { path = "../sinomo-cli" }
 

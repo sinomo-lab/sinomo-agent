@@ -1,0 +1,13 @@
+[package]
+name = "sinomo-cli"
+version.workspace = true
+description = "Shared Sinomo command-line handlers"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+sinomo-lm = { path = "../sinomo-lm" }
+sinomo-local = { path = "../sinomo-local" }

@@ -3,6 +3,7 @@
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
+use sinomo_local::SinomoDataDir;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -243,7 +244,7 @@ impl Default for GitHubCopilotConfig {
             github_host: "github.com".to_string(),
             api_base_url: "https://api.githubcopilot.com".to_string(),
             default_model: "gpt-5.4".to_string(),
-            token_store_path: default_copilot_token_store_path(),
+            token_store_path: default_copilot_credentials_path(),
         }
     }
 }
@@ -271,6 +272,10 @@ impl GitHubCopilotProvider {
         self
     }
 
+    pub fn credentials_path(&self) -> Option<PathBuf> {
+        self.config.token_store_path.clone()
+    }
+
     pub fn device_login_start(&self) -> Result<GitHubDeviceCode, LanguageModelError> {
         let url = format!(
             "https://{}/login/device/code",
@@ -280,10 +285,7 @@ impl GitHubCopilotProvider {
             .http
             .post(url)
             .headers(github_oauth_headers())
-            .form(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("scope", "read:user"),
-            ])
+            .query(&[("client_id", self.config.client_id.as_str())])
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -292,10 +294,12 @@ impl GitHubCopilotProvider {
             })?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model: self.config.default_model.clone(),
-                detail: format!("device login start failed: HTTP {}", response.status()),
+                detail: format!("device login start failed: HTTP {status}: {body}"),
             });
         }
 
@@ -320,7 +324,7 @@ impl GitHubCopilotProvider {
             .http
             .post(url)
             .headers(github_oauth_headers())
-            .form(&[
+            .query(&[
                 ("client_id", self.config.client_id.as_str()),
                 ("device_code", device_code),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
@@ -333,10 +337,12 @@ impl GitHubCopilotProvider {
             })?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model: self.config.default_model.clone(),
-                detail: format!("device login poll failed: HTTP {}", response.status()),
+                detail: format!("device login poll failed: HTTP {status}: {body}"),
             });
         }
 
@@ -356,6 +362,11 @@ impl GitHubCopilotProvider {
     }
 
     pub fn github_token(&self) -> Result<String, LanguageModelError> {
+        if let Some(stored) = self.load_stored_github_token()? {
+            validate_github_copilot_token(&stored.github_token)?;
+            return Ok(stored.github_token);
+        }
+
         for env_var in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
             if let Ok(token) = std::env::var(env_var) {
                 let token = token.trim();
@@ -364,11 +375,6 @@ impl GitHubCopilotProvider {
                     return Ok(token.to_string());
                 }
             }
-        }
-
-        if let Some(stored) = self.load_stored_github_token()? {
-            validate_github_copilot_token(&stored.github_token)?;
-            return Ok(stored.github_token);
         }
 
         Err(LanguageModelError::AuthenticationRequired {
@@ -406,54 +412,53 @@ impl GitHubCopilotProvider {
         } else {
             format!("api.{}", self.config.github_host.trim_end_matches('/'))
         };
-        let url = format!("https://{api_host}/copilot_internal/v2/token");
+        let urls = [
+            format!("https://{api_host}/copilot_internal/user"),
+            format!("https://{api_host}/copilot_internal/v2/token"),
+        ];
+        let mut errors = Vec::new();
+        for url in urls {
+            match self.try_copilot_token_endpoint(&url, github_token) {
+                Ok(token) => return Ok(token),
+                Err(error) => errors.push(error),
+            }
+        }
+        Err(LanguageModelError::ProviderInvocationFailed {
+            provider: Self::PROVIDER_ID.to_string(),
+            model: self.config.default_model.clone(),
+            detail: format!(
+                "Copilot token exchange failed across known endpoints: {}",
+                errors.join("; ")
+            ),
+        })
+    }
+
+    fn try_copilot_token_endpoint(
+        &self,
+        url: &str,
+        github_token: &str,
+    ) -> Result<CopilotApiToken, String> {
         let response = self
             .http
             .get(url)
-            .headers(copilot_exchange_headers(github_token)?)
+            .headers(copilot_exchange_headers(github_token).map_err(|source| source.to_string())?)
             .send()
-            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
-                provider: Self::PROVIDER_ID.to_string(),
-                model: self.config.default_model.clone(),
-                detail: source.to_string(),
-            })?;
+            .map_err(|source| source.to_string())?;
 
         if !response.status().is_success() {
-            return Err(LanguageModelError::ProviderInvocationFailed {
-                provider: Self::PROVIDER_ID.to_string(),
-                model: self.config.default_model.clone(),
-                detail: format!("Copilot token exchange failed: HTTP {}", response.status()),
-            });
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(format!(
+                "{url}: {}",
+                copilot_token_exchange_error_detail(status.as_u16(), &body)
+            ));
         }
 
-        let value = response.json::<serde_json::Value>().map_err(|source| {
-            LanguageModelError::ProviderInvocationFailed {
-                provider: Self::PROVIDER_ID.to_string(),
-                model: self.config.default_model.clone(),
-                detail: source.to_string(),
-            }
-        })?;
-        let token = value
-            .get("token")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| LanguageModelError::ProviderInvocationFailed {
-                provider: Self::PROVIDER_ID.to_string(),
-                model: self.config.default_model.clone(),
-                detail: "Copilot token exchange response did not include token".to_string(),
-            })?;
-        let expires_at = value
-            .get("expires_at")
-            .and_then(|expires| {
-                expires
-                    .as_u64()
-                    .or_else(|| expires.as_str().and_then(|value| value.parse().ok()))
-            })
-            .unwrap_or_else(|| unix_timestamp() + 25 * 60);
-
-        Ok(CopilotApiToken {
-            token: token.to_string(),
-            expires_at,
-        })
+        let value = response
+            .json::<serde_json::Value>()
+            .map_err(|source| format!("{url}: {source}"))?;
+        parse_copilot_api_token(&value)
+            .ok_or_else(|| format!("{url}: response did not include a Copilot API token"))
     }
 
     fn load_stored_github_token(&self) -> Result<Option<StoredGitHubToken>, LanguageModelError> {
@@ -543,10 +548,12 @@ impl LanguageModelProvider for GitHubCopilotProvider {
             })?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
-                detail: format!("Copilot chat completion failed: HTTP {}", response.status()),
+                detail: format!("Copilot chat completion failed: HTTP {status}: {body}"),
             });
         }
 
@@ -620,7 +627,7 @@ struct CopilotApiToken {
     expires_at: u64,
 }
 
-pub const GITHUB_COPILOT_CLIENT_ID: &str = "Iv23liAaGk4lDKhjBaPE";
+pub const GITHUB_COPILOT_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubCopilotCliConfig {
@@ -844,18 +851,56 @@ fn validate_github_copilot_token(token: &str) -> Result<(), LanguageModelError> 
     Ok(())
 }
 
-fn default_copilot_token_store_path() -> Option<PathBuf> {
+fn copilot_token_exchange_error_detail(status: u16, body: &str) -> String {
+    let base = format!("Copilot token exchange failed: HTTP {status}: {body}");
+    if status == 403 && body.contains("Resource not accessible by integration") {
+        format!(
+            "{base}; this usually means the stored GitHub token came from a GitHub App integration \
+             rather than a Copilot-compatible OAuth/device flow. Re-run `sinomo providers \
+             github-copilot auth` after removing the existing credentials file, or use a \
+             fine-grained PAT with Copilot Requests permission."
+        )
+    } else {
+        base
+    }
+}
+
+fn parse_copilot_api_token(value: &serde_json::Value) -> Option<CopilotApiToken> {
+    let token = value
+        .get("token")
+        .or_else(|| value.get("access_token"))
+        .or_else(|| value.pointer("/copilot/token"))
+        .and_then(serde_json::Value::as_str)?;
+    let expires_at = value
+        .get("expires_at")
+        .or_else(|| value.pointer("/copilot/expires_at"))
+        .and_then(|expires| {
+            expires
+                .as_u64()
+                .or_else(|| expires.as_str().and_then(|value| value.parse().ok()))
+        })
+        .or_else(|| {
+            value
+                .get("expires_in")
+                .or_else(|| value.pointer("/copilot/expires_in"))
+                .and_then(serde_json::Value::as_u64)
+                .map(|expires_in| unix_timestamp() + expires_in)
+        })
+        .unwrap_or_else(|| unix_timestamp() + 25 * 60);
+
+    Some(CopilotApiToken {
+        token: token.to_string(),
+        expires_at,
+    })
+}
+
+fn default_copilot_credentials_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SINOMO_COPILOT_TOKEN_FILE") {
         return Some(PathBuf::from(path));
     }
-    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        return Some(
-            PathBuf::from(home)
-                .join(".sinomo")
-                .join("github-copilot.json"),
-        );
-    }
-    None
+    SinomoDataDir::from_env_or_home()
+        .ok()
+        .map(|data| data.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID))
 }
 
 fn unix_timestamp() -> u64 {
@@ -989,6 +1034,20 @@ mod tests {
         assert_eq!(payload["stream"], false);
         assert_eq!(payload["response_format"]["type"], "json_object");
         assert_eq!(payload["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn copilot_token_parser_accepts_common_shapes() {
+        for value in [
+            serde_json::json!({ "token": "copilot-token", "expires_at": 1234 }),
+            serde_json::json!({ "access_token": "copilot-token", "expires_in": 60 }),
+            serde_json::json!({ "copilot": { "token": "copilot-token", "expires_at": "1234" } }),
+        ] {
+            let token = parse_copilot_api_token(&value).expect("token");
+            assert_eq!(token.token, "copilot-token");
+        }
+
+        assert!(parse_copilot_api_token(&serde_json::json!({ "id": 1 })).is_none());
     }
 
     #[test]

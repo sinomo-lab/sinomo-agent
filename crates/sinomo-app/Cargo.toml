@@ -12,6 +12,7 @@ include = ["**/*.rs", "Cargo.toml"]
 serde_json.workspace = true
 time.workspace = true
 tracing.workspace = true
+sinomo-cli = { path = "../sinomo-cli" }
 sinomo-actions = { path = "../sinomo-actions" }
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-api = { path = "../sinomo-api" }

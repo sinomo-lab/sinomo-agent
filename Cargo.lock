@@ -769,6 +769,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "sinomo"
 version = "0.1.0"
+dependencies = [
+ "sinomo-cli",
+]
 
 [[package]]
 name = "sinomo-actions"
@@ -818,6 +821,7 @@ dependencies = [
  "sinomo-agent",
  "sinomo-api",
  "sinomo-audio",
+ "sinomo-cli",
  "sinomo-core",
  "sinomo-deliberation",
  "sinomo-device",
@@ -853,6 +857,14 @@ dependencies = [
  "sinomo-core",
  "sinomo-device",
  "sinomo-gateway",
+]
+
+[[package]]
+name = "sinomo-cli"
+version = "0.1.0"
+dependencies = [
+ "sinomo-lm",
+ "sinomo-local",
 ]
 
 [[package]]
@@ -961,6 +973,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sinomo-local",
+ "thiserror",
+]
+
+[[package]]
+name = "sinomo-local"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

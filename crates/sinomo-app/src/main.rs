@@ -42,6 +42,12 @@ use std::env;
 use time::OffsetDateTime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if !args.is_empty() {
+        sinomo_cli::run(args)?;
+        return Ok(());
+    }
+
     let event_service_capability = CapabilityName::new("service.events.local")?;
     let evolution_capability = CapabilityName::new("evolution.job.scoped")?;
     let module_loader_capability = CapabilityName::new("module.loader.local")?;

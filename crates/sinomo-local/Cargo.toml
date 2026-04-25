@@ -1,0 +1,12 @@
+[package]
+name = "sinomo-local"
+version.workspace = true
+description = "Sinomo local data directory and filesystem layout"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+thiserror.workspace = true
