@@ -59,7 +59,7 @@ impl AnthropicProvider {
                 "CLAUDE_API_KEY",
                 "SINOMO_CLAUDE_API_KEY",
             ],
-            "no Anthropic API key found; set ANTHROPIC_API_KEY or run `sinomo providers anthropic auth`",
+            "no Anthropic API key found; set ANTHROPIC_API_KEY or run `sinomo providers auth anthropic`",
         )
     }
 

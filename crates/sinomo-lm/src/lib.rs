@@ -2,9 +2,23 @@
 
 mod anthropic;
 mod api_key;
+mod claude_code;
+mod codex_cli;
+mod gemini;
 mod openai;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
+pub use claude_code::{
+    CLAUDE_CODE_DEFAULT_MODEL, ClaudeCodeConfig, ClaudeCodeProvider, ClaudePermissionMode,
+};
+pub use codex_cli::{
+    CODEX_CLI_DEFAULT_MODEL, CodexCliConfig, CodexCliProvider, CodexColor, CodexSandboxMode,
+};
+pub use gemini::{GeminiConfig, GeminiProvider};
+#[cfg(test)]
+pub(crate) use gemini::{
+    extract_gemini_response_text, extract_gemini_usage, gemini_generate_content_payload,
+};
 pub use openai::{OpenAiConfig, OpenAiProvider};
 
 use reqwest::blocking::Client;
@@ -1026,6 +1040,133 @@ mod tests {
         let args = GitHubCopilotCliProvider::default().command_args(&request());
 
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn codex_cli_args_use_exec_harness_not_openai_api() {
+        let provider = CodexCliProvider::new(CodexCliConfig {
+            model: "gpt-5.3-codex".to_string(),
+            ..CodexCliConfig::default()
+        });
+
+        let args = provider.command_args(
+            &request(),
+            Some(std::path::Path::new("/tmp/codex-last.txt")),
+        );
+
+        assert_eq!(args[0], "exec");
+        assert!(args.iter().any(|arg| arg == "--full-auto"));
+        assert!(args.windows(2).any(|pair| pair == ["--color", "never"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "/tmp/codex-last.txt"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "gpt-5.3-codex"])
+        );
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn codex_provider_reports_process_coding_agent_capabilities() {
+        let info = CodexCliProvider::default().info();
+
+        assert_eq!(info.provider, CodexCliProvider::PROVIDER_ID);
+        assert_eq!(info.invocation, LanguageModelInvocation::Process);
+        assert!(!info.supports_json_object);
+        assert!(info.supports_tool_permissions);
+    }
+
+    #[test]
+    fn claude_code_args_use_print_mode_coding_agent_harness() {
+        let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
+            model: "claude-sonnet-4-6".to_string(),
+            ..ClaudeCodeConfig::default()
+        });
+
+        let args = provider.command_args(&request());
+
+        assert_eq!(args[0], "-p");
+        assert!(args[1].contains("system:\nReturn JSON only."));
+        assert!(args[1].contains("user:\nSummarize evt_1."));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--output-format", "text"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "auto"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--max-turns", "10"]));
+        assert!(args.iter().any(|arg| arg == "--no-session-persistence"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "claude-sonnet-4-6"])
+        );
+    }
+
+    #[test]
+    fn claude_code_provider_reports_process_coding_agent_capabilities() {
+        let info = ClaudeCodeProvider::default().info();
+
+        assert_eq!(info.provider, ClaudeCodeProvider::PROVIDER_ID);
+        assert_eq!(info.invocation, LanguageModelInvocation::Process);
+        assert!(!info.supports_json_object);
+        assert!(info.supports_tool_permissions);
+    }
+
+    #[test]
+    fn gemini_provider_reports_http_json_capabilities() {
+        let info = GeminiProvider::default().info();
+
+        assert_eq!(info.provider, GeminiProvider::PROVIDER_ID);
+        assert_eq!(info.invocation, LanguageModelInvocation::Http);
+        assert!(info.supports_json_object);
+        assert!(!info.supports_tool_permissions);
+    }
+
+    #[test]
+    fn gemini_payload_uses_generate_content_shape() {
+        let payload = gemini_generate_content_payload(&request(), "gemini-2.5-flash");
+
+        assert_eq!(
+            payload["systemInstruction"]["parts"][0]["text"],
+            "Return JSON only."
+        );
+        assert_eq!(payload["contents"][0]["role"], "user");
+        assert_eq!(
+            payload["contents"][0]["parts"][0]["text"],
+            "Summarize evt_1."
+        );
+        let temperature = payload["generationConfig"]["temperature"].as_f64().unwrap();
+        assert!((temperature - 0.2).abs() < 0.000001);
+        assert_eq!(payload["generationConfig"]["maxOutputTokens"], 200);
+        assert_eq!(
+            payload["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn gemini_text_extractor_reads_candidates_and_usage() {
+        let value = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "first" }, { "text": "second" }],
+                    "role": "model"
+                }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 7,
+                "totalTokenCount": 18
+            }
+        });
+
+        assert_eq!(extract_gemini_response_text(&value), "first\nsecond");
+        assert_eq!(extract_gemini_usage(&value).unwrap().input_tokens, Some(11));
+        assert_eq!(extract_gemini_usage(&value).unwrap().output_tokens, Some(7));
     }
 
     #[test]

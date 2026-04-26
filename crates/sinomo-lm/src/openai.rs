@@ -59,7 +59,7 @@ impl OpenAiProvider {
                 "CODEX_API_KEY",
                 "SINOMO_CODEX_API_KEY",
             ],
-            "no OpenAI API key found; set OPENAI_API_KEY or run `sinomo providers openai auth`",
+            "no OpenAI API key found; set OPENAI_API_KEY or run `sinomo providers auth openai`",
         )
     }
 

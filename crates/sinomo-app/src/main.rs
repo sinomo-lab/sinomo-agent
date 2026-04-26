@@ -23,9 +23,10 @@ use sinomo_evolution::{EvolutionOpportunity, EvolutionPlanner};
 use sinomo_fusion::FusionWorker;
 use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
 use sinomo_lm::{
-    AnthropicConfig, AnthropicProvider, CommandLanguageModelProvider, GitHubCopilotCliConfig,
-    GitHubCopilotCliProvider, GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelProvider,
-    OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL,
+    AnthropicConfig, AnthropicProvider, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig,
+    CodexCliProvider, CommandLanguageModelProvider, GeminiConfig, GeminiProvider,
+    GitHubCopilotCliConfig, GitHubCopilotCliProvider, GitHubCopilotConfig, GitHubCopilotProvider,
+    LanguageModelProvider, OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL,
 };
 use sinomo_memory::{MemoryManager, MemoryPolicy};
 use sinomo_module::{LoadRequest, ModuleLoader};
@@ -580,6 +581,62 @@ fn configured_deliberation_model()
         }));
     }
 
+    if provider == CodexCliProvider::PROVIDER_ID || provider == "openai-codex-cli" {
+        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
+            .unwrap_or_else(|_| PROVIDER_DEFAULT_MODEL.into());
+        let program = env::var("SINOMO_DELIBERATION_LM_PROGRAM")
+            .unwrap_or_else(|_| CodexCliConfig::default().program);
+        let extra_args: Vec<String> = match env::var("SINOMO_DELIBERATION_LM_ARGS_JSON") {
+            Ok(value) => serde_json::from_str(&value)?,
+            Err(_) => Vec::new(),
+        };
+        let config_model = if model == PROVIDER_DEFAULT_MODEL {
+            CodexCliConfig::default().model
+        } else {
+            model.clone()
+        };
+        let provider_client = CodexCliProvider::new(CodexCliConfig {
+            program,
+            model: config_model,
+            extra_args,
+            ..CodexCliConfig::default()
+        });
+
+        return Ok(Some(ConfiguredDeliberationModel {
+            provider_client: Box::new(provider_client),
+            provider: CodexCliProvider::PROVIDER_ID.to_string(),
+            model,
+        }));
+    }
+
+    if provider == ClaudeCodeProvider::PROVIDER_ID || provider == "anthropic-claude-code" {
+        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
+            .unwrap_or_else(|_| PROVIDER_DEFAULT_MODEL.into());
+        let program = env::var("SINOMO_DELIBERATION_LM_PROGRAM")
+            .unwrap_or_else(|_| ClaudeCodeConfig::default().program);
+        let extra_args: Vec<String> = match env::var("SINOMO_DELIBERATION_LM_ARGS_JSON") {
+            Ok(value) => serde_json::from_str(&value)?,
+            Err(_) => Vec::new(),
+        };
+        let config_model = if model == PROVIDER_DEFAULT_MODEL {
+            ClaudeCodeConfig::default().model
+        } else {
+            model.clone()
+        };
+        let provider_client = ClaudeCodeProvider::new(ClaudeCodeConfig {
+            program,
+            model: config_model,
+            extra_args,
+            ..ClaudeCodeConfig::default()
+        });
+
+        return Ok(Some(ConfiguredDeliberationModel {
+            provider_client: Box::new(provider_client),
+            provider: ClaudeCodeProvider::PROVIDER_ID.to_string(),
+            model,
+        }));
+    }
+
     if provider == AnthropicProvider::PROVIDER_ID || provider == "claude" {
         let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
             .unwrap_or_else(|_| AnthropicConfig::default().default_model);
@@ -599,7 +656,26 @@ fn configured_deliberation_model()
         }));
     }
 
-    if provider == OpenAiProvider::PROVIDER_ID || provider == "codex" {
+    if provider == GeminiProvider::PROVIDER_ID || provider == "google-gemini" {
+        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
+            .or_else(|_| env::var("SINOMO_GEMINI_MODEL"))
+            .unwrap_or_else(|_| GeminiConfig::default().default_model);
+        let api_base_url = env::var("SINOMO_GEMINI_API_BASE_URL")
+            .unwrap_or_else(|_| GeminiConfig::default().api_base_url);
+        let provider_client = GeminiProvider::new(GeminiConfig {
+            api_base_url,
+            default_model: model.clone(),
+            credentials_path: GeminiConfig::default().credentials_path,
+        });
+
+        return Ok(Some(ConfiguredDeliberationModel {
+            provider_client: Box::new(provider_client),
+            provider: GeminiProvider::PROVIDER_ID.to_string(),
+            model,
+        }));
+    }
+
+    if provider == OpenAiProvider::PROVIDER_ID || provider == "openai-api" {
         let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
             .unwrap_or_else(|_| OpenAiConfig::default().default_model);
         let api_base_url = env::var("SINOMO_OPENAI_API_BASE_URL")

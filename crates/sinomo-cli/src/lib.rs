@@ -1,8 +1,8 @@
 //! Shared Sinomo command-line handlers.
 
 use sinomo_lm::{
-    AnthropicConfig, AnthropicProvider, GitHubCopilotConfig, GitHubCopilotProvider,
-    LanguageModelError, OpenAiConfig, OpenAiProvider,
+    AnthropicConfig, AnthropicProvider, GeminiConfig, GeminiProvider, GitHubCopilotConfig,
+    GitHubCopilotProvider, LanguageModelError, OpenAiConfig, OpenAiProvider,
 };
 use sinomo_local::SinomoDataDir;
 use std::env;
@@ -12,37 +12,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
+    if let Some(command) = parse_provider_command(&args) {
+        return run_provider_command(command);
+    }
+
     match args.as_slice() {
-        [providers, github_copilot, auth]
-            if providers == "providers" && github_copilot == "github-copilot" && auth == "auth" =>
-        {
-            auth_github_copilot()
-        }
-        [providers, github_copilot, test]
-            if providers == "providers" && github_copilot == "github-copilot" && test == "test" =>
-        {
-            test_github_copilot()
-        }
-        [providers, anthropic, auth]
-            if providers == "providers" && anthropic == "anthropic" && auth == "auth" =>
-        {
-            auth_anthropic()
-        }
-        [providers, anthropic, test]
-            if providers == "providers" && anthropic == "anthropic" && test == "test" =>
-        {
-            test_anthropic()
-        }
-        [providers, openai, auth]
-            if providers == "providers" && openai == "openai" && auth == "auth" =>
-        {
-            auth_openai()
-        }
-        [providers, openai, test]
-            if providers == "providers" && openai == "openai" && test == "test" =>
-        {
-            test_openai()
-        }
         [help] if help == "help" || help == "--help" || help == "-h" => {
             print_usage();
             Ok(())
@@ -52,6 +26,56 @@ pub fn run(args: Vec<String>) -> Result<(), CliError> {
             Ok(())
         }
         _ => Err(CliError::Usage),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderName {
+    GitHubCopilot,
+    Anthropic,
+    OpenAi,
+    Gemini,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderCliCommand {
+    Auth(ProviderName),
+    Test(ProviderName),
+}
+
+fn parse_provider_command(args: &[String]) -> Option<ProviderCliCommand> {
+    let [providers, action, provider] = args else {
+        return None;
+    };
+    if providers != "providers" {
+        return None;
+    }
+
+    let provider = match provider.as_str() {
+        "github-copilot" => ProviderName::GitHubCopilot,
+        "anthropic" => ProviderName::Anthropic,
+        "openai" => ProviderName::OpenAi,
+        "gemini" => ProviderName::Gemini,
+        _ => return None,
+    };
+
+    match action.as_str() {
+        "auth" => Some(ProviderCliCommand::Auth(provider)),
+        "test" => Some(ProviderCliCommand::Test(provider)),
+        _ => None,
+    }
+}
+
+fn run_provider_command(command: ProviderCliCommand) -> Result<(), CliError> {
+    match command {
+        ProviderCliCommand::Auth(ProviderName::GitHubCopilot) => auth_github_copilot(),
+        ProviderCliCommand::Test(ProviderName::GitHubCopilot) => test_github_copilot(),
+        ProviderCliCommand::Auth(ProviderName::Anthropic) => auth_anthropic(),
+        ProviderCliCommand::Test(ProviderName::Anthropic) => test_anthropic(),
+        ProviderCliCommand::Auth(ProviderName::OpenAi) => auth_openai(),
+        ProviderCliCommand::Test(ProviderName::OpenAi) => test_openai(),
+        ProviderCliCommand::Auth(ProviderName::Gemini) => auth_gemini(),
+        ProviderCliCommand::Test(ProviderName::Gemini) => test_gemini(),
     }
 }
 
@@ -186,6 +210,37 @@ pub fn test_openai() -> Result<(), CliError> {
     Ok(())
 }
 
+pub fn auth_gemini() -> Result<(), CliError> {
+    let (provider, credentials_path) = gemini_provider()?;
+    let (api_key, source) = api_key_from_env_or_prompt(
+        "Gemini",
+        &[
+            "SINOMO_GEMINI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_AI_API_KEY",
+        ],
+    )?;
+    provider.save_api_key(&api_key, &source)?;
+    println!("Testing Gemini provider connection...");
+    provider.test_connection()?;
+    println!("Gemini credentials saved to {}", credentials_path.display());
+    Ok(())
+}
+
+pub fn test_gemini() -> Result<(), CliError> {
+    let (provider, credentials_path) = gemini_provider()?;
+    println!(
+        "Testing Gemini credentials at {}",
+        credentials_path.display()
+    );
+    provider.api_key()?;
+    println!("Gemini API key: ok");
+    provider.test_connection()?;
+    println!("Gemini provider connection: ok");
+    Ok(())
+}
+
 fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_provider_dir(GitHubCopilotProvider::PROVIDER_ID)?;
@@ -232,6 +287,20 @@ fn openai_provider() -> Result<(OpenAiProvider, PathBuf), CliError> {
     Ok((provider, credentials_path))
 }
 
+fn gemini_provider() -> Result<(GeminiProvider, PathBuf), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_provider_dir(GeminiProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
+    let provider = GeminiProvider::new(GeminiConfig {
+        api_base_url: env::var("SINOMO_GEMINI_API_BASE_URL")
+            .unwrap_or_else(|_| GeminiConfig::default().api_base_url),
+        default_model: env::var("SINOMO_GEMINI_MODEL")
+            .unwrap_or_else(|_| GeminiConfig::default().default_model),
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
 fn api_key_from_env_or_prompt(
     provider_name: &str,
     env_vars: &[&str],
@@ -264,23 +333,28 @@ fn api_key_from_env_or_prompt(
 
 pub fn print_usage() {
     println!("Usage:");
-    println!("  sinomo providers github-copilot auth");
-    println!("  sinomo providers github-copilot test");
-    println!("  sinomo providers anthropic auth");
-    println!("  sinomo providers anthropic test");
-    println!("  sinomo providers openai auth");
-    println!("  sinomo providers openai test");
-    println!("  sinomo-app providers github-copilot auth");
-    println!("  sinomo-app providers github-copilot test");
-    println!("  sinomo-app providers anthropic auth");
-    println!("  sinomo-app providers anthropic test");
-    println!("  sinomo-app providers openai auth");
-    println!("  sinomo-app providers openai test");
+    println!("  sinomo providers auth github-copilot");
+    println!("  sinomo providers test github-copilot");
+    println!("  sinomo providers auth anthropic");
+    println!("  sinomo providers test anthropic");
+    println!("  sinomo providers auth openai");
+    println!("  sinomo providers test openai");
+    println!("  sinomo providers auth gemini");
+    println!("  sinomo providers test gemini");
+    println!("  sinomo-app providers auth github-copilot");
+    println!("  sinomo-app providers test github-copilot");
+    println!("  sinomo-app providers auth anthropic");
+    println!("  sinomo-app providers test anthropic");
+    println!("  sinomo-app providers auth openai");
+    println!("  sinomo-app providers test openai");
+    println!("  sinomo-app providers auth gemini");
+    println!("  sinomo-app providers test gemini");
     println!();
     println!("Environment:");
     println!("  SINOMO_DATA_DIR             Defaults to ~/.sinomo");
-    println!("  ANTHROPIC_API_KEY           Used by `providers anthropic auth/test`");
-    println!("  OPENAI_API_KEY              Used by `providers openai auth/test`");
+    println!("  ANTHROPIC_API_KEY           Used by `providers auth/test anthropic`");
+    println!("  OPENAI_API_KEY              Used by `providers auth/test openai`");
+    println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
     println!(
         "  SINOMO_ANTHROPIC_MODEL      Defaults to {}",
         AnthropicConfig::default().default_model
@@ -288,6 +362,10 @@ pub fn print_usage() {
     println!(
         "  SINOMO_OPENAI_MODEL         Defaults to {}",
         OpenAiConfig::default().default_model
+    );
+    println!(
+        "  SINOMO_GEMINI_MODEL         Defaults to {}",
+        GeminiConfig::default().default_model
     );
     println!(
         "  SINOMO_COPILOT_CLIENT_ID    Defaults to {}",
@@ -334,3 +412,40 @@ impl std::fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderCliCommand, ProviderName, parse_provider_command};
+
+    #[test]
+    fn provider_commands_parse_action_before_provider() {
+        assert_eq!(
+            parse_provider_command(&[
+                "providers".to_string(),
+                "auth".to_string(),
+                "gemini".to_string(),
+            ]),
+            Some(ProviderCliCommand::Auth(ProviderName::Gemini))
+        );
+        assert_eq!(
+            parse_provider_command(&[
+                "providers".to_string(),
+                "test".to_string(),
+                "github-copilot".to_string(),
+            ]),
+            Some(ProviderCliCommand::Test(ProviderName::GitHubCopilot))
+        );
+    }
+
+    #[test]
+    fn provider_commands_reject_provider_before_action_order() {
+        assert_eq!(
+            parse_provider_command(&[
+                "providers".to_string(),
+                "gemini".to_string(),
+                "auth".to_string(),
+            ]),
+            None
+        );
+    }
+}
