@@ -14,11 +14,9 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
     LanguageModelResponseFormat, LanguageModelRole,
 };
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -391,683 +389,12 @@ pub trait MutationModel {
     ) -> Result<ModelMutationResult, MutationModelError>;
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct EvolutionToolDescriptor {
-    pub name: String,
-    pub input_schema_json: serde_json::Value,
-    pub output_schema_json: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub effects: Vec<ToolEffect>,
-}
+mod tools;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ToolEffect {
-    ReadFile,
-    WriteFile,
-    RunCommand,
-    ReadGitState,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EvolutionToolCall {
-    pub tool: String,
-    #[serde(default)]
-    pub input: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EvolutionToolResult {
-    pub tool: String,
-    pub status: ToolCallStatus,
-    pub output: serde_json::Value,
-    pub evidence: ToolEvidence,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ToolCallStatus {
-    Succeeded,
-    Failed,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ToolEvidence {
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub paths: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EvolutionToolEventContext {
-    pub node_id: NodeId,
-    pub job_id: EvolutionJobId,
-}
-
-impl EvolutionToolEventContext {
-    pub fn new(node_id: NodeId, job_id: EvolutionJobId) -> Self {
-        Self { node_id, job_id }
-    }
-}
-
-pub trait EvolutionTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor;
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult;
-}
-
-#[derive(Default)]
-pub struct EvolutionToolRegistry {
-    tools: BTreeMap<String, Box<dyn EvolutionTool>>,
-}
-
-impl EvolutionToolRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn bootstrap() -> Self {
-        let mut registry = Self::new();
-        registry.register(ReadFileTool);
-        registry.register(ListFilesTool);
-        registry.register(SearchTool);
-        registry.register(ApplyPatchTool);
-        registry.register(RunCommandTool);
-        registry.register(GitDiffTool);
-        registry.register(GitStatusTool);
-        registry.register(FormatTool);
-        registry.register(TestTool);
-        registry
-    }
-
-    pub fn register<T>(&mut self, tool: T)
-    where
-        T: EvolutionTool + 'static,
-    {
-        let name = tool.descriptor().name;
-        self.tools.insert(name, Box::new(tool));
-    }
-
-    pub fn descriptors(&self) -> Vec<EvolutionToolDescriptor> {
-        self.tools.values().map(|tool| tool.descriptor()).collect()
-    }
-
-    pub fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        call: EvolutionToolCall,
-    ) -> EvolutionToolResult {
-        match self.tools.get(&call.tool) {
-            Some(tool) => tool.execute(workspace, call.input),
-            None => {
-                let tool_name = call.tool;
-                failed_tool_result(
-                    tool_name.clone(),
-                    format!("unknown evolution tool `{tool_name}`"),
-                    Vec::new(),
-                )
-            }
-        }
-    }
-
-    pub fn execute_with_event(
-        &self,
-        workspace: &CandidateWorkspace,
-        context: &EvolutionToolEventContext,
-        call: EvolutionToolCall,
-    ) -> (EvolutionToolResult, EventEnvelope) {
-        let tool_name = call.tool.clone();
-        let input = call.input.clone();
-        let result = self.execute(workspace, call);
-        let changed_files = changed_files_from_git_status(&workspace.path);
-        let event = tool_call_event(context, workspace, tool_name, input, &result, changed_files);
-        (result, event)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ReadFileTool;
-
-impl EvolutionTool for ReadFileTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "read_file",
-            object_schema(&[("path", "string")]),
-            object_schema(&[("path", "string"), ("content", "string")]),
-            vec![ToolEffect::ReadFile],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let Some(path) = string_field(&input, "path") else {
-            return failed_tool_result("read_file", "missing string field `path`", Vec::new());
-        };
-        let file_path = workspace.path.join(path);
-        match fs::read_to_string(&file_path) {
-            Ok(content) => succeeded_tool_result(
-                "read_file",
-                serde_json::json!({ "path": path, "content": content }),
-                format!("read {}", file_path.display()),
-                vec![path.to_string()],
-            ),
-            Err(error) => failed_tool_result(
-                "read_file",
-                format!("failed to read {}: {error}", file_path.display()),
-                vec![path.to_string()],
-            ),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ListFilesTool;
-
-impl EvolutionTool for ListFilesTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "list_files",
-            object_schema(&[("path", "string")]),
-            object_schema(&[("path", "string"), ("files", "array")]),
-            vec![ToolEffect::ReadFile],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let path = string_field(&input, "path").unwrap_or(".");
-        let dir_path = workspace.path.join(path);
-        let entries = match fs::read_dir(&dir_path) {
-            Ok(entries) => entries,
-            Err(error) => {
-                return failed_tool_result(
-                    "list_files",
-                    format!("failed to list {}: {error}", dir_path.display()),
-                    vec![path.to_string()],
-                );
-            }
-        };
-        let mut files = Vec::new();
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            files.push(serde_json::json!({
-                "name": name,
-                "kind": if entry_path.is_dir() { "directory" } else { "file" },
-            }));
-        }
-        succeeded_tool_result(
-            "list_files",
-            serde_json::json!({ "path": path, "files": files }),
-            format!("listed {}", dir_path.display()),
-            vec![path.to_string()],
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SearchTool;
-
-impl EvolutionTool for SearchTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "search",
-            object_schema(&[("query", "string")]),
-            object_schema(&[
-                ("query", "string"),
-                ("stdout", "string"),
-                ("stderr", "string"),
-            ]),
-            vec![ToolEffect::ReadFile, ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let Some(query) = string_field(&input, "query") else {
-            return failed_tool_result("search", "missing string field `query`", Vec::new());
-        };
-        command_tool_result(
-            "search",
-            format!("rg -- {}", shell_quote(query)),
-            &workspace.path,
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ApplyPatchTool;
-
-impl EvolutionTool for ApplyPatchTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "apply_patch",
-            object_schema(&[("patch", "string")]),
-            object_schema(&[("stdout", "string"), ("stderr", "string")]),
-            vec![ToolEffect::WriteFile, ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let Some(patch) = string_field(&input, "patch") else {
-            return failed_tool_result("apply_patch", "missing string field `patch`", Vec::new());
-        };
-        let start = Instant::now();
-        let mut child = match shell_command("git apply --whitespace=nowarn -")
-            .current_dir(&workspace.path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                return failed_command_result(
-                    "apply_patch",
-                    "git apply --whitespace=nowarn -",
-                    -1,
-                    duration_millis(start.elapsed()),
-                    String::new(),
-                    error.to_string(),
-                );
-            }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            if let Err(error) = stdin.write_all(patch.as_bytes()) {
-                return failed_command_result(
-                    "apply_patch",
-                    "git apply --whitespace=nowarn -",
-                    -1,
-                    duration_millis(start.elapsed()),
-                    String::new(),
-                    error.to_string(),
-                );
-            }
-        }
-        let output = child.wait_with_output();
-        command_output_result(
-            "apply_patch",
-            "git apply --whitespace=nowarn -",
-            output,
-            start.elapsed(),
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-struct RunCommandTool;
-
-impl EvolutionTool for RunCommandTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "run_command",
-            object_schema(&[("command", "string")]),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let Some(command) = string_field(&input, "command") else {
-            return failed_tool_result("run_command", "missing string field `command`", Vec::new());
-        };
-        command_tool_result("run_command", command.to_string(), &workspace.path)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct GitDiffTool;
-
-impl EvolutionTool for GitDiffTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "git_diff",
-            serde_json::json!({ "type": "object", "properties": {} }),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::ReadGitState, ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        _input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        command_tool_result(
-            "git_diff",
-            "git diff --binary HEAD --".to_string(),
-            &workspace.path,
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-struct GitStatusTool;
-
-impl EvolutionTool for GitStatusTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "git_status",
-            serde_json::json!({ "type": "object", "properties": {} }),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::ReadGitState, ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        _input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        command_tool_result(
-            "git_status",
-            "git status --short".to_string(),
-            &workspace.path,
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-struct FormatTool;
-
-impl EvolutionTool for FormatTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "format",
-            object_schema(&[("command", "string")]),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::RunCommand, ToolEffect::WriteFile],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let command = string_field(&input, "command").unwrap_or("cargo fmt");
-        command_tool_result("format", command.to_string(), &workspace.path)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TestTool;
-
-impl EvolutionTool for TestTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "test",
-            object_schema(&[("command", "string")]),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let command = string_field(&input, "command").unwrap_or("cargo test");
-        command_tool_result("test", command.to_string(), &workspace.path)
-    }
-}
-
-fn descriptor(
-    name: &str,
-    input_schema_json: serde_json::Value,
-    output_schema_json: serde_json::Value,
-    effects: Vec<ToolEffect>,
-) -> EvolutionToolDescriptor {
-    EvolutionToolDescriptor {
-        name: name.to_string(),
-        input_schema_json,
-        output_schema_json,
-        effects,
-    }
-}
-
-fn object_schema(fields: &[(&str, &str)]) -> serde_json::Value {
-    let properties = fields
-        .iter()
-        .map(|(name, kind)| ((*name).to_string(), serde_json::json!({ "type": kind })))
-        .collect::<serde_json::Map<_, _>>();
-    let required = fields
-        .iter()
-        .map(|(name, _)| serde_json::Value::String((*name).to_string()))
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-    })
-}
-
-fn string_field<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a str> {
-    value.get(field).and_then(serde_json::Value::as_str)
-}
-
-fn succeeded_tool_result(
-    tool: impl Into<String>,
-    output: serde_json::Value,
-    summary: impl Into<String>,
-    paths: Vec<String>,
-) -> EvolutionToolResult {
-    EvolutionToolResult {
-        tool: tool.into(),
-        status: ToolCallStatus::Succeeded,
-        output,
-        evidence: ToolEvidence {
-            summary: summary.into(),
-            command: None,
-            exit_code: None,
-            duration_ms: None,
-            paths,
-        },
-    }
-}
-
-fn failed_tool_result(
-    tool: impl Into<String>,
-    summary: impl Into<String>,
-    paths: Vec<String>,
-) -> EvolutionToolResult {
-    EvolutionToolResult {
-        tool: tool.into(),
-        status: ToolCallStatus::Failed,
-        output: serde_json::Value::Null,
-        evidence: ToolEvidence {
-            summary: summary.into(),
-            command: None,
-            exit_code: None,
-            duration_ms: None,
-            paths,
-        },
-    }
-}
-
-fn command_tool_result(tool: &str, command: String, cwd: &Path) -> EvolutionToolResult {
-    let start = Instant::now();
-    let output = shell_command(&command).current_dir(cwd).output();
-    command_output_result(tool, &command, output, start.elapsed())
-}
-
-fn command_output_result(
-    tool: &str,
-    command: &str,
-    output: std::io::Result<std::process::Output>,
-    duration: Duration,
-) -> EvolutionToolResult {
-    match output {
-        Ok(output) => {
-            let exit_code = output.status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            let status = if output.status.success() {
-                ToolCallStatus::Succeeded
-            } else {
-                ToolCallStatus::Failed
-            };
-            EvolutionToolResult {
-                tool: tool.to_string(),
-                status,
-                output: serde_json::json!({
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "exit_code": exit_code,
-                }),
-                evidence: ToolEvidence {
-                    summary: format!("`{command}` exited {exit_code}"),
-                    command: Some(command.to_string()),
-                    exit_code: Some(exit_code),
-                    duration_ms: Some(duration_millis(duration)),
-                    paths: Vec::new(),
-                },
-            }
-        }
-        Err(error) => failed_command_result(
-            tool,
-            command,
-            -1,
-            duration_millis(duration),
-            String::new(),
-            error.to_string(),
-        ),
-    }
-}
-
-fn failed_command_result(
-    tool: &str,
-    command: &str,
-    exit_code: i32,
-    duration_ms: u64,
-    stdout: String,
-    stderr: String,
-) -> EvolutionToolResult {
-    EvolutionToolResult {
-        tool: tool.to_string(),
-        status: ToolCallStatus::Failed,
-        output: serde_json::json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": exit_code,
-        }),
-        evidence: ToolEvidence {
-            summary: format!("failed to run `{command}`"),
-            command: Some(command.to_string()),
-            exit_code: Some(exit_code),
-            duration_ms: Some(duration_ms),
-            paths: Vec::new(),
-        },
-    }
-}
-
-fn tool_call_event(
-    context: &EvolutionToolEventContext,
-    workspace: &CandidateWorkspace,
-    tool: String,
-    input: serde_json::Value,
-    result: &EvolutionToolResult,
-    changed_files: Vec<String>,
-) -> EventEnvelope {
-    let mut event = EventEnvelope::new(
-        EventId::generate(),
-        OffsetDateTime::now_utc(),
-        context.node_id.clone(),
-        Source::new("evolution.tool_registry").expect("valid source"),
-        EventKind::new("evolution.tool.executed").expect("valid event kind"),
-        Salience::new(0.72).expect("valid salience"),
-        Confidence::new(0.95).expect("valid confidence"),
-        RoutingMetadata::new(
-            RoutingScope::TrustedNetwork,
-            LatencyClass::Background,
-            PrivacyClass::Derived,
-        )
-        .with_hint(RoutingHint::new(format!("tool:{tool}")).expect("hint")),
-    )
-    .with_payload(serde_json::json!({
-        "job_id": context.job_id.clone(),
-        "tool": tool,
-        "input": input,
-        "result": result,
-        "changed_files": changed_files,
-        "candidate_workspace": {
-            "job_id": workspace.job_id.clone(),
-            "path": workspace.path.clone(),
-            "branch_name": workspace.branch_name.clone(),
-            "source_revision": workspace.source_revision.clone(),
-        },
-    }));
-
-    for path in &result.evidence.paths {
-        event.evidence.refs.push(sinomo_core::EvidenceRef {
-            uri: format!("file://{}", workspace.path.join(path).display()),
-            kind: sinomo_core::EvidenceKind::Other,
-            content_hash: None,
-        });
-    }
-    event
-}
-
-fn changed_files_from_git_status(cwd: &Path) -> Vec<String> {
-    let Ok(output) = shell_command("git status --short")
-        .current_dir(cwd)
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    parse_git_status_paths(&String::from_utf8_lossy(&output.stdout)).unwrap_or_default()
-}
+pub use tools::{
+    EvolutionTool, EvolutionToolCall, EvolutionToolDescriptor, EvolutionToolEventContext,
+    EvolutionToolRegistry, EvolutionToolResult, ToolCallStatus, ToolEffect, ToolEvidence,
+};
 
 #[cfg(windows)]
 fn shell_command(command: &str) -> Command {
@@ -1081,14 +408,6 @@ fn shell_command(command: &str) -> Command {
     let mut shell = Command::new("sh");
     shell.args(["-c", command]);
     shell
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().try_into().unwrap_or(u64::MAX)
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("{value:?}")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1305,6 +624,8 @@ pub fn render_mutation_bridge_prompt(
         }
     }
 
+    prompt.push_str("\nLong-running command tools emit `run_id` values. If a command produces no further stdout/stderr, the runtime notifies the model after 1 minute, after 5 minutes, and then every 10 minutes of continued inactivity; use `interrupt_command` to send SIGINT or `kill_command` to terminate by run_id when appropriate.\n");
+
     prompt.push_str("\n## Mutation Mode\n");
     if direct_edit {
         prompt.push_str(
@@ -1430,31 +751,31 @@ where
             .write_json(&bundle, "mutation-packet.json", &packet)?;
 
         let mut model_result = None;
-        if !request.dry_run {
-            if let Some(model) = model {
-                let result = model.mutate(&packet, &candidate_workspace)?;
-                self.bundles
-                    .write_text(&bundle, "model-output.txt", &result.raw_output)?;
-                self.bundles
-                    .write_json(&bundle, "model-result.json", &result)?;
-                if let Some(patch) = &result.parsed_patch {
-                    self.bundles.write_text(&bundle, "model.patch", patch)?;
-                }
-                if !result.tool_results.is_empty() {
-                    self.bundles.write_json(
-                        &bundle,
-                        "model-tool-results.json",
-                        &result.tool_results,
-                    )?;
-                }
-                bundle.model_output_path = Some(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join("model-output.txt")
-                        .display()
-                        .to_string(),
-                );
-                model_result = Some(result);
+        if request.dry_run {
+            // Dry-run proposals only prepare candidate artifacts and verification evidence.
+        } else if let Some(model) = model {
+            let result = model.mutate(&packet, &candidate_workspace)?;
+            self.bundles
+                .write_text(&bundle, "model-output.txt", &result.raw_output)?;
+            self.bundles
+                .write_json(&bundle, "model-result.json", &result)?;
+            if let Some(patch) = &result.parsed_patch {
+                self.bundles.write_text(&bundle, "model.patch", patch)?;
             }
+            if !result.tool_results.is_empty() {
+                self.bundles.write_json(
+                    &bundle,
+                    "model-tool-results.json",
+                    &result.tool_results,
+                )?;
+            }
+            bundle.model_output_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("model-output.txt")
+                    .display()
+                    .to_string(),
+            );
+            model_result = Some(result);
         }
 
         let changed_files = self.workspace.changed_files(&candidate_workspace)?;
@@ -2050,6 +1371,9 @@ mod tests {
         assert!(prompt.contains("Candidate Workspace"));
         assert!(prompt.contains(&root.display().to_string()));
         assert!(prompt.contains("apply_patch"));
+        assert!(prompt.contains("interrupt_command"));
+        assert!(prompt.contains("kill_command"));
+        assert!(prompt.contains("no further stdout/stderr"));
         assert!(prompt.contains("Required JSON Response"));
         let _ = fs::remove_dir_all(root);
     }
@@ -2166,7 +1490,7 @@ mod tests {
             LanguageModelResponseFormat::JsonObject
         );
         assert_eq!(result.summary.as_deref(), Some("updated patched.txt"));
-        assert_eq!(result.parsed_patch.as_deref().is_some(), true);
+        assert!(result.parsed_patch.as_deref().is_some());
         assert_eq!(result.tool_results[0].status, ToolCallStatus::Succeeded);
         let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
         assert_eq!(patched.replace("\r\n", "\n"), "new\n");
@@ -2295,6 +1619,8 @@ mod tests {
             "search",
             "apply_patch",
             "run_command",
+            "interrupt_command",
+            "kill_command",
             "git_diff",
             "git_status",
             "format",
@@ -2373,6 +1699,7 @@ mod tests {
 
         assert_eq!(result.status, ToolCallStatus::Succeeded);
         assert_eq!(result.output["exit_code"], 0);
+        assert!(result.output["run_id"].as_str().is_some());
         assert!(
             result.output["stdout"]
                 .as_str()
@@ -2387,6 +1714,74 @@ mod tests {
         );
         assert!(result.evidence.command.is_some());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_control_tool_reports_unknown_run_id() {
+        let root = temp_dir("command-control-tool");
+        fs::create_dir_all(&root).expect("root");
+        let workspace = candidate_workspace(&root);
+        let result = EvolutionToolRegistry::bootstrap().execute(
+            &workspace,
+            EvolutionToolCall {
+                tool: "interrupt_command".to_string(),
+                input: serde_json::json!({ "run_id": "cmd_missing" }),
+            },
+        );
+
+        assert_eq!(result.status, ToolCallStatus::Failed);
+        assert!(
+            result.evidence.summary.contains("cmd_missing"),
+            "{}",
+            result.evidence.summary
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_command_tool_can_terminate_active_run_command() {
+        use std::thread;
+
+        let root = temp_dir("kill-command-tool");
+        fs::create_dir_all(&root).expect("root");
+        let workspace = candidate_workspace(&root);
+        let registry = std::sync::Arc::new(EvolutionToolRegistry::bootstrap());
+        let running_registry = registry.clone();
+        let running_workspace = workspace.clone();
+        let handle = thread::spawn(move || {
+            running_registry.execute(
+                &running_workspace,
+                EvolutionToolCall {
+                    tool: "run_command".to_string(),
+                    input: serde_json::json!({ "command": "sleep 5" }),
+                },
+            )
+        });
+        let run_id = wait_for_active_command(&registry);
+
+        let control = registry.execute(
+            &workspace,
+            EvolutionToolCall {
+                tool: "kill_command".to_string(),
+                input: serde_json::json!({ "run_id": run_id }),
+            },
+        );
+        let result = handle.join().expect("run command thread");
+
+        assert_eq!(control.status, ToolCallStatus::Succeeded);
+        assert_ne!(result.output["exit_code"], 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn wait_for_active_command(registry: &EvolutionToolRegistry) -> String {
+        for _ in 0..100 {
+            if let Some(run_id) = registry.active_command_run_ids().into_iter().next() {
+                return run_id;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("expected an active command run");
     }
 
     #[test]
