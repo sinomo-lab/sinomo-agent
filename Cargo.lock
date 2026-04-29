@@ -863,6 +863,11 @@ dependencies = [
 name = "sinomo-cli"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-eval",
+ "sinomo-evolution",
  "sinomo-lm",
  "sinomo-local",
 ]
@@ -942,6 +947,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-eval",
+ "sinomo-lm",
+ "thiserror",
  "time",
 ]
 

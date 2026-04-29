@@ -9,5 +9,10 @@ license.workspace = true
 include = ["**/*.rs", "Cargo.toml"]
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-eval = { path = "../sinomo-eval" }
+sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-local = { path = "../sinomo-local" }

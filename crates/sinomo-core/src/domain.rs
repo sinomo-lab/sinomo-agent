@@ -4,6 +4,7 @@ use crate::{
     TaskId, TrustDomain, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NodeCapability {
@@ -497,15 +498,27 @@ pub enum MetricValue {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvolutionJob {
     pub job_id: EvolutionJobId,
+    pub objective: String,
     pub target_ring: TrustRing,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_module_id: Option<ModuleId>,
-    pub objective: String,
+    pub edit_scope: EditScope,
+    pub verification: VerificationPlan,
+    pub recovery: RecoveryPlan,
     pub scope: EvolutionScope,
     pub status: EvolutionJobStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_gates: Vec<EvaluationGate>,
     pub rollback_policy: RollbackPolicy,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EditScope {
+    pub workspace_root: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intended_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -518,9 +531,138 @@ pub struct EvolutionScope {
     pub workspace_id: Option<WorkspaceId>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct VerificationPlan {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<VerificationCommand>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct VerificationCommand {
+    pub name: String,
+    pub command: String,
+    pub expected_exit_code: i32,
+    pub gate: EvaluationGate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RecoveryPlan {
+    pub strategy: RecoveryStrategy,
+    pub note: String,
+}
+
+impl Default for RecoveryPlan {
+    fn default() -> Self {
+        Self {
+            strategy: RecoveryStrategy::VmSnapshotRestore,
+            note: "restore the disposable VM snapshot or manually repair the candidate worktree"
+                .to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryStrategy {
+    GitRevert,
+    GitBranchReset,
+    VmSnapshotRestore,
+    ManualRepair,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MutationPacket {
+    pub job_id: EvolutionJobId,
+    pub objective: String,
+    pub target_ring: TrustRing,
+    pub edit_scope: EditScope,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relevant_files: Vec<FileExcerpt>,
+    pub verification: VerificationPlan,
+    pub output_contract: MutationOutputContract,
+    pub recovery: RecoveryPlan,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct FileExcerpt {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MutationOutputContract {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_sections: Vec<String>,
+    pub prefer_patch: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+}
+
+impl Default for MutationOutputContract {
+    fn default() -> Self {
+        Self {
+            expected_sections: vec![
+                "changed files".to_string(),
+                "patch summary".to_string(),
+                "verification notes".to_string(),
+                "experiment notes".to_string(),
+                "recovery notes".to_string(),
+            ],
+            prefer_patch: false,
+            notes: "write directly in the candidate workspace when using a coding-agent provider"
+                .to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateBundleManifest {
+    pub job_id: EvolutionJobId,
+    pub bundle_path: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    pub mutation_packet_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_files_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorecard_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_logs: Vec<CommandLogRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CommandLogRef {
+    pub name: String,
+    pub command: String,
+    pub log_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum EvolutionJobStatus {
+    Created,
+    PacketWritten,
+    MutationStarted,
+    MutationFinished,
+    Verified,
+    ReviewWritten,
+    HumanReviewRequested,
+    HumanKept,
+    HumanRejected,
+    HumanAccepted,
+    Revised,
+    Restored,
+    Failed,
     Observed,
     Scoped,
     Proposed,
@@ -695,5 +837,90 @@ mod tests {
 
         assert!(decision.capability_diff.requests_new_power());
         assert_eq!(decision.action, PolicyAction::RequireMoreEvidence);
+    }
+
+    #[test]
+    fn evolution_job_serializes_bootstrap_loop_contract() {
+        let job = EvolutionJob {
+            job_id: EvolutionJobId::new("evojob_bootstrap").expect("job id"),
+            objective: "improve command evaluation scorecard details".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            target_module_id: None,
+            edit_scope: EditScope {
+                workspace_root: "D:/Workspace/sinomo-agent".to_string(),
+                intended_paths: vec!["crates/sinomo-eval/**".to_string()],
+                notes: "bootstrap supervised VM iteration".to_string(),
+            },
+            verification: VerificationPlan {
+                commands: vec![VerificationCommand {
+                    name: "eval tests".to_string(),
+                    command: "cargo test -p sinomo-eval".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::UnitTests,
+                }],
+            },
+            recovery: RecoveryPlan {
+                strategy: RecoveryStrategy::VmSnapshotRestore,
+                note: "restore VM snapshot if the candidate damages the checkout".to_string(),
+            },
+            scope: EvolutionScope {
+                allowed_paths: vec!["crates/sinomo-eval/**".to_string()],
+                forbidden_paths: Vec::new(),
+                workspace_id: None,
+            },
+            status: EvolutionJobStatus::Created,
+            required_gates: vec![EvaluationGate::UnitTests],
+            rollback_policy: RollbackPolicy::default(),
+        };
+
+        let json = serde_json::to_value(&job).expect("serialize job");
+
+        assert_eq!(json["job_id"], "evojob_bootstrap");
+        assert_eq!(json["status"], "created");
+        assert_eq!(
+            json["edit_scope"]["intended_paths"][0],
+            "crates/sinomo-eval/**"
+        );
+        assert_eq!(
+            json["verification"]["commands"][0]["command"],
+            "cargo test -p sinomo-eval"
+        );
+    }
+
+    #[test]
+    fn mutation_packet_carries_verification_and_recovery_contract() {
+        let packet = MutationPacket {
+            job_id: EvolutionJobId::new("evojob_packet").expect("job id"),
+            objective: "add bundle writer".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            edit_scope: EditScope {
+                workspace_root: "candidate".to_string(),
+                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                notes: String::new(),
+            },
+            relevant_files: vec![FileExcerpt {
+                path: "crates/sinomo-evolution/src/lib.rs".to_string(),
+                content: "pub struct EvolutionPlanner;".to_string(),
+            }],
+            verification: VerificationPlan {
+                commands: vec![VerificationCommand {
+                    name: "check".to_string(),
+                    command: "cargo check".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }],
+            },
+            output_contract: MutationOutputContract::default(),
+            recovery: RecoveryPlan::default(),
+        };
+
+        assert_eq!(packet.verification.commands[0].expected_exit_code, 0);
+        assert!(
+            packet
+                .output_contract
+                .expected_sections
+                .iter()
+                .any(|section| section == "changed files")
+        );
     }
 }

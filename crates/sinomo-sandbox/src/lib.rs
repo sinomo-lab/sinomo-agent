@@ -164,9 +164,23 @@ mod tests {
         let workspace_id = WorkspaceId::new("workspace_candidate").expect("workspace");
         let job = EvolutionJob {
             job_id: EvolutionJobId::new("evojob_candidate").expect("job"),
+            objective: "improve trigger".to_string(),
             target_ring: TrustRing::R3SandboxedModule,
             target_module_id: None,
-            objective: "improve trigger".to_string(),
+            edit_scope: sinomo_core::EditScope {
+                workspace_root: workspace_id.to_string(),
+                intended_paths: vec!["crates/sinomo-trigger/**".to_string()],
+                notes: "sandbox unit test".to_string(),
+            },
+            verification: sinomo_core::VerificationPlan {
+                commands: vec![sinomo_core::VerificationCommand {
+                    name: "unit tests".to_string(),
+                    command: "cargo test -p sinomo-trigger".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::ReplayTests,
+                }],
+            },
+            recovery: sinomo_core::RecoveryPlan::default(),
             scope: EvolutionScope {
                 workspace_id: Some(workspace_id.clone()),
                 allowed_paths: vec!["crates/sinomo-trigger/**".to_string()],

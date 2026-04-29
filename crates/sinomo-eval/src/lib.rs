@@ -5,9 +5,14 @@ use sinomo_core::{
     ArtifactId, Confidence, EvaluationGate, EvaluationGateResult, EvaluationMetric,
     EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJobId,
     LatencyClass, MetricValue, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
-    ScorecardId, Source,
+    ScorecardId, Source, VerificationCommand, VerificationPlan,
 };
 use sinomo_events::ReplayQuery;
+use std::{
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -37,6 +42,145 @@ pub struct CommandEvaluationSuite {
     pub baseline_artifact_id: Option<ArtifactId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub specs: Vec<CommandEvaluationSpec>,
+}
+
+pub trait CommandRunner {
+    fn run(&self, command: &VerificationCommand, cwd: &Path)
+    -> Result<CommandRunResult, EvalError>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LocalCommandRunner;
+
+impl LocalCommandRunner {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl CommandRunner for LocalCommandRunner {
+    fn run(
+        &self,
+        command: &VerificationCommand,
+        cwd: &Path,
+    ) -> Result<CommandRunResult, EvalError> {
+        let start = Instant::now();
+        let output = shell_command(&command.command)
+            .current_dir(cwd)
+            .output()
+            .map_err(|error| EvalError::CommandSpawnFailed {
+                command: command.command.clone(),
+                message: error.to_string(),
+            })?;
+        let duration = start.elapsed();
+
+        Ok(CommandRunResult {
+            name: command.name.clone(),
+            command: command.command.clone(),
+            expected_exit_code: command.expected_exit_code,
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            duration_ms: duration_millis(duration),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CommandRunResult {
+    pub name: String,
+    pub command: String,
+    pub expected_exit_code: i32,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+}
+
+impl CommandRunResult {
+    pub fn passed(&self) -> bool {
+        self.exit_code == self.expected_exit_code
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecutingEvalHarness<R> {
+    pub runner: R,
+}
+
+impl<R> ExecutingEvalHarness<R> {
+    pub fn new(runner: R) -> Self {
+        Self { runner }
+    }
+}
+
+impl<R: CommandRunner> ExecutingEvalHarness<R> {
+    pub fn run_verification_plan(
+        &self,
+        plan: VerificationPlan,
+        cwd: &Path,
+    ) -> Result<(EvaluationScorecard, Vec<CommandRunResult>), EvalError> {
+        if plan.commands.is_empty() {
+            return Err(EvalError::EmptyVerificationPlan);
+        }
+
+        let mut gates = Vec::with_capacity(plan.commands.len());
+        let mut results = Vec::with_capacity(plan.commands.len());
+        let mut passed = 0;
+
+        for command in &plan.commands {
+            let result = self.runner.run(command, cwd)?;
+            let outcome = if result.passed() {
+                passed += 1;
+                EvaluationOutcome::Passed
+            } else {
+                EvaluationOutcome::Failed
+            };
+
+            gates.push(EvaluationGateResult {
+                gate: command.gate.clone(),
+                outcome,
+                summary: format!(
+                    "`{}` exited {}, expected {} in {}ms",
+                    command.command,
+                    result.exit_code,
+                    command.expected_exit_code,
+                    result.duration_ms
+                ),
+            });
+            results.push(result);
+        }
+
+        let outcome = if passed == results.len() {
+            EvaluationOutcome::Passed
+        } else {
+            EvaluationOutcome::Failed
+        };
+        let total_duration_ms = results.iter().map(|result| result.duration_ms).sum::<u64>();
+
+        Ok((
+            EvaluationScorecard {
+                scorecard_id: ScorecardId::generate(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+                outcome,
+                gates,
+                metrics: vec![
+                    EvaluationMetric {
+                        name: "command_count".to_string(),
+                        value: MetricValue::Integer(results.len() as i64),
+                        sample_count: Some(results.len() as u64),
+                    },
+                    EvaluationMetric {
+                        name: "command_duration_ms".to_string(),
+                        value: MetricValue::Integer(total_duration_ms as i64),
+                        sample_count: Some(results.len() as u64),
+                    },
+                ],
+            },
+            results,
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -135,12 +279,35 @@ impl LocalEvalHarness {
 pub enum EvalError {
     #[error("evaluation suite must contain at least one command spec")]
     EmptySuite,
+    #[error("verification plan must contain at least one command")]
+    EmptyVerificationPlan,
+    #[error("failed to spawn command `{command}`: {message}")]
+    CommandSpawnFailed { command: String, message: String },
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut shell = Command::new("powershell");
+    shell.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+    shell
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut shell = Command::new("sh");
+    shell.args(["-c", command]);
+    shell
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sinomo_core::SessionId;
+    use std::env;
 
     #[test]
     fn command_suite_produces_passing_scorecard_with_replay_fixture_count() {
@@ -168,5 +335,98 @@ mod tests {
 
         assert_eq!(scorecard.outcome, EvaluationOutcome::Passed);
         assert_eq!(scorecard.metrics[1].value, MetricValue::Integer(1));
+    }
+
+    #[test]
+    fn executing_harness_passes_successful_command() {
+        let harness = ExecutingEvalHarness::new(LocalCommandRunner::new());
+        let (scorecard, results) = harness
+            .run_verification_plan(
+                VerificationPlan {
+                    commands: vec![verification_command("success", success_command(), 0)],
+                },
+                &env::current_dir().expect("cwd"),
+            )
+            .expect("verification plan");
+
+        assert_eq!(scorecard.outcome, EvaluationOutcome::Passed);
+        assert_eq!(scorecard.gates[0].outcome, EvaluationOutcome::Passed);
+        assert_eq!(results[0].exit_code, 0);
+    }
+
+    #[test]
+    fn executing_harness_fails_nonzero_command() {
+        let harness = ExecutingEvalHarness::new(LocalCommandRunner::new());
+        let (scorecard, results) = harness
+            .run_verification_plan(
+                VerificationPlan {
+                    commands: vec![verification_command("failure", failure_command(), 0)],
+                },
+                &env::current_dir().expect("cwd"),
+            )
+            .expect("verification plan");
+
+        assert_eq!(scorecard.outcome, EvaluationOutcome::Failed);
+        assert_eq!(scorecard.gates[0].outcome, EvaluationOutcome::Failed);
+        assert_ne!(results[0].exit_code, 0);
+    }
+
+    #[test]
+    fn local_command_runner_captures_stdout_and_stderr() {
+        let harness = ExecutingEvalHarness::new(LocalCommandRunner::new());
+        let (_scorecard, results) = harness
+            .run_verification_plan(
+                VerificationPlan {
+                    commands: vec![verification_command("output", output_command(), 0)],
+                },
+                &env::current_dir().expect("cwd"),
+            )
+            .expect("verification plan");
+
+        assert!(results[0].stdout.contains("sinomo-stdout"));
+        assert!(results[0].stderr.contains("sinomo-stderr"));
+    }
+
+    fn verification_command(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        expected_exit_code: i32,
+    ) -> VerificationCommand {
+        VerificationCommand {
+            name: name.into(),
+            command: command.into(),
+            expected_exit_code,
+            gate: EvaluationGate::UnitTests,
+        }
+    }
+
+    #[cfg(windows)]
+    fn success_command() -> String {
+        "exit 0".to_string()
+    }
+
+    #[cfg(not(windows))]
+    fn success_command() -> String {
+        "exit 0".to_string()
+    }
+
+    #[cfg(windows)]
+    fn failure_command() -> String {
+        "exit 7".to_string()
+    }
+
+    #[cfg(not(windows))]
+    fn failure_command() -> String {
+        "exit 7".to_string()
+    }
+
+    #[cfg(windows)]
+    fn output_command() -> String {
+        "Write-Output 'sinomo-stdout'; Write-Error 'sinomo-stderr'; exit 0".to_string()
+    }
+
+    #[cfg(not(windows))]
+    fn output_command() -> String {
+        "printf 'sinomo-stdout\\n'; printf 'sinomo-stderr\\n' >&2".to_string()
     }
 }
