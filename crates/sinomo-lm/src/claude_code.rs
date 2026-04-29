@@ -75,15 +75,14 @@ impl ClaudeCodeProvider {
     }
 
     pub fn command_args(&self, request: &LanguageModelRequest) -> Vec<String> {
-        let mut args = Vec::new();
-        args.push("-p".to_string());
-        args.push(render_plain_prompt(request));
-
-        args.push("--output-format".to_string());
-        args.push("text".to_string());
-
-        args.push("--permission-mode".to_string());
-        args.push(self.config.permission_mode.as_arg().to_string());
+        let mut args = vec![
+            "-p".to_string(),
+            render_plain_prompt(request),
+            "--output-format".to_string(),
+            "text".to_string(),
+            "--permission-mode".to_string(),
+            self.config.permission_mode.as_arg().to_string(),
+        ];
 
         if let Some(max_turns) = self.config.max_turns {
             args.push("--max-turns".to_string());

@@ -170,6 +170,10 @@ impl GitHubCopilotProvider {
     }
 
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
+        self.list_models().map(|_| ())
+    }
+
+    pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
         let token = self.github_token()?;
         let url = format!("{}/models", self.config.api_base_url.trim_end_matches('/'));
         let response = self
@@ -193,7 +197,14 @@ impl GitHubCopilotProvider {
             });
         }
 
-        Ok(())
+        let value = response.json::<serde_json::Value>().map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: self.config.default_model.clone(),
+                detail: source.to_string(),
+            }
+        })?;
+        Ok(extract_copilot_model_ids(&value))
     }
 
     #[allow(dead_code)]
@@ -326,15 +337,20 @@ impl LanguageModelProvider for GitHubCopilotProvider {
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let model = selected_model(&self.config.default_model, request);
         let token = self.copilot_api_token()?;
+        let (endpoint, payload) = if copilot_model_uses_responses_api(&model) {
+            ("responses", responses_payload(request, &model))
+        } else {
+            ("chat/completions", chat_completion_payload(request, &model))
+        };
         let url = format!(
-            "{}/chat/completions",
+            "{}/{endpoint}",
             self.config.api_base_url.trim_end_matches('/')
         );
         let response = self
             .http
             .post(url)
             .headers(copilot_api_headers(&token)?)
-            .json(&chat_completion_payload(request, &model))
+            .json(&payload)
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -348,7 +364,7 @@ impl LanguageModelProvider for GitHubCopilotProvider {
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
-                detail: format!("Copilot chat completion failed: HTTP {status}: {body}"),
+                detail: format!("Copilot {endpoint} failed: HTTP {status}: {body}"),
             });
         }
 
@@ -359,19 +375,35 @@ impl LanguageModelProvider for GitHubCopilotProvider {
                 detail: source.to_string(),
             }
         })?;
-        let content = value
-            .pointer("/choices/0/message/content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let usage = value.get("usage").map(|usage| LanguageModelUsage {
-            input_tokens: usage
-                .get("prompt_tokens")
-                .and_then(serde_json::Value::as_u64),
-            output_tokens: usage
-                .get("completion_tokens")
-                .and_then(serde_json::Value::as_u64),
-        });
+        let (content, usage) = if endpoint == "responses" {
+            (
+                extract_responses_text(&value),
+                value.get("usage").map(|usage| LanguageModelUsage {
+                    input_tokens: usage
+                        .get("input_tokens")
+                        .and_then(serde_json::Value::as_u64),
+                    output_tokens: usage
+                        .get("output_tokens")
+                        .and_then(serde_json::Value::as_u64),
+                }),
+            )
+        } else {
+            (
+                value
+                    .pointer("/choices/0/message/content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                value.get("usage").map(|usage| LanguageModelUsage {
+                    input_tokens: usage
+                        .get("prompt_tokens")
+                        .and_then(serde_json::Value::as_u64),
+                    output_tokens: usage
+                        .get("completion_tokens")
+                        .and_then(serde_json::Value::as_u64),
+                }),
+            )
+        };
 
         Ok(LanguageModelResponse {
             provider: Self::PROVIDER_ID.to_string(),
@@ -597,6 +629,71 @@ fn copilot_api_headers(copilot_token: &str) -> Result<HeaderMap, LanguageModelEr
     Ok(headers)
 }
 
+fn extract_copilot_model_ids(value: &serde_json::Value) -> Vec<String> {
+    let mut models: Vec<String> = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn copilot_model_uses_responses_api(model: &str) -> bool {
+    model == "gpt-5.5" || model.starts_with("gpt-5.5-")
+}
+
+fn responses_payload(request: &LanguageModelRequest, model: &str) -> serde_json::Value {
+    let input: Vec<serde_json::Value> = request
+        .messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": match message.role {
+                    LanguageModelRole::System => "system",
+                    LanguageModelRole::User => "user",
+                    LanguageModelRole::Assistant => "assistant",
+                },
+                "content": message.content,
+            })
+        })
+        .collect();
+    let mut payload = serde_json::json!({
+        "model": model,
+        "input": input,
+        "stream": false,
+        "reasoning": { "effort": "none" },
+    });
+    payload["max_output_tokens"] = serde_json::json!(request.max_output_tokens.unwrap_or(3_000));
+    if request.response_format == LanguageModelResponseFormat::JsonObject {
+        payload["text"] = serde_json::json!({ "format": { "type": "json_object" } });
+    }
+    payload
+}
+
+fn extract_responses_text(value: &serde_json::Value) -> String {
+    value
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|output| output.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|content| {
+            if content.get("type").and_then(serde_json::Value::as_str) == Some("output_text") {
+                content.get("text").and_then(serde_json::Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn chat_completion_payload(request: &LanguageModelRequest, model: &str) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = request
         .messages
@@ -725,6 +822,54 @@ mod tests {
         assert_eq!(payload["stream"], false);
         assert_eq!(payload["response_format"]["type"], "json_object");
         assert_eq!(payload["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn copilot_model_list_parser_extracts_sorted_ids() {
+        let value = serde_json::json!({
+            "data": [
+                { "id": "gpt-5.5", "name": "GPT-5.5" },
+                { "id": "gpt-5.4" },
+                { "id": "gpt-5.5" }
+            ]
+        });
+
+        assert_eq!(
+            extract_copilot_model_ids(&value),
+            vec!["gpt-5.4", "gpt-5.5"]
+        );
+    }
+
+    #[test]
+    fn direct_copilot_responses_payload_uses_responses_shape_for_gpt_5_5() {
+        let payload = responses_payload(&request(), "gpt-5.5");
+
+        assert_eq!(payload["model"], "gpt-5.5");
+        assert_eq!(payload["stream"], false);
+        assert_eq!(payload["text"]["format"]["type"], "json_object");
+        assert_eq!(payload["reasoning"]["effort"], "none");
+        assert_eq!(payload["max_output_tokens"], 200);
+        assert_eq!(payload["input"][0]["role"], "system");
+        assert!(copilot_model_uses_responses_api("gpt-5.5"));
+    }
+
+    #[test]
+    fn copilot_responses_text_extractor_collects_output_text() {
+        let value = serde_json::json!({
+            "output": [
+                { "type": "reasoning", "summary": [] },
+                {
+                    "type": "message",
+                    "content": [
+                        { "type": "output_text", "text": "{\"ok\":" },
+                        { "type": "output_text", "text": "true}" }
+                    ]
+                }
+            ],
+            "usage": { "input_tokens": 1, "output_tokens": 2 }
+        });
+
+        assert_eq!(extract_responses_text(&value), "{\"ok\":true}");
     }
 
     #[test]

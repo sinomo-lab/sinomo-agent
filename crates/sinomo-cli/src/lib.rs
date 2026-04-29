@@ -126,6 +126,7 @@ fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
         Some((command, rest)) if command == "packet" => evolve_show_packet(rest),
         Some((command, rest)) if command == "cleanup" => evolve_cleanup(rest),
         Some((command, rest)) if command == "job" => evolve_job(rest),
+        Some((command, rest)) if command == "models" => evolve_models(rest),
         _ => {
             print_usage();
             Err(CliError::Usage)
@@ -437,6 +438,169 @@ fn evolve_job(args: &[String]) -> Result<(), CliError> {
             evolve_propose(&propose_args)
         }
         _ => Err(CliError::Usage),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelDefaultOptions {
+    provider: String,
+    model: String,
+    repo: Option<PathBuf>,
+}
+
+fn evolve_models(args: &[String]) -> Result<(), CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "list" => evolve_models_list(rest),
+        Some((command, rest)) if command == "default" => evolve_models_default(rest),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn evolve_models_list(args: &[String]) -> Result<(), CliError> {
+    let provider = parse_models_list_provider(args)?;
+    let providers = match provider {
+        Some(provider) => {
+            vec![
+                normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
+                    detail: format!("unknown provider `{provider}`"),
+                })?,
+            ]
+        }
+        None => default_model_provider_ids()
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+    };
+    for provider in providers {
+        println!("{provider}:");
+        for model in provider_model_ids(&provider)? {
+            println!("  {model}");
+        }
+    }
+    Ok(())
+}
+
+fn parse_models_list_provider(args: &[String]) -> Result<Option<String>, CliError> {
+    match args {
+        [] => Ok(None),
+        [flag, provider] if flag == "--provider" => Ok(Some(provider.clone())),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn evolve_models_default(args: &[String]) -> Result<(), CliError> {
+    let options = parse_model_default_options(args)?;
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let paths = EvolutionPaths::new(&data_dir);
+    paths.ensure()?;
+    let existing = read_config(&paths).ok();
+    let repo = options
+        .repo
+        .or_else(|| existing.as_ref().map(|config| PathBuf::from(&config.repo)))
+        .unwrap_or(env::current_dir().map_err(|source| CliError::Io {
+            path: ".".to_string(),
+            detail: source.to_string(),
+        })?);
+    let config = EvolutionConfig {
+        repo: repo.display().to_string(),
+        default_provider: Some(options.provider),
+        default_model: Some(options.model),
+    };
+    write_json(&paths.config, &config)?;
+    println!(
+        "default provider: {}",
+        config.default_provider.as_deref().unwrap_or("")
+    );
+    println!(
+        "default model: {}",
+        config.default_model.as_deref().unwrap_or("")
+    );
+    println!("config: {}", paths.config.display());
+    Ok(())
+}
+
+fn parse_model_default_options(args: &[String]) -> Result<ModelDefaultOptions, CliError> {
+    let provider = flag_value(args, "--provider").ok_or(CliError::Usage)?;
+    let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
+        detail: format!("unknown provider `{provider}`"),
+    })?;
+    let model = flag_value(args, "--model").ok_or(CliError::Usage)?;
+    let repo = flag_value(args, "--repo").map(PathBuf::from);
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--provider" | "--model" | "--repo" => index += 2,
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(ModelDefaultOptions {
+        provider,
+        model,
+        repo,
+    })
+}
+
+fn default_model_provider_ids() -> &'static [&'static str] {
+    &[
+        GitHubCopilotProvider::PROVIDER_ID,
+        GitHubCopilotCliProvider::PROVIDER_ID,
+        CodexCliProvider::PROVIDER_ID,
+        ClaudeCodeProvider::PROVIDER_ID,
+        AnthropicProvider::PROVIDER_ID,
+        OpenAiProvider::PROVIDER_ID,
+        GeminiProvider::PROVIDER_ID,
+    ]
+}
+
+fn normalize_model_provider(provider: &str) -> Option<String> {
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => Some(GitHubCopilotProvider::PROVIDER_ID.to_string()),
+        GitHubCopilotCliProvider::PROVIDER_ID => {
+            Some(GitHubCopilotCliProvider::PROVIDER_ID.to_string())
+        }
+        CodexCliProvider::PROVIDER_ID | "openai-codex-cli" => {
+            Some(CodexCliProvider::PROVIDER_ID.to_string())
+        }
+        ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
+            Some(ClaudeCodeProvider::PROVIDER_ID.to_string())
+        }
+        AnthropicProvider::PROVIDER_ID | "claude" => {
+            Some(AnthropicProvider::PROVIDER_ID.to_string())
+        }
+        OpenAiProvider::PROVIDER_ID | "openai-api" => Some(OpenAiProvider::PROVIDER_ID.to_string()),
+        GeminiProvider::PROVIDER_ID | "google-gemini" => {
+            Some(GeminiProvider::PROVIDER_ID.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn provider_model_ids(provider: &str) -> Result<Vec<String>, CliError> {
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let (provider, _) = github_copilot_provider()?;
+            provider.list_models().map_err(CliError::LanguageModel)
+        }
+        GitHubCopilotCliProvider::PROVIDER_ID => Ok(vec![GitHubCopilotCliConfig::default().model]),
+        CodexCliProvider::PROVIDER_ID => Ok(vec![CODEX_CLI_DEFAULT_MODEL.to_string()]),
+        ClaudeCodeProvider::PROVIDER_ID => Ok(vec![CLAUDE_CODE_DEFAULT_MODEL.to_string()]),
+        AnthropicProvider::PROVIDER_ID => {
+            Ok(vec![env::var("SINOMO_ANTHROPIC_MODEL").unwrap_or_else(
+                |_| AnthropicConfig::default().default_model,
+            )])
+        }
+        OpenAiProvider::PROVIDER_ID => Ok(vec![
+            env::var("SINOMO_OPENAI_MODEL")
+                .unwrap_or_else(|_| OpenAiConfig::default().default_model),
+        ]),
+        GeminiProvider::PROVIDER_ID => Ok(vec![
+            env::var("SINOMO_GEMINI_MODEL")
+                .unwrap_or_else(|_| GeminiConfig::default().default_model),
+        ]),
+        _ => Err(CliError::Parse {
+            detail: format!("unknown provider `{provider}`"),
+        }),
     }
 }
 
@@ -1219,6 +1383,10 @@ pub fn print_usage() {
     println!("  sinomo evolve status [--job evojob_...]");
     println!("  sinomo evolve show [--diff|--review|--scorecard|--packet] [--job evojob_...]");
     println!("  sinomo evolve verify|review|packet|cleanup [--job evojob_...]");
+    println!("  sinomo evolve models list [--provider <provider>]");
+    println!(
+        "  sinomo evolve models default --provider <provider> --model <model> [--repo <path>]"
+    );
     println!("  sinomo providers auth github-copilot");
     println!("  sinomo providers test github-copilot");
     println!("  sinomo providers auth anthropic");
@@ -1339,7 +1507,9 @@ impl std::error::Error for CliError {}
 mod tests {
     use super::{
         CliError, EvolutionJobStatus, EvolutionPaths, ProviderCliCommand, ProviderName,
-        is_terminal_status, parse_propose_options, parse_provider_command, run_evolve_command,
+        is_terminal_status, normalize_model_provider, parse_model_default_options,
+        parse_models_list_provider, parse_propose_options, parse_provider_command,
+        run_evolve_command,
     };
     use sinomo_core::{EvolutionJobId, TrustRing};
     use sinomo_local::SinomoDataDir;
@@ -1402,6 +1572,66 @@ mod tests {
         assert_eq!(options.verify, vec!["cargo test -p sinomo-eval"]);
         assert_eq!(options.target_ring, TrustRing::R1TrustedRuntime);
         assert!(options.dry_run);
+    }
+
+    #[test]
+    fn model_list_parser_accepts_optional_provider() {
+        assert_eq!(parse_models_list_provider(&[]).expect("empty args"), None);
+        assert_eq!(
+            parse_models_list_provider(&["--provider".to_string(), "github-copilot".to_string()])
+                .expect("provider"),
+            Some("github-copilot".to_string())
+        );
+        assert!(matches!(
+            parse_models_list_provider(&["github-copilot".to_string()]),
+            Err(CliError::Usage)
+        ));
+    }
+
+    #[test]
+    fn model_default_parser_accepts_provider_model_and_repo() {
+        let options = parse_model_default_options(&[
+            "--provider".to_string(),
+            "openai-api".to_string(),
+            "--model".to_string(),
+            "gpt-5.5".to_string(),
+            "--repo".to_string(),
+            "/repo".to_string(),
+        ])
+        .expect("options");
+
+        assert_eq!(options.provider, "openai");
+        assert_eq!(options.model, "gpt-5.5");
+        assert_eq!(options.repo.as_deref(), Some(std::path::Path::new("/repo")));
+    }
+
+    #[test]
+    fn model_default_parser_requires_known_provider() {
+        let error = parse_model_default_options(&[
+            "--provider".to_string(),
+            "unknown".to_string(),
+            "--model".to_string(),
+            "model".to_string(),
+        ])
+        .expect_err("unknown provider rejected");
+
+        assert!(matches!(error, CliError::Parse { .. }));
+    }
+
+    #[test]
+    fn model_provider_aliases_normalize_to_supported_provider_ids() {
+        assert_eq!(
+            normalize_model_provider("google-gemini").as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            normalize_model_provider("anthropic-claude-code").as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            normalize_model_provider("github-copilot").as_deref(),
+            Some("github-copilot")
+        );
     }
 
     #[test]

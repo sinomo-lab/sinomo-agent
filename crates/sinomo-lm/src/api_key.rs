@@ -17,10 +17,10 @@ pub(crate) fn resolve_api_key(
     env_vars: &[&str],
     missing_detail: &str,
 ) -> Result<String, LanguageModelError> {
-    if let Some(stored) = load_api_key_credential(credentials_path)? {
-        if !stored.api_key.trim().is_empty() {
-            return Ok(stored.api_key);
-        }
+    if let Some(stored) = load_api_key_credential(credentials_path)?
+        && !stored.api_key.trim().is_empty()
+    {
+        return Ok(stored.api_key);
     }
 
     for env_var in env_vars {
