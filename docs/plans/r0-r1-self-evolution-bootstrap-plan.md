@@ -235,7 +235,8 @@ Every candidate should produce a durable local bundle.
 Example bundle layout:
 
 ```text
-.evolution/candidates/evojob_x/
+$SINOMO_DATA_DIR/evolution/jobs/evojob_x/
+  record.json
   job.json
   mutation-packet.json
   changed-files.json
@@ -245,6 +246,7 @@ Example bundle layout:
   policy-decision.json
   provenance.json
   human-review.md
+  worktree/
 ```
 
 Acceptance criteria:

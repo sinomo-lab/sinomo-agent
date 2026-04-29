@@ -422,7 +422,7 @@ Crate: `sinomo-evolution`
 
 Responsibilities:
 
-- create candidate bundles under `SINOMO_DATA_DIR`
+- create candidate bundles inside per-job folders under `SINOMO_DATA_DIR`
 - write JSON artifacts
 - write command logs
 - write diff
@@ -441,9 +441,10 @@ pub trait CandidateBundleStore {
 Bundle layout:
 
 ```text
-%SINOMO_DATA_DIR%/evolution/candidates/evojob_x/
+%SINOMO_DATA_DIR%/evolution/jobs/evojob_x/
   manifest.json
   job.json
+  record.json
   mutation-packet.json
   model-output.txt
   changed-files.json
@@ -452,12 +453,13 @@ Bundle layout:
   command-logs/
     cargo-test.txt
   human-review.md
+  worktree/
 ```
 
 On Unix-like systems, the same layout is:
 
 ```text
-$SINOMO_DATA_DIR/evolution/candidates/evojob_x/
+$SINOMO_DATA_DIR/evolution/jobs/evojob_x/
 ```
 
 ## Event Families
@@ -484,7 +486,7 @@ Payloads should include `job_id`, `bundle_path`, `objective`, and relevant artif
 
 The CLI is the first minimal user interface for the self-evolution core. It should feel like a small steering wheel, not an operator cockpit.
 
-After model setup and one-time initialization, the minimal loop should be:
+After model setup, the minimal loop should be:
 
 ```powershell
 sinomo evolve propose "implement evolve propose"
@@ -547,34 +549,13 @@ sinomo evolve keep --job evojob_...
 ### Default Paths
 
 - data directory: `SINOMO_DATA_DIR`, falling back to the existing `sinomo-local` default.
-- source repo: current working directory unless configured otherwise.
-- candidate worktrees: `$SINOMO_DATA_DIR/evolution/worktrees/<job_id>/`.
-- candidate bundles: `$SINOMO_DATA_DIR/evolution/candidates/<job_id>/`.
+- source repo: current working directory unless `--repo <path>` is provided.
+- job folders: `$SINOMO_DATA_DIR/evolution/jobs/<job_id>/`.
+- candidate worktrees: `$SINOMO_DATA_DIR/evolution/jobs/<job_id>/worktree/`.
+- candidate bundle artifacts: `$SINOMO_DATA_DIR/evolution/jobs/<job_id>/`.
+- job records: `$SINOMO_DATA_DIR/evolution/jobs/<job_id>/record.json`.
 
 Every command should print the job ID, candidate worktree path, bundle path, and current state.
-
-### `evolve init`
-
-Initializes the local self-evolution workspace under `SINOMO_DATA_DIR`.
-
-Example:
-
-```powershell
-sinomo evolve init --repo "D:\Workspace\sinomo-agent"
-```
-
-Creates:
-
-```text
-$SINOMO_DATA_DIR/evolution/
-  candidates/
-  worktrees/
-  jobs/
-  logs/
-  config.json
-```
-
-`config.json` can store the source repo path and default model provider.
 
 ### `evolve propose "<prompt>"`
 
@@ -603,13 +584,15 @@ Minimal flags:
 Default behavior:
 
 1. Create an `EvolutionJob` from the prompt.
-2. Create a separate git worktree under `SINOMO_DATA_DIR`.
-3. Write a mutation packet into the candidate bundle.
-4. Invoke the selected model provider through `sinomo-lm`.
-5. Run verification automatically in the candidate worktree.
-6. Run review automatically, or assume review passed if review is not implemented yet.
-7. Write the candidate bundle.
-8. Print where the human can inspect the worktree and bundle.
+2. Initialize the evolution data layout if needed.
+3. Create a per-job folder under `SINOMO_DATA_DIR/evolution/jobs/<job_id>/`.
+4. Create a separate git worktree at `SINOMO_DATA_DIR/evolution/jobs/<job_id>/worktree/`.
+5. Write a mutation packet into the candidate bundle.
+6. Invoke the selected model provider through `sinomo-lm`.
+7. Run verification automatically in the candidate worktree.
+8. Run review automatically, or assume review passed if review is not implemented yet.
+9. Write the candidate bundle and job record.
+10. Print where the human can inspect the worktree and bundle.
 
 Minimal verification:
 
@@ -630,8 +613,8 @@ Output:
 ```text
 job: evojob_...
 status: waiting-human-decision
-worktree: C:\Users\IX\.sinomo\evolution\worktrees\evojob_...
-bundle: C:\Users\IX\.sinomo\evolution\candidates\evojob_...
+worktree: C:\Users\IX\.sinomo\evolution\jobs\evojob_...\worktree
+bundle: C:\Users\IX\.sinomo\evolution\jobs\evojob_...
 verification: passed
 review: skipped
 next: inspect the worktree, then run `sinomo evolve keep` or `sinomo evolve reject`
@@ -788,7 +771,7 @@ The first implementation may skip model review and mark it as assumed-passed. La
 
 #### `evolve cleanup`
 
-Removes old candidate worktrees and transient logs while keeping candidate bundles.
+Removes a candidate job folder and its worktree.
 
 Example:
 
@@ -796,7 +779,7 @@ Example:
 sinomo evolve cleanup --job evojob_...
 ```
 
-Cleanup should be conservative during bootstrap. Keeping failed bundles is valuable because they become self-evolution training material.
+Cleanup is explicit because it deletes the local job record, bundle artifacts, and candidate worktree. Failed candidates can still be kept as learning material by leaving the job folder in place.
 
 ## CLI Output Contract
 
@@ -805,8 +788,8 @@ Human-readable output is enough for the first version. Keep it short:
 ```text
 job: evojob_...
 status: waiting-human-decision
-worktree: C:\Users\IX\.sinomo\evolution\worktrees\evojob_...
-bundle: C:\Users\IX\.sinomo\evolution\candidates\evojob_...
+worktree: C:\Users\IX\.sinomo\evolution\jobs\evojob_...\worktree
+bundle: C:\Users\IX\.sinomo\evolution\jobs\evojob_...
 verification: passed
 review: skipped
 ```
@@ -818,8 +801,7 @@ JSON output can be added later when the CLI itself becomes an agent-facing inter
 The first real bootstrapping session should feel like this:
 
 ```powershell
-sinomo evolve init --repo "D:\Workspace\sinomo-agent"
-sinomo evolve propose "implement evolve propose"
+sinomo evolve propose "implement evolve propose" --repo "D:\Workspace\sinomo-agent"
 
 # inspect generated candidate worktree externally
 
@@ -880,7 +862,7 @@ Add:
 
 Behavior:
 
-- writes `$SINOMO_DATA_DIR/evolution/candidates/<job_id>/`
+- writes `$SINOMO_DATA_DIR/evolution/jobs/<job_id>/`
 - writes pretty JSON
 - writes text files
 - returns manifest paths
@@ -1032,7 +1014,6 @@ Files:
 
 Add:
 
-- parse `evolve init`
 - parse `evolve propose`
 - parse `evolve keep`
 - parse `evolve reject`
@@ -1082,12 +1063,11 @@ If we want the smallest possible first implementation, do only:
 1. Core self-evolution data types.
 2. Candidate bundle store.
 3. Real command runner.
-4. `evolve init`.
-5. Git worktree candidate workspace.
-6. `evolve propose "<prompt>"` that invokes the model, writes the bundle, and runs minimal verification.
-7. `evolve keep`.
-8. `evolve reject`.
-9. Active job resolution so `keep` and `reject` can omit `--job`.
+4. Git worktree candidate workspace.
+5. `evolve propose "<prompt>"` that initializes the job folder, invokes the model, writes the bundle, and runs minimal verification.
+6. `evolve keep`.
+7. `evolve reject`.
+8. Active job resolution so `keep` and `reject` can omit `--job`.
 
 This gives Sinomo the smallest model-driven local evolution loop.
 

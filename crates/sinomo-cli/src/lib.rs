@@ -71,8 +71,6 @@ struct StoredEvolutionJob {
 #[derive(Clone, Debug)]
 struct EvolutionPaths {
     root: PathBuf,
-    candidates: PathBuf,
-    worktrees: PathBuf,
     jobs: PathBuf,
     logs: PathBuf,
     config: PathBuf,
@@ -82,8 +80,6 @@ impl EvolutionPaths {
     fn new(data_dir: &SinomoDataDir) -> Self {
         let root = data_dir.root().join("evolution");
         Self {
-            candidates: root.join("candidates"),
-            worktrees: root.join("worktrees"),
             jobs: root.join("jobs"),
             logs: root.join("logs"),
             config: root.join("config.json"),
@@ -92,13 +88,7 @@ impl EvolutionPaths {
     }
 
     fn ensure(&self) -> Result<(), CliError> {
-        for path in [
-            &self.root,
-            &self.candidates,
-            &self.worktrees,
-            &self.jobs,
-            &self.logs,
-        ] {
+        for path in [&self.root, &self.jobs, &self.logs] {
             fs::create_dir_all(path).map_err(|source| CliError::Io {
                 path: path.display().to_string(),
                 detail: source.to_string(),
@@ -107,14 +97,21 @@ impl EvolutionPaths {
         Ok(())
     }
 
+    fn job_dir(&self, job_id: &EvolutionJobId) -> PathBuf {
+        self.jobs.join(job_id.as_str())
+    }
+
     fn job_path(&self, job_id: &EvolutionJobId) -> PathBuf {
+        self.job_dir(job_id).join("record.json")
+    }
+
+    fn legacy_job_path(&self, job_id: &EvolutionJobId) -> PathBuf {
         self.jobs.join(format!("{job_id}.json"))
     }
 }
 
 fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
     match args.split_first() {
-        Some((command, rest)) if command == "init" => evolve_init(rest),
         Some((command, rest)) if command == "propose" => evolve_propose(rest),
         Some((command, rest)) if command == "keep" => {
             evolve_decide(rest, EvolutionJobStatus::HumanKept)
@@ -134,34 +131,6 @@ fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
             Err(CliError::Usage)
         }
     }
-}
-
-fn evolve_init(args: &[String]) -> Result<(), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_root_layout()?;
-    let paths = EvolutionPaths::new(&data_dir);
-    paths.ensure()?;
-
-    let repo =
-        flag_value(args, "--repo")
-            .map(PathBuf::from)
-            .unwrap_or(env::current_dir().map_err(|source| CliError::Io {
-                path: ".".to_string(),
-                detail: source.to_string(),
-            })?);
-    let config = EvolutionConfig {
-        repo: repo.display().to_string(),
-        default_provider: flag_value(args, "--provider"),
-        default_model: flag_value(args, "--model"),
-    };
-    write_json(&paths.config, &config)?;
-
-    println!("evolution: initialized");
-    println!("repo: {}", config.repo);
-    println!("data: {}", paths.root.display());
-    println!("candidates: {}", paths.candidates.display());
-    println!("worktrees: {}", paths.worktrees.display());
-    Ok(())
 }
 
 fn evolve_propose(args: &[String]) -> Result<(), CliError> {
@@ -217,9 +186,9 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     };
 
     let orchestrator = EvolutionOrchestrator::new(
-        GitWorkspaceAdapter::new(&repo, &paths.worktrees),
+        GitWorkspaceAdapter::new(&repo, &paths.jobs),
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
-        LocalCandidateBundleStore::new(&paths.candidates),
+        LocalCandidateBundleStore::new(&paths.jobs),
     );
     let model_runner = CliMutationModel {
         provider,
@@ -272,7 +241,13 @@ fn evolve_status(args: &[String]) -> Result<(), CliError> {
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     if let Some(job_id) = job_flag(args)? {
-        let record = read_stored_job(&paths.job_path(&job_id))?;
+        let job_path = paths.job_path(&job_id);
+        let record_path = if job_path.exists() {
+            job_path
+        } else {
+            paths.legacy_job_path(&job_id)
+        };
+        let record = read_stored_job(&record_path)?;
         print_job_status(&record);
         return Ok(());
     }
@@ -396,7 +371,7 @@ fn evolve_review(args: &[String]) -> Result<(), CliError> {
 }
 
 fn evolve_cleanup(args: &[String]) -> Result<(), CliError> {
-    let (_paths, record) = resolve_job_from_args(args, false)?;
+    let (paths, record) = resolve_job_from_args(args, false)?;
     let path = &record.candidate_workspace.path;
     if path.exists() {
         let output = std::process::Command::new("git")
@@ -427,8 +402,30 @@ fn evolve_cleanup(args: &[String]) -> Result<(), CliError> {
             }
         }
     }
+    let job_dir = paths.job_dir(&record.job.job_id);
+    if job_dir.exists() {
+        fs::remove_dir_all(&job_dir).map_err(|source| CliError::Io {
+            path: job_dir.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    } else {
+        let legacy_record = paths.legacy_job_path(&record.job.job_id);
+        if legacy_record.exists() {
+            fs::remove_file(&legacy_record).map_err(|source| CliError::Io {
+                path: legacy_record.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+    }
+    let bundle_path = PathBuf::from(&record.bundle.bundle_path);
+    if bundle_path.exists() && bundle_path != job_dir {
+        fs::remove_dir_all(&bundle_path).map_err(|source| CliError::Io {
+            path: bundle_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    println!("removed job: {}", record.job.job_id);
     println!("removed worktree: {}", path.display());
-    println!("bundle kept: {}", record.bundle.bundle_path);
     Ok(())
 }
 
@@ -690,8 +687,14 @@ fn list_job_records(paths: &EvolutionPaths) -> Result<Vec<StoredEvolutionJob>, C
             path: paths.jobs.display().to_string(),
             detail: source.to_string(),
         })?;
-        if entry.path().extension().and_then(|ext| ext.to_str()) == Some("json") {
-            records.push(read_stored_job(&entry.path())?);
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            let record_path = entry_path.join("record.json");
+            if record_path.exists() {
+                records.push(read_stored_job(&record_path)?);
+            }
+        } else if entry_path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            records.push(read_stored_job(&entry_path)?);
         }
     }
     Ok(records)
@@ -705,7 +708,13 @@ fn resolve_job_from_args(
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     if let Some(job_id) = job_flag(args)? {
-        let record = read_stored_job(&paths.job_path(&job_id))?;
+        let job_path = paths.job_path(&job_id);
+        let record_path = if job_path.exists() {
+            job_path
+        } else {
+            paths.legacy_job_path(&job_id)
+        };
+        let record = read_stored_job(&record_path)?;
         return Ok((paths, record));
     }
 
@@ -1202,9 +1211,8 @@ fn api_key_from_env_or_prompt(
 
 pub fn print_usage() {
     println!("Usage:");
-    println!("  sinomo evolve init --repo <path>");
     println!(
-        "  sinomo evolve propose \"<objective>\" [--provider github-copilot] [--verify \"cargo check\"]"
+        "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider github-copilot] [--verify \"cargo check\"]"
     );
     println!("  sinomo evolve keep [--job evojob_...]");
     println!("  sinomo evolve reject [--job evojob_...]");
@@ -1330,10 +1338,12 @@ impl std::error::Error for CliError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        EvolutionJobStatus, ProviderCliCommand, ProviderName, is_terminal_status,
-        parse_propose_options, parse_provider_command,
+        CliError, EvolutionJobStatus, EvolutionPaths, ProviderCliCommand, ProviderName,
+        is_terminal_status, parse_propose_options, parse_provider_command, run_evolve_command,
     };
-    use sinomo_core::TrustRing;
+    use sinomo_core::{EvolutionJobId, TrustRing};
+    use sinomo_local::SinomoDataDir;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn provider_commands_parse_action_before_provider() {
@@ -1401,5 +1411,39 @@ mod tests {
         assert!(!is_terminal_status(
             &EvolutionJobStatus::HumanReviewRequested
         ));
+    }
+
+    #[test]
+    fn evolve_init_command_is_removed() {
+        let error = run_evolve_command(&["init".to_string()]).expect_err("init removed");
+
+        assert!(matches!(error, CliError::Usage));
+    }
+
+    #[test]
+    fn evolution_paths_store_record_inside_job_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-layout-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        let paths = EvolutionPaths::new(&SinomoDataDir::new(&root));
+        let job_id = EvolutionJobId::new("evojob_layout").expect("job id");
+
+        assert_eq!(
+            paths.job_path(&job_id),
+            root.join("evolution")
+                .join("jobs")
+                .join("evojob_layout")
+                .join("record.json")
+        );
+        assert_eq!(
+            paths.legacy_job_path(&job_id),
+            root.join("evolution")
+                .join("jobs")
+                .join("evojob_layout.json")
+        );
     }
 }

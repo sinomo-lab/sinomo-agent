@@ -14,9 +14,11 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
     LanguageModelResponseFormat, LanguageModelRole,
 };
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -140,8 +142,17 @@ impl WorkspaceAdapter for GitWorkspaceAdapter {
             &self.source_root,
         )?;
         let branch_name = format!("codex/evolve/{}", job.job_id.as_str());
-        let path = self.worktrees_root.join(job.job_id.as_str());
+        let path = self
+            .worktrees_root
+            .join(job.job_id.as_str())
+            .join("worktree");
         if !path.exists() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|source| WorkspaceError::Io {
+                    path: parent.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+            }
             self.run_git(
                 &[
                     "worktree".to_string(),
@@ -381,6 +392,706 @@ pub trait MutationModel {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionToolDescriptor {
+    pub name: String,
+    pub input_schema_json: serde_json::Value,
+    pub output_schema_json: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<ToolEffect>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolEffect {
+    ReadFile,
+    WriteFile,
+    RunCommand,
+    ReadGitState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EvolutionToolCall {
+    pub tool: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EvolutionToolResult {
+    pub tool: String,
+    pub status: ToolCallStatus,
+    pub output: serde_json::Value,
+    pub evidence: ToolEvidence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolCallStatus {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolEvidence {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EvolutionToolEventContext {
+    pub node_id: NodeId,
+    pub job_id: EvolutionJobId,
+}
+
+impl EvolutionToolEventContext {
+    pub fn new(node_id: NodeId, job_id: EvolutionJobId) -> Self {
+        Self { node_id, job_id }
+    }
+}
+
+pub trait EvolutionTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor;
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        input: serde_json::Value,
+    ) -> EvolutionToolResult;
+}
+
+#[derive(Default)]
+pub struct EvolutionToolRegistry {
+    tools: BTreeMap<String, Box<dyn EvolutionTool>>,
+}
+
+impl EvolutionToolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bootstrap() -> Self {
+        let mut registry = Self::new();
+        registry.register(ReadFileTool);
+        registry.register(ListFilesTool);
+        registry.register(SearchTool);
+        registry.register(ApplyPatchTool);
+        registry.register(RunCommandTool);
+        registry.register(GitDiffTool);
+        registry.register(GitStatusTool);
+        registry.register(FormatTool);
+        registry.register(TestTool);
+        registry
+    }
+
+    pub fn register<T>(&mut self, tool: T)
+    where
+        T: EvolutionTool + 'static,
+    {
+        let name = tool.descriptor().name;
+        self.tools.insert(name, Box::new(tool));
+    }
+
+    pub fn descriptors(&self) -> Vec<EvolutionToolDescriptor> {
+        self.tools.values().map(|tool| tool.descriptor()).collect()
+    }
+
+    pub fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        call: EvolutionToolCall,
+    ) -> EvolutionToolResult {
+        match self.tools.get(&call.tool) {
+            Some(tool) => tool.execute(workspace, call.input),
+            None => {
+                let tool_name = call.tool;
+                failed_tool_result(
+                    tool_name.clone(),
+                    format!("unknown evolution tool `{tool_name}`"),
+                    Vec::new(),
+                )
+            }
+        }
+    }
+
+    pub fn execute_with_event(
+        &self,
+        workspace: &CandidateWorkspace,
+        context: &EvolutionToolEventContext,
+        call: EvolutionToolCall,
+    ) -> (EvolutionToolResult, EventEnvelope) {
+        let tool_name = call.tool.clone();
+        let input = call.input.clone();
+        let result = self.execute(workspace, call);
+        let changed_files = changed_files_from_git_status(&workspace.path);
+        let event = tool_call_event(context, workspace, tool_name, input, &result, changed_files);
+        (result, event)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReadFileTool;
+
+impl EvolutionTool for ReadFileTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "read_file",
+            object_schema(&[("path", "string")]),
+            object_schema(&[("path", "string"), ("content", "string")]),
+            vec![ToolEffect::ReadFile],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        let Some(path) = string_field(&input, "path") else {
+            return failed_tool_result("read_file", "missing string field `path`", Vec::new());
+        };
+        let file_path = workspace.path.join(path);
+        match fs::read_to_string(&file_path) {
+            Ok(content) => succeeded_tool_result(
+                "read_file",
+                serde_json::json!({ "path": path, "content": content }),
+                format!("read {}", file_path.display()),
+                vec![path.to_string()],
+            ),
+            Err(error) => failed_tool_result(
+                "read_file",
+                format!("failed to read {}: {error}", file_path.display()),
+                vec![path.to_string()],
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ListFilesTool;
+
+impl EvolutionTool for ListFilesTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "list_files",
+            object_schema(&[("path", "string")]),
+            object_schema(&[("path", "string"), ("files", "array")]),
+            vec![ToolEffect::ReadFile],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        let path = string_field(&input, "path").unwrap_or(".");
+        let dir_path = workspace.path.join(path);
+        let entries = match fs::read_dir(&dir_path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return failed_tool_result(
+                    "list_files",
+                    format!("failed to list {}: {error}", dir_path.display()),
+                    vec![path.to_string()],
+                );
+            }
+        };
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            files.push(serde_json::json!({
+                "name": name,
+                "kind": if entry_path.is_dir() { "directory" } else { "file" },
+            }));
+        }
+        succeeded_tool_result(
+            "list_files",
+            serde_json::json!({ "path": path, "files": files }),
+            format!("listed {}", dir_path.display()),
+            vec![path.to_string()],
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SearchTool;
+
+impl EvolutionTool for SearchTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "search",
+            object_schema(&[("query", "string")]),
+            object_schema(&[
+                ("query", "string"),
+                ("stdout", "string"),
+                ("stderr", "string"),
+            ]),
+            vec![ToolEffect::ReadFile, ToolEffect::RunCommand],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        let Some(query) = string_field(&input, "query") else {
+            return failed_tool_result("search", "missing string field `query`", Vec::new());
+        };
+        command_tool_result(
+            "search",
+            format!("rg -- {}", shell_quote(query)),
+            &workspace.path,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ApplyPatchTool;
+
+impl EvolutionTool for ApplyPatchTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "apply_patch",
+            object_schema(&[("patch", "string")]),
+            object_schema(&[("stdout", "string"), ("stderr", "string")]),
+            vec![ToolEffect::WriteFile, ToolEffect::RunCommand],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        let Some(patch) = string_field(&input, "patch") else {
+            return failed_tool_result("apply_patch", "missing string field `patch`", Vec::new());
+        };
+        let start = Instant::now();
+        let mut child = match shell_command("git apply --whitespace=nowarn -")
+            .current_dir(&workspace.path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return failed_command_result(
+                    "apply_patch",
+                    "git apply --whitespace=nowarn -",
+                    -1,
+                    duration_millis(start.elapsed()),
+                    String::new(),
+                    error.to_string(),
+                );
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            if let Err(error) = stdin.write_all(patch.as_bytes()) {
+                return failed_command_result(
+                    "apply_patch",
+                    "git apply --whitespace=nowarn -",
+                    -1,
+                    duration_millis(start.elapsed()),
+                    String::new(),
+                    error.to_string(),
+                );
+            }
+        }
+        let output = child.wait_with_output();
+        command_output_result(
+            "apply_patch",
+            "git apply --whitespace=nowarn -",
+            output,
+            start.elapsed(),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RunCommandTool;
+
+impl EvolutionTool for RunCommandTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "run_command",
+            object_schema(&[("command", "string")]),
+            object_schema(&[
+                ("stdout", "string"),
+                ("stderr", "string"),
+                ("exit_code", "integer"),
+            ]),
+            vec![ToolEffect::RunCommand],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        let Some(command) = string_field(&input, "command") else {
+            return failed_tool_result("run_command", "missing string field `command`", Vec::new());
+        };
+        command_tool_result("run_command", command.to_string(), &workspace.path)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GitDiffTool;
+
+impl EvolutionTool for GitDiffTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "git_diff",
+            serde_json::json!({ "type": "object", "properties": {} }),
+            object_schema(&[
+                ("stdout", "string"),
+                ("stderr", "string"),
+                ("exit_code", "integer"),
+            ]),
+            vec![ToolEffect::ReadGitState, ToolEffect::RunCommand],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        _input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        command_tool_result(
+            "git_diff",
+            "git diff --binary HEAD --".to_string(),
+            &workspace.path,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GitStatusTool;
+
+impl EvolutionTool for GitStatusTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "git_status",
+            serde_json::json!({ "type": "object", "properties": {} }),
+            object_schema(&[
+                ("stdout", "string"),
+                ("stderr", "string"),
+                ("exit_code", "integer"),
+            ]),
+            vec![ToolEffect::ReadGitState, ToolEffect::RunCommand],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        _input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        command_tool_result(
+            "git_status",
+            "git status --short".to_string(),
+            &workspace.path,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FormatTool;
+
+impl EvolutionTool for FormatTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "format",
+            object_schema(&[("command", "string")]),
+            object_schema(&[
+                ("stdout", "string"),
+                ("stderr", "string"),
+                ("exit_code", "integer"),
+            ]),
+            vec![ToolEffect::RunCommand, ToolEffect::WriteFile],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        let command = string_field(&input, "command").unwrap_or("cargo fmt");
+        command_tool_result("format", command.to_string(), &workspace.path)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TestTool;
+
+impl EvolutionTool for TestTool {
+    fn descriptor(&self) -> EvolutionToolDescriptor {
+        descriptor(
+            "test",
+            object_schema(&[("command", "string")]),
+            object_schema(&[
+                ("stdout", "string"),
+                ("stderr", "string"),
+                ("exit_code", "integer"),
+            ]),
+            vec![ToolEffect::RunCommand],
+        )
+    }
+
+    fn execute(
+        &self,
+        workspace: &CandidateWorkspace,
+        input: serde_json::Value,
+    ) -> EvolutionToolResult {
+        let command = string_field(&input, "command").unwrap_or("cargo test");
+        command_tool_result("test", command.to_string(), &workspace.path)
+    }
+}
+
+fn descriptor(
+    name: &str,
+    input_schema_json: serde_json::Value,
+    output_schema_json: serde_json::Value,
+    effects: Vec<ToolEffect>,
+) -> EvolutionToolDescriptor {
+    EvolutionToolDescriptor {
+        name: name.to_string(),
+        input_schema_json,
+        output_schema_json,
+        effects,
+    }
+}
+
+fn object_schema(fields: &[(&str, &str)]) -> serde_json::Value {
+    let properties = fields
+        .iter()
+        .map(|(name, kind)| ((*name).to_string(), serde_json::json!({ "type": kind })))
+        .collect::<serde_json::Map<_, _>>();
+    let required = fields
+        .iter()
+        .map(|(name, _)| serde_json::Value::String((*name).to_string()))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    })
+}
+
+fn string_field<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    value.get(field).and_then(serde_json::Value::as_str)
+}
+
+fn succeeded_tool_result(
+    tool: impl Into<String>,
+    output: serde_json::Value,
+    summary: impl Into<String>,
+    paths: Vec<String>,
+) -> EvolutionToolResult {
+    EvolutionToolResult {
+        tool: tool.into(),
+        status: ToolCallStatus::Succeeded,
+        output,
+        evidence: ToolEvidence {
+            summary: summary.into(),
+            command: None,
+            exit_code: None,
+            duration_ms: None,
+            paths,
+        },
+    }
+}
+
+fn failed_tool_result(
+    tool: impl Into<String>,
+    summary: impl Into<String>,
+    paths: Vec<String>,
+) -> EvolutionToolResult {
+    EvolutionToolResult {
+        tool: tool.into(),
+        status: ToolCallStatus::Failed,
+        output: serde_json::Value::Null,
+        evidence: ToolEvidence {
+            summary: summary.into(),
+            command: None,
+            exit_code: None,
+            duration_ms: None,
+            paths,
+        },
+    }
+}
+
+fn command_tool_result(tool: &str, command: String, cwd: &Path) -> EvolutionToolResult {
+    let start = Instant::now();
+    let output = shell_command(&command).current_dir(cwd).output();
+    command_output_result(tool, &command, output, start.elapsed())
+}
+
+fn command_output_result(
+    tool: &str,
+    command: &str,
+    output: std::io::Result<std::process::Output>,
+    duration: Duration,
+) -> EvolutionToolResult {
+    match output {
+        Ok(output) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let status = if output.status.success() {
+                ToolCallStatus::Succeeded
+            } else {
+                ToolCallStatus::Failed
+            };
+            EvolutionToolResult {
+                tool: tool.to_string(),
+                status,
+                output: serde_json::json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": exit_code,
+                }),
+                evidence: ToolEvidence {
+                    summary: format!("`{command}` exited {exit_code}"),
+                    command: Some(command.to_string()),
+                    exit_code: Some(exit_code),
+                    duration_ms: Some(duration_millis(duration)),
+                    paths: Vec::new(),
+                },
+            }
+        }
+        Err(error) => failed_command_result(
+            tool,
+            command,
+            -1,
+            duration_millis(duration),
+            String::new(),
+            error.to_string(),
+        ),
+    }
+}
+
+fn failed_command_result(
+    tool: &str,
+    command: &str,
+    exit_code: i32,
+    duration_ms: u64,
+    stdout: String,
+    stderr: String,
+) -> EvolutionToolResult {
+    EvolutionToolResult {
+        tool: tool.to_string(),
+        status: ToolCallStatus::Failed,
+        output: serde_json::json!({
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+        }),
+        evidence: ToolEvidence {
+            summary: format!("failed to run `{command}`"),
+            command: Some(command.to_string()),
+            exit_code: Some(exit_code),
+            duration_ms: Some(duration_ms),
+            paths: Vec::new(),
+        },
+    }
+}
+
+fn tool_call_event(
+    context: &EvolutionToolEventContext,
+    workspace: &CandidateWorkspace,
+    tool: String,
+    input: serde_json::Value,
+    result: &EvolutionToolResult,
+    changed_files: Vec<String>,
+) -> EventEnvelope {
+    let mut event = EventEnvelope::new(
+        EventId::generate(),
+        OffsetDateTime::now_utc(),
+        context.node_id.clone(),
+        Source::new("evolution.tool_registry").expect("valid source"),
+        EventKind::new("evolution.tool.executed").expect("valid event kind"),
+        Salience::new(0.72).expect("valid salience"),
+        Confidence::new(0.95).expect("valid confidence"),
+        RoutingMetadata::new(
+            RoutingScope::TrustedNetwork,
+            LatencyClass::Background,
+            PrivacyClass::Derived,
+        )
+        .with_hint(RoutingHint::new(format!("tool:{tool}")).expect("hint")),
+    )
+    .with_payload(serde_json::json!({
+        "job_id": context.job_id.clone(),
+        "tool": tool,
+        "input": input,
+        "result": result,
+        "changed_files": changed_files,
+        "candidate_workspace": {
+            "job_id": workspace.job_id.clone(),
+            "path": workspace.path.clone(),
+            "branch_name": workspace.branch_name.clone(),
+            "source_revision": workspace.source_revision.clone(),
+        },
+    }));
+
+    for path in &result.evidence.paths {
+        event.evidence.refs.push(sinomo_core::EvidenceRef {
+            uri: format!("file://{}", workspace.path.join(path).display()),
+            kind: sinomo_core::EvidenceKind::Other,
+            content_hash: None,
+        });
+    }
+    event
+}
+
+fn changed_files_from_git_status(cwd: &Path) -> Vec<String> {
+    let Ok(output) = shell_command("git status --short")
+        .current_dir(cwd)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_git_status_paths(&String::from_utf8_lossy(&output.stdout)).unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut shell = Command::new("powershell");
+    shell.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+    shell
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut shell = Command::new("sh");
+    shell.args(["-c", command]);
+    shell
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("{value:?}")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelMutationResult {
     pub provider: String,
     pub model: String,
@@ -389,12 +1100,32 @@ pub struct ModelMutationResult {
     pub parsed_patch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<StructuredMutationOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<EvolutionToolResult>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct StructuredMutationOutput {
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default, alias = "unified_diff")]
+    pub patch: Option<String>,
+    #[serde(default)]
+    pub patch_summary: Option<String>,
+    #[serde(default)]
+    pub verification_notes: Option<String>,
+    #[serde(default)]
+    pub experiment_notes: Option<String>,
+    #[serde(default)]
+    pub recovery_notes: Option<String>,
+}
+
 pub struct LanguageModelMutationBridge<P> {
     provider: P,
     model: String,
+    tool_registry: EvolutionToolRegistry,
 }
 
 impl<P> LanguageModelMutationBridge<P> {
@@ -402,7 +1133,13 @@ impl<P> LanguageModelMutationBridge<P> {
         Self {
             provider,
             model: model.into(),
+            tool_registry: EvolutionToolRegistry::bootstrap(),
         }
+    }
+
+    pub fn with_tool_registry(mut self, tool_registry: EvolutionToolRegistry) -> Self {
+        self.tool_registry = tool_registry;
+        self
     }
 }
 
@@ -410,37 +1147,79 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
     fn mutate(
         &self,
         packet: &MutationPacket,
-        _workspace: &CandidateWorkspace,
+        workspace: &CandidateWorkspace,
     ) -> Result<ModelMutationResult, MutationModelError> {
         let info = self.provider.info();
+        let response_format = if info.supports_json_object {
+            LanguageModelResponseFormat::JsonObject
+        } else {
+            LanguageModelResponseFormat::Text
+        };
+        let direct_edit = info.supports_tool_permissions;
         let request = LanguageModelRequest {
             provider: info.provider.clone(),
             model: self.model.clone(),
             messages: vec![
                 LanguageModelMessage {
                     role: LanguageModelRole::System,
-                    content: "You are Sinomo's supervised bootstrap mutation worker. Work only inside the candidate workspace and produce reviewable evidence.".to_string(),
+                    content: render_mutation_system_prompt(
+                        response_format == LanguageModelResponseFormat::JsonObject,
+                        direct_edit,
+                    ),
                 },
                 LanguageModelMessage {
                     role: LanguageModelRole::User,
-                    content: render_mutation_prompt(packet),
+                    content: render_mutation_bridge_prompt(
+                        packet,
+                        workspace,
+                        &self.tool_registry.descriptors(),
+                        response_format == LanguageModelResponseFormat::JsonObject,
+                        direct_edit,
+                    ),
                 },
             ],
             temperature: Some(0.2),
             max_output_tokens: None,
-            response_format: LanguageModelResponseFormat::Text,
+            response_format,
             metadata: serde_json::json!({
                 "job_id": packet.job_id,
                 "target_ring": packet.target_ring,
+                "candidate_workspace": workspace.path,
+                "direct_edit": direct_edit,
             }),
         };
         let response = self.provider.complete(&request)?;
+        let structured_output = parse_structured_mutation_output(&response.content);
+        let parsed_patch = structured_output
+            .as_ref()
+            .and_then(|output| output.patch.clone())
+            .or_else(|| extract_patch_from_text(&response.content));
+        let mut tool_results = Vec::new();
+        if !direct_edit
+            && let Some(patch) = parsed_patch
+                .as_ref()
+                .filter(|patch| !patch.trim().is_empty())
+        {
+            tool_results.push(self.tool_registry.execute(
+                workspace,
+                EvolutionToolCall {
+                    tool: "apply_patch".to_string(),
+                    input: serde_json::json!({ "patch": patch }),
+                },
+            ));
+        }
+        let summary = structured_output
+            .as_ref()
+            .and_then(|output| output.patch_summary.clone())
+            .or_else(|| first_non_empty_line(&response.content));
         Ok(ModelMutationResult {
             provider: response.provider,
             model: response.model,
             raw_output: response.content,
-            parsed_patch: None,
-            summary: None,
+            parsed_patch,
+            summary,
+            structured_output,
+            tool_results,
         })
     }
 }
@@ -496,6 +1275,124 @@ pub fn render_mutation_prompt(packet: &MutationPacket) -> String {
     prompt
 }
 
+pub fn render_mutation_bridge_prompt(
+    packet: &MutationPacket,
+    workspace: &CandidateWorkspace,
+    tool_descriptors: &[EvolutionToolDescriptor],
+    structured_json: bool,
+    direct_edit: bool,
+) -> String {
+    let mut prompt = render_mutation_prompt(packet);
+    prompt.push_str("\n## Candidate Workspace\n");
+    prompt.push_str(&format!("path: {}\n", workspace.path.display()));
+    prompt.push_str(&format!("branch: {}\n", workspace.branch_name));
+    if let Some(revision) = &workspace.source_revision {
+        prompt.push_str(&format!("source_revision: {revision}\n"));
+    }
+    prompt.push_str(
+        "Treat this workspace as the only mutation target. The running Sinomo instance may be using the source workspace separately.\n",
+    );
+
+    prompt.push_str("\n## Tool Substrate\n");
+    if tool_descriptors.is_empty() {
+        prompt.push_str("- no registered tools were provided\n");
+    } else {
+        for descriptor in tool_descriptors {
+            prompt.push_str(&format!(
+                "- {} effects={:?} input_schema={}\n",
+                descriptor.name, descriptor.effects, descriptor.input_schema_json
+            ));
+        }
+    }
+
+    prompt.push_str("\n## Mutation Mode\n");
+    if direct_edit {
+        prompt.push_str(
+            "Edit files directly in the candidate workspace. Return concise review notes after the edits.\n",
+        );
+    } else {
+        prompt.push_str(
+            "Return a unified diff in the `patch` field. Sinomo will apply it to the candidate workspace through the tool registry.\n",
+        );
+    }
+
+    if structured_json {
+        prompt.push_str("\n## Required JSON Response\n");
+        prompt.push_str(
+            "Return only a JSON object with keys: changed_files, patch, patch_summary, verification_notes, experiment_notes, recovery_notes.\n",
+        );
+        if direct_edit {
+            prompt.push_str("When files were edited directly, set patch to null unless you also have a useful review diff.\n");
+        }
+    }
+    prompt
+}
+
+fn render_mutation_system_prompt(structured_json: bool, direct_edit: bool) -> String {
+    let mut prompt = String::from(
+        "You are Sinomo's supervised bootstrap mutation worker. Work only on the requested R0/R1 candidate and produce reviewable evidence.",
+    );
+    if direct_edit {
+        prompt.push_str(
+            " You may use the coding-agent harness to edit the candidate workspace directly.",
+        );
+    } else {
+        prompt.push_str(
+            " You cannot edit files directly; produce a reviewable patch that Sinomo can apply as a candidate.",
+        );
+    }
+    if structured_json {
+        prompt.push_str(" Return valid JSON only.");
+    }
+    prompt
+}
+
+pub fn parse_structured_mutation_output(raw_output: &str) -> Option<StructuredMutationOutput> {
+    let json = extract_json_object(raw_output)?;
+    serde_json::from_str::<StructuredMutationOutput>(json).ok()
+}
+
+fn extract_json_object(raw_output: &str) -> Option<&str> {
+    let trimmed = raw_output.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if start < end {
+        Some(&trimmed[start..=end])
+    } else {
+        None
+    }
+}
+
+fn extract_patch_from_text(raw_output: &str) -> Option<String> {
+    let trimmed = raw_output.trim();
+    for fence in ["```diff", "```patch", "```"] {
+        if let Some(start) = trimmed.find(fence) {
+            let body_start = start + fence.len();
+            let body = trimmed[body_start..].trim_start_matches(['\r', '\n']);
+            if let Some(end) = body.find("```") {
+                let patch = body[..end].trim();
+                if patch.contains("diff --git") || patch.contains("--- ") {
+                    return Some(patch.to_string());
+                }
+            }
+        }
+    }
+    trimmed
+        .find("diff --git ")
+        .map(|start| trimmed[start..].trim().to_string())
+}
+
+fn first_non_empty_line(raw_output: &str) -> Option<String> {
+    raw_output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('{') && !line.starts_with('}'))
+        .map(ToOwned::to_owned)
+}
+
 pub struct EvolutionOrchestrator<W, R, B> {
     pub workspace: W,
     pub evaluator: ExecutingEvalHarness<R>,
@@ -532,17 +1429,31 @@ where
         self.bundles
             .write_json(&bundle, "mutation-packet.json", &packet)?;
 
+        let mut model_result = None;
         if !request.dry_run {
             if let Some(model) = model {
-                let model_result = model.mutate(&packet, &candidate_workspace)?;
+                let result = model.mutate(&packet, &candidate_workspace)?;
                 self.bundles
-                    .write_text(&bundle, "model-output.txt", &model_result.raw_output)?;
+                    .write_text(&bundle, "model-output.txt", &result.raw_output)?;
+                self.bundles
+                    .write_json(&bundle, "model-result.json", &result)?;
+                if let Some(patch) = &result.parsed_patch {
+                    self.bundles.write_text(&bundle, "model.patch", patch)?;
+                }
+                if !result.tool_results.is_empty() {
+                    self.bundles.write_json(
+                        &bundle,
+                        "model-tool-results.json",
+                        &result.tool_results,
+                    )?;
+                }
                 bundle.model_output_path = Some(
                     PathBuf::from(&bundle.bundle_path)
                         .join("model-output.txt")
                         .display()
                         .to_string(),
                 );
+                model_result = Some(result);
             }
         }
 
@@ -580,8 +1491,13 @@ where
                 .to_string(),
         );
 
-        let review_summary =
-            human_review_summary(&job, &candidate_workspace, &changed_files, &scorecard);
+        let review_summary = human_review_summary(
+            &job,
+            &candidate_workspace,
+            &changed_files,
+            &scorecard,
+            model_result.as_ref(),
+        );
         self.bundles
             .write_text(&bundle, "human-review.md", &review_summary)?;
         bundle.review_path = Some(
@@ -651,11 +1567,103 @@ fn mutation_packet_for_job(job: &EvolutionJob) -> MutationPacket {
         objective: job.objective.clone(),
         target_ring: job.target_ring.clone(),
         edit_scope: job.edit_scope.clone(),
-        relevant_files: Vec::<FileExcerpt>::new(),
+        relevant_files: select_relevant_files(
+            Path::new(&job.edit_scope.workspace_root),
+            &job.edit_scope.intended_paths,
+        ),
         verification: job.verification.clone(),
         output_contract: MutationOutputContract::default(),
         recovery: job.recovery.clone(),
     }
+}
+
+fn select_relevant_files(workspace_root: &Path, intended_paths: &[String]) -> Vec<FileExcerpt> {
+    const MAX_FILES: usize = 12;
+    const MAX_BYTES_PER_FILE: usize = 16 * 1024;
+
+    let mut candidates = Vec::new();
+    for intended_path in intended_paths {
+        let root = workspace_root.join(glob_base_path(intended_path));
+        if root.is_file() {
+            candidates.push(root);
+        } else if root.is_dir() {
+            collect_relevant_files(&root, &mut candidates, MAX_FILES);
+        }
+        if candidates.len() >= MAX_FILES {
+            break;
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(MAX_FILES);
+
+    candidates
+        .into_iter()
+        .filter_map(|path| {
+            let bytes = fs::read(&path).ok()?;
+            let content =
+                String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES_PER_FILE)]).into_owned();
+            let relative = path
+                .strip_prefix(workspace_root)
+                .unwrap_or(&path)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            Some(FileExcerpt {
+                path: relative,
+                content,
+            })
+        })
+        .collect()
+}
+
+fn glob_base_path(pattern: &str) -> &str {
+    pattern
+        .split(['*', '?', '['])
+        .next()
+        .unwrap_or(pattern)
+        .trim_end_matches(['/', '\\'])
+}
+
+fn collect_relevant_files(dir: &Path, candidates: &mut Vec<PathBuf>, max_files: usize) {
+    if candidates.len() >= max_files || is_ignored_dir(dir) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        if candidates.len() >= max_files {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_relevant_files(&path, candidates, max_files);
+        } else if is_relevant_source_file(&path) {
+            candidates.push(path);
+        }
+    }
+}
+
+fn is_ignored_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules" | ".evolution"))
+}
+
+fn is_relevant_source_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if matches!(name, "Cargo.toml" | "README.md") {
+        return true;
+    }
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("rs" | "toml" | "md" | "json")
+    )
 }
 
 fn human_review_summary(
@@ -663,13 +1671,14 @@ fn human_review_summary(
     workspace: &CandidateWorkspace,
     changed_files: &[String],
     scorecard: &EvaluationScorecard,
+    model_result: Option<&ModelMutationResult>,
 ) -> String {
     let verification = match scorecard.outcome {
         EvaluationOutcome::Passed => "passed",
         EvaluationOutcome::Failed => "failed",
         EvaluationOutcome::Inconclusive => "inconclusive",
     };
-    format!(
+    let mut summary = format!(
         "# Sinomo Evolution Candidate\n\njob: {}\nstatus: awaiting-human-review\nobjective: {}\nworktree: {}\nbranch: {}\nverification: {}\nchanged_files:\n{}\n\nrecovery: {}\n",
         job.job_id,
         job.objective,
@@ -682,7 +1691,32 @@ fn human_review_summary(
             .collect::<Vec<_>>()
             .join("\n"),
         job.recovery.note
-    )
+    );
+    if let Some(model_result) = model_result {
+        summary.push_str("\n## Model Result\n");
+        summary.push_str(&format!(
+            "provider: {}\nmodel: {}\n",
+            model_result.provider, model_result.model
+        ));
+        if let Some(model_summary) = &model_result.summary {
+            summary.push_str(&format!("summary: {model_summary}\n"));
+        }
+        if let Some(output) = &model_result.structured_output {
+            if let Some(notes) = &output.verification_notes {
+                summary.push_str(&format!("verification_notes: {notes}\n"));
+            }
+            if let Some(notes) = &output.recovery_notes {
+                summary.push_str(&format!("recovery_notes: {notes}\n"));
+            }
+        }
+        for tool_result in &model_result.tool_results {
+            summary.push_str(&format!(
+                "tool {}: {:?} ({})\n",
+                tool_result.tool, tool_result.status, tool_result.evidence.summary
+            ));
+        }
+    }
+    summary
 }
 
 fn write_command_log_via_store<B: CandidateBundleStore>(
@@ -906,6 +1940,12 @@ fn trust_ring_hint(target_ring: &TrustRing) -> &'static str {
 mod tests {
     use super::*;
     use sinomo_eval::LocalCommandRunner;
+    use sinomo_lm::{
+        LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
+        PROVIDER_DEFAULT_MODEL,
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -975,6 +2015,162 @@ mod tests {
         assert!(prompt.contains("cargo check"));
         assert!(prompt.contains("recovery notes"));
         assert!(prompt.contains("restore the disposable VM snapshot"));
+    }
+
+    #[test]
+    fn bridge_prompt_exposes_candidate_workspace_tools_and_json_contract() {
+        let root = temp_dir("bridge-prompt");
+        fs::create_dir_all(&root).expect("root");
+        let workspace = candidate_workspace(&root);
+        let packet = MutationPacket {
+            job_id: workspace.job_id.clone(),
+            objective: "add mutation evidence".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            edit_scope: EditScope {
+                workspace_root: root.display().to_string(),
+                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                notes: "keep it focused".to_string(),
+            },
+            relevant_files: Vec::new(),
+            verification: VerificationPlan {
+                commands: Vec::new(),
+            },
+            output_contract: MutationOutputContract::default(),
+            recovery: RecoveryPlan::default(),
+        };
+
+        let prompt = render_mutation_bridge_prompt(
+            &packet,
+            &workspace,
+            &EvolutionToolRegistry::bootstrap().descriptors(),
+            true,
+            false,
+        );
+
+        assert!(prompt.contains("Candidate Workspace"));
+        assert!(prompt.contains(&root.display().to_string()));
+        assert!(prompt.contains("apply_patch"));
+        assert!(prompt.contains("Required JSON Response"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn structured_mutation_output_parses_json_and_patch_fences() {
+        let structured = parse_structured_mutation_output(
+            r#"{"changed_files":["src/lib.rs"],"patch":"diff --git a/src/lib.rs b/src/lib.rs","patch_summary":"updated bridge"}"#,
+        )
+        .expect("structured output");
+
+        assert_eq!(structured.changed_files, vec!["src/lib.rs".to_string()]);
+        assert_eq!(structured.patch_summary.as_deref(), Some("updated bridge"));
+
+        let patch = extract_patch_from_text(
+            "notes\n```diff\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n```\n",
+        )
+        .expect("patch");
+        assert!(patch.starts_with("diff --git"));
+    }
+
+    #[test]
+    fn mutation_packet_collects_relevant_source_excerpts_from_intended_paths() {
+        let root = temp_dir("packet-excerpts");
+        fs::create_dir_all(root.join("crates/example/src")).expect("dirs");
+        fs::write(
+            root.join("crates/example/Cargo.toml"),
+            "[package]\nname = \"example\"\n",
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("crates/example/src/lib.rs"),
+            "pub fn example() {}\n",
+        )
+        .expect("lib");
+        let job = create_bootstrap_job(
+            &EvolutionRequest {
+                objective: "collect context".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["crates/example/**".to_string()],
+                verification_commands: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            &root,
+        );
+
+        let packet = mutation_packet_for_job(&job);
+
+        assert!(
+            packet
+                .relevant_files
+                .iter()
+                .any(|file| file.path == "crates/example/Cargo.toml")
+        );
+        assert!(
+            packet
+                .relevant_files
+                .iter()
+                .any(|file| file.path == "crates/example/src/lib.rs")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn language_model_bridge_requests_json_and_applies_returned_patch() {
+        let root = git_repo("bridge-applies-patch");
+        fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
+        run_in(&root, "git add patched.txt").expect("git add");
+        run_in(&root, "git commit -m init").expect("git commit");
+        let workspace = candidate_workspace(&root);
+        let provider = FakeLanguageModelProvider::new(
+            LanguageModelProviderInfo {
+                provider: "fake-json".to_string(),
+                default_model: "fake-model".to_string(),
+                invocation: sinomo_lm::LanguageModelInvocation::Http,
+                supports_json_object: true,
+                supports_tool_permissions: false,
+            },
+            serde_json::json!({
+                "changed_files": ["patched.txt"],
+                "patch": "diff --git a/patched.txt b/patched.txt\n--- a/patched.txt\n+++ b/patched.txt\n@@ -1 +1 @@\n-old\n+new\n",
+                "patch_summary": "updated patched.txt",
+                "verification_notes": "not run",
+                "experiment_notes": "unit test fixture",
+                "recovery_notes": "restore temp repo"
+            })
+            .to_string(),
+        );
+        let requests = provider.requests.clone();
+        let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
+        let packet = MutationPacket {
+            job_id: workspace.job_id.clone(),
+            objective: "apply patch from json provider".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            edit_scope: EditScope {
+                workspace_root: root.display().to_string(),
+                intended_paths: vec!["patched.txt".to_string()],
+                notes: String::new(),
+            },
+            relevant_files: Vec::new(),
+            verification: VerificationPlan {
+                commands: Vec::new(),
+            },
+            output_contract: MutationOutputContract::default(),
+            recovery: RecoveryPlan::default(),
+        };
+
+        let result = bridge.mutate(&packet, &workspace).expect("mutate");
+
+        assert_eq!(
+            requests.borrow()[0].response_format,
+            LanguageModelResponseFormat::JsonObject
+        );
+        assert_eq!(result.summary.as_deref(), Some("updated patched.txt"));
+        assert_eq!(result.parsed_patch.as_deref().is_some(), true);
+        assert_eq!(result.tool_results[0].status, ToolCallStatus::Succeeded);
+        let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
+        assert_eq!(patched.replace("\r\n", "\n"), "new\n");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1048,6 +2244,257 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn git_workspace_adapter_places_worktree_inside_job_folder() {
+        let source = git_repo("git-workspace-layout-source");
+        fs::write(source.join("README.md"), "# source\n").expect("readme");
+        run_in(&source, "git add README.md").expect("git add");
+        run_in(&source, "git commit -m init").expect("git commit");
+        let jobs_root = temp_dir("git-workspace-layout-jobs");
+        let job = create_bootstrap_job(
+            &EvolutionRequest {
+                objective: "layout".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["README.md".to_string()],
+                verification_commands: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            &source,
+        );
+        let adapter = GitWorkspaceAdapter::new(&source, &jobs_root);
+
+        let workspace = adapter.prepare_candidate(&job).expect("candidate");
+
+        assert_eq!(
+            workspace.path,
+            jobs_root.join(job.job_id.as_str()).join("worktree")
+        );
+        assert!(workspace.path.exists());
+        let _ = run_in(
+            &source,
+            &format!("git worktree remove --force {}", workspace.path.display()),
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(jobs_root);
+    }
+
+    #[test]
+    fn bootstrap_tool_registry_exposes_minimal_phase_three_tools() {
+        let registry = EvolutionToolRegistry::bootstrap();
+        let names = registry
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "read_file",
+            "list_files",
+            "search",
+            "apply_patch",
+            "run_command",
+            "git_diff",
+            "git_status",
+            "format",
+            "test",
+        ] {
+            assert!(names.iter().any(|name| name == expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn read_file_tool_returns_content_and_path_evidence() {
+        let root = temp_dir("read-file-tool");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("notes.txt"), "hello tools").expect("write note");
+        let workspace = candidate_workspace(&root);
+        let result = EvolutionToolRegistry::bootstrap().execute(
+            &workspace,
+            EvolutionToolCall {
+                tool: "read_file".to_string(),
+                input: serde_json::json!({ "path": "notes.txt" }),
+            },
+        );
+
+        assert_eq!(result.status, ToolCallStatus::Succeeded);
+        assert_eq!(result.output["content"], "hello tools");
+        assert_eq!(result.evidence.paths, vec!["notes.txt".to_string()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_registry_can_emit_execution_event_with_result_and_changed_files() {
+        let root = git_repo("tool-event");
+        fs::write(root.join("tracked.txt"), "before\n").expect("write tracked");
+        run_in(&root, "git add tracked.txt").expect("git add");
+        run_in(&root, "git commit -m init").expect("git commit");
+        fs::write(root.join("tracked.txt"), "after\n").expect("modify tracked");
+        let workspace = candidate_workspace(&root);
+        let context = EvolutionToolEventContext::new(
+            NodeId::new("node_tool_test").expect("node"),
+            workspace.job_id.clone(),
+        );
+
+        let (result, event) = EvolutionToolRegistry::bootstrap().execute_with_event(
+            &workspace,
+            &context,
+            EvolutionToolCall {
+                tool: "read_file".to_string(),
+                input: serde_json::json!({ "path": "tracked.txt" }),
+            },
+        );
+
+        assert_eq!(result.status, ToolCallStatus::Succeeded);
+        assert_eq!(event.kind.as_str(), "evolution.tool.executed");
+        assert_eq!(event.payload["tool"], "read_file");
+        assert_eq!(event.payload["result"]["status"], "succeeded");
+        assert_eq!(
+            event.payload["changed_files"],
+            serde_json::json!(["tracked.txt"])
+        );
+        assert_eq!(event.evidence.refs.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_command_tool_captures_exit_code_stdout_and_stderr() {
+        let root = temp_dir("run-command-tool");
+        fs::create_dir_all(&root).expect("root");
+        let workspace = candidate_workspace(&root);
+        let result = EvolutionToolRegistry::bootstrap().execute(
+            &workspace,
+            EvolutionToolCall {
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": output_command() }),
+            },
+        );
+
+        assert_eq!(result.status, ToolCallStatus::Succeeded);
+        assert_eq!(result.output["exit_code"], 0);
+        assert!(
+            result.output["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("sinomo-stdout")
+        );
+        assert!(
+            result.output["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("sinomo-stderr")
+        );
+        assert!(result.evidence.command.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_tools_report_status_and_diff_from_candidate_workspace() {
+        let root = git_repo("git-tools");
+        fs::write(root.join("tracked.txt"), "before\n").expect("write tracked");
+        run_in(&root, "git add tracked.txt").expect("git add");
+        run_in(&root, "git commit -m init").expect("git commit");
+        fs::write(root.join("tracked.txt"), "after\n").expect("modify tracked");
+        let workspace = candidate_workspace(&root);
+        let registry = EvolutionToolRegistry::bootstrap();
+
+        let status = registry.execute(
+            &workspace,
+            EvolutionToolCall {
+                tool: "git_status".to_string(),
+                input: serde_json::json!({}),
+            },
+        );
+        let diff = registry.execute(
+            &workspace,
+            EvolutionToolCall {
+                tool: "git_diff".to_string(),
+                input: serde_json::json!({}),
+            },
+        );
+
+        assert_eq!(status.status, ToolCallStatus::Succeeded);
+        assert!(
+            status.output["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("tracked.txt")
+        );
+        assert_eq!(diff.status, ToolCallStatus::Succeeded);
+        assert!(diff.output["stdout"].as_str().unwrap().contains("+after"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_patch_tool_applies_unified_diff_in_candidate_workspace() {
+        let root = git_repo("apply-patch-tool");
+        fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
+        run_in(&root, "git add patched.txt").expect("git add");
+        run_in(&root, "git commit -m init").expect("git commit");
+        let workspace = candidate_workspace(&root);
+        let patch = "\
+diff --git a/patched.txt b/patched.txt
+index 3b18e51..6320cd2 100644
+--- a/patched.txt
++++ b/patched.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let result = EvolutionToolRegistry::bootstrap().execute(
+            &workspace,
+            EvolutionToolCall {
+                tool: "apply_patch".to_string(),
+                input: serde_json::json!({ "patch": patch }),
+            },
+        );
+
+        assert_eq!(result.status, ToolCallStatus::Succeeded);
+        let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
+        assert_eq!(patched.replace("\r\n", "\n"), "new\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeLanguageModelProvider {
+        info: LanguageModelProviderInfo,
+        response: String,
+        requests: Rc<RefCell<Vec<LanguageModelRequest>>>,
+    }
+
+    impl FakeLanguageModelProvider {
+        fn new(info: LanguageModelProviderInfo, response: String) -> Self {
+            Self {
+                info,
+                response,
+                requests: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+    }
+
+    impl LanguageModelProvider for FakeLanguageModelProvider {
+        fn info(&self) -> LanguageModelProviderInfo {
+            self.info.clone()
+        }
+
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.requests.borrow_mut().push(request.clone());
+            Ok(LanguageModelResponse {
+                provider: self.info.provider.clone(),
+                model: self.info.default_model.clone(),
+                content: self.response.clone(),
+                usage: Some(LanguageModelUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(20),
+                }),
+            })
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct FakeWorkspace {
         root: PathBuf,
@@ -1093,5 +2540,45 @@ mod tests {
             .unwrap_or(Duration::ZERO)
             .as_nanos();
         std::env::temp_dir().join(format!("sinomo-evolution-{name}-{stamp}"))
+    }
+
+    fn candidate_workspace(root: &Path) -> CandidateWorkspace {
+        CandidateWorkspace {
+            job_id: EvolutionJobId::new("evojob_tools").expect("job"),
+            path: root.to_path_buf(),
+            branch_name: "codex/evolve/tools".to_string(),
+            source_revision: Some("test".to_string()),
+        }
+    }
+
+    fn git_repo(name: &str) -> PathBuf {
+        let root = temp_dir(name);
+        fs::create_dir_all(&root).expect("root");
+        run_in(&root, "git init").expect("git init");
+        run_in(&root, "git config user.email sinomo@example.test").expect("git email");
+        run_in(&root, "git config user.name Sinomo").expect("git name");
+        root
+    }
+
+    fn run_in(cwd: &Path, command: &str) -> Result<(), String> {
+        let output = super::shell_command(command)
+            .current_dir(cwd)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    #[cfg(windows)]
+    fn output_command() -> &'static str {
+        "Write-Output sinomo-stdout; [Console]::Error.WriteLine('sinomo-stderr')"
+    }
+
+    #[cfg(not(windows))]
+    fn output_command() -> &'static str {
+        "printf sinomo-stdout; printf sinomo-stderr >&2"
     }
 }
