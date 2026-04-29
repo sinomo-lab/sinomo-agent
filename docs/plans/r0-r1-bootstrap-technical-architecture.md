@@ -16,8 +16,8 @@ accept objective
   -> run verification commands
   -> collect changed files and logs
   -> write candidate bundle
-  -> produce human review summary
-  -> keep, revise, or restore VM snapshot
+  -> produce approval evidence
+  -> approve, reject, or restore VM snapshot
 ```
 
 ## Existing Foundation
@@ -145,9 +145,9 @@ pub enum EvolutionJobStatus {
     MutationStarted,
     MutationFinished,
     Verified,
-    ReviewWritten,
-    HumanKept,
-    HumanRejected,
+    AwaitingApproval,
+    Approved,
+    Rejected,
     Revised,
     Restored,
     Failed,
@@ -199,7 +199,6 @@ pub struct CandidateBundleManifest {
     pub changed_files_path: Option<String>,
     pub diff_path: Option<String>,
     pub scorecard_path: Option<String>,
-    pub review_path: Option<String>,
     pub command_logs: Vec<CommandLogRef>,
 }
 
@@ -260,7 +259,6 @@ pub struct EvolutionReport {
     pub bundle: CandidateBundleManifest,
     pub scorecard: Option<EvaluationScorecard>,
     pub changed_files: Vec<String>,
-    pub review_summary: String,
 }
 ```
 
@@ -444,7 +442,7 @@ Responsibilities:
 - write JSON artifacts
 - write command logs
 - write diff
-- write human review markdown
+- write durable evidence artifacts for later approval, replay, and learning
 
 Proposed trait:
 
@@ -468,9 +466,9 @@ Bundle layout:
   changed-files.json
   diff.patch
   scorecard.json
+  approval-decision.json
   command-logs/
     cargo-test.txt
-  human-review.md
   worktree/
 ```
 
@@ -493,9 +491,9 @@ Self-evolution bootstrap events:
 - `bootstrap.evolution.verification.started`
 - `bootstrap.evolution.verification.finished`
 - `bootstrap.evolution.bundle.written`
-- `bootstrap.evolution.review.written`
-- `bootstrap.evolution.human.kept`
-- `bootstrap.evolution.human.rejected`
+- `bootstrap.evolution.awaiting_approval`
+- `bootstrap.evolution.approved`
+- `bootstrap.evolution.rejected`
 - `bootstrap.evolution.restored`
 
 Payloads should include `job_id`, `bundle_path`, `objective`, and relevant artifact paths. The first implementation can append to an in-memory event store and write bundle files; durable event storage can come later.
@@ -509,9 +507,9 @@ After model setup, the minimal loop should be:
 ```powershell
 sinomo evolve propose "implement evolve propose"
 
-# human reviews the candidate in a normal editor or git tool
+# human inspects the candidate in a normal editor or git tool
 
-sinomo evolve keep
+sinomo evolve approve
 ```
 
 Or, if the candidate is bad:
@@ -520,16 +518,22 @@ Or, if the candidate is bad:
 sinomo evolve reject
 ```
 
-If there is exactly one active evolution job, `--job` can be omitted. If multiple jobs exist, `keep` and `reject` require `--job`.
+Or, if the candidate requires snapshot recovery:
+
+```powershell
+sinomo evolve restore --note "restored VM snapshot before retrying"
+```
+
+If there is exactly one active evolution job, `--job` can be omitted. If multiple jobs exist, `approve`, `reject`, and `restore` require `--job`.
 
 ### CLI Principles
 
 - The human provides a natural-language prompt, not a structured job form.
-- Sinomo creates the job, worktree, bundle, verification plan, and review records automatically.
+- Sinomo creates the job, worktree, bundle, verification plan, and evidence records automatically.
 - Verification is automatic. The minimal first verifier can be only `cargo check` or `cargo test --no-run`.
-- Review is automatic. The minimal first implementation may skip model review and assume it passed.
 - Human supervision happens outside the CLI, using normal editor, git, and diff tools.
-- The human-facing decision is only `keep` or `reject`.
+- The human-facing decision is only `approve` or `reject`.
+- `restore` records the recovery decision when a candidate requires VM snapshot or manual repair.
 - The CLI still preserves the job model. Advanced commands can inspect and operate on jobs explicitly.
 
 ### Active Job Resolution
@@ -539,15 +543,15 @@ Most commands that operate on an existing job accept `--job <evojob_id>`, but th
 Resolution rule:
 
 1. If `--job` is provided, use that job.
-2. If exactly one active job is waiting for human decision, use it.
-3. If exactly one active job exists in any non-terminal state, use it for read-only commands such as `status`, `show`, and `review`.
+2. If exactly one active job is awaiting approval, use it.
+3. If exactly one active job exists in any non-terminal state, use it for read-only commands such as `status` and `show`.
 4. If zero jobs match, print a short message saying there is no active job.
 5. If multiple jobs match, print their IDs and ask the user to rerun with `--job`.
 
 Terminal states:
 
-- `HumanKept`
-- `HumanRejected`
+- `Approved`
+- `Rejected`
 - `Restored`
 - `Failed`
 
@@ -555,13 +559,13 @@ This keeps the normal loop tiny:
 
 ```powershell
 sinomo evolve propose "implement evolve propose"
-sinomo evolve keep
+sinomo evolve approve
 ```
 
 while preserving explicit job control for parallel or historical work:
 
 ```powershell
-sinomo evolve keep --job evojob_...
+sinomo evolve approve --job evojob_...
 ```
 
 ### Default Paths
@@ -597,7 +601,6 @@ Minimal flags:
 - `--model <model>` optionally overrides the provider default.
 - `--repo <path>` overrides the configured source repo.
 - `--verify <command>` overrides the default verification command.
-- `--no-review` skips the automatic review step.
 
 Default behavior:
 
@@ -608,8 +611,8 @@ Default behavior:
 5. Write a mutation packet into the candidate bundle.
 6. Invoke the selected model provider through `sinomo-lm`.
 7. Run verification automatically in the candidate worktree.
-8. Run review automatically, or assume review passed if review is not implemented yet.
-9. Write the candidate bundle and job record.
+8. Write the candidate bundle and job record.
+9. Mark the job as awaiting approval.
 10. Print where the human can inspect the worktree and bundle.
 
 Minimal verification:
@@ -630,37 +633,36 @@ Output:
 
 ```text
 job: evojob_...
-status: waiting-human-decision
+status: awaiting-approval
 worktree: C:\Users\IX\.sinomo\evolution\jobs\evojob_...\worktree
 bundle: C:\Users\IX\.sinomo\evolution\jobs\evojob_...
 verification: passed
-review: skipped
-next: inspect the worktree, then run `sinomo evolve keep` or `sinomo evolve reject`
+next: inspect the worktree, then run `sinomo evolve approve` or `sinomo evolve reject`
 ```
 
-### `evolve keep`
+### `evolve approve`
 
-Keeps the active candidate.
+Approves the active candidate.
 
 Example:
 
 ```powershell
-sinomo evolve keep
+sinomo evolve approve
 ```
 
 With multiple active jobs:
 
 ```powershell
-sinomo evolve keep --job evojob_...
+sinomo evolve approve --job evojob_...
 ```
 
 First implementation:
 
-- mark the job as kept
-- record the human decision in the bundle
+- mark the job as approved
+- record `approval-decision.json` in the bundle
 - print the candidate worktree path
 
-Whether `keep` also merges the candidate into the source repo can be decided later. The minimal first version can leave merging manual because the human may prefer to inspect and apply the code with external tools.
+Whether `approve` also merges the candidate into the source repo can be decided later. The minimal first version can leave merging manual because the human may prefer to inspect and apply the code with external tools.
 
 ### `evolve reject`
 
@@ -681,13 +683,30 @@ sinomo evolve reject --job evojob_...
 First implementation:
 
 - mark the job as rejected
-- record the human decision in the bundle
+- record `approval-decision.json` in the bundle
 - keep the bundle
 - optionally leave or delete the worktree depending on a later cleanup policy
 
+### `evolve restore`
+
+Records that the active candidate requires recovery.
+
+Example:
+
+```powershell
+sinomo evolve restore --note "restored VM snapshot before retrying"
+```
+
+First implementation:
+
+- mark the job as restored
+- record `approval-decision.json` with recovery strategy and note
+- keep the bundle as learning material
+- leave actual VM snapshot restore or manual repair to the supervised bootstrap environment
+
 ### Advanced Job Commands
 
-The minimal interface is `propose`, `keep`, and `reject`, but the architecture should keep the richer job workflow available.
+The minimal interface is `propose`, `approve`, and `reject`, with `restore` available for recovery documentation. The architecture should keep the richer job workflow available.
 
 These commands should support the active job resolution rule, so `--job` is only needed when there is ambiguity.
 
@@ -752,7 +771,7 @@ Output should include:
 - candidate worktree path
 - bundle path
 - verification outcome
-- review outcome
+- approval state
 
 #### `evolve show`
 
@@ -762,8 +781,8 @@ Examples:
 
 ```powershell
 sinomo evolve show --diff
-sinomo evolve show --review
 sinomo evolve show --scorecard
+sinomo evolve show --decision
 sinomo evolve show --packet
 ```
 
@@ -774,18 +793,6 @@ sinomo evolve show --job evojob_... --diff
 ```
 
 This is optional because the human can inspect the worktree directly, but it is useful when operating from a terminal.
-
-#### `evolve review`
-
-Runs or regenerates Sinomo's automatic review for the active candidate.
-
-Example:
-
-```powershell
-sinomo evolve review
-```
-
-The first implementation may skip model review and mark it as assumed-passed. Later, this command can invoke another `sinomo-lm` provider call to critique the candidate.
 
 #### `evolve cleanup`
 
@@ -805,11 +812,10 @@ Human-readable output is enough for the first version. Keep it short:
 
 ```text
 job: evojob_...
-status: waiting-human-decision
+status: awaiting-approval
 worktree: C:\Users\IX\.sinomo\evolution\jobs\evojob_...\worktree
 bundle: C:\Users\IX\.sinomo\evolution\jobs\evojob_...
 verification: passed
-review: skipped
 ```
 
 JSON output can be added later when the CLI itself becomes an agent-facing interface.
@@ -823,7 +829,7 @@ sinomo evolve propose "implement evolve propose" --repo "D:\Workspace\sinomo-age
 
 # inspect generated candidate worktree externally
 
-sinomo evolve keep
+sinomo evolve approve
 ```
 
 If the result is not good:
@@ -1014,7 +1020,7 @@ request
   -> optional model mutation
   -> git diff/status
   -> command eval
-  -> review markdown
+  -> approval evidence
   -> report
 ```
 
@@ -1033,8 +1039,9 @@ Files:
 Add:
 
 - parse `evolve propose`
-- parse `evolve keep`
+- parse `evolve approve`
 - parse `evolve reject`
+- parse `evolve restore`
 - implement active job resolution for omitted `--job`
 - parse advanced commands after the minimal loop works:
   - `evolve job create`
@@ -1042,17 +1049,16 @@ Add:
   - `evolve verify`
   - `evolve status`
   - `evolve show`
-  - `evolve review`
   - `evolve cleanup`
 - print bundle path and scorecard summary
 
 Tests:
 
 - parser accepts `evolve propose "<prompt>"`
-- parser accepts optional `--provider`, `--model`, `--repo`, `--verify`, and `--no-review`
-- parser accepts `evolve keep` and `evolve reject` with optional `--job`
-- active job resolution selects the only waiting job
-- active job resolution reports ambiguity when multiple jobs are waiting
+- parser accepts optional `--provider`, `--model`, `--repo`, and `--verify`
+- parser accepts `evolve approve`, `evolve reject`, and `evolve restore` with optional `--job`
+- active job resolution selects the only job awaiting approval
+- active job resolution reports ambiguity when multiple jobs are awaiting approval
 - parser accepts advanced job commands
 - usage includes evolve commands
 
@@ -1071,8 +1077,8 @@ Expected result:
 - candidate bundle written
 - changed files captured
 - tests run
-- human review summary written
-- human decides keep/revise/restore
+- approval evidence written
+- human decides approve/reject/restore
 
 ## Minimal Milestone Cut
 
@@ -1083,9 +1089,10 @@ If we want the smallest possible first implementation, do only:
 3. Real command runner.
 4. Git worktree candidate workspace.
 5. `evolve propose "<prompt>"` that initializes the job folder, invokes the model, writes the bundle, and runs minimal verification.
-6. `evolve keep`.
+6. `evolve approve`.
 7. `evolve reject`.
-8. Active job resolution so `keep` and `reject` can omit `--job`.
+8. `evolve restore`.
+9. Active job resolution so `approve`, `reject`, and `restore` can omit `--job`.
 
 This gives Sinomo the smallest model-driven local evolution loop.
 
@@ -1094,10 +1101,9 @@ After the smallest loop works, add:
 1. `evolve status`
 2. `evolve show`
 3. `evolve verify`
-4. `evolve review`
-5. `evolve job create`
-6. `evolve packet`
-7. `evolve cleanup`
+4. `evolve job create`
+5. `evolve packet`
+6. `evolve cleanup`
 
 ## Settled Design Questions
 
@@ -1112,7 +1118,7 @@ After the smallest loop works, add:
 The architecture is working when Sinomo can run this loop against its own R1 code:
 
 ```text
-objective -> packet -> model/tool attempt -> tests -> bundle -> review -> next iteration
+objective -> packet -> model/tool attempt -> tests -> bundle -> approval decision -> next iteration
 ```
 
 The first version does not need to be autonomous. It needs to make each iteration clear enough that the human and Sinomo can jointly decide what to try next.

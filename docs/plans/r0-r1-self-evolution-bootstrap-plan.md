@@ -16,25 +16,25 @@ human objective
   -> allowed workspace
   -> coding LLM or tool execution
   -> tests, evals, and logs
-  -> steering decision
+  -> verification evidence
   -> candidate record
-  -> human review
-  -> keep, revise, or restore snapshot
+  -> approval decision
+  -> approve, reject, or restore snapshot
 ```
 
 ## Guiding Position
 
 The bootstrap's purpose is to grow R0/R1 from a minimal barebone core into a stronger self-evolution foundation.
 
-R0/R1 are not merely a protective shell around future R3 modules. They are the first living substrate Sinomo needs to improve: the event log, job model, tool substrate, command runner, evaluation records, candidate bundle format, model bridge, and human review loop.
+R0/R1 are not merely a protective shell around future R3 modules. They are the first living substrate Sinomo needs to improve: the event log, job model, tool substrate, command runner, evaluation records, candidate bundle format, model bridge, and approval loop.
 
 Without a minimally working R0/R1 foundation, R3 modules do not have a meaningful place to live. For example, a tool-use prompt is not useful until there is a real tool substrate that defines available tools, runs commands, captures outputs, reports failures, and lets Sinomo iterate on its own tool-use behavior.
 
 Therefore the immediate target is:
 
-> Sinomo can improve its own R0/R1 evolution machinery in a supervised VM, using evidence and human review to decide the next iteration.
+> Sinomo can improve its own R0/R1 evolution machinery in a supervised VM, using evidence and human approval to decide the next iteration.
 
-The first version should be intentionally permissive. It should let Sinomo try real changes to its own foundation, observe what happened, and recover cheaply when those changes are bad. R3 should come later, after the local R0/R1 loop can scope, mutate, evaluate, record, review, and iterate reliably.
+The first version should be intentionally permissive. It should let Sinomo try real changes to its own foundation, observe what happened, and recover cheaply when those changes are bad. R3 should come later, after the local R0/R1 loop can scope, mutate, evaluate, record, approve or reject, and iterate reliably.
 
 ## Bootstrap Lab Assumptions
 
@@ -47,7 +47,7 @@ This plan assumes a controlled lab environment:
 - R0/R1 changes are allowed and expected.
 - The system optimizes for learning speed, trace quality, and repairability.
 
-The bootstrap loop should still track scope, commands, changed files, evidence, and review decisions, but these are primarily cognitive and operational aids. They help Sinomo and the human understand what happened. They are not intended to be hardened security boundaries in this phase.
+The bootstrap loop should still track scope, commands, changed files, evidence, and approval decisions, but these are primarily cognitive and operational aids. They help Sinomo and the human understand what happened. They are not intended to be hardened security boundaries in this phase.
 
 R0 should start tiny and understandable. R1 should start practical and local-first. The first self-evolution loop should improve R0/R1 with human guidance and rapid snapshot recovery.
 
@@ -63,7 +63,7 @@ Each evolution attempt must include:
 - required verification commands
 - expected experiment scope
 - expected artifacts
-- human review checkpoint
+- approval checkpoint
 - recovery note
 
 Current supporting crates:
@@ -104,14 +104,14 @@ R0 responsibilities:
 Near-term implementation work:
 
 - Make edit-scope description a first-class primitive.
-- Add explicit states for `HumanReviewRequested`, `HumanAccepted`, and `HumanRejected`.
+- Add explicit states for `AwaitingApproval`, `Approved`, and `Rejected`.
 - Add structured recovery metadata to every evolution job.
 - Record whether an iteration requires VM snapshot restore, ordinary git revert, or another repair path.
 
 Acceptance criteria:
 
 - R0 data structures are small enough to inspect manually.
-- A failed bootstrap iteration can be understood from recorded job, command, diff, and review data.
+- A failed bootstrap iteration can be understood from recorded job, command, diff, and approval data.
 - R0 contracts help Sinomo resume after a failed experiment rather than trying to prevent every possible failure.
 
 ## Phase 2: R1 Local Evolution Orchestrator
@@ -127,9 +127,9 @@ EvolutionOpportunity
   -> MutationPacket
   -> LLM or tool run
   -> Sandbox/eval run
-  -> SteeringDecision
+  -> VerificationEvidence
   -> CandidateRecord
-  -> HumanReviewRequest
+  -> ApprovalRequest
 ```
 
 Minimum responsibilities:
@@ -140,9 +140,9 @@ Minimum responsibilities:
 - run verification commands
 - collect changed files
 - produce scorecards
-- produce a steering decision
+- produce verification evidence
 - register candidate metadata
-- summarize candidates for human review
+- summarize candidates for approval
 
 Acceptance criteria:
 
@@ -254,7 +254,7 @@ $SINOMO_DATA_DIR/evolution/jobs/evojob_x/
   scorecard.json
   policy-decision.json
   provenance.json
-  human-review.md
+  approval-decision.json
   worktree/
 ```
 
@@ -264,9 +264,9 @@ Acceptance criteria:
 - Sinomo can replay why a candidate was accepted or rejected.
 - Failed candidates become learning material instead of discarded noise.
 
-## Phase 6: Human Review And Keep/Restore
+## Phase 6: Approval And Keep/Restore
 
-For bootstrap, human review is the iteration mechanism.
+For bootstrap, human approval or rejection is the iteration mechanism. The human does not write a review artifact back into Sinomo; they inspect the candidate externally and record only the decision.
 
 Initial state flow:
 
@@ -274,26 +274,25 @@ Initial state flow:
 scoped
   -> candidate-created
   -> verified
-  -> steering-reviewed
-  -> awaiting-human-review
-  -> kept
-  -> revised-or-restored
+  -> awaiting-approval
+  -> approved
+  -> rejected-or-restored
 ```
 
-Review should show:
+Candidate evidence should show:
 
 - objective
 - changed files
 - diff summary
 - tests run
 - scorecard
-- steering decision
 - experiment notes
 - recovery note
+- approval decision, when one has been recorded
 
 Acceptance criteria:
 
-- Keeping a candidate is explicit.
+- Approving a candidate is explicit.
 - Reverting a candidate or restoring a snapshot is documented.
 - R0/R1 can be improved directly during bootstrap.
 
@@ -323,7 +322,7 @@ Deliverables:
 - ask coding LLM for patch or implementation
 - apply in candidate workspace
 - run tests
-- produce review bundle
+- produce evidence bundle
 
 ### Milestone 3: Guided Self-Improvement
 
@@ -335,7 +334,7 @@ Good first targets:
 - better scorecard fields
 - better edit-scope descriptions
 - better candidate bundle format
-- better human review summary
+- better candidate evidence summary
 
 ## Deferred Work
 
@@ -363,7 +362,7 @@ Suggested crate ownership:
 - `sinomo-events`: append/replay event substrate.
 - `sinomo-evolution`: orchestrator, job state, mutation packets, candidate lifecycle.
 - `sinomo-eval`: command execution and scorecard production.
-- `sinomo-policy`: steering decisions and review requirements.
+- `sinomo-policy`: approval requirements and eventual autonomous promotion policy.
 - `sinomo-registry`: candidate and artifact records.
 - `sinomo-sandbox`: execution requests/results, with hardening deferred.
 - `sinomo-cli` or `sinomo`: thin user-facing command wrapper.

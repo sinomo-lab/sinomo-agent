@@ -2,14 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    CandidateBundleManifest, EvaluationGate, EvaluationOutcome, EvolutionJob, EvolutionJobId,
-    EvolutionJobStatus, MutationPacket, TrustRing, VerificationCommand,
+    CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, EvaluationGate,
+    EvaluationOutcome, EvolutionJob, EvolutionJobId, EvolutionJobStatus, MutationPacket, TrustRing,
+    VerificationCommand,
 };
 use sinomo_eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_evolution::{
     CandidateWorkspace, EvolutionOrchestrator, EvolutionReport, EvolutionRequest,
     GitWorkspaceAdapter, LanguageModelMutationBridge, LocalCandidateBundleStore, MutationModel,
-    MutationModelError, parse_git_status_paths,
+    MutationModelError,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -66,6 +67,8 @@ struct StoredEvolutionJob {
     verification_outcome: Option<EvaluationOutcome>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision: Option<CandidateDecision>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,16 +116,18 @@ impl EvolutionPaths {
 fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
     match args.split_first() {
         Some((command, rest)) if command == "propose" => evolve_propose(rest),
-        Some((command, rest)) if command == "keep" => {
-            evolve_decide(rest, EvolutionJobStatus::HumanKept)
+        Some((command, rest)) if command == "approve" => {
+            evolve_decide(rest, CandidateDecisionOutcome::Approved)
         }
         Some((command, rest)) if command == "reject" => {
-            evolve_decide(rest, EvolutionJobStatus::HumanRejected)
+            evolve_decide(rest, CandidateDecisionOutcome::Rejected)
+        }
+        Some((command, rest)) if command == "restore" => {
+            evolve_decide(rest, CandidateDecisionOutcome::Restored)
         }
         Some((command, rest)) if command == "status" => evolve_status(rest),
         Some((command, rest)) if command == "show" => evolve_show(rest),
         Some((command, rest)) if command == "verify" => evolve_verify(rest),
-        Some((command, rest)) if command == "review" => evolve_review(rest),
         Some((command, rest)) if command == "packet" => evolve_show_packet(rest),
         Some((command, rest)) if command == "cleanup" => evolve_cleanup(rest),
         Some((command, rest)) if command == "job" => evolve_job(rest),
@@ -207,33 +212,35 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn evolve_decide(args: &[String], status: EvolutionJobStatus) -> Result<(), CliError> {
+fn evolve_decide(args: &[String], outcome: CandidateDecisionOutcome) -> Result<(), CliError> {
     let (paths, mut record) = resolve_job_from_args(args, true)?;
-    record.job.status = status.clone();
+    ensure_awaiting_approval(&record)?;
+    let note = flag_value(args, "--note").unwrap_or_default();
+    let decision = CandidateDecision::new(
+        &record.job,
+        outcome,
+        "cli-supervisor",
+        record.candidate_workspace.path.display().to_string(),
+        record.bundle.bundle_path.clone(),
+        record.verification_outcome.clone(),
+        record.changed_files.clone(),
+        note,
+    );
+    let decision_path = PathBuf::from(&record.bundle.bundle_path).join("approval-decision.json");
+    write_json(&decision_path, &decision)?;
+    record.job.status = decision.resulting_status.clone();
+    record.bundle.decision_path = Some(decision_path.display().to_string());
+    record.decision = Some(decision);
+    write_bundle_manifest(&record)?;
+    if let Some(job_path) = &record.bundle.job_path {
+        write_json(Path::new(job_path), &record.job)?;
+    }
     write_stored_job(&paths, &record)?;
-    let decision = match status {
-        EvolutionJobStatus::HumanKept => "kept",
-        EvolutionJobStatus::HumanRejected => "rejected",
-        _ => "updated",
-    };
-    let path = PathBuf::from(&record.bundle.bundle_path).join("human-decision.md");
-    fs::write(
-        &path,
-        format!(
-            "# Human Decision\n\njob: {}\ndecision: {}\nworktree: {}\n",
-            record.job.job_id,
-            decision,
-            record.candidate_workspace.path.display()
-        ),
-    )
-    .map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
     println!("job: {}", record.job.job_id);
     println!("status: {}", job_status_label(&record.job.status));
     println!("worktree: {}", record.candidate_workspace.path.display());
     println!("bundle: {}", record.bundle.bundle_path);
+    println!("decision: {}", decision_path.display());
     Ok(())
 }
 
@@ -269,14 +276,14 @@ fn evolve_show(args: &[String]) -> Result<(), CliError> {
     let (_paths, record) = resolve_job_from_args(args, false)?;
     let artifact = if has_flag(args, "--diff") {
         record.bundle.diff_path.clone()
-    } else if has_flag(args, "--review") {
-        record.bundle.review_path.clone()
     } else if has_flag(args, "--scorecard") {
         record.bundle.scorecard_path.clone()
+    } else if has_flag(args, "--decision") {
+        record.bundle.decision_path.clone()
     } else if has_flag(args, "--packet") {
         Some(record.bundle.mutation_packet_path.clone())
     } else {
-        record.bundle.review_path.clone()
+        record.bundle.diff_path.clone()
     }
     .ok_or_else(|| CliError::MissingArtifact {
         artifact: "requested artifact".to_string(),
@@ -335,39 +342,6 @@ fn evolve_verify(args: &[String]) -> Result<(), CliError> {
     println!("job: {}", record.job.job_id);
     println!("verification: {}", outcome_label(&scorecard.outcome));
     println!("scorecard: {}", scorecard_path.display());
-    Ok(())
-}
-
-fn evolve_review(args: &[String]) -> Result<(), CliError> {
-    let (paths, mut record) = resolve_job_from_args(args, false)?;
-    let changed_files = current_changed_files(&record.candidate_workspace.path)?;
-    let review = format!(
-        "# Sinomo Evolution Candidate\n\njob: {}\nstatus: {}\nobjective: {}\nworktree: {}\nverification: {}\nchanged_files:\n{}\n\nrecovery: {}\n",
-        record.job.job_id,
-        job_status_label(&record.job.status),
-        record.job.objective,
-        record.candidate_workspace.path.display(),
-        record
-            .verification_outcome
-            .as_ref()
-            .map(outcome_label)
-            .unwrap_or("unknown"),
-        changed_files
-            .iter()
-            .map(|path| format!("- {path}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        record.job.recovery.note
-    );
-    let review_path = PathBuf::from(&record.bundle.bundle_path).join("human-review.md");
-    fs::write(&review_path, review).map_err(|source| CliError::Io {
-        path: review_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    record.bundle.review_path = Some(review_path.display().to_string());
-    record.changed_files = changed_files;
-    write_stored_job(&paths, &record)?;
-    println!("review: {}", review_path.display());
     Ok(())
 }
 
@@ -661,7 +635,6 @@ fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, CliError> {
             "--dry-run" | "--no-model" => {
                 dry_run = true;
             }
-            "--no-review" => {}
             value if value.starts_with("--") => return Err(CliError::Usage),
             value => {
                 objective = Some(value.to_string());
@@ -815,12 +788,20 @@ fn write_report_record(paths: &EvolutionPaths, report: &EvolutionReport) -> Resu
             .as_ref()
             .map(|scorecard| scorecard.outcome.clone()),
         changed_files: report.changed_files.clone(),
+        decision: None,
     };
     write_stored_job(paths, &record)?;
     if let Some(job_path) = &record.bundle.job_path {
         write_json(Path::new(job_path), &record.job)?;
     }
     Ok(())
+}
+
+fn write_bundle_manifest(record: &StoredEvolutionJob) -> Result<(), CliError> {
+    write_json(
+        &PathBuf::from(&record.bundle.bundle_path).join("manifest.json"),
+        &record.bundle,
+    )
 }
 
 fn write_stored_job(paths: &EvolutionPaths, record: &StoredEvolutionJob) -> Result<(), CliError> {
@@ -887,7 +868,7 @@ fn resolve_job_from_args(
         .into_iter()
         .filter(|record| {
             if waiting_only {
-                record.job.status == EvolutionJobStatus::HumanReviewRequested
+                record.job.status == EvolutionJobStatus::AwaitingApproval
             } else {
                 !is_terminal_status(&record.job.status)
             }
@@ -903,6 +884,17 @@ fn resolve_job_from_args(
                 .collect(),
         }),
     }
+}
+
+fn ensure_awaiting_approval(record: &StoredEvolutionJob) -> Result<(), CliError> {
+    if record.job.status == EvolutionJobStatus::AwaitingApproval {
+        return Ok(());
+    }
+    Err(CliError::InvalidJobState {
+        job_id: record.job.job_id.to_string(),
+        status: job_status_label(&record.job.status).to_string(),
+        expected: "awaiting-approval".to_string(),
+    })
 }
 
 fn read_config(paths: &EvolutionPaths) -> Result<EvolutionConfig, CliError> {
@@ -933,25 +925,6 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
     })
 }
 
-fn current_changed_files(worktree: &Path) -> Result<Vec<String>, CliError> {
-    let output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(worktree)
-        .output()
-        .map_err(|source| CliError::Io {
-            path: worktree.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(CliError::Io {
-            path: worktree.display().to_string(),
-            detail: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
-    }
-    parse_git_status_paths(&String::from_utf8_lossy(&output.stdout))
-        .map_err(|detail| CliError::Parse { detail })
-}
-
 fn println_report(report: &EvolutionReport) {
     let verification = report
         .scorecard
@@ -963,14 +936,6 @@ fn println_report(report: &EvolutionReport) {
     println!("worktree: {}", report.candidate_workspace.path.display());
     println!("bundle: {}", report.bundle.bundle_path);
     println!("verification: {verification}");
-    println!(
-        "review: {}",
-        report
-            .bundle
-            .review_path
-            .as_deref()
-            .unwrap_or("not-written")
-    );
 }
 
 fn print_job_status(record: &StoredEvolutionJob) {
@@ -987,6 +952,9 @@ fn print_job_status(record: &StoredEvolutionJob) {
             .map(outcome_label)
             .unwrap_or("unknown")
     );
+    if let Some(decision) = &record.decision {
+        println!("decision: {}", decision_outcome_label(&decision.outcome));
+    }
     println!();
 }
 
@@ -1026,8 +994,8 @@ fn parse_trust_ring(value: &str) -> Result<TrustRing, CliError> {
 fn is_terminal_status(status: &EvolutionJobStatus) -> bool {
     matches!(
         status,
-        EvolutionJobStatus::HumanKept
-            | EvolutionJobStatus::HumanRejected
+        EvolutionJobStatus::Approved
+            | EvolutionJobStatus::Rejected
             | EvolutionJobStatus::Restored
             | EvolutionJobStatus::Failed
     )
@@ -1035,9 +1003,9 @@ fn is_terminal_status(status: &EvolutionJobStatus) -> bool {
 
 fn job_status_label(status: &EvolutionJobStatus) -> &'static str {
     match status {
-        EvolutionJobStatus::HumanReviewRequested => "waiting-human-decision",
-        EvolutionJobStatus::HumanKept => "human-kept",
-        EvolutionJobStatus::HumanRejected => "human-rejected",
+        EvolutionJobStatus::AwaitingApproval => "awaiting-approval",
+        EvolutionJobStatus::Approved => "approved",
+        EvolutionJobStatus::Rejected => "rejected",
         EvolutionJobStatus::Created => "created",
         EvolutionJobStatus::Failed => "failed",
         _ => "in-progress",
@@ -1049,6 +1017,14 @@ fn outcome_label(outcome: &EvaluationOutcome) -> &'static str {
         EvaluationOutcome::Passed => "passed",
         EvaluationOutcome::Failed => "failed",
         EvaluationOutcome::Inconclusive => "inconclusive",
+    }
+}
+
+fn decision_outcome_label(outcome: &CandidateDecisionOutcome) -> &'static str {
+    match outcome {
+        CandidateDecisionOutcome::Approved => "approved",
+        CandidateDecisionOutcome::Rejected => "rejected",
+        CandidateDecisionOutcome::Restored => "restored",
     }
 }
 
@@ -1378,11 +1354,12 @@ pub fn print_usage() {
     println!(
         "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider github-copilot] [--verify \"cargo check\"]"
     );
-    println!("  sinomo evolve keep [--job evojob_...]");
-    println!("  sinomo evolve reject [--job evojob_...]");
+    println!("  sinomo evolve approve [--job evojob_...] [--note <note>]");
+    println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
+    println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve status [--job evojob_...]");
-    println!("  sinomo evolve show [--diff|--review|--scorecard|--packet] [--job evojob_...]");
-    println!("  sinomo evolve verify|review|packet|cleanup [--job evojob_...]");
+    println!("  sinomo evolve show [--diff|--scorecard|--decision|--packet] [--job evojob_...]");
+    println!("  sinomo evolve verify|packet|cleanup [--job evojob_...]");
     println!("  sinomo evolve models list [--provider <provider>]");
     println!(
         "  sinomo evolve models default --provider <provider> --model <model> [--repo <path>]"
@@ -1435,13 +1412,32 @@ pub enum CliError {
     Usage,
     AuthDenied,
     AuthExpired,
-    AuthProvider { detail: String },
+    AuthProvider {
+        detail: String,
+    },
     NoActiveJob,
-    AmbiguousJob { job_ids: Vec<String> },
-    MissingArtifact { artifact: String },
-    Parse { detail: String },
-    Io { path: String, detail: String },
-    Json { path: String, detail: String },
+    AmbiguousJob {
+        job_ids: Vec<String>,
+    },
+    InvalidJobState {
+        job_id: String,
+        status: String,
+        expected: String,
+    },
+    MissingArtifact {
+        artifact: String,
+    },
+    Parse {
+        detail: String,
+    },
+    Io {
+        path: String,
+        detail: String,
+    },
+    Json {
+        path: String,
+        detail: String,
+    },
     LocalData(sinomo_local::LocalDataError),
     LanguageModel(LanguageModelError),
     Evolution(sinomo_evolution::EvolutionError),
@@ -1487,6 +1483,14 @@ impl std::fmt::Display for CliError {
                     job_ids.join(", ")
                 )
             }
+            Self::InvalidJobState {
+                job_id,
+                status,
+                expected,
+            } => write!(
+                formatter,
+                "evolution job {job_id} is {status}; expected {expected}"
+            ),
             Self::MissingArtifact { artifact } => {
                 write!(formatter, "{artifact} has not been written")
             }
@@ -1636,11 +1640,9 @@ mod tests {
 
     #[test]
     fn active_job_terminal_statuses_are_explicit() {
-        assert!(is_terminal_status(&EvolutionJobStatus::HumanKept));
-        assert!(is_terminal_status(&EvolutionJobStatus::HumanRejected));
-        assert!(!is_terminal_status(
-            &EvolutionJobStatus::HumanReviewRequested
-        ));
+        assert!(is_terminal_status(&EvolutionJobStatus::Approved));
+        assert!(is_terminal_status(&EvolutionJobStatus::Rejected));
+        assert!(!is_terminal_status(&EvolutionJobStatus::AwaitingApproval));
     }
 
     #[test]

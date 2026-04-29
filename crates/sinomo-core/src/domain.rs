@@ -633,7 +633,7 @@ pub struct CandidateBundleManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scorecard_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_path: Option<String>,
+    pub decision_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_logs: Vec<CommandLogRef>,
 }
@@ -655,11 +655,9 @@ pub enum EvolutionJobStatus {
     MutationStarted,
     MutationFinished,
     Verified,
-    ReviewWritten,
-    HumanReviewRequested,
-    HumanKept,
-    HumanRejected,
-    HumanAccepted,
+    AwaitingApproval,
+    #[serde(alias = "human-kept")]
+    Approved,
     Revised,
     Restored,
     Failed,
@@ -674,12 +672,79 @@ pub enum EvolutionJobStatus {
     Shadowed,
     Canary,
     Promoted,
+    #[serde(alias = "human-rejected")]
     Rejected,
     BuildFailed,
     EvalFailed,
     Denied,
     RolledBack,
     Reverted,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateDecision {
+    pub job_id: EvolutionJobId,
+    pub outcome: CandidateDecisionOutcome,
+    #[serde(with = "time::serde::rfc3339")]
+    pub decided_at: OffsetDateTime,
+    pub decided_by: String,
+    pub resulting_status: EvolutionJobStatus,
+    pub objective: String,
+    pub worktree_path: String,
+    pub bundle_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_outcome: Option<EvaluationOutcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    pub recovery: RecoveryPlan,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl CandidateDecision {
+    pub fn new(
+        job: &EvolutionJob,
+        outcome: CandidateDecisionOutcome,
+        decided_by: impl Into<String>,
+        worktree_path: impl Into<String>,
+        bundle_path: impl Into<String>,
+        verification_outcome: Option<EvaluationOutcome>,
+        changed_files: Vec<String>,
+        note: impl Into<String>,
+    ) -> Self {
+        Self {
+            job_id: job.job_id.clone(),
+            outcome: outcome.clone(),
+            decided_at: OffsetDateTime::now_utc(),
+            decided_by: decided_by.into(),
+            resulting_status: outcome.resulting_status(),
+            objective: job.objective.clone(),
+            worktree_path: worktree_path.into(),
+            bundle_path: bundle_path.into(),
+            verification_outcome,
+            changed_files,
+            recovery: job.recovery.clone(),
+            note: note.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CandidateDecisionOutcome {
+    Approved,
+    Rejected,
+    Restored,
+}
+
+impl CandidateDecisionOutcome {
+    pub fn resulting_status(&self) -> EvolutionJobStatus {
+        match self {
+            Self::Approved => EvolutionJobStatus::Approved,
+            Self::Rejected => EvolutionJobStatus::Rejected,
+            Self::Restored => EvolutionJobStatus::Restored,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -922,5 +987,32 @@ mod tests {
                 .iter()
                 .any(|section| section == "changed files")
         );
+    }
+
+    #[test]
+    fn candidate_decision_maps_to_lifecycle_status() {
+        assert_eq!(
+            CandidateDecisionOutcome::Approved.resulting_status(),
+            EvolutionJobStatus::Approved
+        );
+        assert_eq!(
+            CandidateDecisionOutcome::Rejected.resulting_status(),
+            EvolutionJobStatus::Rejected
+        );
+        assert_eq!(
+            CandidateDecisionOutcome::Restored.resulting_status(),
+            EvolutionJobStatus::Restored
+        );
+    }
+
+    #[test]
+    fn legacy_human_decision_statuses_deserialize_to_approval_states() {
+        let approved: EvolutionJobStatus =
+            serde_json::from_str("\"human-kept\"").expect("approved alias");
+        let rejected: EvolutionJobStatus =
+            serde_json::from_str("\"human-rejected\"").expect("rejected alias");
+
+        assert_eq!(approved, EvolutionJobStatus::Approved);
+        assert_eq!(rejected, EvolutionJobStatus::Rejected);
     }
 }

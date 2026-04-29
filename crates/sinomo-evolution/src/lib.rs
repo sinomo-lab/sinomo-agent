@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
     CandidateBundleManifest, CommandLogRef, Confidence, EditScope, EvaluationGate,
-    EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob,
-    EvolutionJobId, EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass, ModuleId,
+    EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob, EvolutionJobId,
+    EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass, ModuleId,
     MutationOutputContract, MutationPacket, NodeId, PrivacyClass, RecoveryPlan, RollbackPolicy,
     RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing, VerificationCommand,
     VerificationPlan, WorkspaceId,
@@ -72,7 +72,6 @@ pub struct EvolutionReport {
     pub scorecard: Option<EvaluationScorecard>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_files: Vec<String>,
-    pub review_summary: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -333,7 +332,7 @@ impl CandidateBundleStore for LocalCandidateBundleStore {
             changed_files_path: None,
             diff_path: None,
             scorecard_path: None,
-            review_path: None,
+            decision_path: None,
             command_logs: Vec::new(),
         };
         self.write_manifest(&manifest)?;
@@ -716,7 +715,7 @@ pub fn render_mutation_bridge_prompt(
     prompt.push_str("\n## Mutation Mode\n");
     if direct_edit {
         prompt.push_str(
-            "Edit files directly in the candidate workspace. Return concise review notes after the edits.\n",
+            "Edit files directly in the candidate workspace. Return concise evidence notes after the edits.\n",
         );
     } else {
         prompt.push_str(
@@ -733,7 +732,7 @@ pub fn render_mutation_bridge_prompt(
             "`tool_calls` is an array of objects shaped like `{ \"tool\": \"read_file\", \"input\": { ... } }`. Use it when you need more context or want Sinomo to run a command before finalizing. When ready, leave `tool_calls` empty and provide `patch` or final notes.\n",
         );
         if direct_edit {
-            prompt.push_str("When files were edited directly, set patch to null unless you also have a useful review diff.\n");
+            prompt.push_str("When files were edited directly, set patch to null unless you also have a useful evidence diff.\n");
         }
     }
     prompt
@@ -741,7 +740,7 @@ pub fn render_mutation_bridge_prompt(
 
 fn render_mutation_system_prompt(structured_json: bool, direct_edit: bool) -> String {
     let mut prompt = String::from(
-        "You are Sinomo's supervised bootstrap mutation worker. Work only on the requested R0/R1 candidate and produce reviewable evidence.",
+        "You are Sinomo's supervised bootstrap mutation worker. Work only on the requested R0/R1 candidate and produce durable evidence.",
     );
     if direct_edit {
         prompt.push_str(
@@ -749,7 +748,7 @@ fn render_mutation_system_prompt(structured_json: bool, direct_edit: bool) -> St
         );
     } else {
         prompt.push_str(
-            " You cannot edit files directly; produce a reviewable patch that Sinomo can apply as a candidate.",
+            " You cannot edit files directly; produce an inspectable patch that Sinomo can apply as a candidate.",
         );
     }
     if structured_json {
@@ -860,7 +859,6 @@ where
         self.bundles
             .write_json(&bundle, "mutation-packet.json", &packet)?;
 
-        let mut model_result = None;
         if request.dry_run {
             // Dry-run proposals only prepare candidate artifacts and verification evidence.
         } else if let Some(model) = model {
@@ -889,7 +887,6 @@ where
                     .display()
                     .to_string(),
             );
-            model_result = Some(result);
         }
 
         let changed_files = self.workspace.changed_files(&candidate_workspace)?;
@@ -926,33 +923,17 @@ where
                 .to_string(),
         );
 
-        let review_summary = human_review_summary(
-            &job,
-            &candidate_workspace,
-            &changed_files,
-            &scorecard,
-            model_result.as_ref(),
-        );
-        self.bundles
-            .write_text(&bundle, "human-review.md", &review_summary)?;
-        bundle.review_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("human-review.md")
-                .display()
-                .to_string(),
-        );
         self.bundles.write_json(&bundle, "manifest.json", &bundle)?;
 
         Ok(EvolutionReport {
             job: EvolutionJob {
-                status: EvolutionJobStatus::HumanReviewRequested,
+                status: EvolutionJobStatus::AwaitingApproval,
                 ..job
             },
             candidate_workspace,
             bundle,
             scorecard: Some(scorecard),
             changed_files,
-            review_summary,
         })
     }
 }
@@ -1099,59 +1080,6 @@ fn is_relevant_source_file(path: &Path) -> bool {
         path.extension().and_then(|extension| extension.to_str()),
         Some("rs" | "toml" | "md" | "json")
     )
-}
-
-fn human_review_summary(
-    job: &EvolutionJob,
-    workspace: &CandidateWorkspace,
-    changed_files: &[String],
-    scorecard: &EvaluationScorecard,
-    model_result: Option<&ModelMutationResult>,
-) -> String {
-    let verification = match scorecard.outcome {
-        EvaluationOutcome::Passed => "passed",
-        EvaluationOutcome::Failed => "failed",
-        EvaluationOutcome::Inconclusive => "inconclusive",
-    };
-    let mut summary = format!(
-        "# Sinomo Evolution Candidate\n\njob: {}\nstatus: awaiting-human-review\nobjective: {}\nworktree: {}\nbranch: {}\nverification: {}\nchanged_files:\n{}\n\nrecovery: {}\n",
-        job.job_id,
-        job.objective,
-        workspace.path.display(),
-        workspace.branch_name,
-        verification,
-        changed_files
-            .iter()
-            .map(|path| format!("- {path}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        job.recovery.note
-    );
-    if let Some(model_result) = model_result {
-        summary.push_str("\n## Model Result\n");
-        summary.push_str(&format!(
-            "provider: {}\nmodel: {}\n",
-            model_result.provider, model_result.model
-        ));
-        if let Some(model_summary) = &model_result.summary {
-            summary.push_str(&format!("summary: {model_summary}\n"));
-        }
-        if let Some(output) = &model_result.structured_output {
-            if let Some(notes) = &output.verification_notes {
-                summary.push_str(&format!("verification_notes: {notes}\n"));
-            }
-            if let Some(notes) = &output.recovery_notes {
-                summary.push_str(&format!("recovery_notes: {notes}\n"));
-            }
-        }
-        for tool_result in &model_result.tool_results {
-            summary.push_str(&format!(
-                "tool {}: {:?} ({})\n",
-                tool_result.tool, tool_result.status, tool_result.evidence.summary
-            ));
-        }
-    }
-    summary
 }
 
 fn write_command_log_via_store<B: CandidateBundleStore>(
@@ -1378,6 +1306,7 @@ fn trust_ring_hint(target_ring: &TrustRing) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::EvaluationOutcome;
     use sinomo_eval::LocalCommandRunner;
     use sinomo_lm::{
         LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
@@ -1805,7 +1734,7 @@ mod tests {
             )
             .expect("dry run propose");
 
-        assert_eq!(report.job.status, EvolutionJobStatus::HumanReviewRequested);
+        assert_eq!(report.job.status, EvolutionJobStatus::AwaitingApproval);
         assert_eq!(
             report.scorecard.as_ref().expect("scorecard").outcome,
             EvaluationOutcome::Passed
