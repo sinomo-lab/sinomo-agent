@@ -214,19 +214,28 @@ The output contract should ask for:
 - verification notes
 - experiment notes
 - recovery notes
+- optional tool calls when the model needs Sinomo to inspect files, run commands, or apply intermediate edits
 
-The first LLM bridge can be simple:
+The first LLM bridge should be solid enough to support both process coding agents and direct API models:
 
 - generate a prompt from the mutation packet
 - call an existing provider from `sinomo-lm`
-- receive a patch or structured implementation notes
-- optionally hand off to a process coding agent such as a Codex CLI or Claude Code style provider
+- include the candidate workspace path and tool registry descriptors
+- for direct API models, accept structured JSON with `tool_calls`
+- execute tool calls through the R1 tool registry and feed results back into the next model turn
+- receive a final patch or structured implementation notes
+- apply final patches as candidate edits through `apply_patch`
+- record raw output, model turns, tool results, and parsed summaries as bundle evidence
+- for process coding agents such as Codex CLI or Claude Code, let the provider edit the candidate worktree directly behind the `sinomo-lm` abstraction
+- treat target ring as metadata only until the VM/ring separation exists
 
 Acceptance criteria:
 
 - The LLM sees a focused packet that helps it work on the intended part of R0/R1.
 - The LLM result is treated as a candidate, not truth.
 - The candidate must produce enough evidence for the next human-guided iteration.
+- Non-agent API models can use Sinomo tools instead of requiring an external coding-agent CLI.
+- Patch application failures are explicit candidate failures, not silent successes.
 
 ## Phase 5: Evidence And Candidate Bundles
 

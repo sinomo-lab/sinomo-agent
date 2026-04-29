@@ -387,13 +387,17 @@ Responsibilities:
 - render `MutationPacket` into a prompt
 - call selected `LanguageModelProvider`
 - save raw model output
-- optionally parse patch/summary
+- parse structured mutation output when available
+- run model-requested tool calls through `EvolutionToolRegistry`
+- feed tool results back into later model turns
+- apply the final returned patch through `apply_patch` for non-agent providers
+- record raw output, parsed output, model turns, and tool results
 
 Proposed trait:
 
 ```rust
 pub trait MutationModel {
-    fn mutate(&self, packet: &MutationPacket) -> Result<ModelMutationResult, MutationModelError>;
+    fn mutate(&self, packet: &MutationPacket, workspace: &CandidateWorkspace) -> Result<ModelMutationResult, MutationModelError>;
 }
 
 pub struct ModelMutationResult {
@@ -402,6 +406,19 @@ pub struct ModelMutationResult {
     pub raw_output: String,
     pub parsed_patch: Option<String>,
     pub summary: Option<String>,
+    pub structured_output: Option<StructuredMutationOutput>,
+    pub tool_results: Vec<EvolutionToolResult>,
+    pub model_turns: Vec<MutationModelTurn>,
+}
+
+pub struct StructuredMutationOutput {
+    pub tool_calls: Vec<EvolutionToolCall>,
+    pub changed_files: Vec<String>,
+    pub patch: Option<String>,
+    pub patch_summary: Option<String>,
+    pub verification_notes: Option<String>,
+    pub experiment_notes: Option<String>,
+    pub recovery_notes: Option<String>,
 }
 ```
 
@@ -409,8 +426,9 @@ First provider path:
 
 - all model calls are routed through `sinomo-lm`
 - the CLI selects the provider through a common provider flag
-- direct HTTP providers can generate structured plans or review text
+- direct HTTP/API providers can request Sinomo tools, inspect tool results, and return a final patch
 - process coding-agent providers can perform real code editing in the candidate worktree
+- target ring is carried as metadata but ignored by the bridge until VM/ring separation exists
 
 Important design choice:
 

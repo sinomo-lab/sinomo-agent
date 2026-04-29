@@ -423,21 +423,35 @@ pub struct ModelMutationResult {
     pub structured_output: Option<StructuredMutationOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_results: Vec<EvolutionToolResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_turns: Vec<MutationModelTurn>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MutationModelTurn {
+    pub turn: usize,
+    pub raw_output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<StructuredMutationOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<EvolutionToolResult>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct StructuredMutationOutput {
-    #[serde(default)]
+    #[serde(default, alias = "changedFiles")]
     pub changed_files: Vec<String>,
+    #[serde(default, alias = "toolCalls")]
+    pub tool_calls: Vec<EvolutionToolCall>,
     #[serde(default, alias = "unified_diff")]
     pub patch: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "patchSummary")]
     pub patch_summary: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "verificationNotes")]
     pub verification_notes: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "experimentNotes")]
     pub experiment_notes: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "recoveryNotes")]
     pub recovery_notes: Option<String>,
 }
 
@@ -445,6 +459,7 @@ pub struct LanguageModelMutationBridge<P> {
     provider: P,
     model: String,
     tool_registry: EvolutionToolRegistry,
+    max_tool_rounds: usize,
 }
 
 impl<P> LanguageModelMutationBridge<P> {
@@ -453,11 +468,17 @@ impl<P> LanguageModelMutationBridge<P> {
             provider,
             model: model.into(),
             tool_registry: EvolutionToolRegistry::bootstrap(),
+            max_tool_rounds: 4,
         }
     }
 
     pub fn with_tool_registry(mut self, tool_registry: EvolutionToolRegistry) -> Self {
         self.tool_registry = tool_registry;
+        self
+    }
+
+    pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
+        self.max_tool_rounds = max_tool_rounds;
         self
     }
 }
@@ -475,57 +496,122 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
             LanguageModelResponseFormat::Text
         };
         let direct_edit = info.supports_tool_permissions;
-        let request = LanguageModelRequest {
-            provider: info.provider.clone(),
-            model: self.model.clone(),
-            messages: vec![
-                LanguageModelMessage {
-                    role: LanguageModelRole::System,
-                    content: render_mutation_system_prompt(
-                        response_format == LanguageModelResponseFormat::JsonObject,
-                        direct_edit,
-                    ),
-                },
-                LanguageModelMessage {
+        let structured_response = !direct_edit;
+        let descriptors = self.tool_registry.descriptors();
+        let mut messages = vec![
+            LanguageModelMessage {
+                role: LanguageModelRole::System,
+                content: render_mutation_system_prompt(structured_response, direct_edit),
+            },
+            LanguageModelMessage {
+                role: LanguageModelRole::User,
+                content: render_mutation_bridge_prompt(
+                    packet,
+                    workspace,
+                    &descriptors,
+                    structured_response,
+                    direct_edit,
+                ),
+            },
+        ];
+        let mut model_turns = Vec::new();
+        let mut all_tool_results = Vec::new();
+        let mut final_response = None;
+
+        for turn in 1..=self.max_tool_rounds.max(1) {
+            let request = LanguageModelRequest {
+                provider: info.provider.clone(),
+                model: self.model.clone(),
+                messages: messages.clone(),
+                temperature: Some(0.2),
+                max_output_tokens: None,
+                response_format: response_format.clone(),
+                metadata: serde_json::json!({
+                    "job_id": packet.job_id,
+                    "candidate_workspace": workspace.path,
+                    "direct_edit": direct_edit,
+                    "target_ring_policy": "ignored-during-bootstrap",
+                    "turn": turn,
+                    "max_tool_rounds": self.max_tool_rounds,
+                }),
+            };
+            let response = self.provider.complete(&request)?;
+            let structured_output = parse_structured_mutation_output(&response.content);
+            let tool_calls = if direct_edit {
+                Vec::new()
+            } else {
+                structured_output
+                    .as_ref()
+                    .map(|output| output.tool_calls.clone())
+                    .unwrap_or_default()
+            };
+            let mut turn_tool_results = Vec::new();
+            for call in tool_calls {
+                let result = self.tool_registry.execute(workspace, call);
+                turn_tool_results.push(result.clone());
+                all_tool_results.push(result);
+            }
+            model_turns.push(MutationModelTurn {
+                turn,
+                raw_output: response.content.clone(),
+                structured_output: structured_output.clone(),
+                tool_results: turn_tool_results.clone(),
+            });
+
+            let has_final_patch = structured_output
+                .as_ref()
+                .and_then(|output| output.patch.as_ref())
+                .is_some_and(|patch| !patch.trim().is_empty());
+            let has_text_patch = extract_patch_from_text(&response.content).is_some();
+            if !direct_edit && !turn_tool_results.is_empty() && !has_final_patch && !has_text_patch
+            {
+                if turn >= self.max_tool_rounds.max(1) {
+                    return Err(MutationModelError::ToolRoundLimitExceeded {
+                        max_rounds: self.max_tool_rounds,
+                    });
+                }
+                messages.push(LanguageModelMessage {
+                    role: LanguageModelRole::Assistant,
+                    content: response.content,
+                });
+                messages.push(LanguageModelMessage {
                     role: LanguageModelRole::User,
-                    content: render_mutation_bridge_prompt(
-                        packet,
-                        workspace,
-                        &self.tool_registry.descriptors(),
-                        response_format == LanguageModelResponseFormat::JsonObject,
-                        direct_edit,
-                    ),
-                },
-            ],
-            temperature: Some(0.2),
-            max_output_tokens: None,
-            response_format,
-            metadata: serde_json::json!({
-                "job_id": packet.job_id,
-                "target_ring": packet.target_ring,
-                "candidate_workspace": workspace.path,
-                "direct_edit": direct_edit,
-            }),
-        };
-        let response = self.provider.complete(&request)?;
+                    content: render_tool_results_followup(&turn_tool_results),
+                });
+                continue;
+            } else {
+                final_response = Some(response);
+                break;
+            }
+        }
+
+        let response = final_response.ok_or(MutationModelError::ToolRoundLimitExceeded {
+            max_rounds: self.max_tool_rounds,
+        })?;
         let structured_output = parse_structured_mutation_output(&response.content);
         let parsed_patch = structured_output
             .as_ref()
             .and_then(|output| output.patch.clone())
             .or_else(|| extract_patch_from_text(&response.content));
-        let mut tool_results = Vec::new();
         if !direct_edit
             && let Some(patch) = parsed_patch
                 .as_ref()
                 .filter(|patch| !patch.trim().is_empty())
         {
-            tool_results.push(self.tool_registry.execute(
+            let result = self.tool_registry.execute(
                 workspace,
                 EvolutionToolCall {
                     tool: "apply_patch".to_string(),
                     input: serde_json::json!({ "patch": patch }),
                 },
-            ));
+            );
+            if result.status != ToolCallStatus::Succeeded {
+                return Err(MutationModelError::ToolExecution {
+                    tool: result.tool,
+                    detail: result.evidence.summary,
+                });
+            }
+            all_tool_results.push(result);
         }
         let summary = structured_output
             .as_ref()
@@ -538,7 +624,8 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
             parsed_patch,
             summary,
             structured_output,
-            tool_results,
+            tool_results: all_tool_results,
+            model_turns,
         })
     }
 }
@@ -547,7 +634,7 @@ pub fn render_mutation_prompt(packet: &MutationPacket) -> String {
     let mut prompt = String::new();
     prompt.push_str("# Sinomo Mutation Packet\n\n");
     prompt.push_str(&format!("job_id: {}\n", packet.job_id));
-    prompt.push_str(&format!("target_ring: {:?}\n", packet.target_ring));
+    prompt.push_str("target_ring: ignored during current bootstrap pass\n");
     prompt.push_str(&format!("objective: {}\n\n", packet.objective));
     prompt.push_str("## Intended Edit Scope\n");
     prompt.push_str(&format!(
@@ -640,7 +727,10 @@ pub fn render_mutation_bridge_prompt(
     if structured_json {
         prompt.push_str("\n## Required JSON Response\n");
         prompt.push_str(
-            "Return only a JSON object with keys: changed_files, patch, patch_summary, verification_notes, experiment_notes, recovery_notes.\n",
+            "Return only a JSON object with keys: tool_calls, changed_files, patch, patch_summary, verification_notes, experiment_notes, recovery_notes.\n",
+        );
+        prompt.push_str(
+            "`tool_calls` is an array of objects shaped like `{ \"tool\": \"read_file\", \"input\": { ... } }`. Use it when you need more context or want Sinomo to run a command before finalizing. When ready, leave `tool_calls` empty and provide `patch` or final notes.\n",
         );
         if direct_edit {
             prompt.push_str("When files were edited directly, set patch to null unless you also have a useful review diff.\n");
@@ -675,6 +765,18 @@ pub fn parse_structured_mutation_output(raw_output: &str) -> Option<StructuredMu
 
 fn extract_json_object(raw_output: &str) -> Option<&str> {
     let trimmed = raw_output.trim();
+    for fence in ["```json", "```"] {
+        if let Some(start) = trimmed.find(fence) {
+            let body_start = start + fence.len();
+            let body = trimmed[body_start..].trim_start_matches(['\r', '\n']);
+            if let Some(end) = body.find("```") {
+                let candidate = body[..end].trim();
+                if candidate.starts_with('{') && candidate.ends_with('}') {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         return Some(trimmed);
     }
@@ -712,6 +814,14 @@ fn first_non_empty_line(raw_output: &str) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('{') && !line.starts_with('}'))
         .map(ToOwned::to_owned)
+}
+
+fn render_tool_results_followup(results: &[EvolutionToolResult]) -> String {
+    let tool_results_json =
+        serde_json::to_string_pretty(results).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "Tool results from the previous turn:\n```json\n{tool_results_json}\n```\nUse these results as evidence. Return the next JSON response. If more context is required, request more `tool_calls`; if ready, return an empty `tool_calls` array and provide the final patch or notes."
+    )
 }
 
 pub struct EvolutionOrchestrator<W, R, B> {
@@ -768,6 +878,10 @@ where
                     "model-tool-results.json",
                     &result.tool_results,
                 )?;
+            }
+            if !result.model_turns.is_empty() {
+                self.bundles
+                    .write_json(&bundle, "model-turns.json", &result.model_turns)?;
             }
             bundle.model_output_path = Some(
                 PathBuf::from(&bundle.bundle_path)
@@ -1131,6 +1245,10 @@ pub enum BundleError {
 pub enum MutationModelError {
     #[error(transparent)]
     LanguageModel(#[from] LanguageModelError),
+    #[error("mutation tool `{tool}` failed: {detail}")]
+    ToolExecution { tool: String, detail: String },
+    #[error("mutation bridge exceeded max tool rounds ({max_rounds})")]
+    ToolRoundLimitExceeded { max_rounds: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -1393,6 +1511,13 @@ mod tests {
         )
         .expect("patch");
         assert!(patch.starts_with("diff --git"));
+
+        let fenced = parse_structured_mutation_output(
+            "```json\n{\"tool_calls\":[{\"tool\":\"read_file\",\"input\":{\"path\":\"Cargo.toml\"}}],\"changed_files\":[]}\n```",
+        )
+        .expect("fenced json");
+        assert_eq!(fenced.tool_calls.len(), 1);
+        assert_eq!(fenced.tool_calls[0].tool, "read_file");
     }
 
     #[test]
@@ -1498,6 +1623,127 @@ mod tests {
     }
 
     #[test]
+    fn language_model_bridge_runs_tool_rounds_before_final_patch() {
+        let root = git_repo("bridge-tool-rounds");
+        fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
+        run_in(&root, "git add patched.txt").expect("git add");
+        run_in(&root, "git commit -m init").expect("git commit");
+        let workspace = candidate_workspace(&root);
+        let provider = FakeLanguageModelProvider::with_responses(
+            LanguageModelProviderInfo {
+                provider: "fake-tool-loop".to_string(),
+                default_model: "fake-model".to_string(),
+                invocation: sinomo_lm::LanguageModelInvocation::Http,
+                supports_json_object: true,
+                supports_tool_permissions: false,
+            },
+            vec![
+                serde_json::json!({
+                    "tool_calls": [
+                        { "tool": "read_file", "input": { "path": "patched.txt" } }
+                    ],
+                    "changed_files": []
+                })
+                .to_string(),
+                serde_json::json!({
+                    "tool_calls": [],
+                    "changed_files": ["patched.txt"],
+                    "patch": "diff --git a/patched.txt b/patched.txt\n--- a/patched.txt\n+++ b/patched.txt\n@@ -1 +1 @@\n-old\n+new\n",
+                    "patch_summary": "updated after reading file"
+                })
+                .to_string(),
+            ],
+        );
+        let requests = provider.requests.clone();
+        let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
+        let packet = MutationPacket {
+            job_id: workspace.job_id.clone(),
+            objective: "use tools before patch".to_string(),
+            target_ring: TrustRing::R3SandboxedModule,
+            edit_scope: EditScope {
+                workspace_root: root.display().to_string(),
+                intended_paths: vec!["patched.txt".to_string()],
+                notes: String::new(),
+            },
+            relevant_files: Vec::new(),
+            verification: VerificationPlan {
+                commands: Vec::new(),
+            },
+            output_contract: MutationOutputContract::default(),
+            recovery: RecoveryPlan::default(),
+        };
+
+        let result = bridge.mutate(&packet, &workspace).expect("mutate");
+
+        assert_eq!(requests.borrow().len(), 2);
+        assert!(requests.borrow()[0].metadata["target_ring"].is_null());
+        assert_eq!(
+            requests.borrow()[0].metadata["target_ring_policy"],
+            "ignored-during-bootstrap"
+        );
+        assert!(
+            requests.borrow()[1]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("Tool results")
+        );
+        assert_eq!(result.model_turns.len(), 2);
+        assert_eq!(result.tool_results[0].tool, "read_file");
+        assert_eq!(result.tool_results[1].tool, "apply_patch");
+        let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
+        assert_eq!(patched.replace("\r\n", "\n"), "new\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn language_model_bridge_errors_when_final_patch_fails_to_apply() {
+        let root = git_repo("bridge-bad-patch");
+        fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
+        run_in(&root, "git add patched.txt").expect("git add");
+        run_in(&root, "git commit -m init").expect("git commit");
+        let workspace = candidate_workspace(&root);
+        let provider = FakeLanguageModelProvider::new(
+            LanguageModelProviderInfo {
+                provider: "fake-json".to_string(),
+                default_model: "fake-model".to_string(),
+                invocation: sinomo_lm::LanguageModelInvocation::Http,
+                supports_json_object: true,
+                supports_tool_permissions: false,
+            },
+            serde_json::json!({
+                "tool_calls": [],
+                "changed_files": ["missing.txt"],
+                "patch": "diff --git a/missing.txt b/missing.txt\n--- a/missing.txt\n+++ b/missing.txt\n@@ -1 +1 @@\n-old\n+new\n"
+            })
+            .to_string(),
+        );
+        let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
+        let packet = MutationPacket {
+            job_id: workspace.job_id.clone(),
+            objective: "bad patch".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            edit_scope: EditScope {
+                workspace_root: root.display().to_string(),
+                intended_paths: vec!["missing.txt".to_string()],
+                notes: String::new(),
+            },
+            relevant_files: Vec::new(),
+            verification: VerificationPlan {
+                commands: Vec::new(),
+            },
+            output_contract: MutationOutputContract::default(),
+            recovery: RecoveryPlan::default(),
+        };
+
+        let error = bridge.mutate(&packet, &workspace).expect_err("bad patch");
+
+        assert!(matches!(error, MutationModelError::ToolExecution { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn local_bundle_store_writes_packet_and_manifest_paths() {
         let root = temp_dir("bundle-store");
         let store = LocalCandidateBundleStore::new(root.join("candidates"));
@@ -1565,6 +1811,49 @@ mod tests {
             EvaluationOutcome::Passed
         );
         assert!(PathBuf::from(&report.bundle.mutation_packet_path).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orchestrator_writes_model_turn_and_tool_evidence_artifacts() {
+        let root = temp_dir("orchestrator-model-evidence");
+        let candidate = root.join("candidate");
+        fs::create_dir_all(&candidate).expect("candidate dir");
+        let orchestrator = EvolutionOrchestrator::new(
+            FakeWorkspace {
+                root: root.clone(),
+                candidate: candidate.clone(),
+            },
+            ExecutingEvalHarness::new(LocalCommandRunner::new()),
+            LocalCandidateBundleStore::new(root.join("jobs")),
+        );
+        let model = FakeMutationModel;
+
+        let report = orchestrator
+            .propose(
+                EvolutionRequest {
+                    objective: "write model evidence".to_string(),
+                    target_ring: TrustRing::R1TrustedRuntime,
+                    intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                    verification_commands: vec![VerificationCommand {
+                        name: "success".to_string(),
+                        command: "exit 0".to_string(),
+                        expected_exit_code: 0,
+                        gate: EvaluationGate::StaticChecks,
+                    }],
+                    model_provider: None,
+                    model: None,
+                    dry_run: false,
+                },
+                Some(&model),
+            )
+            .expect("propose");
+        let bundle = PathBuf::from(&report.bundle.bundle_path);
+
+        assert!(bundle.join("model-output.txt").exists());
+        assert!(bundle.join("model-result.json").exists());
+        assert!(bundle.join("model-turns.json").exists());
+        assert!(bundle.join("model-tool-results.json").exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1774,6 +2063,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     fn wait_for_active_command(registry: &EvolutionToolRegistry) -> String {
         for _ in 0..100 {
             if let Some(run_id) = registry.active_command_run_ids().into_iter().next() {
@@ -1854,15 +2144,19 @@ index 3b18e51..6320cd2 100644
     #[derive(Clone, Debug)]
     struct FakeLanguageModelProvider {
         info: LanguageModelProviderInfo,
-        response: String,
+        responses: Vec<String>,
         requests: Rc<RefCell<Vec<LanguageModelRequest>>>,
     }
 
     impl FakeLanguageModelProvider {
         fn new(info: LanguageModelProviderInfo, response: String) -> Self {
+            Self::with_responses(info, vec![response])
+        }
+
+        fn with_responses(info: LanguageModelProviderInfo, responses: Vec<String>) -> Self {
             Self {
                 info,
-                response,
+                responses,
                 requests: Rc::new(RefCell::new(Vec::new())),
             }
         }
@@ -1877,15 +2171,66 @@ index 3b18e51..6320cd2 100644
             &self,
             request: &LanguageModelRequest,
         ) -> Result<LanguageModelResponse, LanguageModelError> {
+            let response_index = self.requests.borrow().len();
             self.requests.borrow_mut().push(request.clone());
             Ok(LanguageModelResponse {
                 provider: self.info.provider.clone(),
                 model: self.info.default_model.clone(),
-                content: self.response.clone(),
+                content: self
+                    .responses
+                    .get(response_index)
+                    .or_else(|| self.responses.last())
+                    .cloned()
+                    .unwrap_or_default(),
                 usage: Some(LanguageModelUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(20),
                 }),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeMutationModel;
+
+    impl MutationModel for FakeMutationModel {
+        fn mutate(
+            &self,
+            _packet: &MutationPacket,
+            _workspace: &CandidateWorkspace,
+        ) -> Result<ModelMutationResult, MutationModelError> {
+            let tool_result = EvolutionToolResult {
+                tool: "read_file".to_string(),
+                status: ToolCallStatus::Succeeded,
+                output: serde_json::json!({ "content": "evidence" }),
+                evidence: ToolEvidence {
+                    summary: "read evidence".to_string(),
+                    command: None,
+                    exit_code: None,
+                    duration_ms: None,
+                    paths: vec!["evidence.txt".to_string()],
+                },
+            };
+            Ok(ModelMutationResult {
+                provider: "fake".to_string(),
+                model: "fake-model".to_string(),
+                raw_output: "{\"patch_summary\":\"fake mutation\"}".to_string(),
+                parsed_patch: None,
+                summary: Some("fake mutation".to_string()),
+                structured_output: Some(StructuredMutationOutput {
+                    patch_summary: Some("fake mutation".to_string()),
+                    ..StructuredMutationOutput::default()
+                }),
+                tool_results: vec![tool_result.clone()],
+                model_turns: vec![MutationModelTurn {
+                    turn: 1,
+                    raw_output: "{\"patch_summary\":\"fake mutation\"}".to_string(),
+                    structured_output: Some(StructuredMutationOutput {
+                        patch_summary: Some("fake mutation".to_string()),
+                        ..StructuredMutationOutput::default()
+                    }),
+                    tool_results: vec![tool_result],
+                }],
             })
         }
     }
