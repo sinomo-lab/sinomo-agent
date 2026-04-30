@@ -530,8 +530,7 @@ fn configured_deliberation_model()
     let provider =
         env::var("SINOMO_DELIBERATION_LM_PROVIDER").unwrap_or_else(|_| "command".to_string());
     if provider == GitHubCopilotProvider::PROVIDER_ID {
-        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
-            .unwrap_or_else(|_| GitHubCopilotConfig::default().default_model);
+        let model = GitHubCopilotConfig::default().default_model;
         let api_base_url = env::var("SINOMO_COPILOT_API_BASE_URL")
             .unwrap_or_else(|_| GitHubCopilotConfig::default().api_base_url);
         let github_host = env::var("SINOMO_COPILOT_GITHUB_HOST")
@@ -554,8 +553,7 @@ fn configured_deliberation_model()
     }
 
     if provider == GitHubCopilotCliProvider::PROVIDER_ID {
-        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
-            .unwrap_or_else(|_| PROVIDER_DEFAULT_MODEL.into());
+        let model = PROVIDER_DEFAULT_MODEL.to_string();
         let program = env::var("SINOMO_DELIBERATION_LM_PROGRAM")
             .unwrap_or_else(|_| GitHubCopilotCliConfig::default().program);
         let extra_args: Vec<String> = match env::var("SINOMO_DELIBERATION_LM_ARGS_JSON") {
@@ -582,8 +580,7 @@ fn configured_deliberation_model()
     }
 
     if provider == CodexCliProvider::PROVIDER_ID || provider == "openai-codex-cli" {
-        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
-            .unwrap_or_else(|_| PROVIDER_DEFAULT_MODEL.into());
+        let model = PROVIDER_DEFAULT_MODEL.to_string();
         let program = env::var("SINOMO_DELIBERATION_LM_PROGRAM")
             .unwrap_or_else(|_| CodexCliConfig::default().program);
         let extra_args: Vec<String> = match env::var("SINOMO_DELIBERATION_LM_ARGS_JSON") {
@@ -610,8 +607,7 @@ fn configured_deliberation_model()
     }
 
     if provider == ClaudeCodeProvider::PROVIDER_ID || provider == "anthropic-claude-code" {
-        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
-            .unwrap_or_else(|_| PROVIDER_DEFAULT_MODEL.into());
+        let model = PROVIDER_DEFAULT_MODEL.to_string();
         let program = env::var("SINOMO_DELIBERATION_LM_PROGRAM")
             .unwrap_or_else(|_| ClaudeCodeConfig::default().program);
         let extra_args: Vec<String> = match env::var("SINOMO_DELIBERATION_LM_ARGS_JSON") {
@@ -638,8 +634,7 @@ fn configured_deliberation_model()
     }
 
     if provider == AnthropicProvider::PROVIDER_ID || provider == "claude" {
-        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
-            .unwrap_or_else(|_| AnthropicConfig::default().default_model);
+        let model = AnthropicConfig::default().default_model;
         let api_base_url = env::var("SINOMO_ANTHROPIC_API_BASE_URL")
             .or_else(|_| env::var("SINOMO_CLAUDE_API_BASE_URL"))
             .unwrap_or_else(|_| AnthropicConfig::default().api_base_url);
@@ -657,9 +652,7 @@ fn configured_deliberation_model()
     }
 
     if provider == GeminiProvider::PROVIDER_ID || provider == "google-gemini" {
-        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
-            .or_else(|_| env::var("SINOMO_GEMINI_MODEL"))
-            .unwrap_or_else(|_| GeminiConfig::default().default_model);
+        let model = GeminiConfig::default().default_model;
         let api_base_url = env::var("SINOMO_GEMINI_API_BASE_URL")
             .unwrap_or_else(|_| GeminiConfig::default().api_base_url);
         let provider_client = GeminiProvider::new(GeminiConfig {
@@ -676,8 +669,7 @@ fn configured_deliberation_model()
     }
 
     if provider == OpenAiProvider::PROVIDER_ID || provider == "openai-api" {
-        let model = env::var("SINOMO_DELIBERATION_LM_MODEL")
-            .unwrap_or_else(|_| OpenAiConfig::default().default_model);
+        let model = OpenAiConfig::default().default_model;
         let api_base_url = env::var("SINOMO_OPENAI_API_BASE_URL")
             .or_else(|_| env::var("SINOMO_CODEX_API_BASE_URL"))
             .unwrap_or_else(|_| OpenAiConfig::default().api_base_url);
@@ -701,7 +693,7 @@ fn configured_deliberation_model()
         Ok(value) => serde_json::from_str(&value)?,
         Err(_) => Vec::new(),
     };
-    let model = env::var("SINOMO_DELIBERATION_LM_MODEL").unwrap_or_else(|_| program.clone());
+    let model = program.clone();
     let mode = env::var("SINOMO_DELIBERATION_LM_MODE").unwrap_or_else(|_| "plain".to_string());
     let provider_client = match mode.as_str() {
         "json" => CommandLanguageModelProvider::json_request(

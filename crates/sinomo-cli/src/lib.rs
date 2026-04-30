@@ -1255,25 +1255,11 @@ fn provider_model_ids(provider: &str) -> Result<Vec<String>, CliError> {
         }
         GitHubCopilotCliProvider::PROVIDER_ID => Ok(vec![GitHubCopilotCliConfig::default().model]),
         CodexCliProvider::PROVIDER_ID => Ok(vec![CODEX_CLI_DEFAULT_MODEL.to_string()]),
-        CODEX_PROVIDER_ID => Ok(vec![
-            env::var("SINOMO_CODEX_MODEL")
-                .or_else(|_| env::var("SINOMO_OPENAI_MODEL"))
-                .unwrap_or_else(|_| CODEX_DEFAULT_MODEL.to_string()),
-        ]),
+        CODEX_PROVIDER_ID => Ok(vec![CODEX_DEFAULT_MODEL.to_string()]),
         ClaudeCodeProvider::PROVIDER_ID => Ok(vec![CLAUDE_CODE_DEFAULT_MODEL.to_string()]),
-        AnthropicProvider::PROVIDER_ID => {
-            Ok(vec![env::var("SINOMO_ANTHROPIC_MODEL").unwrap_or_else(
-                |_| AnthropicConfig::default().default_model,
-            )])
-        }
-        OpenAiProvider::PROVIDER_ID => Ok(vec![
-            env::var("SINOMO_OPENAI_MODEL")
-                .unwrap_or_else(|_| OpenAiConfig::default().default_model),
-        ]),
-        GeminiProvider::PROVIDER_ID => Ok(vec![
-            env::var("SINOMO_GEMINI_MODEL")
-                .unwrap_or_else(|_| GeminiConfig::default().default_model),
-        ]),
+        AnthropicProvider::PROVIDER_ID => Ok(vec![AnthropicConfig::default().default_model]),
+        OpenAiProvider::PROVIDER_ID => Ok(vec![OpenAiConfig::default().default_model]),
+        GeminiProvider::PROVIDER_ID => Ok(vec![GeminiConfig::default().default_model]),
         _ => Err(CliError::Parse {
             detail: format!("unknown provider `{provider}`"),
         }),
@@ -1486,12 +1472,7 @@ fn model_or_default(model: &str, default_model: String) -> String {
 }
 
 fn codex_provider_for_model(model: &str) -> CodexProvider {
-    let default_model = model_or_default(
-        model,
-        env::var("SINOMO_CODEX_MODEL")
-            .or_else(|_| env::var("SINOMO_OPENAI_MODEL"))
-            .unwrap_or_else(|_| CODEX_DEFAULT_MODEL.to_string()),
-    );
+    let default_model = model_or_default(model, CODEX_DEFAULT_MODEL.to_string());
     let client_config = OpenAiResponsesCodexConfig {
         api_base_url: env::var("SINOMO_CODEX_API_BASE_URL")
             .or_else(|_| env::var("SINOMO_OPENAI_API_BASE_URL"))
@@ -2041,9 +2022,7 @@ fn anthropic_provider() -> Result<(AnthropicProvider, PathBuf), CliError> {
         api_base_url: env::var("SINOMO_ANTHROPIC_API_BASE_URL")
             .or_else(|_| env::var("SINOMO_CLAUDE_API_BASE_URL"))
             .unwrap_or_else(|_| AnthropicConfig::default().api_base_url),
-        default_model: env::var("SINOMO_ANTHROPIC_MODEL")
-            .or_else(|_| env::var("SINOMO_CLAUDE_MODEL"))
-            .unwrap_or_else(|_| AnthropicConfig::default().default_model),
+        default_model: AnthropicConfig::default().default_model,
         credentials_path: Some(credentials_path.clone()),
     });
     Ok((provider, credentials_path))
@@ -2057,9 +2036,7 @@ fn openai_provider() -> Result<(OpenAiProvider, PathBuf), CliError> {
         api_base_url: env::var("SINOMO_OPENAI_API_BASE_URL")
             .or_else(|_| env::var("SINOMO_CODEX_API_BASE_URL"))
             .unwrap_or_else(|_| OpenAiConfig::default().api_base_url),
-        default_model: env::var("SINOMO_OPENAI_MODEL")
-            .or_else(|_| env::var("SINOMO_CODEX_MODEL"))
-            .unwrap_or_else(|_| OpenAiConfig::default().default_model),
+        default_model: OpenAiConfig::default().default_model,
         credentials_path: Some(credentials_path.clone()),
     });
     Ok((provider, credentials_path))
@@ -2082,8 +2059,7 @@ fn gemini_provider() -> Result<(GeminiProvider, PathBuf), CliError> {
     let provider = GeminiProvider::new(GeminiConfig {
         api_base_url: env::var("SINOMO_GEMINI_API_BASE_URL")
             .unwrap_or_else(|_| GeminiConfig::default().api_base_url),
-        default_model: env::var("SINOMO_GEMINI_MODEL")
-            .unwrap_or_else(|_| GeminiConfig::default().default_model),
+        default_model: GeminiConfig::default().default_model,
         credentials_path: Some(credentials_path.clone()),
     });
     Ok((provider, credentials_path))
@@ -2169,18 +2145,6 @@ pub fn print_usage() {
     println!("  SINOMO_CODEX_API_KEY        Used by `providers auth/test codex`");
     println!("  CODEX_API_KEY               Used by `providers auth/test codex`");
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
-    println!(
-        "  SINOMO_ANTHROPIC_MODEL      Defaults to {}",
-        AnthropicConfig::default().default_model
-    );
-    println!(
-        "  SINOMO_OPENAI_MODEL         Defaults to {}",
-        OpenAiConfig::default().default_model
-    );
-    println!(
-        "  SINOMO_GEMINI_MODEL         Defaults to {}",
-        GeminiConfig::default().default_model
-    );
     println!(
         "  SINOMO_COPILOT_CLIENT_ID    Defaults to {}",
         GitHubCopilotConfig::default().client_id
