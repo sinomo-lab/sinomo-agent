@@ -24,6 +24,8 @@ pub const SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR: &str = "SINOMO_CODEX_CREDENTIAL
 pub const CODEX_AUTH_ISSUER: &str = "https://auth.openai.com";
 pub const CODEX_AUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_CHATGPT_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+// Match the open-source Codex workspace version used by its models manager.
+pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.0.0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexConfig {
@@ -47,6 +49,7 @@ pub struct OpenAiResponsesCodexConfig {
     pub api_base_url: String,
     pub auth_issuer: String,
     pub client_id: String,
+    pub client_version: String,
     pub default_model: String,
     pub credentials_path: Option<PathBuf>,
 }
@@ -57,6 +60,7 @@ impl Default for OpenAiResponsesCodexConfig {
             api_base_url: CODEX_CHATGPT_API_BASE_URL.to_string(),
             auth_issuer: CODEX_AUTH_ISSUER.to_string(),
             client_id: CODEX_AUTH_CLIENT_ID.to_string(),
+            client_version: CODEX_MODELS_CLIENT_VERSION.to_string(),
             default_model: CODEX_DEFAULT_MODEL.to_string(),
             credentials_path: default_codex_credentials_path(),
         }
@@ -319,6 +323,49 @@ impl OpenAiResponsesCodexClient {
         self.config.credentials_path.clone()
     }
 
+    pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        let mut tokens = self.chatgpt_tokens()?;
+        let mut response = self.get_models(&tokens)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            tokens = self.refresh_chatgpt_tokens()?;
+            response = self.get_models(&tokens)?;
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                model: CODEX_DEFAULT_MODEL.to_string(),
+                detail: format!("Codex backend models API failed: HTTP {status}: {body}"),
+            });
+        }
+
+        let body =
+            response
+                .text()
+                .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                    provider: CODEX_PROVIDER_ID.to_string(),
+                    model: CODEX_DEFAULT_MODEL.to_string(),
+                    detail: source.to_string(),
+                })?;
+        let value = serde_json::from_str::<serde_json::Value>(&body).map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                model: CODEX_DEFAULT_MODEL.to_string(),
+                detail: format!("failed to decode Codex models response: {source}; body: {body}"),
+            }
+        })?;
+        let models = extract_codex_model_ids(&value);
+        if models.is_empty() {
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                model: CODEX_DEFAULT_MODEL.to_string(),
+                detail: "Codex backend models API returned no picker-visible models".to_string(),
+            });
+        }
+        Ok(models)
+    }
+
     pub fn device_login_start(&self) -> Result<CodexDeviceCode, LanguageModelError> {
         let issuer = self.config.auth_issuer.trim_end_matches('/');
         let response = self
@@ -529,6 +576,32 @@ impl CodexClient for OpenAiResponsesCodexClient {
 }
 
 impl OpenAiResponsesCodexClient {
+    fn get_models(
+        &self,
+        tokens: &CodexChatGptTokens,
+    ) -> Result<reqwest::blocking::Response, LanguageModelError> {
+        let url = format!(
+            "{}/models?client_version={}",
+            self.config.api_base_url.trim_end_matches('/'),
+            self.config.client_version
+        );
+        let response = self
+            .http
+            .get(url)
+            .headers(codex_json_headers(
+                tokens,
+                CODEX_PROVIDER_ID,
+                CODEX_DEFAULT_MODEL,
+            )?)
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                model: CODEX_DEFAULT_MODEL.to_string(),
+                detail: source.to_string(),
+            })?;
+        Ok(response)
+    }
+
     fn post_responses(
         &self,
         url: &str,
@@ -699,6 +772,10 @@ impl CodexProvider<OpenAiResponsesCodexClient> {
 
     pub fn credentials_path(&self) -> Option<PathBuf> {
         self.client.credentials_path()
+    }
+
+    pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        self.client.list_models()
     }
 
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
@@ -976,8 +1053,35 @@ fn codex_headers(
     provider: &str,
     model: &str,
 ) -> Result<HeaderMap, LanguageModelError> {
+    codex_headers_with_accept(
+        tokens,
+        provider,
+        model,
+        HeaderValue::from_static("text/event-stream"),
+    )
+}
+
+fn codex_json_headers(
+    tokens: &CodexChatGptTokens,
+    provider: &str,
+    model: &str,
+) -> Result<HeaderMap, LanguageModelError> {
+    codex_headers_with_accept(
+        tokens,
+        provider,
+        model,
+        HeaderValue::from_static("application/json"),
+    )
+}
+
+fn codex_headers_with_accept(
+    tokens: &CodexChatGptTokens,
+    provider: &str,
+    model: &str,
+    accept: HeaderValue,
+) -> Result<HeaderMap, LanguageModelError> {
     let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    headers.insert(ACCEPT, accept);
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(USER_AGENT, HeaderValue::from_static("Sinomo/0.1"));
     headers.insert(
@@ -1006,6 +1110,60 @@ fn codex_headers(
         headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
     }
     Ok(headers)
+}
+
+fn extract_codex_model_ids(value: &serde_json::Value) -> Vec<String> {
+    let Some(models) = value
+        .get("models")
+        .or_else(|| value.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut entries = models
+        .iter()
+        .filter_map(codex_model_list_entry)
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut seen = Vec::new();
+    let mut ids = Vec::new();
+    for (_, id) in entries {
+        if seen.iter().any(|existing| existing == &id) {
+            continue;
+        }
+        seen.push(id.clone());
+        ids.push(id);
+    }
+    ids
+}
+
+fn codex_model_list_entry(value: &serde_json::Value) -> Option<(i64, String)> {
+    if let Some(id) = value.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+        return Some((i64::MAX, id.to_string()));
+    }
+    let object = value.as_object()?;
+    if matches!(
+        object.get("visibility").and_then(serde_json::Value::as_str),
+        Some("hide" | "none")
+    ) {
+        return None;
+    }
+    let id = object
+        .get("slug")
+        .or_else(|| object.get("id"))
+        .or_else(|| object.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    let priority = object
+        .get("priority")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(i64::MAX);
+    Some((priority, id))
 }
 
 fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Value {
@@ -1483,6 +1641,24 @@ mod tests {
         });
 
         assert_eq!(payload["instructions"], CODEX_DEFAULT_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn codex_models_parser_uses_remote_catalog_slugs() {
+        let models = extract_codex_model_ids(&serde_json::json!({
+            "models": [
+                { "slug": "gpt-5.4", "priority": 20, "visibility": "list" },
+                { "slug": "hidden-model", "priority": 1, "visibility": "hide" },
+                { "slug": "gpt-5.5", "priority": 10, "visibility": "list" },
+                { "id": "fallback-id", "priority": 30 },
+                "raw-model"
+            ]
+        }));
+
+        assert_eq!(
+            models,
+            vec!["gpt-5.5", "gpt-5.4", "fallback-id", "raw-model"]
+        );
     }
 
     #[test]

@@ -1355,6 +1355,7 @@ fn models_help() -> Result<(), CliError> {
 }
 
 fn models_list(options: ModelListOptions) -> Result<(), CliError> {
+    let explicit_provider = options.provider.is_some();
     let providers = match options.provider {
         Some(provider) => {
             vec![
@@ -1369,9 +1370,18 @@ fn models_list(options: ModelListOptions) -> Result<(), CliError> {
             .collect(),
     };
     for provider in providers {
-        println!("{provider}:");
-        for model in provider_model_ids(&provider)? {
-            println!("  {model}");
+        let models = if explicit_provider {
+            Some(provider_available_model_ids(&provider)?)
+        } else {
+            provider_available_model_ids(&provider).ok()
+        };
+        if let Some(models) = models
+            && !models.is_empty()
+        {
+            println!("{provider}:");
+            for model in models {
+                println!("  {model}");
+            }
         }
     }
     Ok(())
@@ -1502,19 +1512,36 @@ fn normalize_model_provider(provider: &str) -> Option<String> {
     }
 }
 
-fn provider_model_ids(provider: &str) -> Result<Vec<String>, CliError> {
+fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, CliError> {
     match provider {
         GitHubCopilotProvider::PROVIDER_ID => {
             let (provider, _) = github_copilot_provider()?;
             provider.list_models().map_err(CliError::LanguageModel)
         }
-        GitHubCopilotCliProvider::PROVIDER_ID => Ok(vec![GitHubCopilotCliConfig::default().model]),
-        CodexCliProvider::PROVIDER_ID => Ok(vec![CODEX_CLI_DEFAULT_MODEL.to_string()]),
-        CODEX_PROVIDER_ID => Ok(vec![CODEX_DEFAULT_MODEL.to_string()]),
-        ClaudeCodeProvider::PROVIDER_ID => Ok(vec![CLAUDE_CODE_DEFAULT_MODEL.to_string()]),
-        AnthropicProvider::PROVIDER_ID => Ok(vec![AnthropicConfig::default().default_model]),
-        OpenAiProvider::PROVIDER_ID => Ok(vec![OpenAiConfig::default().default_model]),
-        GeminiProvider::PROVIDER_ID => Ok(vec![GeminiConfig::default().default_model]),
+        GitHubCopilotCliProvider::PROVIDER_ID
+        | CodexCliProvider::PROVIDER_ID
+        | ClaudeCodeProvider::PROVIDER_ID => Err(CliError::Parse {
+            detail: format!("provider `{provider}` does not use Sinomo-managed authentication"),
+        }),
+        CODEX_PROVIDER_ID => {
+            let (provider, _) = codex_provider()?;
+            provider.list_models().map_err(CliError::LanguageModel)
+        }
+        AnthropicProvider::PROVIDER_ID => {
+            let (provider, _) = anthropic_provider()?;
+            provider.api_key()?;
+            Ok(vec![AnthropicConfig::default().default_model])
+        }
+        OpenAiProvider::PROVIDER_ID => {
+            let (provider, _) = openai_provider()?;
+            provider.api_key()?;
+            Ok(vec![OpenAiConfig::default().default_model])
+        }
+        GeminiProvider::PROVIDER_ID => {
+            let (provider, _) = gemini_provider()?;
+            provider.api_key()?;
+            Ok(vec![GeminiConfig::default().default_model])
+        }
         _ => Err(CliError::Parse {
             detail: format!("unknown provider `{provider}`"),
         }),
@@ -1736,6 +1763,7 @@ fn codex_provider_for_model(model: &str) -> CodexProvider {
             .unwrap_or_else(|_| config_default.auth_issuer.clone()),
         client_id: env::var("SINOMO_CODEX_CLIENT_ID")
             .unwrap_or_else(|_| config_default.client_id.clone()),
+        client_version: config_default.client_version,
         default_model: default_model.clone(),
         credentials_path: config_default.credentials_path,
     };
