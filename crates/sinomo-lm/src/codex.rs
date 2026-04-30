@@ -1,8 +1,9 @@
 use crate::{
-    LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
-    LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
-    selected_model,
+    LanguageModelCreditUsage, LanguageModelError, LanguageModelInvocation, LanguageModelMessage,
+    LanguageModelProvider, LanguageModelProviderInfo, LanguageModelProviderUsage,
+    LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
+    LanguageModelUsage, LanguageModelUsageLimit, LanguageModelUsageProvider,
+    PROVIDER_DEFAULT_MODEL, selected_model, unix_timestamp,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -366,6 +367,33 @@ impl OpenAiResponsesCodexClient {
         Ok(models)
     }
 
+    pub fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+        let mut tokens = self.chatgpt_tokens()?;
+        let mut response = self.get_usage(&tokens)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            tokens = self.refresh_chatgpt_tokens()?;
+            response = self.get_usage(&tokens)?;
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                model: CODEX_DEFAULT_MODEL.to_string(),
+                detail: format!("Codex backend usage API failed: HTTP {status}: {body}"),
+            });
+        }
+
+        let value = response.json::<serde_json::Value>().map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                model: CODEX_DEFAULT_MODEL.to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+        Ok(codex_usage_from_value(&value, unix_timestamp()))
+    }
+
     pub fn device_login_start(&self) -> Result<CodexDeviceCode, LanguageModelError> {
         let issuer = self.config.auth_issuer.trim_end_matches('/');
         let response = self
@@ -602,6 +630,37 @@ impl OpenAiResponsesCodexClient {
         Ok(response)
     }
 
+    fn get_usage(
+        &self,
+        tokens: &CodexChatGptTokens,
+    ) -> Result<reqwest::blocking::Response, LanguageModelError> {
+        let url = format!("{}/wham/usage", self.chatgpt_backend_base_url());
+        let response = self
+            .http
+            .get(url)
+            .headers(codex_json_headers(
+                tokens,
+                CODEX_PROVIDER_ID,
+                CODEX_DEFAULT_MODEL,
+            )?)
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                model: CODEX_DEFAULT_MODEL.to_string(),
+                detail: source.to_string(),
+            })?;
+        Ok(response)
+    }
+
+    fn chatgpt_backend_base_url(&self) -> String {
+        self.config
+            .api_base_url
+            .trim_end_matches('/')
+            .strip_suffix("/codex")
+            .unwrap_or_else(|| self.config.api_base_url.trim_end_matches('/'))
+            .to_string()
+    }
+
     fn post_responses(
         &self,
         url: &str,
@@ -778,6 +837,10 @@ impl CodexProvider<OpenAiResponsesCodexClient> {
         self.client.list_models()
     }
 
+    pub fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+        self.client.usage()
+    }
+
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
         let request = LanguageModelRequest {
             provider: Self::PROVIDER_ID.to_string(),
@@ -895,6 +958,12 @@ where
                 self.config.max_iterations
             ),
         })
+    }
+}
+
+impl LanguageModelUsageProvider for CodexProvider<OpenAiResponsesCodexClient> {
+    fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+        CodexProvider::usage(self)
     }
 }
 
@@ -1164,6 +1233,105 @@ fn codex_model_list_entry(value: &serde_json::Value) -> Option<(i64, String)> {
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(i64::MAX);
     Some((priority, id))
+}
+
+fn codex_usage_from_value(
+    value: &serde_json::Value,
+    captured_at_unix: u64,
+) -> LanguageModelProviderUsage {
+    let plan = value
+        .get("plan_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut limits = Vec::new();
+    if let Some(rate_limit) = value.get("rate_limit") {
+        limits.extend(codex_rate_limit_entries("codex", None, rate_limit));
+    }
+    if let Some(additional) = value
+        .get("additional_rate_limits")
+        .and_then(serde_json::Value::as_array)
+    {
+        for entry in additional {
+            let id = entry
+                .get("metered_feature")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("codex.additional");
+            let name = entry
+                .get("limit_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if let Some(rate_limit) = entry.get("rate_limit") {
+                limits.extend(codex_rate_limit_entries(id, name, rate_limit));
+            }
+        }
+    }
+
+    LanguageModelProviderUsage {
+        provider: CODEX_PROVIDER_ID.to_string(),
+        plan,
+        captured_at_unix,
+        limits,
+        credits: codex_credit_usage(value.get("credits")),
+    }
+}
+
+fn codex_rate_limit_entries(
+    id: &str,
+    name: Option<String>,
+    value: &serde_json::Value,
+) -> Vec<LanguageModelUsageLimit> {
+    let allowed = value.get("allowed").and_then(serde_json::Value::as_bool);
+    let exhausted = value
+        .get("limit_reached")
+        .and_then(serde_json::Value::as_bool);
+    [
+        ("primary", "primary_window"),
+        ("secondary", "secondary_window"),
+    ]
+    .into_iter()
+    .filter_map(|(scope, key)| {
+        let window = value.get(key)?;
+        let used_percent = codex_json_f64(window.get("used_percent"));
+        Some(LanguageModelUsageLimit {
+            id: id.to_string(),
+            name: name.clone(),
+            scope: Some(scope.to_string()),
+            unlimited: None,
+            allowed,
+            exhausted,
+            remaining: None,
+            entitlement: None,
+            used_percent,
+            remaining_percent: used_percent.map(|percent| (100.0 - percent).max(0.0)),
+            window_seconds: window
+                .get("limit_window_seconds")
+                .and_then(serde_json::Value::as_u64),
+            reset_at_unix: window.get("reset_at").and_then(serde_json::Value::as_i64),
+        })
+    })
+    .collect()
+}
+
+fn codex_credit_usage(value: Option<&serde_json::Value>) -> Option<LanguageModelCreditUsage> {
+    let value = value?;
+    Some(LanguageModelCreditUsage {
+        has_credits: value
+            .get("has_credits")
+            .and_then(serde_json::Value::as_bool),
+        unlimited: value.get("unlimited").and_then(serde_json::Value::as_bool),
+        balance: value
+            .get("balance")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn codex_json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_f64(),
+        Some(serde_json::Value::String(text)) => text.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Value {
@@ -1659,6 +1827,57 @@ mod tests {
             models,
             vec!["gpt-5.5", "gpt-5.4", "fallback-id", "raw-model"]
         );
+    }
+
+    #[test]
+    fn codex_usage_parser_maps_rate_limit_windows() {
+        let usage = codex_usage_from_value(
+            &serde_json::json!({
+                "plan_type": "prolite",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 39,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1777522528
+                    },
+                    "secondary_window": {
+                        "used_percent": 14,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1777996221
+                    }
+                },
+                "additional_rate_limits": [{
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "metered_feature": "codex_bengalfox",
+                    "rate_limit": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary_window": {
+                            "used_percent": 0,
+                            "limit_window_seconds": 18000,
+                            "reset_at": 1777539436
+                        }
+                    }
+                }],
+                "credits": {
+                    "has_credits": false,
+                    "unlimited": false,
+                    "balance": "0"
+                }
+            }),
+            10,
+        );
+
+        assert_eq!(usage.provider, CODEX_PROVIDER_ID);
+        assert_eq!(usage.plan.as_deref(), Some("prolite"));
+        assert_eq!(usage.limits.len(), 3);
+        assert_eq!(usage.limits[0].id, "codex");
+        assert_eq!(usage.limits[0].scope.as_deref(), Some("primary"));
+        assert_eq!(usage.limits[0].used_percent, Some(39.0));
+        assert_eq!(usage.limits[1].remaining_percent, Some(86.0));
+        assert_eq!(usage.credits.unwrap().balance.as_deref(), Some("0"));
     }
 
     #[test]

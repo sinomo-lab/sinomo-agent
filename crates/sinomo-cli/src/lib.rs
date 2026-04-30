@@ -20,9 +20,9 @@ use sinomo_lm::{
     CodexCliProvider, CodexConfig, CodexProvider, CodexToolRegistry, DefaultCodexContextManager,
     DefaultCodexPromptBuilder, GeminiConfig, GeminiProvider, GitHubCopilotCliConfig,
     GitHubCopilotCliProvider, GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError,
-    LanguageModelMessage, LanguageModelProvider, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, OpenAiConfig, OpenAiProvider,
-    OpenAiResponsesCodexClient, OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL,
+    LanguageModelMessage, LanguageModelProvider, LanguageModelProviderUsage, LanguageModelRequest,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, OpenAiConfig,
+    OpenAiProvider, OpenAiResponsesCodexClient, OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL,
 };
 use sinomo_local::SinomoDataDir;
 use std::env;
@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
     run_parsed_cli_command(parse_cli_command(&args)?)
@@ -51,6 +52,7 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
         CliCommand::Evolve(command) => run_evolve_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
+        CliCommand::Usage(options) => usage(options),
     }
 }
 
@@ -61,6 +63,7 @@ enum CliCommand {
     Evolve(EvolveCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
+    Usage(UsageOptions),
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
@@ -77,6 +80,9 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
         ),
         Some((command, rest)) if command == "providers" => {
             Ok(CliCommand::Providers(parse_provider_command(rest)?))
+        }
+        Some((command, rest)) if command == "usage" => {
+            Ok(CliCommand::Usage(parse_usage_options(rest)?))
         }
         _ => Err(CliError::Usage),
     }
@@ -1548,6 +1554,204 @@ fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, CliError>
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UsageOptions {
+    provider: Option<String>,
+    json: bool,
+    help: bool,
+}
+
+fn parse_usage_options(args: &[String]) -> Result<UsageOptions, CliError> {
+    let mut provider = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "help" | "--help" | "-h" => {
+                return Ok(UsageOptions {
+                    provider: None,
+                    json: false,
+                    help: true,
+                });
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--provider" => {
+                let value = args.get(index + 1).ok_or_else(|| CliError::Parse {
+                    detail: "--provider requires a provider id".to_string(),
+                })?;
+                provider = Some(value.clone());
+                index += 2;
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unknown usage option `{value}`"),
+                });
+            }
+        }
+    }
+    Ok(UsageOptions {
+        provider,
+        json,
+        help: false,
+    })
+}
+
+fn usage(options: UsageOptions) -> Result<(), CliError> {
+    if options.help {
+        print_usage_help();
+        return Ok(());
+    }
+    let explicit_provider = options.provider.is_some();
+    let providers = match options.provider {
+        Some(provider) => {
+            vec![
+                normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
+                    detail: format!("unknown provider `{provider}`"),
+                })?,
+            ]
+        }
+        None => subscription_usage_provider_ids()
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+    };
+
+    let mut snapshots = Vec::new();
+    for provider in providers {
+        match provider_usage(&provider) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) if explicit_provider => return Err(error),
+            Err(_) => {}
+        }
+    }
+
+    if options.json {
+        let value = if explicit_provider {
+            snapshots
+                .into_iter()
+                .next()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|source| CliError::Json {
+                    path: "<usage>".to_string(),
+                    detail: source.to_string(),
+                })?
+                .unwrap_or_else(|| serde_json::json!(null))
+        } else {
+            serde_json::to_value(&snapshots).map_err(|source| CliError::Json {
+                path: "<usage>".to_string(),
+                detail: source.to_string(),
+            })?
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|source| CliError::Json {
+                path: "<usage>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+        return Ok(());
+    }
+
+    if snapshots.is_empty() {
+        println!("No authenticated subscription provider usage is available.");
+        println!(
+            "Run `sinomo usage --provider codex` or `sinomo usage --provider github-copilot` for details."
+        );
+        return Ok(());
+    }
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        print_provider_usage(snapshot);
+    }
+    Ok(())
+}
+
+fn subscription_usage_provider_ids() -> &'static [&'static str] {
+    &[CODEX_PROVIDER_ID, GitHubCopilotProvider::PROVIDER_ID]
+}
+
+fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, CliError> {
+    match provider {
+        CODEX_PROVIDER_ID => {
+            let (provider, _) = codex_provider()?;
+            provider.usage().map_err(CliError::LanguageModel)
+        }
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let (provider, _) = github_copilot_provider()?;
+            provider.usage().map_err(CliError::LanguageModel)
+        }
+        _ => Err(CliError::Parse {
+            detail: format!("provider `{provider}` does not expose subscription usage"),
+        }),
+    }
+}
+
+fn print_provider_usage(snapshot: &LanguageModelProviderUsage) {
+    println!("{}:", snapshot.provider);
+    if let Some(plan) = &snapshot.plan {
+        println!("  plan: {plan}");
+    }
+    if let Some(credits) = &snapshot.credits {
+        let mut parts = Vec::new();
+        if let Some(has_credits) = credits.has_credits {
+            parts.push(format!("has_credits={has_credits}"));
+        }
+        if let Some(unlimited) = credits.unlimited {
+            parts.push(format!("unlimited={unlimited}"));
+        }
+        if let Some(balance) = &credits.balance {
+            parts.push(format!("balance={balance}"));
+        }
+        if !parts.is_empty() {
+            println!("  credits: {}", parts.join(", "));
+        }
+    }
+    if snapshot.limits.is_empty() {
+        println!("  limits: unavailable");
+        return;
+    }
+    println!("  limits:");
+    for limit in &snapshot.limits {
+        let label = limit.name.as_deref().unwrap_or(&limit.id);
+        let scope = limit.scope.as_deref().unwrap_or("usage");
+        let mut parts = Vec::new();
+        if let Some(used) = limit.used_percent {
+            parts.push(format!("{used:.1}% used"));
+        } else if let Some(remaining) = limit.remaining_percent {
+            parts.push(format!("{remaining:.1}% remaining"));
+        }
+        if let Some(remaining) = limit.remaining {
+            parts.push(format!("remaining={remaining:.1}"));
+        }
+        if let Some(entitlement) = limit.entitlement {
+            parts.push(format!("entitlement={entitlement:.1}"));
+        }
+        if limit.unlimited == Some(true) {
+            parts.push("unlimited".to_string());
+        }
+        if limit.exhausted == Some(true) {
+            parts.push("exhausted".to_string());
+        }
+        if let Some(reset_at) = limit.reset_at_unix {
+            parts.push(format!("resets={}", format_usage_reset_at(reset_at)));
+        }
+        println!("    {label} ({scope}): {}", parts.join(", "));
+    }
+}
+
+fn format_usage_reset_at(reset_at_unix: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(reset_at_unix)
+        .ok()
+        .and_then(|datetime| datetime.format(&Rfc3339).ok())
+        .unwrap_or_else(|| reset_at_unix.to_string())
+}
+
 #[derive(Clone, Debug)]
 struct ProposeOptions {
     objective: String,
@@ -2427,6 +2631,7 @@ pub fn print_usage() {
     println!("  sinomo");
     println!("  sinomo models list [--provider <provider>]");
     println!("  sinomo models default --provider <provider> --model <model>");
+    println!("  sinomo usage [--provider <provider>] [--json]");
     println!(
         "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider github-copilot] [--verify \"cargo check\"]"
     );
@@ -2495,6 +2700,17 @@ fn print_models_help() {
     println!();
     println!("Providers:");
     for provider in default_model_provider_ids() {
+        println!("  {provider}");
+    }
+}
+
+fn print_usage_help() {
+    println!("Usage:");
+    println!("  sinomo usage [--provider <provider>] [--json]");
+    println!("      Show subscription usage for authenticated providers.");
+    println!();
+    println!("Providers:");
+    for provider in subscription_usage_provider_ids() {
         println!("  {provider}");
     }
 }
@@ -2661,7 +2877,7 @@ mod tests {
         ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
         ProviderName, is_terminal_status, models_default_with_data_dir, normalize_model_provider,
         parse_cli_command, parse_model_default_options, parse_models_list_options,
-        parse_propose_options, parse_provider_command, parse_slash_command,
+        parse_propose_options, parse_provider_command, parse_slash_command, parse_usage_options,
         run_cui_with_handler_io, run_evolve_command,
     };
     use sinomo_core::{EvolutionJobId, NodeId, SessionId, TrustRing};
@@ -2730,6 +2946,15 @@ mod tests {
         assert!(matches!(
             parse_cli_command(&["model".to_string(), "list".to_string()]).expect("model alias"),
             CliCommand::Models(ModelsCliCommand::List(_))
+        ));
+        assert!(matches!(
+            parse_cli_command(&[
+                "usage".to_string(),
+                "--provider".to_string(),
+                "codex".to_string()
+            ])
+            .expect("usage"),
+            CliCommand::Usage(_)
         ));
         assert!(matches!(
             parse_cli_command(&["providers".to_string()]).expect("providers help"),
@@ -2905,6 +3130,20 @@ mod tests {
             parse_models_list_options(&["github-copilot".to_string()]),
             Err(CliError::Usage)
         ));
+    }
+
+    #[test]
+    fn usage_parser_accepts_provider_and_json() {
+        let options = parse_usage_options(&[
+            "--provider".to_string(),
+            "codex".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("usage options");
+
+        assert_eq!(options.provider.as_deref(), Some("codex"));
+        assert!(options.json);
+        assert!(!options.help);
     }
 
     #[test]

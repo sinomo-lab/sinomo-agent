@@ -1,7 +1,8 @@
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelProvider, LanguageModelProviderInfo,
-    LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
-    LanguageModelUsage, render_plain_prompt, selected_model, unix_timestamp,
+    LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse,
+    LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, LanguageModelUsageLimit,
+    LanguageModelUsageProvider, render_plain_prompt, selected_model, unix_timestamp,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -10,6 +11,8 @@ use sinomo_local::SinomoDataDir;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubCopilotConfig {
@@ -205,6 +208,45 @@ impl GitHubCopilotProvider {
             }
         })?;
         Ok(extract_copilot_model_ids(&value))
+    }
+
+    pub fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+        let token = self.github_token()?;
+        let api_host = if self.config.github_host == "github.com" {
+            "api.github.com".to_string()
+        } else {
+            format!("api.{}", self.config.github_host.trim_end_matches('/'))
+        };
+        let url = format!("https://{api_host}/copilot_internal/user");
+        let response = self
+            .http
+            .get(&url)
+            .headers(copilot_exchange_headers(&token)?)
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: self.config.default_model.clone(),
+                detail: source.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: self.config.default_model.clone(),
+                detail: format!("Copilot usage check failed: HTTP {status}: {body}"),
+            });
+        }
+
+        let value = response.json::<serde_json::Value>().map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: self.config.default_model.clone(),
+                detail: source.to_string(),
+            }
+        })?;
+        Ok(copilot_usage_from_value(&value, unix_timestamp()))
     }
 
     #[allow(dead_code)]
@@ -643,6 +685,96 @@ fn extract_copilot_model_ids(value: &serde_json::Value) -> Vec<String> {
     models
 }
 
+fn copilot_usage_from_value(
+    value: &serde_json::Value,
+    captured_at_unix: u64,
+) -> LanguageModelProviderUsage {
+    let plan = value
+        .get("copilot_plan")
+        .or_else(|| value.get("access_type_sku"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let reset_at = value
+        .get("quota_reset_date_utc")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_rfc3339_unix);
+
+    let mut limits = value
+        .get("quota_snapshots")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(|snapshots| snapshots.iter())
+        .filter_map(|(key, snapshot)| copilot_usage_limit(key, snapshot, reset_at))
+        .collect::<Vec<_>>();
+    limits.sort_by(|left, right| left.id.cmp(&right.id));
+
+    LanguageModelProviderUsage {
+        provider: GitHubCopilotProvider::PROVIDER_ID.to_string(),
+        plan,
+        captured_at_unix,
+        limits,
+        credits: None,
+    }
+}
+
+fn copilot_usage_limit(
+    key: &str,
+    value: &serde_json::Value,
+    fallback_reset_at: Option<i64>,
+) -> Option<LanguageModelUsageLimit> {
+    let id = value
+        .get("quota_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(key)
+        .to_string();
+    let unlimited = value.get("unlimited").and_then(serde_json::Value::as_bool);
+    let remaining =
+        json_f64(value.get("remaining")).or_else(|| json_f64(value.get("quota_remaining")));
+    let entitlement = json_f64(value.get("entitlement"));
+    let remaining_percent = json_f64(value.get("percent_remaining"));
+    let used_percent = remaining_percent.map(|percent| (100.0 - percent).max(0.0));
+    let reset_at_unix = json_i64(value.get("quota_reset_at"))
+        .filter(|value| *value > 0)
+        .or(fallback_reset_at);
+
+    Some(LanguageModelUsageLimit {
+        id,
+        name: None,
+        scope: Some("quota".to_string()),
+        unlimited,
+        allowed: unlimited.map(|value| value || remaining.unwrap_or_default() > 0.0),
+        exhausted: Some(unlimited == Some(false) && remaining == Some(0.0)),
+        remaining,
+        entitlement,
+        used_percent,
+        remaining_percent,
+        window_seconds: None,
+        reset_at_unix,
+    })
+}
+
+fn parse_rfc3339_unix(value: &str) -> Option<i64> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .map(|datetime| datetime.unix_timestamp())
+}
+
+fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_f64(),
+        Some(serde_json::Value::String(text)) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn json_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_i64(),
+        Some(serde_json::Value::String(text)) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 fn copilot_model_uses_responses_api(model: &str) -> bool {
     model == "gpt-5.5" || model.starts_with("gpt-5.5-")
 }
@@ -728,6 +860,12 @@ fn chat_completion_payload(request: &LanguageModelRequest, model: &str) -> serde
         payload["response_format"] = serde_json::json!({ "type": "json_object" });
     }
     payload
+}
+
+impl LanguageModelUsageProvider for GitHubCopilotProvider {
+    fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+        GitHubCopilotProvider::usage(self)
+    }
 }
 
 fn copilot_chat_model_uses_max_completion_tokens(model: &str) -> bool {
@@ -856,6 +994,43 @@ mod tests {
             extract_copilot_model_ids(&value),
             vec!["gpt-5.4", "gpt-5.5"]
         );
+    }
+
+    #[test]
+    fn copilot_usage_parser_maps_quota_snapshots() {
+        let usage = copilot_usage_from_value(
+            &serde_json::json!({
+                "copilot_plan": "individual_pro",
+                "quota_reset_date_utc": "2026-05-01T00:00:00.000Z",
+                "quota_snapshots": {
+                    "chat": {
+                        "quota_id": "chat",
+                        "percent_remaining": 100,
+                        "unlimited": true,
+                        "remaining": 0,
+                        "entitlement": 0
+                    },
+                    "premium_interactions": {
+                        "quota_id": "premium_interactions",
+                        "percent_remaining": 13.7,
+                        "quota_remaining": 205.9,
+                        "unlimited": false,
+                        "remaining": 205,
+                        "entitlement": 1500
+                    }
+                }
+            }),
+            42,
+        );
+
+        assert_eq!(usage.provider, GitHubCopilotProvider::PROVIDER_ID);
+        assert_eq!(usage.plan.as_deref(), Some("individual_pro"));
+        assert_eq!(usage.limits.len(), 2);
+        assert_eq!(usage.limits[1].id, "premium_interactions");
+        assert_eq!(usage.limits[1].remaining, Some(205.0));
+        assert_eq!(usage.limits[1].entitlement, Some(1500.0));
+        assert_eq!(usage.limits[1].used_percent, Some(86.3));
+        assert_eq!(usage.limits[1].reset_at_unix, Some(1777593600));
     }
 
     #[test]

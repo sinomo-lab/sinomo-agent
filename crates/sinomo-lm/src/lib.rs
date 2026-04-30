@@ -93,6 +93,59 @@ pub struct LanguageModelUsage {
     pub output_tokens: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelProviderUsage {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    pub captured_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<LanguageModelUsageLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<LanguageModelCreditUsage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelUsageLimit {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlimited: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelCreditUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_credits: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlimited: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
+}
+
+pub trait LanguageModelUsageProvider {
+    fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError>;
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LanguageModelAttribution {
     pub provider: String,
