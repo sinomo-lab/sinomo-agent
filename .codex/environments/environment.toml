@@ -8,4 +8,4 @@ script = ""
 [[actions]]
 name = "Run"
 icon = "run"
-command = "cargo run -p sinomo-app"
+command = "cargo run -p sinomo"

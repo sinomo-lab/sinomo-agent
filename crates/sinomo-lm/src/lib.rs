@@ -14,11 +14,12 @@ pub use claude_code::{
     CLAUDE_CODE_DEFAULT_MODEL, ClaudeCodeConfig, ClaudeCodeProvider, ClaudePermissionMode,
 };
 pub use codex::{
-    CODEX_DEFAULT_MODEL, CodexClient, CodexConfig, CodexContextManager, CodexMessage,
-    CodexModelRequest, CodexModelResponse, CodexPromptBuilder, CodexProvider, CodexRole, CodexTool,
-    CodexToolCall, CodexToolDescriptor, CodexToolRegistry, CodexToolResult,
-    DefaultCodexContextManager, DefaultCodexPromptBuilder, OpenAiResponsesCodexClient,
-    OpenAiResponsesCodexConfig,
+    CODEX_API_KEY_ENV_VAR, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CodexClient, CodexConfig,
+    CodexContextManager, CodexMessage, CodexModelRequest, CodexModelResponse, CodexPromptBuilder,
+    CodexProvider, CodexRole, CodexTool, CodexToolCall, CodexToolDescriptor, CodexToolRegistry,
+    CodexToolResult, DefaultCodexContextManager, DefaultCodexPromptBuilder, OPENAI_API_KEY_ENV_VAR,
+    OpenAiResponsesCodexClient, OpenAiResponsesCodexConfig, SINOMO_CODEX_API_KEY_ENV_VAR,
+    SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR,
 };
 pub use codex_cli::{
     CODEX_CLI_DEFAULT_MODEL, CodexCliConfig, CodexCliProvider, CodexColor, CodexSandboxMode,

@@ -16,11 +16,13 @@ use sinomo_evolution::{
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
-    ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig, CodexCliProvider, GeminiConfig,
-    GeminiProvider, GitHubCopilotCliConfig, GitHubCopilotCliProvider, GitHubCopilotConfig,
-    GitHubCopilotProvider, LanguageModelError, LanguageModelMessage, LanguageModelProvider,
-    LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
-    OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL,
+    CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig,
+    CodexCliProvider, CodexConfig, CodexProvider, CodexToolRegistry, DefaultCodexContextManager,
+    DefaultCodexPromptBuilder, GeminiConfig, GeminiProvider, GitHubCopilotCliConfig,
+    GitHubCopilotCliProvider, GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError,
+    LanguageModelMessage, LanguageModelProvider, LanguageModelRequest, LanguageModelResponse,
+    LanguageModelResponseFormat, LanguageModelRole, OpenAiConfig, OpenAiProvider,
+    OpenAiResponsesCodexClient, OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL,
 };
 use sinomo_local::SinomoDataDir;
 use std::env;
@@ -483,6 +485,10 @@ impl InteractionModel for CliConversationModel {
                     working_dir: env::current_dir().ok(),
                     ..CodexCliConfig::default()
                 });
+                LanguageModelProvider::complete(&provider, &request)
+            }
+            CODEX_PROVIDER_ID => {
+                let provider = codex_provider_for_model(&self.model);
                 LanguageModelProvider::complete(&provider, &request)
             }
             ClaudeCodeProvider::PROVIDER_ID => {
@@ -1209,6 +1215,7 @@ fn default_model_provider_ids() -> &'static [&'static str] {
         GitHubCopilotProvider::PROVIDER_ID,
         GitHubCopilotCliProvider::PROVIDER_ID,
         CodexCliProvider::PROVIDER_ID,
+        CODEX_PROVIDER_ID,
         ClaudeCodeProvider::PROVIDER_ID,
         AnthropicProvider::PROVIDER_ID,
         OpenAiProvider::PROVIDER_ID,
@@ -1225,6 +1232,7 @@ fn normalize_model_provider(provider: &str) -> Option<String> {
         CodexCliProvider::PROVIDER_ID | "openai-codex-cli" => {
             Some(CodexCliProvider::PROVIDER_ID.to_string())
         }
+        CODEX_PROVIDER_ID | "codex-api" => Some(CODEX_PROVIDER_ID.to_string()),
         ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
             Some(ClaudeCodeProvider::PROVIDER_ID.to_string())
         }
@@ -1247,6 +1255,11 @@ fn provider_model_ids(provider: &str) -> Result<Vec<String>, CliError> {
         }
         GitHubCopilotCliProvider::PROVIDER_ID => Ok(vec![GitHubCopilotCliConfig::default().model]),
         CodexCliProvider::PROVIDER_ID => Ok(vec![CODEX_CLI_DEFAULT_MODEL.to_string()]),
+        CODEX_PROVIDER_ID => Ok(vec![
+            env::var("SINOMO_CODEX_MODEL")
+                .or_else(|_| env::var("SINOMO_OPENAI_MODEL"))
+                .unwrap_or_else(|_| CODEX_DEFAULT_MODEL.to_string()),
+        ]),
         ClaudeCodeProvider::PROVIDER_ID => Ok(vec![CLAUDE_CODE_DEFAULT_MODEL.to_string()]),
         AnthropicProvider::PROVIDER_ID => {
             Ok(vec![env::var("SINOMO_ANTHROPIC_MODEL").unwrap_or_else(
@@ -1394,6 +1407,11 @@ impl MutationModel for CliMutationModel {
                 LanguageModelMutationBridge::new(provider, self.model.clone())
                     .mutate(packet, workspace)
             }
+            CODEX_PROVIDER_ID | "codex-api" => {
+                let provider = codex_provider_for_model(&self.model);
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
             ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
                 let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
                     model: model_or_default(&self.model, CLAUDE_CODE_DEFAULT_MODEL.to_string()),
@@ -1465,6 +1483,32 @@ fn model_or_default(model: &str, default_model: String) -> String {
     } else {
         model.to_string()
     }
+}
+
+fn codex_provider_for_model(model: &str) -> CodexProvider {
+    let default_model = model_or_default(
+        model,
+        env::var("SINOMO_CODEX_MODEL")
+            .or_else(|_| env::var("SINOMO_OPENAI_MODEL"))
+            .unwrap_or_else(|_| CODEX_DEFAULT_MODEL.to_string()),
+    );
+    let client_config = OpenAiResponsesCodexConfig {
+        api_base_url: env::var("SINOMO_CODEX_API_BASE_URL")
+            .or_else(|_| env::var("SINOMO_OPENAI_API_BASE_URL"))
+            .unwrap_or_else(|_| OpenAiResponsesCodexConfig::default().api_base_url),
+        default_model: default_model.clone(),
+        credentials_path: OpenAiResponsesCodexConfig::default().credentials_path,
+    };
+    CodexProvider::new(
+        CodexConfig {
+            default_model,
+            ..CodexConfig::default()
+        },
+        OpenAiResponsesCodexClient::new(client_config),
+        CodexToolRegistry::new(),
+        DefaultCodexPromptBuilder::default(),
+        DefaultCodexContextManager::default(),
+    )
 }
 
 fn write_report_record(paths: &EvolutionPaths, report: &EvolutionReport) -> Result<(), CliError> {
@@ -1739,6 +1783,7 @@ fn safe_file_stem(value: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderName {
     GitHubCopilot,
+    Codex,
     Anthropic,
     OpenAi,
     Gemini,
@@ -1760,6 +1805,7 @@ fn parse_provider_command(args: &[String]) -> Option<ProviderCliCommand> {
 
     let provider = match provider.as_str() {
         "github-copilot" => ProviderName::GitHubCopilot,
+        "codex" | "openai-codex" | "codex-api" => ProviderName::Codex,
         "anthropic" => ProviderName::Anthropic,
         "openai" => ProviderName::OpenAi,
         "gemini" => ProviderName::Gemini,
@@ -1777,6 +1823,8 @@ fn run_provider_command(command: ProviderCliCommand) -> Result<(), CliError> {
     match command {
         ProviderCliCommand::Auth(ProviderName::GitHubCopilot) => auth_github_copilot(),
         ProviderCliCommand::Test(ProviderName::GitHubCopilot) => test_github_copilot(),
+        ProviderCliCommand::Auth(ProviderName::Codex) => auth_codex(),
+        ProviderCliCommand::Test(ProviderName::Codex) => test_codex(),
         ProviderCliCommand::Auth(ProviderName::Anthropic) => auth_anthropic(),
         ProviderCliCommand::Test(ProviderName::Anthropic) => test_anthropic(),
         ProviderCliCommand::Auth(ProviderName::OpenAi) => auth_openai(),
@@ -1917,6 +1965,29 @@ pub fn test_openai() -> Result<(), CliError> {
     Ok(())
 }
 
+pub fn auth_codex() -> Result<(), CliError> {
+    let (provider, auth_path) = codex_provider()?;
+    let (api_key, source) = api_key_from_env_or_prompt(
+        "Codex",
+        &["SINOMO_CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"],
+    )?;
+    provider.save_api_key(&api_key, &source)?;
+    println!("Testing Codex provider connection...");
+    provider.test_connection()?;
+    println!("Codex credentials saved to {}", auth_path.display());
+    Ok(())
+}
+
+pub fn test_codex() -> Result<(), CliError> {
+    let (provider, auth_path) = codex_provider()?;
+    println!("Testing Codex credentials at {}", auth_path.display());
+    provider.api_key()?;
+    println!("Codex API key: ok");
+    provider.test_connection()?;
+    println!("Codex provider connection: ok");
+    Ok(())
+}
+
 pub fn auth_gemini() -> Result<(), CliError> {
     let (provider, credentials_path) = gemini_provider()?;
     let (api_key, source) = api_key_from_env_or_prompt(
@@ -1994,6 +2065,16 @@ fn openai_provider() -> Result<(OpenAiProvider, PathBuf), CliError> {
     Ok((provider, credentials_path))
 }
 
+fn codex_provider() -> Result<(CodexProvider, PathBuf), CliError> {
+    let provider = codex_provider_for_model(PROVIDER_DEFAULT_MODEL);
+    let auth_path = provider
+        .credentials_path()
+        .ok_or_else(|| CliError::AuthProvider {
+            detail: "could not resolve Sinomo Codex credentials path; set SINOMO_DATA_DIR or SINOMO_CODEX_CREDENTIALS_FILE".to_string(),
+        })?;
+    Ok((provider, auth_path))
+}
+
 fn gemini_provider() -> Result<(GeminiProvider, PathBuf), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_provider_dir(GeminiProvider::PROVIDER_ID)?;
@@ -2056,6 +2137,8 @@ pub fn print_usage() {
     );
     println!("  sinomo providers auth github-copilot");
     println!("  sinomo providers test github-copilot");
+    println!("  sinomo providers auth codex");
+    println!("  sinomo providers test codex");
     println!("  sinomo providers auth anthropic");
     println!("  sinomo providers test anthropic");
     println!("  sinomo providers auth openai");
@@ -2064,6 +2147,8 @@ pub fn print_usage() {
     println!("  sinomo providers test gemini");
     println!("  sinomo-app providers auth github-copilot");
     println!("  sinomo-app providers test github-copilot");
+    println!("  sinomo-app providers auth codex");
+    println!("  sinomo-app providers test codex");
     println!("  sinomo-app providers auth anthropic");
     println!("  sinomo-app providers test anthropic");
     println!("  sinomo-app providers auth openai");
@@ -2078,8 +2163,11 @@ pub fn print_usage() {
     println!();
     println!("Environment:");
     println!("  SINOMO_DATA_DIR             Defaults to ~/.sinomo");
+    println!("  SINOMO_CODEX_CREDENTIALS_FILE  Overrides Sinomo's Codex credentials file");
     println!("  ANTHROPIC_API_KEY           Used by `providers auth/test anthropic`");
-    println!("  OPENAI_API_KEY              Used by `providers auth/test openai`");
+    println!("  OPENAI_API_KEY              Used by `providers auth/test openai` and codex");
+    println!("  SINOMO_CODEX_API_KEY        Used by `providers auth/test codex`");
+    println!("  CODEX_API_KEY               Used by `providers auth/test codex`");
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
     println!(
         "  SINOMO_ANTHROPIC_MODEL      Defaults to {}",
@@ -2255,6 +2343,14 @@ mod tests {
                 "github-copilot".to_string(),
             ]),
             Some(ProviderCliCommand::Test(ProviderName::GitHubCopilot))
+        );
+        assert_eq!(
+            parse_provider_command(&[
+                "providers".to_string(),
+                "auth".to_string(),
+                "codex".to_string(),
+            ]),
+            Some(ProviderCliCommand::Auth(ProviderName::Codex))
         );
     }
 
@@ -2474,6 +2570,10 @@ mod tests {
         assert_eq!(
             normalize_model_provider("github-copilot").as_deref(),
             Some("github-copilot")
+        );
+        assert_eq!(
+            normalize_model_provider("codex-api").as_deref(),
+            Some("openai-codex")
         );
     }
 

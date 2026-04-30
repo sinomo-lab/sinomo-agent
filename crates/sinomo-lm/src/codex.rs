@@ -1,16 +1,23 @@
-use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
+use crate::api_key::default_api_key_credentials_path;
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, selected_model,
+    LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
+    selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 
 pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.2-codex";
+pub const CODEX_PROVIDER_ID: &str = "openai-codex";
+pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
+pub const CODEX_API_KEY_ENV_VAR: &str = "CODEX_API_KEY";
+pub const SINOMO_CODEX_API_KEY_ENV_VAR: &str = "SINOMO_CODEX_API_KEY";
+pub const SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR: &str = "SINOMO_CODEX_CREDENTIALS_FILE";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexConfig {
@@ -22,7 +29,7 @@ pub struct CodexConfig {
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
-            provider_id: CodexProvider::<OpenAiResponsesCodexClient>::PROVIDER_ID.to_string(),
+            provider_id: CODEX_PROVIDER_ID.to_string(),
             default_model: CODEX_DEFAULT_MODEL.to_string(),
             max_iterations: 12,
         }
@@ -42,11 +49,112 @@ impl Default for OpenAiResponsesCodexConfig {
             api_base_url: "https://api.openai.com/v1".to_string(),
             default_model: CODEX_DEFAULT_MODEL.to_string(),
             credentials_path: default_api_key_credentials_path(
-                "SINOMO_OPENAI_CREDENTIALS_FILE",
-                CodexProvider::<OpenAiResponsesCodexClient>::PROVIDER_ID,
+                SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR,
+                CODEX_PROVIDER_ID,
             ),
         }
     }
+}
+
+fn env_secret(env_var: &str) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_codex_api_key(credentials_path: &Option<PathBuf>) -> Result<String, LanguageModelError> {
+    if let Some(credentials_path) = credentials_path
+        && let Some(api_key) = read_codex_auth_json_api_key(credentials_path)?
+    {
+        return Ok(api_key);
+    }
+    for env_var in [
+        SINOMO_CODEX_API_KEY_ENV_VAR,
+        OPENAI_API_KEY_ENV_VAR,
+        CODEX_API_KEY_ENV_VAR,
+    ] {
+        if let Some(api_key) = env_secret(env_var) {
+            return Ok(api_key);
+        }
+    }
+    Err(LanguageModelError::AuthenticationRequired {
+        provider: CODEX_PROVIDER_ID.to_string(),
+        detail: "no Sinomo Codex API key found; run `sinomo providers auth codex`, set SINOMO_CODEX_API_KEY, or set OPENAI_API_KEY/CODEX_API_KEY".to_string(),
+    })
+}
+
+fn read_codex_auth_json_api_key(
+    credentials_path: &PathBuf,
+) -> Result<Option<String>, LanguageModelError> {
+    let contents = match fs::read_to_string(credentials_path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(LanguageModelError::TokenStore {
+                path: credentials_path.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    let auth = serde_json::from_str::<CodexAuthDotJson>(&contents).map_err(|source| {
+        LanguageModelError::TokenStore {
+            path: credentials_path.display().to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    Ok(auth
+        .openai_api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+fn save_codex_api_key(
+    credentials_path: &Option<PathBuf>,
+    api_key: &str,
+) -> Result<(), LanguageModelError> {
+    let Some(credentials_path) = credentials_path else {
+        return Err(LanguageModelError::AuthenticationRequired {
+            provider: CODEX_PROVIDER_ID.to_string(),
+            detail: "could not resolve a Sinomo Codex credentials path; set SINOMO_DATA_DIR or SINOMO_CODEX_CREDENTIALS_FILE".to_string(),
+        });
+    };
+    if let Some(parent) = credentials_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| LanguageModelError::TokenStore {
+            path: credentials_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let auth = CodexAuthDotJson {
+        auth_mode: Some("apikey".to_string()),
+        openai_api_key: Some(api_key.trim().to_string()),
+        tokens: None,
+        last_refresh: None,
+        agent_identity: None,
+    };
+    let json = serde_json::to_string_pretty(&auth).map_err(|source| {
+        LanguageModelError::RequestSerialization {
+            detail: source.to_string(),
+        }
+    })?;
+    fs::write(credentials_path, json).map_err(|source| LanguageModelError::TokenStore {
+        path: credentials_path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct CodexAuthDotJson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_mode: Option<String>,
+    #[serde(rename = "OPENAI_API_KEY")]
+    openai_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokens: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_refresh: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_identity: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,21 +172,15 @@ impl OpenAiResponsesCodexClient {
     }
 
     pub fn api_key(&self) -> Result<String, LanguageModelError> {
-        resolve_api_key(
-            CodexProvider::<OpenAiResponsesCodexClient>::PROVIDER_ID,
-            &self.config.credentials_path,
-            &[
-                "SINOMO_OPENAI_API_KEY",
-                "OPENAI_API_KEY",
-                "CODEX_API_KEY",
-                "SINOMO_CODEX_API_KEY",
-            ],
-            "no OpenAI API key found; set OPENAI_API_KEY or run `sinomo providers auth openai`",
-        )
+        resolve_codex_api_key(&self.config.credentials_path)
     }
 
-    pub fn save_api_key(&self, api_key: &str, source: &str) -> Result<(), LanguageModelError> {
-        save_api_key_credential(&self.config.credentials_path, api_key, source)
+    pub fn save_api_key(&self, api_key: &str, _source: &str) -> Result<(), LanguageModelError> {
+        save_codex_api_key(&self.config.credentials_path, api_key)
+    }
+
+    pub fn credentials_path(&self) -> Option<PathBuf> {
+        self.config.credentials_path.clone()
     }
 }
 
@@ -101,15 +203,11 @@ impl CodexClient for OpenAiResponsesCodexClient {
         let response = self
             .http
             .post(url)
-            .headers(codex_headers(
-                &api_key,
-                CodexProvider::<OpenAiResponsesCodexClient>::PROVIDER_ID,
-                &request.model,
-            )?)
+            .headers(codex_headers(&api_key, CODEX_PROVIDER_ID, &request.model)?)
             .json(&openai_responses_codex_payload(request))
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
-                provider: CodexProvider::<OpenAiResponsesCodexClient>::PROVIDER_ID.to_string(),
+                provider: CODEX_PROVIDER_ID.to_string(),
                 model: request.model.clone(),
                 detail: source.to_string(),
             })?;
@@ -118,7 +216,7 @@ impl CodexClient for OpenAiResponsesCodexClient {
             let status = response.status();
             let body = response.text().unwrap_or_default();
             return Err(LanguageModelError::ProviderInvocationFailed {
-                provider: CodexProvider::<OpenAiResponsesCodexClient>::PROVIDER_ID.to_string(),
+                provider: CODEX_PROVIDER_ID.to_string(),
                 model: request.model.clone(),
                 detail: format!("OpenAI Responses API failed: HTTP {status}: {body}"),
             });
@@ -126,7 +224,7 @@ impl CodexClient for OpenAiResponsesCodexClient {
 
         let value = response.json::<serde_json::Value>().map_err(|source| {
             LanguageModelError::ProviderInvocationFailed {
-                provider: CodexProvider::<OpenAiResponsesCodexClient>::PROVIDER_ID.to_string(),
+                provider: CODEX_PROVIDER_ID.to_string(),
                 model: request.model.clone(),
                 detail: source.to_string(),
             }
@@ -237,7 +335,11 @@ impl CodexToolRegistry {
     }
 }
 
-pub struct CodexProvider<C, P = DefaultCodexPromptBuilder, M = DefaultCodexContextManager> {
+pub struct CodexProvider<
+    C = OpenAiResponsesCodexClient,
+    P = DefaultCodexPromptBuilder,
+    M = DefaultCodexContextManager,
+> {
     config: CodexConfig,
     client: C,
     tools: CodexToolRegistry,
@@ -255,10 +357,38 @@ impl CodexProvider<OpenAiResponsesCodexClient> {
             DefaultCodexContextManager::default(),
         )
     }
+
+    pub fn api_key(&self) -> Result<String, LanguageModelError> {
+        self.client.api_key()
+    }
+
+    pub fn save_api_key(&self, api_key: &str, source: &str) -> Result<(), LanguageModelError> {
+        self.client.save_api_key(api_key, source)
+    }
+
+    pub fn credentials_path(&self) -> Option<PathBuf> {
+        self.client.credentials_path()
+    }
+
+    pub fn test_connection(&self) -> Result<(), LanguageModelError> {
+        let request = LanguageModelRequest {
+            provider: Self::PROVIDER_ID.to_string(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            messages: vec![LanguageModelMessage {
+                role: LanguageModelRole::User,
+                content: "Reply with ok.".to_string(),
+            }],
+            temperature: None,
+            max_output_tokens: Some(8),
+            response_format: LanguageModelResponseFormat::Text,
+            metadata: serde_json::Value::Null,
+        };
+        self.complete(&request).map(|_| ())
+    }
 }
 
 impl<C, P, M> CodexProvider<C, P, M> {
-    pub const PROVIDER_ID: &'static str = "openai-codex";
+    pub const PROVIDER_ID: &'static str = CODEX_PROVIDER_ID;
 
     pub fn new(
         config: CodexConfig,
@@ -678,7 +808,9 @@ mod tests {
     use super::*;
     use crate::PROVIDER_DEFAULT_MODEL;
     use std::cell::RefCell;
+    use std::fs;
     use std::rc::Rc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn request() -> LanguageModelRequest {
         LanguageModelRequest {
@@ -847,6 +979,35 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].input["path"], "README.md");
         assert_eq!(parsed.continuation_items.len(), 2);
         assert_eq!(parsed.usage.unwrap().input_tokens, Some(10));
+    }
+
+    #[test]
+    fn codex_auth_json_round_trips_official_api_key_shape() {
+        let dir = std::env::temp_dir().join(format!(
+            "sinomo-codex-auth-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        let credentials_path = Some(dir.join("credentials.json"));
+
+        save_codex_api_key(&credentials_path, "sk-test").expect("save codex auth");
+        let auth_path = dir.join("credentials.json");
+        let auth = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&auth_path).expect("auth json"),
+        )
+        .expect("valid auth json");
+
+        assert_eq!(auth["auth_mode"], "apikey");
+        assert_eq!(auth["OPENAI_API_KEY"], "sk-test");
+        assert!(auth.get("tokens").is_none());
+        assert_eq!(
+            read_codex_auth_json_api_key(&auth_path).expect("read auth"),
+            Some("sk-test".to_string())
+        );
+
+        fs::remove_dir_all(dir).ok();
     }
 
     struct FixtureCodexClient {
