@@ -83,7 +83,7 @@ pub struct CodexCliProvider {
 }
 
 impl CodexCliProvider {
-    pub const PROVIDER_ID: &'static str = "codex";
+    pub const PROVIDER_ID: &'static str = "codex-cli";
 
     pub fn new(config: CodexCliConfig) -> Self {
         Self { config }

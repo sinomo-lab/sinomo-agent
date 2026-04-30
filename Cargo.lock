@@ -980,11 +980,13 @@ dependencies = [
 name = "sinomo-lm"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "reqwest",
  "serde",
  "serde_json",
  "sinomo-local",
  "thiserror",
+ "time",
 ]
 
 [[package]]

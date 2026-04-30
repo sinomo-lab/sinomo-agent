@@ -34,30 +34,49 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
-    if args.is_empty() {
-        return run_cui();
-    }
-
-    run_cli_command(&args)
+    run_parsed_cli_command(parse_cli_command(&args)?)
 }
 
 fn run_cli_command(args: &[String]) -> Result<(), CliError> {
-    if args.first().map(String::as_str) == Some("evolve") {
-        return run_evolve_command(&args[1..]);
-    }
+    run_parsed_cli_command(parse_cli_command(args)?)
+}
 
-    if let Some(command) = parse_provider_command(&args) {
-        return run_provider_command(command);
-    }
-
-    match args {
-        [help] if help == "help" || help == "--help" || help == "-h" => {
+fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
+    match command {
+        CliCommand::Cui => run_cui(),
+        CliCommand::Help => {
             print_usage();
             Ok(())
         }
-        [] => {
-            print_usage();
-            Ok(())
+        CliCommand::Evolve(command) => run_evolve_cli_command(command),
+        CliCommand::Models(command) => run_models_command(command),
+        CliCommand::Providers(command) => run_provider_command(command),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CliCommand {
+    Cui,
+    Help,
+    Evolve(EvolveCliCommand),
+    Models(ModelsCliCommand),
+    Providers(ProviderCliCommand),
+}
+
+fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(CliCommand::Cui),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(CliCommand::Help)
+        }
+        Some((command, rest)) if command == "evolve" => {
+            Ok(CliCommand::Evolve(parse_evolve_command(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "models" | "model") => Ok(
+            CliCommand::Models(parse_models_command(rest, ModelDefaultRepoMode::Reject)?),
+        ),
+        Some((command, rest)) if command == "providers" => {
+            Ok(CliCommand::Providers(parse_provider_command(rest)?))
         }
         _ => Err(CliError::Usage),
     }
@@ -422,17 +441,28 @@ impl CliConversationModel {
         data_dir.ensure_root_layout()?;
         let paths = EvolutionPaths::new(&data_dir);
         paths.ensure()?;
-        let config = read_config(&paths).ok();
-        let provider = config
+        let evolution_config = read_config(&paths).ok();
+        let model_config = read_model_config(&ModelPaths::new(&data_dir)).ok();
+        let provider = model_config
             .as_ref()
             .and_then(|config| config.default_provider.clone())
+            .or_else(|| {
+                evolution_config
+                    .as_ref()
+                    .and_then(|config| config.default_provider.clone())
+            })
             .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
         let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
             detail: format!("unknown provider `{provider}`"),
         })?;
-        let model = config
+        let model = model_config
             .as_ref()
             .and_then(|config| config.default_model.clone())
+            .or_else(|| {
+                evolution_config
+                    .as_ref()
+                    .and_then(|config| config.default_model.clone())
+            })
             .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
         Ok(Self {
             provider,
@@ -753,6 +783,37 @@ struct EvolutionConfig {
     default_model: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct ModelConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_model: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ModelPaths {
+    config: PathBuf,
+}
+
+impl ModelPaths {
+    fn new(data_dir: &SinomoDataDir) -> Self {
+        Self {
+            config: data_dir.configs_dir().join("models.json"),
+        }
+    }
+
+    fn ensure(&self) -> Result<(), CliError> {
+        let Some(parent) = self.config.parent() else {
+            return Ok(());
+        };
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct StoredEvolutionJob {
     job: EvolutionJob,
@@ -808,29 +869,76 @@ impl EvolutionPaths {
     }
 }
 
-fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
+#[derive(Debug, Clone)]
+enum EvolveCliCommand {
+    Help,
+    Propose(Vec<String>),
+    Decide(CandidateDecisionOutcome, Vec<String>),
+    Status(Vec<String>),
+    Show(Vec<String>),
+    Verify(Vec<String>),
+    Packet(Vec<String>),
+    Cleanup(Vec<String>),
+    Job(Vec<String>),
+    Models(ModelsCliCommand),
+}
+
+fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, CliError> {
     match args.split_first() {
-        Some((command, rest)) if command == "propose" => evolve_propose(rest),
-        Some((command, rest)) if command == "approve" => {
-            evolve_decide(rest, CandidateDecisionOutcome::Approved)
+        None => Ok(EvolveCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(EvolveCliCommand::Help)
         }
-        Some((command, rest)) if command == "reject" => {
-            evolve_decide(rest, CandidateDecisionOutcome::Rejected)
+        Some((command, rest)) if command == "propose" => {
+            Ok(EvolveCliCommand::Propose(rest.to_vec()))
         }
-        Some((command, rest)) if command == "restore" => {
-            evolve_decide(rest, CandidateDecisionOutcome::Restored)
+        Some((command, rest)) if command == "approve" => Ok(EvolveCliCommand::Decide(
+            CandidateDecisionOutcome::Approved,
+            rest.to_vec(),
+        )),
+        Some((command, rest)) if command == "reject" => Ok(EvolveCliCommand::Decide(
+            CandidateDecisionOutcome::Rejected,
+            rest.to_vec(),
+        )),
+        Some((command, rest)) if command == "restore" => Ok(EvolveCliCommand::Decide(
+            CandidateDecisionOutcome::Restored,
+            rest.to_vec(),
+        )),
+        Some((command, rest)) if command == "status" => Ok(EvolveCliCommand::Status(rest.to_vec())),
+        Some((command, rest)) if command == "show" => Ok(EvolveCliCommand::Show(rest.to_vec())),
+        Some((command, rest)) if command == "verify" => Ok(EvolveCliCommand::Verify(rest.to_vec())),
+        Some((command, rest)) if command == "packet" => Ok(EvolveCliCommand::Packet(rest.to_vec())),
+        Some((command, rest)) if command == "cleanup" => {
+            Ok(EvolveCliCommand::Cleanup(rest.to_vec()))
         }
-        Some((command, rest)) if command == "status" => evolve_status(rest),
-        Some((command, rest)) if command == "show" => evolve_show(rest),
-        Some((command, rest)) if command == "verify" => evolve_verify(rest),
-        Some((command, rest)) if command == "packet" => evolve_show_packet(rest),
-        Some((command, rest)) if command == "cleanup" => evolve_cleanup(rest),
-        Some((command, rest)) if command == "job" => evolve_job(rest),
-        Some((command, rest)) if command == "models" => evolve_models(rest),
-        _ => {
-            print_usage();
-            Err(CliError::Usage)
+        Some((command, rest)) if command == "job" => Ok(EvolveCliCommand::Job(rest.to_vec())),
+        Some((command, rest)) if command == "models" => Ok(EvolveCliCommand::Models(
+            parse_models_command(rest, ModelDefaultRepoMode::Allow)?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+#[cfg(test)]
+fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
+    run_evolve_cli_command(parse_evolve_command(args)?)
+}
+
+fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), CliError> {
+    match command {
+        EvolveCliCommand::Help => {
+            print_evolve_help();
+            Ok(())
         }
+        EvolveCliCommand::Propose(args) => evolve_propose(&args),
+        EvolveCliCommand::Decide(outcome, args) => evolve_decide(&args, outcome),
+        EvolveCliCommand::Status(args) => evolve_status(&args),
+        EvolveCliCommand::Show(args) => evolve_show(&args),
+        EvolveCliCommand::Verify(args) => evolve_verify(&args),
+        EvolveCliCommand::Packet(args) => evolve_show_packet(&args),
+        EvolveCliCommand::Cleanup(args) => evolve_cleanup(&args),
+        EvolveCliCommand::Job(args) => evolve_job(&args),
+        EvolveCliCommand::Models(command) => run_models_command(command),
     }
 }
 
@@ -841,6 +949,7 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let config = read_config(&paths).ok();
+    let model_config = read_model_config(&ModelPaths::new(&data_dir)).ok();
     let repo = options
         .repo
         .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.repo)))
@@ -851,15 +960,25 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     let provider = options
         .provider
         .or_else(|| {
+            model_config
+                .as_ref()
+                .and_then(|config| config.default_provider.clone())
+        })
+        .or_else(|| {
             config
                 .as_ref()
                 .and_then(|config| config.default_provider.clone())
         })
         .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
     let model = options.model.or_else(|| {
-        config
+        model_config
             .as_ref()
             .and_then(|config| config.default_model.clone())
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|config| config.default_model.clone())
+            })
     });
     let verification_commands = if options.verify.is_empty() {
         Vec::new()
@@ -1117,17 +1236,126 @@ struct ModelDefaultOptions {
     repo: Option<PathBuf>,
 }
 
-fn evolve_models(args: &[String]) -> Result<(), CliError> {
+#[derive(Debug, Clone)]
+enum ModelsCliCommand {
+    Help,
+    List(ModelListOptions),
+    Default(ModelDefaultOptions),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelDefaultRepoMode {
+    Allow,
+    Reject,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelListOptions {
+    provider: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CurrentDefaultModel {
+    provider: String,
+    configured_model: String,
+    model: String,
+    config_path: PathBuf,
+}
+
+fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let model_paths = ModelPaths::new(&data_dir);
+    let evolution_paths = EvolutionPaths::new(&data_dir);
+    let model_config = read_model_config(&model_paths).ok();
+    let evolution_config = read_config(&evolution_paths).ok();
+    let provider = model_config
+        .as_ref()
+        .and_then(|config| config.default_provider.clone())
+        .or_else(|| {
+            evolution_config
+                .as_ref()
+                .and_then(|config| config.default_provider.clone())
+        })
+        .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
+    let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
+        detail: format!("unknown provider `{provider}`"),
+    })?;
+    let configured_model = model_config
+        .as_ref()
+        .and_then(|config| config.default_model.clone())
+        .or_else(|| {
+            evolution_config
+                .as_ref()
+                .and_then(|config| config.default_model.clone())
+        })
+        .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
+    let model = effective_model_name(&provider, &configured_model);
+    Ok(CurrentDefaultModel {
+        provider,
+        configured_model,
+        model,
+        config_path: model_paths.config,
+    })
+}
+
+fn effective_model_name(provider: &str, configured_model: &str) -> String {
+    if configured_model != PROVIDER_DEFAULT_MODEL {
+        return configured_model.to_string();
+    }
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => GitHubCopilotConfig::default().default_model,
+        GitHubCopilotCliProvider::PROVIDER_ID => GitHubCopilotCliConfig::default().model,
+        CodexCliProvider::PROVIDER_ID => CODEX_CLI_DEFAULT_MODEL.to_string(),
+        CODEX_PROVIDER_ID => CODEX_DEFAULT_MODEL.to_string(),
+        ClaudeCodeProvider::PROVIDER_ID => CLAUDE_CODE_DEFAULT_MODEL.to_string(),
+        AnthropicProvider::PROVIDER_ID => AnthropicConfig::default().default_model,
+        OpenAiProvider::PROVIDER_ID => OpenAiConfig::default().default_model,
+        GeminiProvider::PROVIDER_ID => GeminiConfig::default().default_model,
+        _ => configured_model.to_string(),
+    }
+}
+
+fn parse_models_command(
+    args: &[String],
+    repo_mode: ModelDefaultRepoMode,
+) -> Result<ModelsCliCommand, CliError> {
     match args.split_first() {
-        Some((command, rest)) if command == "list" => evolve_models_list(rest),
-        Some((command, rest)) if command == "default" => evolve_models_default(rest),
+        None => Ok(ModelsCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(ModelsCliCommand::Help)
+        }
+        Some((command, rest)) if command == "list" => {
+            Ok(ModelsCliCommand::List(parse_models_list_options(rest)?))
+        }
+        Some((command, rest)) if command == "default" => Ok(ModelsCliCommand::Default(
+            parse_model_default_options(rest, repo_mode)?,
+        )),
         _ => Err(CliError::Usage),
     }
 }
 
-fn evolve_models_list(args: &[String]) -> Result<(), CliError> {
-    let provider = parse_models_list_provider(args)?;
-    let providers = match provider {
+fn run_models_command(command: ModelsCliCommand) -> Result<(), CliError> {
+    match command {
+        ModelsCliCommand::Help => models_help(),
+        ModelsCliCommand::List(options) => models_list(options),
+        ModelsCliCommand::Default(options) => models_default(options),
+    }
+}
+
+fn models_help() -> Result<(), CliError> {
+    let current = current_default_model()?;
+    println!("Current default model:");
+    println!("  provider: {}", current.provider);
+    println!("  model: {}", current.model);
+    println!("  configured model: {}", current.configured_model);
+    println!("  config: {}", current.config_path.display());
+    println!();
+    print_models_help();
+    Ok(())
+}
+
+fn models_list(options: ModelListOptions) -> Result<(), CliError> {
+    let providers = match options.provider {
         Some(provider) => {
             vec![
                 normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
@@ -1149,34 +1377,55 @@ fn evolve_models_list(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn parse_models_list_provider(args: &[String]) -> Result<Option<String>, CliError> {
+fn parse_models_list_options(args: &[String]) -> Result<ModelListOptions, CliError> {
     match args {
-        [] => Ok(None),
-        [flag, provider] if flag == "--provider" => Ok(Some(provider.clone())),
+        [] => Ok(ModelListOptions { provider: None }),
+        [flag, provider] if flag == "--provider" => Ok(ModelListOptions {
+            provider: Some(provider.clone()),
+        }),
         _ => Err(CliError::Usage),
     }
 }
 
-fn evolve_models_default(args: &[String]) -> Result<(), CliError> {
-    let options = parse_model_default_options(args)?;
+fn models_default(options: ModelDefaultOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
+    models_default_with_data_dir(options, &data_dir)
+}
+
+fn models_default_with_data_dir(
+    options: ModelDefaultOptions,
+    data_dir: &SinomoDataDir,
+) -> Result<(), CliError> {
     data_dir.ensure_root_layout()?;
-    let paths = EvolutionPaths::new(&data_dir);
-    paths.ensure()?;
-    let existing = read_config(&paths).ok();
-    let repo = options
-        .repo
-        .or_else(|| existing.as_ref().map(|config| PathBuf::from(&config.repo)))
-        .unwrap_or(env::current_dir().map_err(|source| CliError::Io {
-            path: ".".to_string(),
-            detail: source.to_string(),
-        })?);
-    let config = EvolutionConfig {
-        repo: repo.display().to_string(),
+    let model_paths = ModelPaths::new(data_dir);
+    model_paths.ensure()?;
+    let config = ModelConfig {
         default_provider: Some(options.provider),
         default_model: Some(options.model),
     };
-    write_json(&paths.config, &config)?;
+    write_json(&model_paths.config, &config)?;
+
+    if let Some(repo) = options.repo {
+        let evolution_paths = EvolutionPaths::new(data_dir);
+        evolution_paths.ensure()?;
+        let existing = read_config(&evolution_paths).ok();
+        let config = EvolutionConfig {
+            repo: repo.display().to_string(),
+            default_provider: config.default_provider.clone(),
+            default_model: config.default_model.clone(),
+        };
+        let config = if let Some(existing) = existing {
+            EvolutionConfig {
+                repo: config.repo,
+                default_provider: config.default_provider.or(existing.default_provider),
+                default_model: config.default_model.or(existing.default_model),
+            }
+        } else {
+            config
+        };
+        write_json(&evolution_paths.config, &config)?;
+    }
+
     println!(
         "default provider: {}",
         config.default_provider.as_deref().unwrap_or("")
@@ -1185,21 +1434,29 @@ fn evolve_models_default(args: &[String]) -> Result<(), CliError> {
         "default model: {}",
         config.default_model.as_deref().unwrap_or("")
     );
-    println!("config: {}", paths.config.display());
+    println!("config: {}", model_paths.config.display());
     Ok(())
 }
 
-fn parse_model_default_options(args: &[String]) -> Result<ModelDefaultOptions, CliError> {
+fn parse_model_default_options(
+    args: &[String],
+    repo_mode: ModelDefaultRepoMode,
+) -> Result<ModelDefaultOptions, CliError> {
     let provider = flag_value(args, "--provider").ok_or(CliError::Usage)?;
     let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
         detail: format!("unknown provider `{provider}`"),
     })?;
     let model = flag_value(args, "--model").ok_or(CliError::Usage)?;
-    let repo = flag_value(args, "--repo").map(PathBuf::from);
+    let repo = match (repo_mode, flag_value(args, "--repo")) {
+        (ModelDefaultRepoMode::Allow, repo) => repo.map(PathBuf::from),
+        (ModelDefaultRepoMode::Reject, None) => None,
+        (ModelDefaultRepoMode::Reject, Some(_)) => return Err(CliError::Usage),
+    };
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--provider" | "--model" | "--repo" => index += 2,
+            "--provider" | "--model" => index += 2,
+            "--repo" if repo_mode == ModelDefaultRepoMode::Allow => index += 2,
             _ => return Err(CliError::Usage),
         }
     }
@@ -1229,10 +1486,8 @@ fn normalize_model_provider(provider: &str) -> Option<String> {
         GitHubCopilotCliProvider::PROVIDER_ID => {
             Some(GitHubCopilotCliProvider::PROVIDER_ID.to_string())
         }
-        CodexCliProvider::PROVIDER_ID | "openai-codex-cli" => {
-            Some(CodexCliProvider::PROVIDER_ID.to_string())
-        }
-        CODEX_PROVIDER_ID | "codex-api" => Some(CODEX_PROVIDER_ID.to_string()),
+        CodexCliProvider::PROVIDER_ID => Some(CodexCliProvider::PROVIDER_ID.to_string()),
+        CODEX_PROVIDER_ID => Some(CODEX_PROVIDER_ID.to_string()),
         ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
             Some(ClaudeCodeProvider::PROVIDER_ID.to_string())
         }
@@ -1384,7 +1639,7 @@ impl MutationModel for CliMutationModel {
                 LanguageModelMutationBridge::new(provider, self.model.clone())
                     .mutate(packet, workspace)
             }
-            CodexCliProvider::PROVIDER_ID | "openai-codex-cli" => {
+            CodexCliProvider::PROVIDER_ID => {
                 let provider = CodexCliProvider::new(CodexCliConfig {
                     model: model_or_default(&self.model, CODEX_CLI_DEFAULT_MODEL.to_string()),
                     working_dir: Some(workspace.path.clone()),
@@ -1393,7 +1648,7 @@ impl MutationModel for CliMutationModel {
                 LanguageModelMutationBridge::new(provider, self.model.clone())
                     .mutate(packet, workspace)
             }
-            CODEX_PROVIDER_ID | "codex-api" => {
+            CODEX_PROVIDER_ID => {
                 let provider = codex_provider_for_model(&self.model);
                 LanguageModelMutationBridge::new(provider, self.model.clone())
                     .mutate(packet, workspace)
@@ -1473,12 +1728,16 @@ fn model_or_default(model: &str, default_model: String) -> String {
 
 fn codex_provider_for_model(model: &str) -> CodexProvider {
     let default_model = model_or_default(model, CODEX_DEFAULT_MODEL.to_string());
+    let config_default = OpenAiResponsesCodexConfig::default();
     let client_config = OpenAiResponsesCodexConfig {
         api_base_url: env::var("SINOMO_CODEX_API_BASE_URL")
-            .or_else(|_| env::var("SINOMO_OPENAI_API_BASE_URL"))
-            .unwrap_or_else(|_| OpenAiResponsesCodexConfig::default().api_base_url),
+            .unwrap_or_else(|_| config_default.api_base_url.clone()),
+        auth_issuer: env::var("SINOMO_CODEX_AUTH_ISSUER")
+            .unwrap_or_else(|_| config_default.auth_issuer.clone()),
+        client_id: env::var("SINOMO_CODEX_CLIENT_ID")
+            .unwrap_or_else(|_| config_default.client_id.clone()),
         default_model: default_model.clone(),
-        credentials_path: OpenAiResponsesCodexConfig::default().credentials_path,
+        credentials_path: config_default.credentials_path,
     };
     CodexProvider::new(
         CodexConfig {
@@ -1612,6 +1871,17 @@ fn ensure_awaiting_approval(record: &StoredEvolutionJob) -> Result<(), CliError>
 }
 
 fn read_config(paths: &EvolutionPaths) -> Result<EvolutionConfig, CliError> {
+    let content = fs::read_to_string(&paths.config).map_err(|source| CliError::Io {
+        path: paths.config.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: paths.config.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn read_model_config(paths: &ModelPaths) -> Result<ModelConfig, CliError> {
     let content = fs::read_to_string(&paths.config).map_err(|source| CliError::Io {
         path: paths.config.display().to_string(),
         detail: source.to_string(),
@@ -1772,36 +2042,54 @@ enum ProviderName {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderCliCommand {
+    Help,
     Auth(ProviderName),
     Test(ProviderName),
 }
 
-fn parse_provider_command(args: &[String]) -> Option<ProviderCliCommand> {
-    let [providers, action, provider] = args else {
-        return None;
+fn parse_provider_command(args: &[String]) -> Result<ProviderCliCommand, CliError> {
+    match args {
+        [] => return Ok(ProviderCliCommand::Help),
+        [command] if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            return Ok(ProviderCliCommand::Help);
+        }
+        _ => {}
+    }
+
+    let [action, provider] = args else {
+        return Err(CliError::Usage);
     };
-    if providers != "providers" {
-        return None;
+
+    if !matches!(action.as_str(), "auth" | "test") {
+        return Err(CliError::Usage);
     }
 
     let provider = match provider.as_str() {
         "github-copilot" => ProviderName::GitHubCopilot,
-        "codex" | "openai-codex" | "codex-api" => ProviderName::Codex,
+        "codex" => ProviderName::Codex,
         "anthropic" => ProviderName::Anthropic,
         "openai" => ProviderName::OpenAi,
         "gemini" => ProviderName::Gemini,
-        _ => return None,
+        _ => {
+            return Err(CliError::Parse {
+                detail: format!("unknown provider `{provider}`"),
+            });
+        }
     };
 
     match action.as_str() {
-        "auth" => Some(ProviderCliCommand::Auth(provider)),
-        "test" => Some(ProviderCliCommand::Test(provider)),
-        _ => None,
+        "auth" => Ok(ProviderCliCommand::Auth(provider)),
+        "test" => Ok(ProviderCliCommand::Test(provider)),
+        _ => unreachable!("provider action was checked before provider parsing"),
     }
 }
 
 fn run_provider_command(command: ProviderCliCommand) -> Result<(), CliError> {
     match command {
+        ProviderCliCommand::Help => {
+            print_providers_help();
+            Ok(())
+        }
         ProviderCliCommand::Auth(ProviderName::GitHubCopilot) => auth_github_copilot(),
         ProviderCliCommand::Test(ProviderName::GitHubCopilot) => test_github_copilot(),
         ProviderCliCommand::Auth(ProviderName::Codex) => auth_codex(),
@@ -1917,15 +2205,8 @@ pub fn test_anthropic() -> Result<(), CliError> {
 
 pub fn auth_openai() -> Result<(), CliError> {
     let (provider, credentials_path) = openai_provider()?;
-    let (api_key, source) = api_key_from_env_or_prompt(
-        "OpenAI",
-        &[
-            "SINOMO_OPENAI_API_KEY",
-            "OPENAI_API_KEY",
-            "CODEX_API_KEY",
-            "SINOMO_CODEX_API_KEY",
-        ],
-    )?;
+    let (api_key, source) =
+        api_key_from_env_or_prompt("OpenAI", &["SINOMO_OPENAI_API_KEY", "OPENAI_API_KEY"])?;
     provider.save_api_key(&api_key, &source)?;
     println!("Testing OpenAI provider connection...");
     provider.test_connection()?;
@@ -1948,13 +2229,32 @@ pub fn test_openai() -> Result<(), CliError> {
 
 pub fn auth_codex() -> Result<(), CliError> {
     let (provider, auth_path) = codex_provider()?;
-    let (api_key, source) = api_key_from_env_or_prompt(
-        "Codex",
-        &["SINOMO_CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"],
-    )?;
-    provider.save_api_key(&api_key, &source)?;
-    println!("Testing Codex provider connection...");
-    provider.test_connection()?;
+    let device = provider.device_login_start()?;
+
+    println!("Open this URL in your browser:");
+    println!("{}", device.verification_uri);
+    println!();
+    println!("Enter this code:");
+    println!("{}", device.user_code);
+    println!();
+    println!("Waiting for ChatGPT authorization...");
+
+    let started = Instant::now();
+    let expires_in = Duration::from_secs(device.expires_in);
+    let interval = Duration::from_secs(device.interval.max(5));
+
+    loop {
+        if started.elapsed() >= expires_in {
+            return Err(CliError::AuthExpired);
+        }
+        thread::sleep(interval);
+        let poll = provider.device_login_poll(&device)?;
+        if poll.tokens.is_some() {
+            println!("Testing Codex provider connection...");
+            provider.test_connection()?;
+            break;
+        }
+    }
     println!("Codex credentials saved to {}", auth_path.display());
     Ok(())
 }
@@ -1962,8 +2262,8 @@ pub fn auth_codex() -> Result<(), CliError> {
 pub fn test_codex() -> Result<(), CliError> {
     let (provider, auth_path) = codex_provider()?;
     println!("Testing Codex credentials at {}", auth_path.display());
-    provider.api_key()?;
-    println!("Codex API key: ok");
+    provider.chatgpt_tokens()?;
+    println!("Codex ChatGPT auth: ok");
     provider.test_connection()?;
     println!("Codex provider connection: ok");
     Ok(())
@@ -2034,7 +2334,6 @@ fn openai_provider() -> Result<(OpenAiProvider, PathBuf), CliError> {
     let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_base_url: env::var("SINOMO_OPENAI_API_BASE_URL")
-            .or_else(|_| env::var("SINOMO_CODEX_API_BASE_URL"))
             .unwrap_or_else(|_| OpenAiConfig::default().api_base_url),
         default_model: OpenAiConfig::default().default_model,
         credentials_path: Some(credentials_path.clone()),
@@ -2098,6 +2397,8 @@ fn api_key_from_env_or_prompt(
 pub fn print_usage() {
     println!("Usage:");
     println!("  sinomo");
+    println!("  sinomo models list [--provider <provider>]");
+    println!("  sinomo models default --provider <provider> --model <model>");
     println!(
         "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider github-copilot] [--verify \"cargo check\"]"
     );
@@ -2109,7 +2410,7 @@ pub fn print_usage() {
     println!("  sinomo evolve verify|packet|cleanup [--job evojob_...]");
     println!("  sinomo evolve models list [--provider <provider>]");
     println!(
-        "  sinomo evolve models default --provider <provider> --model <model> [--repo <path>]"
+        "  sinomo evolve models default --provider <provider> --model <model> [--repo <path>] (compatibility alias)"
     );
     println!("  sinomo providers auth github-copilot");
     println!("  sinomo providers test github-copilot");
@@ -2134,16 +2435,17 @@ pub fn print_usage() {
     println!();
     println!("CUI:");
     println!("  Run `sinomo` with no arguments to start the command-line user interface.");
-    println!("  Inside the CUI, prefix any CLI command with `/`, for example `/evolve status`.");
+    println!("  Inside the CUI, prefix any CLI command with `/`, for example `/models list`.");
     println!("  Use `/quit` or `/exit` to end the session.");
     println!();
     println!("Environment:");
     println!("  SINOMO_DATA_DIR             Defaults to ~/.sinomo");
     println!("  SINOMO_CODEX_CREDENTIALS_FILE  Overrides Sinomo's Codex credentials file");
+    println!("  SINOMO_CODEX_AUTH_ISSUER       Overrides the Codex ChatGPT auth issuer");
+    println!("  SINOMO_CODEX_CLIENT_ID         Overrides the Codex ChatGPT OAuth client ID");
+    println!("  SINOMO_CODEX_API_BASE_URL      Overrides the Codex ChatGPT backend API base URL");
     println!("  ANTHROPIC_API_KEY           Used by `providers auth/test anthropic`");
-    println!("  OPENAI_API_KEY              Used by `providers auth/test openai` and codex");
-    println!("  SINOMO_CODEX_API_KEY        Used by `providers auth/test codex`");
-    println!("  CODEX_API_KEY               Used by `providers auth/test codex`");
+    println!("  OPENAI_API_KEY              Used by `providers auth/test openai`");
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
     println!(
         "  SINOMO_COPILOT_CLIENT_ID    Defaults to {}",
@@ -2152,6 +2454,58 @@ pub fn print_usage() {
     println!(
         "                               GitHub App client IDs are not accepted by Copilot token exchange"
     );
+}
+
+fn print_models_help() {
+    println!("Models:");
+    println!("  sinomo models");
+    println!("      Show the current default model and this help.");
+    println!("  sinomo models list [--provider <provider>]");
+    println!("      List available or known models.");
+    println!("  sinomo models default --provider <provider> --model <model>");
+    println!("      Set the default model for CUI and model-backed commands.");
+    println!();
+    println!("Providers:");
+    for provider in default_model_provider_ids() {
+        println!("  {provider}");
+    }
+}
+
+fn print_providers_help() {
+    println!("Providers:");
+    println!("  sinomo providers");
+    println!("      Show provider commands.");
+    println!("  sinomo providers auth <provider>");
+    println!("      Authenticate a provider and store credentials in Sinomo's data dir.");
+    println!("  sinomo providers test <provider>");
+    println!("      Validate stored provider credentials.");
+    println!();
+    println!("Provider IDs:");
+    println!("  github-copilot");
+    println!("  codex");
+    println!("  anthropic");
+    println!("  openai");
+    println!("  gemini");
+}
+
+fn print_evolve_help() {
+    println!("Evolution:");
+    println!("  sinomo evolve");
+    println!("      Show evolution commands.");
+    println!(
+        "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"]"
+    );
+    println!("  sinomo evolve approve [--job evojob_...] [--note <note>]");
+    println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
+    println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
+    println!("  sinomo evolve status [--job evojob_...]");
+    println!("  sinomo evolve show [--diff|--scorecard|--decision|--packet] [--job evojob_...]");
+    println!("  sinomo evolve verify [--job evojob_...]");
+    println!("  sinomo evolve packet [--job evojob_...]");
+    println!("  sinomo evolve cleanup [--job evojob_...]");
+    println!("  sinomo evolve job create \"<objective>\" [--repo <path>]");
+    println!("  sinomo evolve models ...");
+    println!("      Compatibility alias for `sinomo models ...`.");
 }
 
 #[derive(Debug)]
@@ -2235,8 +2589,8 @@ impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Usage => write!(formatter, "unknown command; run `sinomo help`"),
-            Self::AuthDenied => write!(formatter, "GitHub device authorization was denied"),
-            Self::AuthExpired => write!(formatter, "GitHub device authorization expired"),
+            Self::AuthDenied => write!(formatter, "device authorization was denied"),
+            Self::AuthExpired => write!(formatter, "device authorization expired"),
             Self::AuthProvider { detail } => write!(formatter, "provider auth failed: {detail}"),
             Self::NoActiveJob => write!(formatter, "no active evolution job"),
             Self::AmbiguousJob { job_ids } => {
@@ -2274,10 +2628,11 @@ impl std::error::Error for CliError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CliError, EvolutionJobStatus, EvolutionPaths, InteractionModel, InteractionRuntime,
-        InteractionSession, InteractionSurface, InteractionSurfaceKind,
-        ModelBackedInteractionHandler, ProviderCliCommand, ProviderName, is_terminal_status,
-        normalize_model_provider, parse_model_default_options, parse_models_list_provider,
+        CliCommand, CliError, EvolutionJobStatus, EvolutionPaths, InteractionModel,
+        InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+        ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
+        ProviderName, is_terminal_status, models_default_with_data_dir, normalize_model_provider,
+        parse_cli_command, parse_model_default_options, parse_models_list_options,
         parse_propose_options, parse_provider_command, parse_slash_command,
         run_cui_with_handler_io, run_evolve_command,
     };
@@ -2293,41 +2648,69 @@ mod tests {
     #[test]
     fn provider_commands_parse_action_before_provider() {
         assert_eq!(
-            parse_provider_command(&[
-                "providers".to_string(),
-                "auth".to_string(),
-                "gemini".to_string(),
-            ]),
-            Some(ProviderCliCommand::Auth(ProviderName::Gemini))
+            parse_provider_command(&["auth".to_string(), "gemini".to_string(),])
+                .expect("provider command"),
+            ProviderCliCommand::Auth(ProviderName::Gemini)
         );
         assert_eq!(
-            parse_provider_command(&[
-                "providers".to_string(),
-                "test".to_string(),
-                "github-copilot".to_string(),
-            ]),
-            Some(ProviderCliCommand::Test(ProviderName::GitHubCopilot))
+            parse_provider_command(&["test".to_string(), "github-copilot".to_string(),])
+                .expect("provider command"),
+            ProviderCliCommand::Test(ProviderName::GitHubCopilot)
         );
         assert_eq!(
-            parse_provider_command(&[
-                "providers".to_string(),
-                "auth".to_string(),
-                "codex".to_string(),
-            ]),
-            Some(ProviderCliCommand::Auth(ProviderName::Codex))
+            parse_provider_command(&["auth".to_string(), "codex".to_string(),])
+                .expect("provider command"),
+            ProviderCliCommand::Auth(ProviderName::Codex)
         );
     }
 
     #[test]
     fn provider_commands_reject_provider_before_action_order() {
-        assert_eq!(
-            parse_provider_command(&[
+        assert!(matches!(
+            parse_provider_command(&["gemini".to_string(), "auth".to_string()]),
+            Err(CliError::Usage)
+        ));
+    }
+
+    #[test]
+    fn top_level_cli_parser_routes_subcommands() {
+        assert!(matches!(
+            parse_cli_command(&[]).expect("cui"),
+            CliCommand::Cui
+        ));
+        assert!(matches!(
+            parse_cli_command(&["help".to_string()]).expect("help"),
+            CliCommand::Help
+        ));
+        assert!(matches!(
+            parse_cli_command(&[
                 "providers".to_string(),
-                "gemini".to_string(),
-                "auth".to_string(),
-            ]),
-            None
-        );
+                "test".to_string(),
+                "openai".to_string()
+            ])
+            .expect("providers"),
+            CliCommand::Providers(ProviderCliCommand::Test(ProviderName::OpenAi))
+        ));
+        assert!(matches!(
+            parse_cli_command(&["models".to_string(), "list".to_string()]).expect("models"),
+            CliCommand::Models(ModelsCliCommand::List(_))
+        ));
+        assert!(matches!(
+            parse_cli_command(&["models".to_string()]).expect("models help"),
+            CliCommand::Models(ModelsCliCommand::Help)
+        ));
+        assert!(matches!(
+            parse_cli_command(&["model".to_string(), "list".to_string()]).expect("model alias"),
+            CliCommand::Models(ModelsCliCommand::List(_))
+        ));
+        assert!(matches!(
+            parse_cli_command(&["providers".to_string()]).expect("providers help"),
+            CliCommand::Providers(ProviderCliCommand::Help)
+        ));
+        assert!(matches!(
+            parse_cli_command(&["evolve".to_string()]).expect("evolve help"),
+            CliCommand::Evolve(super::EvolveCliCommand::Help)
+        ));
     }
 
     #[test]
@@ -2479,28 +2862,54 @@ mod tests {
 
     #[test]
     fn model_list_parser_accepts_optional_provider() {
-        assert_eq!(parse_models_list_provider(&[]).expect("empty args"), None);
         assert_eq!(
-            parse_models_list_provider(&["--provider".to_string(), "github-copilot".to_string()])
+            parse_models_list_options(&[]).expect("empty args"),
+            super::ModelListOptions { provider: None }
+        );
+        assert_eq!(
+            parse_models_list_options(&["--provider".to_string(), "github-copilot".to_string()])
                 .expect("provider"),
-            Some("github-copilot".to_string())
+            super::ModelListOptions {
+                provider: Some("github-copilot".to_string())
+            }
         );
         assert!(matches!(
-            parse_models_list_provider(&["github-copilot".to_string()]),
+            parse_models_list_options(&["github-copilot".to_string()]),
             Err(CliError::Usage)
         ));
     }
 
     #[test]
-    fn model_default_parser_accepts_provider_model_and_repo() {
-        let options = parse_model_default_options(&[
-            "--provider".to_string(),
-            "openai-api".to_string(),
-            "--model".to_string(),
-            "gpt-5.5".to_string(),
-            "--repo".to_string(),
-            "/repo".to_string(),
-        ])
+    fn model_default_parser_accepts_provider_model() {
+        let options = parse_model_default_options(
+            &[
+                "--provider".to_string(),
+                "openai-api".to_string(),
+                "--model".to_string(),
+                "gpt-5.5".to_string(),
+            ],
+            ModelDefaultRepoMode::Reject,
+        )
+        .expect("options");
+
+        assert_eq!(options.provider, "openai");
+        assert_eq!(options.model, "gpt-5.5");
+        assert_eq!(options.repo, None);
+    }
+
+    #[test]
+    fn evolve_model_default_parser_accepts_repo_for_compatibility() {
+        let options = parse_model_default_options(
+            &[
+                "--provider".to_string(),
+                "openai-api".to_string(),
+                "--model".to_string(),
+                "gpt-5.5".to_string(),
+                "--repo".to_string(),
+                "/repo".to_string(),
+            ],
+            ModelDefaultRepoMode::Allow,
+        )
         .expect("options");
 
         assert_eq!(options.provider, "openai");
@@ -2509,13 +2918,48 @@ mod tests {
     }
 
     #[test]
+    fn models_default_writes_global_model_config() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-models-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+
+        models_default_with_data_dir(
+            super::ModelDefaultOptions {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                repo: None,
+            },
+            &data_dir,
+        )
+        .expect("write model defaults");
+
+        let config_path = root.join("config").join("models.json");
+        let config = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&config_path).expect("model config"),
+        )
+        .expect("model config json");
+        assert_eq!(config["default_provider"], "openai");
+        assert_eq!(config["default_model"], "gpt-5.5");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn model_default_parser_requires_known_provider() {
-        let error = parse_model_default_options(&[
-            "--provider".to_string(),
-            "unknown".to_string(),
-            "--model".to_string(),
-            "model".to_string(),
-        ])
+        let error = parse_model_default_options(
+            &[
+                "--provider".to_string(),
+                "unknown".to_string(),
+                "--model".to_string(),
+                "model".to_string(),
+            ],
+            ModelDefaultRepoMode::Reject,
+        )
         .expect_err("unknown provider rejected");
 
         assert!(matches!(error, CliError::Parse { .. }));
@@ -2535,10 +2979,9 @@ mod tests {
             normalize_model_provider("github-copilot").as_deref(),
             Some("github-copilot")
         );
-        assert_eq!(
-            normalize_model_provider("codex-api").as_deref(),
-            Some("openai-codex")
-        );
+        assert_eq!(normalize_model_provider("codex-api"), None);
+        assert_eq!(normalize_model_provider("openai-codex"), None);
+        assert_eq!(normalize_model_provider("openai-codex-cli"), None);
     }
 
     #[test]

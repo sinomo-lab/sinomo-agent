@@ -53,12 +53,7 @@ impl OpenAiProvider {
         resolve_api_key(
             Self::PROVIDER_ID,
             &self.config.credentials_path,
-            &[
-                "SINOMO_OPENAI_API_KEY",
-                "OPENAI_API_KEY",
-                "CODEX_API_KEY",
-                "SINOMO_CODEX_API_KEY",
-            ],
+            &["SINOMO_OPENAI_API_KEY", "OPENAI_API_KEY"],
             "no OpenAI API key found; set OPENAI_API_KEY or run `sinomo providers auth openai`",
         )
     }

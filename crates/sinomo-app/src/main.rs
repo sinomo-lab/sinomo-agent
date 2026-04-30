@@ -579,7 +579,7 @@ fn configured_deliberation_model()
         }));
     }
 
-    if provider == CodexCliProvider::PROVIDER_ID || provider == "openai-codex-cli" {
+    if provider == CodexCliProvider::PROVIDER_ID {
         let model = PROVIDER_DEFAULT_MODEL.to_string();
         let program = env::var("SINOMO_DELIBERATION_LM_PROGRAM")
             .unwrap_or_else(|_| CodexCliConfig::default().program);

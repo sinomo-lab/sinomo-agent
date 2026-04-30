@@ -1,23 +1,29 @@
-use crate::api_key::default_api_key_credentials_path;
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
     LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
     selected_model,
 };
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
-pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.2-codex";
-pub const CODEX_PROVIDER_ID: &str = "openai-codex";
-pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
-pub const CODEX_API_KEY_ENV_VAR: &str = "CODEX_API_KEY";
-pub const SINOMO_CODEX_API_KEY_ENV_VAR: &str = "SINOMO_CODEX_API_KEY";
+pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
+pub const CODEX_PROVIDER_ID: &str = "codex";
+const LEGACY_CODEX_CHATGPT_DEFAULT_MODEL: &str = "gpt-5.2-codex";
+const CODEX_DEFAULT_INSTRUCTIONS: &str =
+    "You are Sinomo's Codex model provider. Answer the user's request clearly and accurately.";
 pub const SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR: &str = "SINOMO_CODEX_CREDENTIALS_FILE";
+pub const CODEX_AUTH_ISSUER: &str = "https://auth.openai.com";
+pub const CODEX_AUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const CODEX_CHATGPT_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexConfig {
@@ -39,6 +45,8 @@ impl Default for CodexConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenAiResponsesCodexConfig {
     pub api_base_url: String,
+    pub auth_issuer: String,
+    pub client_id: String,
     pub default_model: String,
     pub credentials_path: Option<PathBuf>,
 }
@@ -46,47 +54,39 @@ pub struct OpenAiResponsesCodexConfig {
 impl Default for OpenAiResponsesCodexConfig {
     fn default() -> Self {
         Self {
-            api_base_url: "https://api.openai.com/v1".to_string(),
+            api_base_url: CODEX_CHATGPT_API_BASE_URL.to_string(),
+            auth_issuer: CODEX_AUTH_ISSUER.to_string(),
+            client_id: CODEX_AUTH_CLIENT_ID.to_string(),
             default_model: CODEX_DEFAULT_MODEL.to_string(),
-            credentials_path: default_api_key_credentials_path(
-                SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR,
-                CODEX_PROVIDER_ID,
-            ),
+            credentials_path: default_codex_credentials_path(),
         }
     }
 }
 
-fn env_secret(env_var: &str) -> Option<String> {
-    std::env::var(env_var)
+fn default_codex_credentials_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var(SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn resolve_codex_api_key(credentials_path: &Option<PathBuf>) -> Result<String, LanguageModelError> {
-    if let Some(credentials_path) = credentials_path
-        && let Some(api_key) = read_codex_auth_json_api_key(credentials_path)?
     {
-        return Ok(api_key);
+        return Some(PathBuf::from(path));
     }
-    for env_var in [
-        SINOMO_CODEX_API_KEY_ENV_VAR,
-        OPENAI_API_KEY_ENV_VAR,
-        CODEX_API_KEY_ENV_VAR,
-    ] {
-        if let Some(api_key) = env_secret(env_var) {
-            return Ok(api_key);
-        }
-    }
-    Err(LanguageModelError::AuthenticationRequired {
-        provider: CODEX_PROVIDER_ID.to_string(),
-        detail: "no Sinomo Codex API key found; run `sinomo providers auth codex`, set SINOMO_CODEX_API_KEY, or set OPENAI_API_KEY/CODEX_API_KEY".to_string(),
-    })
+    sinomo_local::SinomoDataDir::from_env_or_home()
+        .ok()
+        .map(|dir| dir.provider_credentials_file(CODEX_PROVIDER_ID))
 }
 
-fn read_codex_auth_json_api_key(
+fn missing_codex_chatgpt_auth() -> LanguageModelError {
+    LanguageModelError::AuthenticationRequired {
+        provider: CODEX_PROVIDER_ID.to_string(),
+        detail: "no Sinomo Codex ChatGPT sign-in found; run `sinomo providers auth codex`"
+            .to_string(),
+    }
+}
+
+fn read_codex_chatgpt_tokens(
     credentials_path: &PathBuf,
-) -> Result<Option<String>, LanguageModelError> {
+) -> Result<Option<CodexChatGptTokens>, LanguageModelError> {
     let contents = match fs::read_to_string(credentials_path) {
         Ok(contents) => contents,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -103,15 +103,18 @@ fn read_codex_auth_json_api_key(
             detail: source.to_string(),
         }
     })?;
-    Ok(auth
-        .openai_api_key
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty()))
+    if auth.auth_mode.as_deref() == Some("apikey") || auth.openai_api_key.is_some() {
+        return Err(LanguageModelError::AuthenticationRequired {
+            provider: CODEX_PROVIDER_ID.to_string(),
+            detail: "Codex now uses Sign in with ChatGPT for subscription access; run `sinomo providers auth codex` to replace the old API-key credential".to_string(),
+        });
+    }
+    Ok(auth.tokens.filter(CodexChatGptTokens::has_access_token))
 }
 
-fn save_codex_api_key(
+fn save_codex_chatgpt_tokens(
     credentials_path: &Option<PathBuf>,
-    api_key: &str,
+    tokens: CodexChatGptTokens,
 ) -> Result<(), LanguageModelError> {
     let Some(credentials_path) = credentials_path else {
         return Err(LanguageModelError::AuthenticationRequired {
@@ -125,11 +128,16 @@ fn save_codex_api_key(
             detail: source.to_string(),
         })?;
     }
+    let last_refresh = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|source| LanguageModelError::RequestSerialization {
+            detail: source.to_string(),
+        })?;
     let auth = CodexAuthDotJson {
-        auth_mode: Some("apikey".to_string()),
-        openai_api_key: Some(api_key.trim().to_string()),
-        tokens: None,
-        last_refresh: None,
+        auth_mode: Some("chatgpt".to_string()),
+        openai_api_key: None,
+        tokens: Some(tokens),
+        last_refresh: Some(last_refresh),
         agent_identity: None,
     };
     let json = serde_json::to_string_pretty(&auth).map_err(|source| {
@@ -147,14 +155,136 @@ fn save_codex_api_key(
 struct CodexAuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_mode: Option<String>,
-    #[serde(rename = "OPENAI_API_KEY")]
+    #[serde(
+        default,
+        rename = "OPENAI_API_KEY",
+        skip_serializing_if = "Option::is_none"
+    )]
     openai_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    tokens: Option<serde_json::Value>,
+    tokens: Option<CodexChatGptTokens>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_refresh: Option<serde_json::Value>,
+    last_refresh: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_identity: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexChatGptTokens {
+    pub id_token: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub chatgpt_account_is_fedramp: bool,
+}
+
+impl CodexChatGptTokens {
+    fn has_access_token(&self) -> bool {
+        !self.access_token.trim().is_empty()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexDeviceCode {
+    pub verification_uri: String,
+    pub user_code: String,
+    pub device_auth_id: String,
+    pub interval: u64,
+    pub expires_in: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexDevicePoll {
+    pub tokens: Option<CodexChatGptTokens>,
+    pub pending: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTokenResponse {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRefreshResponse {
+    id_token: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+}
+
+fn codex_auth_invocation_error(detail: String) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: CODEX_PROVIDER_ID.to_string(),
+        model: CODEX_DEFAULT_MODEL.to_string(),
+        detail,
+    }
+}
+
+fn json_u64_or_string(value: Option<&serde_json::Value>) -> Option<u64> {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(serde_json::Value::String(text)) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Result<String, LanguageModelError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            codex_auth_invocation_error(format!(
+                "Codex device authorization response missed `{key}`"
+            ))
+        })
+}
+
+fn tokens_from_response(
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    previous_account_id: Option<String>,
+) -> CodexChatGptTokens {
+    let claims = jwt_auth_claims(&id_token);
+    let auth_claims = claims
+        .get("https://api.openai.com/auth")
+        .and_then(serde_json::Value::as_object);
+    let account_id = auth_claims
+        .and_then(|claims| claims.get("chatgpt_account_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or(previous_account_id);
+    let chatgpt_account_is_fedramp = auth_claims
+        .and_then(|claims| claims.get("chatgpt_account_is_fedramp"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    CodexChatGptTokens {
+        id_token,
+        access_token,
+        refresh_token,
+        account_id,
+        chatgpt_account_is_fedramp,
+    }
+}
+
+fn jwt_auth_claims(jwt: &str) -> serde_json::Value {
+    let Some(payload) = jwt.split('.').nth(1) else {
+        return serde_json::Value::Null;
+    };
+    URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 #[derive(Clone, Debug)]
@@ -171,16 +301,184 @@ impl OpenAiResponsesCodexClient {
         }
     }
 
-    pub fn api_key(&self) -> Result<String, LanguageModelError> {
-        resolve_codex_api_key(&self.config.credentials_path)
+    pub fn chatgpt_tokens(&self) -> Result<CodexChatGptTokens, LanguageModelError> {
+        let Some(credentials_path) = &self.config.credentials_path else {
+            return Err(missing_codex_chatgpt_auth());
+        };
+        read_codex_chatgpt_tokens(credentials_path)?.ok_or_else(missing_codex_chatgpt_auth)
     }
 
-    pub fn save_api_key(&self, api_key: &str, _source: &str) -> Result<(), LanguageModelError> {
-        save_codex_api_key(&self.config.credentials_path, api_key)
+    pub fn save_chatgpt_tokens(
+        &self,
+        tokens: CodexChatGptTokens,
+    ) -> Result<(), LanguageModelError> {
+        save_codex_chatgpt_tokens(&self.config.credentials_path, tokens)
     }
 
     pub fn credentials_path(&self) -> Option<PathBuf> {
         self.config.credentials_path.clone()
+    }
+
+    pub fn device_login_start(&self) -> Result<CodexDeviceCode, LanguageModelError> {
+        let issuer = self.config.auth_issuer.trim_end_matches('/');
+        let response = self
+            .http
+            .post(format!("{issuer}/api/accounts/deviceauth/usercode"))
+            .json(&serde_json::json!({ "client_id": self.config.client_id.as_str() }))
+            .send()
+            .map_err(|source| codex_auth_invocation_error(source.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(codex_auth_invocation_error(format!(
+                "Codex device code request failed: HTTP {status}: {body}"
+            )));
+        }
+        let value = response
+            .json::<serde_json::Value>()
+            .map_err(|source| codex_auth_invocation_error(source.to_string()))?;
+        let device_auth_id = value
+            .get("device_auth_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let user_code = value
+            .get("user_code")
+            .or_else(|| value.get("usercode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if device_auth_id.is_empty() || user_code.is_empty() {
+            return Err(codex_auth_invocation_error(
+                "Codex device code response was missing a device id or user code".to_string(),
+            ));
+        }
+        Ok(CodexDeviceCode {
+            verification_uri: format!("{issuer}/codex/device"),
+            user_code,
+            device_auth_id,
+            interval: json_u64_or_string(value.get("interval")).unwrap_or(5),
+            expires_in: 15 * 60,
+        })
+    }
+
+    pub fn device_login_poll(
+        &self,
+        device: &CodexDeviceCode,
+    ) -> Result<CodexDevicePoll, LanguageModelError> {
+        let issuer = self.config.auth_issuer.trim_end_matches('/');
+        let response = self
+            .http
+            .post(format!("{issuer}/api/accounts/deviceauth/token"))
+            .json(&serde_json::json!({
+                "device_auth_id": device.device_auth_id.as_str(),
+                "user_code": device.user_code.as_str(),
+            }))
+            .send()
+            .map_err(|source| codex_auth_invocation_error(source.to_string()))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(CodexDevicePoll {
+                tokens: None,
+                pending: true,
+            });
+        }
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(codex_auth_invocation_error(format!(
+                "Codex device authorization failed: HTTP {status}: {body}"
+            )));
+        }
+        let value = response
+            .json::<serde_json::Value>()
+            .map_err(|source| codex_auth_invocation_error(source.to_string()))?;
+        let authorization_code = json_string(&value, "authorization_code")?;
+        let code_verifier = json_string(&value, "code_verifier")?;
+        let tokens =
+            self.exchange_device_authorization_code(&authorization_code, &code_verifier)?;
+        self.save_chatgpt_tokens(tokens.clone())?;
+        Ok(CodexDevicePoll {
+            tokens: Some(tokens),
+            pending: false,
+        })
+    }
+
+    fn exchange_device_authorization_code(
+        &self,
+        authorization_code: &str,
+        code_verifier: &str,
+    ) -> Result<CodexChatGptTokens, LanguageModelError> {
+        let issuer = self.config.auth_issuer.trim_end_matches('/');
+        let redirect_uri = format!("{issuer}/deviceauth/callback");
+        let response = self
+            .http
+            .post(format!("{issuer}/oauth/token"))
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", authorization_code),
+                ("redirect_uri", redirect_uri.as_str()),
+                ("client_id", self.config.client_id.as_str()),
+                ("code_verifier", code_verifier),
+            ])
+            .send()
+            .map_err(|source| codex_auth_invocation_error(source.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(codex_auth_invocation_error(format!(
+                "Codex token exchange failed: HTTP {status}: {body}"
+            )));
+        }
+        let exchanged = response
+            .json::<CodexTokenResponse>()
+            .map_err(|source| codex_auth_invocation_error(source.to_string()))?;
+        Ok(tokens_from_response(
+            exchanged.id_token,
+            exchanged.access_token,
+            exchanged.refresh_token,
+            None,
+        ))
+    }
+
+    pub fn refresh_chatgpt_tokens(&self) -> Result<CodexChatGptTokens, LanguageModelError> {
+        let current = self.chatgpt_tokens()?;
+        if current.refresh_token.trim().is_empty() {
+            return Err(LanguageModelError::AuthenticationRequired {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                detail: "Codex ChatGPT auth is missing a refresh token; run `sinomo providers auth codex` again".to_string(),
+            });
+        }
+        let issuer = self.config.auth_issuer.trim_end_matches('/');
+        let response = self
+            .http
+            .post(format!("{issuer}/oauth/token"))
+            .json(&serde_json::json!({
+                "client_id": self.config.client_id.as_str(),
+                "grant_type": "refresh_token",
+                "refresh_token": current.refresh_token.clone(),
+            }))
+            .send()
+            .map_err(|source| codex_auth_invocation_error(source.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::AuthenticationRequired {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                detail: format!("Codex ChatGPT token refresh failed: HTTP {status}: {body}"),
+            });
+        }
+        let refreshed = response
+            .json::<CodexRefreshResponse>()
+            .map_err(|source| codex_auth_invocation_error(source.to_string()))?;
+        let tokens = tokens_from_response(
+            refreshed.id_token.unwrap_or(current.id_token),
+            refreshed.access_token.unwrap_or(current.access_token),
+            refreshed.refresh_token.unwrap_or(current.refresh_token),
+            current.account_id,
+        );
+        self.save_chatgpt_tokens(tokens.clone())?;
+        Ok(tokens)
     }
 }
 
@@ -195,42 +493,61 @@ impl CodexClient for OpenAiResponsesCodexClient {
         &self,
         request: &CodexModelRequest,
     ) -> Result<CodexModelResponse, LanguageModelError> {
-        let api_key = self.api_key()?;
+        let mut tokens = self.chatgpt_tokens()?;
+        let request = request.with_chatgpt_supported_model();
         let url = format!(
             "{}/responses",
             self.config.api_base_url.trim_end_matches('/')
         );
-        let response = self
-            .http
-            .post(url)
-            .headers(codex_headers(&api_key, CODEX_PROVIDER_ID, &request.model)?)
-            .json(&openai_responses_codex_payload(request))
-            .send()
-            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
-                provider: CODEX_PROVIDER_ID.to_string(),
-                model: request.model.clone(),
-                detail: source.to_string(),
-            })?;
-
+        let payload = openai_responses_codex_payload(&request);
+        let mut response = self.post_responses(&url, &request, &tokens, &payload)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            tokens = self.refresh_chatgpt_tokens()?;
+            response = self.post_responses(&url, &request, &tokens, &payload)?;
+        }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: CODEX_PROVIDER_ID.to_string(),
                 model: request.model.clone(),
-                detail: format!("OpenAI Responses API failed: HTTP {status}: {body}"),
+                detail: format!("Codex backend Responses API failed: HTTP {status}: {body}"),
             });
         }
 
-        let value = response.json::<serde_json::Value>().map_err(|source| {
-            LanguageModelError::ProviderInvocationFailed {
+        let body =
+            response
+                .text()
+                .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                    provider: CODEX_PROVIDER_ID.to_string(),
+                    model: request.model.clone(),
+                    detail: source.to_string(),
+                })?;
+
+        parse_openai_responses_codex_body(&body, &request.model)
+    }
+}
+
+impl OpenAiResponsesCodexClient {
+    fn post_responses(
+        &self,
+        url: &str,
+        request: &CodexModelRequest,
+        tokens: &CodexChatGptTokens,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::blocking::Response, LanguageModelError> {
+        let response = self
+            .http
+            .post(url)
+            .headers(codex_headers(tokens, CODEX_PROVIDER_ID, &request.model)?)
+            .json(payload)
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: CODEX_PROVIDER_ID.to_string(),
                 model: request.model.clone(),
                 detail: source.to_string(),
-            }
-        })?;
-
-        Ok(parse_openai_responses_codex_response(&value))
+            })?;
+        Ok(response)
     }
 }
 
@@ -358,12 +675,26 @@ impl CodexProvider<OpenAiResponsesCodexClient> {
         )
     }
 
-    pub fn api_key(&self) -> Result<String, LanguageModelError> {
-        self.client.api_key()
+    pub fn chatgpt_tokens(&self) -> Result<CodexChatGptTokens, LanguageModelError> {
+        self.client.chatgpt_tokens()
     }
 
-    pub fn save_api_key(&self, api_key: &str, source: &str) -> Result<(), LanguageModelError> {
-        self.client.save_api_key(api_key, source)
+    pub fn save_chatgpt_tokens(
+        &self,
+        tokens: CodexChatGptTokens,
+    ) -> Result<(), LanguageModelError> {
+        self.client.save_chatgpt_tokens(tokens)
+    }
+
+    pub fn device_login_start(&self) -> Result<CodexDeviceCode, LanguageModelError> {
+        self.client.device_login_start()
+    }
+
+    pub fn device_login_poll(
+        &self,
+        device: &CodexDeviceCode,
+    ) -> Result<CodexDevicePoll, LanguageModelError> {
+        self.client.device_login_poll(device)
     }
 
     pub fn credentials_path(&self) -> Option<PathBuf> {
@@ -505,6 +836,16 @@ pub struct CodexModelRequest {
     pub metadata: serde_json::Value,
 }
 
+impl CodexModelRequest {
+    fn with_chatgpt_supported_model(&self) -> Self {
+        let mut request = self.clone();
+        if request.model == LEGACY_CODEX_CHATGPT_DEFAULT_MODEL {
+            request.model = CODEX_DEFAULT_MODEL.to_string();
+        }
+        request
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CodexModelResponse {
     #[serde(default)]
@@ -631,17 +972,17 @@ impl CodexMessage {
 }
 
 fn codex_headers(
-    api_key: &str,
+    tokens: &CodexChatGptTokens,
     provider: &str,
     model: &str,
 ) -> Result<HeaderMap, LanguageModelError> {
     let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(USER_AGENT, HeaderValue::from_static("Sinomo/0.1"));
     headers.insert(
         AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|source| {
+        HeaderValue::from_str(&format!("Bearer {}", tokens.access_token)).map_err(|source| {
             LanguageModelError::ProviderInvocationFailed {
                 provider: provider.to_string(),
                 model: model.to_string(),
@@ -649,18 +990,26 @@ fn codex_headers(
             }
         })?,
     );
+    if let Some(account_id) = tokens.account_id.as_deref() {
+        headers.insert(
+            "ChatGPT-Account-ID",
+            HeaderValue::from_str(account_id).map_err(|source| {
+                LanguageModelError::ProviderInvocationFailed {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    detail: source.to_string(),
+                }
+            })?,
+        );
+    }
+    if tokens.chatgpt_account_is_fedramp {
+        headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
+    }
     Ok(headers)
 }
 
 fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Value {
-    let instructions = request
-        .messages
-        .iter()
-        .filter(|message| message.role == CodexRole::System)
-        .map(|message| message.content.as_str())
-        .filter(|content| !content.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let instructions = codex_request_instructions(request);
     let input: Vec<serde_json::Value> = request
         .messages
         .iter()
@@ -682,24 +1031,33 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
     let mut payload = serde_json::json!({
         "model": request.model,
         "input": input,
+        "instructions": instructions,
+        "stream": true,
         "store": false,
     });
-    if !instructions.is_empty() {
-        payload["instructions"] = serde_json::json!(instructions);
-    }
     if !tools.is_empty() {
         payload["tools"] = serde_json::json!(tools);
-    }
-    if let Some(temperature) = request.temperature {
-        payload["temperature"] = serde_json::json!(temperature);
-    }
-    if let Some(max_output_tokens) = request.max_output_tokens {
-        payload["max_output_tokens"] = serde_json::json!(max_output_tokens);
     }
     if request.response_format == LanguageModelResponseFormat::JsonObject {
         payload["text"] = serde_json::json!({ "format": { "type": "json_object" } });
     }
     payload
+}
+
+fn codex_request_instructions(request: &CodexModelRequest) -> String {
+    let instructions = request
+        .messages
+        .iter()
+        .filter(|message| message.role == CodexRole::System)
+        .map(|message| message.content.as_str())
+        .filter(|content| !content.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if instructions.trim().is_empty() {
+        CODEX_DEFAULT_INSTRUCTIONS.to_string()
+    } else {
+        instructions
+    }
 }
 
 fn openai_responses_input_item(message: &CodexMessage) -> serde_json::Value {
@@ -761,6 +1119,142 @@ fn parse_openai_responses_codex_response(value: &serde_json::Value) -> CodexMode
         tool_calls,
         continuation_items,
         usage,
+    }
+}
+
+fn parse_openai_responses_codex_body(
+    body: &str,
+    model: &str,
+) -> Result<CodexModelResponse, LanguageModelError> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        return Ok(parse_openai_responses_codex_response(
+            value.get("response").unwrap_or(&value),
+        ));
+    }
+
+    parse_openai_responses_codex_sse_response(body, model)
+}
+
+fn parse_openai_responses_codex_sse_response(
+    body: &str,
+    model: &str,
+) -> Result<CodexModelResponse, LanguageModelError> {
+    let mut output = Vec::new();
+    let mut output_text = String::new();
+    let normalized = body.replace("\r\n", "\n");
+
+    for block in normalized.split("\n\n") {
+        let Some(event) = parse_sse_event(block, model)? else {
+            continue;
+        };
+        let kind = event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        match kind {
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    output.push(item.clone());
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
+                    output_text.push_str(delta);
+                }
+            }
+            "response.completed" => {
+                let mut response = event
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let missing_or_empty_output = response
+                    .get("output")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(Vec::is_empty);
+                if missing_or_empty_output && !output.is_empty() {
+                    response["output"] = serde_json::json!(output);
+                }
+                if response.get("output_text").is_none() && !output_text.is_empty() {
+                    response["output_text"] = serde_json::json!(output_text);
+                }
+                return Ok(parse_openai_responses_codex_response(&response));
+            }
+            "response.failed" => {
+                let detail = openai_responses_event_error_message(&event)
+                    .unwrap_or_else(|| format!("Codex backend stream failed: {event}"));
+                return Err(codex_provider_invocation_error(model, detail));
+            }
+            _ => {}
+        }
+    }
+
+    if !output.is_empty() || !output_text.is_empty() {
+        let mut response = serde_json::json!({ "output": output });
+        if !output_text.is_empty() {
+            response["output_text"] = serde_json::json!(output_text);
+        }
+        return Ok(parse_openai_responses_codex_response(&response));
+    }
+
+    Err(codex_provider_invocation_error(
+        model,
+        "Codex backend stream closed before response.completed".to_string(),
+    ))
+}
+
+fn parse_sse_event(
+    block: &str,
+    model: &str,
+) -> Result<Option<serde_json::Value>, LanguageModelError> {
+    let mut event_name = None;
+    let mut data_lines = Vec::new();
+
+    for line in block.lines() {
+        if let Some(value) = line.strip_prefix("event:") {
+            event_name = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data_lines.push(value.trim_start());
+        }
+    }
+
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let data = data_lines.join("\n");
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
+        return Ok(None);
+    }
+
+    let mut value = serde_json::from_str::<serde_json::Value>(&data).map_err(|source| {
+        codex_provider_invocation_error(
+            model,
+            format!("failed to parse Codex stream event: {source}: {data}"),
+        )
+    })?;
+    if value.get("type").is_none()
+        && let (Some(kind), Some(object)) = (event_name, value.as_object_mut())
+    {
+        object.insert("type".to_string(), serde_json::json!(kind));
+    }
+
+    Ok(Some(value))
+}
+
+fn openai_responses_event_error_message(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/response/error/message")
+        .or_else(|| value.pointer("/error/message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn codex_provider_invocation_error(model: &str, detail: String) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: CODEX_PROVIDER_ID.to_string(),
+        model: model.to_string(),
+        detail,
     }
 }
 
@@ -923,7 +1417,7 @@ mod tests {
     #[test]
     fn openai_responses_payload_preserves_tools_and_tool_outputs() {
         let payload = openai_responses_codex_payload(&CodexModelRequest {
-            model: "gpt-5.2-codex".to_string(),
+            model: CODEX_DEFAULT_MODEL.to_string(),
             messages: vec![
                 CodexMessage::system("system prompt"),
                 CodexMessage::user("run tool"),
@@ -941,18 +1435,54 @@ mod tests {
                 }),
             ],
             tools: vec![FixtureTool.descriptor()],
-            temperature: None,
+            temperature: Some(0.2),
             max_output_tokens: Some(100),
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::Value::Null,
         });
 
         assert_eq!(payload["instructions"], "system prompt");
+        assert_eq!(payload["model"], CODEX_DEFAULT_MODEL);
         assert_eq!(payload["tools"][0]["name"], "read_context");
         assert_eq!(payload["input"][1]["type"], "reasoning");
         assert_eq!(payload["input"][2]["type"], "function_call_output");
-        assert_eq!(payload["max_output_tokens"], 100);
+        assert!(payload.get("temperature").is_none());
+        assert!(payload.get("max_output_tokens").is_none());
         assert_eq!(payload["text"]["format"]["type"], "json_object");
+        assert_eq!(payload["stream"], true);
+    }
+
+    #[test]
+    fn legacy_chatgpt_codex_default_maps_to_supported_model() {
+        let request = CodexModelRequest {
+            model: LEGACY_CODEX_CHATGPT_DEFAULT_MODEL.to_string(),
+            messages: vec![CodexMessage::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_output_tokens: None,
+            response_format: LanguageModelResponseFormat::Text,
+            metadata: serde_json::Value::Null,
+        };
+
+        assert_eq!(
+            request.with_chatgpt_supported_model().model,
+            CODEX_DEFAULT_MODEL
+        );
+    }
+
+    #[test]
+    fn openai_responses_payload_includes_default_instructions_without_system_prompt() {
+        let payload = openai_responses_codex_payload(&CodexModelRequest {
+            model: CODEX_DEFAULT_MODEL.to_string(),
+            messages: vec![CodexMessage::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_output_tokens: None,
+            response_format: LanguageModelResponseFormat::Text,
+            metadata: serde_json::Value::Null,
+        });
+
+        assert_eq!(payload["instructions"], CODEX_DEFAULT_INSTRUCTIONS);
     }
 
     #[test]
@@ -982,7 +1512,53 @@ mod tests {
     }
 
     #[test]
-    fn codex_auth_json_round_trips_official_api_key_shape() {
+    fn openai_responses_sse_parser_extracts_completed_response() {
+        let body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        );
+
+        let parsed =
+            parse_openai_responses_codex_sse_response(body, CODEX_DEFAULT_MODEL).expect("sse");
+
+        assert_eq!(parsed.content, "hello");
+        assert_eq!(parsed.usage.unwrap().output_tokens, Some(2));
+    }
+
+    #[test]
+    fn openai_responses_sse_parser_uses_text_deltas_as_fallback() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        );
+
+        let parsed =
+            parse_openai_responses_codex_sse_response(body, CODEX_DEFAULT_MODEL).expect("sse");
+
+        assert_eq!(parsed.content, "hello");
+    }
+
+    #[test]
+    fn openai_responses_sse_parser_reports_failed_response() {
+        let body = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"bad stream\"}}}\n\n",
+        );
+
+        let error = parse_openai_responses_codex_sse_response(body, CODEX_DEFAULT_MODEL)
+            .expect_err("failed stream");
+
+        assert!(error.to_string().contains("bad stream"));
+    }
+
+    #[test]
+    fn codex_auth_json_round_trips_official_chatgpt_shape() {
         let dir = std::env::temp_dir().join(format!(
             "sinomo-codex-auth-{}",
             SystemTime::now()
@@ -991,23 +1567,53 @@ mod tests {
                 .as_nanos()
         ));
         let credentials_path = Some(dir.join("credentials.json"));
+        let id_token = fake_chatgpt_id_token("account_123", true);
 
-        save_codex_api_key(&credentials_path, "sk-test").expect("save codex auth");
+        save_codex_chatgpt_tokens(
+            &credentials_path,
+            tokens_from_response(
+                id_token.clone(),
+                "access-token".to_string(),
+                "refresh-token".to_string(),
+                None,
+            ),
+        )
+        .expect("save codex auth");
         let auth_path = dir.join("credentials.json");
         let auth = serde_json::from_str::<serde_json::Value>(
             &fs::read_to_string(&auth_path).expect("auth json"),
         )
         .expect("valid auth json");
 
-        assert_eq!(auth["auth_mode"], "apikey");
-        assert_eq!(auth["OPENAI_API_KEY"], "sk-test");
-        assert!(auth.get("tokens").is_none());
-        assert_eq!(
-            read_codex_auth_json_api_key(&auth_path).expect("read auth"),
-            Some("sk-test".to_string())
-        );
+        assert_eq!(auth["auth_mode"], "chatgpt");
+        assert!(auth.get("OPENAI_API_KEY").is_none());
+        assert_eq!(auth["tokens"]["id_token"], id_token);
+        assert_eq!(auth["tokens"]["access_token"], "access-token");
+        assert_eq!(auth["tokens"]["refresh_token"], "refresh-token");
+        assert_eq!(auth["tokens"]["account_id"], "account_123");
+        assert_eq!(auth["tokens"]["chatgpt_account_is_fedramp"], true);
+        assert!(auth.get("last_refresh").is_some());
+        let tokens = read_codex_chatgpt_tokens(&auth_path)
+            .expect("read auth")
+            .expect("tokens");
+        assert_eq!(tokens.access_token, "access-token");
+        assert_eq!(tokens.account_id.as_deref(), Some("account_123"));
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    fn fake_chatgpt_id_token(account_id: &str, fedramp: bool) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                    "chatgpt_account_is_fedramp": fedramp
+                }
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.sig")
     }
 
     struct FixtureCodexClient {
