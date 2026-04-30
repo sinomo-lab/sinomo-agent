@@ -3,6 +3,7 @@
 mod anthropic;
 mod api_key;
 mod claude_code;
+mod codex;
 mod codex_cli;
 mod gemini;
 mod github_copilot;
@@ -11,6 +12,13 @@ mod openai;
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use claude_code::{
     CLAUDE_CODE_DEFAULT_MODEL, ClaudeCodeConfig, ClaudeCodeProvider, ClaudePermissionMode,
+};
+pub use codex::{
+    CODEX_DEFAULT_MODEL, CodexClient, CodexConfig, CodexContextManager, CodexMessage,
+    CodexModelRequest, CodexModelResponse, CodexPromptBuilder, CodexProvider, CodexRole, CodexTool,
+    CodexToolCall, CodexToolDescriptor, CodexToolRegistry, CodexToolResult,
+    DefaultCodexContextManager, DefaultCodexPromptBuilder, OpenAiResponsesCodexClient,
+    OpenAiResponsesCodexConfig,
 };
 pub use codex_cli::{
     CODEX_CLI_DEFAULT_MODEL, CodexCliConfig, CodexCliProvider, CodexColor, CodexSandboxMode,

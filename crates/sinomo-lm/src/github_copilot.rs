@@ -718,12 +718,20 @@ fn chat_completion_payload(request: &LanguageModelRequest, model: &str) -> serde
         payload["temperature"] = serde_json::json!(temperature);
     }
     if let Some(max_tokens) = request.max_output_tokens {
-        payload["max_tokens"] = serde_json::json!(max_tokens);
+        if copilot_chat_model_uses_max_completion_tokens(model) {
+            payload["max_completion_tokens"] = serde_json::json!(max_tokens);
+        } else {
+            payload["max_tokens"] = serde_json::json!(max_tokens);
+        }
     }
     if request.response_format == LanguageModelResponseFormat::JsonObject {
         payload["response_format"] = serde_json::json!({ "type": "json_object" });
     }
     payload
+}
+
+fn copilot_chat_model_uses_max_completion_tokens(model: &str) -> bool {
+    model == "gpt-5" || model.starts_with("gpt-5.")
 }
 
 fn validate_github_copilot_token(token: &str) -> Result<(), LanguageModelError> {
@@ -820,8 +828,18 @@ mod tests {
 
         assert_eq!(payload["model"], "gpt-5.4");
         assert_eq!(payload["stream"], false);
+        assert_eq!(payload["max_completion_tokens"], 200);
+        assert!(payload.get("max_tokens").is_none());
         assert_eq!(payload["response_format"]["type"], "json_object");
         assert_eq!(payload["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn direct_copilot_legacy_chat_payload_uses_max_tokens() {
+        let payload = chat_completion_payload(&request(), "gpt-4.1");
+
+        assert_eq!(payload["max_tokens"], 200);
+        assert!(payload.get("max_completion_tokens").is_none());
     }
 
     #[test]

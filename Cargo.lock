@@ -867,9 +867,11 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-eval",
+ "sinomo-events",
  "sinomo-evolution",
  "sinomo-lm",
  "sinomo-local",
+ "time",
 ]
 
 [[package]]
