@@ -21,8 +21,9 @@ use sinomo_lm::{
     DefaultCodexPromptBuilder, GeminiConfig, GeminiProvider, GitHubCopilotCliConfig,
     GitHubCopilotCliProvider, GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError,
     LanguageModelMessage, LanguageModelProvider, LanguageModelProviderUsage, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, OpenAiConfig,
-    OpenAiProvider, OpenAiResponsesCodexClient, OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, NvidiaConfig,
+    NvidiaProvider, OpenAiConfig, OpenAiProvider, OpenAiResponsesCodexClient,
+    OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL, normalize_nvidia_model_id,
 };
 use sinomo_local::SinomoDataDir;
 use std::env;
@@ -470,6 +471,7 @@ impl CliConversationModel {
                     .and_then(|config| config.default_model.clone())
             })
             .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
+        let model = normalize_model_id_for_provider(&provider, &model);
         Ok(Self {
             provider,
             model,
@@ -574,6 +576,21 @@ impl InteractionModel for CliConversationModel {
                     ),
                     credentials_path: Some(credentials_path),
                     ..GeminiConfig::default()
+                });
+                LanguageModelProvider::complete(&provider, &request)
+            }
+            NvidiaProvider::PROVIDER_ID => {
+                let credentials_path = self
+                    .data_dir
+                    .provider_credentials_file(NvidiaProvider::PROVIDER_ID);
+                let provider = NvidiaProvider::new(NvidiaConfig {
+                    api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
+                        .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
+                    default_model: model_or_default(
+                        &self.model,
+                        NvidiaConfig::default().default_model,
+                    ),
+                    credentials_path: Some(credentials_path),
                 });
                 LanguageModelProvider::complete(&provider, &request)
             }
@@ -976,6 +993,9 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
                 .and_then(|config| config.default_provider.clone())
         })
         .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
+    let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
+        detail: format!("unknown provider `{provider}`"),
+    })?;
     let model = options.model.or_else(|| {
         model_config
             .as_ref()
@@ -986,6 +1006,7 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
                     .and_then(|config| config.default_model.clone())
             })
     });
+    let model = model.map(|model| normalize_model_id_for_provider(&provider, &model));
     let verification_commands = if options.verify.is_empty() {
         Vec::new()
     } else {
@@ -1306,7 +1327,7 @@ fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
 
 fn effective_model_name(provider: &str, configured_model: &str) -> String {
     if configured_model != PROVIDER_DEFAULT_MODEL {
-        return configured_model.to_string();
+        return normalize_model_id_for_provider(provider, configured_model);
     }
     match provider {
         GitHubCopilotProvider::PROVIDER_ID => GitHubCopilotConfig::default().default_model,
@@ -1317,6 +1338,7 @@ fn effective_model_name(provider: &str, configured_model: &str) -> String {
         AnthropicProvider::PROVIDER_ID => AnthropicConfig::default().default_model,
         OpenAiProvider::PROVIDER_ID => OpenAiConfig::default().default_model,
         GeminiProvider::PROVIDER_ID => GeminiConfig::default().default_model,
+        NvidiaProvider::PROVIDER_ID => NvidiaConfig::default().default_model,
         _ => configured_model.to_string(),
     }
 }
@@ -1463,6 +1485,7 @@ fn parse_model_default_options(
         detail: format!("unknown provider `{provider}`"),
     })?;
     let model = flag_value(args, "--model").ok_or(CliError::Usage)?;
+    let model = normalize_model_id_for_provider(&provider, &model);
     let repo = match (repo_mode, flag_value(args, "--repo")) {
         (ModelDefaultRepoMode::Allow, repo) => repo.map(PathBuf::from),
         (ModelDefaultRepoMode::Reject, None) => None,
@@ -1483,6 +1506,13 @@ fn parse_model_default_options(
     })
 }
 
+fn normalize_model_id_for_provider(provider: &str, model: &str) -> String {
+    match provider {
+        NvidiaProvider::PROVIDER_ID => normalize_nvidia_model_id(model),
+        _ => model.to_string(),
+    }
+}
+
 fn default_model_provider_ids() -> &'static [&'static str] {
     &[
         GitHubCopilotProvider::PROVIDER_ID,
@@ -1493,6 +1523,7 @@ fn default_model_provider_ids() -> &'static [&'static str] {
         AnthropicProvider::PROVIDER_ID,
         OpenAiProvider::PROVIDER_ID,
         GeminiProvider::PROVIDER_ID,
+        NvidiaProvider::PROVIDER_ID,
     ]
 }
 
@@ -1514,6 +1545,7 @@ fn normalize_model_provider(provider: &str) -> Option<String> {
         GeminiProvider::PROVIDER_ID | "google-gemini" => {
             Some(GeminiProvider::PROVIDER_ID.to_string())
         }
+        NvidiaProvider::PROVIDER_ID | "nvidia-nim" => Some(NvidiaProvider::PROVIDER_ID.to_string()),
         _ => None,
     }
 }
@@ -1547,6 +1579,10 @@ fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, CliError>
             let (provider, _) = gemini_provider()?;
             provider.api_key()?;
             Ok(vec![GeminiConfig::default().default_model])
+        }
+        NvidiaProvider::PROVIDER_ID => {
+            let (provider, _) = nvidia_provider()?;
+            provider.list_models().map_err(CliError::LanguageModel)
         }
         _ => Err(CliError::Parse {
             detail: format!("unknown provider `{provider}`"),
@@ -1938,6 +1974,22 @@ impl MutationModel for CliMutationModel {
                 LanguageModelMutationBridge::new(provider, self.model.clone())
                     .mutate(packet, workspace)
             }
+            NvidiaProvider::PROVIDER_ID => {
+                let credentials_path = self
+                    .data_dir
+                    .provider_credentials_file(NvidiaProvider::PROVIDER_ID);
+                let provider = NvidiaProvider::new(NvidiaConfig {
+                    api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
+                        .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
+                    default_model: model_or_default(
+                        &self.model,
+                        NvidiaConfig::default().default_model,
+                    ),
+                    credentials_path: Some(credentials_path),
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
             _ => Err(MutationModelError::LanguageModel(
                 LanguageModelError::ProviderInvocationFailed {
                     provider: self.provider.clone(),
@@ -2270,6 +2322,7 @@ enum ProviderName {
     Anthropic,
     OpenAi,
     Gemini,
+    Nvidia,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2302,6 +2355,7 @@ fn parse_provider_command(args: &[String]) -> Result<ProviderCliCommand, CliErro
         "anthropic" => ProviderName::Anthropic,
         "openai" => ProviderName::OpenAi,
         "gemini" => ProviderName::Gemini,
+        "nvidia" => ProviderName::Nvidia,
         _ => {
             return Err(CliError::Parse {
                 detail: format!("unknown provider `{provider}`"),
@@ -2332,6 +2386,8 @@ fn run_provider_command(command: ProviderCliCommand) -> Result<(), CliError> {
         ProviderCliCommand::Test(ProviderName::OpenAi) => test_openai(),
         ProviderCliCommand::Auth(ProviderName::Gemini) => auth_gemini(),
         ProviderCliCommand::Test(ProviderName::Gemini) => test_gemini(),
+        ProviderCliCommand::Auth(ProviderName::Nvidia) => auth_nvidia(),
+        ProviderCliCommand::Test(ProviderName::Nvidia) => test_nvidia(),
     }
 }
 
@@ -2532,6 +2588,32 @@ pub fn test_gemini() -> Result<(), CliError> {
     Ok(())
 }
 
+pub fn auth_nvidia() -> Result<(), CliError> {
+    let (provider, credentials_path) = nvidia_provider()?;
+    let (api_key, source) = api_key_from_env_or_prompt(
+        "NVIDIA",
+        &["SINOMO_NVIDIA_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY"],
+    )?;
+    provider.save_api_key(&api_key, &source)?;
+    println!("Testing NVIDIA provider connection...");
+    provider.test_connection()?;
+    println!("NVIDIA credentials saved to {}", credentials_path.display());
+    Ok(())
+}
+
+pub fn test_nvidia() -> Result<(), CliError> {
+    let (provider, credentials_path) = nvidia_provider()?;
+    println!(
+        "Testing NVIDIA credentials at {}",
+        credentials_path.display()
+    );
+    provider.api_key()?;
+    println!("NVIDIA API key: ok");
+    provider.test_connection()?;
+    println!("NVIDIA provider connection: ok");
+    Ok(())
+}
+
 fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_provider_dir(GitHubCopilotProvider::PROVIDER_ID)?;
@@ -2596,6 +2678,19 @@ fn gemini_provider() -> Result<(GeminiProvider, PathBuf), CliError> {
     Ok((provider, credentials_path))
 }
 
+fn nvidia_provider() -> Result<(NvidiaProvider, PathBuf), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_provider_dir(NvidiaProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
+    let provider = NvidiaProvider::new(NvidiaConfig {
+        api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
+            .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
+        default_model: NvidiaConfig::default().default_model,
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
 fn api_key_from_env_or_prompt(
     provider_name: &str,
     env_vars: &[&str],
@@ -2629,42 +2724,13 @@ fn api_key_from_env_or_prompt(
 pub fn print_usage() {
     println!("Usage:");
     println!("  sinomo");
-    println!("  sinomo models list [--provider <provider>]");
-    println!("  sinomo models default --provider <provider> --model <model>");
-    println!("  sinomo usage [--provider <provider>] [--json]");
-    println!(
-        "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider github-copilot] [--verify \"cargo check\"]"
-    );
-    println!("  sinomo evolve approve [--job evojob_...] [--note <note>]");
-    println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
-    println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
-    println!("  sinomo evolve status [--job evojob_...]");
-    println!("  sinomo evolve show [--diff|--scorecard|--decision|--packet] [--job evojob_...]");
-    println!("  sinomo evolve verify|packet|cleanup [--job evojob_...]");
-    println!("  sinomo evolve models list [--provider <provider>]");
-    println!(
-        "  sinomo evolve models default --provider <provider> --model <model> [--repo <path>] (compatibility alias)"
-    );
-    println!("  sinomo providers auth github-copilot");
-    println!("  sinomo providers test github-copilot");
-    println!("  sinomo providers auth codex");
-    println!("  sinomo providers test codex");
-    println!("  sinomo providers auth anthropic");
-    println!("  sinomo providers test anthropic");
-    println!("  sinomo providers auth openai");
-    println!("  sinomo providers test openai");
-    println!("  sinomo providers auth gemini");
-    println!("  sinomo providers test gemini");
-    println!("  sinomo-app providers auth github-copilot");
-    println!("  sinomo-app providers test github-copilot");
-    println!("  sinomo-app providers auth codex");
-    println!("  sinomo-app providers test codex");
-    println!("  sinomo-app providers auth anthropic");
-    println!("  sinomo-app providers test anthropic");
-    println!("  sinomo-app providers auth openai");
-    println!("  sinomo-app providers test openai");
-    println!("  sinomo-app providers auth gemini");
-    println!("  sinomo-app providers test gemini");
+    println!("  sinomo help");
+    println!("  sinomo models");
+    println!("  sinomo usage");
+    println!("  sinomo providers");
+    println!("  sinomo evolve");
+    println!();
+    println!("Run `sinomo <subcommand> help` for detailed commands.");
     println!();
     println!("CUI:");
     println!("  Run `sinomo` with no arguments to start the command-line user interface.");
@@ -2680,6 +2746,8 @@ pub fn print_usage() {
     println!("  ANTHROPIC_API_KEY           Used by `providers auth/test anthropic`");
     println!("  OPENAI_API_KEY              Used by `providers auth/test openai`");
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
+    println!("  NVIDIA_API_KEY              Used by `providers auth/test nvidia`");
+    println!("  SINOMO_NVIDIA_API_BASE_URL  Overrides the NVIDIA API base URL");
     println!(
         "  SINOMO_COPILOT_CLIENT_ID    Defaults to {}",
         GitHubCopilotConfig::default().client_id
@@ -2730,6 +2798,7 @@ fn print_providers_help() {
     println!("  anthropic");
     println!("  openai");
     println!("  gemini");
+    println!("  nvidia");
 }
 
 fn print_evolve_help() {
@@ -3162,6 +3231,23 @@ mod tests {
         assert_eq!(options.provider, "openai");
         assert_eq!(options.model, "gpt-5.5");
         assert_eq!(options.repo, None);
+    }
+
+    #[test]
+    fn model_default_parser_normalizes_nvidia_provider_qualified_model() {
+        let options = parse_model_default_options(
+            &[
+                "--provider".to_string(),
+                "nvidia".to_string(),
+                "--model".to_string(),
+                "nvidia/nvidia/nemotron-3-super-120b-a12b".to_string(),
+            ],
+            ModelDefaultRepoMode::Reject,
+        )
+        .expect("options");
+
+        assert_eq!(options.provider, "nvidia");
+        assert_eq!(options.model, "nvidia/nemotron-3-super-120b-a12b");
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod codex;
 mod codex_cli;
 mod gemini;
 mod github_copilot;
+mod nvidia;
 mod openai;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
@@ -33,6 +34,7 @@ pub use github_copilot::{
     GITHUB_COPILOT_CLIENT_ID, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
     GitHubCopilotConfig, GitHubCopilotProvider, GitHubDeviceCode, GitHubDevicePoll,
 };
+pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_nvidia_model_id};
 pub use openai::{OpenAiConfig, OpenAiProvider};
 
 use serde::{Deserialize, Serialize};
