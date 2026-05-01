@@ -6,6 +6,8 @@ Sinomo should be able to mutate its own live runtime autonomously without bringi
 
 This complements the existing event-centric distributed architecture in [architecture.md](architecture.md). The self-evolution system is another background control plane that consumes events, workspaces, traces, evaluation results, and policy incidents, then emits versioned artifacts and rollout events.
 
+The long-horizon human-guided campaign layer is detailed in [plans/human-guided-long-horizon-evolution.md](plans/human-guided-long-horizon-evolution.md). That plan treats `sinomo evolve propose` as a durable scheduled campaign: a human gives an objective, Sinomo proposes staged evaluation targets and near-term tasks, schedules work around renewable resource budgets, delegates open-ended implementation agents, evaluates candidate bundles, rolls out evidence-backed changes through gates, and adapts failed work into easier or more diagnostic next tasks. Capability notes may be useful evidence records, but the campaign framework must remain flexible enough to drop them, revise its own abstractions, or improve the distributed foundation when the objective exposes deeper blockers.
+
 ## Research Takeaways
 
 - WebAssembly is a good default isolation boundary for extension modules because Wasm guests only access host functionality through explicit imports, and WASI adds capability-oriented filesystem access. Wasmtime documents memory isolation, checked control flow, explicit imports/exports, and WASI capability-based filesystem access as core sandbox properties. See [Wasmtime security](https://docs.wasmtime.dev/security.html).

@@ -60,7 +60,7 @@ The event/world-state plane is the architectural center. Perception produces eve
 
 ## Self-Evolution Direction
 
-Sinomo should improve herself through controlled live mutation rather than direct rewriting of trusted runtime code. The first auto-evolution target should be low-risk R3 modules, while R0/R1 contracts are designed from the beginning for continuity checks, standby handoff, and rollback.
+Sinomo should improve herself through controlled live mutation rather than direct rewriting of trusted runtime code. The first auto-evolution target should be low-risk R3 modules, while R0/R1 contracts are designed from the beginning for continuity checks, standby handoff, and rollback. Human-guided long-horizon evolution should be framed as flexible campaign execution: starting from an objective, Sinomo proposes staged evaluations, delegates open-ended implementation agents, evaluates candidate bundles, rolls out evidence-backed changes, adapts failed work into easier or diagnostic tasks, and may improve its own foundation when the objective exposes deeper blockers.
 
 The evolution loop should be explicit:
 
