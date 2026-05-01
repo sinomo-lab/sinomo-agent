@@ -148,6 +148,14 @@ A useful rule:
 A foundation-improvement task is valid when it explains which campaign blocker it removes and how it will be evaluated.
 ```
 
+Foundation work also needs a return-to-objective check:
+
+```text
+After a foundation-improvement task completes, the campaign re-runs or re-scores the blocked objective stage. If the foundation work does not improve the blocker, similar foundation work loses priority until new evidence justifies it.
+```
+
+This prevents foundation repair from becoming an infinite escape hatch while still allowing the campaign to improve prerequisites when they are genuinely blocking progress.
+
 ## Core Vocabulary
 
 | Term | Meaning |
@@ -163,6 +171,7 @@ A foundation-improvement task is valid when it explains which campaign blocker i
 | Resource lease | A temporary reservation granted to an agent or iteration. |
 | Adaptation | The process of changing the next step after failure or discovery. The next step may become easier, narrower, better-instrumented, more foundational, or differently framed. |
 | Ability note | Optional informal record that Sinomo appears to have gained or improved some ability. Not a required registry entry. |
+| Campaign decision | Auditable record of why the campaign selected a task, rejected alternatives, spent resources, paused, resumed, promoted a stage, or changed direction. |
 
 ## Command Shape
 
@@ -408,7 +417,7 @@ priority = expected_metric_gain
          / (estimated_resource_cost * rollout_risk * task_complexity)
 ```
 
-The exact formula should remain explainable. Every selected task should include why it was chosen and why the campaign did not choose the top rejected alternatives.
+The exact formula should remain explainable. Every selected task should include why it was chosen and why the campaign did not choose the top rejected alternatives. This explanation should be stored as a campaign decision record, not only as transient reasoning in an agent transcript.
 
 The campaign should not force all next steps to be implementation patches. Valid near-term tasks include:
 
@@ -542,6 +551,8 @@ reset_windows
 burst_limits
 idle_window_rules
 priority_overrides
+usage_confidence_policy
+budget_debt_policy
 emergency_stop_rules
 ```
 
@@ -558,7 +569,20 @@ estimated_cost
 hard_limit
 expires_at
 reservation_reason
+usage_confidence
+budget_debt_limit
 ```
+
+Track usage confidence explicitly:
+
+```text
+Exact             # measured locally or provider returns exact units/cost
+ProviderReported  # provider reports usage, but timing/rounding may lag
+Estimated         # inferred from tokens, wall time, file size, or heuristic
+Unknown           # resource was consumed but accounting could not be trusted
+```
+
+Also track budget debt: actual usage beyond the estimate but still inside the hard limit. Repeated debt should lower confidence in future estimates and may force smaller leases or stronger approval.
 
 The campaign manager can only dispatch an agent after acquiring leases for the resources that agent may consume. Agents should report actual usage back to the ledger. If a provider cannot report exact token/cost usage, the scheduler records an estimate with lower confidence.
 
@@ -570,13 +594,14 @@ Initial rules:
 
 1. Keep reserve floors. Example: keep 30% of a weekly coding plan and 40% of free API quota unallocated for non-campaign operations unless the human overrides.
 2. Smooth usage across the reset window. A 5-hour window should have per-hour suggested spend, not only a hard cap.
-3. Prefer cheap scouting before expensive implementation. Use free models for status summaries, eval log clustering, candidate critique, and task decomposition when quality is sufficient.
-4. Use expensive coding agents for narrow implementation packets with clear verification commands.
-5. Pause campaigns automatically when leases cannot be acquired without violating reserve floors.
-6. Resume campaigns automatically after reset windows or idle windows open.
-7. Apply failure penalties. If a task family repeatedly fails, reduce its budget priority until the campaign proposes instrumentation, smaller scope, or a prerequisite task.
-8. Limit concurrent mutations. The first version should run one rollout-affecting iteration per campaign at a time.
-9. Permit analysis-only or proposal-only iterations when implementation resources are unavailable.
+3. Preserve cross-campaign fairness. No campaign can consume the full allocatable portion of a shared renewable resource unless it has an explicit priority override. Default scheduling should leave room for at least one urgent non-campaign operation and one other approved campaign.
+4. Prefer cheap scouting before expensive implementation. Use free models for status summaries, eval log clustering, candidate critique, and task decomposition when quality is sufficient.
+5. Use expensive coding agents for narrow implementation packets with clear verification commands.
+6. Pause campaigns automatically when leases cannot be acquired without violating reserve floors.
+7. Resume campaigns automatically after reset windows or idle windows open.
+8. Apply failure penalties. If a task family repeatedly fails, reduce its budget priority until the campaign proposes instrumentation, smaller scope, or a prerequisite task.
+9. Limit concurrent mutations. The first version should run one rollout-affecting iteration per campaign at a time.
+10. Permit analysis-only or proposal-only iterations when implementation resources are unavailable.
 
 The scheduler should produce a visible plan:
 
@@ -588,21 +613,21 @@ next_24h:
   - after reset: reserve 30%, allocate at most two near-term tasks
 ```
 
-## Agent Roles
+## Campaign Functions
 
-The first mechanism can call existing or external agents, but their roles should stay simple. This section intentionally reverts to the original role design.
+The first mechanism can call existing or external agents, but these are functions, not required separate personas or services. The first implementation may combine several functions in one process, one model call, or one local command. Split them only when evidence shows that separation improves reliability, cost, safety, or observability.
 
-| Role | Responsibility | Preferred resources |
+| Function | Responsibility | Preferred resources |
 |---|---|---|
-| Campaign planner | Refine objective, maintain stages, choose next task, adapt backlog after evidence. | Strong reasoning model when budget allows; cheaper model for routine updates. |
-| State scout | Inspect repo/runtime/status/eval logs/artifacts and summarize current state. | Free models plus local tools. |
-| Evaluation designer | Convert stage goals into scorecards, fixtures, verification plans, and measurable checks. | Strong model for initial design; local compute for validation. |
-| Implementation agent | Modify code/config/prompts/workflows, produce artifacts, or propose a better next step in a candidate workspace. | Prepaid coding plan or local coding model. |
-| Review agent | Check spec compliance, risk, code quality, artifact quality, and rollout readiness. | Free/cheap model first; escalate on high risk. |
-| Rollout agent | Apply registry/rollout steps and watch metrics. | Local runtime services. |
-| Budget manager | Allocate leases and pause/resume work. | Deterministic local service, not LLM. |
+| Campaign planning | Refine objective, maintain stages, choose next task, adapt backlog after evidence. | Strong reasoning model when budget allows; cheaper model for routine updates. |
+| State scouting | Inspect repo/runtime/status/eval logs/artifacts and summarize current state. | Free models plus local tools. |
+| Evaluation design | Convert stage goals into scorecards, fixtures, verification plans, and measurable checks. | Strong model for initial design; local compute for validation. |
+| Implementation | Modify code/config/prompts/workflows, produce artifacts, or propose a better next step in a candidate workspace. | Prepaid coding plan or local coding model. |
+| Review | Check spec compliance, risk, code quality, artifact quality, and rollout readiness. | Free/cheap model first; escalate on high risk. |
+| Rollout supervision | Apply registry/rollout steps and watch metrics. | Local runtime services. |
+| Budget management | Allocate leases and pause/resume work. | Deterministic local service, not LLM. |
 
-Agents are workers, not authorities. Authority stays with:
+Functions are workers, not authorities. Authority stays with:
 
 ```text
 campaign state machine
@@ -613,7 +638,7 @@ rollout gates
 human approval policy
 ```
 
-The implementation agent should have the broadest local discretion inside the approved task scope. The campaign planner chooses what outcome is worth pursuing. The implementation agent chooses how to pursue it.
+The implementation agent should have the broadest local discretion inside the approved task scope. The campaign manager chooses what outcome is worth pursuing. The implementation agent chooses how to pursue it.
 
 ## Evaluation And Evidence
 
@@ -650,10 +675,24 @@ cost and latency
 human review decisions
 ```
 
+Evaluation should happen at three levels:
+
+| Level | Question | Example evidence |
+|---|---|---|
+| Task evaluation | Did this candidate do what it claimed? | Tests, artifacts, command output, traces, review notes. |
+| Stage evaluation | Did the candidate improve the current milestone? | Stage scorecard, baseline comparison, regression gates. |
+| Campaign evaluation | Is the overall objective closer, unchanged, or drifting? | Progress summary, stage movement, resource burn, repeated blocker analysis. |
+
 Default rule:
 
 ```text
 If a candidate cannot be evaluated, the next task should usually add evaluation or inspection before trying to improve behavior.
+```
+
+A second default rule handles drift:
+
+```text
+If task scorecards pass but the campaign objective is not getting closer, the campaign should pause for objective/stage review instead of optimizing the local proxy further.
 ```
 
 This rule is general. It applies equally to Minecraft screen interaction, generated video clips, code patches, and scheduler changes.
@@ -697,6 +736,8 @@ A useful rule:
 After two failed attempts at the same near-term task family,
 the next task must be easier, more diagnostic, or more foundational.
 ```
+
+A task family is the same when it targets the same blocker with the same basic approach, even if the prompt wording, branch name, or implementation agent changes. This prevents the campaign from bypassing adaptation by renaming retries.
 
 Examples of easier or better-adapted tasks:
 
@@ -808,6 +849,7 @@ pub enum CandidateResultKind {
     TaskReplacementProposal,
     DesignReviewOnly,
     NoOpWithReason,
+    Other(String),
 }
 
 pub struct EvolutionIterationResult {
@@ -820,6 +862,18 @@ pub struct EvolutionIterationResult {
     pub resource_usage: ResourceUsageSummary,
     pub rollout_recommendation: RolloutRecommendation,
     pub summary: String,
+}
+
+pub struct CampaignDecision {
+    pub decision_id: CampaignDecisionId,
+    pub campaign_id: EvolutionCampaignId,
+    pub stage_id: Option<EvolutionStageId>,
+    pub selected_task_id: Option<EvolutionTaskId>,
+    pub decision_kind: CampaignDecisionKind,
+    pub reason: String,
+    pub alternatives_considered: Vec<String>,
+    pub evidence_refs: Vec<ArtifactRef>,
+    pub resource_context: ResourceUsageSummary,
 }
 
 pub struct ResourceBudgetPolicy {
@@ -838,9 +892,26 @@ pub struct ResourceLease {
     pub provider: Option<String>,
     pub hard_limit: ResourceAmount,
     pub estimated_cost: ResourceAmount,
+    pub budget_debt_limit: Option<ResourceAmount>,
     pub expires_at: OffsetDateTime,
 }
+
+pub enum UsageConfidence {
+    Exact,
+    ProviderReported,
+    Estimated,
+    Unknown,
+}
+
+pub struct ResourceUsageSummary {
+    pub estimated: ResourceAmount,
+    pub actual: Option<ResourceAmount>,
+    pub confidence: UsageConfidence,
+    pub budget_debt: Option<ResourceAmount>,
+}
 ```
+
+`CandidateResultKind` is a coarse routing hint, not a closed ontology. Unknown or new result kinds should be preserved through `Other(String)` and reviewed rather than rejected merely because the campaign manager does not yet know the label.
 
 Optional ability notes can be a JSONL sidecar, not a core model:
 
@@ -883,11 +954,18 @@ evolution.task.replaced
 evolution.resource.lease.requested
 evolution.resource.lease.granted
 evolution.resource.lease.denied
+evolution.resource.usage.recorded
+evolution.campaign.decision.recorded
+evolution.human.checkpoint.requested
+evolution.human.checkpoint.resolved
 evolution.iteration.started
 evolution.iteration.completed
 evolution.iteration.failed
 evolution.adaptation.recorded
 evolution.foundation.blocker.detected
+evolution.rollout.blocked
+evolution.rollout.rollback.requested
+evolution.rollout.rollback.completed
 evolution.ability.note.recorded
 ```
 
@@ -904,6 +982,7 @@ $SINOMO_DATA_DIR/evolution/campaigns/campaign_x/
   budget-policy.json
   resource-ledger.jsonl
   schedule.json
+  decisions.jsonl
   ability-notes.jsonl                 # optional
   stages/
     stage_001.json
@@ -954,6 +1033,25 @@ no public server automation
 no anti-cheat bypass
 no account-risk behavior
 human approval for new external tools or risky control channels
+```
+
+Example ruleset card:
+
+```text
+ruleset:
+  game_version: pinned by proposal or recorded as undecided
+  category: controlled local benchmark, not official speedrun submission
+  allowed_interfaces:
+    - screen/input automation
+    - local server/mod API if approved
+    - logs/traces
+  forbidden:
+    - public server automation
+    - anti-cheat bypass
+    - account-risk behavior
+  seed_policy:
+    - fixed seeds for early evals
+    - held-out seeds for generalization
 ```
 
 ### Why this is more than route planning
@@ -1142,6 +1240,20 @@ Recommended first objective:
 sinomo evolve propose --objective "improve the self-evolution scheduler so it can pause and resume around resource budgets"
 ```
 
+Concrete first-demo success shape:
+
+```text
+sinomo evolve propose --dry-run ...
+  -> writes a campaign bundle
+  -> writes a resource schedule preview
+  -> writes staged evaluation targets
+  -> writes a near-term task list
+  -> writes an approval checkpoint
+
+sinomo evolve show <campaign>
+  -> renders the proposal, current state, budget preview, stages, tasks, decisions, and approval status
+```
+
 Why this is a good first campaign:
 
 - It improves the mechanism itself.
@@ -1160,7 +1272,7 @@ Goal: make `sinomo evolve propose --dry-run` produce an inspectable long-horizon
 
 Deliverables:
 
-- `EvolutionCampaign`, `ObjectiveCard`, `EvolutionStage`, `NearTermEvolutionTask`, `EvolutionIterationResult`, and budget policy data contracts.
+- `EvolutionCampaign`, `ObjectiveCard`, `EvolutionStage`, `NearTermEvolutionTask`, `EvolutionIterationResult`, `CampaignDecision`, and budget policy data contracts.
 - CLI args for objective, horizon, budget policy, reserve floors, approval policy, and dry-run.
 - Proposal writer under `SINOMO_DATA_DIR/evolution/campaigns`.
 - No agent execution yet.
