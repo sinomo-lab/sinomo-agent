@@ -17,6 +17,7 @@ sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-eval = { path = "../sinomo-eval" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-local = { path = "../sinomo-local" }
+sinomo-kv = { path = "../sinomo-kv" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }

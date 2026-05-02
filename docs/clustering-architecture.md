@@ -46,7 +46,7 @@ Initial local state lives at:
 $SINOMO_DATA_DIR/cluster/state.json
 ```
 
-The state file is only a bootstrap artifact. Once the cluster service is implemented, durable membership and config state come from the replicated KV log. The file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
+The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core`. It is only a bootstrap artifact. Once the cluster service is implemented, durable membership and config state come from the replicated KV log. The file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
 
 ## Identity Model
 
@@ -119,8 +119,6 @@ The orphan guard is a hard runtime boundary.
 Allowed while orphaned:
 
 - create or inspect local bootstrap state
-- configure model/provider credentials
-- run purely local diagnostics
 - print help
 
 Blocked while orphaned:
@@ -165,20 +163,24 @@ Transport preference:
 2. Loopback for local daemon clients.
 3. LAN direct QUIC for same-network nodes.
 4. LAN TCP only for development and compatibility.
-5. WebRTC data channels for NAT traversal and roaming across networks.
-6. TURN relay or an HTTPS relay for difficult networks.
+5. Iroh QUIC endpoints for roaming across NATs, using endpoint public keys, direct addresses, and relay URL fallback.
+6. WebRTC data channels for browsers or environments where iroh is unavailable.
+7. TURN relay or an HTTPS relay for difficult networks.
 
 Discovery mechanisms:
 
 - Static endpoints from local bootstrap state and KV membership records.
 - mDNS/DNS-SD for LAN candidates.
 - UDP hole-punch candidates where available.
+- Iroh endpoint records published through the KV under `/iroh/endpoints/<cluster>/<node>`.
 - WebRTC ICE candidates for cross-network paths.
 - Optional user-hosted rendezvous/signaling service.
 
 Discovery finds paths, not authority. Transport sessions are authorized only after mutual authentication with cluster-issued credentials.
 
-Path selection is continuous. A node may move from LAN QUIC to WebRTC relay and back without changing node identity or session membership. The peer registry stores multiple endpoint candidates per node and scores them by latency, reliability, privacy class, and cost.
+Path selection is continuous. A node may move from LAN QUIC to iroh, WebRTC relay, and back without changing node identity or session membership. The peer registry stores multiple endpoint candidates per node and scores them by latency, reliability, privacy class, and cost.
+
+Iroh is the preferred general roaming backend once LAN direct paths are unavailable. The cluster stores the peer endpoint public key, any known direct socket addresses, the selected relay URL or default relay mode, and a TTL. The runtime can use the optional `iroh-transport` Cargo feature to turn that record into an iroh dial configuration using the cluster ALPN `sinomo.iroh-roaming.v1`. WebRTC remains the fallback for browser surfaces and deployments that do not compile or enable iroh.
 
 ## Security Model
 
@@ -374,7 +376,7 @@ Leader loss:
 Roaming:
 
 - Existing transport path may fail.
-- Peer registry tries alternate LAN, direct, WebRTC, or relay candidates.
+- Peer registry tries alternate LAN, iroh, WebRTC, or relay candidates.
 - Node identity and session membership remain stable.
 
 Node restart:
@@ -394,33 +396,34 @@ Disaster recovery:
 
 Phase 0, local bootstrap:
 
-- Add `sinomo cluster` CLI.
-- Persist local cluster state.
-- Add orphan guard hooks around distributed operations.
+- Add `sinomo cluster` CLI. Implemented in `crates/sinomo-cli`.
+- Persist local cluster state. Implemented as `$SINOMO_DATA_DIR/cluster/state.json`.
+- Add orphan guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
 
 Phase 1, contracts:
 
-- Add cluster identity, membership, endpoint, invite, and certificate structs.
-- Extend `sinomo-network` transport kinds for QUIC and WebRTC candidate metadata.
-- Add cluster-aware peer registry records.
+- Add cluster identity, membership, endpoint, invite, and certificate structs. Implemented in `crates/sinomo-core/src/cluster.rs`.
+- Extend `sinomo-network` transport kinds for QUIC, iroh, and WebRTC candidate metadata. Implemented through `TransportKind`, `NodeEndpoint::from_cluster_endpoint`, and `PeerEndpointCandidate`.
+- Add cluster-aware peer registry records. Implemented through `PeerRegistry` cluster member and endpoint candidate indexes.
 
 Phase 2, KV core:
 
-- Implement in-process Raft/KV simulation for tests.
-- Add WAL, snapshots, revisions, compare-and-swap transactions, and watches.
-- Store membership and service registry records in the KV.
+- Implement in-process Raft/KV simulation for tests. Implemented in `crates/sinomo-kv`.
+- Add WAL, snapshots, revisions, compare-and-swap transactions, and watches. Implemented as `KvLogEntry`, `KvSnapshot`, `KvRevision`, `KvTxn`, and prefix watches.
+- Store membership and service registry records in the KV. Implemented for cluster membership records under `/cluster/members/<node_id>`; service registry records use the same generic keyspace and lease primitives.
 
 Phase 3, real local network:
 
-- Add QUIC transport for LAN direct connections.
-- Add mDNS discovery.
-- Add mutual auth using node identity and cluster certificates.
+- Add QUIC transport for LAN direct connections. Implemented the LAN QUIC endpoint config and bounded frame codec in `sinomo-network`; the async socket runtime is deferred until the daemon transport loop exists.
+- Add mDNS discovery. Implemented an mDNS-style discovery cache that records LAN QUIC endpoint advertisements, TTL expiry, and endpoint candidate conversion.
+- Add mutual auth using node identity and cluster certificates. Implemented cluster-auth material, certificate/member verification, and authenticated session establishment against cluster membership records.
 
 Phase 4, roaming:
 
-- Add WebRTC signaling abstraction.
-- Add ICE candidate exchange through the KV or rendezvous service.
-- Add TURN/relay fallback.
+- Add iroh as the preferred roaming backend after LAN direct paths. Implemented as the optional `iroh-transport` Cargo feature, `ClusterTransportKind::Iroh`, `IrohEndpointRecord`, and KV endpoint publication under `/iroh/endpoints/<cluster>/<node>`.
+- Add WebRTC signaling abstraction. Implemented in `sinomo-network` as `WebRtcSignalingEnvelope`, `WebRtcSignalMessage`, and `IceCandidateRecord`.
+- Add ICE candidate exchange through the KV or rendezvous service. Implemented `WebRtcKvExchange` helpers for `/webrtc/signals/...` and `/webrtc/candidates/...` keys using the Phase 2 KV operation surface.
+- Add TURN/relay fallback. Implemented `RoamingConnectionPlanner`, which prefers LAN direct candidates, then iroh candidates, then WebRTC candidates, then TURN/HTTPS relay candidates when direct paths fail or disappear.
 
 Phase 5, DFS integration:
 
@@ -433,4 +436,3 @@ Phase 6, operations:
 - Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands.
 - Add snapshot export/import.
 - Add metrics and event traces for elections, watches, membership changes, and replication lag.
-

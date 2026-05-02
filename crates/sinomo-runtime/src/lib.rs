@@ -28,6 +28,7 @@ pub mod r1 {
     pub use sinomo_dfs as dfs;
     pub use sinomo_eval as eval;
     pub use sinomo_events as events;
+    pub use sinomo_kv as kv;
     pub use sinomo_local as local;
     pub use sinomo_module as module;
     pub use sinomo_network as network;
@@ -42,6 +43,6 @@ pub mod r1 {
 
 pub use r0::core;
 pub use r1::{
-    api, device, dfs, eval, events, local, module, network, node, policy, registry, rollout,
+    api, device, dfs, eval, events, kv, local, module, network, node, policy, registry, rollout,
     sandbox, supervision, sync,
 };

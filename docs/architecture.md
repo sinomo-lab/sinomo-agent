@@ -311,7 +311,7 @@ Initial crate ownership:
 | Group | Crates |
 |---|---|
 | R0 | `sinomo-core` |
-| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-local`, `sinomo-module`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision`, `sinomo-sync` |
+| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-kv`, `sinomo-local`, `sinomo-module`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision`, `sinomo-sync` |
 | R0/R1 boundary | `sinomo-runtime` |
 | R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-trigger`, `sinomo-video`, `sinomo-voice` |
 | Application/tooling | `sinomo`, `sinomo-app`, `sinomo-cli` |

@@ -1,18 +1,27 @@
 //! Peer registry, mesh contracts, and event routing skeletons.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{EventEnvelope, EventId, LatencyClass, NodeId, RoutingScope, SessionId};
+use sinomo_core::{
+    ClusterCertificate, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource,
+    ClusterId, ClusterMemberRecord, ClusterTransportKind, EventEnvelope, EventId, LatencyClass,
+    NodeId, RoutingScope, SessionId,
+};
 use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
+use sinomo_kv::{KvEntry, KvOp, LeaseId};
 use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use thiserror::Error;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Default)]
 pub struct PeerRegistry {
+    cluster_id: Option<ClusterId>,
     nodes: BTreeMap<NodeId, NodeProfile>,
+    cluster_members: BTreeMap<NodeId, ClusterMemberRecord>,
     peer_states: BTreeMap<NodeId, PeerState>,
+    endpoint_candidates: BTreeMap<NodeId, Vec<PeerEndpointCandidate>>,
     sessions: BTreeMap<SessionId, BTreeSet<NodeId>>,
 }
 
@@ -21,12 +30,70 @@ impl PeerRegistry {
         Self::default()
     }
 
+    pub fn cluster_id(&self) -> Option<&ClusterId> {
+        self.cluster_id.as_ref()
+    }
+
+    pub fn set_cluster_id(&mut self, cluster_id: ClusterId) {
+        self.cluster_id = Some(cluster_id);
+    }
+
     pub fn register_node(&mut self, profile: NodeProfile) -> Option<NodeProfile> {
         let node_id = profile.node_id.clone();
         self.peer_states
             .entry(node_id.clone())
             .or_insert_with(|| PeerState::new(NodeEndpoint::in_process(node_id.clone())));
         self.nodes.insert(node_id, profile)
+    }
+
+    pub fn upsert_cluster_member(
+        &mut self,
+        member: ClusterMemberRecord,
+    ) -> Option<ClusterMemberRecord> {
+        self.cluster_id
+            .get_or_insert_with(|| member.cluster_id.clone());
+        let node_id = member.node_id.clone();
+        if !member.endpoints.is_empty() {
+            self.endpoint_candidates.insert(
+                node_id.clone(),
+                member
+                    .endpoints
+                    .iter()
+                    .cloned()
+                    .map(PeerEndpointCandidate::discovered)
+                    .collect(),
+            );
+        }
+        self.cluster_members.insert(node_id, member)
+    }
+
+    pub fn cluster_member(&self, node_id: &NodeId) -> Option<&ClusterMemberRecord> {
+        self.cluster_members.get(node_id)
+    }
+
+    pub fn cluster_members(&self) -> Vec<&ClusterMemberRecord> {
+        self.cluster_members.values().collect()
+    }
+
+    pub fn replace_endpoint_candidates(
+        &mut self,
+        node_id: NodeId,
+        candidates: Vec<PeerEndpointCandidate>,
+    ) {
+        self.endpoint_candidates.insert(node_id, candidates);
+    }
+
+    pub fn endpoint_candidates(&self, node_id: &NodeId) -> &[PeerEndpointCandidate] {
+        self.endpoint_candidates
+            .get(node_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn best_endpoint_candidate(&self, node_id: &NodeId) -> Option<&PeerEndpointCandidate> {
+        self.endpoint_candidates
+            .get(node_id)
+            .and_then(|candidates| candidates.iter().min_by_key(|candidate| candidate.score))
     }
 
     pub fn join_session(
@@ -234,14 +301,750 @@ impl NodeEndpoint {
             transport: TransportKind::InProcess,
         }
     }
+
+    pub fn from_cluster_endpoint(endpoint: &ClusterEndpointRecord) -> Self {
+        Self {
+            node_id: endpoint.node_id.clone(),
+            transport: TransportKind::from_cluster_transport(&endpoint.transport),
+            address: endpoint.address.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransportKind {
     InProcess,
+    Loopback,
     Tcp,
     Quic,
+    Iroh,
+    WebRtc,
+    TurnRelay,
+    HttpsRelay,
+}
+
+impl TransportKind {
+    pub fn from_cluster_transport(transport: &sinomo_core::ClusterTransportKind) -> Self {
+        match transport {
+            sinomo_core::ClusterTransportKind::InProcess => Self::InProcess,
+            sinomo_core::ClusterTransportKind::Loopback => Self::Loopback,
+            sinomo_core::ClusterTransportKind::LanTcp => Self::Tcp,
+            sinomo_core::ClusterTransportKind::LanQuic => Self::Quic,
+            sinomo_core::ClusterTransportKind::Iroh => Self::Iroh,
+            sinomo_core::ClusterTransportKind::WebRtc => Self::WebRtc,
+            sinomo_core::ClusterTransportKind::TurnRelay => Self::TurnRelay,
+            sinomo_core::ClusterTransportKind::HttpsRelay => Self::HttpsRelay,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PeerEndpointCandidate {
+    pub endpoint: ClusterEndpointRecord,
+    pub status: EndpointCandidateStatus,
+    pub score: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+impl PeerEndpointCandidate {
+    pub fn discovered(endpoint: ClusterEndpointRecord) -> Self {
+        let score = endpoint.priority;
+        Self {
+            endpoint,
+            status: EndpointCandidateStatus::Discovered,
+            score,
+            failure_reason: None,
+        }
+    }
+
+    pub fn healthy(mut self, observed_latency_ms: u32) -> Self {
+        self.endpoint.last_observed_latency_ms = Some(observed_latency_ms);
+        self.status = EndpointCandidateStatus::Healthy;
+        self.score = self
+            .endpoint
+            .priority
+            .saturating_add((observed_latency_ms / 10).min(u32::from(u16::MAX)) as u16);
+        self
+    }
+
+    pub fn failed(mut self, reason: impl Into<String>) -> Self {
+        self.status = EndpointCandidateStatus::Failed;
+        self.failure_reason = Some(reason.into());
+        self.score = u16::MAX;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndpointCandidateStatus {
+    Discovered,
+    Probing,
+    Healthy,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LanQuicEndpointConfig {
+    pub bind_address: String,
+    pub alpn: String,
+    pub max_frame_bytes: usize,
+}
+
+impl Default for LanQuicEndpointConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: "0.0.0.0:21355".to_string(),
+            alpn: "sinomo-cluster-v1".to_string(),
+            max_frame_bytes: 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LanQuicFrameCodec {
+    pub max_frame_bytes: usize,
+}
+
+impl Default for LanQuicFrameCodec {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: LanQuicEndpointConfig::default().max_frame_bytes,
+        }
+    }
+}
+
+impl LanQuicFrameCodec {
+    pub fn encode(&self, frame: &NetworkFrame) -> Result<Vec<u8>, NetworkError> {
+        let bytes = serde_json::to_vec(frame).map_err(|source| NetworkError::Serialization {
+            detail: source.to_string(),
+        })?;
+        if bytes.len() > self.max_frame_bytes {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: bytes.len(),
+                max_bytes: self.max_frame_bytes,
+            });
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(&self, bytes: &[u8]) -> Result<NetworkFrame, NetworkError> {
+        if bytes.len() > self.max_frame_bytes {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: bytes.len(),
+                max_bytes: self.max_frame_bytes,
+            });
+        }
+        serde_json::from_slice(bytes).map_err(|source| NetworkError::Serialization {
+            detail: source.to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MdnsDiscoveryCache {
+    records: BTreeMap<String, MdnsDiscoveryRecord>,
+}
+
+impl MdnsDiscoveryCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn upsert(&mut self, record: MdnsDiscoveryRecord) {
+        self.records.insert(record.record_id.clone(), record);
+    }
+
+    pub fn expire_after_tick(&mut self, tick: u64) -> usize {
+        let before = self.records.len();
+        self.records
+            .retain(|_, record| record.expires_after_tick > tick);
+        before.saturating_sub(self.records.len())
+    }
+
+    pub fn endpoint_candidates_for_node(&self, node_id: &NodeId) -> Vec<PeerEndpointCandidate> {
+        self.records
+            .values()
+            .filter(|record| &record.endpoint.node_id == node_id)
+            .map(|record| PeerEndpointCandidate::discovered(record.endpoint.clone()))
+            .collect()
+    }
+
+    pub fn endpoints_for_cluster(&self, cluster_id: &ClusterId) -> Vec<ClusterEndpointRecord> {
+        self.records
+            .values()
+            .filter(|record| &record.cluster_id == cluster_id)
+            .map(|record| record.endpoint.clone())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MdnsDiscoveryRecord {
+    pub record_id: String,
+    pub cluster_id: ClusterId,
+    pub endpoint: ClusterEndpointRecord,
+    pub advertised_tick: u64,
+    pub expires_after_tick: u64,
+}
+
+impl MdnsDiscoveryRecord {
+    pub fn lan_quic(
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        address: impl Into<String>,
+        advertised_tick: u64,
+        ttl_ticks: u64,
+    ) -> Self {
+        let address = address.into();
+        let record_id = format!("{cluster_id}:{node_id}:lan-quic:{address}");
+        Self {
+            record_id,
+            cluster_id,
+            endpoint: ClusterEndpointRecord {
+                endpoint_id: sinomo_core::ClusterEndpointId::generate(),
+                node_id,
+                transport: ClusterTransportKind::LanQuic,
+                address,
+                source: ClusterEndpointSource::Mdns,
+                privacy: ClusterEndpointPrivacy::Lan,
+                priority: 10,
+                last_observed_latency_ms: None,
+            },
+            advertised_tick,
+            expires_after_tick: advertised_tick.saturating_add(ttl_ticks),
+        }
+    }
+}
+
+pub const WEBRTC_SIGNALING_PROTOCOL: &str = "sinomo.webrtc-signaling.v1";
+pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct WebRtcSignalingEnvelope {
+    pub cluster_id: ClusterId,
+    pub exchange_id: String,
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub sequence: u64,
+    pub expires_after_tick: u64,
+    pub message: WebRtcSignalMessage,
+}
+
+impl WebRtcSignalingEnvelope {
+    pub fn offer(
+        cluster_id: ClusterId,
+        exchange_id: impl Into<String>,
+        source_node_id: NodeId,
+        target_node_id: NodeId,
+        sdp: impl Into<String>,
+        expires_after_tick: u64,
+    ) -> Self {
+        Self {
+            cluster_id,
+            exchange_id: exchange_id.into(),
+            source_node_id,
+            target_node_id,
+            sequence: 1,
+            expires_after_tick,
+            message: WebRtcSignalMessage::Offer { sdp: sdp.into() },
+        }
+    }
+
+    pub fn answer(
+        cluster_id: ClusterId,
+        exchange_id: impl Into<String>,
+        source_node_id: NodeId,
+        target_node_id: NodeId,
+        sdp: impl Into<String>,
+        expires_after_tick: u64,
+    ) -> Self {
+        Self {
+            cluster_id,
+            exchange_id: exchange_id.into(),
+            source_node_id,
+            target_node_id,
+            sequence: 2,
+            expires_after_tick,
+            message: WebRtcSignalMessage::Answer { sdp: sdp.into() },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebRtcSignalMessage {
+    Offer { sdp: String },
+    Answer { sdp: String },
+    IceCandidate(IceCandidateRecord),
+    EndOfCandidates,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct IceCandidateRecord {
+    pub cluster_id: ClusterId,
+    pub exchange_id: String,
+    pub node_id: NodeId,
+    pub candidate_id: String,
+    pub candidate_type: IceCandidateType,
+    pub address: String,
+    pub priority: u32,
+    pub raw_candidate: String,
+    pub expires_after_tick: u64,
+}
+
+impl IceCandidateRecord {
+    pub fn endpoint(&self) -> ClusterEndpointRecord {
+        let (transport, privacy, source_priority) = match self.candidate_type {
+            IceCandidateType::Host => (
+                ClusterTransportKind::WebRtc,
+                ClusterEndpointPrivacy::Lan,
+                30,
+            ),
+            IceCandidateType::ServerReflexive => (
+                ClusterTransportKind::WebRtc,
+                ClusterEndpointPrivacy::InternetDirect,
+                60,
+            ),
+            IceCandidateType::PeerReflexive => (
+                ClusterTransportKind::WebRtc,
+                ClusterEndpointPrivacy::InternetDirect,
+                70,
+            ),
+            IceCandidateType::Relay => (
+                ClusterTransportKind::TurnRelay,
+                ClusterEndpointPrivacy::Relayed,
+                120,
+            ),
+        };
+        ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::generate(),
+            node_id: self.node_id.clone(),
+            transport,
+            address: self.address.clone(),
+            source: ClusterEndpointSource::Ice,
+            privacy,
+            priority: source_priority,
+            last_observed_latency_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IceCandidateType {
+    Host,
+    ServerReflexive,
+    PeerReflexive,
+    Relay,
+}
+
+pub struct WebRtcKvExchange;
+
+impl WebRtcKvExchange {
+    pub fn signal_key(cluster_id: &ClusterId, exchange_id: &str, sequence: u64) -> String {
+        format!("/webrtc/signals/{cluster_id}/{exchange_id}/{sequence:020}")
+    }
+
+    pub fn candidate_key(
+        cluster_id: &ClusterId,
+        exchange_id: &str,
+        node_id: &NodeId,
+        candidate_id: &str,
+    ) -> String {
+        format!("/webrtc/candidates/{cluster_id}/{exchange_id}/{node_id}/{candidate_id}")
+    }
+
+    pub fn signal_prefix(cluster_id: &ClusterId, exchange_id: &str) -> String {
+        format!("/webrtc/signals/{cluster_id}/{exchange_id}/")
+    }
+
+    pub fn candidate_prefix(cluster_id: &ClusterId, exchange_id: &str) -> String {
+        format!("/webrtc/candidates/{cluster_id}/{exchange_id}/")
+    }
+
+    pub fn put_signal(
+        envelope: WebRtcSignalingEnvelope,
+        lease_id: Option<LeaseId>,
+    ) -> Result<KvOp, NetworkError> {
+        let key = Self::signal_key(
+            &envelope.cluster_id,
+            &envelope.exchange_id,
+            envelope.sequence,
+        );
+        let value =
+            serde_json::to_vec(&envelope).map_err(|source| NetworkError::Serialization {
+                detail: source.to_string(),
+            })?;
+        Ok(KvOp::Put {
+            key,
+            value,
+            lease_id,
+        })
+    }
+
+    pub fn put_candidate(
+        candidate: IceCandidateRecord,
+        lease_id: Option<LeaseId>,
+    ) -> Result<KvOp, NetworkError> {
+        let key = Self::candidate_key(
+            &candidate.cluster_id,
+            &candidate.exchange_id,
+            &candidate.node_id,
+            &candidate.candidate_id,
+        );
+        let value =
+            serde_json::to_vec(&candidate).map_err(|source| NetworkError::Serialization {
+                detail: source.to_string(),
+            })?;
+        Ok(KvOp::Put {
+            key,
+            value,
+            lease_id,
+        })
+    }
+
+    pub fn signal_from_entry(entry: &KvEntry) -> Result<WebRtcSignalingEnvelope, NetworkError> {
+        serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Serialization {
+            detail: source.to_string(),
+        })
+    }
+
+    pub fn candidate_from_entry(entry: &KvEntry) -> Result<IceCandidateRecord, NetworkError> {
+        serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Serialization {
+            detail: source.to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct IrohEndpointRecord {
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    pub endpoint_public_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    pub relay_mode: IrohRelayMode,
+    pub expires_after_tick: u64,
+}
+
+impl IrohEndpointRecord {
+    pub fn endpoint(&self) -> ClusterEndpointRecord {
+        let has_direct_address = !self.direct_addresses.is_empty();
+        let address = if has_direct_address {
+            format!(
+                "iroh://{}?direct={}",
+                self.endpoint_public_key,
+                self.direct_addresses.join(",")
+            )
+        } else if let Some(relay_url) = &self.relay_url {
+            format!("iroh://{}?relay={relay_url}", self.endpoint_public_key)
+        } else {
+            format!("iroh://{}", self.endpoint_public_key)
+        };
+
+        ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::generate(),
+            node_id: self.node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address,
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: if has_direct_address {
+                ClusterEndpointPrivacy::InternetDirect
+            } else {
+                ClusterEndpointPrivacy::Relayed
+            },
+            priority: if has_direct_address { 40 } else { 90 },
+            last_observed_latency_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IrohRelayMode {
+    Disabled,
+    Default,
+    Custom { relay_url: String },
+}
+
+#[cfg(feature = "iroh-transport")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrohEndpointDialConfig {
+    pub endpoint_public_key: iroh::PublicKey,
+    pub alpn: Vec<u8>,
+    pub relay_url: Option<String>,
+    pub direct_addresses: Vec<String>,
+}
+
+#[cfg(feature = "iroh-transport")]
+impl IrohEndpointDialConfig {
+    pub fn from_record(record: &IrohEndpointRecord) -> Result<Self, NetworkError> {
+        let endpoint_public_key =
+            record
+                .endpoint_public_key
+                .parse()
+                .map_err(|source| NetworkError::Serialization {
+                    detail: format!("invalid iroh public key: {source}"),
+                })?;
+        Ok(Self {
+            endpoint_public_key,
+            alpn: IROH_ROAMING_PROTOCOL.as_bytes().to_vec(),
+            relay_url: record.relay_url.clone(),
+            direct_addresses: record.direct_addresses.clone(),
+        })
+    }
+}
+
+pub struct IrohKvExchange;
+
+impl IrohKvExchange {
+    pub fn endpoint_key(cluster_id: &ClusterId, node_id: &NodeId) -> String {
+        format!("/iroh/endpoints/{cluster_id}/{node_id}")
+    }
+
+    pub fn endpoint_prefix(cluster_id: &ClusterId) -> String {
+        format!("/iroh/endpoints/{cluster_id}/")
+    }
+
+    pub fn put_endpoint(
+        endpoint: IrohEndpointRecord,
+        lease_id: Option<LeaseId>,
+    ) -> Result<KvOp, NetworkError> {
+        let key = Self::endpoint_key(&endpoint.cluster_id, &endpoint.node_id);
+        let value =
+            serde_json::to_vec(&endpoint).map_err(|source| NetworkError::Serialization {
+                detail: source.to_string(),
+            })?;
+        Ok(KvOp::Put {
+            key,
+            value,
+            lease_id,
+        })
+    }
+
+    pub fn endpoint_from_entry(entry: &KvEntry) -> Result<IrohEndpointRecord, NetworkError> {
+        serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Serialization {
+            detail: source.to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterAuthMaterial {
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    pub node_public_key: String,
+    pub certificate: ClusterCertificate,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClusterAuthVerifier {
+    members: BTreeMap<NodeId, ClusterMemberRecord>,
+}
+
+impl ClusterAuthVerifier {
+    pub fn new(members: impl IntoIterator<Item = ClusterMemberRecord>) -> Self {
+        Self {
+            members: members
+                .into_iter()
+                .map(|member| (member.node_id.clone(), member))
+                .collect(),
+        }
+    }
+
+    pub fn verify_peer(
+        &self,
+        local_cluster_id: &ClusterId,
+        peer: &ClusterAuthMaterial,
+        now: OffsetDateTime,
+    ) -> Result<(), NetworkError> {
+        if &peer.cluster_id != local_cluster_id {
+            return Err(NetworkError::ClusterMismatch {
+                expected: local_cluster_id.clone(),
+                actual: peer.cluster_id.clone(),
+            });
+        }
+        if peer.certificate.cluster_id != *local_cluster_id {
+            return Err(NetworkError::ClusterMismatch {
+                expected: local_cluster_id.clone(),
+                actual: peer.certificate.cluster_id.clone(),
+            });
+        }
+        if peer.certificate.node_id != peer.node_id {
+            return Err(NetworkError::CertificateNodeMismatch {
+                material_node_id: peer.node_id.clone(),
+                certificate_node_id: peer.certificate.node_id.clone(),
+            });
+        }
+        if peer.certificate.public_key != peer.node_public_key {
+            return Err(NetworkError::CertificateKeyMismatch {
+                node_id: peer.node_id.clone(),
+            });
+        }
+        if peer.certificate.expires_at <= now {
+            return Err(NetworkError::CertificateExpired {
+                node_id: peer.node_id.clone(),
+            });
+        }
+        if peer.certificate.signature.trim().is_empty() {
+            return Err(NetworkError::CertificateSignatureMissing {
+                node_id: peer.node_id.clone(),
+            });
+        }
+
+        let member =
+            self.members
+                .get(&peer.node_id)
+                .ok_or_else(|| NetworkError::UnauthorizedNode {
+                    node_id: peer.node_id.clone(),
+                })?;
+        if !member.state.is_authorized() {
+            return Err(NetworkError::UnauthorizedNode {
+                node_id: peer.node_id.clone(),
+            });
+        }
+        if member.node_public_key != peer.node_public_key {
+            return Err(NetworkError::CertificateKeyMismatch {
+                node_id: peer.node_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn establish_mutual_session(
+        &self,
+        local: &ClusterAuthMaterial,
+        remote: &ClusterAuthMaterial,
+        now: OffsetDateTime,
+    ) -> Result<AuthenticatedClusterSession, NetworkError> {
+        self.verify_peer(&local.cluster_id, local, now)?;
+        self.verify_peer(&local.cluster_id, remote, now)?;
+        Ok(AuthenticatedClusterSession {
+            cluster_id: local.cluster_id.clone(),
+            local_node_id: local.node_id.clone(),
+            remote_node_id: remote.node_id.clone(),
+            established_at: now,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AuthenticatedClusterSession {
+    pub cluster_id: ClusterId,
+    pub local_node_id: NodeId,
+    pub remote_node_id: NodeId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub established_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LanConnectionPlanner;
+
+impl LanConnectionPlanner {
+    pub fn select_direct_candidate<'a>(
+        candidates: &'a [PeerEndpointCandidate],
+    ) -> Option<&'a PeerEndpointCandidate> {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.endpoint.transport,
+                    ClusterTransportKind::LanQuic | ClusterTransportKind::LanTcp
+                ) && matches!(
+                    candidate.endpoint.privacy,
+                    ClusterEndpointPrivacy::Lan | ClusterEndpointPrivacy::LocalOnly
+                )
+            })
+            .min_by_key(|candidate| {
+                let transport_score = match candidate.endpoint.transport {
+                    ClusterTransportKind::LanQuic => 0,
+                    ClusterTransportKind::LanTcp => 100,
+                    _ => 1_000,
+                };
+                transport_score + u32::from(candidate.score)
+            })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum RoamingPathSelection {
+    Direct(PeerEndpointCandidate),
+    Iroh(PeerEndpointCandidate),
+    WebRtc(PeerEndpointCandidate),
+    Relay(PeerEndpointCandidate),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RoamingConnectionPlanner;
+
+impl RoamingConnectionPlanner {
+    pub fn select_path(candidates: &[PeerEndpointCandidate]) -> Option<RoamingPathSelection> {
+        if let Some(candidate) = LanConnectionPlanner::select_direct_candidate(candidates) {
+            return Some(RoamingPathSelection::Direct(candidate.clone()));
+        }
+
+        if let Some(candidate) = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.endpoint.transport == ClusterTransportKind::Iroh
+                    && candidate.status != EndpointCandidateStatus::Failed
+            })
+            .min_by_key(|candidate| {
+                let privacy_score = match candidate.endpoint.privacy {
+                    ClusterEndpointPrivacy::InternetDirect => 30,
+                    ClusterEndpointPrivacy::Relayed => 80,
+                    ClusterEndpointPrivacy::Lan => 120,
+                    ClusterEndpointPrivacy::LocalOnly => 200,
+                };
+                privacy_score + u32::from(candidate.score)
+            })
+        {
+            return Some(RoamingPathSelection::Iroh(candidate.clone()));
+        }
+
+        if let Some(candidate) = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.endpoint.transport == ClusterTransportKind::WebRtc
+                    && candidate.status != EndpointCandidateStatus::Failed
+            })
+            .min_by_key(|candidate| {
+                let privacy_score = match candidate.endpoint.privacy {
+                    ClusterEndpointPrivacy::Lan => 20,
+                    ClusterEndpointPrivacy::InternetDirect => 40,
+                    ClusterEndpointPrivacy::LocalOnly => 80,
+                    ClusterEndpointPrivacy::Relayed => 300,
+                };
+                privacy_score + u32::from(candidate.score)
+            })
+        {
+            return Some(RoamingPathSelection::WebRtc(candidate.clone()));
+        }
+
+        candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.endpoint.transport,
+                    ClusterTransportKind::TurnRelay | ClusterTransportKind::HttpsRelay
+                ) && candidate.status != EndpointCandidateStatus::Failed
+            })
+            .min_by_key(|candidate| {
+                let relay_score = match candidate.endpoint.transport {
+                    ClusterTransportKind::TurnRelay => 100,
+                    ClusterTransportKind::HttpsRelay => 200,
+                    _ => 500,
+                };
+                relay_score + u32::from(candidate.score)
+            })
+            .cloned()
+            .map(RoamingPathSelection::Relay)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -922,6 +1725,8 @@ pub enum DeliveryStatus {
 pub enum NetworkError {
     #[error("unknown node: {node_id}")]
     UnknownNode { node_id: NodeId },
+    #[error("unauthorized cluster node: {node_id}")]
+    UnauthorizedNode { node_id: NodeId },
     #[error("frame source {source_node_id} does not match local transport node {local_node_id}")]
     FrameSourceMismatch {
         local_node_id: NodeId,
@@ -944,6 +1749,31 @@ pub enum NetworkError {
         expected_target_node_id: NodeId,
         acking_node_id: NodeId,
     },
+    #[error("cluster mismatch: expected {expected}, got {actual}")]
+    ClusterMismatch {
+        expected: ClusterId,
+        actual: ClusterId,
+    },
+    #[error(
+        "certificate node {certificate_node_id} does not match material node {material_node_id}"
+    )]
+    CertificateNodeMismatch {
+        material_node_id: NodeId,
+        certificate_node_id: NodeId,
+    },
+    #[error("certificate key does not match member key for {node_id}")]
+    CertificateKeyMismatch { node_id: NodeId },
+    #[error("certificate expired for {node_id}")]
+    CertificateExpired { node_id: NodeId },
+    #[error("certificate signature missing for {node_id}")]
+    CertificateSignatureMissing { node_id: NodeId },
+    #[error("network frame is {actual_bytes} bytes; max is {max_bytes}")]
+    FrameTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    #[error("network serialization error: {detail}")]
+    Serialization { detail: String },
     #[error(transparent)]
     EventStore(#[from] EventStoreError),
 }
@@ -952,8 +1782,10 @@ pub enum NetworkError {
 mod tests {
     use super::*;
     use sinomo_core::{
-        Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
-        RoutingMetadata, RoutingScope, Salience, SessionId, Source,
+        ClusterCertificate, ClusterCertificateId, ClusterEndpointPrivacy, ClusterEndpointRecord,
+        ClusterEndpointSource, ClusterId, ClusterMemberRecord, ClusterTransportKind, Confidence,
+        EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass, RoutingMetadata,
+        RoutingScope, Salience, SessionId, Source,
     };
     use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
 
@@ -978,6 +1810,498 @@ mod tests {
                 PrivacyClass::Derived,
             ),
         )
+    }
+
+    fn certificate(
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        issuer_node_id: NodeId,
+        public_key: &str,
+        expires_at: time::OffsetDateTime,
+    ) -> ClusterCertificate {
+        ClusterCertificate {
+            certificate_id: ClusterCertificateId::generate(),
+            cluster_id,
+            node_id,
+            issuer_node_id,
+            public_key: public_key.to_string(),
+            capability_scope: Vec::new(),
+            issued_at: time::OffsetDateTime::now_utc(),
+            expires_at,
+            signature: "sig".to_string(),
+        }
+    }
+
+    #[test]
+    fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
+        let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+        let node_id = NodeId::new("node_desktop").expect("node");
+        let timestamp = time::OffsetDateTime::now_utc();
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            node_id.clone(),
+            "desktop",
+            timestamp,
+        );
+        member.endpoints.push(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_lan").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanQuic,
+            address: "192.168.1.20:21353".to_string(),
+            source: ClusterEndpointSource::Mdns,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        });
+        member.endpoints.push(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::WebRtc,
+            address: "webrtc://candidate".to_string(),
+            source: ClusterEndpointSource::Ice,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 50,
+            last_observed_latency_ms: None,
+        });
+        let mut registry = PeerRegistry::new();
+
+        registry.upsert_cluster_member(member.clone());
+
+        assert_eq!(registry.cluster_id(), Some(&cluster_id));
+        assert_eq!(registry.cluster_member(&node_id), Some(&member));
+        assert_eq!(registry.endpoint_candidates(&node_id).len(), 2);
+        assert_eq!(
+            registry
+                .best_endpoint_candidate(&node_id)
+                .expect("best endpoint")
+                .endpoint
+                .transport,
+            ClusterTransportKind::LanQuic
+        );
+    }
+
+    #[test]
+    fn node_endpoint_maps_cluster_roaming_transports() {
+        let node_id = NodeId::new("node_phone").expect("node");
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_ice").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::WebRtc,
+            address: "webrtc://candidate".to_string(),
+            source: ClusterEndpointSource::Ice,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: Some(40),
+        };
+
+        let network_endpoint = NodeEndpoint::from_cluster_endpoint(&endpoint);
+
+        assert_eq!(network_endpoint.node_id, node_id);
+        assert_eq!(network_endpoint.transport, TransportKind::WebRtc);
+        assert_eq!(network_endpoint.address, "webrtc://candidate");
+    }
+
+    #[test]
+    fn node_endpoint_maps_iroh_transport() {
+        let node_id = NodeId::new("node_phone").expect("node");
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_iroh").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://iroh_pk".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 40,
+            last_observed_latency_ms: None,
+        };
+
+        let network_endpoint = NodeEndpoint::from_cluster_endpoint(&endpoint);
+
+        assert_eq!(network_endpoint.node_id, node_id);
+        assert_eq!(network_endpoint.transport, TransportKind::Iroh);
+        assert_eq!(network_endpoint.address, "iroh://iroh_pk");
+    }
+
+    #[test]
+    fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let event = fixture_event("evt_codec", node_a.clone());
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(7),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(8),
+                origin_node_id: node_a,
+                target_node_id: node_b,
+                body: MeshMessageBody::Event {
+                    delivery_id: RouteDeliveryId(9),
+                    event: Box::new(event),
+                },
+            },
+        };
+        let codec = LanQuicFrameCodec {
+            max_frame_bytes: 16 * 1024,
+        };
+
+        let encoded = codec.encode(&frame).expect("encode");
+        let decoded = codec.decode(&encoded).expect("decode");
+
+        assert_eq!(decoded, frame);
+        assert!(matches!(
+            LanQuicFrameCodec { max_frame_bytes: 1 }.encode(&frame),
+            Err(NetworkError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn mdns_discovery_cache_returns_lan_quic_candidates_and_expires_records() {
+        let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+        let node_id = NodeId::new("node_desktop").expect("node");
+        let mut cache = MdnsDiscoveryCache::new();
+        cache.upsert(MdnsDiscoveryRecord::lan_quic(
+            cluster_id.clone(),
+            node_id.clone(),
+            "192.168.1.20:21355",
+            10,
+            5,
+        ));
+
+        let candidates = cache.endpoint_candidates_for_node(&node_id);
+
+        assert_eq!(cache.endpoints_for_cluster(&cluster_id).len(), 1);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].endpoint.transport,
+            ClusterTransportKind::LanQuic
+        );
+        assert_eq!(cache.expire_after_tick(14), 0);
+        assert_eq!(cache.expire_after_tick(15), 1);
+        assert!(cache.endpoint_candidates_for_node(&node_id).is_empty());
+    }
+
+    #[test]
+    fn cluster_auth_verifier_establishes_mutual_session_for_authorized_members() {
+        let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let now = time::OffsetDateTime::now_utc();
+        let expires_at = now + time::Duration::hours(1);
+        let mut member_a =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", now);
+        let mut member_b =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "b", now);
+        member_a.node_public_key = "pk_a".to_string();
+        member_b.node_public_key = "pk_b".to_string();
+        let verifier = ClusterAuthVerifier::new(vec![member_a, member_b]);
+        let material_a = ClusterAuthMaterial {
+            cluster_id: cluster_id.clone(),
+            node_id: node_a.clone(),
+            node_public_key: "pk_a".to_string(),
+            certificate: certificate(
+                cluster_id.clone(),
+                node_a.clone(),
+                node_a.clone(),
+                "pk_a",
+                expires_at,
+            ),
+        };
+        let material_b = ClusterAuthMaterial {
+            cluster_id: cluster_id.clone(),
+            node_id: node_b.clone(),
+            node_public_key: "pk_b".to_string(),
+            certificate: certificate(
+                cluster_id.clone(),
+                node_b.clone(),
+                node_a.clone(),
+                "pk_b",
+                expires_at,
+            ),
+        };
+
+        let session = verifier
+            .establish_mutual_session(&material_a, &material_b, now)
+            .expect("mutual auth");
+
+        assert_eq!(session.cluster_id, cluster_id);
+        assert_eq!(session.local_node_id, node_a);
+        assert_eq!(session.remote_node_id, node_b);
+    }
+
+    #[test]
+    fn cluster_auth_verifier_rejects_expired_or_wrong_key_certificate() {
+        let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+        let node_a = NodeId::new("node_a").expect("node");
+        let now = time::OffsetDateTime::now_utc();
+        let mut member =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", now);
+        member.node_public_key = "pk_a".to_string();
+        let verifier = ClusterAuthVerifier::new(vec![member]);
+        let wrong_key = ClusterAuthMaterial {
+            cluster_id: cluster_id.clone(),
+            node_id: node_a.clone(),
+            node_public_key: "pk_a".to_string(),
+            certificate: certificate(
+                cluster_id.clone(),
+                node_a.clone(),
+                node_a.clone(),
+                "pk_other",
+                now + time::Duration::hours(1),
+            ),
+        };
+        let expired = ClusterAuthMaterial {
+            cluster_id: cluster_id.clone(),
+            node_id: node_a.clone(),
+            node_public_key: "pk_a".to_string(),
+            certificate: certificate(cluster_id, node_a.clone(), node_a, "pk_a", now),
+        };
+
+        assert!(matches!(
+            verifier.verify_peer(&wrong_key.cluster_id, &wrong_key, now),
+            Err(NetworkError::CertificateKeyMismatch { .. })
+        ));
+        assert!(matches!(
+            verifier.verify_peer(&expired.cluster_id, &expired, now),
+            Err(NetworkError::CertificateExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn lan_connection_planner_prefers_lan_quic_over_relays() {
+        let node_id = NodeId::new("node_desktop").expect("node");
+        let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_relay").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::TurnRelay,
+            address: "turn://relay".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 1,
+            last_observed_latency_ms: None,
+        });
+        let lan = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_lan").expect("endpoint"),
+            node_id,
+            transport: ClusterTransportKind::LanQuic,
+            address: "192.168.1.20:21355".to_string(),
+            source: ClusterEndpointSource::Mdns,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        });
+
+        let candidates = [relay, lan];
+        let selected =
+            LanConnectionPlanner::select_direct_candidate(&candidates).expect("direct candidate");
+
+        assert_eq!(selected.endpoint.transport, ClusterTransportKind::LanQuic);
+    }
+
+    #[test]
+    fn webrtc_kv_exchange_round_trips_offer_answer_and_ice_candidates() {
+        let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+        let node_a = NodeId::new("node_a").expect("node");
+        let node_b = NodeId::new("node_b").expect("node");
+        let exchange_id = "exchange_1";
+        let mut store = sinomo_kv::InProcessKvStore::new();
+        store
+            .apply_command(sinomo_kv::KvCommand::Op(
+                WebRtcKvExchange::put_signal(
+                    WebRtcSignalingEnvelope::offer(
+                        cluster_id.clone(),
+                        exchange_id,
+                        node_a.clone(),
+                        node_b.clone(),
+                        "v=0 offer",
+                        10,
+                    ),
+                    None,
+                )
+                .expect("offer op"),
+            ))
+            .expect("put offer");
+        store
+            .apply_command(sinomo_kv::KvCommand::Op(
+                WebRtcKvExchange::put_signal(
+                    WebRtcSignalingEnvelope::answer(
+                        cluster_id.clone(),
+                        exchange_id,
+                        node_b.clone(),
+                        node_a.clone(),
+                        "v=0 answer",
+                        10,
+                    ),
+                    None,
+                )
+                .expect("answer op"),
+            ))
+            .expect("put answer");
+        let relay_candidate = IceCandidateRecord {
+            cluster_id: cluster_id.clone(),
+            exchange_id: exchange_id.to_string(),
+            node_id: node_b.clone(),
+            candidate_id: "relay_1".to_string(),
+            candidate_type: IceCandidateType::Relay,
+            address: "turn://relay.example:3478".to_string(),
+            priority: 10,
+            raw_candidate: "candidate:relay".to_string(),
+            expires_after_tick: 10,
+        };
+        store
+            .apply_command(sinomo_kv::KvCommand::Op(
+                WebRtcKvExchange::put_candidate(relay_candidate.clone(), None)
+                    .expect("candidate op"),
+            ))
+            .expect("put candidate");
+
+        let signals =
+            store.range_prefix(&WebRtcKvExchange::signal_prefix(&cluster_id, exchange_id));
+        let candidates = store.range_prefix(&WebRtcKvExchange::candidate_prefix(
+            &cluster_id,
+            exchange_id,
+        ));
+        let parsed_offer = WebRtcKvExchange::signal_from_entry(&signals[0]).expect("offer");
+        let parsed_candidate =
+            WebRtcKvExchange::candidate_from_entry(&candidates[0]).expect("candidate");
+
+        assert_eq!(signals.len(), 2);
+        assert!(matches!(
+            parsed_offer.message,
+            WebRtcSignalMessage::Offer { .. }
+        ));
+        assert_eq!(parsed_candidate, relay_candidate);
+        assert_eq!(
+            parsed_candidate.endpoint().transport,
+            ClusterTransportKind::TurnRelay
+        );
+    }
+
+    #[test]
+    fn iroh_kv_exchange_round_trips_endpoint_records() {
+        let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+        let node_id = NodeId::new("node_mobile").expect("node");
+        let endpoint = IrohEndpointRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_id.clone(),
+            endpoint_public_key: "iroh_public_key".to_string(),
+            direct_addresses: vec!["203.0.113.10:21356".to_string()],
+            relay_url: Some("https://relay.example".to_string()),
+            relay_mode: IrohRelayMode::Default,
+            expires_after_tick: 50,
+        };
+        let mut store = sinomo_kv::InProcessKvStore::new();
+        store
+            .apply_command(sinomo_kv::KvCommand::Op(
+                IrohKvExchange::put_endpoint(endpoint.clone(), None).expect("endpoint op"),
+            ))
+            .expect("put endpoint");
+
+        let entries = store.range_prefix(&IrohKvExchange::endpoint_prefix(&cluster_id));
+        let parsed = IrohKvExchange::endpoint_from_entry(&entries[0]).expect("endpoint");
+        let cluster_endpoint = parsed.endpoint();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(parsed, endpoint);
+        assert_eq!(cluster_endpoint.node_id, node_id);
+        assert_eq!(cluster_endpoint.transport, ClusterTransportKind::Iroh);
+        assert_eq!(
+            cluster_endpoint.privacy,
+            ClusterEndpointPrivacy::InternetDirect
+        );
+        assert!(
+            cluster_endpoint
+                .address
+                .contains("direct=203.0.113.10:21356")
+        );
+    }
+
+    #[test]
+    fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() {
+        let node_id = NodeId::new("node_mobile").expect("node");
+        let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::WebRtc,
+            address: "webrtc://srflx".to_string(),
+            source: ClusterEndpointSource::Ice,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 60,
+            last_observed_latency_ms: None,
+        })
+        .healthy(35);
+        let turn = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_turn").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::TurnRelay,
+            address: "turn://relay".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 120,
+            last_observed_latency_ms: None,
+        });
+        let selected = RoamingConnectionPlanner::select_path(&[turn.clone(), webrtc.clone()])
+            .expect("roaming path");
+
+        assert!(matches!(
+            selected,
+            RoamingPathSelection::WebRtc(PeerEndpointCandidate { endpoint, .. })
+                if endpoint.address == "webrtc://srflx"
+        ));
+
+        let failed_webrtc = webrtc.failed("ice failed");
+        let fallback =
+            RoamingConnectionPlanner::select_path(&[failed_webrtc, turn]).expect("fallback path");
+
+        assert!(matches!(
+            fallback,
+            RoamingPathSelection::Relay(PeerEndpointCandidate { endpoint, .. })
+                if endpoint.transport == ClusterTransportKind::TurnRelay
+        ));
+    }
+
+    #[test]
+    fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
+        let node_id = NodeId::new("node_mobile").expect("node");
+        let iroh = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_iroh").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://iroh_public_key?relay=https://relay.example".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        });
+        let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::WebRtc,
+            address: "webrtc://srflx".to_string(),
+            source: ClusterEndpointSource::Ice,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 10,
+            last_observed_latency_ms: None,
+        });
+        let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_turn").expect("endpoint"),
+            node_id,
+            transport: ClusterTransportKind::TurnRelay,
+            address: "turn://relay".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 5,
+            last_observed_latency_ms: None,
+        });
+
+        let selected =
+            RoamingConnectionPlanner::select_path(&[relay, webrtc, iroh]).expect("roaming path");
+
+        assert!(matches!(
+            selected,
+            RoamingPathSelection::Iroh(PeerEndpointCandidate { endpoint, .. })
+                if endpoint.transport == ClusterTransportKind::Iroh
+        ));
     }
 
     #[test]

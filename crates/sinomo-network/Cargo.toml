@@ -11,13 +11,17 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "r1"
 
+[features]
+default = []
+iroh-transport = ["dep:iroh"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
+iroh = { version = "0.98.2", optional = true }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }
+sinomo-kv = { path = "../sinomo-kv" }
 sinomo-node = { path = "../sinomo-node" }
-
-[dev-dependencies]
-time.workspace = true

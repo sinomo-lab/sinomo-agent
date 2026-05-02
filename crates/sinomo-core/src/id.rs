@@ -197,6 +197,10 @@ fn validate_open_id(type_name: &'static str, value: &str) -> Result<(), IdError>
 }
 
 define_id!(EventId, "evt_");
+define_id!(ClusterId, "cluster_");
+define_id!(ClusterEndpointId, "endpoint_");
+define_id!(ClusterInviteId, "invite_");
+define_id!(ClusterCertificateId, "cert_");
 define_id!(NodeId, "node_");
 define_id!(DeviceId, "device_");
 define_id!(SessionId, "sess_");
