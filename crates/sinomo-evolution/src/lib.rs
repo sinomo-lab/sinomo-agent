@@ -469,6 +469,149 @@ pub struct CampaignAdaptationRecord {
     pub recorded_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundSchedulingRequest {
+    pub scheduler_service_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub campaigns: Vec<EvolutionCampaign>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_workloads: Vec<ClusterLongHorizonWorkload>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceClassDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_estimates: Vec<ResourceUsageEstimate>,
+    pub max_concurrent_campaigns: usize,
+    pub max_concurrent_workloads: usize,
+    #[serde(default)]
+    pub idle_window_open: bool,
+    #[serde(default)]
+    pub reset_window_open: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    pub now: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterLongHorizonWorkload {
+    pub workload_id: String,
+    pub system: String,
+    pub title: String,
+    pub status: ClusterLongHorizonWorkloadStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_estimates: Vec<ResourceUsageEstimate>,
+    #[serde(default)]
+    pub human_checkpoint_required: bool,
+    #[serde(default)]
+    pub terminal: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum ClusterLongHorizonWorkloadStatus {
+    Ready,
+    Running,
+    PausedBudget,
+    PausedHuman,
+    Complete,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterWorkloadUpdate {
+    pub workload: ClusterLongHorizonWorkload,
+    pub previous_status: ClusterLongHorizonWorkloadStatus,
+    pub action: BackgroundSchedulingAction,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_decisions: Vec<ResourceLeaseDecision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundSchedulingPlan {
+    pub tick_id: String,
+    pub scheduler_service_id: String,
+    pub generated_at: String,
+    pub concurrency_cap: usize,
+    pub workload_concurrency_cap: usize,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_resources_after_tick: Vec<ResourceClassDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub campaigns: Vec<BackgroundCampaignUpdate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_workloads: Vec<ClusterWorkloadUpdate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_campaigns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_campaigns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_workloads: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_workloads: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub human_checkpoints: Vec<HumanCheckpointSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timer_events: Vec<BackgroundTimerEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundCampaignUpdate {
+    pub campaign: EvolutionCampaign,
+    pub previous_status: EvolutionCampaignStatus,
+    pub action: BackgroundSchedulingAction,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_decision: Option<CampaignScheduleDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_iteration: Option<ScheduledIterationPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum BackgroundSchedulingAction {
+    DispatchIterationDryRun,
+    DispatchExternalWorkloadDryRun,
+    ResumeAfterReset,
+    PauseForBudget,
+    HoldHumanCheckpoint,
+    HoldConcurrencyCap,
+    WaitForIdleWindow,
+    NoNearTermTask,
+    IgnoreTerminal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct HumanCheckpointSummary {
+    pub campaign_id: String,
+    pub status: EvolutionCampaignStatus,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_actions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BackgroundTimerEvent {
+    pub event_id: String,
+    pub kind: BackgroundTimerEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_id: Option<String>,
+    pub summary: String,
+    pub due_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum BackgroundTimerEventKind {
+    ResetWindowOpened,
+    IdleWindowOpened,
+    NextTickSuggested,
+    HumanCheckpointRequested,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CampaignTaskReplacementProposal {
     pub title: String,
@@ -744,6 +887,566 @@ pub fn dry_run_resource_scheduler(
         task_decisions,
         next_24h_preview,
         generated_at: now,
+    }
+}
+
+pub fn plan_background_scheduling_tick(
+    request: BackgroundSchedulingRequest,
+) -> BackgroundSchedulingPlan {
+    let now = if request.now.trim().is_empty() {
+        OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown-time".to_string())
+    } else {
+        request.now.clone()
+    };
+    let scheduler_service_id = if request.scheduler_service_id.trim().is_empty() {
+        "sinomo-cluster-scheduler".to_string()
+    } else {
+        request.scheduler_service_id.clone()
+    };
+    let concurrency_cap = request.max_concurrent_campaigns.max(1);
+    let workload_concurrency_cap = request.max_concurrent_workloads.max(concurrency_cap).max(1);
+    let mut shared_resources = if request.reset_window_open {
+        reset_resources_for_background_tick(&request.resources)
+    } else {
+        request.resources.clone()
+    };
+    let mut campaigns = Vec::new();
+    let mut external_workloads = Vec::new();
+    let mut active_campaigns = Vec::new();
+    let mut held_campaigns = Vec::new();
+    let mut active_workloads = Vec::new();
+    let mut held_workloads = Vec::new();
+    let mut human_checkpoints = Vec::new();
+    let mut timer_events = Vec::new();
+
+    if request.reset_window_open {
+        timer_events.push(BackgroundTimerEvent {
+            event_id: generated_id("timer"),
+            kind: BackgroundTimerEventKind::ResetWindowOpened,
+            campaign_id: None,
+            summary: "reset window opened; renewable current-cluster resource usage was refreshed for this scheduling tick".to_string(),
+            due_at: now.clone(),
+        });
+    }
+    if request.idle_window_open {
+        timer_events.push(BackgroundTimerEvent {
+            event_id: generated_id("timer"),
+            kind: BackgroundTimerEventKind::IdleWindowOpened,
+            campaign_id: None,
+            summary:
+                "idle window opened; current-cluster background work may run if policy gates pass"
+                    .to_string(),
+            due_at: now.clone(),
+        });
+    }
+
+    for workload in request.external_workloads {
+        let previous_status = workload.status.clone();
+        let workload_key = cluster_workload_key(&workload);
+        if workload.terminal
+            || matches!(
+                workload.status,
+                ClusterLongHorizonWorkloadStatus::Complete
+                    | ClusterLongHorizonWorkloadStatus::Cancelled
+            )
+        {
+            held_workloads.push(workload_key);
+            external_workloads.push(ClusterWorkloadUpdate {
+                workload,
+                previous_status,
+                action: BackgroundSchedulingAction::IgnoreTerminal,
+                reason: "external workload is terminal and is ignored by the cluster scheduler"
+                    .to_string(),
+                lease_decisions: Vec::new(),
+                evidence_refs: Vec::new(),
+            });
+            continue;
+        }
+        if workload.human_checkpoint_required
+            || matches!(
+                workload.status,
+                ClusterLongHorizonWorkloadStatus::PausedHuman
+            )
+        {
+            let reason = format!(
+                "external workload {} requires a human checkpoint before cluster scheduling can continue",
+                workload_key
+            );
+            held_workloads.push(workload_key.clone());
+            human_checkpoints.push(HumanCheckpointSummary {
+                campaign_id: workload_key.clone(),
+                status: EvolutionCampaignStatus::PausedHuman,
+                reason: reason.clone(),
+                requested_actions: vec!["review external workload budget and policy".to_string()],
+            });
+            timer_events.push(BackgroundTimerEvent {
+                event_id: generated_id("timer"),
+                kind: BackgroundTimerEventKind::HumanCheckpointRequested,
+                campaign_id: Some(workload_key),
+                summary: reason.clone(),
+                due_at: now.clone(),
+            });
+            external_workloads.push(ClusterWorkloadUpdate {
+                workload,
+                previous_status,
+                action: BackgroundSchedulingAction::HoldHumanCheckpoint,
+                reason,
+                lease_decisions: Vec::new(),
+                evidence_refs: Vec::new(),
+            });
+            continue;
+        }
+        if active_workloads.len() >= workload_concurrency_cap {
+            held_workloads.push(workload_key.clone());
+            external_workloads.push(ClusterWorkloadUpdate {
+                workload,
+                previous_status,
+                action: BackgroundSchedulingAction::HoldConcurrencyCap,
+                reason: format!(
+                    "cluster workload concurrency cap {workload_concurrency_cap} is already occupied"
+                ),
+                lease_decisions: Vec::new(),
+                evidence_refs: vec![format!("active workloads: {}", active_workloads.join(", "))],
+            });
+            continue;
+        }
+        if matches!(
+            workload.status,
+            ClusterLongHorizonWorkloadStatus::PausedBudget
+        ) && !(request.reset_window_open || request.idle_window_open)
+        {
+            held_workloads.push(workload_key.clone());
+            external_workloads.push(ClusterWorkloadUpdate {
+                workload,
+                previous_status,
+                action: BackgroundSchedulingAction::WaitForIdleWindow,
+                reason: "external workload is paused for budget until a reset or idle window opens"
+                    .to_string(),
+                lease_decisions: Vec::new(),
+                evidence_refs: Vec::new(),
+            });
+            continue;
+        }
+        if workload.resource_estimates.is_empty() {
+            held_workloads.push(workload_key.clone());
+            external_workloads.push(ClusterWorkloadUpdate {
+                workload,
+                previous_status,
+                action: BackgroundSchedulingAction::NoNearTermTask,
+                reason: "external workload has no resource estimates to schedule".to_string(),
+                lease_decisions: Vec::new(),
+                evidence_refs: Vec::new(),
+            });
+            continue;
+        }
+        let lease_decisions = lease_estimates_against_cluster_resources(
+            &workload_key,
+            &workload.resource_estimates,
+            &shared_resources,
+            &now,
+        );
+        if lease_decisions
+            .iter()
+            .any(|decision| decision.outcome == ResourceLeaseOutcome::Denied)
+        {
+            let mut paused = workload;
+            paused.status = ClusterLongHorizonWorkloadStatus::PausedBudget;
+            held_workloads.push(workload_key);
+            external_workloads.push(ClusterWorkloadUpdate {
+                workload: paused,
+                previous_status,
+                action: BackgroundSchedulingAction::PauseForBudget,
+                reason: "cluster resource scheduler denied at least one external workload lease"
+                    .to_string(),
+                evidence_refs: lease_decisions
+                    .iter()
+                    .map(|decision| format!("{}: {}", decision.decision_id, decision.reason))
+                    .collect(),
+                lease_decisions,
+            });
+            continue;
+        }
+        apply_granted_usage_to_resources(&mut shared_resources, &lease_decisions);
+        let mut running = workload;
+        running.status = ClusterLongHorizonWorkloadStatus::Running;
+        active_workloads.push(workload_key);
+        let mut evidence_refs = running.evidence_refs.clone();
+        evidence_refs.extend(
+            lease_decisions
+                .iter()
+                .map(|decision| format!("{}: {}", decision.decision_id, decision.reason)),
+        );
+        external_workloads.push(ClusterWorkloadUpdate {
+            workload: running,
+            previous_status,
+            action: BackgroundSchedulingAction::DispatchExternalWorkloadDryRun,
+            reason:
+                "cluster scheduler reserved shared budget for an external long-horizon workload"
+                    .to_string(),
+            lease_decisions,
+            evidence_refs,
+        });
+    }
+
+    for campaign in request.campaigns {
+        let previous_status = campaign.status.clone();
+        if is_terminal_campaign_status(&campaign.status) {
+            held_campaigns.push(campaign.campaign_id.clone());
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign,
+                previous_status,
+                action: BackgroundSchedulingAction::IgnoreTerminal,
+                reason: "campaign is terminal and is ignored by the background scheduler"
+                    .to_string(),
+                schedule_decision: None,
+                scheduled_iteration: None,
+                evidence_refs: Vec::new(),
+            });
+            continue;
+        }
+
+        if background_status_requires_human(&campaign.status) {
+            let reason = format!(
+                "human checkpoint required before background scheduling can continue from {:?}",
+                campaign.status
+            );
+            held_campaigns.push(campaign.campaign_id.clone());
+            human_checkpoints.push(HumanCheckpointSummary {
+                campaign_id: campaign.campaign_id.clone(),
+                status: campaign.status.clone(),
+                reason: reason.clone(),
+                requested_actions: campaign.approval_checkpoint.possible_actions.clone(),
+            });
+            timer_events.push(BackgroundTimerEvent {
+                event_id: generated_id("timer"),
+                kind: BackgroundTimerEventKind::HumanCheckpointRequested,
+                campaign_id: Some(campaign.campaign_id.clone()),
+                summary: reason.clone(),
+                due_at: now.clone(),
+            });
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign,
+                previous_status,
+                action: BackgroundSchedulingAction::HoldHumanCheckpoint,
+                reason,
+                schedule_decision: None,
+                scheduled_iteration: None,
+                evidence_refs: Vec::new(),
+            });
+            continue;
+        }
+
+        if active_campaigns.len() >= concurrency_cap
+            || active_workloads.len() >= workload_concurrency_cap
+        {
+            held_campaigns.push(campaign.campaign_id.clone());
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign,
+                previous_status,
+                action: BackgroundSchedulingAction::HoldConcurrencyCap,
+                reason: format!("cluster scheduler concurrency cap is already occupied; campaign cap {concurrency_cap}, workload cap {workload_concurrency_cap}"),
+                schedule_decision: None,
+                scheduled_iteration: None,
+                evidence_refs: vec![
+                    format!("active campaigns: {}", active_campaigns.join(", ")),
+                    format!("active workloads: {}", active_workloads.join(", ")),
+                ],
+            });
+            continue;
+        }
+
+        let mut schedulable_campaign = campaign.clone();
+        if schedulable_campaign.status == EvolutionCampaignStatus::PausedBudget
+            && (request.reset_window_open || request.idle_window_open)
+        {
+            schedulable_campaign.status = EvolutionCampaignStatus::Scheduled;
+        }
+        if !matches!(
+            schedulable_campaign.status,
+            EvolutionCampaignStatus::Approved
+                | EvolutionCampaignStatus::Scheduled
+                | EvolutionCampaignStatus::Running
+        ) {
+            held_campaigns.push(schedulable_campaign.campaign_id.clone());
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign: schedulable_campaign,
+                previous_status,
+                action: BackgroundSchedulingAction::WaitForIdleWindow,
+                reason:
+                    "campaign is not runnable until a reset, idle window, or approval event opens"
+                        .to_string(),
+                schedule_decision: None,
+                scheduled_iteration: None,
+                evidence_refs: Vec::new(),
+            });
+            continue;
+        }
+
+        if schedulable_campaign.near_term_tasks.is_empty() {
+            held_campaigns.push(schedulable_campaign.campaign_id.clone());
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign: schedulable_campaign,
+                previous_status,
+                action: BackgroundSchedulingAction::NoNearTermTask,
+                reason: "campaign has no near-term tasks to dispatch".to_string(),
+                schedule_decision: None,
+                scheduled_iteration: None,
+                evidence_refs: Vec::new(),
+            });
+            continue;
+        }
+
+        let task_estimates = estimates_for_campaign(&request.task_estimates, &schedulable_campaign);
+        let dry_run = dry_run_resource_scheduler(ResourceSchedulerDryRunRequest {
+            campaign: schedulable_campaign.clone(),
+            preview_horizon: "current-cluster background scheduler tick".to_string(),
+            resources: shared_resources.clone(),
+            task_estimates,
+        });
+        if dry_run.aggregate_decision != CampaignScheduleDecision::Scheduled {
+            let mut paused = schedulable_campaign;
+            paused.status = EvolutionCampaignStatus::PausedBudget;
+            held_campaigns.push(paused.campaign_id.clone());
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign: paused,
+                previous_status,
+                action: BackgroundSchedulingAction::PauseForBudget,
+                reason:
+                    "cluster resource scheduler denied at least one lease; campaign stays paused for budget"
+                        .to_string(),
+                schedule_decision: Some(dry_run.aggregate_decision),
+                scheduled_iteration: None,
+                evidence_refs: dry_run
+                    .lease_decisions
+                    .iter()
+                    .map(|decision| format!("{}: {}", decision.decision_id, decision.reason))
+                    .collect(),
+            });
+            continue;
+        }
+
+        apply_granted_usage_to_resources(&mut shared_resources, &dry_run.lease_decisions);
+        let scheduled_iteration = prepare_scheduled_iteration(ScheduledIterationRequest {
+            campaign: schedulable_campaign.clone(),
+            task_id: None,
+            intended_paths: Vec::new(),
+            extra_verification_commands: Vec::new(),
+            dry_run: true,
+        })
+        .ok();
+        if scheduled_iteration.is_some() {
+            active_campaigns.push(schedulable_campaign.campaign_id.clone());
+            active_workloads.push(format!(
+                "sinomo-evolution:{}",
+                schedulable_campaign.campaign_id
+            ));
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign: schedulable_campaign,
+                previous_status,
+                action: BackgroundSchedulingAction::DispatchIterationDryRun,
+                reason: "cluster scheduler prepared one dry-run evolution iteration handoff; no agent was launched"
+                    .to_string(),
+                schedule_decision: Some(dry_run.aggregate_decision),
+                scheduled_iteration,
+                evidence_refs: dry_run
+                    .lease_decisions
+                    .iter()
+                    .map(|decision| format!("{}: {}", decision.decision_id, decision.reason))
+                    .collect(),
+            });
+        } else {
+            held_campaigns.push(schedulable_campaign.campaign_id.clone());
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign: schedulable_campaign,
+                previous_status,
+                action: BackgroundSchedulingAction::NoNearTermTask,
+                reason: "campaign could not prepare an iteration handoff".to_string(),
+                schedule_decision: Some(dry_run.aggregate_decision),
+                scheduled_iteration: None,
+                evidence_refs: Vec::new(),
+            });
+        }
+    }
+
+    timer_events.push(BackgroundTimerEvent {
+        event_id: generated_id("timer"),
+        kind: BackgroundTimerEventKind::NextTickSuggested,
+        campaign_id: None,
+        summary: "next cron-compatible current-cluster scheduler tick should reload all long-horizon work queues and campaign bundles from disk"
+            .to_string(),
+        due_at: "next reset, idle window, or operator-scheduled interval".to_string(),
+    });
+
+    BackgroundSchedulingPlan {
+        tick_id: generated_id("tick"),
+        scheduler_service_id,
+        generated_at: now,
+        concurrency_cap,
+        workload_concurrency_cap,
+        dry_run: request.dry_run,
+        cluster_resources_after_tick: shared_resources,
+        campaigns,
+        external_workloads,
+        active_campaigns,
+        held_campaigns,
+        active_workloads,
+        held_workloads,
+        human_checkpoints,
+        timer_events,
+    }
+}
+
+fn cluster_workload_key(workload: &ClusterLongHorizonWorkload) -> String {
+    format!("{}:{}", workload.system, workload.workload_id)
+}
+
+fn lease_estimates_against_cluster_resources(
+    owner_id: &str,
+    estimates: &[ResourceUsageEstimate],
+    resources: &[ResourceClassDefinition],
+    now: &str,
+) -> Vec<ResourceLeaseDecision> {
+    let mut planned_usage: Vec<(String, u64)> = resources
+        .iter()
+        .map(|resource| (resource.resource_id.clone(), resource.used_units))
+        .collect();
+    let mut decisions = Vec::new();
+    for estimate in estimates {
+        let resource = resource_for_estimate(resources, &estimate.resource);
+        let used_before = planned_usage
+            .iter()
+            .find(|(resource_id, _)| resource_id == &resource.resource_id)
+            .map(|(_, used)| *used)
+            .unwrap_or(resource.used_units);
+        let used_after = used_before.saturating_add(estimate.estimated_units);
+        let reserve_floor_units =
+            reserve_floor_units(resource.total_units, resource.reserve_floor_percent);
+        let spendable_ceiling = resource.total_units.saturating_sub(reserve_floor_units);
+        let (outcome, reason) = if used_after <= spendable_ceiling {
+            if let Some((_, used)) = planned_usage
+                .iter_mut()
+                .find(|(resource_id, _)| resource_id == &resource.resource_id)
+            {
+                *used = used_after;
+            }
+            (
+                ResourceLeaseOutcome::Granted,
+                format!(
+                    "grant: cluster workload {} estimated use {} {} keeps {} at {}/{}; reserve floor remains protected at {}%",
+                    owner_id,
+                    estimate.estimated_units,
+                    resource.unit,
+                    resource.resource_id,
+                    used_after,
+                    resource.total_units,
+                    resource.reserve_floor_percent
+                ),
+            )
+        } else {
+            (
+                ResourceLeaseOutcome::Denied,
+                format!(
+                    "deny: cluster workload {} estimated use {} {} would move {} from {}/{} to {}/{} and violate reserve floor {}%",
+                    owner_id,
+                    estimate.estimated_units,
+                    resource.unit,
+                    resource.resource_id,
+                    used_before,
+                    resource.total_units,
+                    used_after,
+                    resource.total_units,
+                    resource.reserve_floor_percent
+                ),
+            )
+        };
+        decisions.push(ResourceLeaseDecision {
+            decision_id: generated_id("lease_decision"),
+            request_id: generated_id("lease_req"),
+            resource: resource.resource_id.clone(),
+            outcome,
+            reason,
+            reserve_floor_percent: resource.reserve_floor_percent,
+            used_before_units: used_before,
+            estimated_units: estimate.estimated_units,
+            used_after_units: used_after,
+            total_units: resource.total_units,
+            decided_at: now.to_string(),
+        });
+    }
+    decisions
+}
+
+fn reset_resources_for_background_tick(
+    resources: &[ResourceClassDefinition],
+) -> Vec<ResourceClassDefinition> {
+    resources
+        .iter()
+        .cloned()
+        .map(|mut resource| {
+            resource.used_units = 0;
+            resource.notes = format!("{}; reset by background scheduling tick", resource.notes);
+            resource
+        })
+        .collect()
+}
+
+fn is_terminal_campaign_status(status: &EvolutionCampaignStatus) -> bool {
+    matches!(
+        status,
+        EvolutionCampaignStatus::Complete
+            | EvolutionCampaignStatus::Cancelled
+            | EvolutionCampaignStatus::Superseded
+            | EvolutionCampaignStatus::FailedExhausted
+    )
+}
+
+fn background_status_requires_human(status: &EvolutionCampaignStatus) -> bool {
+    matches!(
+        status,
+        EvolutionCampaignStatus::AwaitingApproval
+            | EvolutionCampaignStatus::PausedHuman
+            | EvolutionCampaignStatus::PausedPolicy
+            | EvolutionCampaignStatus::StageComplete
+    )
+}
+
+fn estimates_for_campaign(
+    estimates: &[ResourceUsageEstimate],
+    campaign: &EvolutionCampaign,
+) -> Vec<ResourceUsageEstimate> {
+    let task_ids: Vec<&str> = campaign
+        .near_term_tasks
+        .iter()
+        .map(|task| task.task_id.as_str())
+        .collect();
+    let matching: Vec<ResourceUsageEstimate> = estimates
+        .iter()
+        .filter(|estimate| task_ids.iter().any(|task_id| *task_id == estimate.task_id))
+        .cloned()
+        .collect();
+    if matching.is_empty() {
+        Vec::new()
+    } else {
+        matching
+    }
+}
+
+fn apply_granted_usage_to_resources(
+    resources: &mut [ResourceClassDefinition],
+    decisions: &[ResourceLeaseDecision],
+) {
+    for decision in decisions
+        .iter()
+        .filter(|decision| decision.outcome == ResourceLeaseOutcome::Granted)
+    {
+        if let Some(resource) = resources
+            .iter_mut()
+            .find(|resource| resource.resource_id == decision.resource)
+        {
+            resource.used_units = decision.used_after_units;
+        }
     }
 }
 
@@ -3701,6 +4404,234 @@ mod tests {
             update.stage_scorecard.promotion,
             StagePromotionDecision::HoldFailed
         );
+    }
+
+    #[test]
+    fn background_scheduler_resumes_budget_paused_campaign_after_reset() {
+        let mut campaign = sample_approved_campaign("make campaign scheduling durable");
+        campaign.status = EvolutionCampaignStatus::PausedBudget;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: vec![campaign.clone()],
+            external_workloads: Vec::new(),
+            resources: vec![ResourceClassDefinition {
+                resource_id: "coding-plan-weekly".to_string(),
+                unit: "percent".to_string(),
+                total_units: 100,
+                used_units: 95,
+                reserve_floor_percent: 30,
+                reset_window: "weekly".to_string(),
+                notes: "before reset this campaign would be paused".to_string(),
+            }],
+            task_estimates: vec![ResourceUsageEstimate {
+                task_id: task_id.clone(),
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: None,
+            }],
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: false,
+            reset_window_open: true,
+            dry_run: true,
+            now: "2026-05-02T00:00:00Z".to_string(),
+        });
+
+        assert_eq!(plan.concurrency_cap, 1);
+        assert_eq!(plan.active_campaigns, vec![campaign.campaign_id.clone()]);
+        assert_eq!(
+            plan.campaigns[0].previous_status,
+            EvolutionCampaignStatus::PausedBudget
+        );
+        assert_eq!(
+            plan.campaigns[0].action,
+            BackgroundSchedulingAction::DispatchIterationDryRun
+        );
+        assert_eq!(
+            plan.campaigns[0].campaign.status,
+            EvolutionCampaignStatus::Scheduled
+        );
+        assert!(plan.campaigns[0].scheduled_iteration.is_some());
+        assert!(plan.timer_events.iter().any(|event| {
+            event.kind == BackgroundTimerEventKind::ResetWindowOpened
+                && event.summary.contains("reset window opened")
+        }));
+    }
+
+    #[test]
+    fn background_scheduler_budgets_external_workloads_and_evolution_campaigns_together() {
+        let mut campaign = sample_approved_campaign("share scheduler budget with other systems");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: vec![campaign.clone()],
+            external_workloads: vec![ClusterLongHorizonWorkload {
+                workload_id: "backup-index-01".to_string(),
+                system: "backup".to_string(),
+                title: "index archive snapshots".to_string(),
+                status: ClusterLongHorizonWorkloadStatus::Ready,
+                resource_estimates: vec![ResourceUsageEstimate {
+                    task_id: "backup-index-01".to_string(),
+                    resource: "cluster-background-hours".to_string(),
+                    estimated_units: 50,
+                    actual_units: None,
+                }],
+                human_checkpoint_required: false,
+                terminal: false,
+                evidence_refs: vec!["backup/schedule.json".to_string()],
+            }],
+            resources: vec![ResourceClassDefinition {
+                resource_id: "cluster-background-hours".to_string(),
+                unit: "hours".to_string(),
+                total_units: 100,
+                used_units: 0,
+                reserve_floor_percent: 30,
+                reset_window: "daily".to_string(),
+                notes: "cluster-level budget shared across long-horizon systems".to_string(),
+            }],
+            task_estimates: vec![ResourceUsageEstimate {
+                task_id: task_id.clone(),
+                resource: "cluster-background-hours".to_string(),
+                estimated_units: 30,
+                actual_units: None,
+            }],
+            max_concurrent_campaigns: 4,
+            max_concurrent_workloads: 4,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T00:20:00Z".to_string(),
+        });
+
+        assert_eq!(plan.scheduler_service_id, "sinomo-cluster-scheduler");
+        assert_eq!(
+            plan.external_workloads[0].action,
+            BackgroundSchedulingAction::DispatchExternalWorkloadDryRun
+        );
+        assert_eq!(
+            plan.campaigns[0].action,
+            BackgroundSchedulingAction::PauseForBudget
+        );
+        assert_eq!(
+            plan.campaigns[0].campaign.status,
+            EvolutionCampaignStatus::PausedBudget
+        );
+        let cluster_resource = plan
+            .cluster_resources_after_tick
+            .iter()
+            .find(|resource| resource.resource_id == "cluster-background-hours")
+            .expect("cluster resource");
+        assert_eq!(cluster_resource.used_units, 50);
+        assert!(
+            plan.active_workloads
+                .contains(&"backup:backup-index-01".to_string())
+        );
+        assert!(plan.held_campaigns.contains(&campaign.campaign_id));
+    }
+
+    #[test]
+    fn background_scheduler_holds_external_workloads_at_human_checkpoints() {
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: Vec::new(),
+            external_workloads: vec![ClusterLongHorizonWorkload {
+                workload_id: "dataset-curation-42".to_string(),
+                system: "memory".to_string(),
+                title: "curate high-salience session memory".to_string(),
+                status: ClusterLongHorizonWorkloadStatus::PausedHuman,
+                resource_estimates: vec![ResourceUsageEstimate {
+                    task_id: "dataset-curation-42".to_string(),
+                    resource: "cluster-background-hours".to_string(),
+                    estimated_units: 5,
+                    actual_units: None,
+                }],
+                human_checkpoint_required: true,
+                terminal: false,
+                evidence_refs: Vec::new(),
+            }],
+            resources: vec![ResourceClassDefinition {
+                resource_id: "cluster-background-hours".to_string(),
+                unit: "hours".to_string(),
+                total_units: 100,
+                used_units: 0,
+                reserve_floor_percent: 30,
+                reset_window: "daily".to_string(),
+                notes: "cluster-level budget".to_string(),
+            }],
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: 4,
+            max_concurrent_workloads: 4,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T00:25:00Z".to_string(),
+        });
+
+        assert_eq!(
+            plan.external_workloads[0].action,
+            BackgroundSchedulingAction::HoldHumanCheckpoint
+        );
+        assert!(
+            plan.held_workloads
+                .contains(&"memory:dataset-curation-42".to_string())
+        );
+        assert!(plan.human_checkpoints.iter().any(|checkpoint| {
+            checkpoint.campaign_id == "memory:dataset-curation-42"
+                && checkpoint.reason.contains("external workload")
+        }));
+    }
+
+    #[test]
+    fn background_scheduler_honors_concurrency_cap_and_human_checkpoints() {
+        let mut first = sample_approved_campaign("run first background campaign");
+        first.status = EvolutionCampaignStatus::Scheduled;
+        let mut second = sample_approved_campaign("hold second background campaign");
+        second.status = EvolutionCampaignStatus::Scheduled;
+        let mut checkpoint = sample_approved_campaign("wait for human checkpoint");
+        checkpoint.status = EvolutionCampaignStatus::StageComplete;
+        let first_id = first.campaign_id.clone();
+        let second_id = second.campaign_id.clone();
+        let checkpoint_id = checkpoint.campaign_id.clone();
+
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: vec![first, second, checkpoint],
+            external_workloads: Vec::new(),
+            resources: vec![ResourceClassDefinition {
+                resource_id: "coding-plan-weekly".to_string(),
+                unit: "percent".to_string(),
+                total_units: 100,
+                used_units: 0,
+                reserve_floor_percent: 30,
+                reset_window: "weekly".to_string(),
+                notes: "test budget".to_string(),
+            }],
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T00:10:00Z".to_string(),
+        });
+
+        assert_eq!(plan.active_campaigns, vec![first_id]);
+        assert!(plan.held_campaigns.contains(&second_id));
+        assert!(plan.human_checkpoints.iter().any(|checkpoint| {
+            checkpoint.campaign_id == checkpoint_id
+                && checkpoint.reason.contains("human checkpoint")
+        }));
+        let held = plan
+            .campaigns
+            .iter()
+            .find(|update| update.campaign.campaign_id == second_id)
+            .expect("held campaign update");
+        assert_eq!(held.action, BackgroundSchedulingAction::HoldConcurrencyCap);
+        assert!(held.scheduled_iteration.is_none());
     }
 
     fn sample_approved_campaign(objective: &str) -> EvolutionCampaign {

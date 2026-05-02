@@ -3,15 +3,17 @@
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
+    BackgroundSchedulingPlan, BackgroundSchedulingRequest,
     CampaignDecision as EvolutionCampaignDecision, CampaignDecisionKind, CampaignProposalRequest,
-    CampaignScheduleDecision, CandidateWorkspace, EvolutionCampaign, EvolutionCampaignStatus,
+    CampaignScheduleDecision, CandidateWorkspace, ClusterLongHorizonWorkload,
+    ClusterLongHorizonWorkloadStatus, EvolutionCampaign, EvolutionCampaignStatus,
     EvolutionFailureClass, EvolutionOrchestrator, EvolutionReport, EvolutionRequest,
     GitWorkspaceAdapter, LanguageModelMutationBridge, LocalCandidateBundleStore, MutationModel,
     MutationModelError, ReserveFloor, ResourceClassDefinition, ResourceSchedulerDryRun,
     ResourceSchedulerDryRunRequest, ResourceUsageEstimate, ScheduledIterationPlan,
     ScheduledIterationRequest, StageEvaluationRequest, StageEvaluationUpdate,
-    dry_run_resource_scheduler, evaluate_campaign_stage, prepare_scheduled_iteration,
-    propose_evolution_campaign,
+    dry_run_resource_scheduler, evaluate_campaign_stage, plan_background_scheduling_tick,
+    prepare_scheduled_iteration, propose_evolution_campaign,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -2044,6 +2046,33 @@ impl EvolutionPaths {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct BackgroundSchedulerPaths {
+    root: PathBuf,
+    plan_json: PathBuf,
+    status_json: PathBuf,
+    events_jsonl: PathBuf,
+}
+
+impl BackgroundSchedulerPaths {
+    fn new(paths: &EvolutionPaths) -> Self {
+        let root = paths.root.join("background-scheduler");
+        Self {
+            plan_json: root.join("scheduler-plan.json"),
+            status_json: root.join("background-status.json"),
+            events_jsonl: root.join("scheduler-events.jsonl"),
+            root,
+        }
+    }
+
+    fn ensure(&self) -> Result<(), CliError> {
+        fs::create_dir_all(&self.root).map_err(|source| CliError::Io {
+            path: self.root.display().to_string(),
+            detail: source.to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CampaignBundlePaths {
     root: PathBuf,
     campaign_json: PathBuf,
@@ -2100,6 +2129,7 @@ enum EvolveCliCommand {
     Schedule(Vec<String>),
     Iterate(Vec<String>),
     Evaluate(Vec<String>),
+    Tick(Vec<String>),
     Decide(CandidateDecisionOutcome, Vec<String>),
     Status(Vec<String>),
     Show(Vec<String>),
@@ -2127,6 +2157,9 @@ fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, CliError> {
         }
         Some((command, rest)) if command == "evaluate" => {
             Ok(EvolveCliCommand::Evaluate(rest.to_vec()))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "tick" | "run-background") => {
+            Ok(EvolveCliCommand::Tick(rest.to_vec()))
         }
         Some((command, rest)) if command == "approve" => Ok(EvolveCliCommand::Decide(
             CandidateDecisionOutcome::Approved,
@@ -2170,6 +2203,7 @@ fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), CliError> {
         EvolveCliCommand::Schedule(args) => evolve_schedule(&args),
         EvolveCliCommand::Iterate(args) => evolve_iterate(&args),
         EvolveCliCommand::Evaluate(args) => evolve_evaluate(&args),
+        EvolveCliCommand::Tick(args) => evolve_tick(&args),
         EvolveCliCommand::Decide(outcome, args) => evolve_decide(&args, outcome),
         EvolveCliCommand::Status(args) => evolve_status(&args),
         EvolveCliCommand::Show(args) => evolve_show(&args),
@@ -2378,6 +2412,43 @@ fn evolve_evaluate(args: &[String]) -> Result<(), CliError> {
     });
     let bundle = write_campaign_stage_evaluation(&paths, &update)?;
     println_stage_evaluation(&update, &bundle);
+    Ok(())
+}
+
+fn evolve_tick(args: &[String]) -> Result<(), CliError> {
+    let options = parse_background_tick_options(args)?;
+    if !options.dry_run {
+        return Err(CliError::Usage);
+    }
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = EvolutionPaths::new(&data_dir);
+    paths.ensure()?;
+    let campaigns = read_background_tick_campaigns(&paths, &options.campaign_ids)?;
+    let external_workloads = parse_background_tick_external_workloads(
+        &options.external_workloads,
+        &options.external_workload_estimates,
+        &options.external_human_checkpoints,
+    )?;
+    let resources = parse_background_tick_resources(&options.resources, &campaigns)?;
+    let task_estimates = parse_background_tick_estimates(&options.estimates, &campaigns)?;
+    let now = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+        scheduler_service_id: options.scheduler_service_id,
+        campaigns,
+        external_workloads,
+        resources,
+        task_estimates,
+        max_concurrent_campaigns: options.max_concurrent_campaigns,
+        max_concurrent_workloads: options.max_concurrent_workloads,
+        idle_window_open: options.idle_window_open,
+        reset_window_open: options.reset_window_open,
+        dry_run: true,
+        now,
+    });
+    let background_paths = write_background_scheduling_plan(&paths, &plan)?;
+    println_background_tick(&plan, &background_paths);
     Ok(())
 }
 
@@ -3302,6 +3373,22 @@ struct ScheduleOptions {
 }
 
 #[derive(Clone, Debug)]
+struct BackgroundTickOptions {
+    scheduler_service_id: String,
+    campaign_ids: Vec<String>,
+    external_workloads: Vec<String>,
+    external_workload_estimates: Vec<String>,
+    external_human_checkpoints: Vec<String>,
+    resources: Vec<String>,
+    estimates: Vec<String>,
+    max_concurrent_campaigns: usize,
+    max_concurrent_workloads: usize,
+    idle_window_open: bool,
+    reset_window_open: bool,
+    dry_run: bool,
+}
+
+#[derive(Clone, Debug)]
 struct IterationOptions {
     campaign_id: String,
     task_id: Option<String>,
@@ -3536,6 +3623,146 @@ fn parse_iteration_options(args: &[String]) -> Result<IterationOptions, CliError
     })
 }
 
+fn parse_background_tick_options(args: &[String]) -> Result<BackgroundTickOptions, CliError> {
+    let mut scheduler_service_id = "sinomo-cluster-scheduler".to_string();
+    let mut campaign_ids = Vec::new();
+    let mut external_workloads = Vec::new();
+    let mut external_workload_estimates = Vec::new();
+    let mut external_human_checkpoints = Vec::new();
+    let mut resources = Vec::new();
+    let mut estimates = Vec::new();
+    let mut max_concurrent_campaigns = 1usize;
+    let mut max_concurrent_workloads = 1usize;
+    let mut idle_window_open = false;
+    let mut reset_window_open = false;
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--cluster" | "--cluster-id" => {
+                return Err(CliError::Parse {
+                    detail: "cluster identifiers are not supported; scheduler operations always target the current cluster".to_string(),
+                });
+            }
+            "--scheduler-service" | "--scheduler-service-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                if value.trim().is_empty() {
+                    return Err(CliError::Parse {
+                        detail: "scheduler service id must not be empty".to_string(),
+                    });
+                }
+                scheduler_service_id = value.clone();
+            }
+            "--campaign" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    campaign_ids.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--workload" | "--external-workload" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    external_workloads.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--workload-estimate" | "--external-estimate" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    external_workload_estimates.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--workload-human-checkpoint" | "--external-human-checkpoint" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    external_human_checkpoints.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--resource" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    resources.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--estimate" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    estimates.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--max-concurrent" | "--max-concurrent-campaigns" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                max_concurrent_campaigns =
+                    value.parse::<usize>().map_err(|source| CliError::Parse {
+                        detail: format!(
+                            "invalid max concurrent campaign count `{value}`: {source}"
+                        ),
+                    })?;
+                if max_concurrent_campaigns == 0 {
+                    return Err(CliError::Parse {
+                        detail: "max concurrent campaign count must be at least 1".to_string(),
+                    });
+                }
+                max_concurrent_workloads = max_concurrent_workloads.max(max_concurrent_campaigns);
+            }
+            "--max-concurrent-workloads" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                max_concurrent_workloads =
+                    value.parse::<usize>().map_err(|source| CliError::Parse {
+                        detail: format!(
+                            "invalid max concurrent workload count `{value}`: {source}"
+                        ),
+                    })?;
+                if max_concurrent_workloads == 0 {
+                    return Err(CliError::Parse {
+                        detail: "max concurrent workload count must be at least 1".to_string(),
+                    });
+                }
+            }
+            "--idle-window-open" => idle_window_open = true,
+            "--reset-window-open" => reset_window_open = true,
+            "--dry-run" | "--preview" => dry_run = true,
+            value if value.starts_with("--") => return Err(CliError::Usage),
+            value => campaign_ids.push(value.to_string()),
+        }
+        index += 1;
+    }
+    Ok(BackgroundTickOptions {
+        scheduler_service_id,
+        campaign_ids,
+        external_workloads,
+        external_workload_estimates,
+        external_human_checkpoints,
+        resources,
+        estimates,
+        max_concurrent_campaigns,
+        max_concurrent_workloads,
+        idle_window_open,
+        reset_window_open,
+        dry_run,
+    })
+}
+
 fn parse_schedule_options(args: &[String]) -> Result<ScheduleOptions, CliError> {
     let mut campaign_id = None;
     let mut resources = Vec::new();
@@ -3601,6 +3828,94 @@ fn parse_schedule_resources(
     values
         .iter()
         .map(|value| parse_schedule_resource(value, campaign))
+        .collect()
+}
+
+fn parse_background_tick_resources(
+    values: &[String],
+    campaigns: &[EvolutionCampaign],
+) -> Result<Vec<ResourceClassDefinition>, CliError> {
+    if values.is_empty() {
+        let mut resources = Vec::new();
+        for campaign in campaigns {
+            for floor in &campaign.budget_policy.reserve_floors {
+                if let Some(resource) =
+                    resources
+                        .iter_mut()
+                        .find(|resource: &&mut ResourceClassDefinition| {
+                            resource.resource_id == floor.resource
+                        })
+                {
+                    resource.reserve_floor_percent =
+                        resource.reserve_floor_percent.max(floor.floor_percent);
+                } else {
+                    resources.push(ResourceClassDefinition {
+                        resource_id: floor.resource.clone(),
+                        unit: "percent".to_string(),
+                        total_units: 100,
+                        used_units: 0,
+                        reserve_floor_percent: floor.floor_percent,
+                        reset_window: "current reset window".to_string(),
+                        notes: "derived from background campaign reserve floors".to_string(),
+                    });
+                }
+            }
+        }
+        return Ok(resources);
+    }
+    let fallback = campaigns
+        .first()
+        .cloned()
+        .unwrap_or_else(|| EvolutionCampaign {
+            campaign_id: "background_tick".to_string(),
+            status: EvolutionCampaignStatus::Scheduled,
+            objective_card: sinomo_evolution::ObjectiveCard {
+                objective_id: "objective_background_tick".to_string(),
+                human_text: "background scheduler tick".to_string(),
+                interpreted_goal: "background scheduler tick".to_string(),
+                non_goals: Vec::new(),
+                assumptions: Vec::new(),
+                constraints: Vec::new(),
+                success_metrics: Vec::new(),
+                failure_conditions: Vec::new(),
+                safety_notes: Vec::new(),
+                resource_policy: "background".to_string(),
+                approval_policy: "manual-only".to_string(),
+                initial_horizon: "24h".to_string(),
+                assumptions_needing_human_review: Vec::new(),
+            },
+            stages: Vec::new(),
+            near_term_tasks: Vec::new(),
+            iteration_results: Vec::new(),
+            decisions: Vec::new(),
+            budget_policy: sinomo_evolution::CampaignBudgetPolicy {
+                policy_id: "background".to_string(),
+                reserve_floors: Vec::new(),
+                scheduling_notes: Vec::new(),
+                confidence: "unknown".to_string(),
+                debt_note: "unknown".to_string(),
+            },
+            resource_schedule_preview: sinomo_evolution::ResourceSchedulePreview {
+                horizon: "24h".to_string(),
+                entries: Vec::new(),
+            },
+            approval_checkpoint: sinomo_evolution::ApprovalCheckpoint {
+                policy: "manual-only".to_string(),
+                status: sinomo_evolution::ApprovalCheckpointStatus::Approved,
+                required_before: "background tick".to_string(),
+                editable_fields: Vec::new(),
+                possible_actions: Vec::new(),
+            },
+            target_ring: TrustRing::R1TrustedRuntime,
+            dry_run: true,
+            capability_registry_required: Some(false),
+            created_at: "unknown-time".to_string(),
+            updated_at: "unknown-time".to_string(),
+            source_repo: None,
+        });
+    values
+        .iter()
+        .map(|value| parse_schedule_resource(value, &fallback))
         .collect()
 }
 
@@ -3675,6 +3990,24 @@ fn parse_schedule_estimates(
     values
         .iter()
         .map(|value| parse_schedule_estimate(value, campaign))
+        .collect()
+}
+
+fn parse_background_tick_estimates(
+    values: &[String],
+    campaigns: &[EvolutionCampaign],
+) -> Result<Vec<ResourceUsageEstimate>, CliError> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(first_campaign) = campaigns.first() else {
+        return Err(CliError::Parse {
+            detail: "background estimates need at least one campaign".to_string(),
+        });
+    };
+    values
+        .iter()
+        .map(|value| parse_schedule_estimate(value, first_campaign))
         .collect()
 }
 
@@ -4233,6 +4566,297 @@ fn write_campaign_stage_evaluation(
     Ok(bundle)
 }
 
+fn write_background_scheduling_plan(
+    paths: &EvolutionPaths,
+    plan: &BackgroundSchedulingPlan,
+) -> Result<BackgroundSchedulerPaths, CliError> {
+    let background_paths = BackgroundSchedulerPaths::new(paths);
+    background_paths.ensure()?;
+    write_json(&background_paths.plan_json, plan)?;
+    write_json(&background_paths.status_json, plan)?;
+    for event in &plan.timer_events {
+        append_jsonl(&background_paths.events_jsonl, event)?;
+    }
+    for update in &plan.campaigns {
+        let mut campaign = update.campaign.clone();
+        campaign.updated_at = plan.generated_at.clone();
+        campaign
+            .decisions
+            .push(background_campaign_decision(plan, update));
+        let bundle = write_campaign_bundle(paths, &campaign)?;
+        if let Some(iteration) = &update.scheduled_iteration {
+            write_json(&bundle.iteration_plan_json, iteration)?;
+            write_json(&bundle.iteration_request_json, &iteration.evolution_request)?;
+            append_jsonl(&bundle.iteration_dispatches_jsonl, iteration)?;
+        }
+    }
+    Ok(background_paths)
+}
+
+fn background_campaign_decision(
+    plan: &BackgroundSchedulingPlan,
+    update: &sinomo_evolution::BackgroundCampaignUpdate,
+) -> EvolutionCampaignDecision {
+    let kind = match update.action {
+        sinomo_evolution::BackgroundSchedulingAction::PauseForBudget => {
+            CampaignDecisionKind::Paused
+        }
+        sinomo_evolution::BackgroundSchedulingAction::DispatchIterationDryRun
+            if matches!(
+                update.previous_status,
+                EvolutionCampaignStatus::PausedBudget
+            ) =>
+        {
+            CampaignDecisionKind::Resumed
+        }
+        sinomo_evolution::BackgroundSchedulingAction::DispatchIterationDryRun => {
+            CampaignDecisionKind::TaskSelected
+        }
+        sinomo_evolution::BackgroundSchedulingAction::HoldHumanCheckpoint => {
+            CampaignDecisionKind::Paused
+        }
+        _ => CampaignDecisionKind::ResourcePolicySelected,
+    };
+    EvolutionCampaignDecision {
+        decision_id: format!("decision_{}", update.campaign.decisions.len() + 1),
+        kind,
+        summary: format!("Background scheduler action: {:?}", update.action),
+        rationale: update.reason.clone(),
+        evidence_refs: vec![
+            "background-scheduler/scheduler-plan.json".to_string(),
+            "background-scheduler/scheduler-events.jsonl".to_string(),
+        ],
+        decided_by: "sinomo evolve tick --dry-run".to_string(),
+        decided_at: plan.generated_at.clone(),
+    }
+}
+
+fn read_background_tick_campaigns(
+    paths: &EvolutionPaths,
+    campaign_ids: &[String],
+) -> Result<Vec<EvolutionCampaign>, CliError> {
+    if !campaign_ids.is_empty() {
+        return campaign_ids
+            .iter()
+            .map(|campaign_id| read_campaign(paths, campaign_id))
+            .collect();
+    }
+    let mut campaigns = Vec::new();
+    if !paths.campaigns.exists() {
+        return Ok(campaigns);
+    }
+    let entries = fs::read_dir(&paths.campaigns).map_err(|source| CliError::Io {
+        path: paths.campaigns.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| CliError::Io {
+            path: paths.campaigns.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let path = entry.path().join("campaign.json");
+        if path.exists() {
+            let content = fs::read_to_string(&path).map_err(|source| CliError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            campaigns.push(
+                serde_json::from_str(&content).map_err(|source| CliError::Json {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                })?,
+            );
+        }
+    }
+    campaigns.sort_by(|left: &EvolutionCampaign, right: &EvolutionCampaign| {
+        left.campaign_id.cmp(&right.campaign_id)
+    });
+    Ok(campaigns)
+}
+
+fn parse_background_tick_external_workloads(
+    workload_specs: &[String],
+    estimate_specs: &[String],
+    checkpoint_specs: &[String],
+) -> Result<Vec<ClusterLongHorizonWorkload>, CliError> {
+    let mut workloads = Vec::new();
+    for spec in workload_specs {
+        let workload = parse_external_workload_spec(spec)?;
+        if workloads
+            .iter()
+            .any(|existing: &ClusterLongHorizonWorkload| {
+                existing.system == workload.system && existing.workload_id == workload.workload_id
+            })
+        {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "duplicate external workload `{}`",
+                    external_workload_key(&workload)
+                ),
+            });
+        }
+        workloads.push(workload);
+    }
+    for spec in estimate_specs {
+        let (system, workload_id, estimate) = parse_external_workload_estimate(spec)?;
+        let workload = ensure_external_workload(&mut workloads, &system, &workload_id);
+        workload.resource_estimates.push(estimate);
+    }
+    for spec in checkpoint_specs {
+        let (system, workload_id) = parse_external_workload_key(spec)?;
+        let workload = ensure_external_workload(&mut workloads, &system, &workload_id);
+        workload.human_checkpoint_required = true;
+        if workload.status == ClusterLongHorizonWorkloadStatus::Ready {
+            workload.status = ClusterLongHorizonWorkloadStatus::PausedHuman;
+        }
+    }
+    Ok(workloads)
+}
+
+fn ensure_external_workload<'a>(
+    workloads: &'a mut Vec<ClusterLongHorizonWorkload>,
+    system: &str,
+    workload_id: &str,
+) -> &'a mut ClusterLongHorizonWorkload {
+    if let Some(index) = workloads
+        .iter()
+        .position(|workload| workload.system == system && workload.workload_id == workload_id)
+    {
+        return &mut workloads[index];
+    }
+    workloads.push(ClusterLongHorizonWorkload {
+        workload_id: workload_id.to_string(),
+        system: system.to_string(),
+        title: workload_id.to_string(),
+        status: ClusterLongHorizonWorkloadStatus::Ready,
+        resource_estimates: Vec::new(),
+        human_checkpoint_required: false,
+        terminal: false,
+        evidence_refs: Vec::new(),
+    });
+    workloads
+        .last_mut()
+        .expect("just inserted external workload")
+}
+
+fn parse_external_workload_spec(value: &str) -> Result<ClusterLongHorizonWorkload, CliError> {
+    let parts: Vec<&str> = value.splitn(4, ':').collect();
+    let [system, workload_id, status, title] = match parts.as_slice() {
+        [system, workload_id, status] => [*system, *workload_id, *status, *workload_id],
+        [system, workload_id, status, title] => [*system, *workload_id, *status, *title],
+        _ => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "external workload `{value}` must look like system:workload_id:status[:title]"
+                ),
+            });
+        }
+    };
+    if system.trim().is_empty() || workload_id.trim().is_empty() {
+        return Err(CliError::Parse {
+            detail: format!("external workload `{value}` needs non-empty system and workload id"),
+        });
+    }
+    let status = parse_external_workload_status(status)?;
+    let terminal = matches!(
+        status,
+        ClusterLongHorizonWorkloadStatus::Complete | ClusterLongHorizonWorkloadStatus::Cancelled
+    );
+    Ok(ClusterLongHorizonWorkload {
+        workload_id: workload_id.trim().to_string(),
+        system: system.trim().to_string(),
+        title: title.trim().to_string(),
+        status,
+        resource_estimates: Vec::new(),
+        human_checkpoint_required: false,
+        terminal,
+        evidence_refs: vec!["sinomo evolve tick external workload input".to_string()],
+    })
+}
+
+fn parse_external_workload_estimate(
+    value: &str,
+) -> Result<(String, String, ResourceUsageEstimate), CliError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let [system, workload_id, resource, units] = match parts.as_slice() {
+        [system, workload_id, resource, units] => [*system, *workload_id, *resource, *units],
+        _ => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "external workload estimate `{value}` must look like system:workload_id:resource:units"
+                ),
+            });
+        }
+    };
+    if system.trim().is_empty() || workload_id.trim().is_empty() || resource.trim().is_empty() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "external workload estimate `{value}` needs non-empty system, workload id, and resource"
+            ),
+        });
+    }
+    let estimated_units = units
+        .trim()
+        .parse::<u64>()
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid external workload estimate `{value}`: {source}"),
+        })?;
+    Ok((
+        system.trim().to_string(),
+        workload_id.trim().to_string(),
+        ResourceUsageEstimate {
+            task_id: workload_id.trim().to_string(),
+            resource: resource.trim().to_string(),
+            estimated_units,
+            actual_units: None,
+        },
+    ))
+}
+
+fn parse_external_workload_key(value: &str) -> Result<(String, String), CliError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let [system, workload_id] = match parts.as_slice() {
+        [system, workload_id] => [*system, *workload_id],
+        _ => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "external workload key `{value}` must look like system:workload_id"
+                ),
+            });
+        }
+    };
+    if system.trim().is_empty() || workload_id.trim().is_empty() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "external workload key `{value}` needs non-empty system and workload id"
+            ),
+        });
+    }
+    Ok((system.trim().to_string(), workload_id.trim().to_string()))
+}
+
+fn parse_external_workload_status(
+    value: &str,
+) -> Result<ClusterLongHorizonWorkloadStatus, CliError> {
+    match value {
+        "ready" => Ok(ClusterLongHorizonWorkloadStatus::Ready),
+        "running" => Ok(ClusterLongHorizonWorkloadStatus::Running),
+        "paused-budget" => Ok(ClusterLongHorizonWorkloadStatus::PausedBudget),
+        "paused-human" => Ok(ClusterLongHorizonWorkloadStatus::PausedHuman),
+        "complete" => Ok(ClusterLongHorizonWorkloadStatus::Complete),
+        "cancelled" | "canceled" => Ok(ClusterLongHorizonWorkloadStatus::Cancelled),
+        _ => Err(CliError::Parse {
+            detail: format!(
+                "unknown external workload status `{value}`; expected ready, running, paused-budget, paused-human, complete, or cancelled"
+            ),
+        }),
+    }
+}
+
+fn external_workload_key(workload: &ClusterLongHorizonWorkload) -> String {
+    format!("{}:{}", workload.system, workload.workload_id)
+}
+
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::Io {
@@ -4376,6 +5000,47 @@ fn println_stage_evaluation(update: &StageEvaluationUpdate, bundle: &CampaignBun
     if update.adaptation.is_some() {
         println!("adaptation: {}", bundle.adaptation_json.display());
         println!("adaptations: {}", bundle.adaptations_jsonl.display());
+    }
+}
+
+fn println_background_tick(plan: &BackgroundSchedulingPlan, paths: &BackgroundSchedulerPaths) {
+    println!("background tick: {}", plan.tick_id);
+    println!("scheduler service: {}", plan.scheduler_service_id);
+    println!("dry run: {}", plan.dry_run);
+    println!("campaign concurrency cap: {}", plan.concurrency_cap);
+    println!(
+        "workload concurrency cap: {}",
+        plan.workload_concurrency_cap
+    );
+    println!(
+        "cluster resources: {}",
+        plan.cluster_resources_after_tick.len()
+    );
+    println!("campaign updates: {}", plan.campaigns.len());
+    println!(
+        "external workload updates: {}",
+        plan.external_workloads.len()
+    );
+    println!("active campaigns: {}", plan.active_campaigns.len());
+    println!("held campaigns: {}", plan.held_campaigns.len());
+    println!("active workloads: {}", plan.active_workloads.len());
+    println!("held workloads: {}", plan.held_workloads.len());
+    println!("human checkpoints: {}", plan.human_checkpoints.len());
+    println!("timer events: {}", plan.timer_events.len());
+    println!("scheduler plan: {}", paths.plan_json.display());
+    println!("scheduler status: {}", paths.status_json.display());
+    println!("scheduler events: {}", paths.events_jsonl.display());
+    for update in &plan.campaigns {
+        println!(
+            "campaign {}: {:?} ({})",
+            update.campaign.campaign_id, update.action, update.reason
+        );
+    }
+    for update in &plan.external_workloads {
+        println!(
+            "workload {}:{}: {:?} ({})",
+            update.workload.system, update.workload.workload_id, update.action, update.reason
+        );
     }
 }
 
@@ -5052,6 +5717,12 @@ fn print_evolve_help() {
     println!(
         "      Write phase-3 stage scorecard/adaptation artifacts and update campaign state after candidate evaluation."
     );
+    println!(
+        "  sinomo evolve tick --dry-run [--scheduler-service <service_id>] [--campaign <campaign>] [--workload <system:id:status[:title]>] [--workload-estimate <system:id:resource:units>] [--resource <resource:used/total[:window]>] [--estimate <task:resource:units>] [--max-concurrent <n>] [--max-concurrent-workloads <n>] [--idle-window-open] [--reset-window-open]"
+    );
+    println!(
+        "      Write phase-4 background scheduler plan/status/event artifacts and dry-run iteration handoffs without autonomous execution."
+    );
     println!("  sinomo evolve approve [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
@@ -5546,6 +6217,103 @@ mod tests {
         assert_eq!(options.max_wall_time.as_deref(), Some("10m"));
         assert!(options.pause_after_proposal);
         assert!(options.dry_run);
+    }
+
+    #[test]
+    fn evolve_tick_parser_accepts_phase_four_background_flags() {
+        let command = super::parse_evolve_command(&[
+            "tick".to_string(),
+            "--dry-run".to_string(),
+            "--scheduler-service".to_string(),
+            "sinomo-cluster-scheduler".to_string(),
+            "--max-concurrent".to_string(),
+            "1".to_string(),
+            "--max-concurrent-workloads".to_string(),
+            "4".to_string(),
+            "--workload".to_string(),
+            "backup:backup-index-01:ready:Backup index".to_string(),
+            "--workload-estimate".to_string(),
+            "backup:backup-index-01:cluster-background-hours:40".to_string(),
+            "--workload-human-checkpoint".to_string(),
+            "memory:dataset-curation-42".to_string(),
+            "--resource".to_string(),
+            "coding-plan-weekly:75/100:weekly".to_string(),
+            "--estimate".to_string(),
+            "coding-plan-weekly:10".to_string(),
+            "--reset-window-open".to_string(),
+            "--idle-window-open".to_string(),
+        ])
+        .expect("tick command");
+        assert!(matches!(command, super::EvolveCliCommand::Tick(_)));
+
+        let options = super::parse_background_tick_options(&[
+            "--dry-run".to_string(),
+            "--scheduler-service".to_string(),
+            "sinomo-cluster-scheduler".to_string(),
+            "--max-concurrent".to_string(),
+            "1".to_string(),
+            "--max-concurrent-workloads".to_string(),
+            "4".to_string(),
+            "--workload".to_string(),
+            "backup:backup-index-01:ready:Backup index".to_string(),
+            "--workload-estimate".to_string(),
+            "backup:backup-index-01:cluster-background-hours:40".to_string(),
+            "--workload-human-checkpoint".to_string(),
+            "memory:dataset-curation-42".to_string(),
+            "--resource".to_string(),
+            "coding-plan-weekly:75/100:weekly".to_string(),
+            "--estimate".to_string(),
+            "coding-plan-weekly:10".to_string(),
+            "--reset-window-open".to_string(),
+            "--idle-window-open".to_string(),
+        ])
+        .expect("tick options");
+
+        assert!(options.dry_run);
+        assert_eq!(options.scheduler_service_id, "sinomo-cluster-scheduler");
+        assert_eq!(options.max_concurrent_campaigns, 1);
+        assert_eq!(options.max_concurrent_workloads, 4);
+        assert_eq!(options.resources, vec!["coding-plan-weekly:75/100:weekly"]);
+        assert_eq!(options.estimates, vec!["coding-plan-weekly:10"]);
+        assert_eq!(
+            options.external_workloads,
+            vec!["backup:backup-index-01:ready:Backup index"]
+        );
+        assert_eq!(
+            options.external_workload_estimates,
+            vec!["backup:backup-index-01:cluster-background-hours:40"]
+        );
+        assert_eq!(
+            options.external_human_checkpoints,
+            vec!["memory:dataset-curation-42"]
+        );
+        let workloads = super::parse_background_tick_external_workloads(
+            &options.external_workloads,
+            &options.external_workload_estimates,
+            &options.external_human_checkpoints,
+        )
+        .expect("external workloads");
+        assert_eq!(workloads.len(), 2);
+        assert_eq!(workloads[0].system, "backup");
+        assert_eq!(
+            workloads[0].resource_estimates[0].resource,
+            "cluster-background-hours"
+        );
+        assert_eq!(workloads[0].resource_estimates[0].estimated_units, 40);
+        assert!(workloads[1].human_checkpoint_required);
+        assert!(options.reset_window_open);
+        assert!(options.idle_window_open);
+    }
+
+    #[test]
+    fn evolve_tick_parser_rejects_cluster_identifier_flags() {
+        let result = super::parse_background_tick_options(&[
+            "--dry-run".to_string(),
+            "--cluster".to_string(),
+            "home-cluster".to_string(),
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]

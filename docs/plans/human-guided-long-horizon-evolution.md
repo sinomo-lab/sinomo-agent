@@ -595,7 +595,7 @@ Initial rules:
 1. Keep reserve floors. Example: keep 30% of a weekly coding plan and 40% of free API quota unallocated for non-campaign operations unless the human overrides.
 2. Smooth usage across the reset window. A 5-hour window should have per-hour suggested spend, not only a hard cap.
 3. Preserve cross-campaign fairness. No campaign can consume the full allocatable portion of a shared renewable resource unless it has an explicit priority override. Default scheduling should leave room for at least one urgent non-campaign operation and one other approved campaign.
-4. Prefer cheap scouting before expensive implementation. Use free models for status summaries, eval log clustering, candidate critique, and task decomposition when quality is sufficient.
+4. Prefer cheap scouting before expensive implementation. Use free models for status summaries, eval-log grouping, candidate critique, and task decomposition when quality is sufficient.
 5. Use expensive coding agents for narrow implementation packets with clear verification commands.
 6. Pause campaigns automatically when leases cannot be acquired without violating reserve floors.
 7. Resume campaigns automatically after reset windows or idle windows open.
@@ -607,7 +607,7 @@ The scheduler should produce a visible plan:
 
 ```text
 next_24h:
-  - 02:00 local: run free-model eval-log clustering
+  - 02:00 local: run free-model eval-log grouping
   - 03:00 local: run one coding-plan implementation lease, max 45 minutes
   - 03:50 local: run local tests and write scorecard
   - after reset: reserve 30%, allocate at most two near-term tasks
