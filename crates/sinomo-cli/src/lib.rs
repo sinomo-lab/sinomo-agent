@@ -1,5 +1,6 @@
 //! Shared Sinomo command-line handlers.
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
     CandidateWorkspace, EvolutionOrchestrator, EvolutionReport, EvolutionRequest,
@@ -26,10 +27,17 @@ use sinomo_runtime::core::{
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::rollout::{
+    MainExitKind, MainExitObservation, SelfRolloutPaths, classify_main_exit,
+};
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -51,6 +59,8 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
             Ok(())
         }
         CliCommand::Evolve(command) => run_evolve_cli_command(command),
+        CliCommand::Daemon(command) => run_daemon_cli_command(command),
+        CliCommand::Rollout(command) => run_rollout_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
         CliCommand::Usage(options) => usage(options),
@@ -62,6 +72,8 @@ enum CliCommand {
     Cui,
     Help,
     Evolve(EvolveCliCommand),
+    Daemon(DaemonCliCommand),
+    Rollout(RolloutCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
     Usage(UsageOptions),
@@ -76,6 +88,12 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
         Some((command, rest)) if command == "evolve" => {
             Ok(CliCommand::Evolve(parse_evolve_command(rest)?))
         }
+        Some((command, rest)) if command == "daemon" => {
+            Ok(CliCommand::Daemon(parse_daemon_command(rest)?))
+        }
+        Some((command, rest)) if command == "rollout" => {
+            Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
+        }
         Some((command, rest)) if matches!(command.as_str(), "models" | "model") => Ok(
             CliCommand::Models(parse_models_command(rest, ModelDefaultRepoMode::Reject)?),
         ),
@@ -87,6 +105,1122 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
         }
         _ => Err(CliError::Usage),
     }
+}
+
+const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
+const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
+const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+const SHADOW_MAIN_HOST_ENV: &str = "SINOMO_SHADOW_MAIN_HOST";
+const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DaemonCliCommand {
+    Help,
+    Run(DaemonRunOptions),
+    Start(DaemonRunOptions),
+    Status(DaemonRunOptions),
+    Stop(DaemonRunOptions),
+    ShadowRun(DaemonRunOptions),
+    ShadowStart(DaemonRunOptions),
+    ShadowStatus(DaemonRunOptions),
+    ShadowStop(DaemonRunOptions),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DaemonRunOptions {
+    host: String,
+    port: u16,
+}
+
+impl Default for DaemonRunOptions {
+    fn default() -> Self {
+        Self {
+            host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
+            port: SINOMO_DAEMON_DEFAULT_PORT,
+        }
+    }
+}
+
+impl DaemonRunOptions {
+    fn shadow_default() -> Self {
+        Self {
+            host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
+            port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DaemonProbeStatus {
+    Running(DaemonStatus),
+    Locked { status: Option<DaemonStatus> },
+    NotRunning,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DaemonStatus {
+    pid: u32,
+    host: String,
+    port: u16,
+    address: String,
+    started_at: String,
+    data_dir: PathBuf,
+    lock_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonPaths {
+    root: PathBuf,
+    lock: PathBuf,
+    status: PathBuf,
+}
+
+impl DaemonPaths {
+    fn new(data_dir: &SinomoDataDir) -> Self {
+        Self::with_root(data_dir.root().join("daemon"))
+    }
+
+    fn for_shadow(data_dir: &SinomoDataDir) -> Self {
+        Self::with_root(data_dir.root().join("shadow-daemon"))
+    }
+
+    fn with_root(root: PathBuf) -> Self {
+        Self {
+            lock: root.join("daemon.lock"),
+            status: root.join("status.json"),
+            root,
+        }
+    }
+
+    fn ensure(&self) -> Result<(), CliError> {
+        fs::create_dir_all(&self.root).map_err(|source| CliError::Io {
+            path: self.root.display().to_string(),
+            detail: source.to_string(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct DaemonLock {
+    file: File,
+    paths: DaemonPaths,
+}
+
+impl DaemonLock {
+    fn acquire(paths: &DaemonPaths, options: &DaemonRunOptions) -> Result<Self, CliError> {
+        paths.ensure()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&paths.lock)
+            .map_err(|source| CliError::Io {
+                path: paths.lock.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        file.try_lock_exclusive()
+            .map_err(|source| CliError::DaemonAlreadyRunning {
+                lock_file: paths.lock.display().to_string(),
+                detail: source.to_string(),
+            })?;
+
+        let status = DaemonStatus::new(options, paths);
+        let status_json = serde_json::to_vec_pretty(&status).map_err(|source| CliError::Json {
+            path: paths.status.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        fs::write(&paths.status, status_json).map_err(|source| CliError::Io {
+            path: paths.status.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        file.set_len(0).map_err(|source| CliError::Io {
+            path: paths.lock.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        serde_json::to_writer_pretty(&file, &status).map_err(|source| CliError::Json {
+            path: paths.lock.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        Ok(Self {
+            file,
+            paths: paths.clone(),
+        })
+    }
+}
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.paths.status);
+        let _ = self.file.unlock();
+        let _ = fs::remove_file(&self.paths.lock);
+    }
+}
+
+impl DaemonStatus {
+    fn new(options: &DaemonRunOptions, paths: &DaemonPaths) -> Self {
+        Self {
+            pid: std::process::id(),
+            host: options.host.clone(),
+            port: options.port,
+            address: daemon_connect_address(&options.host, options.port),
+            started_at: OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            data_dir: paths.root.parent().unwrap_or(&paths.root).to_path_buf(),
+            lock_file: paths.lock.clone(),
+        }
+    }
+}
+
+fn daemon_connect_address(host: &str, port: u16) -> String {
+    let connect_host = match host {
+        "0.0.0.0" | "::" => SINOMO_DAEMON_DEFAULT_HOST,
+        value => value,
+    };
+    format!("{connect_host}:{port}")
+}
+
+fn parse_daemon_command(args: &[String]) -> Result<DaemonCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(DaemonCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(DaemonCliCommand::Help)
+        }
+        Some((command, rest)) if command == "shadow" => parse_shadow_daemon_command(rest),
+        Some((command, rest)) if command == "run" => {
+            Ok(DaemonCliCommand::Run(parse_daemon_run_options(rest)?))
+        }
+        Some((command, rest)) if command == "start" => {
+            Ok(DaemonCliCommand::Start(parse_daemon_run_options(rest)?))
+        }
+        Some((command, rest)) if command == "status" => {
+            Ok(DaemonCliCommand::Status(parse_daemon_run_options(rest)?))
+        }
+        Some((command, rest)) if command == "stop" => {
+            Ok(DaemonCliCommand::Stop(parse_daemon_run_options(rest)?))
+        }
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_shadow_daemon_command(args: &[String]) -> Result<DaemonCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(DaemonCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(DaemonCliCommand::Help)
+        }
+        Some((command, rest)) if command == "run" => Ok(DaemonCliCommand::ShadowRun(
+            parse_daemon_options_with_default(rest, DaemonRunOptions::shadow_default())?,
+        )),
+        Some((command, rest)) if command == "start" => Ok(DaemonCliCommand::ShadowStart(
+            parse_daemon_options_with_default(rest, DaemonRunOptions::shadow_default())?,
+        )),
+        Some((command, rest)) if command == "status" => Ok(DaemonCliCommand::ShadowStatus(
+            parse_daemon_options_with_default(rest, DaemonRunOptions::shadow_default())?,
+        )),
+        Some((command, rest)) if command == "stop" => Ok(DaemonCliCommand::ShadowStop(
+            parse_daemon_options_with_default(rest, DaemonRunOptions::shadow_default())?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_daemon_run_options(args: &[String]) -> Result<DaemonRunOptions, CliError> {
+    parse_daemon_options_with_default(args, DaemonRunOptions::default())
+}
+
+fn parse_daemon_options_with_default(
+    args: &[String],
+    mut options: DaemonRunOptions,
+) -> Result<DaemonRunOptions, CliError> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--host" => {
+                index += 1;
+                let Some(host) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.host = host.clone();
+            }
+            "--port" => {
+                index += 1;
+                let Some(port) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.port = port.parse::<u16>().map_err(|source| CliError::Parse {
+                    detail: format!("invalid daemon port `{port}`: {source}"),
+                })?;
+            }
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn run_daemon_cli_command(command: DaemonCliCommand) -> Result<(), CliError> {
+    match command {
+        DaemonCliCommand::Help => {
+            print_daemon_help();
+            Ok(())
+        }
+        DaemonCliCommand::Run(options) => run_daemon(options),
+        DaemonCliCommand::Start(options) => start_daemon(options),
+        DaemonCliCommand::Status(options) => print_daemon_status(options),
+        DaemonCliCommand::Stop(options) => stop_daemon(options),
+        DaemonCliCommand::ShadowRun(options) => run_shadow_daemon(options),
+        DaemonCliCommand::ShadowStart(options) => start_shadow_daemon(options),
+        DaemonCliCommand::ShadowStatus(options) => print_shadow_daemon_status(options),
+        DaemonCliCommand::ShadowStop(options) => stop_shadow_daemon(options),
+    }
+}
+
+fn daemon_paths_from_defaults() -> Result<DaemonPaths, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    Ok(DaemonPaths::new(&data_dir))
+}
+
+fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    Ok(DaemonPaths::for_shadow(&data_dir))
+}
+
+fn run_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+    run_daemon_with_paths(options, daemon_paths_from_defaults()?, "daemon")
+}
+
+fn run_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let shadow_paths = DaemonPaths::for_shadow(&data_dir);
+    let main_paths = DaemonPaths::new(&data_dir);
+    let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+    let main_options = shadow_main_options_from_env()?;
+    run_shadow_daemon_with_paths(
+        options,
+        shadow_paths,
+        main_paths,
+        rollout_paths,
+        main_options,
+    )
+}
+
+fn run_shadow_daemon_with_paths(
+    options: DaemonRunOptions,
+    shadow_paths: DaemonPaths,
+    main_paths: DaemonPaths,
+    rollout_paths: SelfRolloutPaths,
+    main_options: DaemonRunOptions,
+) -> Result<(), CliError> {
+    let _lock = DaemonLock::acquire(&shadow_paths, &options)?;
+    let bind_address = format!("{}:{}", options.host, options.port);
+    let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
+        address: bind_address.clone(),
+        detail: source.to_string(),
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CliError::Network {
+            address: bind_address.clone(),
+            detail: source.to_string(),
+        })?;
+    println!("sinomo shadow daemon listening on {bind_address}");
+
+    let mut supervised_main: Option<Child> = None;
+    let mut main_restart_suppressed = false;
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _address)) => {
+                if handle_daemon_connection(&mut stream, &shadow_paths)? {
+                    break;
+                }
+            }
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
+            Err(source) => {
+                return Err(CliError::Network {
+                    address: bind_address.clone(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+
+        if !main_restart_suppressed
+            && supervised_main.is_none()
+            && rollout_paths.main_binary.exists()
+            && matches!(
+                probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT),
+                DaemonProbeStatus::NotRunning
+            )
+        {
+            supervised_main = Some(spawn_main_for_shadow(
+                &rollout_paths.main_binary,
+                &main_options,
+            )?);
+        }
+
+        if let Some(child) = supervised_main.as_mut() {
+            if let Some(status) = child.try_wait().map_err(|source| CliError::Io {
+                path: rollout_paths.main_binary.display().to_string(),
+                detail: source.to_string(),
+            })? {
+                let observation = main_exit_observation_from_status(status);
+                let kind = classify_main_exit(observation);
+                write_json(
+                    &rollout_paths.root.join("last-main-exit.json"),
+                    &serde_json::json!({
+                        "exit_code": observation.exit_code,
+                        "signal": observation.signal,
+                        "requested_shutdown": observation.requested_shutdown,
+                        "kind": kind,
+                        "observed_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string())
+                    }),
+                )?;
+                supervised_main = None;
+                if kind == MainExitKind::Crash {
+                    supervised_main = Some(spawn_main_for_shadow(
+                        &rollout_paths.main_binary,
+                        &main_options,
+                    )?);
+                } else {
+                    main_restart_suppressed = true;
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+fn spawn_main_for_shadow(binary: &Path, options: &DaemonRunOptions) -> Result<Child, CliError> {
+    Command::new(binary)
+        .arg("daemon")
+        .arg("run")
+        .arg("--host")
+        .arg(&options.host)
+        .arg("--port")
+        .arg(options.port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| CliError::Io {
+            path: binary.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn main_exit_observation_from_status(status: ExitStatus) -> MainExitObservation {
+    #[cfg(unix)]
+    {
+        if let Some(signal) = status.signal() {
+            return MainExitObservation::signal(signal);
+        }
+    }
+    MainExitObservation::exit_code(status.code().unwrap_or(1))
+}
+
+fn shadow_main_options_from_env() -> Result<DaemonRunOptions, CliError> {
+    let mut options = DaemonRunOptions::default();
+    if let Ok(host) = env::var(SHADOW_MAIN_HOST_ENV) {
+        options.host = host;
+    }
+    if let Ok(port) = env::var(SHADOW_MAIN_PORT_ENV) {
+        options.port = port.parse::<u16>().map_err(|source| CliError::Parse {
+            detail: format!("invalid {SHADOW_MAIN_PORT_ENV} `{port}`: {source}"),
+        })?;
+    }
+    Ok(options)
+}
+
+fn run_daemon_with_paths(
+    options: DaemonRunOptions,
+    paths: DaemonPaths,
+    label: &str,
+) -> Result<(), CliError> {
+    let _lock = DaemonLock::acquire(&paths, &options)?;
+    let bind_address = format!("{}:{}", options.host, options.port);
+    let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
+        address: bind_address.clone(),
+        detail: source.to_string(),
+    })?;
+    println!("sinomo {label} listening on {bind_address}");
+
+    for stream in listener.incoming() {
+        let mut stream = stream.map_err(|source| CliError::Network {
+            address: bind_address.clone(),
+            detail: source.to_string(),
+        })?;
+        if handle_daemon_connection(&mut stream, &paths)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn start_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+    start_daemon_with_paths(
+        options,
+        daemon_paths_from_defaults()?,
+        &["daemon", "run"],
+        "daemon",
+    )
+}
+
+fn start_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+    start_daemon_with_paths(
+        options,
+        shadow_daemon_paths_from_defaults()?,
+        &["daemon", "shadow", "run"],
+        "shadow daemon",
+    )
+}
+
+fn start_daemon_with_paths(
+    options: DaemonRunOptions,
+    paths: DaemonPaths,
+    command_prefix: &[&str],
+    label: &str,
+) -> Result<(), CliError> {
+    if matches!(
+        probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT),
+        DaemonProbeStatus::Running(_) | DaemonProbeStatus::Locked { .. }
+    ) {
+        return Err(CliError::DaemonAlreadyRunning {
+            lock_file: paths.lock.display().to_string(),
+            detail: "daemon lock is already held".to_string(),
+        });
+    }
+
+    let exe = env::current_exe().map_err(|source| CliError::Io {
+        path: "current executable".to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut command = Command::new(exe);
+    command.args(command_prefix);
+    let child = command
+        .arg("--host")
+        .arg(&options.host)
+        .arg("--port")
+        .arg(options.port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| CliError::Io {
+            path: format!("sinomo {label} start"),
+            detail: source.to_string(),
+        })?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let DaemonProbeStatus::Running(status) =
+            probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
+        {
+            println!(
+                "sinomo {label} started: pid={} address={}",
+                status.pid, status.address
+            );
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(CliError::Network {
+        address: daemon_connect_address(&options.host, options.port),
+        detail: format!("daemon process {} did not become ready", child.id()),
+    })
+}
+
+fn print_daemon_status(options: DaemonRunOptions) -> Result<(), CliError> {
+    print_daemon_status_with_paths(options, daemon_paths_from_defaults()?, "daemon")
+}
+
+fn print_shadow_daemon_status(options: DaemonRunOptions) -> Result<(), CliError> {
+    print_daemon_status_with_paths(
+        options,
+        shadow_daemon_paths_from_defaults()?,
+        "shadow daemon",
+    )
+}
+
+fn print_daemon_status_with_paths(
+    options: DaemonRunOptions,
+    paths: DaemonPaths,
+    label: &str,
+) -> Result<(), CliError> {
+    match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => {
+            println!("sinomo {label} is running");
+            println!("  pid: {}", status.pid);
+            println!("  address: {}", status.address);
+            println!("  lock: {}", status.lock_file.display());
+            println!("  status: {}", paths.status.display());
+            Ok(())
+        }
+        DaemonProbeStatus::Locked { status } => {
+            println!("sinomo {label} lock is held but the listener did not answer");
+            if let Some(status) = status {
+                println!("  pid: {}", status.pid);
+                println!("  address: {}", status.address);
+            } else {
+                println!(
+                    "  address: {}",
+                    daemon_connect_address(&options.host, options.port)
+                );
+            }
+            println!("  lock: {}", paths.lock.display());
+            Ok(())
+        }
+        DaemonProbeStatus::NotRunning => {
+            println!("sinomo {label} is not running");
+            println!(
+                "  default address: {}",
+                daemon_connect_address(&options.host, options.port)
+            );
+            Ok(())
+        }
+    }
+}
+
+fn stop_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+    stop_daemon_with_paths(daemon_paths_from_defaults()?, options, "daemon")
+}
+
+fn stop_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+    stop_daemon_with_paths(
+        shadow_daemon_paths_from_defaults()?,
+        options,
+        "shadow daemon",
+    )
+}
+
+fn stop_daemon_with_paths(
+    paths: DaemonPaths,
+    _options: DaemonRunOptions,
+    label: &str,
+) -> Result<(), CliError> {
+    match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => {
+            let response = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT)?;
+            println!("{}", response.trim());
+            Ok(())
+        }
+        DaemonProbeStatus::Locked { .. } => Err(CliError::DaemonNotRunning {
+            detail: format!("{label} lock is held but the listener did not answer"),
+        }),
+        DaemonProbeStatus::NotRunning => Err(CliError::DaemonNotRunning {
+            detail: "no daemon lock is held".to_string(),
+        }),
+    }
+}
+
+fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProbeStatus {
+    let status = read_daemon_status(paths).ok();
+    if let Some(status) = &status {
+        if send_daemon_command(&status.address, "STATUS", timeout).is_ok() {
+            return DaemonProbeStatus::Running(status.clone());
+        }
+    }
+
+    if !paths.lock.exists() {
+        let _ = fs::remove_file(&paths.status);
+        return DaemonProbeStatus::NotRunning;
+    }
+
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&paths.lock)
+    else {
+        return DaemonProbeStatus::Locked { status };
+    };
+
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            let _ = fs::remove_file(&paths.lock);
+            let _ = fs::remove_file(&paths.status);
+            DaemonProbeStatus::NotRunning
+        }
+        Err(_) => DaemonProbeStatus::Locked { status },
+    }
+}
+
+fn read_daemon_status(paths: &DaemonPaths) -> Result<DaemonStatus, CliError> {
+    let content = fs::read_to_string(&paths.status).map_err(|source| CliError::Io {
+        path: paths.status.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: paths.status.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn send_daemon_command(
+    address: &str,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, CliError> {
+    let mut stream = TcpStream::connect(address).map_err(|source| CliError::Network {
+        address: address.to_string(),
+        detail: source.to_string(),
+    })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    stream
+        .write_all(format!("{command}\n").as_bytes())
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    let _ = stream.shutdown(Shutdown::Write);
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(response)
+}
+
+fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Result<bool, CliError> {
+    let mut reader =
+        io::BufReader::new(stream.try_clone().map_err(|source| CliError::Network {
+            address: "daemon client".to_string(),
+            detail: source.to_string(),
+        })?);
+    let mut request = String::new();
+    reader
+        .read_line(&mut request)
+        .map_err(|source| CliError::Network {
+            address: "daemon client".to_string(),
+            detail: source.to_string(),
+        })?;
+    let command = request.lines().next().unwrap_or_default().trim();
+    match command {
+        "STATUS" => {
+            let status = read_daemon_status(paths)?;
+            let body = serde_json::to_string_pretty(&status).map_err(|source| CliError::Json {
+                path: paths.status.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            stream
+                .write_all(body.as_bytes())
+                .map_err(|source| CliError::Network {
+                    address: status.address.clone(),
+                    detail: source.to_string(),
+                })?;
+            Ok(false)
+        }
+        "SHUTDOWN" => {
+            stream
+                .write_all(b"sinomo daemon stopping\n")
+                .map_err(|source| CliError::Network {
+                    address: "daemon client".to_string(),
+                    detail: source.to_string(),
+                })?;
+            Ok(true)
+        }
+        _ => {
+            stream
+                .write_all(b"unknown daemon command\n")
+                .map_err(|source| CliError::Network {
+                    address: "daemon client".to_string(),
+                    detail: source.to_string(),
+                })?;
+            Ok(false)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum RolloutCliCommand {
+    Help,
+    InitSource(RolloutOptions),
+    Apply(RolloutOptions),
+    Status,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RolloutOptions {
+    repo: Option<PathBuf>,
+    host: String,
+    port: u16,
+}
+
+impl Default for RolloutOptions {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
+            port: SINOMO_DAEMON_DEFAULT_PORT,
+        }
+    }
+}
+
+fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(RolloutCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(RolloutCliCommand::Help)
+        }
+        Some((command, rest)) if command == "init-source" => {
+            Ok(RolloutCliCommand::InitSource(parse_rollout_options(rest)?))
+        }
+        Some((command, rest)) if command == "apply" => {
+            Ok(RolloutCliCommand::Apply(parse_rollout_options(rest)?))
+        }
+        Some((command, [])) if command == "status" => Ok(RolloutCliCommand::Status),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_rollout_options(args: &[String]) -> Result<RolloutOptions, CliError> {
+    let mut options = RolloutOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                index += 1;
+                let Some(repo) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.repo = Some(PathBuf::from(repo));
+            }
+            "--host" => {
+                index += 1;
+                let Some(host) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.host = host.clone();
+            }
+            "--port" => {
+                index += 1;
+                let Some(port) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.port = port.parse::<u16>().map_err(|source| CliError::Parse {
+                    detail: format!("invalid rollout daemon port `{port}`: {source}"),
+                })?;
+            }
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), CliError> {
+    match command {
+        RolloutCliCommand::Help => {
+            print_rollout_help();
+            Ok(())
+        }
+        RolloutCliCommand::InitSource(options) => rollout_init_source(options),
+        RolloutCliCommand::Apply(options) => rollout_apply(options),
+        RolloutCliCommand::Status => rollout_status(),
+    }
+}
+
+fn rollout_paths_from_defaults() -> Result<SelfRolloutPaths, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    Ok(SelfRolloutPaths::new(&data_dir.root()))
+}
+
+fn rollout_ensure_layout(paths: &SelfRolloutPaths) -> Result<(), CliError> {
+    for path in [&paths.root, &paths.bin] {
+        fs::create_dir_all(path).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    if let Some(parent) = paths.source_repo.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+fn rollout_init_source(options: RolloutOptions) -> Result<(), CliError> {
+    let paths = rollout_paths_from_defaults()?;
+    rollout_ensure_layout(&paths)?;
+    ensure_source_repo(&paths, options.repo.as_deref())?;
+    println!("source repo: {}", paths.source_repo.display());
+    Ok(())
+}
+
+fn rollout_status() -> Result<(), CliError> {
+    let paths = rollout_paths_from_defaults()?;
+    println!("rollout source: {}", paths.source_repo.display());
+    println!("main binary: {}", paths.main_binary.display());
+    println!("shadow binary: {}", paths.shadow_binary.display());
+    println!("state: {}", paths.state.display());
+    println!(
+        "source repo exists: {}",
+        paths.source_repo.join(".git").exists()
+    );
+    println!("main binary exists: {}", paths.main_binary.exists());
+    println!("shadow binary exists: {}", paths.shadow_binary.exists());
+    Ok(())
+}
+
+fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
+    let paths = rollout_paths_from_defaults()?;
+    rollout_ensure_layout(&paths)?;
+    ensure_source_repo(&paths, options.repo.as_deref())?;
+    let plan = paths.plan();
+    let build = Command::new(&plan.build_program)
+        .args(&plan.build_args)
+        .current_dir(&plan.build_dir)
+        .output()
+        .map_err(|source| CliError::Io {
+            path: format!("{} {}", plan.build_program, plan.build_args.join(" ")),
+            detail: source.to_string(),
+        })?;
+    let build_log = format!(
+        "command: {} {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+        plan.build_program,
+        plan.build_args.join(" "),
+        build.status,
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    fs::write(&plan.build_log, build_log).map_err(|source| CliError::Io {
+        path: plan.build_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if !build.status.success() {
+        return Err(CliError::Process {
+            command: format!("{} {}", plan.build_program, plan.build_args.join(" ")),
+            status: build.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
+        });
+    }
+    install_binary_atomically(&plan.built_binary, &plan.install_main_binary)?;
+    stop_main_daemon_if_running(&options)?;
+    install_binary_atomically(&plan.built_binary, &plan.install_shadow_binary)?;
+    restart_shadow_daemon_from_binary(&plan.install_shadow_binary, &options)?;
+    wait_for_main_daemon_health(&options)?;
+    write_json(
+        &plan.state,
+        &serde_json::json!({
+            "source_repo": paths.source_repo,
+            "main_binary": plan.install_main_binary,
+            "shadow_binary": plan.install_shadow_binary,
+            "built_binary": plan.built_binary,
+            "build_log": plan.build_log,
+            "updated_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string())
+        }),
+    )?;
+    println!("rollout applied");
+    println!("  source: {}", plan.build_dir.display());
+    println!("  main binary: {}", plan.install_main_binary.display());
+    println!("  shadow binary: {}", plan.install_shadow_binary.display());
+    Ok(())
+}
+
+fn ensure_source_repo(paths: &SelfRolloutPaths, repo: Option<&Path>) -> Result<(), CliError> {
+    if paths.source_repo.join(".git").exists() {
+        return Ok(());
+    }
+    let source = match repo {
+        Some(repo) => repo.to_path_buf(),
+        None => env::current_dir().map_err(|source| CliError::Io {
+            path: ".".to_string(),
+            detail: source.to_string(),
+        })?,
+    };
+    let output = Command::new("git")
+        .arg("clone")
+        .arg(&source)
+        .arg(&paths.source_repo)
+        .output()
+        .map_err(|source| CliError::Io {
+            path: "git clone".to_string(),
+            detail: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Process {
+            command: format!(
+                "git clone {} {}",
+                source.display(),
+                paths.source_repo.display()
+            ),
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn install_binary_atomically(source: &Path, destination: &Path) -> Result<(), CliError> {
+    if !source.exists() {
+        return Err(CliError::MissingArtifact {
+            artifact: source.display().to_string(),
+        });
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let next = destination.with_extension("next");
+    fs::copy(source, &next).map_err(|error| CliError::Io {
+        path: format!("{} -> {}", source.display(), next.display()),
+        detail: error.to_string(),
+    })?;
+    if destination.exists() {
+        let previous = destination.with_extension("previous");
+        let _ = fs::remove_file(&previous);
+        fs::rename(destination, &previous).map_err(|source| CliError::Io {
+            path: format!("{} -> {}", destination.display(), previous.display()),
+            detail: source.to_string(),
+        })?;
+    }
+    fs::rename(&next, destination).map_err(|source| CliError::Io {
+        path: format!("{} -> {}", next.display(), destination.display()),
+        detail: source.to_string(),
+    })?;
+    Ok(())
+}
+
+fn stop_main_daemon_if_running(_options: &RolloutOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = DaemonPaths::new(&data_dir);
+    if let DaemonProbeStatus::Running(status) = probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
+        let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if matches!(
+                probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT),
+                DaemonProbeStatus::NotRunning
+            ) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Ok(())
+}
+
+fn restart_shadow_daemon_from_binary(
+    binary: &Path,
+    options: &RolloutOptions,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = DaemonPaths::for_shadow(&data_dir);
+    if let DaemonProbeStatus::Running(status) = probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
+        let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if matches!(
+                probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT),
+                DaemonProbeStatus::NotRunning
+            ) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    start_daemon_binary(
+        binary,
+        &["daemon", "shadow", "run"],
+        options,
+        paths,
+        "shadow daemon",
+    )
+}
+
+fn start_daemon_binary(
+    binary: &Path,
+    command_prefix: &[&str],
+    options: &RolloutOptions,
+    paths: DaemonPaths,
+    label: &str,
+) -> Result<(), CliError> {
+    let mut command = Command::new(binary);
+    command.args(command_prefix);
+    command.env(SHADOW_MAIN_HOST_ENV, &options.host);
+    command.env(SHADOW_MAIN_PORT_ENV, options.port.to_string());
+    let child = command
+        .arg("--host")
+        .arg(&options.host)
+        .arg("--port")
+        .arg(SINOMO_SHADOW_DAEMON_DEFAULT_PORT.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| CliError::Io {
+            path: binary.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let DaemonProbeStatus::Running(status) =
+            probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
+        {
+            println!(
+                "{label} healthy: pid={} address={}",
+                status.pid, status.address
+            );
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(CliError::Network {
+        address: daemon_connect_address(&options.host, SINOMO_SHADOW_DAEMON_DEFAULT_PORT),
+        detail: format!(
+            "rolled out {label} process {} did not become ready",
+            child.id()
+        ),
+    })
+}
+
+fn wait_for_main_daemon_health(options: &RolloutOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = DaemonPaths::new(&data_dir);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let DaemonProbeStatus::Running(status) =
+            probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
+        {
+            println!(
+                "main daemon healthy: pid={} address={}",
+                status.pid, status.address
+            );
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(CliError::Network {
+        address: daemon_connect_address(&options.host, options.port),
+        detail: "rolled out main daemon did not become ready under shadow supervision".to_string(),
+    })
 }
 
 pub fn run_cui() -> Result<(), CliError> {
@@ -973,13 +2107,21 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     paths.ensure()?;
     let config = read_config(&paths).ok();
     let model_config = read_model_config(&ModelPaths::new(&data_dir)).ok();
-    let repo = options
+    let repo = if let Some(repo) = options
         .repo
         .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.repo)))
-        .unwrap_or(env::current_dir().map_err(|source| CliError::Io {
+    {
+        repo
+    } else {
+        let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+        rollout_ensure_layout(&rollout_paths)?;
+        let current_repo = env::current_dir().map_err(|source| CliError::Io {
             path: ".".to_string(),
             detail: source.to_string(),
-        })?);
+        })?;
+        ensure_source_repo(&rollout_paths, Some(&current_repo))?;
+        rollout_paths.source_repo
+    };
     let provider = options
         .provider
         .or_else(|| {
@@ -1059,7 +2201,7 @@ fn evolve_decide(args: &[String], outcome: CandidateDecisionOutcome) -> Result<(
     let note = flag_value(args, "--note").unwrap_or_default();
     let decision = CandidateDecision::new(
         &record.job,
-        outcome,
+        outcome.clone(),
         "cli-supervisor",
         record.candidate_workspace.path.display().to_string(),
         record.bundle.bundle_path.clone(),
@@ -1077,12 +2219,60 @@ fn evolve_decide(args: &[String], outcome: CandidateDecisionOutcome) -> Result<(
         write_json(Path::new(job_path), &record.job)?;
     }
     write_stored_job(&paths, &record)?;
+    if outcome == CandidateDecisionOutcome::Approved {
+        commit_and_fast_forward_approved_candidate(&record)?;
+    }
     println!("job: {}", record.job.job_id);
     println!("status: {}", job_status_label(&record.job.status));
     println!("worktree: {}", record.candidate_workspace.path.display());
     println!("bundle: {}", record.bundle.bundle_path);
     println!("decision: {}", decision_path.display());
     Ok(())
+}
+
+fn commit_and_fast_forward_approved_candidate(record: &StoredEvolutionJob) -> Result<(), CliError> {
+    let worktree = &record.candidate_workspace.path;
+    run_git_command(worktree, &["add", "-A"])?;
+    let status = run_git_command(worktree, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        run_git_command(
+            worktree,
+            &[
+                "commit",
+                "-m",
+                &format!("Apply evolution job {}", record.job.job_id),
+            ],
+        )?;
+    }
+    let source_root = Path::new(&record.job.edit_scope.workspace_root);
+    run_git_command(
+        source_root,
+        &[
+            "merge",
+            "--ff-only",
+            &record.candidate_workspace.branch_name,
+        ],
+    )?;
+    Ok(())
+}
+
+fn run_git_command(cwd: &Path, args: &[&str]) -> Result<String, CliError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|source| CliError::Io {
+            path: format!("git {}", args.join(" ")),
+            detail: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Process {
+            command: format!("git {}", args.join(" ")),
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn evolve_status(args: &[String]) -> Result<(), CliError> {
@@ -2725,6 +3915,8 @@ pub fn print_usage() {
     println!("Usage:");
     println!("  sinomo");
     println!("  sinomo help");
+    println!("  sinomo daemon");
+    println!("  sinomo rollout");
     println!("  sinomo models");
     println!("  sinomo usage");
     println!("  sinomo providers");
@@ -2755,6 +3947,38 @@ pub fn print_usage() {
     println!(
         "                               GitHub App client IDs are not accepted by Copilot token exchange"
     );
+}
+
+fn print_daemon_help() {
+    println!("Daemon:");
+    println!("  sinomo daemon");
+    println!("      Show daemon commands.");
+    println!("  sinomo daemon run [--host <host>] [--port <port>]");
+    println!("      Run the daemon in the foreground. Defaults to 127.0.0.1:21353.");
+    println!("  sinomo daemon start [--host <host>] [--port <port>]");
+    println!("      Start the daemon as a detached background process.");
+    println!("  sinomo daemon status");
+    println!("      Probe the data-directory lock and daemon listener.");
+    println!("  sinomo daemon stop");
+    println!("      Ask the running daemon to shut down.");
+    println!("  sinomo daemon shadow run|start|status|stop [--host <host>] [--port <port>]");
+    println!("      Control the shadow daemon. Defaults to 127.0.0.1:21354.");
+}
+
+fn print_rollout_help() {
+    println!("Rollout:");
+    println!("  sinomo rollout");
+    println!("      Show rollout commands.");
+    println!("  sinomo rollout init-source [--repo <path>]");
+    println!(
+        "      Create or reuse the data-directory source repo at $SINOMO_DATA_DIR/source/sinomo."
+    );
+    println!("  sinomo rollout apply [--repo <path>] [--host <host>] [--port <port>]");
+    println!(
+        "      Build the data-directory source repo, install bin/sinomo-main and bin/sinomo-shadow, restart shadow supervision, then verify main health."
+    );
+    println!("  sinomo rollout status");
+    println!("      Show source, binary, and rollout state paths.");
 }
 
 fn print_models_help() {
@@ -2857,6 +4081,22 @@ pub enum CliError {
     LanguageModel(LanguageModelError),
     Evolution(sinomo_evolution::EvolutionError),
     Eval(sinomo_runtime::eval::EvalError),
+    DaemonAlreadyRunning {
+        lock_file: String,
+        detail: String,
+    },
+    DaemonNotRunning {
+        detail: String,
+    },
+    Network {
+        address: String,
+        detail: String,
+    },
+    Process {
+        command: String,
+        status: i32,
+        stderr: String,
+    },
 }
 
 impl CliError {
@@ -2932,6 +4172,26 @@ impl std::fmt::Display for CliError {
             Self::LanguageModel(error) => write!(formatter, "{error}"),
             Self::Evolution(error) => write!(formatter, "{error}"),
             Self::Eval(error) => write!(formatter, "{error}"),
+            Self::DaemonAlreadyRunning { lock_file, detail } => {
+                write!(
+                    formatter,
+                    "sinomo daemon is already running or locked at {lock_file}: {detail}"
+                )
+            }
+            Self::DaemonNotRunning { detail } => {
+                write!(formatter, "sinomo daemon is not running: {detail}")
+            }
+            Self::Network { address, detail } => {
+                write!(formatter, "network error at {address}: {detail}")
+            }
+            Self::Process {
+                command,
+                status,
+                stderr,
+            } => write!(
+                formatter,
+                "process `{command}` failed with status {status}: {stderr}"
+            ),
         }
     }
 }
@@ -2941,13 +4201,15 @@ impl std::error::Error for CliError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, CliError, EvolutionJobStatus, EvolutionPaths, InteractionModel,
-        InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+        CliCommand, CliError, DaemonCliCommand, DaemonProbeStatus, DaemonRunOptions,
+        EvolutionJobStatus, EvolutionPaths, InteractionModel, InteractionRuntime,
+        InteractionSession, InteractionSurface, InteractionSurfaceKind,
         ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
-        ProviderName, is_terminal_status, models_default_with_data_dir, normalize_model_provider,
-        parse_cli_command, parse_model_default_options, parse_models_list_options,
-        parse_propose_options, parse_provider_command, parse_slash_command, parse_usage_options,
-        run_cui_with_handler_io, run_evolve_command,
+        ProviderName, RolloutCliCommand, RolloutOptions, is_terminal_status,
+        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+        parse_daemon_command, parse_model_default_options, parse_models_list_options,
+        parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
+        parse_usage_options, run_cui_with_handler_io, run_evolve_command,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -2996,6 +4258,14 @@ mod tests {
             CliCommand::Help
         ));
         assert!(matches!(
+            parse_cli_command(&["daemon".to_string(), "status".to_string()]).expect("daemon"),
+            CliCommand::Daemon(DaemonCliCommand::Status(_))
+        ));
+        assert!(matches!(
+            parse_cli_command(&["daemon".to_string()]).expect("daemon help"),
+            CliCommand::Daemon(DaemonCliCommand::Help)
+        ));
+        assert!(matches!(
             parse_cli_command(&[
                 "providers".to_string(),
                 "test".to_string(),
@@ -3030,9 +4300,170 @@ mod tests {
             CliCommand::Providers(ProviderCliCommand::Help)
         ));
         assert!(matches!(
+            parse_cli_command(&["rollout".to_string(), "status".to_string()]).expect("rollout"),
+            CliCommand::Rollout(RolloutCliCommand::Status)
+        ));
+        assert!(matches!(
             parse_cli_command(&["evolve".to_string()]).expect("evolve help"),
             CliCommand::Evolve(super::EvolveCliCommand::Help)
         ));
+    }
+
+    #[test]
+    fn rollout_parser_accepts_apply_status_and_init_source() {
+        assert_eq!(
+            parse_rollout_command(&["status".to_string()]).expect("status"),
+            RolloutCliCommand::Status
+        );
+        assert_eq!(
+            parse_rollout_command(&["apply".to_string()]).expect("apply"),
+            RolloutCliCommand::Apply(RolloutOptions::default())
+        );
+        assert_eq!(
+            parse_rollout_command(&[
+                "init-source".to_string(),
+                "--repo".to_string(),
+                "/work/sinomo".to_string()
+            ])
+            .expect("init-source"),
+            RolloutCliCommand::InitSource(RolloutOptions {
+                repo: Some(std::path::PathBuf::from("/work/sinomo")),
+                host: "127.0.0.1".to_string(),
+                port: 21_353,
+            })
+        );
+    }
+
+    #[test]
+    fn rollout_parser_reuses_daemon_endpoint_defaults() {
+        assert_eq!(
+            parse_rollout_command(&[
+                "apply".to_string(),
+                "--host".to_string(),
+                "0.0.0.0".to_string(),
+                "--port".to_string(),
+                "21400".to_string()
+            ])
+            .expect("apply custom"),
+            RolloutCliCommand::Apply(RolloutOptions {
+                repo: None,
+                host: "0.0.0.0".to_string(),
+                port: 21_400,
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
+        assert_eq!(
+            parse_daemon_command(&["shadow".to_string(), "run".to_string()]).expect("shadow"),
+            DaemonCliCommand::ShadowRun(DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21_354,
+            })
+        );
+        assert_eq!(
+            parse_daemon_command(&["shadow".to_string(), "status".to_string()]).expect("shadow"),
+            DaemonCliCommand::ShadowStatus(DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21_354,
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_paths_for_shadow_are_separate_from_main_daemon() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-daemon-shadow-paths-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let main = super::DaemonPaths::new(&data_dir);
+        let shadow = super::DaemonPaths::for_shadow(&data_dir);
+
+        assert_eq!(main.root, root.join("daemon"));
+        assert_eq!(shadow.root, root.join("shadow-daemon"));
+        assert_ne!(main.lock, shadow.lock);
+        assert_ne!(main.status, shadow.status);
+    }
+
+    #[test]
+    fn daemon_parser_uses_port_21353_by_default() {
+        assert_eq!(
+            parse_daemon_command(&["run".to_string()]).expect("daemon run"),
+            DaemonCliCommand::Run(DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21_353,
+            })
+        );
+        assert_eq!(
+            parse_daemon_command(&["status".to_string()]).expect("daemon status"),
+            DaemonCliCommand::Status(DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21_353,
+            })
+        );
+        assert_eq!(
+            parse_daemon_command(&[
+                "run".to_string(),
+                "--host".to_string(),
+                "0.0.0.0".to_string(),
+                "--port".to_string(),
+                "21354".to_string(),
+            ])
+            .expect("daemon run custom"),
+            DaemonCliCommand::Run(DaemonRunOptions {
+                host: "0.0.0.0".to_string(),
+                port: 21_354,
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_paths_live_under_data_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-daemon-paths-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        let paths = super::DaemonPaths::new(&SinomoDataDir::new(&root));
+
+        assert_eq!(paths.root, root.join("daemon"));
+        assert_eq!(paths.lock, root.join("daemon").join("daemon.lock"));
+        assert_eq!(paths.status, root.join("daemon").join("status.json"));
+    }
+
+    #[test]
+    fn daemon_lock_prevents_duplicate_instances_and_preserves_probe_status() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-daemon-lock-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        let paths = super::DaemonPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("daemon paths");
+
+        let lock = super::DaemonLock::acquire(&paths, &DaemonRunOptions::default())
+            .expect("first daemon lock");
+        assert!(matches!(
+            super::probe_daemon_status(&paths, Duration::from_millis(1)),
+            DaemonProbeStatus::Locked { .. }
+        ));
+        assert!(super::DaemonLock::acquire(&paths, &DaemonRunOptions::default()).is_err());
+
+        drop(lock);
+        assert!(matches!(
+            super::probe_daemon_status(&paths, Duration::from_millis(1)),
+            DaemonProbeStatus::NotRunning
+        ));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

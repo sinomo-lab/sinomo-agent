@@ -59,6 +59,34 @@ Node examples:
 - `node.server.home`
 - `node.sensor.office`
 
+### Local Daemon / Service Mode
+
+The initial local service entry point is `sinomo daemon`. It is intentionally small: a foreground service command plus CLI controls that can be wrapped by systemd, launchd, a shell supervisor, or a future Sinomo-owned service manager.
+
+- `sinomo daemon run` runs the daemon in the foreground.
+- `sinomo daemon start` launches a detached local background process.
+- `sinomo daemon status` probes both the data-directory lock and the listener.
+- `sinomo daemon stop` asks the running daemon to shut down.
+- `sinomo daemon shadow run|start|status|stop` controls the shadow daemon on `127.0.0.1:21354` by default.
+
+The daemon listens on `127.0.0.1:21353` by default. The bind host and port can be overridden with `--host` and `--port`, but the default should remain stable so local tools can discover the service without a separate registry.
+
+Each daemon instance owns `$SINOMO_DATA_DIR/daemon/daemon.lock` and writes `$SINOMO_DATA_DIR/daemon/status.json`. The lock prevents duplicate local daemons for the same data directory. The status file records the PID, bind address, start time, data directory, and lock path so CLI commands can distinguish three cases: running and reachable, locked but not reachable, or not running. This probe path is the first local control-plane primitive for long-running background work such as scheduled evolution campaigns.
+
+### Self-Rollout Source and Shadow Daemon
+
+The first self-rollout path treats Sinomo's own source as durable node-local state. `sinomo rollout init-source` creates `$SINOMO_DATA_DIR/source/sinomo` by cloning the current repository unless a different `--repo` is supplied. When `sinomo evolve propose` does not receive an explicit `--repo` or configured repo, it uses this data-directory source repository so approved self-evolution work lands in Sinomo's maintained source rather than the operator's checkout.
+
+Approved evolution decisions commit the candidate worktree and fast-forward the source repository. Rollout is then an explicit local operation:
+
+- `sinomo rollout status` prints the data-directory source, installed main binary, installed shadow binary, and rollout state paths.
+- `sinomo rollout apply` builds `$SINOMO_DATA_DIR/source/sinomo` with `cargo build -p sinomo`.
+- The build log is written to `$SINOMO_DATA_DIR/rollout/build.log`.
+- The produced binary is copied atomically to `$SINOMO_DATA_DIR/bin/sinomo-main` and `$SINOMO_DATA_DIR/bin/sinomo-shadow`.
+- The main daemon is stopped, the shadow daemon is restarted from the installed shadow binary, and the shadow daemon starts the installed main binary and verifies it becomes healthy.
+
+The shadow daemon owns separate state under `$SINOMO_DATA_DIR/shadow-daemon/` so it does not contend with the main daemon's lock. Its steady-state responsibility is intentionally narrow: it supervises the main daemon process that it launched. If that process exits with a crash-class exit code or crash-class Unix signal, the shadow daemon records `$SINOMO_DATA_DIR/rollout/last-main-exit.json` and restarts the main daemon. If the main daemon exits cleanly or is terminated/killed by operator action, the shadow daemon records the event and does not restart it. This preserves a difference between real crashes and intentional intervention.
+
 ### Device Model
 
 A device represents a concrete source or action target associated with a node.
