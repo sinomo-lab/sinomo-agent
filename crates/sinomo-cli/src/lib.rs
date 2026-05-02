@@ -3,9 +3,12 @@
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
-    CandidateWorkspace, EvolutionOrchestrator, EvolutionReport, EvolutionRequest,
-    GitWorkspaceAdapter, LanguageModelMutationBridge, LocalCandidateBundleStore, MutationModel,
-    MutationModelError,
+    CampaignDecision as EvolutionCampaignDecision, CampaignDecisionKind, CampaignProposalRequest,
+    CampaignScheduleDecision, CandidateWorkspace, EvolutionCampaign, EvolutionCampaignStatus,
+    EvolutionOrchestrator, EvolutionReport, EvolutionRequest, GitWorkspaceAdapter,
+    LanguageModelMutationBridge, LocalCandidateBundleStore, MutationModel, MutationModelError,
+    ReserveFloor, ResourceClassDefinition, ResourceSchedulerDryRun, ResourceSchedulerDryRunRequest,
+    ResourceUsageEstimate, dry_run_resource_scheduler, propose_evolution_campaign,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -1988,6 +1991,7 @@ struct StoredEvolutionJob {
 struct EvolutionPaths {
     root: PathBuf,
     jobs: PathBuf,
+    campaigns: PathBuf,
     logs: PathBuf,
     config: PathBuf,
 }
@@ -1997,6 +2001,7 @@ impl EvolutionPaths {
         let root = data_dir.root().join("evolution");
         Self {
             jobs: root.join("jobs"),
+            campaigns: root.join("campaigns"),
             logs: root.join("logs"),
             config: root.join("config.json"),
             root,
@@ -2004,13 +2009,21 @@ impl EvolutionPaths {
     }
 
     fn ensure(&self) -> Result<(), CliError> {
-        for path in [&self.root, &self.jobs, &self.logs] {
+        for path in [&self.root, &self.jobs, &self.campaigns, &self.logs] {
             fs::create_dir_all(path).map_err(|source| CliError::Io {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             })?;
         }
         Ok(())
+    }
+
+    fn campaign_dir(&self, campaign_id: &str) -> PathBuf {
+        self.campaigns.join(campaign_id)
+    }
+
+    fn campaign_path(&self, campaign_id: &str) -> PathBuf {
+        self.campaign_dir(campaign_id).join("campaign.json")
     }
 
     fn job_dir(&self, job_id: &EvolutionJobId) -> PathBuf {
@@ -2026,10 +2039,47 @@ impl EvolutionPaths {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CampaignBundlePaths {
+    root: PathBuf,
+    campaign_json: PathBuf,
+    objective_card_json: PathBuf,
+    stages_json: PathBuf,
+    near_term_tasks_json: PathBuf,
+    resource_schedule_preview_json: PathBuf,
+    resource_ledger_json: PathBuf,
+    scheduler_dry_run_json: PathBuf,
+    lease_requests_jsonl: PathBuf,
+    lease_decisions_jsonl: PathBuf,
+    approval_checkpoint_json: PathBuf,
+    decisions_jsonl: PathBuf,
+}
+
+impl CampaignBundlePaths {
+    fn new(paths: &EvolutionPaths, campaign_id: &str) -> Self {
+        let root = paths.campaign_dir(campaign_id);
+        Self {
+            campaign_json: paths.campaign_path(campaign_id),
+            objective_card_json: root.join("objective-card.json"),
+            stages_json: root.join("stages.json"),
+            near_term_tasks_json: root.join("near-term-tasks.json"),
+            resource_schedule_preview_json: root.join("resource-schedule-preview.json"),
+            resource_ledger_json: root.join("resource-ledger.json"),
+            scheduler_dry_run_json: root.join("scheduler-dry-run.json"),
+            lease_requests_jsonl: root.join("lease-requests.jsonl"),
+            lease_decisions_jsonl: root.join("lease-decisions.jsonl"),
+            approval_checkpoint_json: root.join("approval-checkpoint.json"),
+            decisions_jsonl: root.join("decisions.jsonl"),
+            root,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum EvolveCliCommand {
     Help,
     Propose(Vec<String>),
+    Schedule(Vec<String>),
     Decide(CandidateDecisionOutcome, Vec<String>),
     Status(Vec<String>),
     Show(Vec<String>),
@@ -2048,6 +2098,9 @@ fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, CliError> {
         }
         Some((command, rest)) if command == "propose" => {
             Ok(EvolveCliCommand::Propose(rest.to_vec()))
+        }
+        Some((command, rest)) if command == "schedule" => {
+            Ok(EvolveCliCommand::Schedule(rest.to_vec()))
         }
         Some((command, rest)) if command == "approve" => Ok(EvolveCliCommand::Decide(
             CandidateDecisionOutcome::Approved,
@@ -2088,6 +2141,7 @@ fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), CliError> {
             Ok(())
         }
         EvolveCliCommand::Propose(args) => evolve_propose(&args),
+        EvolveCliCommand::Schedule(args) => evolve_schedule(&args),
         EvolveCliCommand::Decide(outcome, args) => evolve_decide(&args, outcome),
         EvolveCliCommand::Status(args) => evolve_status(&args),
         EvolveCliCommand::Show(args) => evolve_show(&args),
@@ -2109,6 +2163,7 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     let model_config = read_model_config(&ModelPaths::new(&data_dir)).ok();
     let repo = if let Some(repo) = options
         .repo
+        .clone()
         .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.repo)))
     {
         repo
@@ -2122,6 +2177,35 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
         ensure_source_repo(&rollout_paths, Some(&current_repo))?;
         rollout_paths.source_repo
     };
+
+    if options.dry_run || options.pause_after_proposal {
+        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: options.objective.clone(),
+            horizon: options
+                .horizon
+                .clone()
+                .unwrap_or_else(|| "30 days".to_string()),
+            budget_policy: options
+                .budget_policy
+                .clone()
+                .unwrap_or_else(|| "free-and-prepaid".to_string()),
+            reserve_floors: parse_reserve_floors(&options.reserve_floors)?,
+            approval_policy: options
+                .approval_policy
+                .clone()
+                .unwrap_or_else(|| "stage-rollout".to_string()),
+            max_wall_time: options.max_wall_time.clone(),
+            pause_after_proposal: options.pause_after_proposal,
+            dry_run: true,
+            approved: options.approve_campaign,
+            target_ring: options.target_ring.clone(),
+            source_repo: Some(repo.display().to_string()),
+        });
+        let bundle = write_campaign_bundle(&paths, &campaign)?;
+        println_campaign_proposal(&campaign, &bundle);
+        return Ok(());
+    }
+
     let provider = options
         .provider
         .or_else(|| {
@@ -2192,6 +2276,28 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
 
     write_report_record(&paths, &report)?;
     println_report(&report);
+    Ok(())
+}
+
+fn evolve_schedule(args: &[String]) -> Result<(), CliError> {
+    let options = parse_schedule_options(args)?;
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = EvolutionPaths::new(&data_dir);
+    paths.ensure()?;
+    if !options.dry_run {
+        return Err(CliError::Usage);
+    }
+    let mut campaign = read_campaign(&paths, &options.campaign_id)?;
+    let resources = parse_schedule_resources(&options.resources, &campaign)?;
+    let task_estimates = parse_schedule_estimates(&options.estimates, &campaign, &resources)?;
+    let dry_run = dry_run_resource_scheduler(ResourceSchedulerDryRunRequest {
+        campaign: campaign.clone(),
+        preview_horizon: "24h".to_string(),
+        resources,
+        task_estimates,
+    });
+    let bundle = write_campaign_schedule_dry_run(&paths, &mut campaign, &dry_run)?;
+    println_scheduler_dry_run(&dry_run, &bundle);
     Ok(())
 }
 
@@ -2593,12 +2699,12 @@ fn models_list(options: ModelListOptions) -> Result<(), CliError> {
         } else {
             provider_available_model_ids(&provider).ok()
         };
-        if let Some(models) = models
-            && !models.is_empty()
-        {
-            println!("{provider}:");
-            for model in models {
-                println!("  {model}");
+        if let Some(models) = models {
+            if !models.is_empty() {
+                println!("{provider}:");
+                for model in models {
+                    println!("  {model}");
+                }
             }
         }
     }
@@ -2988,6 +3094,13 @@ struct ProposeOptions {
     verify: Vec<String>,
     target_ring: TrustRing,
     dry_run: bool,
+    horizon: Option<String>,
+    budget_policy: Option<String>,
+    reserve_floors: Vec<String>,
+    approval_policy: Option<String>,
+    max_wall_time: Option<String>,
+    pause_after_proposal: bool,
+    approve_campaign: bool,
 }
 
 fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, CliError> {
@@ -2999,9 +3112,20 @@ fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, CliError> {
     let mut verify = Vec::new();
     let mut target_ring = TrustRing::R1TrustedRuntime;
     let mut dry_run = false;
+    let mut horizon = None;
+    let mut budget_policy = None;
+    let mut reserve_floors = Vec::new();
+    let mut approval_policy = None;
+    let mut max_wall_time = None;
+    let mut pause_after_proposal = false;
+    let mut approve_campaign = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--objective" => {
+                index += 1;
+                objective = args.get(index).cloned();
+            }
             "--provider" => {
                 index += 1;
                 provider = args.get(index).cloned();
@@ -3032,6 +3156,34 @@ fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, CliError> {
                     target_ring = parse_trust_ring(value)?;
                 }
             }
+            "--horizon" => {
+                index += 1;
+                horizon = args.get(index).cloned();
+            }
+            "--budget-policy" => {
+                index += 1;
+                budget_policy = args.get(index).cloned();
+            }
+            "--reserve" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    reserve_floors.push(value.clone());
+                }
+            }
+            "--approval" => {
+                index += 1;
+                approval_policy = args.get(index).cloned();
+            }
+            "--max-wall-time" => {
+                index += 1;
+                max_wall_time = args.get(index).cloned();
+            }
+            "--pause-after-proposal" => {
+                pause_after_proposal = true;
+            }
+            "--approve" => {
+                approve_campaign = true;
+            }
             "--dry-run" | "--no-model" => {
                 dry_run = true;
             }
@@ -3051,6 +3203,203 @@ fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, CliError> {
         verify,
         target_ring,
         dry_run,
+        horizon,
+        budget_policy,
+        reserve_floors,
+        approval_policy,
+        max_wall_time,
+        pause_after_proposal,
+        approve_campaign,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ScheduleOptions {
+    campaign_id: String,
+    resources: Vec<String>,
+    estimates: Vec<String>,
+    dry_run: bool,
+}
+
+fn parse_schedule_options(args: &[String]) -> Result<ScheduleOptions, CliError> {
+    let mut campaign_id = None;
+    let mut resources = Vec::new();
+    let mut estimates = Vec::new();
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--resource" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    resources.push(value.clone());
+                }
+            }
+            "--estimate" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    estimates.push(value.clone());
+                }
+            }
+            "--dry-run" | "--preview" => {
+                dry_run = true;
+            }
+            value if value.starts_with("--") => return Err(CliError::Usage),
+            value => {
+                if campaign_id.is_some() {
+                    return Err(CliError::Usage);
+                }
+                campaign_id = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    Ok(ScheduleOptions {
+        campaign_id: campaign_id.ok_or(CliError::Usage)?,
+        resources,
+        estimates,
+        dry_run,
+    })
+}
+
+fn parse_schedule_resources(
+    values: &[String],
+    campaign: &EvolutionCampaign,
+) -> Result<Vec<ResourceClassDefinition>, CliError> {
+    if values.is_empty() {
+        return Ok(campaign
+            .budget_policy
+            .reserve_floors
+            .iter()
+            .map(|floor| ResourceClassDefinition {
+                resource_id: floor.resource.clone(),
+                unit: "percent".to_string(),
+                total_units: 100,
+                used_units: 0,
+                reserve_floor_percent: floor.floor_percent,
+                reset_window: "current reset window".to_string(),
+                notes: "derived from campaign reserve-floor config".to_string(),
+            })
+            .collect());
+    }
+
+    values
+        .iter()
+        .map(|value| parse_schedule_resource(value, campaign))
+        .collect()
+}
+
+fn parse_schedule_resource(
+    value: &str,
+    campaign: &EvolutionCampaign,
+) -> Result<ResourceClassDefinition, CliError> {
+    let mut parts = value.split(':');
+    let resource_id = parts.next().unwrap_or_default().trim();
+    let usage = parts.next().ok_or_else(|| CliError::Parse {
+        detail: format!("resource `{value}` must look like resource:used/total[:reset-window]"),
+    })?;
+    let reset_window = parts.next().unwrap_or("current reset window");
+    if parts.next().is_some() || resource_id.is_empty() {
+        return Err(CliError::Parse {
+            detail: format!("resource `{value}` must look like resource:used/total[:reset-window]"),
+        });
+    }
+    let (used, total) = usage.split_once('/').ok_or_else(|| CliError::Parse {
+        detail: format!("resource `{value}` must include used/total units"),
+    })?;
+    let used_units = used.parse::<u64>().map_err(|source| CliError::Parse {
+        detail: format!("invalid used units in resource `{value}`: {source}"),
+    })?;
+    let total_units = total.parse::<u64>().map_err(|source| CliError::Parse {
+        detail: format!("invalid total units in resource `{value}`: {source}"),
+    })?;
+    if total_units == 0 || used_units > total_units {
+        return Err(CliError::Parse {
+            detail: format!("resource `{value}` must have 0 <= used <= total and total > 0"),
+        });
+    }
+    let reserve_floor_percent = campaign
+        .budget_policy
+        .reserve_floors
+        .iter()
+        .find(|floor| floor.resource == resource_id)
+        .map(|floor| floor.floor_percent)
+        .unwrap_or(0);
+    Ok(ResourceClassDefinition {
+        resource_id: resource_id.to_string(),
+        unit: "percent".to_string(),
+        total_units,
+        used_units,
+        reserve_floor_percent,
+        reset_window: reset_window.to_string(),
+        notes: "provided by schedule dry-run command".to_string(),
+    })
+}
+
+fn parse_schedule_estimates(
+    values: &[String],
+    campaign: &EvolutionCampaign,
+    resources: &[ResourceClassDefinition],
+) -> Result<Vec<ResourceUsageEstimate>, CliError> {
+    if values.is_empty() {
+        let Some(task) = campaign.near_term_tasks.first() else {
+            return Ok(Vec::new());
+        };
+        let resource = resources
+            .first()
+            .map(|resource| resource.resource_id.clone())
+            .unwrap_or_else(|| "local-agent-wall-time".to_string());
+        return Ok(vec![ResourceUsageEstimate {
+            task_id: task.task_id.clone(),
+            resource,
+            estimated_units: 10,
+            actual_units: None,
+        }]);
+    }
+
+    values
+        .iter()
+        .map(|value| parse_schedule_estimate(value, campaign))
+        .collect()
+}
+
+fn parse_schedule_estimate(
+    value: &str,
+    campaign: &EvolutionCampaign,
+) -> Result<ResourceUsageEstimate, CliError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let (task_id, resource, units) = match parts.as_slice() {
+        [resource, units] => {
+            let Some(task) = campaign.near_term_tasks.first() else {
+                return Err(CliError::Parse {
+                    detail: "cannot infer task id because campaign has no near-term tasks"
+                        .to_string(),
+                });
+            };
+            (task.task_id.clone(), resource.trim(), units.trim())
+        }
+        [task_id, resource, units] => (task_id.trim().to_string(), resource.trim(), units.trim()),
+        _ => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "estimate `{value}` must look like resource:units or task:resource:units"
+                ),
+            });
+        }
+    };
+    if resource.is_empty() || units.is_empty() {
+        return Err(CliError::Parse {
+            detail: format!("estimate `{value}` must include resource and units"),
+        });
+    }
+    let estimated_units = units.parse::<u64>().map_err(|source| CliError::Parse {
+        detail: format!("invalid estimated units in `{value}`: {source}"),
+    })?;
+    Ok(ResourceUsageEstimate {
+        task_id,
+        resource: resource.to_string(),
+        estimated_units,
+        actual_units: None,
     })
 }
 
@@ -3381,6 +3730,197 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
         path: path.display().to_string(),
         detail: source.to_string(),
     })
+}
+
+fn write_campaign_bundle(
+    paths: &EvolutionPaths,
+    campaign: &EvolutionCampaign,
+) -> Result<CampaignBundlePaths, CliError> {
+    let bundle = CampaignBundlePaths::new(paths, &campaign.campaign_id);
+    fs::create_dir_all(&bundle.root).map_err(|source| CliError::Io {
+        path: bundle.root.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    write_json(&bundle.campaign_json, campaign)?;
+    write_json(&bundle.objective_card_json, &campaign.objective_card)?;
+    write_json(&bundle.stages_json, &campaign.stages)?;
+    write_json(&bundle.near_term_tasks_json, &campaign.near_term_tasks)?;
+    write_json(
+        &bundle.resource_schedule_preview_json,
+        &campaign.resource_schedule_preview,
+    )?;
+    write_json(
+        &bundle.approval_checkpoint_json,
+        &campaign.approval_checkpoint,
+    )?;
+    let mut decisions = String::new();
+    for decision in &campaign.decisions {
+        decisions.push_str(
+            &serde_json::to_string(decision).map_err(|source| CliError::Json {
+                path: bundle.decisions_jsonl.display().to_string(),
+                detail: source.to_string(),
+            })?,
+        );
+        decisions.push('\n');
+    }
+    fs::write(&bundle.decisions_jsonl, decisions).map_err(|source| CliError::Io {
+        path: bundle.decisions_jsonl.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(bundle)
+}
+
+fn read_campaign(paths: &EvolutionPaths, campaign_id: &str) -> Result<EvolutionCampaign, CliError> {
+    let path = paths.campaign_path(campaign_id);
+    let content = fs::read_to_string(&path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn write_campaign_schedule_dry_run(
+    paths: &EvolutionPaths,
+    campaign: &mut EvolutionCampaign,
+    dry_run: &ResourceSchedulerDryRun,
+) -> Result<CampaignBundlePaths, CliError> {
+    let previous_status = campaign.status.clone();
+    campaign.status = match dry_run.aggregate_decision {
+        CampaignScheduleDecision::PausedBudget => EvolutionCampaignStatus::PausedBudget,
+        CampaignScheduleDecision::Delayed => EvolutionCampaignStatus::Scheduled,
+        CampaignScheduleDecision::Scheduled => EvolutionCampaignStatus::Scheduled,
+    };
+    campaign.updated_at = dry_run.generated_at.clone();
+    let decision_kind = if dry_run.aggregate_decision == CampaignScheduleDecision::PausedBudget {
+        CampaignDecisionKind::Paused
+    } else if matches!(previous_status, EvolutionCampaignStatus::PausedBudget) {
+        CampaignDecisionKind::Resumed
+    } else {
+        CampaignDecisionKind::ResourcePolicySelected
+    };
+    campaign.decisions.push(EvolutionCampaignDecision {
+        decision_id: format!("decision_{}", campaign.decisions.len() + 1),
+        kind: decision_kind,
+        summary: match dry_run.aggregate_decision {
+            CampaignScheduleDecision::PausedBudget => {
+                "Paused because one or more resource leases would violate reserve floors"
+                    .to_string()
+            }
+            CampaignScheduleDecision::Delayed => {
+                "Delayed because the scheduler had no runnable lease requests".to_string()
+            }
+            CampaignScheduleDecision::Scheduled => {
+                "Scheduled because all previewed resource leases preserve reserve floors"
+                    .to_string()
+            }
+        },
+        rationale:
+            "Phase 1 resource scheduler dry run gates dispatch before any agent work starts."
+                .to_string(),
+        evidence_refs: vec![
+            "scheduler-dry-run.json".to_string(),
+            "resource-ledger.json".to_string(),
+            "lease-decisions.jsonl".to_string(),
+        ],
+        decided_by: "sinomo evolve schedule --dry-run".to_string(),
+        decided_at: dry_run.generated_at.clone(),
+    });
+
+    let bundle = write_campaign_bundle(paths, campaign)?;
+    write_json(&bundle.resource_ledger_json, &dry_run.resource_ledger)?;
+    write_json(&bundle.scheduler_dry_run_json, dry_run)?;
+    write_jsonl(&bundle.lease_requests_jsonl, &dry_run.lease_requests)?;
+    write_jsonl(&bundle.lease_decisions_jsonl, &dry_run.lease_decisions)?;
+    Ok(bundle)
+}
+
+fn write_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let mut lines = String::new();
+    for value in values {
+        lines.push_str(
+            &serde_json::to_string(value).map_err(|source| CliError::Json {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?,
+        );
+        lines.push('\n');
+    }
+    fs::write(path, lines).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn parse_reserve_floors(values: &[String]) -> Result<Vec<ReserveFloor>, CliError> {
+    values
+        .iter()
+        .map(|value| parse_reserve_floor(value))
+        .collect()
+}
+
+fn parse_reserve_floor(value: &str) -> Result<ReserveFloor, CliError> {
+    let (resource, floor) = value.rsplit_once(':').ok_or_else(|| CliError::Parse {
+        detail: format!("reserve floor `{value}` must look like resource:30%"),
+    })?;
+    let floor = floor
+        .trim_end_matches('%')
+        .parse::<u8>()
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid reserve floor `{value}`: {source}"),
+        })?;
+    if floor > 100 || resource.trim().is_empty() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "reserve floor `{value}` must have a non-empty resource and 0-100 percent"
+            ),
+        });
+    }
+    Ok(ReserveFloor {
+        resource: resource.to_string(),
+        floor_percent: floor,
+    })
+}
+
+fn println_campaign_proposal(campaign: &EvolutionCampaign, bundle: &CampaignBundlePaths) {
+    println!("campaign: {}", campaign.campaign_id);
+    println!("status: {:?}", campaign.status);
+    println!("objective: {}", campaign.objective_card.human_text);
+    println!("horizon: {}", campaign.objective_card.initial_horizon);
+    println!("budget policy: {}", campaign.budget_policy.policy_id);
+    println!("approval: {:?}", campaign.approval_checkpoint.status);
+    println!("bundle: {}", bundle.root.display());
+    println!("campaign json: {}", bundle.campaign_json.display());
+    println!("stages: {}", campaign.stages.len());
+    println!("near-term tasks: {}", campaign.near_term_tasks.len());
+}
+
+fn println_scheduler_dry_run(dry_run: &ResourceSchedulerDryRun, bundle: &CampaignBundlePaths) {
+    println!("campaign: {}", dry_run.campaign_id);
+    println!("scheduler decision: {:?}", dry_run.aggregate_decision);
+    println!("preview horizon: {}", dry_run.preview_horizon);
+    println!("current reset window: {}", dry_run.current_reset_window);
+    println!("resource ledger: {}", bundle.resource_ledger_json.display());
+    println!(
+        "scheduler dry run: {}",
+        bundle.scheduler_dry_run_json.display()
+    );
+    println!("lease requests: {}", dry_run.lease_requests.len());
+    println!("lease decisions: {}", dry_run.lease_decisions.len());
+    for task in &dry_run.task_decisions {
+        println!(
+            "task {}: {:?} ({})",
+            task.task_id, task.decision, task.explanation
+        );
+    }
 }
 
 fn println_report(report: &EvolutionReport) {
@@ -4032,6 +4572,18 @@ fn print_evolve_help() {
     println!(
         "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"]"
     );
+    println!(
+        "      With --dry-run or --pause-after-proposal, write a phase-0 campaign bundle under $SINOMO_DATA_DIR/evolution/campaigns/."
+    );
+    println!(
+        "      Campaign flags: --objective <text> --horizon <duration> --budget-policy <policy> --reserve <resource:percent%> --approval <policy> --max-wall-time <duration> [--approve]"
+    );
+    println!(
+        "  sinomo evolve schedule <campaign> --dry-run [--resource <resource:used/total[:window]>] [--estimate <resource:units>]"
+    );
+    println!(
+        "      Write phase-1 resource-ledger, lease request/decision, scheduler dry-run, and pause/schedule decision artifacts."
+    );
     println!("  sinomo evolve approve [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
@@ -4491,6 +5043,271 @@ mod tests {
         assert_eq!(options.verify, vec!["cargo test -p sinomo-eval"]);
         assert_eq!(options.target_ring, TrustRing::R1TrustedRuntime);
         assert!(options.dry_run);
+    }
+
+    #[test]
+    fn evolve_propose_parser_accepts_campaign_phase_zero_flags() {
+        let options = parse_propose_options(&[
+            "--objective".to_string(),
+            "speedrun minecraft".to_string(),
+            "--horizon".to_string(),
+            "30 days".to_string(),
+            "--budget-policy".to_string(),
+            "free-and-prepaid".to_string(),
+            "--reserve".to_string(),
+            "coding-plan-weekly:30%".to_string(),
+            "--reserve".to_string(),
+            "free-api-openrouter:40%".to_string(),
+            "--approval".to_string(),
+            "stage-rollout".to_string(),
+            "--max-wall-time".to_string(),
+            "10m".to_string(),
+            "--pause-after-proposal".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .expect("options");
+
+        assert_eq!(options.objective, "speedrun minecraft");
+        assert_eq!(options.horizon.as_deref(), Some("30 days"));
+        assert_eq!(options.budget_policy.as_deref(), Some("free-and-prepaid"));
+        assert_eq!(
+            options.reserve_floors,
+            vec!["coding-plan-weekly:30%", "free-api-openrouter:40%"]
+        );
+        assert_eq!(options.approval_policy.as_deref(), Some("stage-rollout"));
+        assert_eq!(options.max_wall_time.as_deref(), Some("10m"));
+        assert!(options.pause_after_proposal);
+        assert!(options.dry_run);
+    }
+
+    #[test]
+    fn evolve_schedule_parser_accepts_phase_one_resource_dry_run_flags() {
+        let command = super::parse_evolve_command(&[
+            "schedule".to_string(),
+            "camp_demo".to_string(),
+            "--resource".to_string(),
+            "coding-plan-weekly:65/100:weekly".to_string(),
+            "--estimate".to_string(),
+            "coding-plan-weekly:10".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .expect("schedule command");
+        assert!(matches!(command, super::EvolveCliCommand::Schedule(_)));
+
+        let options = super::parse_schedule_options(&[
+            "camp_demo".to_string(),
+            "--resource".to_string(),
+            "coding-plan-weekly:65/100:weekly".to_string(),
+            "--estimate".to_string(),
+            "coding-plan-weekly:10".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .expect("schedule options");
+
+        assert_eq!(options.campaign_id, "camp_demo");
+        assert_eq!(options.resources, vec!["coding-plan-weekly:65/100:weekly"]);
+        assert_eq!(options.estimates, vec!["coding-plan-weekly:10"]);
+        assert!(options.dry_run);
+    }
+
+    #[test]
+    fn campaign_scheduler_dry_run_persists_phase_one_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-campaign-schedule-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let mut campaign = sinomo_evolution::propose_evolution_campaign(
+            sinomo_evolution::CampaignProposalRequest {
+                objective: "improve scheduler".to_string(),
+                horizon: "14 days".to_string(),
+                budget_policy: "free-and-prepaid".to_string(),
+                reserve_floors: vec![sinomo_evolution::ReserveFloor {
+                    resource: "coding-plan-weekly".to_string(),
+                    floor_percent: 30,
+                }],
+                approval_policy: "stage-rollout".to_string(),
+                max_wall_time: Some("10m".to_string()),
+                pause_after_proposal: false,
+                dry_run: true,
+                approved: true,
+                target_ring: TrustRing::R1TrustedRuntime,
+                source_repo: Some("/repo".to_string()),
+            },
+        );
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let _bundle = super::write_campaign_bundle(&paths, &campaign).expect("bundle");
+        let dry_run = sinomo_evolution::dry_run_resource_scheduler(
+            sinomo_evolution::ResourceSchedulerDryRunRequest {
+                campaign: campaign.clone(),
+                preview_horizon: "24h".to_string(),
+                resources: vec![sinomo_evolution::ResourceClassDefinition {
+                    resource_id: "coding-plan-weekly".to_string(),
+                    unit: "percent".to_string(),
+                    total_units: 100,
+                    used_units: 65,
+                    reserve_floor_percent: 30,
+                    reset_window: "weekly".to_string(),
+                    notes: "test budget".to_string(),
+                }],
+                task_estimates: vec![sinomo_evolution::ResourceUsageEstimate {
+                    task_id,
+                    resource: "coding-plan-weekly".to_string(),
+                    estimated_units: 10,
+                    actual_units: Some(65),
+                }],
+            },
+        );
+
+        let bundle = super::write_campaign_schedule_dry_run(&paths, &mut campaign, &dry_run)
+            .expect("scheduler artifacts");
+
+        assert!(bundle.resource_ledger_json.exists());
+        assert!(bundle.scheduler_dry_run_json.exists());
+        assert!(bundle.lease_requests_jsonl.exists());
+        assert!(bundle.lease_decisions_jsonl.exists());
+        let persisted: sinomo_evolution::EvolutionCampaign = serde_json::from_str(
+            &std::fs::read_to_string(&bundle.campaign_json).expect("campaign json"),
+        )
+        .expect("campaign parse");
+        assert_eq!(
+            persisted.status,
+            sinomo_evolution::EvolutionCampaignStatus::PausedBudget
+        );
+        assert!(
+            std::fs::read_to_string(&bundle.decisions_jsonl)
+                .expect("decisions jsonl")
+                .contains("Paused")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn campaign_scheduler_dry_run_records_resume_when_budget_recovers() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-campaign-resume-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let mut campaign = sinomo_evolution::propose_evolution_campaign(
+            sinomo_evolution::CampaignProposalRequest {
+                objective: "improve scheduler".to_string(),
+                horizon: "14 days".to_string(),
+                budget_policy: "free-and-prepaid".to_string(),
+                reserve_floors: vec![sinomo_evolution::ReserveFloor {
+                    resource: "coding-plan-weekly".to_string(),
+                    floor_percent: 30,
+                }],
+                approval_policy: "stage-rollout".to_string(),
+                max_wall_time: Some("10m".to_string()),
+                pause_after_proposal: false,
+                dry_run: true,
+                approved: true,
+                target_ring: TrustRing::R1TrustedRuntime,
+                source_repo: Some("/repo".to_string()),
+            },
+        );
+        campaign.status = sinomo_evolution::EvolutionCampaignStatus::PausedBudget;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        super::write_campaign_bundle(&paths, &campaign).expect("bundle");
+        let dry_run = sinomo_evolution::dry_run_resource_scheduler(
+            sinomo_evolution::ResourceSchedulerDryRunRequest {
+                campaign: campaign.clone(),
+                preview_horizon: "24h".to_string(),
+                resources: vec![sinomo_evolution::ResourceClassDefinition {
+                    resource_id: "coding-plan-weekly".to_string(),
+                    unit: "percent".to_string(),
+                    total_units: 100,
+                    used_units: 20,
+                    reserve_floor_percent: 30,
+                    reset_window: "weekly".to_string(),
+                    notes: "test budget".to_string(),
+                }],
+                task_estimates: vec![sinomo_evolution::ResourceUsageEstimate {
+                    task_id,
+                    resource: "coding-plan-weekly".to_string(),
+                    estimated_units: 10,
+                    actual_units: Some(20),
+                }],
+            },
+        );
+
+        let bundle = super::write_campaign_schedule_dry_run(&paths, &mut campaign, &dry_run)
+            .expect("scheduler artifacts");
+
+        let persisted: sinomo_evolution::EvolutionCampaign = serde_json::from_str(
+            &std::fs::read_to_string(&bundle.campaign_json).expect("campaign json"),
+        )
+        .expect("campaign parse");
+        assert_eq!(
+            persisted.status,
+            sinomo_evolution::EvolutionCampaignStatus::Scheduled
+        );
+        assert!(
+            std::fs::read_to_string(&bundle.decisions_jsonl)
+                .expect("decisions jsonl")
+                .contains("Resumed")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn campaign_writer_persists_phase_zero_bundle_under_data_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-campaign-bundle-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let campaign = sinomo_evolution::propose_evolution_campaign(
+            sinomo_evolution::CampaignProposalRequest {
+                objective: "improve scheduler".to_string(),
+                horizon: "14 days".to_string(),
+                budget_policy: "free-and-prepaid".to_string(),
+                reserve_floors: vec![sinomo_evolution::ReserveFloor {
+                    resource: "coding-plan-weekly".to_string(),
+                    floor_percent: 25,
+                }],
+                approval_policy: "stage-rollout".to_string(),
+                max_wall_time: Some("10m".to_string()),
+                pause_after_proposal: true,
+                dry_run: true,
+                approved: false,
+                target_ring: TrustRing::R1TrustedRuntime,
+                source_repo: Some("/repo".to_string()),
+            },
+        );
+
+        let bundle = super::write_campaign_bundle(&paths, &campaign).expect("bundle");
+
+        assert_eq!(bundle.root, paths.campaign_dir(&campaign.campaign_id));
+        assert!(bundle.campaign_json.exists());
+        assert!(bundle.objective_card_json.exists());
+        assert!(bundle.stages_json.exists());
+        assert!(bundle.near_term_tasks_json.exists());
+        assert!(bundle.resource_schedule_preview_json.exists());
+        assert!(bundle.approval_checkpoint_json.exists());
+        assert!(bundle.decisions_jsonl.exists());
+        let persisted: sinomo_evolution::EvolutionCampaign = serde_json::from_str(
+            &std::fs::read_to_string(&bundle.campaign_json).expect("campaign json"),
+        )
+        .expect("campaign parse");
+        assert_eq!(persisted.campaign_id, campaign.campaign_id);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

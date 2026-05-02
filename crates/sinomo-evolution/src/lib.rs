@@ -64,6 +64,1075 @@ pub struct EvolutionRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CampaignProposalRequest {
+    pub objective: String,
+    pub horizon: String,
+    pub budget_policy: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserve_floors: Vec<ReserveFloor>,
+    pub approval_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wall_time: Option<String>,
+    #[serde(default)]
+    pub pause_after_proposal: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub approved: bool,
+    pub target_ring: TrustRing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionCampaign {
+    pub campaign_id: String,
+    pub status: EvolutionCampaignStatus,
+    pub objective_card: ObjectiveCard,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<EvolutionStage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub near_term_tasks: Vec<NearTermEvolutionTask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iteration_results: Vec<EvolutionIterationResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<CampaignDecision>,
+    pub budget_policy: CampaignBudgetPolicy,
+    pub resource_schedule_preview: ResourceSchedulePreview,
+    pub approval_checkpoint: ApprovalCheckpoint,
+    pub target_ring: TrustRing,
+    pub dry_run: bool,
+    pub capability_registry_required: Option<bool>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum EvolutionCampaignStatus {
+    Draft,
+    AwaitingApproval,
+    Approved,
+    Scheduled,
+    Running,
+    PausedBudget,
+    PausedPolicy,
+    PausedHuman,
+    StageComplete,
+    Complete,
+    Cancelled,
+    Superseded,
+    FailedExhausted,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ObjectiveCard {
+    pub objective_id: String,
+    pub human_text: String,
+    pub interpreted_goal: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_goals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub success_metrics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_conditions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safety_notes: Vec<String>,
+    pub resource_policy: String,
+    pub approval_policy: String,
+    pub initial_horizon: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions_needing_human_review: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionStage {
+    pub stage_id: String,
+    pub name: String,
+    pub purpose: String,
+    pub baseline: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_metrics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regression_gates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_task_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eval_suite: Vec<String>,
+    pub estimated_budget: String,
+    pub promotion_policy: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_conditions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NearTermEvolutionTask {
+    pub task_id: String,
+    pub stage_id: String,
+    pub title: String,
+    pub objective: String,
+    pub rationale: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_commands: Vec<String>,
+    pub estimated_budget: String,
+    pub approval_required: bool,
+    pub expected_result_kind: EvolutionResultKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum EvolutionResultKind {
+    Patch,
+    Artifact,
+    Evaluator,
+    Instrumentation,
+    FoundationRepair,
+    TaskReplacementProposal,
+    Documentation,
+    RolloutGuard,
+    Other(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionIterationResult {
+    pub iteration_id: String,
+    pub task_id: String,
+    pub result_kind: EvolutionResultKind,
+    pub status: EvolutionIterationStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum EvolutionIterationStatus {
+    Proposed,
+    ResourceLeaseRequested,
+    ResourceLeaseGranted,
+    AgentRunning,
+    CandidateProduced,
+    Evaluating,
+    AwaitingRolloutApproval,
+    RollingOut,
+    RolledOut,
+    Rejected,
+    RolledBack,
+    Adapted,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CampaignDecision {
+    pub decision_id: String,
+    pub kind: CampaignDecisionKind,
+    pub summary: String,
+    pub rationale: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub decided_by: String,
+    pub decided_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum CampaignDecisionKind {
+    ProposalCreated,
+    Approved,
+    Rejected,
+    Edited,
+    TaskSelected,
+    ResourcePolicySelected,
+    Paused,
+    Resumed,
+    StagePromoted,
+    DirectionChanged,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CampaignBudgetPolicy {
+    pub policy_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserve_floors: Vec<ReserveFloor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduling_notes: Vec<String>,
+    pub confidence: String,
+    pub debt_note: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ReserveFloor {
+    pub resource: String,
+    pub floor_percent: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceSchedulePreview {
+    pub horizon: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ResourceScheduleEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceScheduleEntry {
+    pub resource: String,
+    pub window: String,
+    pub planned_use: String,
+    pub reserve_floor: String,
+    pub notes: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ApprovalCheckpoint {
+    pub policy: String,
+    pub status: ApprovalCheckpointStatus,
+    pub required_before: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editable_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub possible_actions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum ApprovalCheckpointStatus {
+    AwaitingHuman,
+    Approved,
+    Rejected,
+    Edited,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceSchedulerDryRunRequest {
+    pub campaign: EvolutionCampaign,
+    pub preview_horizon: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceClassDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_estimates: Vec<ResourceUsageEstimate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceClassDefinition {
+    pub resource_id: String,
+    pub unit: String,
+    pub total_units: u64,
+    pub used_units: u64,
+    pub reserve_floor_percent: u8,
+    pub reset_window: String,
+    pub notes: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceUsageEstimate {
+    pub task_id: String,
+    pub resource: String,
+    pub estimated_units: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_units: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceSchedulerDryRun {
+    pub campaign_id: String,
+    pub aggregate_decision: CampaignScheduleDecision,
+    pub preview_horizon: String,
+    pub current_reset_window: String,
+    pub resource_ledger: ResourceLedger,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_requests: Vec<ResourceLeaseRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_decisions: Vec<ResourceLeaseDecision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_decisions: Vec<TaskScheduleDecision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_24h_preview: Vec<Next24hScheduleEntry>,
+    pub generated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum CampaignScheduleDecision {
+    Scheduled,
+    Delayed,
+    PausedBudget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceLedger {
+    pub ledger_id: String,
+    pub campaign_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceClassDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_records: Vec<ResourceUsageRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_records: Vec<ResourceLeaseDecision>,
+    pub generated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceUsageRecord {
+    pub task_id: String,
+    pub resource: String,
+    pub estimated_units: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_units: Option<u64>,
+    pub reset_window: String,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceLeaseRequest {
+    pub request_id: String,
+    pub campaign_id: String,
+    pub task_id: String,
+    pub resource: String,
+    pub estimated_units: u64,
+    pub requested_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResourceLeaseDecision {
+    pub decision_id: String,
+    pub request_id: String,
+    pub resource: String,
+    pub outcome: ResourceLeaseOutcome,
+    pub reason: String,
+    pub reserve_floor_percent: u8,
+    pub used_before_units: u64,
+    pub estimated_units: u64,
+    pub used_after_units: u64,
+    pub total_units: u64,
+    pub decided_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum ResourceLeaseOutcome {
+    Granted,
+    Denied,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TaskScheduleDecision {
+    pub task_id: String,
+    pub decision: TaskScheduleDecisionKind,
+    pub resource: String,
+    pub explanation: String,
+    pub lease_decision_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum TaskScheduleDecisionKind {
+    RunNow,
+    Delayed,
+    PausedBudget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct Next24hScheduleEntry {
+    pub task_id: String,
+    pub resource: String,
+    pub reset_window: String,
+    pub planned_start: String,
+    pub decision: TaskScheduleDecisionKind,
+    pub explanation: String,
+}
+
+pub fn dry_run_resource_scheduler(
+    request: ResourceSchedulerDryRunRequest,
+) -> ResourceSchedulerDryRun {
+    let now = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    let resources = if request.resources.is_empty() {
+        default_resource_classes(&request.campaign)
+    } else {
+        request.resources
+    };
+    let task_estimates = if request.task_estimates.is_empty() {
+        default_resource_usage_estimates(&request.campaign, &resources)
+    } else {
+        request.task_estimates
+    };
+    let current_reset_window = resources
+        .first()
+        .map(|resource| resource.reset_window.clone())
+        .unwrap_or_else(|| "no reset window configured".to_string());
+    let mut planned_usage: Vec<(String, u64)> = resources
+        .iter()
+        .map(|resource| (resource.resource_id.clone(), resource.used_units))
+        .collect();
+    let mut lease_requests = Vec::new();
+    let mut lease_decisions = Vec::new();
+    let mut task_decisions = Vec::new();
+    let mut next_24h_preview = Vec::new();
+    let mut usage_records = Vec::new();
+
+    for estimate in task_estimates {
+        let resource = resource_for_estimate(&resources, &estimate.resource);
+        let used_before = planned_usage
+            .iter()
+            .find(|(resource_id, _)| resource_id == &resource.resource_id)
+            .map(|(_, used)| *used)
+            .unwrap_or(resource.used_units);
+        let used_after = used_before.saturating_add(estimate.estimated_units);
+        let reserve_floor_units =
+            reserve_floor_units(resource.total_units, resource.reserve_floor_percent);
+        let spendable_ceiling = resource.total_units.saturating_sub(reserve_floor_units);
+        let request_id = generated_id("lease_req");
+        let lease_request = ResourceLeaseRequest {
+            request_id: request_id.clone(),
+            campaign_id: request.campaign.campaign_id.clone(),
+            task_id: estimate.task_id.clone(),
+            resource: resource.resource_id.clone(),
+            estimated_units: estimate.estimated_units,
+            requested_at: now.clone(),
+        };
+        let (outcome, task_decision, reason) = if used_after <= spendable_ceiling {
+            if let Some((_, used)) = planned_usage
+                .iter_mut()
+                .find(|(resource_id, _)| resource_id == &resource.resource_id)
+            {
+                *used = used_after;
+            }
+            (
+                ResourceLeaseOutcome::Granted,
+                TaskScheduleDecisionKind::RunNow,
+                format!(
+                    "grant: estimated use {} {} keeps {} at {}/{}; reserve floor remains protected at {}%",
+                    estimate.estimated_units,
+                    resource.unit,
+                    resource.resource_id,
+                    used_after,
+                    resource.total_units,
+                    resource.reserve_floor_percent
+                ),
+            )
+        } else {
+            (
+                ResourceLeaseOutcome::Denied,
+                TaskScheduleDecisionKind::PausedBudget,
+                format!(
+                    "deny: estimated use {} {} would move {} from {}/{} to {}/{} and violate reserve floor {}%",
+                    estimate.estimated_units,
+                    resource.unit,
+                    resource.resource_id,
+                    used_before,
+                    resource.total_units,
+                    used_after,
+                    resource.total_units,
+                    resource.reserve_floor_percent
+                ),
+            )
+        };
+        let decision_id = generated_id("lease_decision");
+        let lease_decision = ResourceLeaseDecision {
+            decision_id: decision_id.clone(),
+            request_id,
+            resource: resource.resource_id.clone(),
+            outcome,
+            reason: reason.clone(),
+            reserve_floor_percent: resource.reserve_floor_percent,
+            used_before_units: used_before,
+            estimated_units: estimate.estimated_units,
+            used_after_units: used_after,
+            total_units: resource.total_units,
+            decided_at: now.clone(),
+        };
+        usage_records.push(ResourceUsageRecord {
+            task_id: estimate.task_id.clone(),
+            resource: resource.resource_id.clone(),
+            estimated_units: estimate.estimated_units,
+            actual_units: estimate.actual_units,
+            reset_window: resource.reset_window.clone(),
+            recorded_at: now.clone(),
+        });
+        task_decisions.push(TaskScheduleDecision {
+            task_id: estimate.task_id.clone(),
+            decision: task_decision.clone(),
+            resource: resource.resource_id.clone(),
+            explanation: reason.clone(),
+            lease_decision_id: decision_id,
+        });
+        next_24h_preview.push(Next24hScheduleEntry {
+            task_id: estimate.task_id,
+            resource: resource.resource_id.clone(),
+            reset_window: resource.reset_window.clone(),
+            planned_start: if task_decision == TaskScheduleDecisionKind::RunNow {
+                "now".to_string()
+            } else {
+                "after reset or human budget review".to_string()
+            },
+            decision: task_decision,
+            explanation: reason,
+        });
+        lease_requests.push(lease_request);
+        lease_decisions.push(lease_decision);
+    }
+
+    let aggregate_decision = if lease_decisions
+        .iter()
+        .any(|decision| decision.outcome == ResourceLeaseOutcome::Denied)
+    {
+        CampaignScheduleDecision::PausedBudget
+    } else if lease_decisions.is_empty() {
+        CampaignScheduleDecision::Delayed
+    } else {
+        CampaignScheduleDecision::Scheduled
+    };
+    let resource_ledger = ResourceLedger {
+        ledger_id: generated_id("ledger"),
+        campaign_id: request.campaign.campaign_id.clone(),
+        resources,
+        usage_records,
+        lease_records: lease_decisions.clone(),
+        generated_at: now.clone(),
+    };
+
+    ResourceSchedulerDryRun {
+        campaign_id: request.campaign.campaign_id,
+        aggregate_decision,
+        preview_horizon: request.preview_horizon,
+        current_reset_window,
+        resource_ledger,
+        lease_requests,
+        lease_decisions,
+        task_decisions,
+        next_24h_preview,
+        generated_at: now,
+    }
+}
+
+fn default_resource_classes(campaign: &EvolutionCampaign) -> Vec<ResourceClassDefinition> {
+    if campaign.budget_policy.reserve_floors.is_empty() {
+        return vec![ResourceClassDefinition {
+            resource_id: "local-agent-wall-time".to_string(),
+            unit: "percent".to_string(),
+            total_units: 100,
+            used_units: 0,
+            reserve_floor_percent: 0,
+            reset_window: "current 24h preview window".to_string(),
+            notes:
+                "default dry-run resource; replace with configured resource classes before dispatch"
+                    .to_string(),
+        }];
+    }
+    campaign
+        .budget_policy
+        .reserve_floors
+        .iter()
+        .map(|floor| ResourceClassDefinition {
+            resource_id: floor.resource.clone(),
+            unit: "percent".to_string(),
+            total_units: 100,
+            used_units: 0,
+            reserve_floor_percent: floor.floor_percent,
+            reset_window: "current reset window".to_string(),
+            notes: "derived from campaign reserve-floor config".to_string(),
+        })
+        .collect()
+}
+
+fn default_resource_usage_estimates(
+    campaign: &EvolutionCampaign,
+    resources: &[ResourceClassDefinition],
+) -> Vec<ResourceUsageEstimate> {
+    let Some(task) = campaign.near_term_tasks.first() else {
+        return Vec::new();
+    };
+    let resource = resources
+        .first()
+        .map(|resource| resource.resource_id.clone())
+        .unwrap_or_else(|| "local-agent-wall-time".to_string());
+    vec![ResourceUsageEstimate {
+        task_id: task.task_id.clone(),
+        resource,
+        estimated_units: 10,
+        actual_units: None,
+    }]
+}
+
+fn resource_for_estimate<'a>(
+    resources: &'a [ResourceClassDefinition],
+    resource_id: &str,
+) -> &'a ResourceClassDefinition {
+    resources
+        .iter()
+        .find(|resource| resource.resource_id == resource_id)
+        .or_else(|| resources.first())
+        .expect("resource scheduler dry run requires at least one resource")
+}
+
+fn reserve_floor_units(total_units: u64, reserve_floor_percent: u8) -> u64 {
+    (total_units.saturating_mul(reserve_floor_percent as u64) + 99) / 100
+}
+
+pub fn propose_evolution_campaign(request: CampaignProposalRequest) -> EvolutionCampaign {
+    let now = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    let campaign_id = generated_id("camp");
+    let objective_id = generated_id("objcard");
+    let objective_kind = classify_objective(&request.objective);
+    let stages = stages_for_objective(objective_kind);
+    let near_term_tasks = tasks_for_objective(objective_kind, &stages);
+    let budget_policy = CampaignBudgetPolicy {
+        policy_id: request.budget_policy.clone(),
+        reserve_floors: request.reserve_floors.clone(),
+        scheduling_notes: budget_notes(&request),
+        confidence: "estimated: no live resource ledger in phase 0".to_string(),
+        debt_note:
+            "Phase 1 must replace this preview with lease accounting and reset-window state."
+                .to_string(),
+    };
+    let status = if request.approved {
+        EvolutionCampaignStatus::Approved
+    } else {
+        EvolutionCampaignStatus::AwaitingApproval
+    };
+    let approval_status = if request.approved {
+        ApprovalCheckpointStatus::Approved
+    } else {
+        ApprovalCheckpointStatus::AwaitingHuman
+    };
+
+    EvolutionCampaign {
+        campaign_id: campaign_id.clone(),
+        status,
+        objective_card: ObjectiveCard {
+            objective_id,
+            human_text: request.objective.clone(),
+            interpreted_goal: interpreted_goal(objective_kind, &request.objective),
+            non_goals: non_goals(objective_kind),
+            assumptions: assumptions(objective_kind),
+            constraints: proposal_constraints(&request),
+            success_metrics: success_metrics(objective_kind),
+            failure_conditions: failure_conditions(objective_kind, &request.reserve_floors),
+            safety_notes: safety_notes(objective_kind),
+            resource_policy: request.budget_policy.clone(),
+            approval_policy: request.approval_policy.clone(),
+            initial_horizon: request.horizon.clone(),
+            assumptions_needing_human_review: vec![
+                "Confirm objective interpretation, target environment, spending boundaries, and approval policy before scheduled execution.".to_string(),
+            ],
+        },
+        stages,
+        near_term_tasks,
+        iteration_results: Vec::new(),
+        decisions: vec![CampaignDecision {
+            decision_id: generated_id("decision"),
+            kind: CampaignDecisionKind::ProposalCreated,
+            summary: "Created phase-0 long-horizon campaign proposal without agent execution.".to_string(),
+            rationale: "Phase 0 is proposal-only: persist an inspectable campaign bundle with stages, tasks, budgets, and approval state before dispatching implementation agents.".to_string(),
+            evidence_refs: vec!["docs/plans/human-guided-long-horizon-evolution.md#phase-0-campaign-proposal-only".to_string()],
+            decided_by: "sinomo.evolution.campaign-planner.phase0".to_string(),
+            decided_at: now.clone(),
+        }],
+        resource_schedule_preview: resource_schedule_preview(&request),
+        budget_policy,
+        approval_checkpoint: ApprovalCheckpoint {
+            policy: request.approval_policy.clone(),
+            status: approval_status,
+            required_before: "scheduling the first implementation iteration or spending scarce resources".to_string(),
+            editable_fields: vec![
+                "objective_card".to_string(),
+                "stages".to_string(),
+                "near_term_tasks".to_string(),
+                "budget_policy".to_string(),
+                "approval_policy".to_string(),
+            ],
+            possible_actions: vec!["approve".to_string(), "reject".to_string(), "edit".to_string()],
+        },
+        target_ring: request.target_ring,
+        dry_run: request.dry_run,
+        capability_registry_required: Some(false),
+        created_at: now.clone(),
+        updated_at: now,
+        source_repo: request.source_repo,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObjectiveKind {
+    Scheduler,
+    Minecraft,
+    Video,
+    Generic,
+}
+
+fn classify_objective(objective: &str) -> ObjectiveKind {
+    let lower = objective.to_ascii_lowercase();
+    if lower.contains("scheduler")
+        || lower.contains("pause")
+        || lower.contains("resume")
+        || lower.contains("budget")
+    {
+        ObjectiveKind::Scheduler
+    } else if lower.contains("minecraft") || lower.contains("speedrun") {
+        ObjectiveKind::Minecraft
+    } else if lower.contains("video") || lower.contains("clip") {
+        ObjectiveKind::Video
+    } else {
+        ObjectiveKind::Generic
+    }
+}
+
+fn generated_id(prefix: &str) -> String {
+    format!(
+        "{prefix}_{}",
+        EventId::generate()
+            .as_str()
+            .trim_start_matches(EventId::PREFIX)
+    )
+}
+
+fn proposal_constraints(request: &CampaignProposalRequest) -> Vec<String> {
+    let mut constraints = vec![
+        format!("horizon: {}", request.horizon),
+        format!("budget policy: {}", request.budget_policy),
+        "no formal capability registry is required for phase 0".to_string(),
+    ];
+    if let Some(max_wall_time) = &request.max_wall_time {
+        constraints.push(format!("max wall time: {max_wall_time}"));
+    }
+    if request.pause_after_proposal {
+        constraints
+            .push("pause after proposal before scheduling implementation agents".to_string());
+    }
+    constraints
+}
+
+fn interpreted_goal(kind: ObjectiveKind, objective: &str) -> String {
+    match kind {
+        ObjectiveKind::Scheduler => "Improve Sinomo's self-evolution scheduling foundation so campaigns can plan, pause, and resume around resource budgets with durable evidence.".to_string(),
+        ObjectiveKind::Minecraft => "Build and improve Sinomo until it can make measurable progress toward Minecraft speedrunning objectives in a controlled local environment.".to_string(),
+        ObjectiveKind::Video => "Build and improve a repeatable workflow that can plan, generate, inspect, revise, and assemble generated video segments into a longer draft.".to_string(),
+        ObjectiveKind::Generic => format!("Pursue the human objective as a durable, staged self-evolution campaign: {objective}"),
+    }
+}
+
+fn non_goals(kind: ObjectiveKind) -> Vec<String> {
+    let mut goals = vec![
+        "No unapproved paid API overage.".to_string(),
+        "No broad live rollout without evidence gates.".to_string(),
+        "No direct mutation of the active checkout.".to_string(),
+    ];
+    match kind {
+        ObjectiveKind::Minecraft => {
+            goals.push(
+                "No public-server automation, anti-cheat bypass, or account-risk behavior."
+                    .to_string(),
+            );
+        }
+        ObjectiveKind::Video => {
+            goals.push("No unreviewed public publishing or use of copyrighted assets unless explicitly approved.".to_string());
+        }
+        _ => {}
+    }
+    goals
+}
+
+fn assumptions(kind: ObjectiveKind) -> Vec<String> {
+    match kind {
+        ObjectiveKind::Scheduler => vec![
+            "Current scheduler/resource controls are incomplete and should be improved through small verified changes.".to_string(),
+            "The first run is allowed to work on Sinomo's own foundation when that removes campaign blockers.".to_string(),
+        ],
+        ObjectiveKind::Minecraft => vec![
+            "The target environment is a controlled local Minecraft setup or equivalent fixture.".to_string(),
+            "Early progress means observation/action evidence, not a full speedrun.".to_string(),
+        ],
+        ObjectiveKind::Video => vec![
+            "Available video APIs or local generators may have quota, duration, or quality limits.".to_string(),
+            "Early progress means creating and inspecting short clips before scaling to 15 minutes.".to_string(),
+        ],
+        ObjectiveKind::Generic => vec![
+            "The objective should be refined with evidence before implementation agents run.".to_string(),
+            "Near-term tasks may include foundation repair if the current system blocks progress.".to_string(),
+        ],
+    }
+}
+
+fn success_metrics(kind: ObjectiveKind) -> Vec<String> {
+    match kind {
+        ObjectiveKind::Scheduler => vec![
+            "A persisted campaign bundle includes objective, stages, tasks, resource preview, and approval checkpoint.".to_string(),
+            "A scheduler dry run can explain run/pause/resume decisions without spending scarce resources.".to_string(),
+            "Tests cover resource lease boundaries and resume behavior before rollout.".to_string(),
+        ],
+        ObjectiveKind::Minecraft => vec![
+            "Controlled setup launches or is described with reproducible metadata.".to_string(),
+            "Observation/action evidence is saved for at least one bounded interaction.".to_string(),
+            "Stage scorecards improve over repeated controlled attempts without unsafe public automation.".to_string(),
+        ],
+        ObjectiveKind::Video => vec![
+            "At least one short generated clip is saved with prompt, provider, and cost metadata.".to_string(),
+            "Generated clips can be inspected and scored against scene intent.".to_string(),
+            "A composition path assembles selected clips into a longer draft with QA artifacts.".to_string(),
+        ],
+        ObjectiveKind::Generic => vec![
+            "Each stage has falsifiable metrics and required artifacts.".to_string(),
+            "Near-term tasks are small enough that failure teaches something useful.".to_string(),
+            "Every candidate has evidence before approval or rollout.".to_string(),
+        ],
+    }
+}
+
+fn failure_conditions(kind: ObjectiveKind, reserves: &[ReserveFloor]) -> Vec<String> {
+    let mut conditions = vec![
+        "A proposed stage lacks explicit acceptance metrics or required evidence.".to_string(),
+        "The campaign dispatches agents or spends scarce resources before approval.".to_string(),
+        "The proposal cannot be inspected or resumed from disk.".to_string(),
+    ];
+    if reserves.is_empty() {
+        conditions.push(
+            "Resource reserve floors are not declared or reviewed before scheduled execution."
+                .to_string(),
+        );
+    } else {
+        conditions.push(format!(
+            "A run would violate reserve floors: {}.",
+            reserves
+                .iter()
+                .map(|reserve| format!("{}:{}%", reserve.resource, reserve.floor_percent))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    match kind {
+        ObjectiveKind::Minecraft => conditions
+            .push("The campaign attempts public-server or account-risk behavior.".to_string()),
+        ObjectiveKind::Video => conditions.push(
+            "The campaign uses paid video API capacity or publishes artifacts without approval."
+                .to_string(),
+        ),
+        _ => {}
+    }
+    conditions
+}
+
+fn safety_notes(kind: ObjectiveKind) -> Vec<String> {
+    let mut notes = vec![
+        "Human approval is required before scheduled execution.".to_string(),
+        "Implementation agents may propose better next tasks but must attach evidence.".to_string(),
+    ];
+    if kind == ObjectiveKind::Minecraft {
+        notes.push(
+            "Keep game automation in controlled local fixtures with an emergency stop path."
+                .to_string(),
+        );
+    }
+    notes
+}
+
+fn stages_for_objective(kind: ObjectiveKind) -> Vec<EvolutionStage> {
+    let stage_specs: Vec<(&str, &str, &str)> = match kind {
+        ObjectiveKind::Scheduler => vec![
+            (
+                "proposal-completeness",
+                "Proposal completeness",
+                "Persist an inspectable campaign bundle with objective, stages, tasks, budget preview, decisions, and approval state.",
+            ),
+            (
+                "resource-ledger-dry-run",
+                "Resource ledger dry run",
+                "Preview leases, reserve floors, reset windows, and pause/resume decisions without spending scarce resources.",
+            ),
+            (
+                "resume-loop",
+                "Pause/resume loop",
+                "Demonstrate that a campaign can pause for budget, resume after a reset, and explain the transition.",
+            ),
+            (
+                "rollout-readiness",
+                "Rollout readiness",
+                "Attach verification and rollout evidence before any scheduler change is promoted.",
+            ),
+        ],
+        ObjectiveKind::Minecraft => vec![
+            (
+                "controlled-setup",
+                "Controlled setup",
+                "Establish a reproducible local environment for attempts.",
+            ),
+            (
+                "baseline-observation-action",
+                "Baseline observation/action",
+                "Demonstrate observation and one bounded action or equivalent controlled interaction.",
+            ),
+            (
+                "interaction-trace",
+                "Interaction trace",
+                "Record enough evidence to diagnose why attempts succeed or fail.",
+            ),
+            (
+                "primitive-tasks",
+                "Primitive tasks",
+                "Complete small tasks in controlled fixtures before route-level objectives.",
+            ),
+        ],
+        ObjectiveKind::Video => vec![
+            (
+                "single-clip",
+                "Single clip generation",
+                "Generate and save one short clip with metadata.",
+            ),
+            (
+                "clip-inspection",
+                "Clip inspection",
+                "Inspect generated clips through frames, metadata, or another practical method.",
+            ),
+            (
+                "scene-batch",
+                "Scene batch",
+                "Generate several clips from a scene plan and select or retry weak outputs.",
+            ),
+            (
+                "composition",
+                "Composition",
+                "Assemble selected clips into a draft artifact with QA evidence.",
+            ),
+        ],
+        ObjectiveKind::Generic => vec![
+            (
+                "objective-refinement",
+                "Objective refinement",
+                "Turn the raw objective into falsifiable stages and metrics.",
+            ),
+            (
+                "baseline",
+                "Baseline evidence",
+                "Measure or estimate the current state before implementation.",
+            ),
+            (
+                "first-candidate",
+                "First candidate",
+                "Produce one bounded candidate or task-replacement proposal with evidence.",
+            ),
+            (
+                "reliability",
+                "Reliability",
+                "Repeat the workflow with acceptable cost, quality, runtime, and no regression.",
+            ),
+        ],
+    };
+
+    stage_specs
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, name, purpose))| EvolutionStage {
+            stage_id: format!("stage-{:02}-{id}", index + 1),
+            name: name.to_string(),
+            purpose: purpose.to_string(),
+            baseline: "not measured in phase 0; first scheduled iteration must capture or justify baseline".to_string(),
+            acceptance_metrics: vec![
+                "Required artifacts are persisted in the campaign bundle.".to_string(),
+                "A human can inspect pass/fail evidence for this stage.".to_string(),
+                "Regression gates from earlier stages remain green or explicitly waived by policy.".to_string(),
+            ],
+            regression_gates: vec!["campaign bundle remains readable".to_string(), "resource policy remains satisfied".to_string()],
+            required_artifacts: vec!["stage scorecard".to_string(), "evidence summary".to_string()],
+            allowed_task_types: vec!["patch".to_string(), "evaluator".to_string(), "instrumentation".to_string(), "foundation-repair".to_string(), "task-replacement-proposal".to_string()],
+            eval_suite: vec!["phase-0 manual proposal inspection".to_string()],
+            estimated_budget: "small planning/model budget; no scarce execution until approved".to_string(),
+            promotion_policy: "Promote only after all acceptance metrics pass and required artifacts exist.".to_string(),
+            failure_conditions: vec![
+                "No measurable acceptance metric is attached.".to_string(),
+                "Required artifacts are missing or not linked.".to_string(),
+            ],
+        })
+        .collect()
+}
+
+fn tasks_for_objective(
+    kind: ObjectiveKind,
+    stages: &[EvolutionStage],
+) -> Vec<NearTermEvolutionTask> {
+    stages
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(index, stage)| NearTermEvolutionTask {
+            task_id: format!("task-{:02}-{}", index + 1, stage.stage_id.trim_start_matches("stage-")),
+            stage_id: stage.stage_id.clone(),
+            title: match (kind, index) {
+                (ObjectiveKind::Scheduler, 0) => "Persist phase-0 campaign proposals".to_string(),
+                (ObjectiveKind::Scheduler, 1) => "Design resource ledger dry-run scorecard".to_string(),
+                (ObjectiveKind::Scheduler, _) => "Add pause/resume state transition tests".to_string(),
+                _ => format!("Advance {}", stage.name),
+            },
+            objective: format!("Make progress on stage `{}` while preserving evidence and approval gates.", stage.name),
+            rationale: "Selected because it is small, inspectable, and failure would produce useful adaptation evidence.".to_string(),
+            required_evidence: vec!["changed artifacts or scorecard".to_string(), "decision rationale".to_string(), "verification output".to_string()],
+            verification_commands: vec!["cargo test --workspace".to_string()],
+            estimated_budget: "one focused implementation iteration after approval".to_string(),
+            approval_required: true,
+            expected_result_kind: if kind == ObjectiveKind::Scheduler && index == 1 {
+                EvolutionResultKind::Evaluator
+            } else if kind == ObjectiveKind::Scheduler && index == 2 {
+                EvolutionResultKind::FoundationRepair
+            } else {
+                EvolutionResultKind::Patch
+            },
+        })
+        .collect()
+}
+
+fn budget_notes(request: &CampaignProposalRequest) -> Vec<String> {
+    let mut notes = vec![
+        "Phase 0 only previews budget policy; Phase 1 must enforce leases.".to_string(),
+        "Free and prepaid resources should be spread across reset windows instead of spent immediately.".to_string(),
+    ];
+    if request.reserve_floors.is_empty() {
+        notes.push(
+            "No reserve floors were provided; require human review before scheduled execution."
+                .to_string(),
+        );
+    }
+    if let Some(max_wall_time) = &request.max_wall_time {
+        notes.push(format!("max wall time: {max_wall_time}"));
+    }
+    if request.pause_after_proposal {
+        notes.push("pause after proposal before scheduling implementation agents".to_string());
+    }
+    notes
+}
+
+fn resource_schedule_preview(request: &CampaignProposalRequest) -> ResourceSchedulePreview {
+    let entries = if request.reserve_floors.is_empty() {
+        vec![ResourceScheduleEntry {
+            resource: request.budget_policy.clone(),
+            window: request.horizon.clone(),
+            planned_use: "proposal only; no agent dispatch".to_string(),
+            reserve_floor: "unconfigured".to_string(),
+            notes: "Add reserve floors before scheduled execution.".to_string(),
+        }]
+    } else {
+        request
+            .reserve_floors
+            .iter()
+            .map(|reserve| ResourceScheduleEntry {
+                resource: reserve.resource.clone(),
+                window: request.horizon.clone(),
+                planned_use: "proposal only now; later iterations must request leases before use"
+                    .to_string(),
+                reserve_floor: format!("{}%", reserve.floor_percent),
+                notes: "Do not schedule work that would cross this reserve floor.".to_string(),
+            })
+            .collect()
+    };
+    ResourceSchedulePreview {
+        horizon: request.horizon.clone(),
+        entries,
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EvolutionReport {
     pub job: EvolutionJob,
     pub candidate_workspace: CandidateWorkspace,
@@ -592,25 +1661,26 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
             .as_ref()
             .and_then(|output| output.patch.clone())
             .or_else(|| extract_patch_from_text(&response.content));
-        if !direct_edit
-            && let Some(patch) = parsed_patch
+        if !direct_edit {
+            if let Some(patch) = parsed_patch
                 .as_ref()
                 .filter(|patch| !patch.trim().is_empty())
-        {
-            let result = self.tool_registry.execute(
-                workspace,
-                EvolutionToolCall {
-                    tool: "apply_patch".to_string(),
-                    input: serde_json::json!({ "patch": patch }),
-                },
-            );
-            if result.status != ToolCallStatus::Succeeded {
-                return Err(MutationModelError::ToolExecution {
-                    tool: result.tool,
-                    detail: result.evidence.summary,
-                });
+            {
+                let result = self.tool_registry.execute(
+                    workspace,
+                    EvolutionToolCall {
+                        tool: "apply_patch".to_string(),
+                        input: serde_json::json!({ "patch": patch }),
+                    },
+                );
+                if result.status != ToolCallStatus::Succeeded {
+                    return Err(MutationModelError::ToolExecution {
+                        tool: result.tool,
+                        detail: result.evidence.summary,
+                    });
+                }
+                all_tool_results.push(result);
             }
-            all_tool_results.push(result);
         }
         let summary = structured_output
             .as_ref()
@@ -1315,6 +2385,203 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn campaign_proposal_contains_inspectable_phase_zero_plan() {
+        let proposal = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "improve the self-evolution scheduler so it can pause and resume around resource budgets".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: true,
+            dry_run: true,
+            approved: false,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        });
+
+        assert!(proposal.campaign_id.starts_with("camp_"));
+        assert_eq!(proposal.status, EvolutionCampaignStatus::AwaitingApproval);
+        assert_eq!(proposal.objective_card.initial_horizon, "30 days");
+        assert!(
+            proposal
+                .objective_card
+                .failure_conditions
+                .iter()
+                .any(|condition| condition.contains("reserve"))
+        );
+        assert!(proposal.stages.len() >= 3);
+        assert!(
+            proposal
+                .stages
+                .iter()
+                .all(|stage| !stage.acceptance_metrics.is_empty())
+        );
+        assert!(
+            proposal
+                .stages
+                .iter()
+                .all(|stage| !stage.failure_conditions.is_empty())
+        );
+        assert!(proposal.near_term_tasks.len() >= 2);
+        assert_eq!(proposal.budget_policy.reserve_floors[0].floor_percent, 30);
+        assert!(
+            proposal
+                .budget_policy
+                .scheduling_notes
+                .iter()
+                .any(|note| note.contains("max wall time: 10m"))
+        );
+        assert!(
+            proposal
+                .budget_policy
+                .scheduling_notes
+                .iter()
+                .any(|note| note.contains("pause after proposal"))
+        );
+        assert_eq!(
+            proposal.iteration_results,
+            Vec::<EvolutionIterationResult>::new()
+        );
+        assert!(
+            proposal
+                .decisions
+                .iter()
+                .any(|decision| decision.kind == CampaignDecisionKind::ProposalCreated)
+        );
+        assert_eq!(
+            proposal.approval_checkpoint.status,
+            ApprovalCheckpointStatus::AwaitingHuman
+        );
+        assert!(proposal.capability_registry_required == Some(false));
+    }
+
+    #[test]
+    fn resource_scheduler_dry_run_denies_leases_that_violate_reserve_floor() {
+        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "improve the self-evolution scheduler so it can pause and resume around resource budgets".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        });
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+
+        let dry_run = dry_run_resource_scheduler(ResourceSchedulerDryRunRequest {
+            campaign: campaign.clone(),
+            preview_horizon: "24h".to_string(),
+            resources: vec![ResourceClassDefinition {
+                resource_id: "coding-plan-weekly".to_string(),
+                unit: "percent".to_string(),
+                total_units: 100,
+                used_units: 65,
+                reserve_floor_percent: 30,
+                reset_window: "weekly reset window".to_string(),
+                notes: "free coding plan budget".to_string(),
+            }],
+            task_estimates: vec![ResourceUsageEstimate {
+                task_id: task_id.clone(),
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: Some(65),
+            }],
+        });
+
+        assert_eq!(
+            dry_run.aggregate_decision,
+            CampaignScheduleDecision::PausedBudget
+        );
+        assert_eq!(dry_run.resource_ledger.resources[0].used_units, 65);
+        assert_eq!(dry_run.resource_ledger.usage_records[0].estimated_units, 10);
+        assert_eq!(
+            dry_run.resource_ledger.usage_records[0].actual_units,
+            Some(65)
+        );
+        assert_eq!(
+            dry_run.lease_decisions[0].outcome,
+            ResourceLeaseOutcome::Denied
+        );
+        assert!(dry_run.lease_decisions[0].reason.contains("reserve floor"));
+        assert_eq!(dry_run.task_decisions[0].task_id, task_id);
+        assert_eq!(
+            dry_run.task_decisions[0].decision,
+            TaskScheduleDecisionKind::PausedBudget
+        );
+    }
+
+    #[test]
+    fn resource_scheduler_dry_run_grants_leases_when_reserve_floor_remains_safe() {
+        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "improve the self-evolution scheduler so it can pause and resume around resource budgets".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        });
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+
+        let dry_run = dry_run_resource_scheduler(ResourceSchedulerDryRunRequest {
+            campaign,
+            preview_horizon: "24h".to_string(),
+            resources: vec![ResourceClassDefinition {
+                resource_id: "coding-plan-weekly".to_string(),
+                unit: "percent".to_string(),
+                total_units: 100,
+                used_units: 40,
+                reserve_floor_percent: 30,
+                reset_window: "weekly reset window".to_string(),
+                notes: "free coding plan budget".to_string(),
+            }],
+            task_estimates: vec![ResourceUsageEstimate {
+                task_id: task_id.clone(),
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: Some(40),
+            }],
+        });
+
+        assert_eq!(
+            dry_run.aggregate_decision,
+            CampaignScheduleDecision::Scheduled
+        );
+        assert_eq!(
+            dry_run.lease_decisions[0].outcome,
+            ResourceLeaseOutcome::Granted
+        );
+        assert_eq!(
+            dry_run.task_decisions[0].decision,
+            TaskScheduleDecisionKind::RunNow
+        );
+        assert!(dry_run.next_24h_preview.iter().any(|entry| {
+            entry.task_id == task_id
+                && entry
+                    .explanation
+                    .contains("reserve floor remains protected")
+        }));
+    }
 
     #[test]
     fn r1_job_receives_continuity_gates_and_workspace_scope() {
