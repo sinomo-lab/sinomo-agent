@@ -61,12 +61,17 @@ fn run_cli_command(args: &[String]) -> Result<(), CliError> {
 }
 
 fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
+    if cli_command_requires_cluster_state(&command) {
+        require_cluster_bootstrap_state()?;
+    }
+
     match command {
         CliCommand::Cui => run_cui(),
         CliCommand::Help => {
             print_usage();
             Ok(())
         }
+        CliCommand::Cluster(command) => run_cluster_cli_command(command),
         CliCommand::Evolve(command) => run_evolve_cli_command(command),
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
@@ -76,10 +81,18 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
     }
 }
 
+fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
+    matches!(
+        command,
+        CliCommand::Cui | CliCommand::Evolve(_) | CliCommand::Daemon(_) | CliCommand::Rollout(_)
+    )
+}
+
 #[derive(Debug, Clone)]
 enum CliCommand {
     Cui,
     Help,
+    Cluster(ClusterCliCommand),
     Evolve(EvolveCliCommand),
     Daemon(DaemonCliCommand),
     Rollout(RolloutCliCommand),
@@ -93,6 +106,9 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
         None => Ok(CliCommand::Cui),
         Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
             Ok(CliCommand::Help)
+        }
+        Some((command, rest)) if command == "cluster" => {
+            Ok(CliCommand::Cluster(parse_cluster_command(rest)?))
         }
         Some((command, rest)) if command == "evolve" => {
             Ok(CliCommand::Evolve(parse_evolve_command(rest)?))
@@ -122,6 +138,454 @@ const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const SHADOW_MAIN_HOST_ENV: &str = "SINOMO_SHADOW_MAIN_HOST";
 const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClusterCliCommand {
+    Help,
+    Init(ClusterInitOptions),
+    Join(ClusterJoinOptions),
+    Status,
+    Peers,
+    Leave,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterInitOptions {
+    cluster_id: Option<String>,
+    node_id: Option<NodeId>,
+    name: String,
+}
+
+impl Default for ClusterInitOptions {
+    fn default() -> Self {
+        Self {
+            cluster_id: None,
+            node_id: None,
+            name: "sinomo-local".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterJoinOptions {
+    invite: String,
+    cluster_id: Option<String>,
+    node_id: Option<NodeId>,
+    name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct ClusterState {
+    cluster_id: String,
+    cluster_name: String,
+    local_node_id: NodeId,
+    local_node_display_name: String,
+    bootstrap: ClusterBootstrap,
+    term: u64,
+    kv_revision: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    members: Vec<ClusterMember>,
+    initialized_at: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum ClusterBootstrap {
+    InitializedLocally,
+    Joined { invite: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct ClusterMember {
+    node_id: NodeId,
+    display_name: String,
+    role: ClusterMemberRole,
+    state: ClusterMemberState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    addresses: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum ClusterMemberRole {
+    Voter,
+    Learner,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum ClusterMemberState {
+    Active,
+    Pending,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterPaths {
+    root: PathBuf,
+    state: PathBuf,
+}
+
+impl ClusterPaths {
+    fn new(data_dir: &SinomoDataDir) -> Self {
+        let root = data_dir.root().join("cluster");
+        Self {
+            state: root.join("state.json"),
+            root,
+        }
+    }
+
+    fn ensure(&self) -> Result<(), CliError> {
+        fs::create_dir_all(&self.root).map_err(|source| CliError::Io {
+            path: self.root.display().to_string(),
+            detail: source.to_string(),
+        })
+    }
+}
+
+fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(ClusterCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(ClusterCliCommand::Help)
+        }
+        Some((command, rest)) if command == "init" => {
+            Ok(ClusterCliCommand::Init(parse_cluster_init_options(rest)?))
+        }
+        Some((command, rest)) if command == "join" => {
+            Ok(ClusterCliCommand::Join(parse_cluster_join_options(rest)?))
+        }
+        Some((command, [])) if command == "status" => Ok(ClusterCliCommand::Status),
+        Some((command, [])) if command == "peers" => Ok(ClusterCliCommand::Peers),
+        Some((command, [])) if command == "leave" => Ok(ClusterCliCommand::Leave),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_cluster_init_options(args: &[String]) -> Result<ClusterInitOptions, CliError> {
+    let mut options = ClusterInitOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--cluster-id" => {
+                index += 1;
+                let Some(cluster_id) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                validate_cluster_id(cluster_id)?;
+                options.cluster_id = Some(cluster_id.clone());
+            }
+            "--node-id" => {
+                index += 1;
+                let Some(node_id) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.node_id =
+                    Some(
+                        NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
+                            detail: format!("invalid node id `{node_id}`: {source}"),
+                        })?,
+                    );
+            }
+            "--name" => {
+                index += 1;
+                let Some(name) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.name = non_empty_cluster_name(name)?;
+            }
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_cluster_join_options(args: &[String]) -> Result<ClusterJoinOptions, CliError> {
+    let Some((invite, rest)) = args.split_first() else {
+        return Err(CliError::Usage);
+    };
+    if invite.starts_with("--") {
+        return Err(CliError::Usage);
+    }
+
+    let mut options = ClusterJoinOptions {
+        invite: invite.clone(),
+        cluster_id: None,
+        node_id: None,
+        name: "sinomo-node".to_string(),
+    };
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--cluster-id" => {
+                index += 1;
+                let Some(cluster_id) = rest.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                validate_cluster_id(cluster_id)?;
+                options.cluster_id = Some(cluster_id.clone());
+            }
+            "--node-id" => {
+                index += 1;
+                let Some(node_id) = rest.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.node_id =
+                    Some(
+                        NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
+                            detail: format!("invalid node id `{node_id}`: {source}"),
+                        })?,
+                    );
+            }
+            "--name" => {
+                index += 1;
+                let Some(name) = rest.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.name = non_empty_cluster_name(name)?;
+            }
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn validate_cluster_id(cluster_id: &str) -> Result<(), CliError> {
+    if !cluster_id.starts_with("cluster_") {
+        return Err(CliError::Parse {
+            detail: format!("cluster id `{cluster_id}` must start with cluster_"),
+        });
+    }
+    if !cluster_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return Err(CliError::Parse {
+            detail: format!("cluster id `{cluster_id}` contains an invalid character"),
+        });
+    }
+    Ok(())
+}
+
+fn non_empty_cluster_name(name: &str) -> Result<String, CliError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CliError::Parse {
+            detail: "cluster node name cannot be empty".to_string(),
+        });
+    }
+    Ok(name.to_string())
+}
+
+fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), CliError> {
+    match command {
+        ClusterCliCommand::Help => {
+            print_cluster_help();
+            Ok(())
+        }
+        ClusterCliCommand::Init(options) => cluster_init(options),
+        ClusterCliCommand::Join(options) => cluster_join(options),
+        ClusterCliCommand::Status => cluster_status(),
+        ClusterCliCommand::Peers => cluster_peers(),
+        ClusterCliCommand::Leave => cluster_leave(),
+    }
+}
+
+fn cluster_paths_from_defaults() -> Result<ClusterPaths, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    Ok(ClusterPaths::new(&data_dir))
+}
+
+fn require_cluster_bootstrap_state() -> Result<ClusterState, CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    read_cluster_state(&paths)
+}
+
+fn cluster_init(options: ClusterInitOptions) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    cluster_init_with_paths(options, &paths)
+}
+
+fn cluster_init_with_paths(
+    options: ClusterInitOptions,
+    paths: &ClusterPaths,
+) -> Result<(), CliError> {
+    paths.ensure()?;
+    if paths.state.exists() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "cluster is already initialized at {}; use `sinomo cluster status`",
+                paths.state.display()
+            ),
+        });
+    }
+
+    let local_node_id = options.node_id.unwrap_or_else(NodeId::generate);
+    let timestamp = now_rfc3339();
+    let cluster_id = options.cluster_id.unwrap_or_else(|| {
+        format!(
+            "cluster_{}",
+            local_node_id.as_str().trim_start_matches("node_")
+        )
+    });
+    validate_cluster_id(&cluster_id)?;
+    let state = ClusterState {
+        cluster_id,
+        cluster_name: options.name.clone(),
+        local_node_id: local_node_id.clone(),
+        local_node_display_name: options.name,
+        bootstrap: ClusterBootstrap::InitializedLocally,
+        term: 1,
+        kv_revision: 1,
+        members: vec![ClusterMember {
+            node_id: local_node_id,
+            display_name: "local".to_string(),
+            role: ClusterMemberRole::Voter,
+            state: ClusterMemberState::Active,
+            addresses: Vec::new(),
+        }],
+        initialized_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    write_json(&paths.state, &state)?;
+    println!("cluster initialized: {}", state.cluster_id);
+    println!("local node: {}", state.local_node_id);
+    println!("state: {}", paths.state.display());
+    Ok(())
+}
+
+fn cluster_join(options: ClusterJoinOptions) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    cluster_join_with_paths(options, &paths)
+}
+
+fn cluster_join_with_paths(
+    options: ClusterJoinOptions,
+    paths: &ClusterPaths,
+) -> Result<(), CliError> {
+    paths.ensure()?;
+    if paths.state.exists() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "cluster is already initialized at {}; leave before joining another cluster",
+                paths.state.display()
+            ),
+        });
+    }
+
+    let local_node_id = options.node_id.unwrap_or_else(NodeId::generate);
+    let timestamp = now_rfc3339();
+    let cluster_id = options
+        .cluster_id
+        .unwrap_or_else(|| "cluster_pending".to_string());
+    validate_cluster_id(&cluster_id)?;
+    let state = ClusterState {
+        cluster_id,
+        cluster_name: options.name.clone(),
+        local_node_id: local_node_id.clone(),
+        local_node_display_name: options.name,
+        bootstrap: ClusterBootstrap::Joined {
+            invite: options.invite.clone(),
+        },
+        term: 0,
+        kv_revision: 0,
+        members: vec![ClusterMember {
+            node_id: local_node_id,
+            display_name: "local".to_string(),
+            role: ClusterMemberRole::Learner,
+            state: ClusterMemberState::Pending,
+            addresses: Vec::new(),
+        }],
+        initialized_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    write_json(&paths.state, &state)?;
+    println!("cluster join recorded: {}", state.cluster_id);
+    println!("local node: {}", state.local_node_id);
+    println!("invite: {}", options.invite);
+    println!("state: {}", paths.state.display());
+    Ok(())
+}
+
+fn cluster_status() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    match read_cluster_state(&paths) {
+        Ok(state) => {
+            println!("cluster: {}", state.cluster_id);
+            println!("name: {}", state.cluster_name);
+            println!("local node: {}", state.local_node_id);
+            println!("bootstrap: {}", cluster_bootstrap_label(&state.bootstrap));
+            println!("term: {}", state.term);
+            println!("kv revision: {}", state.kv_revision);
+            println!("members: {}", state.members.len());
+            println!("state: {}", paths.state.display());
+            Ok(())
+        }
+        Err(CliError::ClusterOrphan) => {
+            println!("cluster: orphan");
+            println!("state: not initialized");
+            println!("next: run `sinomo cluster init` or `sinomo cluster join <invite>`");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn cluster_peers() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    let state = read_cluster_state(&paths)?;
+    for member in state.members {
+        println!(
+            "{}\t{}\t{:?}\t{:?}",
+            member.node_id, member.display_name, member.role, member.state
+        );
+    }
+    Ok(())
+}
+
+fn cluster_leave() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    if !paths.state.exists() {
+        return Err(CliError::ClusterOrphan);
+    }
+    fs::remove_file(&paths.state).map_err(|source| CliError::Io {
+        path: paths.state.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    println!("cluster state removed: {}", paths.state.display());
+    Ok(())
+}
+
+fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterState, CliError> {
+    if !paths.state.exists() {
+        return Err(CliError::ClusterOrphan);
+    }
+    let content = fs::read_to_string(&paths.state).map_err(|source| CliError::Io {
+        path: paths.state.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: paths.state.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn cluster_bootstrap_label(bootstrap: &ClusterBootstrap) -> &'static str {
+    match bootstrap {
+        ClusterBootstrap::InitializedLocally => "initialized-locally",
+        ClusterBootstrap::Joined { .. } => "joined",
+    }
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DaemonCliCommand {
@@ -5576,6 +6040,7 @@ pub fn print_usage() {
     println!("Usage:");
     println!("  sinomo");
     println!("  sinomo help");
+    println!("  sinomo cluster");
     println!("  sinomo daemon");
     println!("  sinomo rollout");
     println!("  sinomo models");
@@ -5608,6 +6073,28 @@ pub fn print_usage() {
     println!(
         "                               GitHub App client IDs are not accepted by Copilot token exchange"
     );
+}
+
+fn print_cluster_help() {
+    println!("Cluster:");
+    println!("  sinomo cluster");
+    println!("      Show cluster commands.");
+    println!(
+        "  sinomo cluster init [--name <name>] [--cluster-id cluster_...] [--node-id node_...]"
+    );
+    println!("      Bootstrap a new single-node cluster and clear orphan-node state.");
+    println!(
+        "  sinomo cluster join <invite> [--name <name>] [--cluster-id cluster_...] [--node-id node_...]"
+    );
+    println!(
+        "      Record intent to join an existing cluster. Network reconciliation is handled by the cluster service."
+    );
+    println!("  sinomo cluster status");
+    println!("      Show local cluster bootstrap state, or report that this node is orphaned.");
+    println!("  sinomo cluster peers");
+    println!("      List known peers. Fails while the node is orphaned.");
+    println!("  sinomo cluster leave");
+    println!("      Remove local cluster bootstrap state.");
 }
 
 fn print_daemon_help() {
@@ -5753,6 +6240,7 @@ pub enum CliError {
         status: String,
         expected: String,
     },
+    ClusterOrphan,
     MissingArtifact {
         artifact: String,
     },
@@ -5852,6 +6340,10 @@ impl std::fmt::Display for CliError {
                 formatter,
                 "evolution job {job_id} is {status}; expected {expected}"
             ),
+            Self::ClusterOrphan => write!(
+                formatter,
+                "this node is not part of a cluster; run `sinomo cluster init` or `sinomo cluster join <invite>`"
+            ),
             Self::MissingArtifact { artifact } => {
                 write!(formatter, "{artifact} has not been written")
             }
@@ -5892,15 +6384,17 @@ impl std::error::Error for CliError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, CliError, DaemonCliCommand, DaemonProbeStatus, DaemonRunOptions,
-        EvolutionJobStatus, EvolutionPaths, InteractionModel, InteractionRuntime,
-        InteractionSession, InteractionSurface, InteractionSurfaceKind,
-        ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
-        ProviderName, RolloutCliCommand, RolloutOptions, is_terminal_status,
-        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-        parse_daemon_command, parse_model_default_options, parse_models_list_options,
-        parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-        parse_usage_options, run_cui_with_handler_io, run_evolve_command,
+        CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterJoinOptions,
+        ClusterPaths, DaemonCliCommand, DaemonProbeStatus, DaemonRunOptions, EvolutionJobStatus,
+        EvolutionPaths, InteractionModel, InteractionRuntime, InteractionSession,
+        InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
+        ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand, ProviderName,
+        RolloutCliCommand, RolloutOptions, cluster_init_with_paths, cluster_join_with_paths,
+        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
+        parse_cli_command, parse_cluster_command, parse_daemon_command,
+        parse_model_default_options, parse_models_list_options, parse_propose_options,
+        parse_provider_command, parse_rollout_command, parse_slash_command, parse_usage_options,
+        read_cluster_state, run_cui_with_handler_io, run_evolve_command,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -5957,6 +6451,11 @@ mod tests {
             CliCommand::Daemon(DaemonCliCommand::Help)
         ));
         assert!(matches!(
+            parse_cli_command(&["cluster".to_string(), "status".to_string()])
+                .expect("cluster status"),
+            CliCommand::Cluster(ClusterCliCommand::Status)
+        ));
+        assert!(matches!(
             parse_cli_command(&[
                 "providers".to_string(),
                 "test".to_string(),
@@ -5998,6 +6497,106 @@ mod tests {
             parse_cli_command(&["evolve".to_string()]).expect("evolve help"),
             CliCommand::Evolve(super::EvolveCliCommand::Help)
         ));
+    }
+
+    #[test]
+    fn cluster_parser_accepts_init_and_join_options() {
+        assert_eq!(
+            parse_cluster_command(&[
+                "init".to_string(),
+                "--name".to_string(),
+                "home".to_string(),
+                "--cluster-id".to_string(),
+                "cluster_home".to_string(),
+                "--node-id".to_string(),
+                "node_desktop".to_string(),
+            ])
+            .expect("cluster init"),
+            ClusterCliCommand::Init(ClusterInitOptions {
+                cluster_id: Some("cluster_home".to_string()),
+                node_id: Some(NodeId::new("node_desktop").expect("node")),
+                name: "home".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_cluster_command(&[
+                "join".to_string(),
+                "sinomo-join://token".to_string(),
+                "--name".to_string(),
+                "laptop".to_string(),
+            ])
+            .expect("cluster join"),
+            ClusterCliCommand::Join(ClusterJoinOptions {
+                invite: "sinomo-join://token".to_string(),
+                cluster_id: None,
+                node_id: None,
+                name: "laptop".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn cluster_init_persists_local_bootstrap_state() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-init-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+
+        cluster_init_with_paths(
+            ClusterInitOptions {
+                cluster_id: Some("cluster_test".to_string()),
+                node_id: Some(NodeId::new("node_local").expect("node")),
+                name: "test cluster".to_string(),
+            },
+            &paths,
+        )
+        .expect("cluster init");
+
+        let state = read_cluster_state(&paths).expect("cluster state");
+        assert_eq!(state.cluster_id, "cluster_test");
+        assert_eq!(
+            state.local_node_id,
+            NodeId::new("node_local").expect("node")
+        );
+        assert_eq!(state.term, 1);
+        assert_eq!(state.kv_revision, 1);
+        assert_eq!(state.members.len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_join_records_pending_learner_state() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-join-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+
+        cluster_join_with_paths(
+            ClusterJoinOptions {
+                invite: "sinomo-join://token".to_string(),
+                cluster_id: Some("cluster_joined".to_string()),
+                node_id: Some(NodeId::new("node_joiner").expect("node")),
+                name: "joiner".to_string(),
+            },
+            &paths,
+        )
+        .expect("cluster join");
+
+        let state = read_cluster_state(&paths).expect("cluster state");
+        assert_eq!(state.cluster_id, "cluster_joined");
+        assert_eq!(state.term, 0);
+        assert_eq!(state.kv_revision, 0);
+        assert_eq!(state.members[0].role, super::ClusterMemberRole::Learner);
+        assert_eq!(state.members[0].state, super::ClusterMemberState::Pending);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
