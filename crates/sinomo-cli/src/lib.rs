@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
     CampaignDecision as EvolutionCampaignDecision, CampaignDecisionKind, CampaignProposalRequest,
     CampaignScheduleDecision, CandidateWorkspace, EvolutionCampaign, EvolutionCampaignStatus,
-    EvolutionOrchestrator, EvolutionReport, EvolutionRequest, GitWorkspaceAdapter,
-    LanguageModelMutationBridge, LocalCandidateBundleStore, MutationModel, MutationModelError,
-    ReserveFloor, ResourceClassDefinition, ResourceSchedulerDryRun, ResourceSchedulerDryRunRequest,
-    ResourceUsageEstimate, ScheduledIterationPlan, ScheduledIterationRequest,
-    dry_run_resource_scheduler, prepare_scheduled_iteration, propose_evolution_campaign,
+    EvolutionFailureClass, EvolutionOrchestrator, EvolutionReport, EvolutionRequest,
+    GitWorkspaceAdapter, LanguageModelMutationBridge, LocalCandidateBundleStore, MutationModel,
+    MutationModelError, ReserveFloor, ResourceClassDefinition, ResourceSchedulerDryRun,
+    ResourceSchedulerDryRunRequest, ResourceUsageEstimate, ScheduledIterationPlan,
+    ScheduledIterationRequest, StageEvaluationRequest, StageEvaluationUpdate,
+    dry_run_resource_scheduler, evaluate_campaign_stage, prepare_scheduled_iteration,
+    propose_evolution_campaign,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -24,9 +26,10 @@ use sinomo_lm::{
 };
 use sinomo_runtime::core::{
     CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, Confidence,
-    EvaluationGate, EvaluationOutcome, EventEnvelope, EventId, EventKind, EvolutionJob,
-    EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustRing, VerificationCommand,
+    EvaluationGate, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind,
+    EvolutionJob, EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId,
+    PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustRing,
+    VerificationCommand,
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
@@ -2055,6 +2058,10 @@ struct CampaignBundlePaths {
     iteration_plan_json: PathBuf,
     iteration_request_json: PathBuf,
     iteration_dispatches_jsonl: PathBuf,
+    stage_scorecard_json: PathBuf,
+    stage_scorecards_jsonl: PathBuf,
+    adaptation_json: PathBuf,
+    adaptations_jsonl: PathBuf,
     approval_checkpoint_json: PathBuf,
     decisions_jsonl: PathBuf,
 }
@@ -2075,6 +2082,10 @@ impl CampaignBundlePaths {
             iteration_plan_json: root.join("iteration-plan.json"),
             iteration_request_json: root.join("iteration-request.json"),
             iteration_dispatches_jsonl: root.join("iteration-dispatches.jsonl"),
+            stage_scorecard_json: root.join("stage-scorecard.json"),
+            stage_scorecards_jsonl: root.join("stage-scorecards.jsonl"),
+            adaptation_json: root.join("adaptation.json"),
+            adaptations_jsonl: root.join("adaptations.jsonl"),
             approval_checkpoint_json: root.join("approval-checkpoint.json"),
             decisions_jsonl: root.join("decisions.jsonl"),
             root,
@@ -2088,6 +2099,7 @@ enum EvolveCliCommand {
     Propose(Vec<String>),
     Schedule(Vec<String>),
     Iterate(Vec<String>),
+    Evaluate(Vec<String>),
     Decide(CandidateDecisionOutcome, Vec<String>),
     Status(Vec<String>),
     Show(Vec<String>),
@@ -2112,6 +2124,9 @@ fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, CliError> {
         }
         Some((command, rest)) if command == "iterate" => {
             Ok(EvolveCliCommand::Iterate(rest.to_vec()))
+        }
+        Some((command, rest)) if command == "evaluate" => {
+            Ok(EvolveCliCommand::Evaluate(rest.to_vec()))
         }
         Some((command, rest)) if command == "approve" => Ok(EvolveCliCommand::Decide(
             CandidateDecisionOutcome::Approved,
@@ -2154,6 +2169,7 @@ fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), CliError> {
         EvolveCliCommand::Propose(args) => evolve_propose(&args),
         EvolveCliCommand::Schedule(args) => evolve_schedule(&args),
         EvolveCliCommand::Iterate(args) => evolve_iterate(&args),
+        EvolveCliCommand::Evaluate(args) => evolve_evaluate(&args),
         EvolveCliCommand::Decide(outcome, args) => evolve_decide(&args, outcome),
         EvolveCliCommand::Status(args) => evolve_status(&args),
         EvolveCliCommand::Show(args) => evolve_show(&args),
@@ -2334,6 +2350,34 @@ fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
     })?;
     let bundle = write_campaign_iteration_dry_run(&paths, &mut campaign, &plan)?;
     println_iteration_dry_run(&plan, &bundle);
+    Ok(())
+}
+
+fn evolve_evaluate(args: &[String]) -> Result<(), CliError> {
+    let options = parse_stage_evaluation_options(args)?;
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = EvolutionPaths::new(&data_dir);
+    paths.ensure()?;
+    let campaign = read_campaign(&paths, &options.campaign_id)?;
+    let job_path = paths.job_path(&options.job_id);
+    let record_path = if job_path.exists() {
+        job_path
+    } else {
+        paths.legacy_job_path(&options.job_id)
+    };
+    let record = read_stored_job(&record_path)?;
+    let report = evolution_report_from_record(record)?;
+    let update = evaluate_campaign_stage(StageEvaluationRequest {
+        campaign,
+        task_id: options.task_id,
+        report,
+        resource_usage: options.resource_usage,
+        failure_class: options.failure_class,
+        root_cause_summary: options.root_cause_summary,
+        what_was_learned: options.what_was_learned,
+    });
+    let bundle = write_campaign_stage_evaluation(&paths, &update)?;
+    println_stage_evaluation(&update, &bundle);
     Ok(())
 }
 
@@ -3266,6 +3310,178 @@ struct IterationOptions {
     dry_run: bool,
 }
 
+#[derive(Clone, Debug)]
+struct StageEvaluationOptions {
+    campaign_id: String,
+    job_id: EvolutionJobId,
+    task_id: String,
+    failure_class: Option<EvolutionFailureClass>,
+    root_cause_summary: Option<String>,
+    what_was_learned: Vec<String>,
+    resource_usage: Vec<ResourceUsageEstimate>,
+}
+
+fn parse_stage_evaluation_options(args: &[String]) -> Result<StageEvaluationOptions, CliError> {
+    let mut campaign_id = None;
+    let mut job_id = None;
+    let mut task_id = None;
+    let mut failure_class = None;
+    let mut root_cause_summary = None;
+    let mut what_was_learned = Vec::new();
+    let mut resource_usage = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--job" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                job_id =
+                    Some(
+                        value
+                            .parse::<EvolutionJobId>()
+                            .map_err(|source| CliError::Parse {
+                                detail: format!("invalid evolution job id `{value}`: {source}"),
+                            })?,
+                    );
+            }
+            "--task" => {
+                index += 1;
+                task_id = args.get(index).cloned();
+                if task_id.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--failure-class" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                failure_class = Some(parse_failure_class(value)?);
+            }
+            "--root-cause" => {
+                index += 1;
+                root_cause_summary = args.get(index).cloned();
+                if root_cause_summary.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--learned" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    what_was_learned.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--usage" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    resource_usage.push(parse_stage_resource_usage(value, task_id.as_deref())?);
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            value if value.starts_with("--") => return Err(CliError::Usage),
+            value => {
+                if campaign_id.is_some() {
+                    return Err(CliError::Usage);
+                }
+                campaign_id = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    Ok(StageEvaluationOptions {
+        campaign_id: campaign_id.ok_or(CliError::Usage)?,
+        job_id: job_id.ok_or(CliError::Usage)?,
+        task_id: task_id.ok_or(CliError::Usage)?,
+        failure_class,
+        root_cause_summary,
+        what_was_learned,
+        resource_usage,
+    })
+}
+
+fn parse_failure_class(value: &str) -> Result<EvolutionFailureClass, CliError> {
+    match value {
+        "build-test-failure" => Ok(EvolutionFailureClass::BuildTestFailure),
+        "eval-regression" => Ok(EvolutionFailureClass::EvalRegression),
+        "artifact-quality-failure" => Ok(EvolutionFailureClass::ArtifactQualityFailure),
+        "rollout-failure" => Ok(EvolutionFailureClass::RolloutFailure),
+        "resource-exhaustion" => Ok(EvolutionFailureClass::ResourceExhaustion),
+        "repeated-implementation-failure" => {
+            Ok(EvolutionFailureClass::RepeatedImplementationFailure)
+        }
+        "foundation-blocker" => Ok(EvolutionFailureClass::FoundationBlocker),
+        "ambiguous-metric" => Ok(EvolutionFailureClass::AmbiguousMetric),
+        "wrong-task-selection" => Ok(EvolutionFailureClass::WrongTaskSelection),
+        "inconclusive-evidence" => Ok(EvolutionFailureClass::InconclusiveEvidence),
+        _ => Err(CliError::Parse {
+            detail: format!("unknown failure class `{value}`"),
+        }),
+    }
+}
+
+fn parse_stage_resource_usage(
+    value: &str,
+    default_task_id: Option<&str>,
+) -> Result<ResourceUsageEstimate, CliError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let (task_id, resource, estimated, actual) = match parts.as_slice() {
+        [resource, estimated] => (
+            default_task_id.ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "usage `{value}` needs --task first or task:resource:estimated[:actual]"
+                ),
+            })?,
+            resource.trim(),
+            estimated.trim(),
+            None,
+        ),
+        [resource, estimated, actual] => (
+            default_task_id.ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "usage `{value}` needs --task first or task:resource:estimated[:actual]"
+                ),
+            })?,
+            resource.trim(),
+            estimated.trim(),
+            Some(actual.trim()),
+        ),
+        [task_id, resource, estimated, actual] => (
+            task_id.trim(),
+            resource.trim(),
+            estimated.trim(),
+            Some(actual.trim()),
+        ),
+        _ => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "usage `{value}` must look like resource:estimated[:actual] or task:resource:estimated:actual"
+                ),
+            });
+        }
+    };
+    let estimated_units = estimated.parse::<u64>().map_err(|source| CliError::Parse {
+        detail: format!("invalid estimated usage units in `{value}`: {source}"),
+    })?;
+    let actual_units = actual
+        .map(|actual| {
+            actual.parse::<u64>().map_err(|source| CliError::Parse {
+                detail: format!("invalid actual usage units in `{value}`: {source}"),
+            })
+        })
+        .transpose()?;
+    Ok(ResourceUsageEstimate {
+        task_id: task_id.to_string(),
+        resource: resource.to_string(),
+        estimated_units,
+        actual_units,
+    })
+}
+
 fn parse_iteration_options(args: &[String]) -> Result<IterationOptions, CliError> {
     let mut campaign_id = None;
     let mut task_id = None;
@@ -3714,6 +3930,37 @@ fn read_stored_job(path: &Path) -> Result<StoredEvolutionJob, CliError> {
     })
 }
 
+fn evolution_report_from_record(record: StoredEvolutionJob) -> Result<EvolutionReport, CliError> {
+    let scorecard = if let Some(scorecard_path) = &record.bundle.scorecard_path {
+        let path = PathBuf::from(scorecard_path);
+        if path.exists() {
+            Some(read_json_file::<EvaluationScorecard>(&path)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(EvolutionReport {
+        job: record.job,
+        candidate_workspace: record.candidate_workspace,
+        bundle: record.bundle,
+        scorecard,
+        changed_files: record.changed_files,
+    })
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, CliError> {
+    let content = fs::read_to_string(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
 fn list_job_records(paths: &EvolutionPaths) -> Result<Vec<StoredEvolutionJob>, CliError> {
     if !paths.jobs.exists() {
         return Ok(Vec::new());
@@ -3972,6 +4219,46 @@ fn write_campaign_iteration_dry_run(
     Ok(bundle)
 }
 
+fn write_campaign_stage_evaluation(
+    paths: &EvolutionPaths,
+    update: &StageEvaluationUpdate,
+) -> Result<CampaignBundlePaths, CliError> {
+    let bundle = write_campaign_bundle(paths, &update.campaign)?;
+    write_json(&bundle.stage_scorecard_json, &update.stage_scorecard)?;
+    append_jsonl(&bundle.stage_scorecards_jsonl, &update.stage_scorecard)?;
+    if let Some(adaptation) = &update.adaptation {
+        write_json(&bundle.adaptation_json, adaptation)?;
+        append_jsonl(&bundle.adaptations_jsonl, adaptation)?;
+    }
+    Ok(bundle)
+}
+
+fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let line = serde_json::to_string(value).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    use std::io::Write;
+    writeln!(file, "{line}").map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
 fn write_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::Io {
@@ -4072,6 +4359,24 @@ fn println_iteration_dry_run(plan: &ScheduledIterationPlan, bundle: &CampaignBun
         "iteration dispatches: {}",
         bundle.iteration_dispatches_jsonl.display()
     );
+}
+
+fn println_stage_evaluation(update: &StageEvaluationUpdate, bundle: &CampaignBundlePaths) {
+    println!("campaign: {}", update.stage_scorecard.campaign_id);
+    println!("stage: {}", update.stage_scorecard.stage_id);
+    println!("task: {}", update.stage_scorecard.task_id);
+    println!("outcome: {:?}", update.stage_scorecard.outcome);
+    println!("promotion: {:?}", update.stage_scorecard.promotion);
+    println!("campaign status: {:?}", update.campaign.status);
+    println!("stage scorecard: {}", bundle.stage_scorecard_json.display());
+    println!(
+        "stage scorecards: {}",
+        bundle.stage_scorecards_jsonl.display()
+    );
+    if update.adaptation.is_some() {
+        println!("adaptation: {}", bundle.adaptation_json.display());
+        println!("adaptations: {}", bundle.adaptations_jsonl.display());
+    }
 }
 
 fn println_report(report: &EvolutionReport) {
@@ -4741,6 +5046,12 @@ fn print_evolve_help() {
     println!(
         "      Write phase-2 scheduled-iteration handoff artifacts without starting an implementation agent."
     );
+    println!(
+        "  sinomo evolve evaluate <campaign> --job <evojob_...> --task <task_id> [--failure-class <class>] [--root-cause <text>] [--learned <text>] [--usage <resource:estimated[:actual]>]"
+    );
+    println!(
+        "      Write phase-3 stage scorecard/adaptation artifacts and update campaign state after candidate evaluation."
+    );
     println!("  sinomo evolve approve [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
@@ -5235,6 +5546,57 @@ mod tests {
         assert_eq!(options.max_wall_time.as_deref(), Some("10m"));
         assert!(options.pause_after_proposal);
         assert!(options.dry_run);
+    }
+
+    #[test]
+    fn evolve_evaluate_parser_accepts_phase_three_stage_flags() {
+        let command = super::parse_evolve_command(&[
+            "evaluate".to_string(),
+            "camp_demo".to_string(),
+            "--job".to_string(),
+            "evojob_demo".to_string(),
+            "--task".to_string(),
+            "task_demo".to_string(),
+            "--failure-class".to_string(),
+            "foundation-blocker".to_string(),
+            "--root-cause".to_string(),
+            "stage evidence missing from packet".to_string(),
+            "--learned".to_string(),
+            "add stage evidence before retry".to_string(),
+        ])
+        .expect("evaluate command");
+        assert!(matches!(command, super::EvolveCliCommand::Evaluate(_)));
+
+        let options = super::parse_stage_evaluation_options(&[
+            "camp_demo".to_string(),
+            "--job".to_string(),
+            "evojob_demo".to_string(),
+            "--task".to_string(),
+            "task_demo".to_string(),
+            "--failure-class".to_string(),
+            "foundation-blocker".to_string(),
+            "--root-cause".to_string(),
+            "stage evidence missing from packet".to_string(),
+            "--learned".to_string(),
+            "add stage evidence before retry".to_string(),
+        ])
+        .expect("stage evaluation options");
+
+        assert_eq!(options.campaign_id, "camp_demo");
+        assert_eq!(options.job_id.as_str(), "evojob_demo");
+        assert_eq!(options.task_id, "task_demo");
+        assert_eq!(
+            options.failure_class,
+            Some(sinomo_evolution::EvolutionFailureClass::FoundationBlocker)
+        );
+        assert_eq!(
+            options.root_cause_summary.as_deref(),
+            Some("stage evidence missing from packet")
+        );
+        assert_eq!(
+            options.what_was_learned,
+            vec!["add stage evidence before retry".to_string()]
+        );
     }
 
     #[test]

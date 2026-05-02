@@ -378,6 +378,97 @@ pub struct ScheduledIterationPlan {
     pub operator_notes: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StageEvaluationRequest {
+    pub campaign: EvolutionCampaign,
+    pub task_id: String,
+    pub report: EvolutionReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_usage: Vec<ResourceUsageEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<EvolutionFailureClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cause_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub what_was_learned: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StageEvaluationUpdate {
+    pub campaign: EvolutionCampaign,
+    pub stage_scorecard: CampaignStageScorecard,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptation: Option<CampaignAdaptationRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CampaignStageScorecard {
+    pub scorecard_id: String,
+    pub campaign_id: String,
+    pub stage_id: String,
+    pub task_id: String,
+    pub iteration_id: String,
+    pub outcome: EvaluationOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_metrics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub met_metrics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_metrics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regression_gates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub promotion: StagePromotionDecision,
+    pub summary: String,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum StagePromotionDecision {
+    Promote,
+    HoldFailed,
+    HoldInconclusive,
+    HoldHumanCheckpoint,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum EvolutionFailureClass {
+    BuildTestFailure,
+    EvalRegression,
+    ArtifactQualityFailure,
+    RolloutFailure,
+    ResourceExhaustion,
+    RepeatedImplementationFailure,
+    FoundationBlocker,
+    AmbiguousMetric,
+    WrongTaskSelection,
+    InconclusiveEvidence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CampaignAdaptationRecord {
+    pub adaptation_id: String,
+    pub campaign_id: String,
+    pub stage_id: String,
+    pub failed_iteration_id: String,
+    pub failed_task_id: String,
+    pub failure_class: EvolutionFailureClass,
+    pub root_cause_summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub what_was_learned: Vec<String>,
+    pub next_task_simplification: String,
+    pub new_eval_or_diagnostic: String,
+    pub foundation_issue_detected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_task_candidate: Option<NearTermEvolutionTask>,
+    pub budget_adjustment: String,
+    pub human_attention_needed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub recorded_at: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CampaignTaskReplacementProposal {
     pub title: String,
@@ -911,6 +1002,392 @@ pub fn record_scheduled_iteration_result(
     campaign.status = campaign_status;
     campaign.updated_at = now;
     campaign
+}
+
+pub fn evaluate_campaign_stage(request: StageEvaluationRequest) -> StageEvaluationUpdate {
+    let StageEvaluationRequest {
+        campaign,
+        task_id,
+        report,
+        resource_usage,
+        failure_class,
+        root_cause_summary,
+        what_was_learned,
+    } = request;
+    let task = campaign
+        .near_term_tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .cloned();
+    let stage = task
+        .as_ref()
+        .and_then(|task| {
+            campaign
+                .stages
+                .iter()
+                .find(|stage| stage.stage_id == task.stage_id)
+                .cloned()
+        })
+        .or_else(|| campaign.stages.first().cloned());
+    let stage_id = stage
+        .as_ref()
+        .map(|stage| stage.stage_id.clone())
+        .unwrap_or_else(|| "stage_unknown".to_string());
+    let outcome = report
+        .scorecard
+        .as_ref()
+        .map(|scorecard| scorecard.outcome.clone())
+        .unwrap_or(EvaluationOutcome::Inconclusive);
+    let evidence_refs = campaign_iteration_evidence_refs(&report, &resource_usage);
+    let declared_metrics = stage
+        .as_ref()
+        .map(|stage| stage.acceptance_metrics.clone())
+        .unwrap_or_default();
+    let met_metrics = if outcome == EvaluationOutcome::Passed {
+        declared_metrics.clone()
+    } else {
+        Vec::new()
+    };
+    let missing_metrics = declared_metrics
+        .iter()
+        .filter(|metric| !met_metrics.contains(metric))
+        .cloned()
+        .collect::<Vec<_>>();
+    let promotion = match outcome {
+        EvaluationOutcome::Passed if missing_metrics.is_empty() => StagePromotionDecision::Promote,
+        EvaluationOutcome::Passed => StagePromotionDecision::HoldHumanCheckpoint,
+        EvaluationOutcome::Failed => StagePromotionDecision::HoldFailed,
+        EvaluationOutcome::Inconclusive => StagePromotionDecision::HoldInconclusive,
+    };
+    let now = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    let stage_scorecard = CampaignStageScorecard {
+        scorecard_id: generated_id("stage_score"),
+        campaign_id: campaign.campaign_id.clone(),
+        stage_id: stage_id.clone(),
+        task_id: task_id.clone(),
+        iteration_id: generated_id("stage_eval"),
+        outcome: outcome.clone(),
+        declared_metrics,
+        met_metrics,
+        missing_metrics,
+        regression_gates: stage
+            .as_ref()
+            .map(|stage| stage.regression_gates.clone())
+            .unwrap_or_default(),
+        evidence_refs: evidence_refs.clone(),
+        promotion: promotion.clone(),
+        summary: match promotion {
+            StagePromotionDecision::Promote => {
+                "stage acceptance metrics passed; ready for human rollout checkpoint".to_string()
+            }
+            StagePromotionDecision::HoldFailed => {
+                "stage metrics did not pass; adapt before retrying same task family".to_string()
+            }
+            StagePromotionDecision::HoldInconclusive => {
+                "stage evidence is inconclusive; human metric checkpoint required".to_string()
+            }
+            StagePromotionDecision::HoldHumanCheckpoint => {
+                "stage evidence needs human review before promotion".to_string()
+            }
+        },
+        recorded_at: now.clone(),
+    };
+
+    let mut campaign =
+        record_scheduled_iteration_result(campaign, &task_id, &report, resource_usage);
+    let adaptation = if outcome == EvaluationOutcome::Failed {
+        Some(build_campaign_adaptation_record(
+            &mut campaign,
+            task.as_ref(),
+            &stage_id,
+            &task_id,
+            failure_class.unwrap_or_else(|| classify_failure_from_report(&report)),
+            root_cause_summary,
+            what_was_learned,
+            &evidence_refs,
+            &now,
+        ))
+    } else {
+        None
+    };
+
+    match stage_scorecard.promotion {
+        StagePromotionDecision::Promote => {
+            campaign.status = EvolutionCampaignStatus::StageComplete;
+            campaign.approval_checkpoint.status = ApprovalCheckpointStatus::AwaitingHuman;
+            campaign.approval_checkpoint.required_before =
+                format!("first rollout or next-stage scheduling for {stage_id}");
+            campaign.decisions.push(CampaignDecision {
+                decision_id: generated_id("decision"),
+                kind: CampaignDecisionKind::StagePromoted,
+                summary: format!("Stage metrics met for `{stage_id}`"),
+                rationale:
+                    "Phase 3 promotion requires declared stage metrics to pass before stage completion."
+                        .to_string(),
+                evidence_refs: vec!["stage-scorecards.jsonl".to_string()],
+                decided_by: "campaign-stage-evaluator".to_string(),
+                decided_at: now.clone(),
+            });
+        }
+        StagePromotionDecision::HoldInconclusive | StagePromotionDecision::HoldHumanCheckpoint => {
+            campaign.status = EvolutionCampaignStatus::PausedHuman;
+            campaign.approval_checkpoint.status = ApprovalCheckpointStatus::AwaitingHuman;
+            campaign.approval_checkpoint.required_before =
+                format!("clarify ambiguous metrics for {stage_id}");
+        }
+        StagePromotionDecision::HoldFailed => {
+            if matches!(
+                adaptation
+                    .as_ref()
+                    .map(|adaptation| &adaptation.failure_class),
+                Some(
+                    EvolutionFailureClass::FoundationBlocker
+                        | EvolutionFailureClass::AmbiguousMetric
+                )
+            ) {
+                campaign.status = EvolutionCampaignStatus::PausedHuman;
+                campaign.approval_checkpoint.status = ApprovalCheckpointStatus::AwaitingHuman;
+                campaign.approval_checkpoint.required_before =
+                    format!("review adaptation before retrying {stage_id}");
+            } else {
+                campaign.status = EvolutionCampaignStatus::Scheduled;
+            }
+        }
+    }
+    campaign.updated_at = now;
+
+    StageEvaluationUpdate {
+        campaign,
+        stage_scorecard,
+        adaptation,
+    }
+}
+
+fn campaign_iteration_evidence_refs(
+    report: &EvolutionReport,
+    resource_usage: &[ResourceUsageEstimate],
+) -> Vec<String> {
+    let mut evidence = vec![
+        format!("job:{}", report.job.job_id),
+        format!(
+            "candidate-worktree:{}",
+            report.candidate_workspace.path.display()
+        ),
+        format!("bundle:{}", report.bundle.bundle_path),
+    ];
+    if let Some(scorecard_path) = &report.bundle.scorecard_path {
+        evidence.push(format!("scorecard:{scorecard_path}"));
+    }
+    if let Some(changed_files_path) = &report.bundle.changed_files_path {
+        evidence.push(format!("changed-files:{changed_files_path}"));
+    }
+    for usage in resource_usage {
+        evidence.push(format!(
+            "resource-usage:{} estimated={} actual={}",
+            usage.resource,
+            usage.estimated_units,
+            usage
+                .actual_units
+                .map(|units| units.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+    evidence
+}
+
+fn classify_failure_from_report(report: &EvolutionReport) -> EvolutionFailureClass {
+    if report.changed_files.is_empty() {
+        EvolutionFailureClass::WrongTaskSelection
+    } else if report
+        .job
+        .required_gates
+        .contains(&EvaluationGate::StaticChecks)
+    {
+        EvolutionFailureClass::BuildTestFailure
+    } else {
+        EvolutionFailureClass::EvalRegression
+    }
+}
+
+fn build_campaign_adaptation_record(
+    campaign: &mut EvolutionCampaign,
+    task: Option<&NearTermEvolutionTask>,
+    stage_id: &str,
+    task_id: &str,
+    failure_class: EvolutionFailureClass,
+    root_cause_summary: Option<String>,
+    what_was_learned: Vec<String>,
+    evidence_refs: &[String],
+    now: &str,
+) -> CampaignAdaptationRecord {
+    let repeated_failures = campaign
+        .iteration_results
+        .iter()
+        .filter(|result| {
+            result.task_id == task_id && result.status == EvolutionIterationStatus::Adapted
+        })
+        .count();
+    let foundation_issue_detected = failure_class == EvolutionFailureClass::FoundationBlocker;
+    let human_attention_needed = matches!(
+        failure_class,
+        EvolutionFailureClass::FoundationBlocker | EvolutionFailureClass::AmbiguousMetric
+    );
+    let should_propose_replacement = foundation_issue_detected || repeated_failures >= 2;
+    let replacement_task_candidate = if should_propose_replacement {
+        Some(adapted_task_for_failure(
+            task,
+            stage_id,
+            task_id,
+            &failure_class,
+            root_cause_summary.as_deref(),
+        ))
+    } else {
+        None
+    };
+    if let Some(replacement) = replacement_task_candidate.clone() {
+        campaign.near_term_tasks.insert(0, replacement.clone());
+        campaign.decisions.push(CampaignDecision {
+            decision_id: generated_id("decision"),
+            kind: CampaignDecisionKind::DirectionChanged,
+            summary: format!("Proposed adapted task `{}`", replacement.task_id),
+            rationale: format!(
+                "Failed task `{task_id}` classified as {:?}; next work must be easier, diagnostic, or foundational.",
+                failure_class
+            ),
+            evidence_refs: evidence_refs.to_vec(),
+            decided_by: "campaign-stage-evaluator".to_string(),
+            decided_at: now.to_string(),
+        });
+    }
+    CampaignAdaptationRecord {
+        adaptation_id: generated_id("adapt"),
+        campaign_id: campaign.campaign_id.clone(),
+        stage_id: stage_id.to_string(),
+        failed_iteration_id: campaign
+            .iteration_results
+            .last()
+            .map(|result| result.iteration_id.clone())
+            .unwrap_or_else(|| "unknown-iteration".to_string()),
+        failed_task_id: task_id.to_string(),
+        failure_class: failure_class.clone(),
+        root_cause_summary: root_cause_summary.unwrap_or_else(|| {
+            format!(
+                "candidate failed with class {:?}; inspect scorecard and logs",
+                failure_class
+            )
+        }),
+        what_was_learned,
+        next_task_simplification: adaptation_simplification(&failure_class),
+        new_eval_or_diagnostic: adaptation_diagnostic(&failure_class),
+        foundation_issue_detected,
+        replacement_task_candidate,
+        budget_adjustment: adaptation_budget_adjustment(&failure_class),
+        human_attention_needed,
+        evidence_refs: evidence_refs.to_vec(),
+        recorded_at: now.to_string(),
+    }
+}
+
+fn adapted_task_for_failure(
+    task: Option<&NearTermEvolutionTask>,
+    stage_id: &str,
+    task_id: &str,
+    failure_class: &EvolutionFailureClass,
+    root_cause: Option<&str>,
+) -> NearTermEvolutionTask {
+    let base_title = task
+        .map(|task| task.title.clone())
+        .unwrap_or_else(|| task_id.to_string());
+    let (title, objective, expected_result_kind) = match failure_class {
+        EvolutionFailureClass::FoundationBlocker => (
+            format!("Repair foundation blocker for {base_title}"),
+            format!(
+                "Reproduce and repair the foundation blocker before retrying `{task_id}`. Root cause: {}",
+                root_cause.unwrap_or("foundation blocker needs diagnosis")
+            ),
+            EvolutionResultKind::FoundationRepair,
+        ),
+        EvolutionFailureClass::AmbiguousMetric => (
+            format!("Clarify metrics for {base_title}"),
+            format!(
+                "Add a clearer stage metric or diagnostic scorecard before retrying `{task_id}`."
+            ),
+            EvolutionResultKind::Evaluator,
+        ),
+        _ => (
+            format!("Add diagnostic repro for {base_title}"),
+            format!(
+                "Make the failure for `{task_id}` reproducible and narrower before another implementation attempt."
+            ),
+            EvolutionResultKind::Instrumentation,
+        ),
+    };
+    NearTermEvolutionTask {
+        task_id: generated_id("task"),
+        stage_id: stage_id.to_string(),
+        title,
+        objective,
+        rationale: "Phase 3 adaptation requires a failed task family to become easier, more diagnostic, or more foundational before retry.".to_string(),
+        required_evidence: vec![
+            "failed iteration scorecard".to_string(),
+            "focused diagnostic or blocker repro".to_string(),
+        ],
+        verification_commands: task
+            .map(|task| task.verification_commands.clone())
+            .unwrap_or_default(),
+        estimated_budget: "smaller diagnostic lease before full implementation retry".to_string(),
+        approval_required: true,
+        expected_result_kind,
+    }
+}
+
+fn adaptation_simplification(failure_class: &EvolutionFailureClass) -> String {
+    match failure_class {
+        EvolutionFailureClass::FoundationBlocker => {
+            "switch to a prerequisite foundation repair before retrying the original stage task"
+                .to_string()
+        }
+        EvolutionFailureClass::AmbiguousMetric => {
+            "replace the ambiguous metric with a narrower diagnostic scorecard".to_string()
+        }
+        EvolutionFailureClass::ResourceExhaustion => {
+            "defer expensive work and schedule an analysis-only or cheaper scouting task"
+                .to_string()
+        }
+        _ => "split the failed task into a smaller diagnostic or instrumentation step".to_string(),
+    }
+}
+
+fn adaptation_diagnostic(failure_class: &EvolutionFailureClass) -> String {
+    match failure_class {
+        EvolutionFailureClass::BuildTestFailure => {
+            "focused repro test or build log triage".to_string()
+        }
+        EvolutionFailureClass::EvalRegression => "metric-specific regression fixture".to_string(),
+        EvolutionFailureClass::ArtifactQualityFailure => {
+            "labeled artifact inspection examples".to_string()
+        }
+        EvolutionFailureClass::RolloutFailure => "shadow-only rollout health check".to_string(),
+        EvolutionFailureClass::FoundationBlocker => {
+            "foundation blocker reproduction and post-fix gate".to_string()
+        }
+        EvolutionFailureClass::AmbiguousMetric => "human-reviewed metric clarification".to_string(),
+        _ => "diagnostic evidence bundle before retry".to_string(),
+    }
+}
+
+fn adaptation_budget_adjustment(failure_class: &EvolutionFailureClass) -> String {
+    match failure_class {
+        EvolutionFailureClass::ResourceExhaustion => {
+            "lower next lease estimate and wait for reset or cheaper resource class".to_string()
+        }
+        EvolutionFailureClass::RepeatedImplementationFailure => {
+            "cap retries until diagnostic task passes".to_string()
+        }
+        _ => "keep existing budget policy; require scheduling before adapted dispatch".to_string(),
+    }
 }
 
 pub fn accept_task_replacement_proposal(
@@ -3133,6 +3610,190 @@ mod tests {
                     .rationale
                     .contains("rollout still requires existing approval")
         }));
+    }
+
+    #[test]
+    fn stage_evaluation_promotes_only_when_declared_metrics_pass() {
+        let mut campaign = sample_approved_campaign("improve staged evaluation for self evolution");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let stage_id = campaign.near_term_tasks[0].stage_id.clone();
+        let report = sample_iteration_report(&campaign, &task_id, EvaluationOutcome::Passed);
+
+        let update = evaluate_campaign_stage(StageEvaluationRequest {
+            campaign,
+            task_id: task_id.clone(),
+            report,
+            resource_usage: Vec::new(),
+            failure_class: None,
+            root_cause_summary: None,
+            what_was_learned: Vec::new(),
+        });
+
+        assert_eq!(update.stage_scorecard.stage_id, stage_id);
+        assert_eq!(update.stage_scorecard.outcome, EvaluationOutcome::Passed);
+        assert_eq!(
+            update.stage_scorecard.promotion,
+            StagePromotionDecision::Promote
+        );
+        assert!(update.stage_scorecard.missing_metrics.is_empty());
+        assert_eq!(
+            update.campaign.status,
+            EvolutionCampaignStatus::StageComplete
+        );
+        assert!(update.campaign.decisions.iter().any(|decision| {
+            decision.kind == CampaignDecisionKind::StagePromoted
+                && decision.summary.contains("Stage metrics met")
+        }));
+    }
+
+    #[test]
+    fn stage_evaluation_records_adaptation_and_proposes_foundation_task_after_repeated_failure() {
+        let mut campaign = sample_approved_campaign("adapt failed staged evaluation attempts");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let stage_id = campaign.near_term_tasks[0].stage_id.clone();
+        campaign.iteration_results.push(EvolutionIterationResult {
+            iteration_id: "iter_previous_failure".to_string(),
+            task_id: task_id.clone(),
+            result_kind: EvolutionResultKind::Patch,
+            status: EvolutionIterationStatus::Adapted,
+            evidence: vec!["scorecard:/tmp/previous-scorecard.json".to_string()],
+            summary: Some("previous attempt failed".to_string()),
+        });
+        let report = sample_iteration_report(&campaign, &task_id, EvaluationOutcome::Failed);
+
+        let update = evaluate_campaign_stage(StageEvaluationRequest {
+            campaign,
+            task_id: task_id.clone(),
+            report,
+            resource_usage: Vec::new(),
+            failure_class: Some(EvolutionFailureClass::FoundationBlocker),
+            root_cause_summary: Some(
+                "the campaign packet does not expose stage evidence".to_string(),
+            ),
+            what_was_learned: vec!["stage evidence must be visible before retrying".to_string()],
+        });
+
+        let adaptation = update.adaptation.expect("failed repeated task adapts");
+        assert_eq!(adaptation.failed_task_id, task_id);
+        assert_eq!(adaptation.stage_id, stage_id);
+        assert_eq!(
+            adaptation.failure_class,
+            EvolutionFailureClass::FoundationBlocker
+        );
+        assert!(adaptation.foundation_issue_detected);
+        assert!(adaptation.human_attention_needed);
+        assert!(adaptation.next_task_simplification.contains("foundation"));
+        let replacement = adaptation
+            .replacement_task_candidate
+            .expect("foundation blocker creates explicit task");
+        assert_eq!(
+            replacement.expected_result_kind,
+            EvolutionResultKind::FoundationRepair
+        );
+        assert_eq!(
+            update.campaign.near_term_tasks[0].task_id,
+            replacement.task_id
+        );
+        assert_eq!(update.campaign.status, EvolutionCampaignStatus::PausedHuman);
+        assert_eq!(
+            update.stage_scorecard.promotion,
+            StagePromotionDecision::HoldFailed
+        );
+    }
+
+    fn sample_approved_campaign(objective: &str) -> EvolutionCampaign {
+        propose_evolution_campaign(CampaignProposalRequest {
+            objective: objective.to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        })
+    }
+
+    fn sample_iteration_report(
+        campaign: &EvolutionCampaign,
+        task_id: &str,
+        outcome: EvaluationOutcome,
+    ) -> EvolutionReport {
+        let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+            campaign: campaign.clone(),
+            task_id: Some(task_id.to_string()),
+            intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+            extra_verification_commands: vec!["cargo test -p sinomo-evolution --lib".to_string()],
+            dry_run: true,
+        })
+        .expect("plan");
+        let job_id = EvolutionJobId::generate();
+        EvolutionReport {
+            job: EvolutionJob {
+                job_id: job_id.clone(),
+                objective: plan.evolution_request.objective,
+                target_ring: campaign.target_ring.clone(),
+                target_module_id: None,
+                edit_scope: EditScope {
+                    workspace_root: "/workspace/sinomo".to_string(),
+                    intended_paths: plan.evolution_request.intended_paths.clone(),
+                    notes: "campaign scheduled iteration".to_string(),
+                },
+                verification: VerificationPlan {
+                    commands: plan.evolution_request.verification_commands.clone(),
+                },
+                recovery: RecoveryPlan::default(),
+                scope: EvolutionScope {
+                    allowed_paths: plan.evolution_request.intended_paths.clone(),
+                    forbidden_paths: Vec::new(),
+                    workspace_id: Some(WorkspaceId::new("workspace_campaign").expect("workspace")),
+                },
+                status: EvolutionJobStatus::AwaitingApproval,
+                required_gates: vec![EvaluationGate::StaticChecks],
+                rollback_policy: RollbackPolicy::default(),
+            },
+            candidate_workspace: CandidateWorkspace {
+                job_id: job_id.clone(),
+                path: PathBuf::from("/tmp/sinomo-candidate-worktree"),
+                branch_name: "evolution/test-campaign-task".to_string(),
+                source_revision: Some("abc123".to_string()),
+            },
+            bundle: CandidateBundleManifest {
+                job_id,
+                bundle_path: "/tmp/sinomo-candidate-bundle".to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+                mutation_packet_path: "/tmp/sinomo-candidate-bundle/mutation-packet.json"
+                    .to_string(),
+                job_path: Some("/tmp/sinomo-candidate-bundle/job.json".to_string()),
+                model_output_path: Some(
+                    "/tmp/sinomo-candidate-bundle/model-output.json".to_string(),
+                ),
+                changed_files_path: Some(
+                    "/tmp/sinomo-candidate-bundle/changed-files.json".to_string(),
+                ),
+                diff_path: Some("/tmp/sinomo-candidate-bundle/diff.patch".to_string()),
+                scorecard_path: Some("/tmp/sinomo-candidate-bundle/scorecard.json".to_string()),
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            scorecard: Some(EvaluationScorecard {
+                scorecard_id: ScorecardId::generate(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+                outcome,
+                gates: Vec::new(),
+                metrics: Vec::new(),
+            }),
+            changed_files: vec!["crates/sinomo-evolution/src/lib.rs".to_string()],
+        }
     }
 
     #[test]
