@@ -274,6 +274,18 @@ The system should separate immutable foundation code from evolvable modules.
 
 R0 should remain tiny and continuity-focused. R1 should be boring in behavior but mutable in deployment: it must be designed for autonomous replacement through redundant supervisors, shadow instances, atomic desired-state changes, and fast rollback.
 
+The crate graph now makes this trust-ring cut explicit. Each workspace crate declares `[package.metadata.sinomo] ring = "..."` in its `Cargo.toml`, and `sinomo-runtime` is the R0/R1 boundary facade. R0/R1 crates must not depend on R2 services or application crates. R2 services and application crates must cross the foundation boundary through the `sinomo-runtime` facade instead of depending directly on R0/R1 crates.
+
+Initial crate ownership:
+
+| Group | Crates |
+|---|---|
+| R0 | `sinomo-core` |
+| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-local`, `sinomo-module`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision`, `sinomo-sync` |
+| R0/R1 boundary | `sinomo-runtime` |
+| R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-trigger`, `sinomo-video`, `sinomo-voice` |
+| Application/tooling | `sinomo`, `sinomo-app`, `sinomo-cli` |
+
 ### Evolution Delivery Model
 
 Self-evolution should flow through explicit artifacts:
@@ -319,6 +331,8 @@ The initial foundation should support these R1 requirements even if their first 
 
 - Stable trust ring metadata on modules, jobs, policies, and artifacts.
 - Module manifest and artifact identity types in `sinomo-core`.
+- An explicit `sinomo-runtime` facade that aggregates only R0/R1 crates and gives R2 services a stable foundation import boundary.
+- Workspace architecture tests that reject missing ring metadata, R0/R1 dependencies on R2/application crates, and direct R2/application dependencies on R0/R1 crates outside `sinomo-runtime`.
 - A policy decision boundary that candidate code cannot bypass.
 - An artifact registry model backed by PostgreSQL metadata and DFS/local content storage.
 - Node-local module loader state with current, previous, shadow, and candidate versions.

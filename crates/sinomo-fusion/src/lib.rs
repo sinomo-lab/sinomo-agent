@@ -1,6 +1,6 @@
 //! Cross-modal alignment skeleton.
 
-use sinomo_core::{
+use sinomo_runtime::core::{
     Confidence, EventEnvelope, EventId, EventKind, EventLinks, LatencyClass, PrivacyClass,
     RoutingMetadata, RoutingScope, Salience, Source,
 };
@@ -55,7 +55,7 @@ impl FusionWorker {
         event
             .routing
             .hints
-            .push(sinomo_core::RoutingHint::new("requires:context-packet").expect("hint"));
+            .push(sinomo_runtime::core::RoutingHint::new("requires:context-packet").expect("hint"));
         Some(event)
     }
 }
@@ -63,7 +63,7 @@ impl FusionWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{
+    use sinomo_runtime::core::{
         Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
         RoutingMetadata, RoutingScope, Salience, SessionId, Source,
     };

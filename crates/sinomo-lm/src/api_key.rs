@@ -1,6 +1,6 @@
 use crate::{LanguageModelError, unix_timestamp};
 use serde::{Deserialize, Serialize};
-use sinomo_local::SinomoDataDir;
+use sinomo_runtime::local::SinomoDataDir;
 use std::fs;
 use std::path::PathBuf;
 

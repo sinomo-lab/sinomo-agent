@@ -778,7 +778,9 @@ For bootstrap, rollout may simply mean merging a candidate branch or switching a
 
 ## Data Model Additions
 
-Initial contracts should live in `sinomo-core` when they are pure data. Orchestration behavior belongs in `sinomo-evolution`; evaluation execution belongs in `sinomo-eval`; model/provider selection and metering should integrate with `sinomo-lm`; rollout execution belongs in `sinomo-rollout`.
+Initial contracts should live in R0/R1 crates when they are pure foundation data. `sinomo-core` remains the R0 contract crate, `sinomo-runtime` is the explicit R0/R1 boundary facade, and each workspace crate declares its trust ring in `[package.metadata.sinomo]`. Orchestration behavior belongs in the R2 `sinomo-evolution` service; evaluation execution belongs in the R1 `sinomo-eval` crate; model/provider selection and metering should integrate with the R2 `sinomo-lm` service; rollout execution belongs in the R1 `sinomo-rollout` crate.
+
+The campaign implementation must preserve the dependency direction: R2 services and application crates cross into the foundation through `sinomo-runtime`, while R0/R1 crates must not depend on R2 service or application crates.
 
 This version intentionally does not require a formal capability data model.
 

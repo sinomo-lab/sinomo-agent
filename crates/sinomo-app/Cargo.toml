@@ -8,6 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 include = ["**/*.rs", "Cargo.toml"]
 
+[package.metadata.sinomo]
+ring = "application"
+
 [dependencies]
 serde_json.workspace = true
 time.workspace = true
@@ -15,28 +18,14 @@ tracing.workspace = true
 sinomo-cli = { path = "../sinomo-cli" }
 sinomo-actions = { path = "../sinomo-actions" }
 sinomo-agent = { path = "../sinomo-agent" }
-sinomo-api = { path = "../sinomo-api" }
-sinomo-core = { path = "../sinomo-core" }
 sinomo-audio = { path = "../sinomo-audio" }
-sinomo-device = { path = "../sinomo-device" }
-sinomo-dfs = { path = "../sinomo-dfs" }
-sinomo-eval = { path = "../sinomo-eval" }
-sinomo-events = { path = "../sinomo-events" }
 sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-fusion = { path = "../sinomo-fusion" }
 sinomo-gateway = { path = "../sinomo-gateway" }
 sinomo-deliberation = { path = "../sinomo-deliberation" }
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-memory = { path = "../sinomo-memory" }
-sinomo-module = { path = "../sinomo-module" }
-sinomo-network = { path = "../sinomo-network" }
-sinomo-node = { path = "../sinomo-node" }
-sinomo-policy = { path = "../sinomo-policy" }
-sinomo-registry = { path = "../sinomo-registry" }
-sinomo-rollout = { path = "../sinomo-rollout" }
-sinomo-sandbox = { path = "../sinomo-sandbox" }
-sinomo-supervision = { path = "../sinomo-supervision" }
-sinomo-sync = { path = "../sinomo-sync" }
 sinomo-trigger = { path = "../sinomo-trigger" }
 sinomo-video = { path = "../sinomo-video" }
 sinomo-voice = { path = "../sinomo-voice" }
+sinomo-runtime = { path = "../sinomo-runtime" }

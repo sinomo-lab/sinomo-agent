@@ -1,11 +1,11 @@
 use crate::{CandidateWorkspace, parse_git_status_paths, shell_command};
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
+use sinomo_runtime::core::{
     Confidence, EvaluationGate, EventEnvelope, EventId, EventKind, EvolutionJobId, LatencyClass,
     NodeId, PrivacyClass, RoutingHint, RoutingMetadata, RoutingScope, Salience, Source,
     VerificationCommand,
 };
-use sinomo_eval::{
+use sinomo_runtime::eval::{
     CommandControlAction, CommandControlRegistry, CommandRunResult, CommandRunner,
     LocalCommandRunner, NoopCommandRunObserver,
 };
@@ -116,7 +116,7 @@ impl EvolutionToolRegistry {
     pub fn bootstrap() -> Self {
         let mut registry = Self::new();
         let command_runner = LocalCommandRunner::with_observer(
-            sinomo_eval::CommandInactivityPolicy::default(),
+            sinomo_runtime::eval::CommandInactivityPolicy::default(),
             NoopCommandRunObserver,
             registry.command_control.clone(),
         );
@@ -819,9 +819,9 @@ fn tool_call_event(
     }));
 
     for path in &result.evidence.paths {
-        event.evidence.refs.push(sinomo_core::EvidenceRef {
+        event.evidence.refs.push(sinomo_runtime::core::EvidenceRef {
             uri: format!("file://{}", workspace.path.join(path).display()),
-            kind: sinomo_core::EvidenceKind::Other,
+            kind: sinomo_runtime::core::EvidenceKind::Other,
             content_hash: None,
         });
     }

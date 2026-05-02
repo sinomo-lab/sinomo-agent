@@ -1,13 +1,13 @@
 //! Bounded interactive controller skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
+use sinomo_runtime::core::{
     ActionRequest, Confidence, ContextPacket, EntityId, EventEnvelope, EventId, EventKind,
     LatencyClass, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
     TaskId, TriggerAction, TriggerDecision,
 };
-use sinomo_device::{DeviceKind, DeviceProfile};
-use sinomo_events::{EventStore, ReplayDirection, ReplayQuery, StoredEvent};
+use sinomo_runtime::device::{DeviceKind, DeviceProfile};
+use sinomo_runtime::events::{EventStore, ReplayDirection, ReplayQuery, StoredEvent};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -231,18 +231,18 @@ fn collect_json_text(value: &serde_json::Value, text: &mut String) {
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error(transparent)]
-    EventStore(#[from] sinomo_events::EventStoreError),
+    EventStore(#[from] sinomo_runtime::events::EventStoreError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{
+    use sinomo_runtime::core::{
         Confidence, DeviceId, EventEnvelope, EventId, EventKind, LatencyClass, NodeId,
         PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
     };
-    use sinomo_device::DeviceState;
-    use sinomo_events::{EventStore, InMemoryEventStore};
+    use sinomo_runtime::device::DeviceState;
+    use sinomo_runtime::events::{EventStore, InMemoryEventStore};
 
     fn event(id: &str, text: &str, salience: f32) -> EventEnvelope {
         EventEnvelope::new(
@@ -293,7 +293,7 @@ mod tests {
         let context = BoundedContext {
             session_id: SessionId::new("sess_agent").expect("session"),
             events: vec![StoredEvent {
-                sequence: sinomo_events::EventSequence(1),
+                sequence: sinomo_runtime::events::EventSequence(1),
                 appended_at: time::OffsetDateTime::now_utc(),
                 event: event("evt_alert", "urgent alert", 0.9),
             }],

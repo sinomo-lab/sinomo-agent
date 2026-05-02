@@ -1,8 +1,8 @@
 //! Hot and warm memory policy skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{ContextPacket, EntityId, MemoryRecord, SessionId, TrustDomain};
-use sinomo_events::StoredEvent;
+use sinomo_runtime::core::{ContextPacket, EntityId, MemoryRecord, SessionId, TrustDomain};
+use sinomo_runtime::events::StoredEvent;
 use std::collections::VecDeque;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -188,7 +188,7 @@ impl MemoryManager {
     }
 }
 
-fn promotion_reason(event: &sinomo_core::EventEnvelope) -> Option<PromotionReason> {
+fn promotion_reason(event: &sinomo_runtime::core::EventEnvelope) -> Option<PromotionReason> {
     let kind = event.kind.as_str();
     if kind.starts_with("safety.") {
         Some(PromotionReason::SafetyIncident)
@@ -206,7 +206,7 @@ fn promotion_reason(event: &sinomo_core::EventEnvelope) -> Option<PromotionReaso
     }
 }
 
-fn summarize_event(event: &sinomo_core::EventEnvelope) -> String {
+fn summarize_event(event: &sinomo_runtime::core::EventEnvelope) -> String {
     let mut text = String::new();
     collect_text(&event.payload, &mut text);
     let text = text.trim();
@@ -246,11 +246,11 @@ pub enum MemoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{
+    use sinomo_runtime::core::{
         Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
         RoutingMetadata, RoutingScope, Salience, Source,
     };
-    use sinomo_events::EventSequence;
+    use sinomo_runtime::events::EventSequence;
 
     fn stored(id: &str, kind: &str, salience: f32) -> StoredEvent {
         StoredEvent {

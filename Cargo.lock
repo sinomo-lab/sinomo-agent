@@ -779,8 +779,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-core",
- "sinomo-device",
+ "sinomo-runtime",
  "thiserror",
  "time",
 ]
@@ -791,9 +790,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-core",
- "sinomo-device",
- "sinomo-events",
+ "sinomo-runtime",
  "thiserror",
  "time",
 ]
@@ -819,29 +816,15 @@ dependencies = [
  "serde_json",
  "sinomo-actions",
  "sinomo-agent",
- "sinomo-api",
  "sinomo-audio",
  "sinomo-cli",
- "sinomo-core",
  "sinomo-deliberation",
- "sinomo-device",
- "sinomo-dfs",
- "sinomo-eval",
- "sinomo-events",
  "sinomo-evolution",
  "sinomo-fusion",
  "sinomo-gateway",
  "sinomo-lm",
  "sinomo-memory",
- "sinomo-module",
- "sinomo-network",
- "sinomo-node",
- "sinomo-policy",
- "sinomo-registry",
- "sinomo-rollout",
- "sinomo-sandbox",
- "sinomo-supervision",
- "sinomo-sync",
+ "sinomo-runtime",
  "sinomo-trigger",
  "sinomo-video",
  "sinomo-voice",
@@ -854,9 +837,9 @@ name = "sinomo-audio"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "sinomo-core",
  "sinomo-device",
  "sinomo-gateway",
+ "sinomo-runtime",
 ]
 
 [[package]]
@@ -865,12 +848,9 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-core",
- "sinomo-eval",
- "sinomo-events",
  "sinomo-evolution",
  "sinomo-lm",
- "sinomo-local",
+ "sinomo-runtime",
  "time",
 ]
 
@@ -891,10 +871,9 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-core",
- "sinomo-events",
  "sinomo-lm",
  "sinomo-memory",
+ "sinomo-runtime",
  "thiserror",
  "time",
 ]
@@ -948,9 +927,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-core",
- "sinomo-eval",
  "sinomo-lm",
+ "sinomo-runtime",
  "thiserror",
  "time",
 ]
@@ -960,7 +938,7 @@ name = "sinomo-fusion"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "sinomo-core",
+ "sinomo-runtime",
  "time",
 ]
 
@@ -970,8 +948,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-core",
- "sinomo-device",
+ "sinomo-runtime",
  "thiserror",
  "time",
 ]
@@ -984,7 +961,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sinomo-local",
+ "sinomo-runtime",
  "thiserror",
  "time",
 ]
@@ -1002,8 +979,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-core",
- "sinomo-events",
+ "sinomo-runtime",
  "thiserror",
  "time",
 ]
@@ -1071,6 +1047,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-runtime"
+version = "0.1.0"
+dependencies = [
+ "sinomo-api",
+ "sinomo-core",
+ "sinomo-device",
+ "sinomo-dfs",
+ "sinomo-eval",
+ "sinomo-events",
+ "sinomo-local",
+ "sinomo-module",
+ "sinomo-network",
+ "sinomo-node",
+ "sinomo-policy",
+ "sinomo-registry",
+ "sinomo-rollout",
+ "sinomo-sandbox",
+ "sinomo-supervision",
+ "sinomo-sync",
+]
+
+[[package]]
 name = "sinomo-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -1108,8 +1106,7 @@ name = "sinomo-trigger"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "sinomo-core",
- "sinomo-events",
+ "sinomo-runtime",
  "time",
 ]
 
@@ -1118,9 +1115,9 @@ name = "sinomo-video"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "sinomo-core",
  "sinomo-device",
  "sinomo-gateway",
+ "sinomo-runtime",
 ]
 
 [[package]]
@@ -1129,8 +1126,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-core",
- "sinomo-device",
+ "sinomo-runtime",
  "time",
 ]
 

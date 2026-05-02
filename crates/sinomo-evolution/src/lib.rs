@@ -1,7 +1,11 @@
 //! Autonomous self-evolution planning skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
+use sinomo_lm::{
+    LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
+    LanguageModelResponseFormat, LanguageModelRole,
+};
+use sinomo_runtime::core::{
     CandidateBundleManifest, CommandLogRef, Confidence, EditScope, EvaluationGate,
     EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob, EvolutionJobId,
     EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass, ModuleId,
@@ -9,11 +13,7 @@ use sinomo_core::{
     RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing, VerificationCommand,
     VerificationPlan, WorkspaceId,
 };
-use sinomo_eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
-use sinomo_lm::{
-    LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
-    LanguageModelResponseFormat, LanguageModelRole,
-};
+use sinomo_runtime::eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1146,7 +1146,7 @@ pub enum EvolutionError {
     #[error(transparent)]
     Bundle(#[from] BundleError),
     #[error(transparent)]
-    Eval(#[from] sinomo_eval::EvalError),
+    Eval(#[from] sinomo_runtime::eval::EvalError),
     #[error(transparent)]
     MutationModel(#[from] MutationModelError),
 }
@@ -1200,15 +1200,15 @@ impl EvolutionPlanner {
             objective: opportunity.objective,
             target_ring: opportunity.target_ring,
             target_module_id: opportunity.target_module_id,
-            edit_scope: sinomo_core::EditScope {
+            edit_scope: sinomo_runtime::core::EditScope {
                 workspace_root: opportunity.workspace_id.to_string(),
                 intended_paths: opportunity.allowed_paths.clone(),
                 notes: "planner-scoped evolution opportunity".to_string(),
             },
-            verification: sinomo_core::VerificationPlan {
+            verification: sinomo_runtime::core::VerificationPlan {
                 commands: required_gates
                     .iter()
-                    .map(|gate| sinomo_core::VerificationCommand {
+                    .map(|gate| sinomo_runtime::core::VerificationCommand {
                         name: format!("{gate:?}"),
                         command: "cargo check".to_string(),
                         expected_exit_code: 0,
@@ -1216,7 +1216,7 @@ impl EvolutionPlanner {
                     })
                     .collect(),
             },
-            recovery: sinomo_core::RecoveryPlan::default(),
+            recovery: sinomo_runtime::core::RecoveryPlan::default(),
             scope: EvolutionScope {
                 allowed_paths: opportunity.allowed_paths.clone(),
                 forbidden_paths: opportunity.forbidden_paths.clone(),
@@ -1265,9 +1265,9 @@ impl EvolutionPlanner {
             "candidate_workspace": workspace,
         }));
         if let Some(workspace_id) = &job.scope.workspace_id {
-            event.evidence.refs.push(sinomo_core::EvidenceRef {
+            event.evidence.refs.push(sinomo_runtime::core::EvidenceRef {
                 uri: format!("dfs://{workspace_id}"),
-                kind: sinomo_core::EvidenceKind::Other,
+                kind: sinomo_runtime::core::EvidenceKind::Other,
                 content_hash: None,
             });
         }
@@ -1306,12 +1306,12 @@ fn trust_ring_hint(target_ring: &TrustRing) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::EvaluationOutcome;
-    use sinomo_eval::LocalCommandRunner;
     use sinomo_lm::{
         LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
         PROVIDER_DEFAULT_MODEL,
     };
+    use sinomo_runtime::core::EvaluationOutcome;
+    use sinomo_runtime::eval::LocalCommandRunner;
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};

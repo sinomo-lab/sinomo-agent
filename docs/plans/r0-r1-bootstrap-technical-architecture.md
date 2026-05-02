@@ -25,16 +25,17 @@ accept objective
 The repository already has most of the broad shapes:
 
 - `sinomo-core`: IDs, events, trust rings, evolution jobs, scorecards, artifacts, policy decisions.
+- `sinomo-runtime`: explicit R0/R1 boundary facade that aggregates only foundation crates.
 - `sinomo-events`: in-memory append/replay event store.
-- `sinomo-evolution`: opportunity-to-job planner and candidate workspace plan.
+- `sinomo-evolution`: R2 evolution service with opportunity-to-job planning and candidate workspace behavior.
 - `sinomo-eval`: command scorecard skeleton.
-- `sinomo-lm`: HTTP and process language model providers, including Codex CLI and Claude Code style providers.
+- `sinomo-lm`: R2 HTTP and process language model providers, including Codex CLI and Claude Code style providers.
 - `sinomo-policy`: policy decision skeleton.
 - `sinomo-registry`: candidate and artifact record skeleton.
 - `sinomo-sandbox`: sandbox run request/result skeleton.
 - `sinomo-cli`: provider auth/test commands.
 
-The bootstrap work should avoid replacing this foundation. Instead, turn the existing broad shapes into a minimal executable core. Temporary scaffolding is allowed where useful, but stable data types should be designed for the long-term self-evolution system and placed in `sinomo-core` when they fit.
+The bootstrap work should avoid replacing this foundation. Instead, turn the existing broad shapes into a minimal executable core. Temporary scaffolding is allowed where useful, but stable data types should be designed for the long-term self-evolution system and placed in R0/R1 crates when they fit. R2 services can depend on R0/R1, but R0/R1 crates must not depend back on R2 or application crates.
 
 ## Architecture Shape
 
@@ -51,13 +52,13 @@ CLI/API entry point
   human-facing command that runs one local supervised self-evolution iteration
 ```
 
-R0 should contain minimal durable data contracts. R1 should contain behavior. The CLI should be thin.
+R0 should contain minimal durable data contracts. R1 should contain trusted runtime behavior. The explicit Rust boundary is `sinomo-runtime`, which re-exports only R0/R1 crates and is checked by workspace architecture tests. The CLI should be thin.
 
 ## Design Decisions
 
 These choices guide the first implementation:
 
-1. Do not create a separate disposable bootstrap data model. Self-evolution is a core concept, so stable interfaces should be designed for the long-term system and moved directly into `sinomo-core` when they fit.
+1. Do not create a separate disposable bootstrap data model. Self-evolution is a core concept, so stable interfaces should be designed for the long-term system and moved directly into R0/R1 crates when they fit.
 2. `evolve propose` must mutate a separate repository checkout or git worktree from day one. The active Sinomo instance should not build or test against files being mutated underneath it.
 3. All language-model calls go through `sinomo-lm` using a common provider flag. Process coding agents such as Codex CLI or Claude Code are implementations behind the `sinomo-lm` abstraction.
 4. Candidate bundles live under `SINOMO_DATA_DIR`, not inside the repository.

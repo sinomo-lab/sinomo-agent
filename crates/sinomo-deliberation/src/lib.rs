@@ -1,14 +1,14 @@
 //! Deliberation job, cancellation, and summary skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
-    Confidence, ContextPacket, DeliberationJob, DfsObjectId, EventEnvelope, EventId, EventKind,
-    JobCancellation, JobStatus, LatencyClass, NodeId, PrivacyClass, RoutingMetadata, RoutingScope,
-    Salience, SessionId, Source, TaskId, WorkspaceId,
-};
 use sinomo_lm::{
     LanguageModelAttribution, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
     LanguageModelResponseFormat, LanguageModelRole,
+};
+use sinomo_runtime::core::{
+    Confidence, ContextPacket, DeliberationJob, DfsObjectId, EventEnvelope, EventId, EventKind,
+    JobCancellation, JobStatus, LatencyClass, NodeId, PrivacyClass, RoutingMetadata, RoutingScope,
+    Salience, SessionId, Source, TaskId, WorkspaceId,
 };
 use std::collections::VecDeque;
 use thiserror::Error;
@@ -328,7 +328,7 @@ pub enum DeliberationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::ContextPacket;
+    use sinomo_runtime::core::ContextPacket;
 
     #[test]
     fn queue_runs_and_completes_job_with_summary() {

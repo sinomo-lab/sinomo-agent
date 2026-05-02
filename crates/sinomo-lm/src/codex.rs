@@ -76,7 +76,7 @@ fn default_codex_credentials_path() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(path));
     }
-    sinomo_local::SinomoDataDir::from_env_or_home()
+    sinomo_runtime::local::SinomoDataDir::from_env_or_home()
         .ok()
         .map(|dir| dir.provider_credentials_file(CODEX_PROVIDER_ID))
 }

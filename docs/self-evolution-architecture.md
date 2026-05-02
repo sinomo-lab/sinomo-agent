@@ -433,7 +433,7 @@ Disconnected nodes keep running their last stable approved artifact. They may ap
 
 ## Data Model Additions
 
-Initial types can live in `sinomo-core` as serializable placeholders, then move behavior into service crates.
+Initial R0/R1 types can live in `sinomo-core` as serializable placeholders, then move behavior into R1 service crates. The crate boundary is explicit: every workspace crate declares `[package.metadata.sinomo] ring = "..."`, `sinomo-runtime` aggregates only R0/R1 crates, and architecture tests reject any R0/R1 dependency on R2 service or application crates. R2 evolution services may call into this boundary, but R0/R1 crates must not depend back on model providers, perception, memory, agent, deliberation, action, or CLI/application crates.
 
 ```rust
 pub struct ModuleId(String);

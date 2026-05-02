@@ -8,5 +8,8 @@ rust-version.workspace = true
 license.workspace = true
 include = ["**/*.rs", "Cargo.toml"]
 
+[package.metadata.sinomo]
+ring = "r1"
+
 [dependencies]
 thiserror.workspace = true

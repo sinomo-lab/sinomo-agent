@@ -1,14 +1,6 @@
 //! Shared Sinomo command-line handlers.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
-    CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, Confidence,
-    EvaluationGate, EvaluationOutcome, EventEnvelope, EventId, EventKind, EvolutionJob,
-    EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustRing, VerificationCommand,
-};
-use sinomo_eval::{ExecutingEvalHarness, LocalCommandRunner};
-use sinomo_events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
 use sinomo_evolution::{
     CandidateWorkspace, EvolutionOrchestrator, EvolutionReport, EvolutionRequest,
     GitWorkspaceAdapter, LanguageModelMutationBridge, LocalCandidateBundleStore, MutationModel,
@@ -25,7 +17,15 @@ use sinomo_lm::{
     NvidiaProvider, OpenAiConfig, OpenAiProvider, OpenAiResponsesCodexClient,
     OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL, normalize_nvidia_model_id,
 };
-use sinomo_local::SinomoDataDir;
+use sinomo_runtime::core::{
+    CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, Confidence,
+    EvaluationGate, EvaluationOutcome, EventEnvelope, EventId, EventKind, EvolutionJob,
+    EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId, PrivacyClass,
+    RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustRing, VerificationCommand,
+};
+use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
+use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
+use sinomo_runtime::local::SinomoDataDir;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -2852,11 +2852,11 @@ pub enum CliError {
         path: String,
         detail: String,
     },
-    LocalData(sinomo_local::LocalDataError),
-    EventStore(sinomo_events::EventStoreError),
+    LocalData(sinomo_runtime::local::LocalDataError),
+    EventStore(sinomo_runtime::events::EventStoreError),
     LanguageModel(LanguageModelError),
     Evolution(sinomo_evolution::EvolutionError),
-    Eval(sinomo_eval::EvalError),
+    Eval(sinomo_runtime::eval::EvalError),
 }
 
 impl CliError {
@@ -2868,14 +2868,14 @@ impl CliError {
     }
 }
 
-impl From<sinomo_local::LocalDataError> for CliError {
-    fn from(error: sinomo_local::LocalDataError) -> Self {
+impl From<sinomo_runtime::local::LocalDataError> for CliError {
+    fn from(error: sinomo_runtime::local::LocalDataError) -> Self {
         Self::LocalData(error)
     }
 }
 
-impl From<sinomo_events::EventStoreError> for CliError {
-    fn from(error: sinomo_events::EventStoreError) -> Self {
+impl From<sinomo_runtime::events::EventStoreError> for CliError {
+    fn from(error: sinomo_runtime::events::EventStoreError) -> Self {
         Self::EventStore(error)
     }
 }
@@ -2892,8 +2892,8 @@ impl From<sinomo_evolution::EvolutionError> for CliError {
     }
 }
 
-impl From<sinomo_eval::EvalError> for CliError {
-    fn from(error: sinomo_eval::EvalError) -> Self {
+impl From<sinomo_runtime::eval::EvalError> for CliError {
+    fn from(error: sinomo_runtime::eval::EvalError) -> Self {
         Self::Eval(error)
     }
 }
@@ -2949,12 +2949,12 @@ mod tests {
         parse_propose_options, parse_provider_command, parse_slash_command, parse_usage_options,
         run_cui_with_handler_io, run_evolve_command,
     };
-    use sinomo_core::{EvolutionJobId, NodeId, SessionId, TrustRing};
-    use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
     };
-    use sinomo_local::SinomoDataDir;
+    use sinomo_runtime::core::{EvolutionJobId, NodeId, SessionId, TrustRing};
+    use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
+    use sinomo_runtime::local::SinomoDataDir;
     use std::io::Cursor;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

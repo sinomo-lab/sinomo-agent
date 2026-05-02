@@ -7,7 +7,7 @@ use crate::{
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use sinomo_local::SinomoDataDir;
+use sinomo_runtime::local::SinomoDataDir;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

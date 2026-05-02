@@ -1,24 +1,9 @@
 use sinomo_actions::{ActionExecutor, ActionSandboxPolicy};
 use sinomo_agent::{BoundedContextBuilder, InteractiveAgent};
-use sinomo_api::ApiService;
 use sinomo_audio::AudioPerceptionWorker;
-use sinomo_core::{
-    ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
-    CapabilityName, DeviceCapability, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteRequest,
-    EvaluationGate, ModuleId, ModuleManifest, ModuleResourceLimits, NodeCapability, RolloutPlan,
-    RolloutPlanId, RolloutStrategy, SessionId, SyncPolicy, TaskId, TrustRing, WorkspaceId,
-};
 use sinomo_deliberation::{
     DeliberationJobRecord, DeliberationQueue, DeliberationWorker, WorkspaceSnapshot,
 };
-use sinomo_device::{DevicePermission, DeviceProfile};
-use sinomo_dfs::{
-    DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, MountKind, Workspace, WorkspaceMount,
-};
-use sinomo_eval::{
-    CommandEvaluationSpec, CommandEvaluationSuite, LocalEvalHarness, ReplayFixtureRef,
-};
-use sinomo_events::{EventSequence, EventStore, InMemoryEventStore, ReplayQuery, StoredEvent};
 use sinomo_evolution::{EvolutionOpportunity, EvolutionPlanner};
 use sinomo_fusion::FusionWorker;
 use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
@@ -29,14 +14,33 @@ use sinomo_lm::{
     LanguageModelProvider, OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL,
 };
 use sinomo_memory::{MemoryManager, MemoryPolicy};
-use sinomo_module::{LoadRequest, ModuleLoader};
-use sinomo_network::{InProcessRouter, PeerRegistry};
-use sinomo_node::{HostedService, NodeProfile};
-use sinomo_policy::{PolicyEngine, PolicyInput};
-use sinomo_registry::{ArtifactRegistry, CandidateRecord, RegistryEntry, RegistryStatus};
-use sinomo_rollout::{RolloutController, RolloutObservation};
-use sinomo_sandbox::{SandboxCommand, SandboxHarness, SandboxRunRequest, SandboxWorkspaceSnapshot};
-use sinomo_sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncRegistry};
+use sinomo_runtime::api::ApiService;
+use sinomo_runtime::core::{
+    ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
+    CapabilityName, DeviceCapability, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteRequest,
+    EvaluationGate, ModuleId, ModuleManifest, ModuleResourceLimits, NodeCapability, RolloutPlan,
+    RolloutPlanId, RolloutStrategy, SessionId, SyncPolicy, TaskId, TrustRing, WorkspaceId,
+};
+use sinomo_runtime::device::{DevicePermission, DeviceProfile};
+use sinomo_runtime::dfs::{
+    DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, MountKind, Workspace, WorkspaceMount,
+};
+use sinomo_runtime::eval::{
+    CommandEvaluationSpec, CommandEvaluationSuite, LocalEvalHarness, ReplayFixtureRef,
+};
+use sinomo_runtime::events::{
+    EventSequence, EventStore, InMemoryEventStore, ReplayQuery, StoredEvent,
+};
+use sinomo_runtime::module::{LoadRequest, ModuleLoader};
+use sinomo_runtime::network::{InProcessRouter, PeerRegistry};
+use sinomo_runtime::node::{HostedService, NodeProfile};
+use sinomo_runtime::policy::{PolicyEngine, PolicyInput};
+use sinomo_runtime::registry::{ArtifactRegistry, CandidateRecord, RegistryEntry, RegistryStatus};
+use sinomo_runtime::rollout::{RolloutController, RolloutObservation};
+use sinomo_runtime::sandbox::{
+    SandboxCommand, SandboxHarness, SandboxRunRequest, SandboxWorkspaceSnapshot,
+};
+use sinomo_runtime::sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncRegistry};
 use sinomo_trigger::RuleBasedTrigger;
 use sinomo_video::VideoPerceptionWorker;
 use sinomo_voice::{SpeechOutputRequest, VoiceOutputService};
@@ -66,17 +70,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_capability(NodeCapability::new(voice_capability.clone()))
         .with_capability(NodeCapability::new(api_capability.clone()))
         .with_service(HostedService::new(event_service_capability));
-    workstation.node_id = sinomo_core::NodeId::new("node_desktop")?;
+    workstation.node_id = sinomo_runtime::core::NodeId::new("node_desktop")?;
 
     let mut home_server = NodeProfile::local("home server")?
         .with_capability(NodeCapability::new(registry_capability))
         .with_capability(NodeCapability::new(module_loader_capability));
-    home_server.node_id = sinomo_core::NodeId::new("node_server")?;
+    home_server.node_id = sinomo_runtime::core::NodeId::new("node_server")?;
 
     let workspace_device = DeviceProfile::new(
         workstation.node_id.clone(),
         "local evolution workspace",
-        sinomo_device::DeviceKind::Filesystem,
+        sinomo_runtime::device::DeviceKind::Filesystem,
     )
     .with_capability(DeviceCapability::new(CapabilityName::new(
         "storage.workspace.local",
@@ -96,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let speaker = DeviceProfile::new(
         workstation.node_id.clone(),
         "local speaker",
-        sinomo_device::DeviceKind::Speaker,
+        sinomo_runtime::device::DeviceKind::Speaker,
     )
     .with_capability(DeviceCapability::new(CapabilityName::new(
         "voice.output.synthetic",
@@ -309,7 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let record = action_executor.execute(request);
             let event = action_executor.execution_event(&record, Some(context.session_id.clone()));
             store.append(event)?;
-            Ok::<_, sinomo_events::EventStoreError>(record)
+            Ok::<_, sinomo_runtime::events::EventStoreError>(record)
         })
         .transpose()?;
     let mut voice =
@@ -719,7 +723,7 @@ fn configured_deliberation_model()
 
 fn stored_session(
     store: &InMemoryEventStore,
-    receipt: &sinomo_events::AppendReceipt,
+    receipt: &sinomo_runtime::events::AppendReceipt,
 ) -> Result<SessionId, Box<dyn std::error::Error>> {
     let event = store
         .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))?

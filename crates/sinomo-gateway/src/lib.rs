@@ -1,8 +1,8 @@
 //! Ingress adapter and normalized stream chunk skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{DeviceId, EventSpan, NodeId, SessionId, Source};
-use sinomo_device::DeviceProfile;
+use sinomo_runtime::core::{DeviceId, EventSpan, NodeId, SessionId, Source};
+use sinomo_runtime::device::DeviceProfile;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -141,13 +141,13 @@ impl InputAdapter for SyntheticInputAdapter {
 #[derive(Debug, Error)]
 pub enum GatewayError {
     #[error(transparent)]
-    Scalar(#[from] sinomo_core::ScalarError),
+    Scalar(#[from] sinomo_runtime::core::ScalarError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::NodeId;
+    use sinomo_runtime::core::NodeId;
 
     #[test]
     fn synthetic_audio_chunk_carries_node_and_device_provenance() {

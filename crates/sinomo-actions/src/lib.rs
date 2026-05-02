@@ -1,11 +1,11 @@
 //! Sandbox-aware action execution skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
+use sinomo_runtime::core::{
     ActionRequest, Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId,
     PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source, TaskId,
 };
-use sinomo_device::{DevicePermission, DeviceProfile};
+use sinomo_runtime::device::{DevicePermission, DeviceProfile};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -261,15 +261,15 @@ pub enum ActionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{DeviceCapability, DeviceId};
-    use sinomo_device::DeviceKind;
+    use sinomo_runtime::core::{DeviceCapability, DeviceId};
+    use sinomo_runtime::device::DeviceKind;
 
     #[test]
     fn local_action_executes_when_kind_and_device_are_allowed() {
         let node = NodeId::new("node_desktop").expect("node");
         let device = DeviceProfile::new(node.clone(), "screen", DeviceKind::Screen)
             .with_capability(DeviceCapability::new(
-                sinomo_core::CapabilityName::new("action.desktop.inspect").expect("cap"),
+                sinomo_runtime::core::CapabilityName::new("action.desktop.inspect").expect("cap"),
             ))
             .with_permission(DevicePermission::ExecuteAction);
         let request = ActionRequest {

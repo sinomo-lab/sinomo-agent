@@ -1,10 +1,10 @@
 //! Video and screen perception event producer skeleton.
 
-use sinomo_core::{
+use sinomo_gateway::{InputChunk, InputModality};
+use sinomo_runtime::core::{
     Confidence, EventEnvelope, EventId, EventKind, EventSpan, LatencyClass, PrivacyClass,
     RoutingMetadata, RoutingScope, Salience, Source,
 };
-use sinomo_gateway::{InputChunk, InputModality};
 
 #[derive(Clone, Debug, Default)]
 pub struct VideoPerceptionWorker;
@@ -74,9 +74,9 @@ fn base_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{NodeId, SessionId};
-    use sinomo_device::DeviceProfile;
     use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
+    use sinomo_runtime::core::{NodeId, SessionId};
+    use sinomo_runtime::device::DeviceProfile;
 
     #[test]
     fn video_worker_emits_screen_observation() {

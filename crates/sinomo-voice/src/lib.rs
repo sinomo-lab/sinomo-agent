@@ -1,11 +1,11 @@
 //! Speech output and duplex control skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
+use sinomo_runtime::core::{
     Confidence, DeviceId, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
     RoutingMetadata, RoutingScope, Salience, SessionId, Source, TaskId,
 };
-use sinomo_device::{DevicePermission, DeviceProfile};
+use sinomo_runtime::device::{DevicePermission, DeviceProfile};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
@@ -179,7 +179,7 @@ impl VoiceOutputService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_device::DeviceKind;
+    use sinomo_runtime::device::DeviceKind;
 
     #[test]
     fn speech_output_completes_on_local_speaker() {
@@ -210,9 +210,12 @@ mod tests {
     fn barge_in_interrupts_active_session_output() {
         let node = NodeId::new("node_desktop").expect("node");
         let session = SessionId::new("sess_voice").expect("session");
-        let speaker =
-            DeviceProfile::new(node.clone(), "speaker", sinomo_device::DeviceKind::Speaker)
-                .with_permission(DevicePermission::EmitOutput);
+        let speaker = DeviceProfile::new(
+            node.clone(),
+            "speaker",
+            sinomo_runtime::device::DeviceKind::Speaker,
+        )
+        .with_permission(DevicePermission::EmitOutput);
         let request = SpeechOutputRequest {
             request_id: TaskId::new("task_voice").expect("task"),
             origin_node_id: node.clone(),
