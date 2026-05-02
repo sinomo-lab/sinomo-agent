@@ -1,14 +1,14 @@
 //! Autonomous self-evolution planning skeleton.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sinomo_lm::{
-    LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
-    LanguageModelResponseFormat, LanguageModelRole,
+    LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
+    LanguageModelRequest, LanguageModelResponseFormat, LanguageModelRole,
 };
 use sinomo_runtime::core::{
     CandidateBundleManifest, CommandLogRef, Confidence, EditScope, EvaluationGate,
-    EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob, EvolutionJobId,
-    EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass, ModuleId,
+    EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob,
+    EvolutionJobId, EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass, ModuleId,
     MutationOutputContract, MutationPacket, NodeId, PrivacyClass, RecoveryPlan, RollbackPolicy,
     RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing, VerificationCommand,
     VerificationPlan, WorkspaceId,
@@ -355,6 +355,54 @@ pub struct ResourceSchedulerDryRun {
     pub generated_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScheduledIterationRequest {
+    pub campaign: EvolutionCampaign,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intended_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_verification_commands: Vec<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScheduledIterationPlan {
+    pub campaign_id: String,
+    pub iteration_id: String,
+    pub task: NearTermEvolutionTask,
+    pub evolution_request: EvolutionRequest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CampaignTaskReplacementProposal {
+    pub title: String,
+    pub objective: String,
+    pub rationale: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_commands: Vec<String>,
+    pub expected_result_kind: EvolutionResultKind,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum CampaignIterationError {
+    #[error("campaign `{campaign_id}` is not approved for scheduled iteration")]
+    CampaignNotApproved { campaign_id: String },
+    #[error("campaign `{campaign_id}` has no near-term tasks")]
+    NoNearTermTasks { campaign_id: String },
+    #[error("task `{task_id}` was not found in campaign `{campaign_id}`")]
+    TaskNotFound {
+        campaign_id: String,
+        task_id: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum CampaignScheduleDecision {
     Scheduled,
@@ -670,6 +718,257 @@ fn resource_for_estimate<'a>(
 
 fn reserve_floor_units(total_units: u64, reserve_floor_percent: u8) -> u64 {
     (total_units.saturating_mul(reserve_floor_percent as u64) + 99) / 100
+}
+
+pub fn prepare_scheduled_iteration(
+    request: ScheduledIterationRequest,
+) -> Result<ScheduledIterationPlan, CampaignIterationError> {
+    let campaign = request.campaign;
+    if !matches!(
+        campaign.status,
+        EvolutionCampaignStatus::Approved
+            | EvolutionCampaignStatus::Scheduled
+            | EvolutionCampaignStatus::Running
+    ) {
+        return Err(CampaignIterationError::CampaignNotApproved {
+            campaign_id: campaign.campaign_id,
+        });
+    }
+    let task = match request.task_id {
+        Some(task_id) => campaign
+            .near_term_tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .cloned()
+            .ok_or_else(|| CampaignIterationError::TaskNotFound {
+                campaign_id: campaign.campaign_id.clone(),
+                task_id,
+            })?,
+        None => campaign.near_term_tasks.first().cloned().ok_or_else(|| {
+            CampaignIterationError::NoNearTermTasks {
+                campaign_id: campaign.campaign_id.clone(),
+            }
+        })?,
+    };
+    let mut command_texts = task.verification_commands.clone();
+    command_texts.extend(request.extra_verification_commands);
+    if command_texts.is_empty() {
+        command_texts.push("cargo check".to_string());
+    }
+    let verification_commands = command_texts
+        .into_iter()
+        .enumerate()
+        .map(|(index, command)| VerificationCommand {
+            name: format!("campaign-task-verify-{}", index + 1),
+            command,
+            expected_exit_code: 0,
+            gate: EvaluationGate::StaticChecks,
+        })
+        .collect();
+    let intended_paths = if request.intended_paths.is_empty() {
+        default_iteration_intended_paths(&task.expected_result_kind)
+    } else {
+        request.intended_paths
+    };
+    let iteration_id = generated_id("iter");
+    let evolution_request = EvolutionRequest {
+        objective: format!(
+            "Campaign {} scheduled iteration {}\nTask {}: {}\n\nTask objective: {}\nRequired evidence: {}",
+            campaign.campaign_id,
+            iteration_id,
+            task.task_id,
+            task.title,
+            task.objective,
+            if task.required_evidence.is_empty() {
+                "none declared".to_string()
+            } else {
+                task.required_evidence.join("; ")
+            }
+        ),
+        target_ring: campaign.target_ring.clone(),
+        intended_paths,
+        verification_commands,
+        model_provider: None,
+        model: None,
+        dry_run: request.dry_run,
+    };
+    Ok(ScheduledIterationPlan {
+        campaign_id: campaign.campaign_id,
+        iteration_id,
+        task,
+        evolution_request,
+        operator_notes: vec![
+            "resource scheduling must have granted a lease before model or agent dispatch"
+                .to_string(),
+            "candidate work happens in an isolated worktree; the active checkout is not mutated"
+                .to_string(),
+        ],
+    })
+}
+
+pub fn record_scheduled_iteration_result(
+    mut campaign: EvolutionCampaign,
+    task_id: &str,
+    report: &EvolutionReport,
+    resource_usage: Vec<ResourceUsageEstimate>,
+) -> EvolutionCampaign {
+    let now = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    let task_kind = campaign
+        .near_term_tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .map(|task| task.expected_result_kind.clone())
+        .unwrap_or(EvolutionResultKind::Other("unknown-task".to_string()));
+    let outcome = report
+        .scorecard
+        .as_ref()
+        .map(|scorecard| &scorecard.outcome);
+    let status = if matches!(outcome, Some(EvaluationOutcome::Failed)) {
+        EvolutionIterationStatus::Adapted
+    } else if matches!(outcome, Some(EvaluationOutcome::Passed)) {
+        EvolutionIterationStatus::AwaitingRolloutApproval
+    } else {
+        EvolutionIterationStatus::Evaluating
+    };
+    let mut evidence = vec![
+        format!("job:{}", report.job.job_id),
+        format!(
+            "candidate-worktree:{}",
+            report.candidate_workspace.path.display()
+        ),
+        format!("bundle:{}", report.bundle.bundle_path),
+    ];
+    if let Some(scorecard_path) = &report.bundle.scorecard_path {
+        evidence.push(format!("scorecard:{scorecard_path}"));
+    }
+    if let Some(changed_files_path) = &report.bundle.changed_files_path {
+        evidence.push(format!("changed-files:{changed_files_path}"));
+    }
+    for usage in &resource_usage {
+        evidence.push(format!(
+            "resource-usage:{} estimated={} actual={}",
+            usage.resource,
+            usage.estimated_units,
+            usage
+                .actual_units
+                .map(|units| units.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+    let summary = match outcome {
+        Some(EvaluationOutcome::Passed) => Some(
+            "candidate produced and verification passed; waiting for rollout approval".to_string(),
+        ),
+        Some(EvaluationOutcome::Failed) => Some(
+            "candidate verification failed; recorded as adaptation evidence instead of retrying silently"
+                .to_string(),
+        ),
+        Some(EvaluationOutcome::Inconclusive) | None => Some(
+            "candidate evidence is incomplete or inconclusive; keep under human review".to_string(),
+        ),
+    };
+    campaign.iteration_results.push(EvolutionIterationResult {
+        iteration_id: generated_id("iter_result"),
+        task_id: task_id.to_string(),
+        result_kind: task_kind,
+        status: status.clone(),
+        evidence: evidence.clone(),
+        summary,
+    });
+    let (decision_kind, decision_summary, decision_rationale, campaign_status) = match status {
+        EvolutionIterationStatus::Adapted => (
+            CampaignDecisionKind::DirectionChanged,
+            "Recorded failed iteration as adaptation evidence".to_string(),
+            "Phase 2 must not silently retry failed implementation work; the next backlog change needs explicit review."
+                .to_string(),
+            EvolutionCampaignStatus::Scheduled,
+        ),
+        EvolutionIterationStatus::AwaitingRolloutApproval => (
+            CampaignDecisionKind::TaskSelected,
+            "Attached one scheduled candidate to campaign".to_string(),
+            "Verification passed in the candidate bundle; rollout still requires existing approval gates."
+                .to_string(),
+            EvolutionCampaignStatus::PausedHuman,
+        ),
+        _ => (
+            CampaignDecisionKind::TaskSelected,
+            "Attached inconclusive scheduled candidate to campaign".to_string(),
+            "The candidate bundle needs human inspection before further scheduling.".to_string(),
+            EvolutionCampaignStatus::PausedHuman,
+        ),
+    };
+    campaign.decisions.push(CampaignDecision {
+        decision_id: generated_id("decision"),
+        kind: decision_kind,
+        summary: decision_summary,
+        rationale: decision_rationale,
+        evidence_refs: evidence,
+        decided_by: "campaign-iteration-runner".to_string(),
+        decided_at: now.clone(),
+    });
+    campaign.status = campaign_status;
+    campaign.updated_at = now;
+    campaign
+}
+
+pub fn accept_task_replacement_proposal(
+    mut campaign: EvolutionCampaign,
+    proposal: CampaignTaskReplacementProposal,
+) -> EvolutionCampaign {
+    let now = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    let stage_id = campaign
+        .near_term_tasks
+        .first()
+        .map(|task| task.stage_id.clone())
+        .or_else(|| campaign.stages.first().map(|stage| stage.stage_id.clone()))
+        .unwrap_or_else(|| "stage_replacement".to_string());
+    let task = NearTermEvolutionTask {
+        task_id: generated_id("task"),
+        stage_id,
+        title: proposal.title.clone(),
+        objective: proposal.objective.clone(),
+        rationale: proposal.rationale.clone(),
+        required_evidence: proposal.required_evidence.clone(),
+        verification_commands: proposal.verification_commands.clone(),
+        estimated_budget: "inherits campaign resource policy; schedule before dispatch".to_string(),
+        approval_required: true,
+        expected_result_kind: proposal.expected_result_kind,
+    };
+    campaign.near_term_tasks.insert(0, task.clone());
+    campaign.decisions.push(CampaignDecision {
+        decision_id: generated_id("decision"),
+        kind: CampaignDecisionKind::DirectionChanged,
+        summary: format!("Accepted replacement task `{}`", task.task_id),
+        rationale: proposal.rationale,
+        evidence_refs: vec![format!("replacement-task:{}", task.task_id)],
+        decided_by: "campaign-iteration-runner".to_string(),
+        decided_at: now.clone(),
+    });
+    campaign.status = EvolutionCampaignStatus::Scheduled;
+    campaign.updated_at = now;
+    campaign
+}
+
+fn default_iteration_intended_paths(kind: &EvolutionResultKind) -> Vec<String> {
+    match kind {
+        EvolutionResultKind::Documentation => vec!["docs/**".to_string()],
+        EvolutionResultKind::Evaluator => vec!["crates/sinomo-eval/**".to_string()],
+        EvolutionResultKind::TaskReplacementProposal => vec!["docs/plans/**".to_string()],
+        EvolutionResultKind::Artifact => vec!["docs/**".to_string(), "crates/**".to_string()],
+        EvolutionResultKind::Instrumentation
+        | EvolutionResultKind::FoundationRepair
+        | EvolutionResultKind::RolloutGuard
+        | EvolutionResultKind::Patch
+        | EvolutionResultKind::Other(_) => vec![
+            "crates/sinomo-evolution/**".to_string(),
+            "crates/sinomo-cli/**".to_string(),
+            "docs/**".to_string(),
+        ],
+    }
 }
 
 pub fn propose_evolution_campaign(request: CampaignProposalRequest) -> EvolutionCampaign {
@@ -1293,10 +1592,16 @@ impl WorkspaceAdapter for GitWorkspaceAdapter {
 pub fn parse_git_status_paths(status: &str) -> Result<Vec<String>, String> {
     let mut paths = Vec::new();
     for line in status.lines().filter(|line| !line.trim().is_empty()) {
-        if line.len() < 4 {
+        let bytes = line.as_bytes();
+        let path_start = if bytes.get(1).is_some_and(|byte| byte.is_ascii_whitespace()) {
+            2
+        } else {
+            3
+        };
+        if line.len() < path_start {
             return Err(format!("invalid porcelain status line: {line}"));
         }
-        let path = line[3..].trim();
+        let path = line[path_start..].trim();
         let path = path
             .rsplit_once(" -> ")
             .map(|(_, new_path)| new_path)
@@ -1515,12 +1820,54 @@ pub struct StructuredMutationOutput {
     pub patch: Option<String>,
     #[serde(default, alias = "patchSummary")]
     pub patch_summary: Option<String>,
-    #[serde(default, alias = "verificationNotes")]
+    #[serde(
+        default,
+        alias = "verificationNotes",
+        deserialize_with = "deserialize_optional_note"
+    )]
     pub verification_notes: Option<String>,
-    #[serde(default, alias = "experimentNotes")]
+    #[serde(
+        default,
+        alias = "experimentNotes",
+        deserialize_with = "deserialize_optional_note"
+    )]
     pub experiment_notes: Option<String>,
-    #[serde(default, alias = "recoveryNotes")]
+    #[serde(
+        default,
+        alias = "recoveryNotes",
+        deserialize_with = "deserialize_optional_note"
+    )]
     pub recovery_notes: Option<String>,
+}
+
+fn deserialize_optional_note<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(note) => Ok(Some(note)),
+        serde_json::Value::Array(items) => {
+            let notes: Vec<String> = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(note) => Some(note),
+                    other => Some(other.to_string()),
+                })
+                .collect();
+            if notes.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(notes.join("\n")))
+            }
+        }
+        other => Ok(Some(other.to_string())),
+    }
 }
 
 pub struct LanguageModelMutationBridge<P> {
@@ -1558,13 +1905,14 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
         workspace: &CandidateWorkspace,
     ) -> Result<ModelMutationResult, MutationModelError> {
         let info = self.provider.info();
-        let response_format = if info.supports_json_object {
+        let direct_edit =
+            info.supports_tool_permissions && info.invocation == LanguageModelInvocation::Process;
+        let structured_response = !direct_edit;
+        let response_format = if structured_response && info.supports_json_object {
             LanguageModelResponseFormat::JsonObject
         } else {
             LanguageModelResponseFormat::Text
         };
-        let direct_edit = info.supports_tool_permissions;
-        let structured_response = !direct_edit;
         let descriptors = self.tool_registry.descriptors();
         let mut messages = vec![
             LanguageModelMessage {
@@ -1796,7 +2144,7 @@ pub fn render_mutation_bridge_prompt(
     if structured_json {
         prompt.push_str("\n## Required JSON Response\n");
         prompt.push_str(
-            "Return only a JSON object with keys: tool_calls, changed_files, patch, patch_summary, verification_notes, experiment_notes, recovery_notes.\n",
+            "Return only a json object with keys: tool_calls, changed_files, patch, patch_summary, verification_notes, experiment_notes, recovery_notes.\n",
         );
         prompt.push_str(
             "`tool_calls` is an array of objects shaped like `{ \"tool\": \"read_file\", \"input\": { ... } }`. Use it when you need more context or want Sinomo to run a command before finalizing. When ready, leave `tool_calls` empty and provide `patch` or final notes.\n",
@@ -1822,7 +2170,7 @@ fn render_mutation_system_prompt(structured_json: bool, direct_edit: bool) -> St
         );
     }
     if structured_json {
-        prompt.push_str(" Return valid JSON only.");
+        prompt.push_str(" Return valid json only.");
     }
     prompt
 }
@@ -2380,7 +2728,7 @@ mod tests {
         LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
         PROVIDER_DEFAULT_MODEL,
     };
-    use sinomo_runtime::core::EvaluationOutcome;
+    use sinomo_runtime::core::{EvaluationOutcome, ScorecardId};
     use sinomo_runtime::eval::LocalCommandRunner;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -2584,6 +2932,210 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_iteration_prepares_dry_run_agent_handoff_from_approved_campaign() {
+        let mut campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective:
+                "improve the self-evolution scheduler so it can dispatch one approved task safely"
+                    .to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        });
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+
+        let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+            campaign: campaign.clone(),
+            task_id: Some(task_id.clone()),
+            intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+            extra_verification_commands: vec!["cargo test -p sinomo-evolution --lib".to_string()],
+            dry_run: true,
+        })
+        .expect("approved campaign can prepare one iteration");
+
+        assert_eq!(plan.campaign_id, campaign.campaign_id);
+        assert_eq!(plan.task.task_id, task_id);
+        assert_eq!(plan.evolution_request.dry_run, true);
+        assert!(plan.evolution_request.objective.contains("Campaign"));
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains(&plan.task.task_id)
+        );
+        assert_eq!(
+            plan.evolution_request.intended_paths,
+            vec!["crates/sinomo-evolution/**".to_string()]
+        );
+        assert!(
+            plan.evolution_request
+                .verification_commands
+                .iter()
+                .any(
+                    |command| command.command == "cargo test -p sinomo-evolution --lib"
+                        && command.gate == EvaluationGate::StaticChecks
+                )
+        );
+
+        let unapproved = propose_evolution_campaign(CampaignProposalRequest {
+            approved: false,
+            ..CampaignProposalRequest {
+                objective: "unapproved campaign must not dispatch".to_string(),
+                horizon: "30 days".to_string(),
+                budget_policy: "free-and-prepaid".to_string(),
+                reserve_floors: Vec::new(),
+                approval_policy: "stage-rollout".to_string(),
+                max_wall_time: None,
+                pause_after_proposal: true,
+                dry_run: true,
+                approved: false,
+                target_ring: TrustRing::R1TrustedRuntime,
+                source_repo: Some("/workspace/sinomo".to_string()),
+            }
+        });
+        assert!(matches!(
+            prepare_scheduled_iteration(ScheduledIterationRequest {
+                campaign: unapproved,
+                task_id: None,
+                intended_paths: Vec::new(),
+                extra_verification_commands: Vec::new(),
+                dry_run: true,
+            }),
+            Err(CampaignIterationError::CampaignNotApproved { .. })
+        ));
+    }
+
+    #[test]
+    fn scheduled_iteration_result_pauses_campaign_for_rollout_review() {
+        let mut campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "improve the self-evolution scheduler so it can evaluate one implementation candidate".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        });
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+            campaign: campaign.clone(),
+            task_id: Some(task_id.clone()),
+            intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+            extra_verification_commands: vec!["cargo test -p sinomo-evolution --lib".to_string()],
+            dry_run: true,
+        })
+        .expect("plan");
+        let job_id = EvolutionJobId::generate();
+        let report = EvolutionReport {
+            job: EvolutionJob {
+                job_id: job_id.clone(),
+                objective: plan.evolution_request.objective,
+                target_ring: campaign.target_ring.clone(),
+                target_module_id: None,
+                edit_scope: EditScope {
+                    workspace_root: "/workspace/sinomo".to_string(),
+                    intended_paths: plan.evolution_request.intended_paths.clone(),
+                    notes: "campaign scheduled iteration".to_string(),
+                },
+                verification: VerificationPlan {
+                    commands: plan.evolution_request.verification_commands.clone(),
+                },
+                recovery: RecoveryPlan::default(),
+                scope: EvolutionScope {
+                    allowed_paths: plan.evolution_request.intended_paths.clone(),
+                    forbidden_paths: Vec::new(),
+                    workspace_id: Some(WorkspaceId::new("workspace_campaign").expect("workspace")),
+                },
+                status: EvolutionJobStatus::AwaitingApproval,
+                required_gates: vec![EvaluationGate::StaticChecks],
+                rollback_policy: RollbackPolicy::default(),
+            },
+            candidate_workspace: CandidateWorkspace {
+                job_id: job_id.clone(),
+                path: PathBuf::from("/tmp/sinomo-candidate-worktree"),
+                branch_name: "evolution/test-campaign-task".to_string(),
+                source_revision: Some("abc123".to_string()),
+            },
+            bundle: CandidateBundleManifest {
+                job_id,
+                bundle_path: "/tmp/sinomo-candidate-bundle".to_string(),
+                created_at: time::OffsetDateTime::now_utc(),
+                mutation_packet_path: "/tmp/sinomo-candidate-bundle/mutation-packet.json"
+                    .to_string(),
+                job_path: Some("/tmp/sinomo-candidate-bundle/job.json".to_string()),
+                model_output_path: Some(
+                    "/tmp/sinomo-candidate-bundle/model-output.json".to_string(),
+                ),
+                changed_files_path: Some(
+                    "/tmp/sinomo-candidate-bundle/changed-files.json".to_string(),
+                ),
+                diff_path: Some("/tmp/sinomo-candidate-bundle/diff.patch".to_string()),
+                scorecard_path: Some("/tmp/sinomo-candidate-bundle/scorecard.json".to_string()),
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            scorecard: Some(EvaluationScorecard {
+                scorecard_id: ScorecardId::generate(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+                outcome: EvaluationOutcome::Passed,
+                gates: Vec::new(),
+                metrics: Vec::new(),
+            }),
+            changed_files: vec!["crates/sinomo-evolution/src/lib.rs".to_string()],
+        };
+
+        let updated = record_scheduled_iteration_result(
+            campaign,
+            &task_id,
+            &report,
+            vec![ResourceUsageEstimate {
+                task_id: task_id.clone(),
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: Some(8),
+            }],
+        );
+
+        assert_eq!(updated.status, EvolutionCampaignStatus::PausedHuman);
+        assert_eq!(updated.iteration_results.len(), 1);
+        assert_eq!(updated.iteration_results[0].task_id, task_id);
+        assert_eq!(
+            updated.iteration_results[0].status,
+            EvolutionIterationStatus::AwaitingRolloutApproval
+        );
+        assert!(
+            updated.iteration_results[0]
+                .evidence
+                .iter()
+                .any(|evidence| evidence.contains("scorecard"))
+        );
+        assert!(updated.decisions.iter().any(|decision| {
+            decision.kind == CampaignDecisionKind::TaskSelected
+                && decision
+                    .rationale
+                    .contains("rollout still requires existing approval")
+        }));
+    }
+
+    #[test]
     fn r1_job_receives_continuity_gates_and_workspace_scope() {
         let planner = EvolutionPlanner::new(NodeId::new("node_desktop").expect("node"));
         let (job, workspace) = planner.scope_job(EvolutionOpportunity {
@@ -2607,12 +3159,15 @@ mod tests {
 
     #[test]
     fn git_status_parser_handles_modified_untracked_and_renamed_paths() {
-        let paths = parse_git_status_paths(" M crates/a.rs\n?? docs/new.md\nR  old.rs -> new.rs\n")
-            .expect("status paths");
+        let paths = parse_git_status_paths(
+            " M crates/a.rs\nM agent-target.md\n?? docs/new.md\nR  old.rs -> new.rs\n",
+        )
+        .expect("status paths");
 
         assert_eq!(
             paths,
             vec![
+                "agent-target.md".to_string(),
                 "crates/a.rs".to_string(),
                 "docs/new.md".to_string(),
                 "new.rs".to_string()
@@ -2689,6 +3244,7 @@ mod tests {
         assert!(prompt.contains("kill_command"));
         assert!(prompt.contains("no further stdout/stderr"));
         assert!(prompt.contains("Required JSON Response"));
+        assert!(prompt.contains("json object"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2714,6 +3270,17 @@ mod tests {
         .expect("fenced json");
         assert_eq!(fenced.tool_calls.len(), 1);
         assert_eq!(fenced.tool_calls[0].tool, "read_file");
+
+        let array_notes = parse_structured_mutation_output(
+            r#"{"changed_files":["agent-target.md"],"patch":"diff --git a/agent-target.md b/agent-target.md","verification_notes":["ran grep","passed"],"experiment_notes":["none"],"recovery_notes":["checkout file"]}"#,
+        )
+        .expect("array notes json");
+        assert_eq!(
+            array_notes.verification_notes.as_deref(),
+            Some("ran grep\npassed")
+        );
+        assert_eq!(array_notes.experiment_notes.as_deref(), Some("none"));
+        assert_eq!(array_notes.recovery_notes.as_deref(), Some("checkout file"));
     }
 
     #[test]
@@ -2890,6 +3457,68 @@ mod tests {
         assert_eq!(result.tool_results[1].tool, "apply_patch");
         let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
         assert_eq!(patched.replace("\r\n", "\n"), "new\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn language_model_bridge_treats_http_tool_providers_as_structured_patch_mode() {
+        let root = git_repo("bridge-http-tool-provider");
+        fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
+        run_in(&root, "git add patched.txt").expect("git add");
+        run_in(&root, "git commit -m init").expect("git commit");
+        let workspace = candidate_workspace(&root);
+        let provider = FakeLanguageModelProvider::new(
+            LanguageModelProviderInfo {
+                provider: "fake-http-tools".to_string(),
+                default_model: "fake-model".to_string(),
+                invocation: sinomo_lm::LanguageModelInvocation::Http,
+                supports_json_object: true,
+                supports_tool_permissions: true,
+            },
+            serde_json::json!({
+                "tool_calls": [],
+                "changed_files": ["patched.txt"],
+                "patch": "diff --git a/patched.txt b/patched.txt\n--- a/patched.txt\n+++ b/patched.txt\n@@ -1 +1 @@\n-old\n+new\n",
+                "patch_summary": "patched tracked file"
+            })
+            .to_string(),
+        );
+        let requests = provider.requests.clone();
+        let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
+        let packet = MutationPacket {
+            job_id: workspace.job_id.clone(),
+            objective: "patch file".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            edit_scope: EditScope {
+                workspace_root: root.display().to_string(),
+                intended_paths: vec!["patched.txt".to_string()],
+                notes: String::new(),
+            },
+            relevant_files: Vec::new(),
+            verification: VerificationPlan {
+                commands: Vec::new(),
+            },
+            output_contract: MutationOutputContract::default(),
+            recovery: RecoveryPlan::default(),
+        };
+
+        let result = bridge.mutate(&packet, &workspace).expect("mutation");
+
+        let request = &requests.borrow()[0];
+        assert_eq!(request.metadata["direct_edit"], false);
+        assert_eq!(
+            request.response_format,
+            LanguageModelResponseFormat::JsonObject
+        );
+        assert_eq!(
+            result
+                .structured_output
+                .as_ref()
+                .map(|output| output.changed_files.clone()),
+            Some(vec!["patched.txt".to_string()])
+        );
+        let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
+        assert_eq!(patched, "new\n");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3334,6 +3963,37 @@ index 3b18e51..6320cd2 100644
         assert_eq!(result.status, ToolCallStatus::Succeeded);
         let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
         assert_eq!(patched.replace("\r\n", "\n"), "new\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_patch_tool_applies_v4a_update_patch_in_candidate_workspace() {
+        let root = git_repo("apply-v4a-patch-tool");
+        fs::write(root.join("patched.txt"), "# Title\n\nold\n").expect("write tracked");
+        run_in(&root, "git add patched.txt").expect("git add");
+        run_in(&root, "git commit -m init").expect("git commit");
+        let workspace = candidate_workspace(&root);
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: patched.txt\n",
+            "@@\n",
+            " # Title\n",
+            " \n",
+            "-old\n",
+            "+new\n",
+            "*** End Patch\n"
+        );
+        let result = EvolutionToolRegistry::bootstrap().execute(
+            &workspace,
+            EvolutionToolCall {
+                tool: "apply_patch".to_string(),
+                input: serde_json::json!({ "patch": patch }),
+            },
+        );
+
+        assert_eq!(result.status, ToolCallStatus::Succeeded);
+        let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
+        assert_eq!(patched.replace("\r\n", "\n"), "# Title\n\nnew\n");
         let _ = fs::remove_dir_all(root);
     }
 

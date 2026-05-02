@@ -8,7 +8,8 @@ use sinomo_evolution::{
     EvolutionOrchestrator, EvolutionReport, EvolutionRequest, GitWorkspaceAdapter,
     LanguageModelMutationBridge, LocalCandidateBundleStore, MutationModel, MutationModelError,
     ReserveFloor, ResourceClassDefinition, ResourceSchedulerDryRun, ResourceSchedulerDryRunRequest,
-    ResourceUsageEstimate, dry_run_resource_scheduler, propose_evolution_campaign,
+    ResourceUsageEstimate, ScheduledIterationPlan, ScheduledIterationRequest,
+    dry_run_resource_scheduler, prepare_scheduled_iteration, propose_evolution_campaign,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -2051,6 +2052,9 @@ struct CampaignBundlePaths {
     scheduler_dry_run_json: PathBuf,
     lease_requests_jsonl: PathBuf,
     lease_decisions_jsonl: PathBuf,
+    iteration_plan_json: PathBuf,
+    iteration_request_json: PathBuf,
+    iteration_dispatches_jsonl: PathBuf,
     approval_checkpoint_json: PathBuf,
     decisions_jsonl: PathBuf,
 }
@@ -2068,6 +2072,9 @@ impl CampaignBundlePaths {
             scheduler_dry_run_json: root.join("scheduler-dry-run.json"),
             lease_requests_jsonl: root.join("lease-requests.jsonl"),
             lease_decisions_jsonl: root.join("lease-decisions.jsonl"),
+            iteration_plan_json: root.join("iteration-plan.json"),
+            iteration_request_json: root.join("iteration-request.json"),
+            iteration_dispatches_jsonl: root.join("iteration-dispatches.jsonl"),
             approval_checkpoint_json: root.join("approval-checkpoint.json"),
             decisions_jsonl: root.join("decisions.jsonl"),
             root,
@@ -2080,6 +2087,7 @@ enum EvolveCliCommand {
     Help,
     Propose(Vec<String>),
     Schedule(Vec<String>),
+    Iterate(Vec<String>),
     Decide(CandidateDecisionOutcome, Vec<String>),
     Status(Vec<String>),
     Show(Vec<String>),
@@ -2101,6 +2109,9 @@ fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, CliError> {
         }
         Some((command, rest)) if command == "schedule" => {
             Ok(EvolveCliCommand::Schedule(rest.to_vec()))
+        }
+        Some((command, rest)) if command == "iterate" => {
+            Ok(EvolveCliCommand::Iterate(rest.to_vec()))
         }
         Some((command, rest)) if command == "approve" => Ok(EvolveCliCommand::Decide(
             CandidateDecisionOutcome::Approved,
@@ -2142,6 +2153,7 @@ fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), CliError> {
         }
         EvolveCliCommand::Propose(args) => evolve_propose(&args),
         EvolveCliCommand::Schedule(args) => evolve_schedule(&args),
+        EvolveCliCommand::Iterate(args) => evolve_iterate(&args),
         EvolveCliCommand::Decide(outcome, args) => evolve_decide(&args, outcome),
         EvolveCliCommand::Status(args) => evolve_status(&args),
         EvolveCliCommand::Show(args) => evolve_show(&args),
@@ -2298,6 +2310,30 @@ fn evolve_schedule(args: &[String]) -> Result<(), CliError> {
     });
     let bundle = write_campaign_schedule_dry_run(&paths, &mut campaign, &dry_run)?;
     println_scheduler_dry_run(&dry_run, &bundle);
+    Ok(())
+}
+
+fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
+    let options = parse_iteration_options(args)?;
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = EvolutionPaths::new(&data_dir);
+    paths.ensure()?;
+    if !options.dry_run {
+        return Err(CliError::Usage);
+    }
+    let mut campaign = read_campaign(&paths, &options.campaign_id)?;
+    let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+        campaign: campaign.clone(),
+        task_id: options.task_id.clone(),
+        intended_paths: options.intended_paths.clone(),
+        extra_verification_commands: options.verification_commands.clone(),
+        dry_run: true,
+    })
+    .map_err(|source| CliError::Parse {
+        detail: source.to_string(),
+    })?;
+    let bundle = write_campaign_iteration_dry_run(&paths, &mut campaign, &plan)?;
+    println_iteration_dry_run(&plan, &bundle);
     Ok(())
 }
 
@@ -3221,6 +3257,69 @@ struct ScheduleOptions {
     dry_run: bool,
 }
 
+#[derive(Clone, Debug)]
+struct IterationOptions {
+    campaign_id: String,
+    task_id: Option<String>,
+    intended_paths: Vec<String>,
+    verification_commands: Vec<String>,
+    dry_run: bool,
+}
+
+fn parse_iteration_options(args: &[String]) -> Result<IterationOptions, CliError> {
+    let mut campaign_id = None;
+    let mut task_id = None;
+    let mut intended_paths = Vec::new();
+    let mut verification_commands = Vec::new();
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--task" => {
+                index += 1;
+                task_id = args.get(index).cloned();
+                if task_id.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--path" | "--allow" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    intended_paths.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--verify" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    verification_commands.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--dry-run" | "--preview" => {
+                dry_run = true;
+            }
+            value if value.starts_with("--") => return Err(CliError::Usage),
+            value => {
+                if campaign_id.is_some() {
+                    return Err(CliError::Usage);
+                }
+                campaign_id = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    Ok(IterationOptions {
+        campaign_id: campaign_id.ok_or(CliError::Usage)?,
+        task_id,
+        intended_paths,
+        verification_commands,
+        dry_run,
+    })
+}
+
 fn parse_schedule_options(args: &[String]) -> Result<ScheduleOptions, CliError> {
     let mut campaign_id = None;
     let mut resources = Vec::new();
@@ -3837,6 +3936,42 @@ fn write_campaign_schedule_dry_run(
     Ok(bundle)
 }
 
+fn write_campaign_iteration_dry_run(
+    paths: &EvolutionPaths,
+    campaign: &mut EvolutionCampaign,
+    plan: &ScheduledIterationPlan,
+) -> Result<CampaignBundlePaths, CliError> {
+    let now = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    campaign.status = EvolutionCampaignStatus::Scheduled;
+    campaign.updated_at = now.clone();
+    campaign.decisions.push(EvolutionCampaignDecision {
+        decision_id: format!("decision_{}", campaign.decisions.len() + 1),
+        kind: CampaignDecisionKind::TaskSelected,
+        summary: format!(
+            "Prepared dry-run scheduled iteration {} for task {}",
+            plan.iteration_id, plan.task.task_id
+        ),
+        rationale:
+            "Phase 2 strategy-plan execution writes an inspectable handoff before any agent work starts."
+                .to_string(),
+        evidence_refs: vec![
+            "iteration-plan.json".to_string(),
+            "iteration-request.json".to_string(),
+            "iteration-dispatches.jsonl".to_string(),
+        ],
+        decided_by: "sinomo evolve iterate --dry-run".to_string(),
+        decided_at: now,
+    });
+
+    let bundle = write_campaign_bundle(paths, campaign)?;
+    write_json(&bundle.iteration_plan_json, plan)?;
+    write_json(&bundle.iteration_request_json, &plan.evolution_request)?;
+    write_jsonl(&bundle.iteration_dispatches_jsonl, &[plan.clone()])?;
+    Ok(bundle)
+}
+
 fn write_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::Io {
@@ -3921,6 +4056,22 @@ fn println_scheduler_dry_run(dry_run: &ResourceSchedulerDryRun, bundle: &Campaig
             task.task_id, task.decision, task.explanation
         );
     }
+}
+
+fn println_iteration_dry_run(plan: &ScheduledIterationPlan, bundle: &CampaignBundlePaths) {
+    println!("campaign: {}", plan.campaign_id);
+    println!("iteration: {}", plan.iteration_id);
+    println!("task: {}", plan.task.task_id);
+    println!("dry run: {}", plan.evolution_request.dry_run);
+    println!("iteration plan: {}", bundle.iteration_plan_json.display());
+    println!(
+        "iteration request: {}",
+        bundle.iteration_request_json.display()
+    );
+    println!(
+        "iteration dispatches: {}",
+        bundle.iteration_dispatches_jsonl.display()
+    );
 }
 
 fn println_report(report: &EvolutionReport) {
@@ -4584,6 +4735,12 @@ fn print_evolve_help() {
     println!(
         "      Write phase-1 resource-ledger, lease request/decision, scheduler dry-run, and pause/schedule decision artifacts."
     );
+    println!(
+        "  sinomo evolve iterate <campaign> --dry-run [--task <task_id>] [--path <glob>] [--verify \"<command>\"]"
+    );
+    println!(
+        "      Write phase-2 scheduled-iteration handoff artifacts without starting an implementation agent."
+    );
     println!("  sinomo evolve approve [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
@@ -5078,6 +5235,120 @@ mod tests {
         assert_eq!(options.max_wall_time.as_deref(), Some("10m"));
         assert!(options.pause_after_proposal);
         assert!(options.dry_run);
+    }
+
+    #[test]
+    fn evolve_iterate_parser_accepts_phase_two_dry_run_flags() {
+        let command = super::parse_evolve_command(&[
+            "iterate".to_string(),
+            "camp_demo".to_string(),
+            "--task".to_string(),
+            "task_demo".to_string(),
+            "--path".to_string(),
+            "crates/sinomo-evolution/**".to_string(),
+            "--verify".to_string(),
+            "cargo test -p sinomo-evolution --lib".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .expect("iterate command");
+        assert!(matches!(command, super::EvolveCliCommand::Iterate(_)));
+
+        let options = super::parse_iteration_options(&[
+            "camp_demo".to_string(),
+            "--task".to_string(),
+            "task_demo".to_string(),
+            "--path".to_string(),
+            "crates/sinomo-evolution/**".to_string(),
+            "--verify".to_string(),
+            "cargo test -p sinomo-evolution --lib".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .expect("iteration options");
+
+        assert_eq!(options.campaign_id, "camp_demo");
+        assert_eq!(options.task_id.as_deref(), Some("task_demo"));
+        assert_eq!(
+            options.intended_paths,
+            vec!["crates/sinomo-evolution/**".to_string()]
+        );
+        assert_eq!(
+            options.verification_commands,
+            vec!["cargo test -p sinomo-evolution --lib".to_string()]
+        );
+        assert!(options.dry_run);
+    }
+
+    #[test]
+    fn campaign_iteration_dry_run_persists_phase_two_handoff_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-campaign-iterate-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let mut campaign = sinomo_evolution::propose_evolution_campaign(
+            sinomo_evolution::CampaignProposalRequest {
+                objective: "improve scheduler iteration dispatch".to_string(),
+                horizon: "14 days".to_string(),
+                budget_policy: "free-and-prepaid".to_string(),
+                reserve_floors: vec![sinomo_evolution::ReserveFloor {
+                    resource: "coding-plan-weekly".to_string(),
+                    floor_percent: 30,
+                }],
+                approval_policy: "stage-rollout".to_string(),
+                max_wall_time: Some("10m".to_string()),
+                pause_after_proposal: false,
+                dry_run: true,
+                approved: true,
+                target_ring: TrustRing::R1TrustedRuntime,
+                source_repo: Some("/repo".to_string()),
+            },
+        );
+        campaign.status = sinomo_evolution::EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        super::write_campaign_bundle(&paths, &campaign).expect("bundle");
+        let plan = sinomo_evolution::prepare_scheduled_iteration(
+            sinomo_evolution::ScheduledIterationRequest {
+                campaign: campaign.clone(),
+                task_id: Some(task_id.clone()),
+                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                extra_verification_commands: vec![
+                    "cargo test -p sinomo-evolution --lib".to_string(),
+                ],
+                dry_run: true,
+            },
+        )
+        .expect("iteration plan");
+
+        let bundle = super::write_campaign_iteration_dry_run(&paths, &mut campaign, &plan)
+            .expect("iteration artifacts");
+
+        assert!(bundle.iteration_plan_json.exists());
+        assert!(bundle.iteration_request_json.exists());
+        assert!(bundle.iteration_dispatches_jsonl.exists());
+        let persisted: sinomo_evolution::EvolutionCampaign = serde_json::from_str(
+            &std::fs::read_to_string(&bundle.campaign_json).expect("campaign json"),
+        )
+        .expect("campaign parse");
+        assert_eq!(
+            persisted.status,
+            sinomo_evolution::EvolutionCampaignStatus::Scheduled
+        );
+        assert!(
+            std::fs::read_to_string(&bundle.iteration_dispatches_jsonl)
+                .expect("dispatch jsonl")
+                .contains(&plan.iteration_id)
+        );
+        assert!(
+            std::fs::read_to_string(&bundle.decisions_jsonl)
+                .expect("decisions jsonl")
+                .contains("TaskSelected")
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

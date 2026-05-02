@@ -334,6 +334,9 @@ impl EvolutionTool for ApplyPatchTool {
             return failed_tool_result("apply_patch", "missing string field `patch`", Vec::new());
         };
         let start = Instant::now();
+        if patch.trim_start().starts_with("*** Begin Patch") {
+            return apply_v4a_patch(workspace, patch, start);
+        }
         let mut child = match shell_command("git apply --whitespace=nowarn -")
             .current_dir(&workspace.path)
             .stdin(std::process::Stdio::piped())
@@ -373,6 +376,116 @@ impl EvolutionTool for ApplyPatchTool {
             output,
             start.elapsed(),
         )
+    }
+}
+
+fn apply_v4a_patch(
+    workspace: &CandidateWorkspace,
+    patch: &str,
+    start: Instant,
+) -> EvolutionToolResult {
+    match apply_v4a_patch_to_workspace(&workspace.path, patch) {
+        Ok(paths) => EvolutionToolResult {
+            tool: "apply_patch".to_string(),
+            status: ToolCallStatus::Succeeded,
+            output: serde_json::json!({
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 0,
+                "format": "v4a"
+            }),
+            evidence: ToolEvidence {
+                summary: "applied V4A patch".to_string(),
+                command: Some("apply V4A patch".to_string()),
+                exit_code: Some(0),
+                duration_ms: Some(duration_millis(start.elapsed())),
+                paths,
+            },
+        },
+        Err(error) => failed_command_result(
+            "apply_patch",
+            "apply V4A patch",
+            -1,
+            duration_millis(start.elapsed()),
+            String::new(),
+            error,
+        ),
+    }
+}
+
+fn apply_v4a_patch_to_workspace(root: &Path, patch: &str) -> Result<Vec<String>, String> {
+    let mut changed_paths = Vec::new();
+    let mut lines = patch.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(path) = line.strip_prefix("*** Update File: ") else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || path.starts_with('/') || path.split('/').any(|part| part == "..") {
+            return Err(format!("unsafe V4A patch path `{path}`"));
+        }
+        let mut old_text = String::new();
+        let mut new_text = String::new();
+        let mut in_hunk = false;
+        while let Some(next_line) = lines.peek().copied() {
+            if next_line.starts_with("*** Update File: ")
+                || next_line.starts_with("*** Add File: ")
+                || next_line.starts_with("*** Delete File: ")
+                || next_line.starts_with("*** End Patch")
+            {
+                break;
+            }
+            let hunk_line = lines.next().unwrap_or_default();
+            if hunk_line.starts_with("@@") {
+                in_hunk = true;
+                continue;
+            }
+            if !in_hunk {
+                continue;
+            }
+            if let Some(rest) = hunk_line.strip_prefix('+') {
+                new_text.push_str(rest);
+                new_text.push('\n');
+            } else if let Some(rest) = hunk_line.strip_prefix('-') {
+                old_text.push_str(rest);
+                old_text.push('\n');
+            } else if let Some(rest) = hunk_line.strip_prefix(' ') {
+                old_text.push_str(rest);
+                old_text.push('\n');
+                new_text.push_str(rest);
+                new_text.push('\n');
+            } else if hunk_line.is_empty() {
+                old_text.push('\n');
+                new_text.push('\n');
+            }
+        }
+        if old_text.is_empty() {
+            return Err(format!(
+                "V4A patch for `{path}` did not contain removable context"
+            ));
+        }
+        let file_path = root.join(path);
+        let content = fs::read_to_string(&file_path)
+            .map_err(|error| format!("failed to read {}: {error}", file_path.display()))?;
+        let updated = if content.contains(&old_text) {
+            content.replacen(&old_text, &new_text, 1)
+        } else {
+            let old_without_final_newline = old_text.trim_end_matches('\n');
+            let new_without_final_newline = new_text.trim_end_matches('\n');
+            if old_without_final_newline.is_empty() || !content.contains(old_without_final_newline)
+            {
+                return Err(format!("V4A patch context not found in `{path}`"));
+            }
+            content.replacen(old_without_final_newline, new_without_final_newline, 1)
+        };
+        fs::write(&file_path, updated)
+            .map_err(|error| format!("failed to write {}: {error}", file_path.display()))?;
+        changed_paths.push(path.to_string());
+    }
+    if changed_paths.is_empty() {
+        Err("V4A patch did not contain any update file sections".to_string())
+    } else {
+        Ok(changed_paths)
     }
 }
 
