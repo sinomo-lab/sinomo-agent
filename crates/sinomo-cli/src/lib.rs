@@ -4049,6 +4049,12 @@ fn run_daemon_with_paths(
     loop {
         match listener.accept() {
             Ok((mut stream, _address)) => {
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
                 if handle_daemon_connection(&mut stream, &paths)? {
                     break;
                 }
@@ -11504,14 +11510,15 @@ mod tests {
         cluster_peer_members, cluster_sync_targets, daemon_package_version,
         daemon_status_matches_options, decode_cluster_join_invite, encode_cluster_join_invite,
         ensure_daemon_cluster_members, ensure_rollout_layout, handle_daemon_cluster_join,
-        handle_daemon_cluster_kv_txn, handle_daemon_cluster_sync, handle_daemon_rollout_build,
-        install_should_update_binary, install_with_layout, is_terminal_status,
-        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-        parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-        parse_dfs_command, parse_install_options, parse_model_default_options,
-        parse_models_list_options, parse_propose_options, parse_provider_command,
-        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-        read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
+        handle_daemon_cluster_kv_txn, handle_daemon_cluster_sync, handle_daemon_connection,
+        handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
+        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
+        parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+        parse_daemon_command, parse_dfs_command, parse_install_options,
+        parse_model_default_options, parse_models_list_options, parse_propose_options,
+        parse_provider_command, parse_rollout_command, parse_slash_command,
+        parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
+        read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
         read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
         run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
         sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
@@ -11529,8 +11536,10 @@ mod tests {
     use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
     use sinomo_runtime::kv::{KvCompare, KvOp, KvTxn};
     use sinomo_runtime::local::SinomoDataDir;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use time::OffsetDateTime;
 
@@ -12932,6 +12941,52 @@ mod tests {
         assert_eq!(paths.root, root.join("daemon"));
         assert_eq!(paths.lock, root.join("daemon").join("daemon.lock"));
         assert_eq!(paths.status, root.join("daemon").join("status.json"));
+    }
+
+    #[test]
+    fn daemon_accepted_stream_is_reset_to_blocking_for_delayed_client_input() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-daemon-blocking-stream-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("daemon paths");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let address = listener.local_addr().expect("local addr");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            thread::sleep(Duration::from_millis(50));
+            stream.write_all(b"STATUS\n").expect("write");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read");
+            response
+        });
+        let mut accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        accepted.set_nonblocking(false).expect("blocking stream");
+
+        let should_shutdown = handle_daemon_connection(&mut accepted, &paths).expect("handle");
+        drop(accepted);
+        let response = client.join().expect("client");
+
+        assert!(!should_shutdown);
+        assert!(response.contains("auth failed"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
