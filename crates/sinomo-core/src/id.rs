@@ -207,6 +207,7 @@ define_id!(SessionId, "sess_");
 define_id!(EntityId, "entity_");
 define_id!(TaskId, "task_");
 define_id!(WorkspaceId, "workspace_");
+define_open_id!(DfsFileSystemId, "fs_");
 define_id!(DfsObjectId, "obj_");
 define_id!(DfsVersion, "version_");
 define_id!(ArtifactId, "artifact_");

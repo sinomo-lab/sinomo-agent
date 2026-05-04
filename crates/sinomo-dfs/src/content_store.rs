@@ -89,6 +89,23 @@ impl LocalContentStore {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    pub fn manifests_for_object(&self, object_id: &str) -> Result<Vec<ContentManifest>> {
+        let object_root = self.root.join("objects").join(object_id);
+        if !object_root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut manifests: Vec<ContentManifest> = Vec::new();
+        for entry in read_dir(&object_root)? {
+            let path = entry.path().join("manifest.json");
+            if path.is_file() {
+                manifests.push(serde_json::from_slice(&read_file(&path)?)?);
+            }
+        }
+        manifests.sort_by(|left, right| left.version.cmp(&right.version));
+        Ok(manifests)
+    }
+
     pub fn has_blob(&self, hash: &str) -> Result<bool> {
         let path = self.blob_path(hash)?;
         Ok(path.is_file())
@@ -163,6 +180,21 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     })
 }
 
+fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = Vec::new();
+    let reader = fs::read_dir(path).map_err(|source| ContentStoreError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    for entry in reader {
+        entries.push(entry.map_err(|source| ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        })?);
+    }
+    Ok(entries)
+}
+
 fn remove_file(path: &Path) -> Result<()> {
     fs::remove_file(path).map_err(|source| ContentStoreError::Io {
         path: path.to_owned(),
@@ -218,6 +250,12 @@ mod tests {
                 .read_manifest("object-a", "v1")
                 .expect("read manifest"),
             manifest
+        );
+        assert_eq!(
+            store
+                .manifests_for_object("object-a")
+                .expect("object manifests"),
+            vec![manifest]
         );
 
         cleanup(&root);

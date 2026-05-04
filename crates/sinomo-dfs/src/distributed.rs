@@ -1,7 +1,7 @@
 //! Distributed eventual object protocol for DFS.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{DfsObjectId, DfsVersion, NodeId, WorkspaceId};
+use sinomo_core::{DfsFileSystemId, DfsObjectId, DfsVersion, NodeId};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -22,6 +22,14 @@ impl DfsReplicationPolicy {
         };
         policy.validate()?;
         Ok(policy)
+    }
+
+    pub fn confirmed(desired_replicas: usize) -> Result<Self, DfsDistributedError> {
+        Self::new(desired_replicas, desired_replicas)
+    }
+
+    pub fn is_strict_confirmed(&self) -> bool {
+        self.min_commit_replicas == self.desired_replicas
     }
 
     fn validate(&self) -> Result<(), DfsDistributedError> {
@@ -48,12 +56,86 @@ impl DfsReplicationPolicy {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaCandidate {
+    pub node_id: NodeId,
+    pub weight: u32,
+}
+
+impl DfsReplicaCandidate {
+    pub fn new(node_id: NodeId) -> Self {
+        Self { node_id, weight: 1 }
+    }
+
+    pub fn weighted(node_id: NodeId, weight: u32) -> Result<Self, DfsDistributedError> {
+        if weight == 0 {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: "replica candidate weight must be greater than zero".to_string(),
+            });
+        }
+        Ok(Self { node_id, weight })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaPlacementRequest {
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub target_version: DfsVersion,
+    pub coordinator_node_id: NodeId,
+    pub policy: DfsReplicationPolicy,
+    pub candidates: Vec<DfsReplicaCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaPlacementPlan {
+    pub desired_replica_nodes: Vec<NodeId>,
+    pub preferred_commit_nodes: Vec<NodeId>,
+}
+
+pub fn plan_replicas(
+    request: &DfsReplicaPlacementRequest,
+) -> Result<DfsReplicaPlacementPlan, DfsDistributedError> {
+    request.policy.validate()?;
+    validate_candidate_set(&request.candidates, &request.policy)?;
+
+    let mut ranked = request.candidates.clone();
+    ranked.sort_by(|left, right| {
+        let left_is_coordinator = left.node_id == request.coordinator_node_id;
+        let right_is_coordinator = right.node_id == request.coordinator_node_id;
+        right_is_coordinator
+            .cmp(&left_is_coordinator)
+            .then_with(|| {
+                placement_score(request, right)
+                    .cmp(&placement_score(request, left))
+                    .then_with(|| left.node_id.cmp(&right.node_id))
+            })
+    });
+
+    let desired_replica_nodes: Vec<NodeId> = ranked
+        .iter()
+        .take(request.policy.desired_replicas)
+        .map(|candidate| candidate.node_id.clone())
+        .collect();
+    let preferred_commit_nodes = desired_replica_nodes
+        .iter()
+        .take(request.policy.min_commit_replicas)
+        .cloned()
+        .collect();
+
+    Ok(DfsReplicaPlacementPlan {
+        desired_replica_nodes,
+        preferred_commit_nodes,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsWriteIntentState {
     AwaitingReceipts,
     Committed,
     Rejected,
     Conflict,
+    Aborted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -66,12 +148,14 @@ pub enum DfsReplicaReceiptState {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DistributedWriteIntent {
     pub intent_id: String,
-    pub workspace_id: WorkspaceId,
+    pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<DfsVersion>,
     pub target_version: DfsVersion,
     pub requesting_node_id: NodeId,
+    #[serde(default)]
+    pub owner_epoch: u64,
     pub desired_replica_nodes: Vec<NodeId>,
     pub policy: DfsReplicationPolicy,
     pub state: DfsWriteIntentState,
@@ -80,7 +164,7 @@ pub struct DistributedWriteIntent {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DistributedReplicaReceipt {
     pub intent_id: String,
-    pub workspace_id: WorkspaceId,
+    pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
     pub version: DfsVersion,
     pub replica_node_id: NodeId,
@@ -90,7 +174,7 @@ pub struct DistributedReplicaReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DistributedRepairJob {
     pub intent_id: String,
-    pub workspace_id: WorkspaceId,
+    pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
     pub version: DfsVersion,
     pub missing_replica_node_id: NodeId,
@@ -115,26 +199,26 @@ impl DistributedEventualCoordinator {
 
     pub fn set_committed_version(
         &mut self,
-        workspace_id: WorkspaceId,
+        file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
         version: DfsVersion,
     ) {
         self.committed_versions
-            .insert(ObjectKey::new(workspace_id, object_id), version);
+            .insert(ObjectKey::new(file_system_id, object_id), version);
     }
 
     pub fn committed_version(
         &self,
-        workspace_id: &WorkspaceId,
+        file_system_id: &DfsFileSystemId,
         object_id: &DfsObjectId,
     ) -> Option<&DfsVersion> {
         self.committed_versions
-            .get(&ObjectKey::from_refs(workspace_id, object_id))
+            .get(&ObjectKey::from_refs(file_system_id, object_id))
     }
 
     pub fn create_intent(
         &mut self,
-        workspace_id: WorkspaceId,
+        file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
         base_version: Option<DfsVersion>,
         target_version: DfsVersion,
@@ -142,10 +226,33 @@ impl DistributedEventualCoordinator {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<DistributedWriteIntent, DfsDistributedError> {
+        self.create_intent_at_epoch(
+            file_system_id,
+            object_id,
+            base_version,
+            target_version,
+            requesting_node_id,
+            0,
+            desired_replica_nodes,
+            policy,
+        )
+    }
+
+    pub fn create_intent_at_epoch(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        base_version: Option<DfsVersion>,
+        target_version: DfsVersion,
+        requesting_node_id: NodeId,
+        owner_epoch: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+    ) -> Result<DistributedWriteIntent, DfsDistributedError> {
         policy.validate()?;
         validate_replica_set(&desired_replica_nodes, &policy)?;
 
-        let key = ObjectKey::new(workspace_id.clone(), object_id.clone());
+        let key = ObjectKey::new(file_system_id.clone(), object_id.clone());
         if let Some(committed_version) = self.committed_versions.get(&key) {
             if Some(committed_version) != base_version.as_ref() {
                 return Err(DfsDistributedError::BaseVersionConflict {
@@ -157,7 +264,7 @@ impl DistributedEventualCoordinator {
         }
 
         if self.intents.values().any(|intent| {
-            intent.workspace_id == workspace_id
+            intent.file_system_id == file_system_id
                 && intent.object_id == object_id
                 && intent.target_version == target_version
                 && matches!(
@@ -174,11 +281,12 @@ impl DistributedEventualCoordinator {
         let intent_id = self.next_intent_id();
         let intent = DistributedWriteIntent {
             intent_id: intent_id.clone(),
-            workspace_id,
+            file_system_id,
             object_id,
             base_version,
             target_version,
             requesting_node_id,
+            owner_epoch,
             desired_replica_nodes,
             policy,
             state: DfsWriteIntentState::AwaitingReceipts,
@@ -236,7 +344,9 @@ impl DistributedEventualCoordinator {
 
         if matches!(
             intent.state,
-            DfsWriteIntentState::Rejected | DfsWriteIntentState::Conflict
+            DfsWriteIntentState::Rejected
+                | DfsWriteIntentState::Conflict
+                | DfsWriteIntentState::Aborted
         ) {
             return Err(DfsDistributedError::IntentClosed {
                 intent_id: intent_id.to_string(),
@@ -246,14 +356,17 @@ impl DistributedEventualCoordinator {
 
         let receipt = DistributedReplicaReceipt {
             intent_id: intent_id.to_string(),
-            workspace_id: intent.workspace_id.clone(),
+            file_system_id: intent.file_system_id.clone(),
             object_id: intent.object_id.clone(),
             version: intent.target_version.clone(),
             replica_node_id: replica_node_id.clone(),
             state: DfsReplicaReceiptState::Durable,
         };
         self.receipts
-            .insert((intent_id.to_string(), replica_node_id), receipt);
+            .insert((intent_id.to_string(), replica_node_id.clone()), receipt);
+        self.repair_jobs.retain(|job| {
+            job.intent_id != intent_id || job.missing_replica_node_id != replica_node_id
+        });
 
         if self.is_commit_ready(intent_id)? {
             self.commit_intent(intent_id)?;
@@ -271,6 +384,78 @@ impl DistributedEventualCoordinator {
         &self.repair_jobs
     }
 
+    pub fn abort_intent(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<DistributedWriteIntent, DfsDistributedError> {
+        let intent =
+            self.intents
+                .get_mut(intent_id)
+                .ok_or_else(|| DfsDistributedError::UnknownIntent {
+                    intent_id: intent_id.to_string(),
+                })?;
+        if !matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
+            return Err(DfsDistributedError::IntentClosed {
+                intent_id: intent_id.to_string(),
+                state: intent.state.clone(),
+            });
+        }
+        intent.state = DfsWriteIntentState::Aborted;
+        self.repair_jobs.retain(|job| job.intent_id != intent_id);
+        Ok(intent.clone())
+    }
+
+    pub fn downgrade_intent_policy(
+        &mut self,
+        intent_id: &str,
+        policy: DfsReplicationPolicy,
+    ) -> Result<DistributedWriteIntent, DfsDistributedError> {
+        policy.validate()?;
+        let current = self.intents.get(intent_id).cloned().ok_or_else(|| {
+            DfsDistributedError::UnknownIntent {
+                intent_id: intent_id.to_string(),
+            }
+        })?;
+
+        if !matches!(current.state, DfsWriteIntentState::AwaitingReceipts) {
+            return Err(DfsDistributedError::IntentClosed {
+                intent_id: intent_id.to_string(),
+                state: current.state,
+            });
+        }
+        if policy.desired_replicas != current.policy.desired_replicas {
+            return Err(DfsDistributedError::InvalidPolicy {
+                reason: "first-version policy downgrade must keep desired_replicas unchanged"
+                    .to_string(),
+            });
+        }
+        if policy.min_commit_replicas > current.policy.min_commit_replicas {
+            return Err(DfsDistributedError::InvalidPolicy {
+                reason: "policy downgrade cannot increase min_commit_replicas".to_string(),
+            });
+        }
+
+        let commit_ready = self.durable_receipt_count(intent_id) >= policy.min_commit_replicas;
+        let intent =
+            self.intents
+                .get_mut(intent_id)
+                .ok_or_else(|| DfsDistributedError::UnknownIntent {
+                    intent_id: intent_id.to_string(),
+                })?;
+        intent.policy = policy;
+
+        if commit_ready {
+            self.commit_intent(intent_id)?;
+        }
+
+        self.intents
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| DfsDistributedError::UnknownIntent {
+                intent_id: intent_id.to_string(),
+            })
+    }
+
     fn commit_intent(&mut self, intent_id: &str) -> Result<(), DfsDistributedError> {
         let durable_nodes = self.durable_receipt_nodes(intent_id);
         let intent =
@@ -286,7 +471,7 @@ impl DistributedEventualCoordinator {
 
         intent.state = DfsWriteIntentState::Committed;
         self.committed_versions.insert(
-            ObjectKey::new(intent.workspace_id.clone(), intent.object_id.clone()),
+            ObjectKey::new(intent.file_system_id.clone(), intent.object_id.clone()),
             intent.target_version.clone(),
         );
 
@@ -297,7 +482,7 @@ impl DistributedEventualCoordinator {
         {
             self.repair_jobs.push(DistributedRepairJob {
                 intent_id: intent.intent_id.clone(),
-                workspace_id: intent.workspace_id.clone(),
+                file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
                 version: intent.target_version.clone(),
                 missing_replica_node_id: missing_replica_node_id.clone(),
@@ -326,21 +511,21 @@ impl DistributedEventualCoordinator {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct ObjectKey {
-    workspace_id: WorkspaceId,
+    file_system_id: DfsFileSystemId,
     object_id: DfsObjectId,
 }
 
 impl ObjectKey {
-    fn new(workspace_id: WorkspaceId, object_id: DfsObjectId) -> Self {
+    fn new(file_system_id: DfsFileSystemId, object_id: DfsObjectId) -> Self {
         Self {
-            workspace_id,
+            file_system_id,
             object_id,
         }
     }
 
-    fn from_refs(workspace_id: &WorkspaceId, object_id: &DfsObjectId) -> Self {
+    fn from_refs(file_system_id: &DfsFileSystemId, object_id: &DfsObjectId) -> Self {
         Self {
-            workspace_id: workspace_id.clone(),
+            file_system_id: file_system_id.clone(),
             object_id: object_id.clone(),
         }
     }
@@ -364,6 +549,43 @@ fn validate_replica_set(
     }
 
     Ok(())
+}
+
+fn validate_candidate_set(
+    candidates: &[DfsReplicaCandidate],
+    policy: &DfsReplicationPolicy,
+) -> Result<(), DfsDistributedError> {
+    let unique_nodes = candidates
+        .iter()
+        .map(|candidate| &candidate.node_id)
+        .collect::<BTreeSet<_>>();
+    if unique_nodes.len() != candidates.len() {
+        return Err(DfsDistributedError::InvalidReplicaSet {
+            reason: "replica candidates contain duplicate nodes".to_string(),
+        });
+    }
+    if candidates.iter().any(|candidate| candidate.weight == 0) {
+        return Err(DfsDistributedError::InvalidReplicaSet {
+            reason: "replica candidate weight must be greater than zero".to_string(),
+        });
+    }
+    if candidates.len() < policy.desired_replicas {
+        return Err(DfsDistributedError::InvalidReplicaSet {
+            reason: "not enough replica candidates for desired_replicas".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn placement_score(request: &DfsReplicaPlacementRequest, candidate: &DfsReplicaCandidate) -> u128 {
+    let hash_input = format!(
+        "{}\0{}\0{}\0{}",
+        request.file_system_id, request.object_id, request.target_version, candidate.node_id
+    );
+    let hash = blake3::hash(hash_input.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    u128::from_be_bytes(bytes).saturating_mul(candidate.weight as u128)
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -403,8 +625,8 @@ pub enum DfsDistributedError {
 mod tests {
     use super::*;
 
-    fn workspace_id() -> WorkspaceId {
-        WorkspaceId::new("workspace_repo").expect("workspace")
+    fn file_system_id() -> DfsFileSystemId {
+        DfsFileSystemId::new("sifs").expect("filesystem")
     }
 
     fn object_id() -> DfsObjectId {
@@ -427,16 +649,16 @@ mod tests {
         coordinator: &mut DistributedEventualCoordinator,
         policy: DfsReplicationPolicy,
     ) -> DistributedWriteIntent {
-        let workspace_id = workspace_id();
+        let file_system_id = file_system_id();
         let object_id = object_id();
         coordinator.set_committed_version(
-            workspace_id.clone(),
+            file_system_id.clone(),
             object_id.clone(),
             version("version_1"),
         );
         coordinator
             .create_intent(
-                workspace_id,
+                file_system_id,
                 object_id,
                 Some(version("version_1")),
                 version("version_2"),
@@ -445,6 +667,37 @@ mod tests {
                 policy,
             )
             .expect("intent")
+    }
+
+    #[test]
+    fn placement_planner_prefers_coordinator_and_is_deterministic() {
+        let request = DfsReplicaPlacementRequest {
+            file_system_id: file_system_id(),
+            object_id: object_id(),
+            target_version: version("version_2"),
+            coordinator_node_id: node("node_b"),
+            policy: policy(2, 3),
+            candidates: vec![
+                DfsReplicaCandidate::new(node("node_a")),
+                DfsReplicaCandidate::new(node("node_b")),
+                DfsReplicaCandidate::new(node("node_c")),
+                DfsReplicaCandidate::new(node("node_d")),
+            ],
+        };
+
+        let first = plan_replicas(&request).expect("first plan");
+        let second = plan_replicas(&request).expect("second plan");
+
+        assert_eq!(first, second);
+        assert_eq!(first.desired_replica_nodes.len(), 3);
+        assert_eq!(first.desired_replica_nodes[0], node("node_b"));
+        assert_eq!(first.preferred_commit_nodes.len(), 2);
+        assert!(
+            first
+                .preferred_commit_nodes
+                .iter()
+                .all(|node_id| first.desired_replica_nodes.contains(node_id))
+        );
     }
 
     #[test]
@@ -461,7 +714,7 @@ mod tests {
 
         assert_eq!(updated.state, DfsWriteIntentState::Committed);
         assert_eq!(
-            coordinator.committed_version(&workspace_id(), &object_id()),
+            coordinator.committed_version(&file_system_id(), &object_id()),
             Some(&version("version_2"))
         );
     }
@@ -477,9 +730,26 @@ mod tests {
 
         assert_eq!(updated.state, DfsWriteIntentState::AwaitingReceipts);
         assert_eq!(
-            coordinator.committed_version(&workspace_id(), &object_id()),
+            coordinator.committed_version(&file_system_id(), &object_id()),
             Some(&version("version_1"))
         );
+    }
+
+    #[test]
+    fn duplicate_receipts_are_idempotent() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let intent = create_intent(&mut coordinator, policy(2, 3));
+
+        coordinator
+            .record_durable_receipt(&intent.intent_id, node("node_a"))
+            .expect("first receipt");
+        let updated = coordinator
+            .record_durable_receipt(&intent.intent_id, node("node_a"))
+            .expect("duplicate receipt");
+
+        assert_eq!(updated.state, DfsWriteIntentState::AwaitingReceipts);
+        assert_eq!(coordinator.durable_receipt_count(&intent.intent_id), 1);
+        assert!(coordinator.repair_jobs().is_empty());
     }
 
     #[test]
@@ -498,7 +768,33 @@ mod tests {
             coordinator.repair_jobs(),
             &[DistributedRepairJob {
                 intent_id: intent.intent_id,
-                workspace_id: workspace_id(),
+                file_system_id: file_system_id(),
+                object_id: object_id(),
+                version: version("version_2"),
+                missing_replica_node_id: node("node_c"),
+            }]
+        );
+    }
+
+    #[test]
+    fn repair_receipt_clears_pending_repair_job() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let intent = create_intent(&mut coordinator, policy(1, 3));
+
+        let committed = coordinator
+            .record_durable_receipt(&intent.intent_id, node("node_a"))
+            .expect("threshold receipt");
+        assert_eq!(committed.state, DfsWriteIntentState::Committed);
+        assert_eq!(coordinator.repair_jobs().len(), 2);
+
+        coordinator
+            .record_durable_receipt(&intent.intent_id, node("node_b"))
+            .expect("repair receipt");
+        assert_eq!(
+            coordinator.repair_jobs(),
+            &[DistributedRepairJob {
+                intent_id: intent.intent_id,
+                file_system_id: file_system_id(),
                 object_id: object_id(),
                 version: version("version_2"),
                 missing_replica_node_id: node("node_c"),
@@ -530,19 +826,65 @@ mod tests {
     }
 
     #[test]
+    fn abort_closes_pending_confirmed_intent_without_advancing_version() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let intent = create_intent(&mut coordinator, policy(3, 3));
+
+        coordinator
+            .record_durable_receipt(&intent.intent_id, node("node_a"))
+            .expect("first receipt");
+        let aborted = coordinator
+            .abort_intent(&intent.intent_id)
+            .expect("abort intent");
+
+        assert_eq!(aborted.state, DfsWriteIntentState::Aborted);
+        assert_eq!(
+            coordinator.committed_version(&file_system_id(), &object_id()),
+            Some(&version("version_1"))
+        );
+        assert!(matches!(
+            coordinator.record_durable_receipt(&intent.intent_id, node("node_b")),
+            Err(DfsDistributedError::IntentClosed {
+                state: DfsWriteIntentState::Aborted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn confirmed_intent_can_downgrade_to_eventual_threshold() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let intent = create_intent(&mut coordinator, policy(3, 3));
+
+        coordinator
+            .record_durable_receipt(&intent.intent_id, node("node_a"))
+            .expect("first receipt");
+        let downgraded = coordinator
+            .downgrade_intent_policy(&intent.intent_id, policy(1, 3))
+            .expect("downgrade intent");
+
+        assert_eq!(downgraded.state, DfsWriteIntentState::Committed);
+        assert_eq!(
+            coordinator.committed_version(&file_system_id(), &object_id()),
+            Some(&version("version_2"))
+        );
+        assert_eq!(coordinator.repair_jobs().len(), 2);
+    }
+
+    #[test]
     fn rejects_stale_base_version_when_current_version_is_known() {
         let mut coordinator = DistributedEventualCoordinator::new();
-        let workspace_id = workspace_id();
+        let file_system_id = file_system_id();
         let object_id = object_id();
         coordinator.set_committed_version(
-            workspace_id.clone(),
+            file_system_id.clone(),
             object_id.clone(),
             version("version_2"),
         );
 
         let error = coordinator
             .create_intent(
-                workspace_id,
+                file_system_id,
                 object_id.clone(),
                 Some(version("version_1")),
                 version("version_3"),

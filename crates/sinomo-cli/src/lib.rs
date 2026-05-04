@@ -31,10 +31,14 @@ use sinomo_runtime::core::{
     ClusterBootstrap, ClusterBootstrapState, ClusterEndpointId, ClusterEndpointPrivacy,
     ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterJoinInvite,
     ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterTransportKind, Confidence,
-    EvaluationGate, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind,
-    EvolutionJob, EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId,
-    PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustRing,
-    VerificationCommand,
+    DfsFileSystemId, DfsObjectId, EvaluationGate, EvaluationOutcome, EvaluationScorecard,
+    EventEnvelope, EventId, EventKind, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
+    LatencyClass, MutationPacket, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
+    SessionId, Source, TrustRing, VerificationCommand,
+};
+use sinomo_runtime::dfs::{
+    DfsMetadataShardId, DfsOperatorInspector, DfsPinMode, DfsPinRecord, LocalDfsPinStore,
+    LocalJsonMetadataBackend,
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
@@ -78,6 +82,7 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
         CliCommand::Evolve(command) => run_evolve_cli_command(command),
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
+        CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
         CliCommand::Usage(options) => usage(options),
@@ -105,6 +110,7 @@ enum CliCommand {
     Evolve(EvolveCliCommand),
     Daemon(DaemonCliCommand),
     Rollout(RolloutCliCommand),
+    Dfs(DfsCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
     Usage(UsageOptions),
@@ -128,6 +134,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
         Some((command, rest)) if command == "rollout" => {
             Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
         }
+        Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
         Some((command, rest)) if matches!(command.as_str(), "models" | "model") => Ok(
             CliCommand::Models(parse_models_command(rest, ModelDefaultRepoMode::Reject)?),
         ),
@@ -3406,6 +3413,630 @@ fn evolve_job(args: &[String]) -> Result<(), CliError> {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum DfsCliCommand {
+    Help,
+    Status(DfsCommonOptions),
+    FileSystem {
+        file_system_id: DfsFileSystemId,
+        options: DfsCommonOptions,
+    },
+    Object {
+        object_id: DfsObjectId,
+        options: DfsCommonOptions,
+    },
+    Conflicts(DfsFilterOptions),
+    Repair(DfsFilterOptions),
+    Pin(DfsPinCliCommand),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+struct DfsCommonOptions {
+    metadata_root: Option<PathBuf>,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+struct DfsFilterOptions {
+    common: DfsCommonOptions,
+    file_system_id: Option<DfsFileSystemId>,
+    object_id: Option<DfsObjectId>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum DfsPinCliCommand {
+    List(DfsPinListOptions),
+    Add(DfsPinAddOptions),
+    Remove(DfsPinRemoveOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+struct DfsPinListOptions {
+    pin_root: Option<PathBuf>,
+    file_system_id: Option<DfsFileSystemId>,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DfsPinAddOptions {
+    pin_root: Option<PathBuf>,
+    file_system_id: DfsFileSystemId,
+    path: String,
+    object_id: Option<DfsObjectId>,
+    node_id: Option<NodeId>,
+    mode: DfsPinMode,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DfsPinRemoveOptions {
+    pin_root: Option<PathBuf>,
+    file_system_id: DfsFileSystemId,
+    path: String,
+    node_id: Option<NodeId>,
+    json: bool,
+}
+
+fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(DfsCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(DfsCliCommand::Help)
+        }
+        Some((command, rest)) if command == "status" => {
+            Ok(DfsCliCommand::Status(parse_dfs_common_options(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "filesystem" | "fs") => {
+            let (id, rest) = rest.split_first().ok_or(CliError::Usage)?;
+            Ok(DfsCliCommand::FileSystem {
+                file_system_id: parse_dfs_file_system_id(id)?,
+                options: parse_dfs_common_options(rest)?,
+            })
+        }
+        Some((command, rest)) if command == "object" => {
+            let (id, rest) = rest.split_first().ok_or(CliError::Usage)?;
+            Ok(DfsCliCommand::Object {
+                object_id: parse_dfs_object_id(id)?,
+                options: parse_dfs_common_options(rest)?,
+            })
+        }
+        Some((command, rest)) if command == "conflicts" => {
+            Ok(DfsCliCommand::Conflicts(parse_dfs_filter_options(rest)?))
+        }
+        Some((command, rest)) if command == "repair" => {
+            Ok(DfsCliCommand::Repair(parse_dfs_filter_options(rest)?))
+        }
+        Some((command, rest)) if command == "pin" => {
+            Ok(DfsCliCommand::Pin(parse_dfs_pin_command(rest)?))
+        }
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_dfs_common_options(args: &[String]) -> Result<DfsCommonOptions, CliError> {
+    let mut options = DfsCommonOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--metadata-root" => {
+                index += 1;
+                let Some(path) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.metadata_root = Some(PathBuf::from(path));
+            }
+            "--json" => options.json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_dfs_filter_options(args: &[String]) -> Result<DfsFilterOptions, CliError> {
+    let mut options = DfsFilterOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--metadata-root" => {
+                index += 1;
+                let Some(path) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.common.metadata_root = Some(PathBuf::from(path));
+            }
+            "--filesystem" | "--fs" => {
+                index += 1;
+                let Some(file_system_id) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.file_system_id = Some(parse_dfs_file_system_id(file_system_id)?);
+            }
+            "--object" => {
+                index += 1;
+                let Some(object_id) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.object_id = Some(parse_dfs_object_id(object_id)?);
+            }
+            "--json" => options.common.json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_dfs_pin_command(args: &[String]) -> Result<DfsPinCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "list" => {
+            Ok(DfsPinCliCommand::List(parse_dfs_pin_list_options(rest)?))
+        }
+        Some((command, rest)) if command == "add" => {
+            Ok(DfsPinCliCommand::Add(parse_dfs_pin_add_options(rest)?))
+        }
+        Some((command, rest)) if command == "remove" => Ok(DfsPinCliCommand::Remove(
+            parse_dfs_pin_remove_options(rest)?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_dfs_pin_list_options(args: &[String]) -> Result<DfsPinListOptions, CliError> {
+    let mut options = DfsPinListOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pin-root" => {
+                index += 1;
+                let Some(path) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.pin_root = Some(PathBuf::from(path));
+            }
+            "--filesystem" | "--fs" => {
+                index += 1;
+                let Some(file_system_id) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.file_system_id = Some(parse_dfs_file_system_id(file_system_id)?);
+            }
+            "--json" => options.json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_dfs_pin_add_options(args: &[String]) -> Result<DfsPinAddOptions, CliError> {
+    let mut pin_root = None;
+    let mut file_system_id = None;
+    let mut path = None;
+    let mut object_id = None;
+    let mut node_id = None;
+    let mut mode = DfsPinMode::Content;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pin-root" => {
+                index += 1;
+                pin_root = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
+            }
+            "--filesystem" | "--fs" => {
+                index += 1;
+                file_system_id = Some(parse_dfs_file_system_id(
+                    args.get(index).ok_or(CliError::Usage)?,
+                )?);
+            }
+            "--path" => {
+                index += 1;
+                path = Some(non_empty_string(
+                    args.get(index).ok_or(CliError::Usage)?,
+                    "path",
+                )?);
+            }
+            "--object" => {
+                index += 1;
+                object_id = Some(parse_dfs_object_id(
+                    args.get(index).ok_or(CliError::Usage)?,
+                )?);
+            }
+            "--node" => {
+                index += 1;
+                node_id = Some(parse_node_id(args.get(index).ok_or(CliError::Usage)?)?);
+            }
+            "--mode" => {
+                index += 1;
+                mode = parse_dfs_pin_mode(args.get(index).ok_or(CliError::Usage)?)?;
+            }
+            "--json" => json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(DfsPinAddOptions {
+        pin_root,
+        file_system_id: file_system_id.unwrap_or_else(default_dfs_file_system_id),
+        path: path.ok_or(CliError::Usage)?,
+        object_id,
+        node_id,
+        mode,
+        json,
+    })
+}
+
+fn parse_dfs_pin_remove_options(args: &[String]) -> Result<DfsPinRemoveOptions, CliError> {
+    let mut pin_root = None;
+    let mut file_system_id = None;
+    let mut path = None;
+    let mut node_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pin-root" => {
+                index += 1;
+                pin_root = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
+            }
+            "--filesystem" | "--fs" => {
+                index += 1;
+                file_system_id = Some(parse_dfs_file_system_id(
+                    args.get(index).ok_or(CliError::Usage)?,
+                )?);
+            }
+            "--path" => {
+                index += 1;
+                path = Some(non_empty_string(
+                    args.get(index).ok_or(CliError::Usage)?,
+                    "path",
+                )?);
+            }
+            "--node" => {
+                index += 1;
+                node_id = Some(parse_node_id(args.get(index).ok_or(CliError::Usage)?)?);
+            }
+            "--json" => json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(DfsPinRemoveOptions {
+        pin_root,
+        file_system_id: file_system_id.unwrap_or_else(default_dfs_file_system_id),
+        path: path.ok_or(CliError::Usage)?,
+        node_id,
+        json,
+    })
+}
+
+fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError> {
+    match command {
+        DfsCliCommand::Help => {
+            print_dfs_help();
+            Ok(())
+        }
+        DfsCliCommand::Status(options) => {
+            let backend = open_dfs_metadata_backend(&options)?;
+            let status = DfsOperatorInspector::new(&backend).status()?;
+            if options.json {
+                print_json("<dfs-status>", &status)?;
+            } else {
+                println!("DFS status:");
+                println!("  filesystems: {}", status.file_system_count);
+                println!("  objects: {}", status.object_count);
+                println!("  versions: {}", status.version_count);
+                println!("  receipts: {}", status.receipt_count);
+                println!("  intents: {}", status.intent_count);
+                println!("  pending writes: {}", status.pending_write_count);
+                println!("  pending repairs: {}", status.pending_repair_count);
+                println!("  open conflicts: {}", status.open_conflict_count);
+            }
+            Ok(())
+        }
+        DfsCliCommand::FileSystem {
+            file_system_id,
+            options,
+        } => {
+            let backend = open_dfs_metadata_backend(&options)?;
+            let inspector = DfsOperatorInspector::new(&backend);
+            let Some(file_system) = inspector.file_system(&file_system_id)? else {
+                return Err(CliError::MissingArtifact {
+                    artifact: format!("DFS filesystem {file_system_id}"),
+                });
+            };
+            if options.json {
+                print_json("<dfs-filesystem>", &file_system)?;
+            } else {
+                println!("DFS filesystem: {}", file_system.file_system.file_system_id);
+                println!("  name: {}", file_system.file_system.display_name);
+                println!("  owner: {}", file_system.file_system.owner_node_id);
+                println!(
+                    "  subtree policies: {}",
+                    file_system.file_system.subtree_policies.len()
+                );
+                println!("  objects: {}", file_system.object_count);
+                println!("  pending repairs: {}", file_system.pending_repair_count);
+                println!("  open conflicts: {}", file_system.open_conflict_count);
+            }
+            Ok(())
+        }
+        DfsCliCommand::Object { object_id, options } => {
+            let backend = open_dfs_metadata_backend(&options)?;
+            let inspector = DfsOperatorInspector::new(&backend);
+            let Some(object) = inspector.object(&object_id)? else {
+                return Err(CliError::MissingArtifact {
+                    artifact: format!("DFS object {object_id}"),
+                });
+            };
+            if options.json {
+                print_json("<dfs-object>", &object)?;
+            } else {
+                println!("DFS object: {}", object.object.object_id);
+                println!("  filesystem: {}", object.object.file_system_id);
+                println!("  path: {}", object.object.path);
+                println!("  owner: {}", object.object.owner_node_id);
+                println!("  policy: {:?}", object.object.policy);
+                println!("  visible version: {}", object.object.version);
+                println!(
+                    "  content hash: {}",
+                    option_label(&object.object.content_hash)
+                );
+                println!(
+                    "  locations: {}",
+                    join_labels(&object.object.current_locations)
+                );
+                println!("  agent state: {:?}", object.agent_state);
+                println!("  versions: {}", object.versions.len());
+                println!("  receipts: {}", object.receipts.len());
+                println!("  intents: {}", object.intents.len());
+                println!("  pending repairs: {}", object.repairs.len());
+                println!(
+                    "  open conflicts: {}",
+                    object
+                        .conflicts
+                        .iter()
+                        .filter(|conflict| conflict.status
+                            == sinomo_runtime::dfs::DfsConflictStatus::Open)
+                        .count()
+                );
+            }
+            Ok(())
+        }
+        DfsCliCommand::Conflicts(options) => {
+            let backend = open_dfs_metadata_backend(&options.common)?;
+            let conflicts = DfsOperatorInspector::new(&backend)
+                .conflicts(options.file_system_id.as_ref(), options.object_id.as_ref())?;
+            if options.common.json {
+                print_json("<dfs-conflicts>", &conflicts)?;
+            } else if conflicts.is_empty() {
+                println!("No DFS conflicts.");
+            } else {
+                for conflict in conflicts {
+                    println!(
+                        "{} object={} local={} remote={} status={:?} reason={}",
+                        conflict.conflict_id,
+                        conflict.object_id,
+                        conflict.local_version,
+                        conflict.remote_version,
+                        conflict.status,
+                        conflict.reason
+                    );
+                }
+            }
+            Ok(())
+        }
+        DfsCliCommand::Repair(options) => {
+            let backend = open_dfs_metadata_backend(&options.common)?;
+            let repairs = DfsOperatorInspector::new(&backend)
+                .repairs(options.file_system_id.as_ref(), options.object_id.as_ref())?;
+            if options.common.json {
+                print_json("<dfs-repair>", &repairs)?;
+            } else if repairs.is_empty() {
+                println!("No DFS repairs are pending.");
+            } else {
+                for repair in repairs {
+                    println!(
+                        "{} object={} version={} missing={} hash={}",
+                        repair.intent_id,
+                        repair.object_id,
+                        repair.version,
+                        repair.missing_replica_node_id,
+                        option_label(&repair.content_hash)
+                    );
+                }
+            }
+            Ok(())
+        }
+        DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
+    }
+}
+
+fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliError> {
+    match command {
+        DfsPinCliCommand::List(options) => {
+            let store = LocalDfsPinStore::new(dfs_pin_root(options.pin_root)?);
+            let pins = store.list_pins(options.file_system_id.as_ref())?;
+            if options.json {
+                print_json("<dfs-pins>", &pins)?;
+            } else if pins.is_empty() {
+                println!("No DFS pins.");
+            } else {
+                for pin in pins {
+                    println!(
+                        "{} path={} node={} mode={:?} object={}",
+                        pin.file_system_id,
+                        pin.path,
+                        pin.pinned_by_node_id,
+                        pin.mode,
+                        pin.object_id
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                }
+            }
+            Ok(())
+        }
+        DfsPinCliCommand::Add(options) => {
+            let store = LocalDfsPinStore::new(dfs_pin_root(options.pin_root)?);
+            let node_id = options.node_id.unwrap_or_else(default_dfs_node_id);
+            let record = DfsPinRecord {
+                file_system_id: options.file_system_id,
+                path: options.path,
+                object_id: options.object_id,
+                pinned_by_node_id: node_id,
+                mode: options.mode,
+                created_at: OffsetDateTime::now_utc(),
+            };
+            store.put_pin(&record)?;
+            if options.json {
+                print_json("<dfs-pin>", &record)?;
+            } else {
+                println!(
+                    "pinned {} path={} node={} mode={:?}",
+                    record.file_system_id, record.path, record.pinned_by_node_id, record.mode
+                );
+            }
+            Ok(())
+        }
+        DfsPinCliCommand::Remove(options) => {
+            let store = LocalDfsPinStore::new(dfs_pin_root(options.pin_root)?);
+            let removed = store.remove_pin(
+                &options.file_system_id,
+                &options.path,
+                options.node_id.as_ref(),
+            )?;
+            if options.json {
+                print_json(
+                    "<dfs-pin-remove>",
+                    &serde_json::json!({
+                        "file_system_id": options.file_system_id,
+                        "path": options.path,
+                        "removed": removed,
+                    }),
+                )?;
+            } else if removed {
+                println!(
+                    "removed pin for {} path={}",
+                    options.file_system_id, options.path
+                );
+            } else {
+                println!(
+                    "no matching pin for {} path={}",
+                    options.file_system_id, options.path
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn open_dfs_metadata_backend(
+    options: &DfsCommonOptions,
+) -> Result<LocalJsonMetadataBackend, CliError> {
+    LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        dfs_metadata_root(options.metadata_root.clone())?,
+    )
+    .map_err(CliError::from)
+}
+
+fn dfs_metadata_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    Ok(data_dir.dfs_dir().join("metadata").join("root"))
+}
+
+fn dfs_pin_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    Ok(data_dir.dfs_dir().join("pins"))
+}
+
+fn parse_dfs_file_system_id(value: &str) -> Result<DfsFileSystemId, CliError> {
+    DfsFileSystemId::new(value).map_err(|source| CliError::Parse {
+        detail: format!("invalid DFS filesystem id `{value}`: {source}"),
+    })
+}
+
+fn default_dfs_file_system_id() -> DfsFileSystemId {
+    DfsFileSystemId::new("sifs").expect("valid default DFS filesystem id")
+}
+
+fn parse_dfs_object_id(value: &str) -> Result<DfsObjectId, CliError> {
+    DfsObjectId::new(value).map_err(|source| CliError::Parse {
+        detail: format!("invalid DFS object id `{value}`: {source}"),
+    })
+}
+
+fn parse_node_id(value: &str) -> Result<NodeId, CliError> {
+    NodeId::new(value).map_err(|source| CliError::Parse {
+        detail: format!("invalid node id `{value}`: {source}"),
+    })
+}
+
+fn parse_dfs_pin_mode(value: &str) -> Result<DfsPinMode, CliError> {
+    match value {
+        "metadata" => Ok(DfsPinMode::Metadata),
+        "content" => Ok(DfsPinMode::Content),
+        _ => Err(CliError::Parse {
+            detail: format!("invalid DFS pin mode `{value}`"),
+        }),
+    }
+}
+
+fn default_dfs_node_id() -> NodeId {
+    cluster_paths_from_defaults()
+        .and_then(|paths| read_cluster_state(&paths))
+        .map(|state| state.local_node_id)
+        .unwrap_or_else(|_| NodeId::new("node_local").expect("valid fallback node id"))
+}
+
+fn non_empty_string(value: &str, field: &str) -> Result<String, CliError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::Parse {
+            detail: format!("{field} cannot be empty"),
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+fn print_json<T: Serialize>(label: &str, value: &T) -> Result<(), CliError> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|source| CliError::Json {
+            path: label.to_string(),
+            detail: source.to_string(),
+        })?
+    );
+    Ok(())
+}
+
+fn option_label(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "-".to_string())
+}
+
+fn join_labels<T: ToString>(values: &[T]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelDefaultOptions {
     provider: String,
@@ -6282,6 +6913,7 @@ pub fn print_usage() {
     println!("  sinomo cluster");
     println!("  sinomo daemon");
     println!("  sinomo rollout");
+    println!("  sinomo dfs");
     println!("  sinomo models");
     println!("  sinomo usage");
     println!("  sinomo providers");
@@ -6366,6 +6998,33 @@ fn print_rollout_help() {
     );
     println!("  sinomo rollout status");
     println!("      Show source, binary, and rollout state paths.");
+}
+
+fn print_dfs_help() {
+    println!("DFS:");
+    println!("  sinomo dfs");
+    println!("      Show DFS commands.");
+    println!("  sinomo dfs status [--metadata-root <path>] [--json]");
+    println!("      Summarize local shard metadata, writes, repairs, and conflicts.");
+    println!("  sinomo dfs filesystem <file_system_id> [--metadata-root <path>] [--json]");
+    println!("      Inspect one filesystem.");
+    println!("  sinomo dfs object <object_id> [--metadata-root <path>] [--json]");
+    println!("      Inspect one object with versions, receipts, intents, conflicts, and repairs.");
+    println!(
+        "  sinomo dfs conflicts [--filesystem <file_system_id>] [--object <object_id>] [--metadata-root <path>] [--json]"
+    );
+    println!("      List conflict records.");
+    println!(
+        "  sinomo dfs repair [--filesystem <file_system_id>] [--object <object_id>] [--metadata-root <path>] [--json]"
+    );
+    println!("      List inferred missing replica repairs.");
+    println!("  sinomo dfs pin list [--filesystem <file_system_id>] [--pin-root <path>] [--json]");
+    println!(
+        "  sinomo dfs pin add --path <path> [--filesystem <file_system_id>] [--object <object_id>] [--node <node_id>] [--mode metadata|content] [--pin-root <path>] [--json]"
+    );
+    println!(
+        "  sinomo dfs pin remove --path <path> [--filesystem <file_system_id>] [--node <node_id>] [--pin-root <path>] [--json]"
+    );
 }
 
 fn print_models_help() {
@@ -6496,6 +7155,8 @@ pub enum CliError {
     },
     LocalData(sinomo_runtime::local::LocalDataError),
     EventStore(sinomo_runtime::events::EventStoreError),
+    DfsMetadata(sinomo_runtime::dfs::MetadataBackendError),
+    DfsPin(sinomo_runtime::dfs::DfsPinStoreError),
     LanguageModel(LanguageModelError),
     Evolution(sinomo_evolution::EvolutionError),
     Eval(sinomo_runtime::eval::EvalError),
@@ -6535,6 +7196,18 @@ impl From<sinomo_runtime::local::LocalDataError> for CliError {
 impl From<sinomo_runtime::events::EventStoreError> for CliError {
     fn from(error: sinomo_runtime::events::EventStoreError) -> Self {
         Self::EventStore(error)
+    }
+}
+
+impl From<sinomo_runtime::dfs::MetadataBackendError> for CliError {
+    fn from(error: sinomo_runtime::dfs::MetadataBackendError) -> Self {
+        Self::DfsMetadata(error)
+    }
+}
+
+impl From<sinomo_runtime::dfs::DfsPinStoreError> for CliError {
+    fn from(error: sinomo_runtime::dfs::DfsPinStoreError) -> Self {
+        Self::DfsPin(error)
     }
 }
 
@@ -6591,6 +7264,8 @@ impl std::fmt::Display for CliError {
             Self::Json { path, detail } => write!(formatter, "json error at {path}: {detail}"),
             Self::LocalData(error) => write!(formatter, "{error}"),
             Self::EventStore(error) => write!(formatter, "{error}"),
+            Self::DfsMetadata(error) => write!(formatter, "{error}"),
+            Self::DfsPin(error) => write!(formatter, "{error}"),
             Self::LanguageModel(error) => write!(formatter, "{error}"),
             Self::Evolution(error) => write!(formatter, "{error}"),
             Self::Eval(error) => write!(formatter, "{error}"),
@@ -6624,17 +7299,17 @@ impl std::error::Error for CliError {}
 mod tests {
     use super::{
         CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterJoinOptions,
-        ClusterPaths, DaemonCliCommand, DaemonProbeStatus, DaemonRunOptions, EvolutionJobStatus,
-        EvolutionPaths, InteractionModel, InteractionRuntime, InteractionSession,
-        InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
-        ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand, ProviderName,
-        RolloutCliCommand, RolloutOptions, cli_command_requires_cluster_state,
-        cluster_init_with_paths, cluster_join_with_paths, is_terminal_status,
-        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-        parse_cluster_command, parse_daemon_command, parse_model_default_options,
-        parse_models_list_options, parse_propose_options, parse_provider_command,
-        parse_rollout_command, parse_slash_command, parse_usage_options, read_cluster_state,
-        run_cui_with_handler_io, run_evolve_command,
+        ClusterPaths, DaemonCliCommand, DaemonProbeStatus, DaemonRunOptions, DfsCliCommand,
+        DfsCommonOptions, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths,
+        InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
+        InteractionSurfaceKind, ModelBackedInteractionHandler, ModelDefaultRepoMode,
+        ModelsCliCommand, ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutOptions,
+        cli_command_requires_cluster_state, cluster_init_with_paths, cluster_join_with_paths,
+        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
+        parse_cli_command, parse_cluster_command, parse_daemon_command, parse_dfs_command,
+        parse_model_default_options, parse_models_list_options, parse_propose_options,
+        parse_provider_command, parse_rollout_command, parse_slash_command, parse_usage_options,
+        read_cluster_state, run_cui_with_handler_io, run_evolve_command,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -6737,6 +7412,10 @@ mod tests {
             CliCommand::Rollout(RolloutCliCommand::Status)
         ));
         assert!(matches!(
+            parse_cli_command(&["dfs".to_string(), "status".to_string()]).expect("dfs"),
+            CliCommand::Dfs(DfsCliCommand::Status(_))
+        ));
+        assert!(matches!(
             parse_cli_command(&["evolve".to_string()]).expect("evolve help"),
             CliCommand::Evolve(super::EvolveCliCommand::Help)
         ));
@@ -6756,9 +7435,63 @@ mod tests {
         assert!(!cli_command_requires_cluster_state(&CliCommand::Cluster(
             ClusterCliCommand::Status
         )));
+        assert!(!cli_command_requires_cluster_state(&CliCommand::Dfs(
+            DfsCliCommand::Help
+        )));
         assert!(cli_command_requires_cluster_state(&CliCommand::Models(
             ModelsCliCommand::Help
         )));
+    }
+
+    #[test]
+    fn dfs_parser_accepts_operator_and_pin_commands() {
+        let metadata_root = std::env::temp_dir().join("sinomo-cli-dfs-meta");
+        assert_eq!(
+            parse_dfs_command(&[
+                "status".to_string(),
+                "--metadata-root".to_string(),
+                metadata_root.display().to_string(),
+                "--json".to_string(),
+            ])
+            .expect("dfs status"),
+            DfsCliCommand::Status(DfsCommonOptions {
+                metadata_root: Some(metadata_root.clone()),
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse_dfs_command(&[
+                "conflicts".to_string(),
+                "--filesystem".to_string(),
+                "sifs".to_string(),
+                "--object".to_string(),
+                "obj_artifact".to_string(),
+            ])
+            .expect("dfs conflicts"),
+            DfsCliCommand::Conflicts(DfsFilterOptions {
+                common: DfsCommonOptions::default(),
+                file_system_id: Some(
+                    sinomo_runtime::core::DfsFileSystemId::new("sifs").expect("filesystem")
+                ),
+                object_id: Some(
+                    sinomo_runtime::core::DfsObjectId::new("obj_artifact").expect("object")
+                ),
+            })
+        );
+        assert!(matches!(
+            parse_dfs_command(&[
+                "pin".to_string(),
+                "add".to_string(),
+                "--path".to_string(),
+                "src/lib.rs".to_string(),
+                "--mode".to_string(),
+                "metadata".to_string(),
+            ])
+            .expect("dfs pin add"),
+            DfsCliCommand::Pin(DfsPinCliCommand::Add(options))
+                if options.mode == sinomo_runtime::dfs::DfsPinMode::Metadata
+                    && options.path == "src/lib.rs"
+        ));
     }
 
     #[test]

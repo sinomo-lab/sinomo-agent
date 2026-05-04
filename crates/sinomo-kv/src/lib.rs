@@ -709,6 +709,51 @@ impl InProcessRaftKvCluster {
         Ok(committed_revision)
     }
 
+    pub fn txn_response(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        if !self.online.contains(&self.leader_id) {
+            return Err(KvError::LeaderOffline {
+                leader_id: self.leader_id.clone(),
+            });
+        }
+        let online_voters = self.voters.intersection(&self.online).count();
+        if online_voters < self.quorum_size() {
+            return Err(KvError::QuorumUnavailable {
+                online_voters,
+                quorum: self.quorum_size(),
+            });
+        }
+
+        let index = self.next_log_index;
+        self.next_log_index += 1;
+        let mut leader_response = None;
+        for node_id in self
+            .voters
+            .intersection(&self.online)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let node = self
+                .nodes
+                .get_mut(&node_id)
+                .ok_or_else(|| KvError::UnknownNode {
+                    node_id: node_id.clone(),
+                })?;
+            let response = node.store.txn(txn.clone())?;
+            if node_id == self.leader_id {
+                leader_response = Some(response.clone());
+            }
+            node.log.push(KvLogEntry {
+                index,
+                term: self.term,
+                command: KvCommand::Txn(txn.clone()),
+                revision: response.revision,
+            });
+        }
+        leader_response.ok_or_else(|| KvError::UnknownNode {
+            node_id: self.leader_id.clone(),
+        })
+    }
+
     pub fn put(&mut self, key: impl Into<String>, value: Vec<u8>) -> Result<KvRevision, KvError> {
         self.apply_as_leader(KvCommand::Op(KvOp::Put {
             key: key.into(),
@@ -718,7 +763,7 @@ impl InProcessRaftKvCluster {
     }
 
     pub fn txn(&mut self, txn: KvTxn) -> Result<KvRevision, KvError> {
-        self.apply_as_leader(KvCommand::Txn(txn))
+        self.txn_response(txn).map(|response| response.revision)
     }
 
     pub fn put_cluster_member(

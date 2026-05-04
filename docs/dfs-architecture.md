@@ -2,8 +2,11 @@
 
 ## Purpose
 
-Sinomo DFS is a local-first distributed workspace layer for agent workspaces,
-artifacts, evidence bundles, task staging, and cross-device handoff.
+Sinomo DFS is a local-first distributed object and metadata layer for agent
+artifacts, evidence bundles, task staging, and cross-device handoff. It exposes
+a default virtual filesystem named `sifs` (Sinomo File System), but it does not
+own higher-level layout concepts such as evolution workspaces. Layout is built
+above DFS by applying policies to SIFS subtrees.
 
 The design borrows the useful shape of Ceph:
 
@@ -23,19 +26,22 @@ fleet-scale throughput.
 - Replacing the host filesystem.
 - Replacing Git for source history and merge review.
 - Storing large file bytes in the cluster KV.
+- Storing per-file, per-directory-entry, object-version, or replica-receipt
+  metadata in the cluster KV.
 - Public federation between unrelated users.
 - Strong multi-writer POSIX semantics across unreliable mobile links.
 - Requiring phones or laptops to stay online for quorum.
 
-The DFS should make distributed workspaces reliable and inspectable without
+The DFS should make distributed SIFS objects reliable and inspectable without
 pretending every device is always available.
 
 ## Existing Baseline
 
 The current repository already has the first useful slice:
 
-- `sinomo-dfs` defines workspaces, mounts, object metadata, policies, read/write
-  routing, network messages, policy violation events, and a local-owned service.
+- `sinomo-dfs` defines the default `sifs` filesystem, subtree policies, object
+  metadata, read/write routing, network messages, policy violation events, and
+  a local-owned service.
 - `sinomo-kv` provides the in-process etcd-like control-plane surface:
   revisions, transactions, leases, watches, snapshots, and a Raft-style test
   harness.
@@ -45,8 +51,8 @@ The current repository already has the first useful slice:
 - `sinomo-supervision` already indexes `dfs.*` events for audit views.
 
 The next implementation should evolve the DFS crate from an in-memory
-local-owned skeleton into a KV-backed metadata service plus a durable local
-content store.
+local-owned skeleton into a sharded DFS metadata service, a durable local
+content store, and a small KV-backed control plane for configuration.
 
 ## First Version Scope
 
@@ -91,47 +97,77 @@ Ceph term mapping for Sinomo:
 
 Sinomo should not copy Ceph's placement group complexity at first. A small
 cluster can compute object placement directly from object metadata, node
-capabilities, node health, and workspace policy.
+capabilities, node health, and inherited subtree policy.
 
 ## Recommended Distributed Algorithm
 
 Use a hybrid algorithm:
 
-1. Raft-backed KV for metadata authority.
-2. Owner/coordinator protocols for object writes.
-3. Deterministic policy placement for replicas and read caches.
-4. Content-addressed immutable blobs with BLAKE3 hashes.
-5. Watch-driven cache invalidation for metadata.
-6. Anti-entropy repair after reconnect.
+1. Raft-backed KV only for compact control-plane configuration.
+2. Sharded DFS metadata service for namespace, version, and receipt records.
+3. Owner/coordinator protocols for object writes.
+4. Deterministic policy placement for replicas and read caches.
+5. Content-addressed immutable blobs with BLAKE3 hashes.
+6. Journal-driven metadata catch-up and anti-entropy repair after reconnect.
 
-This is intentionally not a fully symmetric peer-to-peer filesystem. Mutable
-truth lives in a small, understandable control plane. Bytes can move
-peer-to-peer, but metadata, ownership, visible versions, receipts, and conflicts
-are resolved through KV transactions.
+This is intentionally not a fully symmetric peer-to-peer filesystem. Cluster
+configuration lives in a small, understandable KV control plane. Bytes can move
+peer-to-peer. High-cardinality file metadata lives in sharded metadata stores
+that are replicated only to the nodes responsible for those shards.
 
-### Metadata Consensus
+### Control Plane
 
-DFS metadata uses the existing `sinomo-kv` Raft-style control plane.
+DFS uses the existing `sinomo-kv` Raft-style control plane for small, duplicated
+configuration only. The DFS service talks to it through a small control-plane KV
+client interface so production can bind the same code to the networked KV
+service and tests can use the deterministic Raft harness.
 
 Properties:
 
-- workspace, path, object, version, intent, receipt, and conflict records are KV
-  keys,
-- every visible metadata mutation has a monotonic KV revision,
-- writers use compare-and-swap transactions against the expected object version,
-- readers may use a local watch cache but can fall back to a linearizable KV read
-  for decisions that need current truth,
+- filesystem config, metadata shard placement, policy defaults, service
+  discovery, and owner/primary epochs are KV keys,
+- KV data must remain small enough to duplicate across all control-plane voters,
+- file paths, dentries, inodes, object versions, chunk manifests, write intents,
+  replica receipts, and conflict records are not stored in KV,
 - phones and roaming devices should normally be learners or non-voting data
   nodes, not quorum voters.
 
-Recommendation: keep all mutable namespace and version decisions in KV, even
-when object content transfer happens directly between nodes.
+Recommendation: keep only cluster-wide routing and placement decisions in KV.
+Namespace and version decisions belong to DFS metadata shards.
+
+### Metadata Plane
+
+The metadata plane is a CephFS-MDS-like service with Sinomo local-first
+adjustments:
+
+- metadata is partitioned into SIFS metadata shards,
+- shard ownership and replica sets are configured by the KV control plane,
+- each shard stores records in a local ordered store, not global KV,
+- each shard has an append-only journal for mutation replication and replay,
+- large directories split into directory fragments by filename hash,
+- shard replicas subscribe to journal entries and compact snapshots,
+- roaming devices can hold read caches or learner replicas without becoming
+  quorum voters.
+
+The baseline metadata key model should be:
+
+```text
+inode/{inode_id}
+dirfrag/{dir_inode}/{frag_id}/dentry/{name_hash}/{name}
+version/{object_id}/{version}
+receipt/{object_id}/{version}/{replica_node_id}
+conflict/{file_system_id}/{conflict_id}
+journal/{shard_id}/{sequence}
+```
+
+This gives the system room for millions of files in one build tree without
+putting millions of keys into a cluster-wide KV replicated to every node.
 
 ### Object Write Algorithm
 
 Mutable objects use a single logical coordinator per write. For `local-owned`,
 the coordinator is the owner node. For replicated policies, the coordinator is
-usually the owner node at first and can later become an elected workspace
+usually the owner node at first and can later become an elected metadata-shard
 coordinator if needed.
 
 Algorithm:
@@ -141,12 +177,12 @@ Algorithm:
 3. Writer stages content locally and computes a BLAKE3 content hash.
 4. Coordinator checks policy, object epoch, and expected base version.
 5. Content is committed locally or replicated according to policy.
-6. Required replica receipts are recorded in KV.
-7. A single KV compare-and-swap advances the visible version.
-8. Metadata watchers notify caches and session participants.
+6. Required replica receipts are recorded in the metadata shard journal/store.
+7. A shard-local compare-and-append advances the visible version.
+8. Metadata subscribers notify caches and session participants.
 
-This gives linearizable visible-version changes without forcing all bytes
-through the consensus log.
+This gives serialized visible-version changes within the responsible metadata
+shard without forcing file metadata or bytes through the cluster KV.
 
 ### Distributed Eventual Object Algorithm
 
@@ -157,8 +193,9 @@ The concrete first-version algorithm is:
 Threshold Primary-Copy Object Replication with Anti-Entropy Repair
 ```
 
-The primary/coordinator serializes visible versions through KV. Replica
-convergence is asynchronous after the commit threshold is met.
+The primary/coordinator serializes visible versions through the responsible
+metadata shard. Replica convergence is asynchronous after the commit threshold
+is met.
 
 Definitions:
 
@@ -176,8 +213,8 @@ Commit protocol:
 3. Writer stages content locally.
 4. Coordinator sends `StageBlob` to selected replicas until at least `W`
    eligible nodes have durable receipts.
-5. Coordinator advances the visible version with one KV transaction comparing
-   base version, intent state, epoch, and the required receipt set.
+5. Coordinator advances the visible version with one metadata-shard transaction
+   comparing base version, intent state, epoch, and the required receipt set.
 6. Replication jobs continue asynchronously until all `N` desired replicas have
    the committed version.
 7. Reads prefer the nearest current replica, may fall back to the coordinator or
@@ -185,17 +222,17 @@ Commit protocol:
 
 Convergence guarantee:
 
-- If the KV control plane has quorum, at least one current committed replica
-  remains reachable over time, and eligible replica nodes eventually reconnect,
-  then anti-entropy repair eventually brings every desired replica to the current
-  committed version.
+- If the metadata shard has a live primary or can elect/fence a new primary, at
+  least one current committed replica remains reachable over time, and eligible
+  replica nodes eventually reconnect, then anti-entropy repair eventually brings
+  every desired replica to the current committed version.
 - If concurrent disconnected writes happen, convergence is to explicit conflict
   records, not silent overwrite.
 
 This is "eventual consistency" for content placement and cache convergence. The
-visible object version is still serialized by KV when the cluster has quorum.
-That boundary keeps the system understandable: replicas may lag, but the
-authoritative current version does not fork silently.
+visible object version is still serialized by the metadata shard. That boundary
+keeps the system understandable: replicas may lag, but the authoritative current
+version does not fork silently.
 
 Intent states:
 
@@ -241,10 +278,10 @@ Commit operation:
 txn(
   compare: commit predicate,
   success:
-    put /dfs/versions/<object_id>/<target_version>
-    put /dfs/objects/<workspace_id>/<object_id>.visible_version = target_version
-    put /dfs/intents/...state = committed
-    put /dfs/replication-jobs/... for missing desired replicas
+    append journal entry for version/<object_id>/<target_version>
+    update object/<object_id>.visible_version = target_version
+    update intent/<object_id>/<intent_id>.state = committed
+    append replication-job entries for missing desired replicas
   failure:
     leave intent pending or create conflict according to policy
 )
@@ -290,7 +327,7 @@ For each candidate node, compute a score from:
 - storage capability,
 - battery and bandwidth hints,
 - trust domain and privacy eligibility,
-- stable hash of `(workspace_id, object_id, version, node_id)`.
+- stable hash of `(file_system_id, object_id, version, node_id)`.
 
 Then select:
 
@@ -306,7 +343,7 @@ caches.
 
 ### Read Cache Algorithm
 
-The default coding-workspace policy should be `local-owned` plus automatic
+The default coding-subtree policy should be `local-owned` plus automatic
 read-cache replicas.
 
 Rules:
@@ -362,27 +399,29 @@ This is the best fit for Sinomo's expected cluster shape:
 - local-first access,
 - intermittent mobile devices,
 - policy-sensitive raw content,
-- coding workspaces where explicit conflicts are better than hidden merges.
+- coding subtrees where explicit conflicts are better than hidden merges.
 
-It also maps directly onto existing crates: `sinomo-kv` already provides
-transactions and watches, `sinomo-network` already carries protocol messages,
-and `sinomo-dfs` already has owner-routed local-owned behavior.
+It also maps directly onto existing crates: `sinomo-kv` already provides a
+small replicated control plane, `sinomo-network` already carries protocol
+messages, and `sinomo-dfs` already has owner-routed local-owned behavior.
 
 ## Core Components
 
 ### Metadata Coordinator
 
-The metadata coordinator owns path and object truth through the KV. It is a
-library/service surface in `sinomo-dfs`, backed by `sinomo-kv`.
+The metadata coordinator owns path and object truth through DFS metadata shards.
+It is a library/service surface in `sinomo-dfs`, backed by shard-local ordered
+stores and append-only journals. `sinomo-kv` only tells nodes where shards live
+and which epoch/primary is valid.
 
 Responsibilities:
 
-- create, update, and tombstone workspaces,
-- map workspace paths to stable object IDs,
+- create, update, and tombstone namespace records,
+- map filesystem paths to stable object IDs,
 - track object kind, owner, visible version, policy, and provenance,
 - track version manifests, content hashes, replica receipts, and conflicts,
-- perform compare-and-swap write coordination,
-- publish watchable metadata updates to local caches.
+- perform shard-local compare-and-append write coordination,
+- publish journal-backed metadata updates to local caches.
 
 The coordinator does not store file content.
 
@@ -421,14 +460,14 @@ blake3:<lowercase-hex-digest>
 
 Placement is policy-driven. Inputs:
 
-- object or inherited directory/workspace policy,
+- object or inherited directory/subtree policy,
 - owner node,
 - preferred nodes and allowed trust domains,
 - node health and endpoint quality,
 - storage capability and free-space hints,
 - privacy class and raw-content egress rules,
 - latency, battery, bandwidth, and roaming cost,
-- active session and pinned workspace state.
+- active session and pinned filesystem state.
 
 Outputs:
 
@@ -461,17 +500,22 @@ messages. It should support:
 - repair pull,
 - abort staging.
 
-The current `DfsNetworkMessage` can be extended rather than replaced. Large
-payloads should eventually move out of single JSON frames into chunked streams,
-but the first implementation can keep tests in-process and bounded.
+The current `DfsNetworkMessage` is extended rather than replaced. The first
+operating implementation transfers bounded whole blobs in protocol messages for
+staging and repair. Large payloads should move to chunked/ranged streams after
+the minimal service path is stable.
 
 ## Metadata Model
 
-Workspaces are named views over mounted objects and local paths.
+SIFS is the default DFS namespace. It is not a project or evolution workspace;
+it is the low-level virtual filesystem used by the Sinomo cluster itself.
+Agents and higher-level services can map their own directory layouts onto SIFS,
+but DFS metadata only records object identity, paths, versions, locations,
+receipts, conflicts, and inherited subtree policy.
 
 Object identity is stable across path moves:
 
-- `workspace_id`
+- `file_system_id`
 - `object_id`
 - `path`
 - `kind`
@@ -510,35 +554,51 @@ Conflict metadata is first-class:
 
 The public DFS API should expose both levels:
 
-- workspace/path APIs for filesystem-like agent workflows,
+- SIFS path APIs for filesystem-like agent workflows,
 - lower-level object/version APIs for replication, repair, audit, and advanced
   tools.
 
 The lower-level API should make object identity, visible version, requested
 version, content hash, replica receipts, and conflict state explicit.
 
-## KV Keyspace
+## Control-Plane Keyspace
 
-Use slash-delimited keys and JSON values:
+Use slash-delimited `sinomo-kv` keys and JSON values only for compact
+configuration:
 
 ```text
-/dfs/workspaces/<workspace_id>
-/dfs/mounts/<workspace_id>/<mount_id>
-/dfs/paths/<workspace_id>/<escaped_path>
-/dfs/objects/<workspace_id>/<object_id>
-/dfs/versions/<object_id>/<version>
-/dfs/placements/<object_id>/<version>
-/dfs/intents/<workspace_id>/<object_id>/<intent_id>
-/dfs/receipts/<object_id>/<version>/<node_id>
-/dfs/replication-jobs/<object_id>/<version>/<node_id>
-/dfs/conflicts/<workspace_id>/<object_id>/<conflict_id>
-/dfs/pins/<node_id>/<workspace_id>/<escaped_path>
-/dfs/cache-hints/<node_id>/<workspace_id>
-/dfs/gc/<node_id>/<object_id>/<version>
+/dfs-control/filesystems/<file_system_id>/config
+/dfs-control/filesystems/<file_system_id>/metadata-shards/<shard_id>
+/dfs-control/policies/<policy_id>
+/dfs-control/services/metadata/<node_id>
+/dfs-control/services/content/<node_id>
 ```
 
-Important rule: path keys are indexes. Object and version keys are the durable
-identity records.
+Important rule: this keyspace must not contain per-path, per-object,
+per-version, receipt, or conflict records.
+
+## Metadata-Shard Keyspace
+
+Each metadata shard uses its own local ordered store and journal. The exact
+storage engine can change, but the logical records should look like:
+
+```text
+inode/<inode_id>
+dirfrag/<dir_inode>/<frag_id>/dentry/<name_hash>/<name>
+object/<object_id>
+version/<object_id>/<version>
+intent/<object_id>/<intent_id>
+receipt/<object_id>/<version>/<node_id>
+replication-job/<object_id>/<version>/<node_id>
+conflict/<object_id>/<conflict_id>
+pin/<node_id>/<file_system_id>/<escaped_path>
+cache-hint/<node_id>/<file_system_id>
+gc/<node_id>/<object_id>/<version>
+journal/<sequence>
+```
+
+Important rule: these records are replicated by shard policy, not duplicated to
+every KV voter.
 
 ## Policy Model
 
@@ -579,9 +639,9 @@ limits:
 ```
 
 The enum can remain the public quick mode while the structured policy becomes
-the persisted and inherited workspace policy.
+the persisted and inherited subtree policy.
 
-Default coding-workspace policy:
+Default coding-subtree policy:
 
 ```text
 mode: local-owned
@@ -591,7 +651,7 @@ locality:
   prefer_session_nodes: true
 conflict: owner-serial
 privacy:
-  raw_content_may_leave_owner: true unless workspace policy narrows it
+  raw_content_may_leave_owner: true unless subtree policy narrows it
 ```
 
 Default distributed-eventual policy:
@@ -608,7 +668,7 @@ locality:
   prefer_session_nodes: true
 conflict: branch
 privacy:
-  raw_content_may_leave_owner: true unless workspace policy narrows it
+  raw_content_may_leave_owner: true unless subtree policy narrows it
 ```
 
 For more durable artifacts, use:
@@ -624,7 +684,7 @@ replication:
 
 ### Local-Owned
 
-1. Requester reads metadata from KV or local watch cache.
+1. Requester reads metadata from the responsible metadata shard or local cache.
 2. If requester is owner, stage and commit locally.
 3. If requester is not owner, route the write request to owner.
 4. Owner checks policy and expected base version.
@@ -638,15 +698,16 @@ they do not accept writes.
 
 ### Replicated-Confirmed
 
-1. Coordinator creates a write intent in KV with expected base version.
+1. Coordinator creates a write intent in the responsible metadata shard with the
+   expected base version.
 2. Writer stages content locally and pushes/pulls content to selected replicas.
-3. Each replica verifies hash and writes a receipt key.
+3. Each replica verifies hash and returns a durable receipt.
 4. Coordinator advances visible version only after required receipts exist.
 5. If receipts do not arrive before timeout, intent becomes rejected or pending
    according to policy.
 
-The visible version update must be one KV transaction comparing the current
-version and required receipt keys.
+The visible version update must be one shard-local transaction comparing the
+current version and required receipts.
 
 ### Replicated-Eventual
 
@@ -655,7 +716,7 @@ version and required receipt keys.
 2. Writer stages content locally and computes BLAKE3.
 3. Coordinator obtains durable receipts from at least `min_commit_replicas`
    eligible nodes.
-4. Coordinator advances visible version through KV.
+4. Coordinator advances visible version through the metadata shard.
 5. Replication jobs are queued for remaining desired locations.
 6. Reads can return the new version from any current replica.
 7. Remote caches expose stale/pending state until replication catches up.
@@ -675,7 +736,7 @@ This is suitable for logs, audit evidence, and event-linked artifacts.
 
 ### Ephemeral-Local
 
-1. Content is written only to the local content store or mounted local path.
+1. Content is written only to the local content store or policy-scoped local path.
 2. No cluster metadata is required unless promoted.
 3. Promotion creates a normal DFS object and emits provenance.
 
@@ -692,7 +753,7 @@ Read routing should prefer the closest valid content:
 5. durable home replica,
 6. relayed/roaming fetch as fallback.
 
-For `local-owned` coding workspaces, automatic read-cache replicas are allowed
+For `local-owned` coding subtrees, automatic read-cache replicas are allowed
 when policy permits raw content to leave the owner. These caches improve local
 inspection and review but never become write authorities.
 
@@ -718,7 +779,7 @@ Default strategies:
 - `append-only`: no conflict for appends, only ordering metadata.
 - `ephemeral-local`: local process owns conflict handling.
 
-For coding workspaces, conflict versions should appear as explicit files or
+For coding subtrees, conflict versions should appear as explicit files or
 reviewable metadata so agents can resolve them using diff and tests.
 
 ## Roaming Behavior
@@ -732,9 +793,9 @@ Behavior rules:
 - Reads may use cached content if policy permits stale reads.
 - Writes to an offline owner should queue, fail fast, or create a conflict
   candidate according to policy.
-- Ownership transfer is explicit and fenced through KV; it is not inferred from
-  owner unreachability.
-- Pinned workspaces can prefetch likely-needed files before a node leaves LAN.
+- Ownership transfer is explicit and fenced through the control plane or
+  responsible metadata shard; it is not inferred from owner unreachability.
+- Pinned SIFS paths can prefetch likely-needed files before a node leaves LAN.
 - Reconnect should repair by comparing manifests and receipts, not by scanning
   arbitrary directories.
 
@@ -742,7 +803,8 @@ Ownership transfer needs a conservative rule:
 
 1. old owner lease expired or operator/policy requested handoff,
 2. candidate owner has the latest confirmed content,
-3. KV transaction fences the old owner epoch and updates `owner_node_id`,
+3. shard/control-plane transaction fences the old owner epoch and updates the
+   responsible owner or primary,
 4. old owner must reject writes from stale epochs after reconnect.
 
 ## Local-First Optimizations
@@ -751,10 +813,10 @@ The system should make common local actions cheap:
 
 - Metadata watch cache on every active node.
 - Local content-addressed blob cache.
-- Pinning for active workspaces and task paths.
+- Pinning for active SIFS subtrees and task paths.
 - Prefetch recent manifests and small files for active sessions.
-- Avoid copying large repository checkouts when a local Git mount can serve as
-  the owner path.
+- Avoid copying large repository checkouts when a local Git checkout can serve
+  as the owner path.
 - Store derived summaries or evidence handles when raw content may not move.
 - Run build/test actions on the node that owns the checkout unless policy says
   otherwise.
@@ -784,20 +846,20 @@ Required checks:
 - local sandbox filesystem scope,
 - retention and evidence policy.
 
-Sensitive raw content should be encrypted per workspace or object before it
+Sensitive raw content should be encrypted per filesystem or object before it
 leaves the owner. The metadata plane should store hashes, versions, and policy
 references, not cleartext secrets.
 
 Policy denials emit `dfs.policy.violation` with requesting node, executing node,
-workspace, object, and reason.
+filesystem, object, and reason.
 
 ## Event Families
 
 Initial event kinds:
 
 ```text
-dfs.workspace.created
-dfs.workspace.mounted
+dfs.filesystem.created
+dfs.filesystem.policy-scoped
 dfs.object.created
 dfs.object.moved
 dfs.object.tombstoned
@@ -817,7 +879,7 @@ dfs.cache.evicted
 dfs.policy.violation
 ```
 
-These events should carry node, workspace, object, version, policy, content hash,
+These events should carry node, filesystem, object, version, policy, content hash,
 and routing metadata where applicable.
 
 ## Implementation Plan
@@ -827,60 +889,108 @@ and routing metadata where applicable.
 - Add a `LocalContentStore` to `sinomo-dfs`.
 - Replace the placeholder FNV hash for persisted content with BLAKE3.
 - Persist staged blobs and manifests under `$SINOMO_DATA_DIR/dfs/content`.
-- Keep the current in-memory service for tests, but add filesystem-backed tests
-  for local-owned reads and writes.
+- Keep local metadata only as a cache; authoritative DFS metadata should be
+  written through the DFS metadata backend.
 
-### Phase 2: KV-Backed Metadata
+### Phase 2: DFS Metadata Plane
 
-- Add serializers and key builders for DFS workspace, path, object, version,
-  intent, receipt, and conflict records.
-- Add a `KvDfsMetadataStore` facade over `sinomo-kv`.
-- Use KV compare-and-swap for object version updates.
-- Add metadata watch support so nodes keep local caches fresh.
+- Add serializers and key builders for inodes, dentries, dirfrags, object
+  versions, intents, receipts, and conflicts. The first implementation includes
+  filesystem, path, inode, dirfrag, object-version, write-intent, receipt, and
+  conflict records.
+- Add a `DfsMetadataBackend` facade over a local ordered store plus append-only
+  journal. The first backend is `LocalJsonMetadataBackend`; it is a durable
+  correctness backend, not the final high-throughput storage engine.
+- Wire `NetworkedDfsService` so filesystem/object registration, durable receipts,
+  and visible-version commits can persist through `DfsMetadataBackend` while
+  the in-memory `DfsMetadataStore` remains a routing cache.
+- Add directory fragmentation thresholds for large directories.
+- Use shard-local compare-and-append for object version updates.
+- Add metadata subscription support so nodes keep local caches fresh. The first
+  implementation exposes a shard journal cursor and pollable journal batches.
+
+### Phase 2a: KV Control Plane
+
+- Add small `sinomo-kv` control-plane records for filesystem config and metadata
+  shard placement.
+- Keep this keyspace separate from file/object metadata.
+- Use KV only to discover or fence the metadata shard primary and replica set.
 
 ### Phase 3: First Distributed Eventual Objects
 
-- Add placement planning for `min_commit_replicas` and `desired_replicas`.
+- Add deterministic placement planning for `min_commit_replicas` and
+  `desired_replicas`. The first implementation uses a candidate-node placement
+  request and weighted rendezvous ordering with coordinator preference.
 - Add replica push/pull messages and receipt records.
 - Commit after policy threshold receipts, then queue background replication.
-- Surface stale/pending cache state on reads.
-- Add anti-entropy repair that re-replicates until desired replica count is met.
+- Surface stale/pending cache state on reads through explicit freshness results.
+- Add anti-entropy repair that retries offline replicas until desired replica
+  count is met.
 
 ### Phase 4: Replicated-Confirmed
 
 - Add strict confirmed policy where `min_commit_replicas == desired_replicas`.
+  The first implementation exposes `DfsReplicationPolicy::confirmed(N)` and
+  rejects replicated-confirmed writes that try to use an eventual threshold.
 - Add stricter read behavior that can require reads from fully confirmed replica
-  sets.
-- Implement timeout, abort, and policy downgrade behavior.
-- Add tests for quorum available, replica offline, duplicate receipt, stale base
-  version, strict threshold failure, and reconnect repair.
+  sets. Confirmed reads check the required replica list against receipt-backed
+  metadata when a metadata backend is present, otherwise against local routing
+  metadata.
+- Implement timeout handling for pending confirmed writes:
+  keep pending, abort the intent, or explicitly downgrade the pending intent to
+  an eventual threshold while keeping the desired replica set for repair.
+- Add tests for all-replica commit, replica offline pending behavior, duplicate
+  receipts, stale base version, strict threshold failure, abort, downgrade, and
+  reconnect repair.
 
 ### Phase 5: Conflict Objects and Handoff
 
-- Add explicit conflict records and conflict read views.
-- Add owner epoch fencing.
-- Add conservative ownership transfer for pinned or relocated workspaces.
-- Add reconnect reconciliation from manifests and KV receipts.
+- Make conflict metadata operational:
+  `DfsMetadataBackend` can persist, fetch, list, and update conflict records;
+  `NetworkedDfsService` keeps a local conflict cache and exposes open conflict
+  read views before returning current or stale bytes.
+- For `replicated-eventual`, stale base writes and duplicate concurrent target
+  versions become explicit branch-style conflict records with local candidate
+  hash, visible competing hash, base version, producing node, and status.
+  `replicated-confirmed` keeps the stricter Phase 4 behavior: stale commits
+  reject instead of silently branching.
+- Reconnect reconciliation compares local manifests with visible object
+  metadata:
+  matching current manifests refresh durable receipts and current locations,
+  while divergent non-visible manifests create conflict records for operator or
+  agent resolution.
+- Owner epoch fencing uses the control-plane metadata-shard epoch. Write intents
+  capture the current shard epoch, commits re-check that epoch before advancing
+  the visible version, and old owners reject new writes after a shard primary
+  handoff.
+- Conservative handoff is explicit:
+  the candidate node must already have the latest visible content hash locally,
+  the control-plane shard primary transfer must compare the expected epoch, the
+  epoch increments on success, and local filesystem/object ownership metadata is
+  updated only after the fenced transfer succeeds.
+- Added tests for conflict persistence/update, stale-write conflict read views,
+  reconnect receipt/conflict reconciliation, epoch-CAS shard transfer, and old
+  owner fencing after handoff.
 
 ### Phase 6: Operator and Agent Surfaces
 
+- Add reusable operator inspection views in `sinomo-dfs`:
+  status summaries, SIFS summaries, object detail views, conflict lists,
+  inferred repair gaps, and agent-facing object states.
+- Add a local pin-record store for operator and agent workflows. Pins are local
+  records under the DFS data directory; they express desired local metadata or
+  content locality without changing object ownership or replication policy.
 - Add `sinomo dfs` inspection commands:
-  `workspace`, `object`, `status`, `pin`, `repair`, `conflicts`.
-- Add supervision audit views for replication lag, stale reads, policy denials,
-  and unresolved conflicts.
-- Add task-workspace helpers for evolution and coding workflows.
-
-## First Coding Slice
-
-The most useful next code change is Phase 1 plus the beginning of Phase 2:
-
-1. Introduce durable content-store types in `sinomo-dfs`.
-2. Introduce DFS KV key builders and JSON record helpers.
-3. Add path-level and lower-level object/version API contracts.
-4. Keep existing `LocalOwnedDfsService` behavior intact.
-5. Add focused tests proving a local-owned object can be staged, committed,
-   persisted, reopened, and routed through existing metadata.
-6. Add tests proving read-cache replicas are never write authorities.
-
-That preserves the current working skeleton while creating the foundation needed
-for replicated policies.
+  `status`, `filesystem`, `object`, `repair`, `conflicts`, and `pin`.
+  All inspection commands support `--json`; metadata commands support
+  `--metadata-root <path>` for explicit shard inspection.
+- Add `sinomo dfs pin list|add|remove` with optional `--pin-root <path>` for
+  tests, task-layout helpers, and future prefetch services.
+- The first operator repair view is derived from committed intents, desired
+  replica sets, and durable receipts. It reports missing replicas; it does not
+  trigger repair by itself.
+- Agent-facing SIFS summaries label objects as `current`,
+  `pending-write`, `pending-repair`, `conflicted`, or `metadata-only`, giving
+  evolution/coding workflows a compact decision surface before opening files.
+- Supervision can now consume the same operator models for replication lag,
+  policy denials, stale reads, and unresolved conflicts.

@@ -23,7 +23,8 @@ use sinomo_runtime::core::{
 };
 use sinomo_runtime::device::{DevicePermission, DeviceProfile};
 use sinomo_runtime::dfs::{
-    DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, MountKind, Workspace, WorkspaceMount,
+    DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsSubtreePolicy,
+    sifs_file_system_id,
 };
 use sinomo_runtime::eval::{
     CommandEvaluationSpec, CommandEvaluationSuite, LocalEvalHarness, ReplayFixtureRef,
@@ -131,20 +132,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let workspace_id = WorkspaceId::new("workspace_evolution_trigger")?;
     let candidate_object_id = DfsObjectId::new("obj_trigger_candidate")?;
+    let sifs_id = sifs_file_system_id();
     let mut dfs = DfsMetadataStore::new();
-    dfs.add_workspace(Workspace {
-        workspace_id: workspace_id.clone(),
+    dfs.add_file_system(DfsFileSystem {
+        file_system_id: sifs_id.clone(),
         display_name: "trigger evolution candidate".to_string(),
         owner_node_id: workstation.node_id.clone(),
-        mounts: vec![WorkspaceMount {
-            path: "modules/trigger".to_string(),
-            kind: MountKind::TaskStaging,
+        subtree_policies: vec![DfsSubtreePolicy {
+            path_prefix: "modules/trigger".to_string(),
             policy: DfsObjectPolicy::LocalOwned,
         }],
     });
     dfs.add_object(DfsObjectMetadata {
         object_id: candidate_object_id.clone(),
-        workspace_id: workspace_id.clone(),
+        file_system_id: sifs_id.clone(),
         path: "modules/trigger/silence_policy.wasm".to_string(),
         kind: DfsObjectKind::Artifact,
         owner_node_id: workstation.node_id.clone(),
@@ -399,7 +400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let write_route = dfs.route_write(
         DfsWriteRequest {
-            workspace_id,
+            file_system_id: sifs_id,
             object_id: candidate_object_id,
             target_version: DfsVersion::new("version_2")?,
             requesting_node_id: home_server.node_id.clone(),

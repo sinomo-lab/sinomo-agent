@@ -1,7 +1,7 @@
 use crate::{
-    ArtifactId, CapabilityName, DeviceId, DfsObjectId, DfsVersion, EntityId, EventId,
-    EvolutionJobId, ModuleId, NodeId, PolicyDecisionId, RolloutPlanId, ScorecardId, SessionId,
-    TaskId, TrustDomain, WorkspaceId,
+    ArtifactId, CapabilityName, DeviceId, DfsFileSystemId, DfsObjectId, DfsVersion, EntityId,
+    EventId, EvolutionJobId, ModuleId, NodeId, PolicyDecisionId, RolloutPlanId, ScorecardId,
+    SessionId, TaskId, TrustDomain, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -170,7 +170,7 @@ pub enum DfsObjectPolicy {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteRequest {
-    pub workspace_id: WorkspaceId,
+    pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
     pub target_version: DfsVersion,
     pub requesting_node_id: NodeId,
@@ -178,7 +178,7 @@ pub struct DfsWriteRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteReceipt {
-    pub workspace_id: WorkspaceId,
+    pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
     pub committed_version: DfsVersion,
     pub owner_node_id: NodeId,
