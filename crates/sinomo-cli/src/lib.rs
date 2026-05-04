@@ -2233,8 +2233,17 @@ fn cluster_peer_members(paths: &ClusterPaths) -> Result<Vec<ClusterMemberRecord>
     refresh_cluster_kv_from_local_daemon(paths)?;
     let mut state = read_cluster_state(paths)?;
     if matches!(state.bootstrap, ClusterBootstrap::Joined { .. }) {
-        if let Err(error) = reconcile_cluster_join_with_introducers(&mut state, Some(paths)) {
-            eprintln!("warning: could not refresh cluster membership from introducers: {error}");
+        let needs_join_registration = state
+            .members
+            .iter()
+            .find(|member| member.node_id == state.local_node_id)
+            .map_or(true, |member| !member.state.is_authorized());
+        if needs_join_registration {
+            if let Err(error) = reconcile_cluster_join_with_introducers(&mut state, Some(paths)) {
+                eprintln!(
+                    "warning: could not refresh cluster membership from introducers: {error}"
+                );
+            }
         }
         let (main_options, shadow_options) = local_daemon_cluster_options()?;
         ensure_daemon_cluster_members(
