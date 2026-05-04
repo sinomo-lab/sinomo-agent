@@ -203,6 +203,7 @@ const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
 const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
+const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
 const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -1342,11 +1343,17 @@ fn cluster_init_with_paths(
         ))
         .expect("generated cluster id")
     });
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "cluster paths have no data directory parent".to_string(),
+    })?;
+    let main_identity = load_or_create_main_node_identity(data_dir)?;
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         options.name.clone(),
         local_node_id.clone(),
         options.name,
+        main_identity.public_key.clone(),
         timestamp,
     );
     ensure_daemon_cluster_members(
@@ -1437,6 +1444,66 @@ fn cluster_join_command(uri: &str) -> String {
     format!("sinomo cluster join \"{uri}\"")
 }
 
+fn sign_cluster_join_invite(
+    invite: &ClusterJoinInvite,
+    identity: &NodeIdentity,
+) -> Result<String, CliError> {
+    let key_pair = identity.key_pair()?;
+    let payload = cluster_invite_signing_payload(invite)?;
+    Ok(URL_SAFE_NO_PAD.encode(key_pair.sign(payload.as_bytes()).as_ref()))
+}
+
+fn verify_cluster_join_invite_signature(invite: &ClusterJoinInvite) -> Result<(), CliError> {
+    if invite.signature.trim().is_empty()
+        || invite.issuer_public_key.trim().is_empty()
+        || invite.issuer_node_id.as_str().trim().is_empty()
+    {
+        return Err(CliError::AuthDenied);
+    }
+    let public_key = URL_SAFE_NO_PAD
+        .decode(invite.issuer_public_key.as_bytes())
+        .map_err(|_| CliError::AuthDenied)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(invite.signature.as_bytes())
+        .map_err(|_| CliError::AuthDenied)?;
+    let payload = cluster_invite_signing_payload(invite)?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| CliError::AuthDenied)
+}
+
+fn cluster_invite_signing_payload(invite: &ClusterJoinInvite) -> Result<String, CliError> {
+    let expires_at = invite
+        .expires_at
+        .format(&Rfc3339)
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid invite expiry timestamp: {source}"),
+        })?;
+    let introducers =
+        serde_json::to_string(&invite.introducers).map_err(|source| CliError::Json {
+            path: "cluster invite introducers".to_string(),
+            detail: source.to_string(),
+        })?;
+    let allowed_roles =
+        serde_json::to_string(&invite.allowed_member_roles).map_err(|source| CliError::Json {
+            path: "cluster invite allowed roles".to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(format!(
+        "{CLUSTER_INVITE_AUTH_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        invite.invite_id,
+        invite.cluster_id,
+        invite.cluster_name.clone().unwrap_or_default(),
+        introducers,
+        invite.token_id,
+        expires_at,
+        invite.trust_domain,
+        allowed_roles,
+        invite.issuer_node_id,
+        invite.issuer_public_key
+    ))
+}
+
 fn build_cluster_invite(
     state: &ClusterBootstrapState,
     options: &ClusterInviteOptions,
@@ -1453,7 +1520,12 @@ fn build_cluster_invite(
             .collect()
     };
     let invite_id = sinomo_runtime::core::ClusterInviteId::generate();
-    Ok(ClusterJoinInvite {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "cluster paths have no data directory parent".to_string(),
+    })?;
+    let issuer_identity = load_or_create_main_node_identity(data_dir)?;
+    let mut invite = ClusterJoinInvite {
         invite_id: invite_id.clone(),
         cluster_id: state.cluster_id.clone(),
         cluster_name: Some(state.cluster_name.clone()),
@@ -1462,8 +1534,12 @@ fn build_cluster_invite(
         expires_at: now + time::Duration::seconds(options.ttl_seconds),
         trust_domain: TrustDomain::new("trust.local").expect("static trust domain"),
         allowed_member_roles: vec![ClusterMemberRole::Learner, ClusterMemberRole::NonVoting],
-        signature: "local-bootstrap-signature-pending".to_string(),
-    })
+        issuer_node_id: state.local_node_id.clone(),
+        issuer_public_key: issuer_identity.public_key.clone(),
+        signature: String::new(),
+    };
+    invite.signature = sign_cluster_join_invite(&invite, &issuer_identity)?;
+    Ok(invite)
 }
 
 fn default_invite_introducers(
@@ -1625,8 +1701,9 @@ fn cluster_join_with_paths(
 
     let local_node_id = options.node_id.unwrap_or_else(NodeId::generate);
     let timestamp = OffsetDateTime::now_utc();
-    let mut invite = parse_cluster_join_invite_argument(&options.invite)?;
-    if invite.expires_at != OffsetDateTime::UNIX_EPOCH && invite.expires_at <= timestamp {
+    let invite = parse_cluster_join_invite_argument(&options.invite)?;
+    verify_cluster_join_invite_signature(&invite)?;
+    if invite.expires_at <= timestamp {
         return Err(CliError::Parse {
             detail: format!(
                 "cluster invite expired at {}",
@@ -1637,27 +1714,19 @@ fn cluster_join_with_paths(
     if let Some(cluster_id) = &options.cluster_id
         && cluster_id != &invite.cluster_id
     {
-        if is_legacy_placeholder_invite(&invite) {
-            invite.cluster_id = cluster_id.clone();
-        } else {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "cluster id override `{cluster_id}` does not match invite cluster `{}`",
-                    invite.cluster_id
-                ),
-            });
-        }
-    } else if let Some(cluster_id) = &options.cluster_id {
-        invite.cluster_id = cluster_id.clone();
-    }
-    if invite.cluster_id == ClusterId::new("cluster_pending").expect("static cluster id")
-        && is_legacy_placeholder_invite(&invite)
-    {
         return Err(CliError::Parse {
-            detail: "legacy join tokens require --cluster-id; use `sinomo cluster invite` to create a portable invite".to_string(),
+            detail: format!(
+                "cluster id override `{cluster_id}` does not match invite cluster `{}`",
+                invite.cluster_id
+            ),
         });
     }
     let cluster_id = invite.cluster_id.clone();
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "cluster paths have no data directory parent".to_string(),
+    })?;
+    let main_identity = load_or_create_main_node_identity(data_dir)?;
     let mut state = ClusterBootstrapState::pending_join(
         cluster_id,
         invite
@@ -1666,6 +1735,7 @@ fn cluster_join_with_paths(
             .unwrap_or_else(|| options.name.clone()),
         local_node_id.clone(),
         options.name,
+        main_identity.public_key.clone(),
         invite,
         timestamp,
     );
@@ -1689,6 +1759,7 @@ fn cluster_join_retry_with_paths(
 ) -> Result<(), CliError> {
     let timestamp = OffsetDateTime::now_utc();
     let invite = parse_cluster_join_invite_argument(&options.invite)?;
+    verify_cluster_join_invite_signature(&invite)?;
     if invite.cluster_id != state.cluster_id {
         return Err(CliError::Parse {
             detail: format!(
@@ -1806,12 +1877,6 @@ struct ClusterJoinRegistrationResponse {
     kv_snapshot: Option<KvSnapshot>,
 }
 
-fn is_legacy_placeholder_invite(invite: &ClusterJoinInvite) -> bool {
-    invite.expires_at == OffsetDateTime::UNIX_EPOCH
-        && invite.signature == "pending-network-validation"
-        && invite.cluster_name.is_none()
-}
-
 fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
     let raw = raw.trim();
     let invite = if let Some(path) = raw.strip_prefix('@') {
@@ -1876,10 +1941,11 @@ fn decode_cluster_join_invite(raw: &str) -> Result<ClusterJoinInvite, CliError> 
             detail: source.to_string(),
         })
     } else {
-        Ok(ClusterJoinInvite::local_placeholder(
-            raw.to_string(),
-            ClusterId::new("cluster_pending").expect("static cluster id"),
-        ))
+        Err(CliError::Parse {
+            detail:
+                "cluster join requires a sinomo-join://v1 invite, invite JSON, or invite file path"
+                    .to_string(),
+        })
     }
 }
 
@@ -2517,16 +2583,17 @@ fn ensure_main_daemon_cluster_member(
             .unwrap_or(ClusterMemberState::Pending),
     };
     let local_node_id = state.local_node_id.clone();
+    let node_public_key = existing_member_public_key(state, &local_node_id).unwrap_or_default();
     let mut member = ClusterMemberRecord::local_voter(
         state.cluster_id.clone(),
         local_node_id.clone(),
         state.local_node_display_name.clone(),
+        node_public_key,
         timestamp,
     );
     let capabilities = main_daemon_capabilities(&role);
     member.role = role;
     member.state = member_state;
-    member.node_public_key = "pending-daemon-node-key".to_string();
     upsert_daemon_member(
         state,
         member,
@@ -2548,24 +2615,26 @@ fn ensure_shadow_daemon_cluster_member(
         .find(|member| member.node_id == shadow_node_id)
         .map(|member| member.state.clone())
         .filter(|state| *state != ClusterMemberState::Pending);
+    let node_public_key = existing_member_public_key(state, &shadow_node_id).unwrap_or_default();
     let mut member = match &state.bootstrap {
         ClusterBootstrap::InitializedLocally => ClusterMemberRecord::local_non_voting(
             state.cluster_id.clone(),
             shadow_node_id.clone(),
             format!("{} shadow", state.local_node_display_name),
+            node_public_key,
             timestamp,
         ),
         ClusterBootstrap::Joined { .. } => ClusterMemberRecord::pending_non_voting(
             state.cluster_id.clone(),
             shadow_node_id.clone(),
             format!("{} shadow", state.local_node_display_name),
+            node_public_key,
             timestamp,
         ),
     };
     if let Some(existing_state) = existing_shadow_state {
         member.state = existing_state;
     }
-    member.node_public_key = "pending-shadow-daemon-node-key".to_string();
     upsert_daemon_member(
         state,
         member,
@@ -2573,6 +2642,15 @@ fn ensure_shadow_daemon_cluster_member(
         daemon_advertised_endpoints(&shadow_node_id, options, 10),
         timestamp,
     );
+}
+
+fn existing_member_public_key(state: &ClusterBootstrapState, node_id: &NodeId) -> Option<String> {
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == *node_id)
+        .map(|member| member.node_public_key.clone())
+        .filter(|key| !key.trim().is_empty())
 }
 
 fn upsert_daemon_member(
@@ -4236,6 +4314,29 @@ fn handle_daemon_cluster_join(
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let mut state = read_cluster_state(&cluster_paths)?;
+    if let Err(error) = verify_cluster_join_invite_signature(&request.invite) {
+        return Ok(ClusterJoinRegistrationResponse {
+            accepted: false,
+            detail: format!("invite signature rejected: {error}"),
+            state,
+            kv_snapshot: None,
+        });
+    }
+    if !state.members.iter().any(|member| {
+        member.node_id == request.invite.issuer_node_id
+            && member.node_public_key == request.invite.issuer_public_key
+            && member.state.is_authorized()
+    }) {
+        return Ok(ClusterJoinRegistrationResponse {
+            accepted: false,
+            detail: format!(
+                "invite issuer {} is not an authorized cluster member",
+                request.invite.issuer_node_id
+            ),
+            state,
+            kv_snapshot: None,
+        });
+    }
     if let Ok(main_status) = read_daemon_status(paths) {
         let main_options = daemon_options_from_status(&main_status);
         let shadow_options = match probe_daemon_status(
@@ -10456,7 +10557,7 @@ fn print_cluster_help() {
         "  sinomo cluster join <invite> [--name <name>] [--cluster-id cluster_...] [--node-id node_...]"
     );
     println!(
-        "      Record intent to join an existing cluster from a sinomo-join URI, invite file, or legacy token."
+        "      Record intent to join an existing cluster from a signed sinomo-join URI or invite file."
     );
     println!("  sinomo cluster status");
     println!("      Show local cluster bootstrap state, or report that this node is orphaned.");
@@ -10872,8 +10973,9 @@ mod tests {
         parse_models_list_options, parse_propose_options, parse_provider_command,
         parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
         read_cluster_members_from_kv, read_cluster_state, run_cui_with_handler_io,
-        run_cui_with_handler_io_and_daemon, run_evolve_command, sign_daemon_command_from_data_dir,
-        stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout,
+        run_cui_with_handler_io_and_daemon, run_evolve_command, sign_cluster_join_invite,
+        sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
+        uninstall_with_layout,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -11139,6 +11241,29 @@ mod tests {
         )));
     }
 
+    fn signed_test_invite_uri(
+        root: &std::path::Path,
+        cluster_id: &str,
+        issuer_node_id: &str,
+    ) -> String {
+        let identity = super::load_or_create_main_node_identity(root).expect("test identity");
+        let mut invite = ClusterJoinInvite {
+            invite_id: ClusterInviteId::generate(),
+            cluster_id: ClusterId::new(cluster_id).expect("cluster"),
+            cluster_name: Some("test cluster".to_string()),
+            introducers: Vec::new(),
+            token_id: "token_test".to_string(),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            trust_domain: TrustDomain::new("trust.local").expect("trust"),
+            allowed_member_roles: vec![ClusterMemberRole::Learner, ClusterMemberRole::NonVoting],
+            issuer_node_id: NodeId::new(issuer_node_id).expect("issuer node"),
+            issuer_public_key: identity.public_key.clone(),
+            signature: String::new(),
+        };
+        invite.signature = sign_cluster_join_invite(&invite, &identity).expect("sign invite");
+        encode_cluster_join_invite(&invite).expect("invite uri")
+    }
+
     #[test]
     fn dfs_parser_accepts_operator_and_pin_commands() {
         let metadata_root = std::env::temp_dir().join("sinomo-cli-dfs-meta");
@@ -11283,7 +11408,6 @@ mod tests {
             .expect("main daemon member");
         assert_eq!(main.role, ClusterMemberRole::Voter);
         assert_eq!(main.state, ClusterMemberState::Active);
-        assert_ne!(main.node_public_key, "pending-daemon-node-key");
         assert!(!main.node_public_key.trim().is_empty());
         assert_eq!(main.endpoints[0].address, "127.0.0.1:21353");
         let shadow = state
@@ -11293,7 +11417,7 @@ mod tests {
             .expect("shadow daemon member");
         assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
         assert_eq!(shadow.state, ClusterMemberState::Active);
-        assert_ne!(shadow.node_public_key, "pending-shadow-daemon-node-key");
+        assert!(!shadow.node_public_key.trim().is_empty());
         assert_ne!(shadow.node_public_key, main.node_public_key);
         assert_eq!(shadow.endpoints[0].address, "127.0.0.1:21354");
         let kv_members = read_cluster_members_from_kv(&paths).expect("kv members");
@@ -11361,8 +11485,8 @@ mod tests {
 
         cluster_join_with_paths(
             ClusterJoinOptions {
-                invite: "sinomo-join://token".to_string(),
-                cluster_id: Some(ClusterId::new("cluster_joined").expect("cluster")),
+                invite: signed_test_invite_uri(&root, "cluster_joined", "node_host"),
+                cluster_id: None,
                 node_id: Some(NodeId::new("node_joiner").expect("node")),
                 name: "joiner".to_string(),
             },
@@ -11379,7 +11503,7 @@ mod tests {
         assert_eq!(state.kv_revision, 0);
         assert_eq!(state.members[0].role, ClusterMemberRole::Learner);
         assert_eq!(state.members[0].state, ClusterMemberState::Pending);
-        assert_ne!(state.members[0].node_public_key, "pending-daemon-node-key");
+        assert!(!state.members[0].node_public_key.trim().is_empty());
         let shadow = state
             .members
             .iter()
@@ -11481,6 +11605,10 @@ mod tests {
         .expect("cluster invite");
         let mut offline_invite = rendered.invite.clone();
         offline_invite.introducers.clear();
+        let host_identity =
+            super::load_or_create_main_node_identity(&host_root).expect("host identity");
+        offline_invite.signature =
+            sign_cluster_join_invite(&offline_invite, &host_identity).expect("resign invite");
         let offline_uri = encode_cluster_join_invite(&offline_invite).expect("offline invite");
 
         cluster_join_with_paths(
@@ -11543,6 +11671,10 @@ mod tests {
         .expect("cluster invite");
         let mut offline_invite = rendered.invite.clone();
         offline_invite.introducers.clear();
+        let host_identity =
+            super::load_or_create_main_node_identity(&host_root).expect("host identity");
+        offline_invite.signature =
+            sign_cluster_join_invite(&offline_invite, &host_identity).expect("resign invite");
         let offline_uri = encode_cluster_join_invite(&offline_invite).expect("offline invite");
         cluster_join_with_paths(
             ClusterJoinOptions {
@@ -11663,7 +11795,9 @@ mod tests {
         )
         .expect("cluster init");
 
-        let invite = ClusterJoinInvite {
+        let host_identity =
+            super::load_or_create_main_node_identity(&host_root).expect("host identity");
+        let mut invite = ClusterJoinInvite {
             invite_id: ClusterInviteId::new("invite_sync").expect("invite"),
             cluster_id: cluster_id.clone(),
             cluster_name: Some("sync cluster".to_string()),
@@ -11672,8 +11806,11 @@ mod tests {
             expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
             trust_domain: TrustDomain::new("trust.local").expect("trust"),
             allowed_member_roles: vec![ClusterMemberRole::Learner],
-            signature: "test-signature".to_string(),
+            issuer_node_id: NodeId::new("node_host").expect("node"),
+            issuer_public_key: host_identity.public_key.clone(),
+            signature: String::new(),
         };
+        invite.signature = sign_cluster_join_invite(&invite, &host_identity).expect("sign invite");
         cluster_join_with_paths(
             ClusterJoinOptions {
                 invite: encode_cluster_join_invite(&invite).expect("invite uri"),

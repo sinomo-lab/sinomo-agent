@@ -139,7 +139,9 @@ Invite payload fields:
 - allowed trust domain
 - allowed node roles
 - optional relay or signaling endpoints
-- signature from an active voter or cluster authority
+- issuer node ID
+- issuer public key
+- Ed25519 signature from an active voter or cluster authority over the full invite payload
 
 Join tokens are one-time or short-lived. A leaked token should not grant ongoing authority after the token expires or after a successful use.
 
@@ -431,6 +433,7 @@ Phase 0, local bootstrap:
 - Add `sinomo cluster` CLI. Implemented in `crates/sinomo-cli`.
 - Persist local cluster state. Implemented as `$SINOMO_DATA_DIR/cluster/state.json`.
 - Add orphan guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
+- Remove legacy raw-token bootstrap. Implemented by requiring `sinomo cluster join` inputs to be signed `sinomo-join://v1` payloads, invite JSON, or files containing one of those forms.
 
 Phase 1, contracts:
 
@@ -438,6 +441,7 @@ Phase 1, contracts:
 - Extend `sinomo-network` transport kinds for QUIC, iroh, and WebRTC candidate metadata. Implemented through `TransportKind`, `NodeEndpoint::from_cluster_endpoint`, and `PeerEndpointCandidate`.
 - Add cluster-aware peer registry records. Implemented through `PeerRegistry` cluster member and endpoint candidate indexes.
 - Represent the local main daemon and shadow daemon as separate cluster members. Implemented in `crates/sinomo-cli`: cluster bootstrap writes the main daemon as the local voter/learner and the derived shadow daemon as a non-voting communication-capable member.
+- Use real bootstrap identity material. Implemented by generating the local Ed25519 identity before bootstrap state creation, storing explicit member public keys in every member record, signing invites with the issuer node identity, and verifying invite signatures before local join or introducer acceptance.
 
 Phase 2, KV core:
 

@@ -2018,6 +2018,7 @@ mod tests {
             cluster_id.clone(),
             node_id.clone(),
             "desktop",
+            "pk_desktop",
             timestamp,
         );
         member.endpoints.push(ClusterEndpointRecord {
@@ -2165,12 +2166,10 @@ mod tests {
         let node_b = NodeId::new("node_b").expect("node");
         let now = time::OffsetDateTime::now_utc();
         let expires_at = now + time::Duration::hours(1);
-        let mut member_a =
-            ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", now);
-        let mut member_b =
-            ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "b", now);
-        member_a.node_public_key = "pk_a".to_string();
-        member_b.node_public_key = "pk_b".to_string();
+        let member_a =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", "pk_a", now);
+        let member_b =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "b", "pk_b", now);
         let verifier = ClusterAuthVerifier::new(vec![member_a, member_b]);
         let material_a = ClusterAuthMaterial {
             cluster_id: cluster_id.clone(),
@@ -2211,9 +2210,8 @@ mod tests {
         let cluster_id = ClusterId::new("cluster_home").expect("cluster");
         let node_a = NodeId::new("node_a").expect("node");
         let now = time::OffsetDateTime::now_utc();
-        let mut member =
-            ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", now);
-        member.node_public_key = "pk_a".to_string();
+        let member =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", "pk_a", now);
         let verifier = ClusterAuthVerifier::new(vec![member]);
         let wrong_key = ClusterAuthMaterial {
             cluster_id: cluster_id.clone(),

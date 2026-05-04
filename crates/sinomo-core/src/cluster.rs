@@ -46,10 +46,12 @@ impl ClusterBootstrapState {
         cluster_name: impl Into<String>,
         local_node_id: NodeId,
         local_node_display_name: impl Into<String>,
+        local_node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
     ) -> Self {
         let cluster_name = cluster_name.into();
         let local_node_display_name = local_node_display_name.into();
+        let local_node_public_key = local_node_public_key.into();
         Self {
             cluster_id: cluster_id.clone(),
             cluster_name: cluster_name.clone(),
@@ -62,6 +64,7 @@ impl ClusterBootstrapState {
                 cluster_id,
                 local_node_id,
                 local_node_display_name,
+                local_node_public_key,
                 timestamp,
             )],
             initialized_at: timestamp,
@@ -74,11 +77,13 @@ impl ClusterBootstrapState {
         cluster_name: impl Into<String>,
         local_node_id: NodeId,
         local_node_display_name: impl Into<String>,
+        local_node_public_key: impl Into<String>,
         invite: ClusterJoinInvite,
         timestamp: OffsetDateTime,
     ) -> Self {
         let cluster_name = cluster_name.into();
         let local_node_display_name = local_node_display_name.into();
+        let local_node_public_key = local_node_public_key.into();
         Self {
             cluster_id: cluster_id.clone(),
             cluster_name: cluster_name.clone(),
@@ -91,6 +96,7 @@ impl ClusterBootstrapState {
                 cluster_id,
                 local_node_id,
                 local_node_display_name,
+                local_node_public_key,
                 timestamp,
             )],
             initialized_at: timestamp,
@@ -120,23 +126,9 @@ pub struct ClusterJoinInvite {
     pub trust_domain: TrustDomain,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_member_roles: Vec<ClusterMemberRole>,
+    pub issuer_node_id: NodeId,
+    pub issuer_public_key: String,
     pub signature: String,
-}
-
-impl ClusterJoinInvite {
-    pub fn local_placeholder(raw_invite: impl Into<String>, cluster_id: ClusterId) -> Self {
-        Self {
-            invite_id: ClusterInviteId::generate(),
-            cluster_id,
-            cluster_name: None,
-            introducers: Vec::new(),
-            token_id: raw_invite.into(),
-            expires_at: OffsetDateTime::UNIX_EPOCH,
-            trust_domain: TrustDomain::new("trust.local").expect("static trust domain"),
-            allowed_member_roles: vec![ClusterMemberRole::Learner],
-            signature: "pending-network-validation".to_string(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -167,12 +159,14 @@ impl ClusterMemberRecord {
         cluster_id: ClusterId,
         node_id: NodeId,
         display_name: impl Into<String>,
+        node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
     ) -> Self {
         Self::new(
             cluster_id,
             node_id,
             display_name,
+            node_public_key,
             ClusterMemberRole::Voter,
             ClusterMemberState::Active,
             timestamp,
@@ -183,12 +177,14 @@ impl ClusterMemberRecord {
         cluster_id: ClusterId,
         node_id: NodeId,
         display_name: impl Into<String>,
+        node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
     ) -> Self {
         Self::new(
             cluster_id,
             node_id,
             display_name,
+            node_public_key,
             ClusterMemberRole::Learner,
             ClusterMemberState::Pending,
             timestamp,
@@ -199,12 +195,14 @@ impl ClusterMemberRecord {
         cluster_id: ClusterId,
         node_id: NodeId,
         display_name: impl Into<String>,
+        node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
     ) -> Self {
         Self::new(
             cluster_id,
             node_id,
             display_name,
+            node_public_key,
             ClusterMemberRole::NonVoting,
             ClusterMemberState::Active,
             timestamp,
@@ -215,12 +213,14 @@ impl ClusterMemberRecord {
         cluster_id: ClusterId,
         node_id: NodeId,
         display_name: impl Into<String>,
+        node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
     ) -> Self {
         Self::new(
             cluster_id,
             node_id,
             display_name,
+            node_public_key,
             ClusterMemberRole::NonVoting,
             ClusterMemberState::Pending,
             timestamp,
@@ -231,6 +231,7 @@ impl ClusterMemberRecord {
         cluster_id: ClusterId,
         node_id: NodeId,
         display_name: impl Into<String>,
+        node_public_key: impl Into<String>,
         role: ClusterMemberRole,
         state: ClusterMemberState,
         timestamp: OffsetDateTime,
@@ -242,7 +243,7 @@ impl ClusterMemberRecord {
             role,
             state,
             trust_domain: TrustDomain::new("trust.local").expect("static trust domain"),
-            node_public_key: "pending-node-key".to_string(),
+            node_public_key: node_public_key.into(),
             certificate_id: None,
             capabilities: Vec::new(),
             allowed_capabilities: Vec::new(),
@@ -373,6 +374,7 @@ mod tests {
             "home",
             NodeId::new("node_desktop").expect("node"),
             "desktop",
+            "pk_desktop",
             timestamp,
         );
 
@@ -403,6 +405,8 @@ mod tests {
             expires_at: timestamp,
             trust_domain: TrustDomain::new("trust.local").expect("trust"),
             allowed_member_roles: vec![ClusterMemberRole::Learner],
+            issuer_node_id: NodeId::new("node_desktop").expect("node"),
+            issuer_public_key: "pk_desktop".to_string(),
             signature: "sig".to_string(),
         };
 

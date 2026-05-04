@@ -208,14 +208,13 @@ fn cluster_member(
     node_id: NodeId,
     display_name: &str,
 ) -> ClusterMemberRecord {
-    let mut member = ClusterMemberRecord::local_voter(
+    ClusterMemberRecord::local_voter(
         cluster_id,
         node_id,
         display_name,
+        format!("pk_{display_name}"),
         time::OffsetDateTime::now_utc(),
-    );
-    member.node_public_key = format!("pk_{display_name}");
-    member
+    )
 }
 
 fn start_three_nodes() -> (Vec<LocalhostKvNode>, Vec<SocketAddr>) {

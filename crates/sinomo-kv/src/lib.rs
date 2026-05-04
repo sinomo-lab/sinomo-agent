@@ -1014,6 +1014,7 @@ mod tests {
             ClusterId::new("cluster_home").expect("cluster"),
             node_id.clone(),
             "desktop",
+            "pk_desktop",
             OffsetDateTime::now_utc(),
         );
         let mut store = InProcessKvStore::new();
