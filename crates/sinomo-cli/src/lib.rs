@@ -587,6 +587,9 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
         path: layout.boot_dir.display().to_string(),
         detail: source.to_string(),
     })?;
+    if install_should_update_binary(&layout.binary)? {
+        stop_installed_daemons_for_update(layout)?;
+    }
     install_current_binary(&layout.binary)?;
     write_boot_entries(layout, &options)?;
     activate_boot_entries(layout);
@@ -661,14 +664,26 @@ fn uninstall_with_layout(
 }
 
 fn install_current_binary(destination: &Path) -> Result<(), CliError> {
-    let current = env::current_exe().map_err(|source| CliError::Io {
-        path: "current executable".to_string(),
-        detail: source.to_string(),
-    })?;
+    let current = current_executable_path()?;
     if same_path_if_exists(&current, destination) {
         return Ok(());
     }
     install_binary_atomically(&current, destination)
+}
+
+fn install_should_update_binary(destination: &Path) -> Result<bool, CliError> {
+    if !destination.exists() {
+        return Ok(false);
+    }
+    let current = current_executable_path()?;
+    Ok(!same_path_if_exists(&current, destination))
+}
+
+fn current_executable_path() -> Result<PathBuf, CliError> {
+    env::current_exe().map_err(|source| CliError::Io {
+        path: "current executable".to_string(),
+        detail: source.to_string(),
+    })
 }
 
 fn same_path_if_exists(left: &Path, right: &Path) -> bool {
@@ -893,6 +908,58 @@ fn ensure_installed_daemon_started(
     }
     start_installed_sinomo_daemon(&layout.binary, &layout.data_dir, args, paths, label)?;
     Ok(())
+}
+
+fn stop_installed_daemons_for_update(layout: &InstallLayout) -> Result<(), CliError> {
+    stop_daemon_before_install_update(
+        &DaemonPaths::with_root(layout.data_dir.join("shadow-daemon")),
+        "shadow daemon",
+    )?;
+    stop_daemon_before_install_update(
+        &DaemonPaths::with_root(layout.data_dir.join("daemon")),
+        "daemon",
+    )?;
+    Ok(())
+}
+
+fn stop_daemon_before_install_update(paths: &DaemonPaths, label: &str) -> Result<(), CliError> {
+    match probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => {
+            match send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT) {
+                Ok(_) => println!("sinomo {label} stop requested for binary update"),
+                Err(error) => {
+                    if matches!(
+                        probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT),
+                        DaemonProbeStatus::NotRunning
+                    ) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        DaemonProbeStatus::Locked { .. } => {
+            println!("sinomo {label} lock is held; waiting before binary update");
+        }
+        DaemonProbeStatus::NotRunning => return Ok(()),
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if matches!(
+            probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT),
+            DaemonProbeStatus::NotRunning
+        ) {
+            println!("sinomo {label} stopped");
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(CliError::Network {
+        address: paths.status.display().to_string(),
+        detail: format!("{label} did not stop before binary update"),
+    })
 }
 
 fn start_installed_sinomo_daemon(
@@ -8511,7 +8578,7 @@ fn print_install_help() {
         "  sinomo install [--host <host>] [--port <port>] [--shadow-port <port>] [--no-start]"
     );
     println!(
-        "      Create the data directory, copy the current binary, add boot entries for the main and shadow daemons, then start them."
+        "      Create or update the local install, add boot entries for the main and shadow daemons, then start them."
     );
     println!("  sinomo uninstall [--no-stop]");
     println!("      Remove Sinomo boot entries and stop daemons. The data directory is retained.");
@@ -8863,13 +8930,14 @@ mod tests {
         ProviderName, RolloutCliCommand, RolloutOptions, UninstallOptions,
         cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
         cluster_join_with_paths, decode_cluster_join_invite, handle_daemon_cluster_join,
-        install_with_layout, is_terminal_status, models_default_with_data_dir,
-        normalize_model_provider, parse_cli_command, parse_cluster_command,
-        parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
-        parse_install_options, parse_model_default_options, parse_models_list_options,
-        parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-        parse_uninstall_options, parse_usage_options, read_cluster_state, run_cui_with_handler_io,
-        run_cui_with_handler_io_and_daemon, run_evolve_command, uninstall_with_layout,
+        install_should_update_binary, install_with_layout, is_terminal_status,
+        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+        parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+        parse_dfs_command, parse_install_options, parse_model_default_options,
+        parse_models_list_options, parse_propose_options, parse_provider_command,
+        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+        read_cluster_state, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
+        run_evolve_command, uninstall_with_layout,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -9063,6 +9131,28 @@ mod tests {
         assert!(!layout.shadow_boot_entry.exists());
         assert!(layout.data_dir.exists());
         assert!(layout.binary.exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn install_detects_existing_binary_update() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-install-update-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let destination = root.join("bin").join(if cfg!(windows) {
+            "sinomo.exe"
+        } else {
+            "sinomo"
+        });
+
+        assert!(!install_should_update_binary(&destination).expect("missing destination"));
+        std::fs::create_dir_all(destination.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&destination, b"old binary").expect("write old binary");
+        assert!(install_should_update_binary(&destination).expect("existing destination"));
         std::fs::remove_dir_all(root).ok();
     }
 
