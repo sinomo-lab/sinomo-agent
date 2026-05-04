@@ -11653,6 +11653,55 @@ mod tests {
     }
 
     #[test]
+    fn read_cluster_state_accepts_legacy_unsigned_join_invite() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-legacy-cluster-state-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        std::fs::write(
+            &paths.state,
+            r#"{
+  "cluster_id": "cluster_legacy",
+  "cluster_name": "legacy",
+  "local_node_id": "node_legacy",
+  "local_node_display_name": "legacy node",
+  "bootstrap": {
+    "joined": {
+      "invite": {
+        "invite_id": "invite_legacy",
+        "cluster_id": "cluster_legacy",
+        "cluster_name": "legacy",
+        "introducers": [],
+        "token_id": "token_legacy",
+        "expires_at": "2026-05-05T08:52:04Z",
+        "trust_domain": "trust.local",
+        "allowed_member_roles": ["learner"],
+        "signature": "local-bootstrap-signature-pending"
+      }
+    }
+  },
+  "term": 1,
+  "kv_revision": 0,
+  "members": [],
+  "initialized_at": "2026-05-04T08:16:46Z",
+  "updated_at": "2026-05-04T11:45:01Z"
+}"#,
+        )
+        .expect("write legacy state");
+
+        let state = read_cluster_state(&paths).expect("legacy cluster state");
+        assert_eq!(state.cluster_id.as_str(), "cluster_legacy");
+        assert!(matches!(state.bootstrap, ClusterBootstrap::Joined { .. }));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-cli-install-{}",
