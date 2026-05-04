@@ -2219,10 +2219,23 @@ fn format_rollout_status(status: &ClusterNodeRolloutStatus) -> String {
 
 fn cluster_peers() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    refresh_cluster_kv_from_local_daemon(&paths)?;
-    let mut state = read_cluster_state(&paths)?;
+    let members = cluster_peer_members(&paths)?;
+    for member in members {
+        println!(
+            "{}\t{}\t{:?}\t{:?}",
+            member.node_id, member.display_name, member.role, member.state
+        );
+    }
+    Ok(())
+}
+
+fn cluster_peer_members(paths: &ClusterPaths) -> Result<Vec<ClusterMemberRecord>, CliError> {
+    refresh_cluster_kv_from_local_daemon(paths)?;
+    let mut state = read_cluster_state(paths)?;
     if matches!(state.bootstrap, ClusterBootstrap::Joined { .. }) {
-        reconcile_cluster_join_with_introducers(&mut state, Some(&paths))?;
+        if let Err(error) = reconcile_cluster_join_with_introducers(&mut state, Some(paths)) {
+            eprintln!("warning: could not refresh cluster membership from introducers: {error}");
+        }
         let (main_options, shadow_options) = local_daemon_cluster_options()?;
         ensure_daemon_cluster_members(
             &mut state,
@@ -2231,15 +2244,9 @@ fn cluster_peers() -> Result<(), CliError> {
             OffsetDateTime::now_utc(),
         );
         write_json(&paths.state, &state)?;
-        sync_cluster_state_to_kv(&paths, &state)?;
+        sync_cluster_state_to_kv(paths, &state)?;
     }
-    for member in state.members {
-        println!(
-            "{}\t{}\t{:?}\t{:?}",
-            member.node_id, member.display_name, member.role, member.state
-        );
-    }
-    Ok(())
+    Ok(state.members)
 }
 
 fn cluster_leave() -> Result<(), CliError> {
@@ -11479,29 +11486,29 @@ mod tests {
         RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
         UninstallOptions, authenticate_daemon_command, cli_command_requires_cluster_state,
         cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
-        daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
-        encode_cluster_join_invite, ensure_daemon_cluster_members, ensure_rollout_layout,
-        handle_daemon_cluster_join, handle_daemon_cluster_kv_txn, handle_daemon_cluster_sync,
-        handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
-        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
-        parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-        parse_daemon_command, parse_dfs_command, parse_install_options,
-        parse_model_default_options, parse_models_list_options, parse_propose_options,
-        parse_provider_command, parse_rollout_command, parse_slash_command,
+        cluster_peer_members, daemon_package_version, daemon_status_matches_options,
+        decode_cluster_join_invite, encode_cluster_join_invite, ensure_daemon_cluster_members,
+        ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_txn,
+        handle_daemon_cluster_sync, handle_daemon_rollout_build, install_should_update_binary,
+        install_with_layout, is_terminal_status, models_default_with_data_dir,
+        normalize_model_provider, parse_cli_command, parse_cluster_command,
+        parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
+        parse_install_options, parse_model_default_options, parse_models_list_options,
+        parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
         parse_uninstall_options, parse_usage_options, read_cluster_members_from_kv,
         read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
         refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
         run_cui_with_handler_io_and_daemon, run_evolve_command, sign_cluster_join_invite,
         sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
-        uninstall_with_layout,
+        uninstall_with_layout, write_json,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
     };
     use sinomo_runtime::core::{
-        ClusterBootstrap, ClusterId, ClusterInviteId, ClusterJoinInvite, ClusterMemberRole,
-        ClusterMemberState, ClusterNodeAvailability, EvolutionJobId, NodeId, SessionId,
-        TrustDomain, TrustRing,
+        ClusterBootstrap, ClusterBootstrapState, ClusterId, ClusterInviteId, ClusterJoinInvite,
+        ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
+        EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
     };
     use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
     use sinomo_runtime::kv::{KvCompare, KvOp, KvTxn};
@@ -11509,6 +11516,7 @@ mod tests {
     use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use time::OffsetDateTime;
 
     #[test]
     fn provider_commands_parse_action_before_provider() {
@@ -11698,6 +11706,64 @@ mod tests {
         let state = read_cluster_state(&paths).expect("legacy cluster state");
         assert_eq!(state.cluster_id.as_str(), "cluster_legacy");
         assert!(matches!(state.bootstrap, ClusterBootstrap::Joined { .. }));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_peer_members_tolerates_unreachable_join_introducers() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-peers-offline-introducer-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        cluster_init_with_paths(
+            ClusterInitOptions {
+                cluster_id: Some(ClusterId::new("cluster_peers_offline").expect("cluster")),
+                node_id: Some(NodeId::new("node_peers_host").expect("node")),
+                name: "offline peers".to_string(),
+            },
+            &paths,
+        )
+        .expect("cluster init");
+        let rendered = cluster_invite_with_paths(
+            ClusterInviteOptions {
+                ttl_seconds: 120,
+                introducers: vec!["127.0.0.1:1".to_string()],
+                output: None,
+            },
+            &paths,
+        )
+        .expect("cluster invite");
+        let mut state = ClusterBootstrapState::pending_join(
+            ClusterId::new("cluster_peers_offline").expect("cluster"),
+            "offline peers".to_string(),
+            NodeId::new("node_peers_joined").expect("node"),
+            "joined peer".to_string(),
+            "joined-public-key".to_string(),
+            rendered.invite,
+            OffsetDateTime::now_utc(),
+        );
+        state.members.push(ClusterMemberRecord::local_voter(
+            ClusterId::new("cluster_peers_offline").expect("cluster"),
+            NodeId::new("node_existing_peer").expect("node"),
+            "existing peer",
+            "existing-public-key",
+            OffsetDateTime::now_utc(),
+        ));
+        write_json(&paths.state, &state).expect("write joined state");
+        sync_cluster_state_to_kv(&paths, &state).expect("sync kv");
+
+        let members = cluster_peer_members(&paths).expect("peer members");
+
+        assert!(
+            members
+                .iter()
+                .any(|member| member.node_id == NodeId::new("node_peers_joined").expect("node"))
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
