@@ -587,8 +587,18 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
         path: layout.boot_dir.display().to_string(),
         detail: source.to_string(),
     })?;
-    if install_should_update_binary(&layout.binary)? {
-        stop_installed_daemons_for_update(layout)?;
+    let main_paths = DaemonPaths::with_root(layout.data_dir.join("daemon"));
+    let shadow_paths = DaemonPaths::with_root(layout.data_dir.join("shadow-daemon"));
+    let updating_binary = install_should_update_binary(&layout.binary)?;
+    let restarting_for_options =
+        options.start && install_running_daemons_need_restart(&options, &main_paths, &shadow_paths);
+    if updating_binary || restarting_for_options {
+        let reason = if updating_binary {
+            "binary update"
+        } else {
+            "install option update"
+        };
+        stop_installed_daemons_before_install(layout, reason)?;
     }
     install_current_binary(&layout.binary)?;
     write_boot_entries(layout, &options)?;
@@ -607,12 +617,7 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
             "--port".to_string(),
             options.port.to_string(),
         ];
-        ensure_installed_daemon_started(
-            layout,
-            &main_args,
-            &DaemonPaths::with_root(layout.data_dir.join("daemon")),
-            "daemon",
-        )?;
+        ensure_installed_daemon_started(layout, &main_args, &main_paths, "daemon")?;
         let shadow_args = vec![
             "daemon".to_string(),
             "shadow".to_string(),
@@ -622,12 +627,7 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
             "--port".to_string(),
             options.shadow_port.to_string(),
         ];
-        ensure_installed_daemon_started(
-            layout,
-            &shadow_args,
-            &DaemonPaths::with_root(layout.data_dir.join("shadow-daemon")),
-            "shadow daemon",
-        )?;
+        ensure_installed_daemon_started(layout, &shadow_args, &shadow_paths, "shadow daemon")?;
     }
     Ok(())
 }
@@ -677,6 +677,40 @@ fn install_should_update_binary(destination: &Path) -> Result<bool, CliError> {
     }
     let current = current_executable_path()?;
     Ok(!same_path_if_exists(&current, destination))
+}
+
+fn install_running_daemons_need_restart(
+    options: &InstallOptions,
+    main_paths: &DaemonPaths,
+    shadow_paths: &DaemonPaths,
+) -> bool {
+    daemon_probe_status_needs_install_restart(
+        probe_daemon_status(main_paths, DAEMON_PROBE_TIMEOUT),
+        &options.host,
+        options.port,
+    ) || daemon_probe_status_needs_install_restart(
+        probe_daemon_status(shadow_paths, DAEMON_PROBE_TIMEOUT),
+        &options.host,
+        options.shadow_port,
+    )
+}
+
+fn daemon_probe_status_needs_install_restart(
+    status: DaemonProbeStatus,
+    host: &str,
+    port: u16,
+) -> bool {
+    match status {
+        DaemonProbeStatus::Running(status)
+        | DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => !daemon_status_matches_options(&status, host, port),
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => false,
+    }
+}
+
+fn daemon_status_matches_options(status: &DaemonStatus, host: &str, port: u16) -> bool {
+    status.host == host && status.port == port
 }
 
 fn current_executable_path() -> Result<PathBuf, CliError> {
@@ -910,23 +944,32 @@ fn ensure_installed_daemon_started(
     Ok(())
 }
 
-fn stop_installed_daemons_for_update(layout: &InstallLayout) -> Result<(), CliError> {
-    stop_daemon_before_install_update(
+fn stop_installed_daemons_before_install(
+    layout: &InstallLayout,
+    reason: &str,
+) -> Result<(), CliError> {
+    stop_daemon_before_install(
         &DaemonPaths::with_root(layout.data_dir.join("shadow-daemon")),
         "shadow daemon",
+        reason,
     )?;
-    stop_daemon_before_install_update(
+    stop_daemon_before_install(
         &DaemonPaths::with_root(layout.data_dir.join("daemon")),
         "daemon",
+        reason,
     )?;
     Ok(())
 }
 
-fn stop_daemon_before_install_update(paths: &DaemonPaths, label: &str) -> Result<(), CliError> {
+fn stop_daemon_before_install(
+    paths: &DaemonPaths,
+    label: &str,
+    reason: &str,
+) -> Result<(), CliError> {
     match probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT) {
         DaemonProbeStatus::Running(status) => {
             match send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT) {
-                Ok(_) => println!("sinomo {label} stop requested for binary update"),
+                Ok(_) => println!("sinomo {label} stop requested for {reason}"),
                 Err(error) => {
                     if matches!(
                         probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT),
@@ -939,7 +982,7 @@ fn stop_daemon_before_install_update(paths: &DaemonPaths, label: &str) -> Result
             }
         }
         DaemonProbeStatus::Locked { .. } => {
-            println!("sinomo {label} lock is held; waiting before binary update");
+            println!("sinomo {label} lock is held; waiting before {reason}");
         }
         DaemonProbeStatus::NotRunning => return Ok(()),
     }
@@ -958,7 +1001,7 @@ fn stop_daemon_before_install_update(paths: &DaemonPaths, label: &str) -> Result
 
     Err(CliError::Network {
         address: paths.status.display().to_string(),
-        detail: format!("{label} did not stop before binary update"),
+        detail: format!("{label} did not stop before {reason}"),
     })
 }
 
@@ -986,8 +1029,10 @@ fn start_installed_sinomo_daemon(
         if let DaemonProbeStatus::Running(status) = probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT)
         {
             println!(
-                "sinomo {label} started: pid={} address={}",
-                status.pid, status.address
+                "sinomo {label} started: pid={} bind={} control={}",
+                status.pid,
+                daemon_bind_address(&status),
+                status.address
             );
             return Ok(());
         }
@@ -2155,6 +2200,10 @@ fn daemon_connect_address(host: &str, port: u16) -> String {
     format!("{connect_host}:{port}")
 }
 
+fn daemon_bind_address(status: &DaemonStatus) -> String {
+    format!("{}:{}", status.host, status.port)
+}
+
 fn parse_daemon_command(args: &[String]) -> Result<DaemonCliCommand, CliError> {
     match args.split_first() {
         None => Ok(DaemonCliCommand::Help),
@@ -2525,8 +2574,10 @@ fn start_daemon_with_paths(
             probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
         {
             println!(
-                "sinomo {label} started: pid={} address={}",
-                status.pid, status.address
+                "sinomo {label} started: pid={} bind={} control={}",
+                status.pid,
+                daemon_bind_address(&status),
+                status.address
             );
             return Ok(());
         }
@@ -2560,7 +2611,8 @@ fn print_daemon_status_with_paths(
         DaemonProbeStatus::Running(status) => {
             println!("sinomo {label} is running");
             println!("  pid: {}", status.pid);
-            println!("  address: {}", status.address);
+            println!("  bind: {}", daemon_bind_address(&status));
+            println!("  control address: {}", status.address);
             if let Some(cluster) = &status.cluster {
                 println!("  cluster: {}", cluster.cluster_id);
                 println!("  node: {}", cluster.node_id);
@@ -2579,7 +2631,8 @@ fn print_daemon_status_with_paths(
             println!("sinomo {label} lock is held but the listener did not answer");
             if let Some(status) = status {
                 println!("  pid: {}", status.pid);
-                println!("  address: {}", status.address);
+                println!("  bind: {}", daemon_bind_address(&status));
+                println!("  control address: {}", status.address);
                 if let Some(cluster) = &status.cluster {
                     println!("  cluster: {}", cluster.cluster_id);
                     println!("  node: {}", cluster.node_id);
@@ -2591,8 +2644,9 @@ fn print_daemon_status_with_paths(
                     );
                 }
             } else {
+                println!("  default bind: {}:{}", options.host, options.port);
                 println!(
-                    "  address: {}",
+                    "  default control address: {}",
                     daemon_connect_address(&options.host, options.port)
                 );
             }
@@ -2601,8 +2655,9 @@ fn print_daemon_status_with_paths(
         }
         DaemonProbeStatus::NotRunning => {
             println!("sinomo {label} is not running");
+            println!("  default bind: {}:{}", options.host, options.port);
             println!(
-                "  default address: {}",
+                "  default control address: {}",
                 daemon_connect_address(&options.host, options.port)
             );
             Ok(())
@@ -3593,8 +3648,10 @@ fn start_daemon_binary(
             probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
         {
             println!(
-                "{label} healthy: pid={} address={}",
-                status.pid, status.address
+                "{label} healthy: pid={} bind={} control={}",
+                status.pid,
+                daemon_bind_address(&status),
+                status.address
             );
             return Ok(());
         }
@@ -3618,8 +3675,10 @@ fn wait_for_main_daemon_health(options: &RolloutOptions) -> Result<(), CliError>
             probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
         {
             println!(
-                "main daemon healthy: pid={} address={}",
-                status.pid, status.address
+                "main daemon healthy: pid={} bind={} control={}",
+                status.pid,
+                daemon_bind_address(&status),
+                status.address
             );
             return Ok(());
         }
@@ -9053,13 +9112,13 @@ mod tests {
         ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
         ProviderName, RolloutCliCommand, RolloutOptions, UninstallOptions,
         cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
-        cluster_join_with_paths, decode_cluster_join_invite, encode_cluster_join_invite,
-        handle_daemon_cluster_join, install_should_update_binary, install_with_layout,
-        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
-        parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-        parse_daemon_command, parse_dfs_command, parse_install_options,
-        parse_model_default_options, parse_models_list_options, parse_propose_options,
-        parse_provider_command, parse_rollout_command, parse_slash_command,
+        cluster_join_with_paths, daemon_status_matches_options, decode_cluster_join_invite,
+        encode_cluster_join_invite, handle_daemon_cluster_join, install_should_update_binary,
+        install_with_layout, is_terminal_status, models_default_with_data_dir,
+        normalize_model_provider, parse_cli_command, parse_cluster_command,
+        parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
+        parse_install_options, parse_model_default_options, parse_models_list_options,
+        parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
         parse_uninstall_options, parse_usage_options, read_cluster_state, run_cui_with_handler_io,
         run_cui_with_handler_io_and_daemon, run_evolve_command, uninstall_with_layout,
     };
@@ -9278,6 +9337,24 @@ mod tests {
         std::fs::write(&destination, b"old binary").expect("write old binary");
         assert!(install_should_update_binary(&destination).expect("existing destination"));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn install_detects_daemon_option_mismatch() {
+        let status = DaemonStatus {
+            pid: 4242,
+            host: "127.0.0.1".to_string(),
+            port: 21_353,
+            address: "127.0.0.1:21353".to_string(),
+            started_at: "2026-05-04T00:00:00Z".to_string(),
+            data_dir: PathBuf::from("data"),
+            lock_file: PathBuf::from("data/daemon/daemon.lock"),
+            cluster: None,
+        };
+
+        assert!(daemon_status_matches_options(&status, "127.0.0.1", 21_353));
+        assert!(!daemon_status_matches_options(&status, "0.0.0.0", 21_353));
+        assert!(!daemon_status_matches_options(&status, "127.0.0.1", 21_354));
     }
 
     #[test]
