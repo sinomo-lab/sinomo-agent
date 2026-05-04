@@ -25,6 +25,7 @@ Commands:
 ```text
 sinomo cluster
 sinomo cluster init [--name <name>] [--cluster-id cluster_...] [--node-id node_...]
+sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]
 sinomo cluster join <invite> [--name <name>] [--cluster-id cluster_...] [--node-id node_...]
 sinomo cluster status
 sinomo cluster peers
@@ -39,6 +40,24 @@ An uninitialized node is an orphan. Orphan nodes must not run distributed operat
 - local help and credential setup commands that do not mutate cluster state
 
 `sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves the node into pending learner state until the cluster control plane accepts it.
+
+`sinomo cluster invite` creates a portable `sinomo-join://v1/...` invite. For a remote machine on the same LAN, the initialized machine should include an address reachable from the remote host:
+
+```text
+sinomo cluster invite --introducer 192.168.1.10:21353 --output join.txt
+```
+
+The remote machine can then run:
+
+```text
+sinomo cluster join <sinomo-join://v1/...> --name <remote-name>
+```
+
+or, if the invite was copied as a file:
+
+```text
+sinomo cluster join join.txt --name <remote-name>
+```
 
 Initial local state lives at:
 
@@ -111,6 +130,7 @@ The first node is both control-plane voter and data-plane participant. Additiona
 Invite payload fields:
 
 - `cluster_id`
+- optional `cluster_name`
 - introducer endpoints
 - join token ID
 - token expiry
@@ -443,6 +463,6 @@ Phase 5, DFS integration:
 
 Phase 6, operations:
 
-- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands.
+- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local bootstrap invites; approval, revocation, and promotion remain future work.
 - Add snapshot export/import.
 - Add metrics and event traces for elections, watches, membership changes, and replication lag.

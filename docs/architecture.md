@@ -77,6 +77,17 @@ Each daemon instance owns `$SINOMO_DATA_DIR/daemon/daemon.lock` and writes `$SIN
 
 The main daemon and shadow daemon are separate cluster nodes that share the same local data directory. `sinomo cluster init` records the main daemon as the local voter node and records a derived `<main-node-id>-shadow` node for the shadow daemon. The shadow node is active but non-voting: it can receive and send cluster communications for supervision, recovery, and rollout coordination, but it does not participate in KV quorum, scheduling, DFS ownership, or normal workload placement.
 
+The default `sinomo` command is daemon-first. When the local main daemon is running and registered with a cluster, the CLI treats that daemon as the local cluster runtime for the orphan guard and starts the CUI session under the daemon's cluster node identity. If no daemon is reachable, the CLI falls back to the local bootstrap state and reports the normal orphan guidance when neither path exists. Explicit lifecycle commands such as `sinomo daemon run`, `sinomo daemon start`, and `sinomo install` remain opt-in process-management operations.
+
+`sinomo install` promotes the current binary into the local data directory and wires both daemons into local boot startup:
+
+- `sinomo install [--host <host>] [--port <port>] [--shadow-port <port>] [--no-start]`
+- `sinomo uninstall [--no-stop]`
+
+Install creates `$SINOMO_DATA_DIR`, copies the current executable to `$SINOMO_DATA_DIR/bin/sinomo`, writes a boot entry for the main daemon and a boot entry for the shadow daemon, and starts both daemons unless `--no-start` is set. The install default bind host is `0.0.0.0` so a freshly installed node can accept LAN cluster traffic; explicit operators can use `--host 127.0.0.1` for local-only installs.
+
+On Windows the boot entries are per-user Startup `.cmd` files because the binary does not yet implement the Windows Service Control Manager protocol and service registration commonly requires elevated privileges. On Unix-like systems the boot entries are systemd user service files when a user systemd config directory is available; install best-effort enables those user units, and uninstall best-effort disables them. `sinomo uninstall` removes only those boot entries and optionally stops the daemons; it intentionally retains `$SINOMO_DATA_DIR` and the installed binary so cluster identity, KV state, and local metadata survive reinstall.
+
 ### Self-Rollout Source and Shadow Daemon
 
 The first self-rollout path treats Sinomo's own source as durable node-local state. `sinomo rollout init-source` creates `$SINOMO_DATA_DIR/source/sinomo` by cloning the current repository unless a different `--repo` is supplied. When `sinomo evolve propose` does not receive an explicit `--repo` or configured repo, it uses this data-directory source repository so approved self-evolution work lands in Sinomo's maintained source rather than the operator's checkout.
@@ -85,11 +96,14 @@ Approved evolution decisions commit the candidate worktree and fast-forward the 
 
 - `sinomo rollout status` prints the data-directory source, installed main binary, installed shadow binary, and rollout state paths.
 - `sinomo rollout apply` builds `$SINOMO_DATA_DIR/source/sinomo` with `cargo build -p sinomo`.
+- `sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>]` supports development clusters where each node has been installed with `sinomo install` and at least the initiating node has a fresh checkout. The initiating CLI builds the repo or reads the supplied binary, pushes that binary to each local/discovered/explicit target daemon, and each target starts the new binary through its local shadow daemon.
 - The build log is written to `$SINOMO_DATA_DIR/rollout/build.log`.
 - The produced binary is copied atomically to `$SINOMO_DATA_DIR/bin/sinomo-main` and `$SINOMO_DATA_DIR/bin/sinomo-shadow`.
 - The main daemon is stopped, the shadow daemon is restarted from the installed shadow binary, and the shadow daemon starts the installed main binary and verifies it becomes healthy.
 
 The shadow daemon owns separate state under `$SINOMO_DATA_DIR/shadow-daemon/` so it does not contend with the main daemon's lock. Its steady-state responsibility is intentionally narrow: it supervises the main daemon process that it launched. If that process exits with a crash-class exit code or crash-class Unix signal, the shadow daemon records `$SINOMO_DATA_DIR/rollout/last-main-exit.json` and restarts the main daemon. If the main daemon exits cleanly or is terminated/killed by operator action, the shadow daemon records the event and does not restart it. This preserves a difference between real crashes and intentional intervention.
+
+For development cluster rollout, explicit `--target <host:port>` is the practical path until full membership reconciliation is online. Cluster metadata endpoints are also used when present, but a node that has only recorded a local pending join may not yet be visible to the initiating node. The remote daemon writes versioned `sinomo-main-*` and `sinomo-shadow-*` binaries under its data directory so Windows can accept upgrades even when the old executable is still locked.
 
 ### Device Model
 

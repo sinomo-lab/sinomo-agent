@@ -1,5 +1,6 @@
 //! Shared Sinomo command-line handlers.
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
@@ -34,7 +35,7 @@ use sinomo_runtime::core::{
     DfsFileSystemId, DfsObjectId, EvaluationGate, EvaluationOutcome, EvaluationScorecard,
     EventEnvelope, EventId, EventKind, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
     LatencyClass, MutationPacket, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
-    SessionId, Source, TrustRing, VerificationCommand,
+    SessionId, Source, TrustDomain, TrustRing, VerificationCommand,
 };
 use sinomo_runtime::dfs::{
     DfsMetadataShardId, DfsOperatorInspector, DfsPinMode, DfsPinRecord, LocalDfsPinStore,
@@ -51,11 +52,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -69,7 +72,7 @@ fn run_cli_command(args: &[String]) -> Result<(), CliError> {
 
 fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
     if cli_command_requires_cluster_state(&command) {
-        require_cluster_bootstrap_state()?;
+        require_cluster_runtime_state()?;
     }
 
     match command {
@@ -79,6 +82,12 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
             Ok(())
         }
         CliCommand::Cluster(command) => run_cluster_cli_command(command),
+        CliCommand::InstallHelp => {
+            print_install_help();
+            Ok(())
+        }
+        CliCommand::Install(options) => install(options),
+        CliCommand::Uninstall(options) => uninstall(options),
         CliCommand::Evolve(command) => run_evolve_cli_command(command),
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
@@ -107,6 +116,9 @@ enum CliCommand {
     Cui,
     Help,
     Cluster(ClusterCliCommand),
+    InstallHelp,
+    Install(InstallOptions),
+    Uninstall(UninstallOptions),
     Evolve(EvolveCliCommand),
     Daemon(DaemonCliCommand),
     Rollout(RolloutCliCommand),
@@ -124,6 +136,18 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
         }
         Some((command, rest)) if command == "cluster" => {
             Ok(CliCommand::Cluster(parse_cluster_command(rest)?))
+        }
+        Some((command, rest)) if command == "install" && is_help_args(rest) => {
+            Ok(CliCommand::InstallHelp)
+        }
+        Some((command, rest)) if command == "install" => {
+            Ok(CliCommand::Install(parse_install_options(rest)?))
+        }
+        Some((command, rest)) if command == "uninstall" && is_help_args(rest) => {
+            Ok(CliCommand::InstallHelp)
+        }
+        Some((command, rest)) if command == "uninstall" => {
+            Ok(CliCommand::Uninstall(parse_uninstall_options(rest)?))
         }
         Some((command, rest)) if command == "evolve" => {
             Ok(CliCommand::Evolve(parse_evolve_command(rest)?))
@@ -148,19 +172,116 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
     }
 }
 
+fn is_help_args(args: &[String]) -> bool {
+    matches!(args, [arg] if matches!(arg.as_str(), "help" | "--help" | "-h"))
+}
+
 const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
 const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const SHADOW_MAIN_HOST_ENV: &str = "SINOMO_SHADOW_MAIN_HOST";
 const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
+const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
 const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
+const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
+const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
+const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
+const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
+const INSTALL_MAIN_BOOT_NAME: &str = "Sinomo Daemon";
+const INSTALL_SHADOW_BOOT_NAME: &str = "Sinomo Shadow Daemon";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstallOptions {
+    host: String,
+    port: u16,
+    shadow_port: u16,
+    start: bool,
+}
+
+impl Default for InstallOptions {
+    fn default() -> Self {
+        Self {
+            host: INSTALL_DEFAULT_HOST.to_string(),
+            port: SINOMO_DAEMON_DEFAULT_PORT,
+            shadow_port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+            start: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UninstallOptions {
+    stop: bool,
+}
+
+impl Default for UninstallOptions {
+    fn default() -> Self {
+        Self { stop: true }
+    }
+}
+
+fn parse_install_options(args: &[String]) -> Result<InstallOptions, CliError> {
+    let mut options = InstallOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "help" | "--help" | "-h" if args.len() == 1 => return Err(CliError::Usage),
+            "--host" => {
+                index += 1;
+                let Some(host) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.host = host.clone();
+            }
+            "--port" => {
+                index += 1;
+                let Some(port) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.port = parse_port("install port", port)?;
+            }
+            "--shadow-port" => {
+                index += 1;
+                let Some(port) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.shadow_port = parse_port("install shadow port", port)?;
+            }
+            "--no-start" => options.start = false,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_uninstall_options(args: &[String]) -> Result<UninstallOptions, CliError> {
+    let mut options = UninstallOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "help" | "--help" | "-h" if args.len() == 1 => return Err(CliError::Usage),
+            "--no-stop" => options.stop = false,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_port(label: &str, value: &str) -> Result<u16, CliError> {
+    value.parse::<u16>().map_err(|source| CliError::Parse {
+        detail: format!("invalid {label} `{value}`: {source}"),
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClusterCliCommand {
     Help,
     Init(ClusterInitOptions),
+    Invite(ClusterInviteOptions),
     Join(ClusterJoinOptions),
     Status,
     Peers,
@@ -193,9 +314,27 @@ struct ClusterJoinOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterInviteOptions {
+    ttl_seconds: i64,
+    introducers: Vec<String>,
+    output: Option<PathBuf>,
+}
+
+impl Default for ClusterInviteOptions {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: CLUSTER_INVITE_DEFAULT_TTL_SECONDS,
+            introducers: Vec::new(),
+            output: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ClusterPaths {
     root: PathBuf,
     state: PathBuf,
+    invites: PathBuf,
 }
 
 impl ClusterPaths {
@@ -203,6 +342,7 @@ impl ClusterPaths {
         let root = data_dir.root().join("cluster");
         Self {
             state: root.join("state.json"),
+            invites: root.join("invites"),
             root,
         }
     }
@@ -212,6 +352,10 @@ impl ClusterPaths {
             path: self.root.display().to_string(),
             detail: source.to_string(),
         })
+    }
+
+    fn invite_path(&self, invite_id: &sinomo_runtime::core::ClusterInviteId) -> PathBuf {
+        self.invites.join(format!("{}.json", invite_id.as_str()))
     }
 }
 
@@ -224,6 +368,9 @@ fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand, CliError>
         Some((command, rest)) if command == "init" => {
             Ok(ClusterCliCommand::Init(parse_cluster_init_options(rest)?))
         }
+        Some((command, rest)) if command == "invite" => Ok(ClusterCliCommand::Invite(
+            parse_cluster_invite_options(rest)?,
+        )),
         Some((command, rest)) if command == "join" => {
             Ok(ClusterCliCommand::Join(parse_cluster_join_options(rest)?))
         }
@@ -264,6 +411,46 @@ fn parse_cluster_init_options(args: &[String]) -> Result<ClusterInitOptions, Cli
                     return Err(CliError::Usage);
                 };
                 options.name = non_empty_cluster_name(name)?;
+            }
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_cluster_invite_options(args: &[String]) -> Result<ClusterInviteOptions, CliError> {
+    let mut options = ClusterInviteOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--ttl-seconds" => {
+                index += 1;
+                let Some(ttl) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.ttl_seconds = ttl.parse::<i64>().map_err(|source| CliError::Parse {
+                    detail: format!("invalid invite ttl `{ttl}`: {source}"),
+                })?;
+                if options.ttl_seconds <= 0 {
+                    return Err(CliError::Parse {
+                        detail: "invite ttl must be greater than zero seconds".to_string(),
+                    });
+                }
+            }
+            "--introducer" => {
+                index += 1;
+                let Some(introducer) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.introducers.push(non_empty_address(introducer)?);
+            }
+            "--output" => {
+                index += 1;
+                let Some(output) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.output = Some(PathBuf::from(output));
             }
             _ => return Err(CliError::Usage),
         }
@@ -338,6 +525,417 @@ fn non_empty_cluster_name(name: &str) -> Result<String, CliError> {
     Ok(name.to_string())
 }
 
+fn non_empty_address(address: &str) -> Result<String, CliError> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err(CliError::Parse {
+            detail: "cluster introducer address cannot be empty".to_string(),
+        });
+    }
+    Ok(address.to_string())
+}
+
+fn format_rfc3339(timestamp: OffsetDateTime) -> String {
+    timestamp
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstallLayout {
+    data_dir: PathBuf,
+    bin_dir: PathBuf,
+    binary: PathBuf,
+    boot_dir: PathBuf,
+    main_boot_entry: PathBuf,
+    shadow_boot_entry: PathBuf,
+}
+
+impl InstallLayout {
+    fn new(data_dir: &SinomoDataDir, boot_dir: PathBuf) -> Self {
+        let data_root = data_dir.root();
+        let bin_dir = data_root.join("bin");
+        let binary = bin_dir.join(format!("sinomo{}", env::consts::EXE_SUFFIX));
+        let main_boot_entry = boot_entry_path(&boot_dir, INSTALL_MAIN_BOOT_NAME);
+        let shadow_boot_entry = boot_entry_path(&boot_dir, INSTALL_SHADOW_BOOT_NAME);
+        Self {
+            data_dir: data_root,
+            bin_dir,
+            binary,
+            boot_dir,
+            main_boot_entry,
+            shadow_boot_entry,
+        }
+    }
+}
+
+fn install(options: InstallOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let boot_dir = default_boot_dir(&data_dir)?;
+    let layout = InstallLayout::new(&data_dir, boot_dir);
+    install_with_layout(options, &layout)
+}
+
+fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Result<(), CliError> {
+    fs::create_dir_all(&layout.bin_dir).map_err(|source| CliError::Io {
+        path: layout.bin_dir.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    fs::create_dir_all(&layout.boot_dir).map_err(|source| CliError::Io {
+        path: layout.boot_dir.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    install_current_binary(&layout.binary)?;
+    write_boot_entries(layout, &options)?;
+    activate_boot_entries(layout);
+    println!("installed binary: {}", layout.binary.display());
+    println!("boot entry: {}", layout.main_boot_entry.display());
+    println!("boot entry: {}", layout.shadow_boot_entry.display());
+    println!("data directory retained at: {}", layout.data_dir.display());
+
+    if options.start {
+        let main_args = vec![
+            "daemon".to_string(),
+            "start".to_string(),
+            "--host".to_string(),
+            options.host.clone(),
+            "--port".to_string(),
+            options.port.to_string(),
+        ];
+        ensure_installed_daemon_started(
+            layout,
+            &main_args,
+            &DaemonPaths::with_root(layout.data_dir.join("daemon")),
+            "daemon",
+        )?;
+        let shadow_args = vec![
+            "daemon".to_string(),
+            "shadow".to_string(),
+            "start".to_string(),
+            "--host".to_string(),
+            options.host.clone(),
+            "--port".to_string(),
+            options.shadow_port.to_string(),
+        ];
+        ensure_installed_daemon_started(
+            layout,
+            &shadow_args,
+            &DaemonPaths::with_root(layout.data_dir.join("shadow-daemon")),
+            "shadow daemon",
+        )?;
+    }
+    Ok(())
+}
+
+fn uninstall(options: UninstallOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let boot_dir = default_boot_dir(&data_dir)?;
+    let layout = InstallLayout::new(&data_dir, boot_dir);
+    uninstall_with_layout(options, &layout)
+}
+
+fn uninstall_with_layout(
+    options: UninstallOptions,
+    layout: &InstallLayout,
+) -> Result<(), CliError> {
+    if options.stop {
+        stop_daemon_if_running(
+            &DaemonPaths::with_root(layout.data_dir.join("shadow-daemon")),
+            "shadow daemon",
+        )?;
+        stop_daemon_if_running(
+            &DaemonPaths::with_root(layout.data_dir.join("daemon")),
+            "daemon",
+        )?;
+    }
+    deactivate_boot_entries(layout);
+    remove_boot_entry(&layout.main_boot_entry)?;
+    remove_boot_entry(&layout.shadow_boot_entry)?;
+    println!("removed boot entry: {}", layout.main_boot_entry.display());
+    println!("removed boot entry: {}", layout.shadow_boot_entry.display());
+    println!("data directory retained at: {}", layout.data_dir.display());
+    Ok(())
+}
+
+fn install_current_binary(destination: &Path) -> Result<(), CliError> {
+    let current = env::current_exe().map_err(|source| CliError::Io {
+        path: "current executable".to_string(),
+        detail: source.to_string(),
+    })?;
+    if same_path_if_exists(&current, destination) {
+        return Ok(());
+    }
+    install_binary_atomically(&current, destination)
+}
+
+fn same_path_if_exists(left: &Path, right: &Path) -> bool {
+    let Ok(left) = fs::canonicalize(left) else {
+        return false;
+    };
+    let Ok(right) = fs::canonicalize(right) else {
+        return false;
+    };
+    left == right
+}
+
+fn default_boot_dir(data_dir: &SinomoDataDir) -> Result<PathBuf, CliError> {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = env::var("APPDATA") {
+            let appdata = appdata.trim();
+            if !appdata.is_empty() {
+                return Ok(PathBuf::from(appdata)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Start Menu")
+                    .join("Programs")
+                    .join("Startup"));
+            }
+        }
+        Ok(data_dir.root().join("startup"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+            let config_home = config_home.trim();
+            if !config_home.is_empty() {
+                return Ok(PathBuf::from(config_home).join("systemd").join("user"));
+            }
+        }
+        if let Ok(home) = env::var("HOME") {
+            let home = home.trim();
+            if !home.is_empty() {
+                return Ok(PathBuf::from(home)
+                    .join(".config")
+                    .join("systemd")
+                    .join("user"));
+            }
+        }
+        Ok(data_dir.root().join("startup"))
+    }
+}
+
+fn boot_entry_path(boot_dir: &Path, name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        boot_dir.join(format!("{name}.cmd"))
+    }
+    #[cfg(not(windows))]
+    {
+        let file_name = name.to_ascii_lowercase().replace(' ', "-");
+        boot_dir.join(format!("{file_name}.service"))
+    }
+}
+
+fn write_boot_entries(layout: &InstallLayout, options: &InstallOptions) -> Result<(), CliError> {
+    #[cfg(windows)]
+    let main_command_prefix = ["daemon", "start"];
+    #[cfg(not(windows))]
+    let main_command_prefix = ["daemon", "run"];
+    #[cfg(windows)]
+    let shadow_command_prefix = ["daemon", "shadow", "start"];
+    #[cfg(not(windows))]
+    let shadow_command_prefix = ["daemon", "shadow", "run"];
+
+    write_boot_entry(
+        &layout.main_boot_entry,
+        &layout.data_dir,
+        &layout.binary,
+        &main_command_prefix,
+        &options.host,
+        options.port,
+        "Sinomo daemon",
+    )?;
+    write_boot_entry(
+        &layout.shadow_boot_entry,
+        &layout.data_dir,
+        &layout.binary,
+        &shadow_command_prefix,
+        &options.host,
+        options.shadow_port,
+        "Sinomo shadow daemon",
+    )
+}
+
+fn write_boot_entry(
+    path: &Path,
+    data_dir: &Path,
+    binary: &Path,
+    command_prefix: &[&str],
+    host: &str,
+    port: u16,
+    description: &str,
+) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let content = boot_entry_content(data_dir, binary, command_prefix, host, port, description);
+    fs::write(path, content).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn boot_entry_content(
+    data_dir: &Path,
+    binary: &Path,
+    command_prefix: &[&str],
+    host: &str,
+    port: u16,
+    description: &str,
+) -> String {
+    let command = command_prefix.join(" ");
+    #[cfg(windows)]
+    {
+        let _ = description;
+        format!(
+            "@echo off\r\nset \"SINOMO_DATA_DIR={}\"\r\n\"{}\" {} --host {} --port {}\r\n",
+            data_dir.display(),
+            binary.display(),
+            command,
+            host,
+            port
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "[Unit]\nDescription={description}\n\n[Service]\nEnvironment=SINOMO_DATA_DIR={}\nExecStart={} {} --host {} --port {}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+            data_dir.display(),
+            binary.display(),
+            command,
+            host,
+            port
+        )
+    }
+}
+
+fn remove_boot_entry(path: &Path) -> Result<(), CliError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn activate_boot_entries(_layout: &InstallLayout) {}
+
+#[cfg(not(windows))]
+fn activate_boot_entries(layout: &InstallLayout) {
+    systemctl_user_best_effort(&["daemon-reload"]);
+    for entry in [&layout.main_boot_entry, &layout.shadow_boot_entry] {
+        let Some(unit) = entry.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        systemctl_user_best_effort(&["enable", unit]);
+    }
+}
+
+#[cfg(windows)]
+fn deactivate_boot_entries(_layout: &InstallLayout) {}
+
+#[cfg(not(windows))]
+fn deactivate_boot_entries(layout: &InstallLayout) {
+    for entry in [&layout.main_boot_entry, &layout.shadow_boot_entry] {
+        let Some(unit) = entry.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        systemctl_user_best_effort(&["disable", unit]);
+    }
+    systemctl_user_best_effort(&["daemon-reload"]);
+}
+
+#[cfg(not(windows))]
+fn systemctl_user_best_effort(args: &[&str]) {
+    let output = Command::new("systemctl").arg("--user").args(args).output();
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!(
+                "warning: systemctl --user {} failed: {}",
+                args.join(" "),
+                stderr.trim()
+            );
+        }
+        Err(source) => {
+            println!(
+                "warning: systemctl --user {} could not run: {}",
+                args.join(" "),
+                source
+            );
+        }
+    }
+}
+
+fn ensure_installed_daemon_started(
+    layout: &InstallLayout,
+    args: &[String],
+    paths: &DaemonPaths,
+    label: &str,
+) -> Result<(), CliError> {
+    if matches!(
+        probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT),
+        DaemonProbeStatus::Running(_)
+    ) {
+        println!("sinomo {label} already running");
+        return Ok(());
+    }
+    run_installed_sinomo(&layout.binary, &layout.data_dir, args)?;
+    println!("sinomo {label} start requested");
+    Ok(())
+}
+
+fn run_installed_sinomo(binary: &Path, data_dir: &Path, args: &[String]) -> Result<(), CliError> {
+    let output = Command::new(binary)
+        .args(args)
+        .env("SINOMO_DATA_DIR", data_dir)
+        .output()
+        .map_err(|source| CliError::Io {
+            path: binary.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Process {
+            command: format!("{} {}", binary.display(), args.join(" ")),
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        println!("{}", stdout.trim());
+    }
+    Ok(())
+}
+
+fn stop_daemon_if_running(paths: &DaemonPaths, label: &str) -> Result<(), CliError> {
+    match probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => {
+            let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT)?;
+            println!("sinomo {label} stop requested");
+            Ok(())
+        }
+        DaemonProbeStatus::Locked { .. } => {
+            println!("sinomo {label} lock is held; boot entry removal will continue");
+            Ok(())
+        }
+        DaemonProbeStatus::NotRunning => {
+            println!("sinomo {label} is not running");
+            Ok(())
+        }
+    }
+}
+
 fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), CliError> {
     match command {
         ClusterCliCommand::Help => {
@@ -345,6 +943,7 @@ fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), CliError> {
             Ok(())
         }
         ClusterCliCommand::Init(options) => cluster_init(options),
+        ClusterCliCommand::Invite(options) => cluster_invite(options),
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Status => cluster_status(),
         ClusterCliCommand::Peers => cluster_peers(),
@@ -361,6 +960,15 @@ fn cluster_paths_from_defaults() -> Result<ClusterPaths, CliError> {
 fn require_cluster_bootstrap_state() -> Result<ClusterBootstrapState, CliError> {
     let paths = cluster_paths_from_defaults()?;
     read_cluster_state(&paths)
+}
+
+fn require_cluster_runtime_state() -> Result<(), CliError> {
+    if let Some(status) = default_main_daemon_status()? {
+        if status.cluster.is_some() {
+            return Ok(());
+        }
+    }
+    require_cluster_bootstrap_state().map(|_| ())
 }
 
 fn cluster_init(options: ClusterInitOptions) -> Result<(), CliError> {
@@ -411,6 +1019,119 @@ fn cluster_init_with_paths(
     Ok(())
 }
 
+fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    let rendered = cluster_invite_with_paths(options, &paths)?;
+    println!("invite: {}", rendered.uri);
+    println!("cluster: {}", rendered.invite.cluster_id);
+    println!("expires: {}", format_rfc3339(rendered.invite.expires_at));
+    println!("saved: {}", rendered.persisted_path.display());
+    if let Some(output) = rendered.output_path {
+        println!("output: {}", output.display());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenderedClusterInvite {
+    invite: ClusterJoinInvite,
+    uri: String,
+    persisted_path: PathBuf,
+    output_path: Option<PathBuf>,
+}
+
+fn cluster_invite_with_paths(
+    options: ClusterInviteOptions,
+    paths: &ClusterPaths,
+) -> Result<RenderedClusterInvite, CliError> {
+    paths.ensure()?;
+    fs::create_dir_all(&paths.invites).map_err(|source| CliError::Io {
+        path: paths.invites.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let state = read_cluster_state(paths)?;
+    let now = OffsetDateTime::now_utc();
+    let invite = build_cluster_invite(&state, &options, now)?;
+    let uri = encode_cluster_join_invite(&invite)?;
+    let persisted_path = paths.invite_path(&invite.invite_id);
+    write_json(&persisted_path, &invite)?;
+    if let Some(output) = &options.output {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).map_err(|source| CliError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        fs::write(output, format!("{uri}\n")).map_err(|source| CliError::Io {
+            path: output.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    Ok(RenderedClusterInvite {
+        invite,
+        uri,
+        persisted_path,
+        output_path: options.output,
+    })
+}
+
+fn build_cluster_invite(
+    state: &ClusterBootstrapState,
+    options: &ClusterInviteOptions,
+    now: OffsetDateTime,
+) -> Result<ClusterJoinInvite, CliError> {
+    let introducers = if options.introducers.is_empty() {
+        state
+            .members
+            .iter()
+            .flat_map(|member| member.endpoints.iter().cloned())
+            .collect()
+    } else {
+        options
+            .introducers
+            .iter()
+            .map(|address| invite_introducer_endpoint(&state.local_node_id, address.clone()))
+            .collect()
+    };
+    let invite_id = sinomo_runtime::core::ClusterInviteId::generate();
+    Ok(ClusterJoinInvite {
+        invite_id: invite_id.clone(),
+        cluster_id: state.cluster_id.clone(),
+        cluster_name: Some(state.cluster_name.clone()),
+        introducers,
+        token_id: format!("token_{}", invite_id.as_str().trim_start_matches("invite_")),
+        expires_at: now + time::Duration::seconds(options.ttl_seconds),
+        trust_domain: TrustDomain::new("trust.local").expect("static trust domain"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner, ClusterMemberRole::NonVoting],
+        signature: "local-bootstrap-signature-pending".to_string(),
+    })
+}
+
+fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterEndpointRecord {
+    let is_loopback = address.starts_with("127.")
+        || address.starts_with("localhost:")
+        || address.starts_with("[::1]:")
+        || address.starts_with("::1:");
+    ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::generate(),
+        node_id: node_id.clone(),
+        transport: if is_loopback {
+            ClusterTransportKind::Loopback
+        } else {
+            ClusterTransportKind::LanTcp
+        },
+        address,
+        source: ClusterEndpointSource::Static,
+        privacy: if is_loopback {
+            ClusterEndpointPrivacy::LocalOnly
+        } else {
+            ClusterEndpointPrivacy::Lan
+        },
+        priority: if is_loopback { 100 } else { 20 },
+        last_observed_latency_ms: None,
+    }
+}
+
 fn cluster_join(options: ClusterJoinOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     cluster_join_with_paths(options, &paths)
@@ -432,13 +1153,45 @@ fn cluster_join_with_paths(
 
     let local_node_id = options.node_id.unwrap_or_else(NodeId::generate);
     let timestamp = OffsetDateTime::now_utc();
-    let cluster_id = options
-        .cluster_id
-        .unwrap_or_else(|| ClusterId::new("cluster_pending").expect("static cluster id"));
-    let invite = ClusterJoinInvite::local_placeholder(options.invite.clone(), cluster_id.clone());
+    let mut invite = parse_cluster_join_invite_argument(&options.invite)?;
+    if invite.expires_at != OffsetDateTime::UNIX_EPOCH && invite.expires_at <= timestamp {
+        return Err(CliError::Parse {
+            detail: format!(
+                "cluster invite expired at {}",
+                format_rfc3339(invite.expires_at)
+            ),
+        });
+    }
+    if let Some(cluster_id) = &options.cluster_id
+        && cluster_id != &invite.cluster_id
+    {
+        if is_legacy_placeholder_invite(&invite) {
+            invite.cluster_id = cluster_id.clone();
+        } else {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "cluster id override `{cluster_id}` does not match invite cluster `{}`",
+                    invite.cluster_id
+                ),
+            });
+        }
+    } else if let Some(cluster_id) = &options.cluster_id {
+        invite.cluster_id = cluster_id.clone();
+    }
+    if invite.cluster_id == ClusterId::new("cluster_pending").expect("static cluster id")
+        && is_legacy_placeholder_invite(&invite)
+    {
+        return Err(CliError::Parse {
+            detail: "legacy join tokens require --cluster-id; use `sinomo cluster invite` to create a portable invite".to_string(),
+        });
+    }
+    let cluster_id = invite.cluster_id.clone();
     let mut state = ClusterBootstrapState::pending_join(
         cluster_id,
-        options.name.clone(),
+        invite
+            .cluster_name
+            .clone()
+            .unwrap_or_else(|| options.name.clone()),
         local_node_id.clone(),
         options.name,
         invite,
@@ -456,6 +1209,65 @@ fn cluster_join_with_paths(
     println!("invite: {}", options.invite);
     println!("state: {}", paths.state.display());
     Ok(())
+}
+
+fn is_legacy_placeholder_invite(invite: &ClusterJoinInvite) -> bool {
+    invite.expires_at == OffsetDateTime::UNIX_EPOCH
+        && invite.signature == "pending-network-validation"
+        && invite.cluster_name.is_none()
+}
+
+fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
+    let raw = raw.trim();
+    let invite = if let Some(path) = raw.strip_prefix('@') {
+        fs::read_to_string(path).map_err(|source| CliError::Io {
+            path: path.to_string(),
+            detail: source.to_string(),
+        })?
+    } else if Path::new(raw).exists() {
+        fs::read_to_string(raw).map_err(|source| CliError::Io {
+            path: raw.to_string(),
+            detail: source.to_string(),
+        })?
+    } else {
+        raw.to_string()
+    };
+    decode_cluster_join_invite(invite.trim())
+}
+
+fn encode_cluster_join_invite(invite: &ClusterJoinInvite) -> Result<String, CliError> {
+    let bytes = serde_json::to_vec(invite).map_err(|source| CliError::Json {
+        path: "cluster invite".to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(format!(
+        "{SINOMO_JOIN_URI_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(bytes)
+    ))
+}
+
+fn decode_cluster_join_invite(raw: &str) -> Result<ClusterJoinInvite, CliError> {
+    if let Some(payload) = raw.strip_prefix(SINOMO_JOIN_URI_PREFIX) {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|source| CliError::Parse {
+                detail: format!("invalid cluster invite encoding: {source}"),
+            })?;
+        serde_json::from_slice(&bytes).map_err(|source| CliError::Json {
+            path: "cluster invite".to_string(),
+            detail: source.to_string(),
+        })
+    } else if raw.trim_start().starts_with('{') {
+        serde_json::from_str(raw).map_err(|source| CliError::Json {
+            path: "cluster invite".to_string(),
+            detail: source.to_string(),
+        })
+    } else {
+        Ok(ClusterJoinInvite::local_placeholder(
+            raw.to_string(),
+            ClusterId::new("cluster_pending").expect("static cluster id"),
+        ))
+    }
 }
 
 fn cluster_status() -> Result<(), CliError> {
@@ -1067,6 +1879,14 @@ fn daemon_paths_from_defaults() -> Result<DaemonPaths, CliError> {
     Ok(DaemonPaths::new(&data_dir))
 }
 
+fn default_main_daemon_status() -> Result<Option<DaemonStatus>, CliError> {
+    let paths = daemon_paths_from_defaults()?;
+    Ok(match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => Some(status),
+        DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => None,
+    })
+}
+
 fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
@@ -1094,12 +1914,14 @@ fn run_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
     let main_paths = DaemonPaths::new(&data_dir);
     let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
     let main_options = shadow_main_options_from_env()?;
+    let main_binary = shadow_main_binary_from_env(&rollout_paths);
     run_shadow_daemon_with_paths(
         options,
         shadow_paths,
         main_paths,
         rollout_paths,
         main_options,
+        main_binary,
     )
 }
 
@@ -1109,6 +1931,7 @@ fn run_shadow_daemon_with_paths(
     main_paths: DaemonPaths,
     rollout_paths: SelfRolloutPaths,
     main_options: DaemonRunOptions,
+    main_binary: PathBuf,
 ) -> Result<(), CliError> {
     let registration = daemon_cluster_registration(
         DaemonClusterProcess::Shadow,
@@ -1149,21 +1972,18 @@ fn run_shadow_daemon_with_paths(
 
         if !main_restart_suppressed
             && supervised_main.is_none()
-            && rollout_paths.main_binary.exists()
+            && main_binary.exists()
             && matches!(
                 probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT),
                 DaemonProbeStatus::NotRunning
             )
         {
-            supervised_main = Some(spawn_main_for_shadow(
-                &rollout_paths.main_binary,
-                &main_options,
-            )?);
+            supervised_main = Some(spawn_main_for_shadow(&main_binary, &main_options)?);
         }
 
         if let Some(child) = supervised_main.as_mut() {
             if let Some(status) = child.try_wait().map_err(|source| CliError::Io {
-                path: rollout_paths.main_binary.display().to_string(),
+                path: main_binary.display().to_string(),
                 detail: source.to_string(),
             })? {
                 let observation = main_exit_observation_from_status(status);
@@ -1180,10 +2000,7 @@ fn run_shadow_daemon_with_paths(
                 )?;
                 supervised_main = None;
                 if kind == MainExitKind::Crash {
-                    supervised_main = Some(spawn_main_for_shadow(
-                        &rollout_paths.main_binary,
-                        &main_options,
-                    )?);
+                    supervised_main = Some(spawn_main_for_shadow(&main_binary, &main_options)?);
                 } else {
                     main_restart_suppressed = true;
                 }
@@ -1234,6 +2051,14 @@ fn shadow_main_options_from_env() -> Result<DaemonRunOptions, CliError> {
         })?;
     }
     Ok(options)
+}
+
+fn shadow_main_binary_from_env(rollout_paths: &SelfRolloutPaths) -> PathBuf {
+    env::var(SHADOW_MAIN_BINARY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| rollout_paths.main_binary.clone())
 }
 
 fn run_daemon_with_paths(
@@ -1442,7 +2267,11 @@ fn stop_daemon_with_paths(
 fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProbeStatus {
     let status = read_daemon_status(paths).ok();
     if let Some(status) = &status {
-        if send_daemon_command(&status.address, "STATUS", timeout).is_ok() {
+        if send_daemon_command(&status.address, "STATUS", timeout)
+            .ok()
+            .and_then(|response| serde_json::from_str::<DaemonStatus>(&response).ok())
+            .is_some_and(|remote_status| daemon_status_matches_probe(status, &remote_status))
+        {
             return DaemonProbeStatus::Running(status.clone());
         }
     }
@@ -1471,6 +2300,13 @@ fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProbeSta
         }
         Err(_) => DaemonProbeStatus::Locked { status },
     }
+}
+
+fn daemon_status_matches_probe(expected: &DaemonStatus, actual: &DaemonStatus) -> bool {
+    expected.pid == actual.pid
+        && expected.data_dir == actual.data_dir
+        && expected.lock_file == actual.lock_file
+        && expected.port == actual.port
 }
 
 fn read_daemon_status(paths: &DaemonPaths) -> Result<DaemonStatus, CliError> {
@@ -1560,6 +2396,25 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
                 })?;
             Ok(true)
         }
+        command if command.starts_with("ROLLOUT_BINARY ") => {
+            let payload = command
+                .strip_prefix("ROLLOUT_BINARY ")
+                .unwrap_or_default()
+                .trim();
+            let response = handle_daemon_rollout_binary(paths, payload)?;
+            let body =
+                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                    path: "rollout response".to_string(),
+                    detail: source.to_string(),
+                })?;
+            stream
+                .write_all(body.as_bytes())
+                .map_err(|source| CliError::Network {
+                    address: "daemon client".to_string(),
+                    detail: source.to_string(),
+                })?;
+            Ok(true)
+        }
         _ => {
             stream
                 .write_all(b"unknown daemon command\n")
@@ -1572,27 +2427,177 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
     }
 }
 
+fn handle_daemon_rollout_binary(
+    paths: &DaemonPaths,
+    payload: &str,
+) -> Result<ClusterRolloutBinaryResponse, CliError> {
+    let request: ClusterRolloutBinaryRequest =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "cluster rollout request".to_string(),
+            detail: source.to_string(),
+        })?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    rollout_ensure_layout(&rollout_paths)?;
+    let binary = URL_SAFE_NO_PAD
+        .decode(request.binary_base64.as_bytes())
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid rollout binary encoding: {source}"),
+        })?;
+    let suffix = rollout_artifact_suffix();
+    let main_binary = rollout_paths
+        .bin
+        .join(format!("sinomo-main-{suffix}{}", env::consts::EXE_SUFFIX));
+    let shadow_binary = rollout_paths
+        .bin
+        .join(format!("sinomo-shadow-{suffix}{}", env::consts::EXE_SUFFIX));
+    write_executable_atomically(&binary, &main_binary)?;
+    write_executable_atomically(&binary, &shadow_binary)?;
+
+    let current = read_daemon_status(paths)?;
+    stop_shadow_daemon_for_rollout(data_dir)?;
+    spawn_shadow_for_cluster_rollout(
+        &shadow_binary,
+        &main_binary,
+        &current.host,
+        current.port,
+        request.shadow_port,
+    )?;
+    write_json(
+        &rollout_paths.state,
+        &serde_json::json!({
+            "source": request.source,
+            "main_binary": main_binary,
+            "shadow_binary": shadow_binary,
+            "requested_at": request.requested_at,
+            "applied_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string()),
+            "mode": "cluster-binary-push"
+        }),
+    )?;
+    Ok(ClusterRolloutBinaryResponse {
+        status: "accepted".to_string(),
+        detail: "new shadow daemon started; current main daemon will stop and be relaunched"
+            .to_string(),
+        main_binary,
+        shadow_binary,
+    })
+}
+
+fn rollout_artifact_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn write_executable_atomically(bytes: &[u8], destination: &Path) -> Result<(), CliError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let next = destination.with_extension("next");
+    fs::write(&next, bytes).map_err(|source| CliError::Io {
+        path: next.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&next, fs::Permissions::from_mode(0o755)).map_err(|source| {
+            CliError::Io {
+                path: next.display().to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+    }
+    fs::rename(&next, destination).map_err(|source| CliError::Io {
+        path: format!("{} -> {}", next.display(), destination.display()),
+        detail: source.to_string(),
+    })
+}
+
+fn stop_shadow_daemon_for_rollout(data_dir: &Path) -> Result<(), CliError> {
+    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    if let DaemonProbeStatus::Running(status) =
+        probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT)
+    {
+        let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if matches!(
+                probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
+                DaemonProbeStatus::NotRunning
+            ) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Ok(())
+}
+
+fn spawn_shadow_for_cluster_rollout(
+    shadow_binary: &Path,
+    main_binary: &Path,
+    main_host: &str,
+    main_port: u16,
+    shadow_port: u16,
+) -> Result<(), CliError> {
+    Command::new(shadow_binary)
+        .args(["daemon", "shadow", "run"])
+        .arg("--host")
+        .arg(main_host)
+        .arg("--port")
+        .arg(shadow_port.to_string())
+        .env(SHADOW_MAIN_BINARY_ENV, main_binary)
+        .env(SHADOW_MAIN_HOST_ENV, main_host)
+        .env(SHADOW_MAIN_PORT_ENV, main_port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| CliError::Io {
+            path: shadow_binary.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum RolloutCliCommand {
     Help,
     InitSource(RolloutOptions),
     Apply(RolloutOptions),
+    Cluster(RolloutOptions),
     Status,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct RolloutOptions {
     repo: Option<PathBuf>,
+    binary: Option<PathBuf>,
+    targets: Vec<String>,
     host: String,
     port: u16,
+    shadow_port: u16,
+    skip_local: bool,
 }
 
 impl Default for RolloutOptions {
     fn default() -> Self {
         Self {
             repo: None,
+            binary: None,
+            targets: Vec::new(),
             host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
             port: SINOMO_DAEMON_DEFAULT_PORT,
+            shadow_port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+            skip_local: false,
         }
     }
 }
@@ -1608,6 +2613,9 @@ fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand, CliError>
         }
         Some((command, rest)) if command == "apply" => {
             Ok(RolloutCliCommand::Apply(parse_rollout_options(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "cluster" | "apply-cluster") => {
+            Ok(RolloutCliCommand::Cluster(parse_rollout_options(rest)?))
         }
         Some((command, [])) if command == "status" => Ok(RolloutCliCommand::Status),
         _ => Err(CliError::Usage),
@@ -1626,6 +2634,20 @@ fn parse_rollout_options(args: &[String]) -> Result<RolloutOptions, CliError> {
                 };
                 options.repo = Some(PathBuf::from(repo));
             }
+            "--binary" => {
+                index += 1;
+                let Some(binary) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.binary = Some(PathBuf::from(binary));
+            }
+            "--target" => {
+                index += 1;
+                let Some(target) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.targets.push(non_empty_address(target)?);
+            }
             "--host" => {
                 index += 1;
                 let Some(host) = args.get(index) else {
@@ -1642,6 +2664,16 @@ fn parse_rollout_options(args: &[String]) -> Result<RolloutOptions, CliError> {
                     detail: format!("invalid rollout daemon port `{port}`: {source}"),
                 })?;
             }
+            "--shadow-port" => {
+                index += 1;
+                let Some(port) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.shadow_port = port.parse::<u16>().map_err(|source| CliError::Parse {
+                    detail: format!("invalid rollout shadow daemon port `{port}`: {source}"),
+                })?;
+            }
+            "--skip-local" => options.skip_local = true,
             _ => return Err(CliError::Usage),
         }
         index += 1;
@@ -1657,6 +2689,7 @@ fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), CliError> {
         }
         RolloutCliCommand::InitSource(options) => rollout_init_source(options),
         RolloutCliCommand::Apply(options) => rollout_apply(options),
+        RolloutCliCommand::Cluster(options) => rollout_cluster(options),
         RolloutCliCommand::Status => rollout_status(),
     }
 }
@@ -1759,6 +2792,180 @@ fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     println!("  main binary: {}", plan.install_main_binary.display());
     println!("  shadow binary: {}", plan.install_shadow_binary.display());
     Ok(())
+}
+
+fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
+    let binary = rollout_prepare_dev_binary(&options)?;
+    let targets = rollout_cluster_targets(&options)?;
+    if targets.is_empty() {
+        return Err(CliError::Parse {
+            detail: "no rollout targets found; pass --target <host:port> or start a clustered local daemon".to_string(),
+        });
+    }
+    let binary_bytes = fs::read(&binary).map_err(|source| CliError::Io {
+        path: binary.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let source = options
+        .repo
+        .as_ref()
+        .or(options.binary.as_ref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| binary.display().to_string());
+    let requested_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let request = ClusterRolloutBinaryRequest {
+        source,
+        binary_base64: URL_SAFE_NO_PAD.encode(binary_bytes),
+        host: options.host.clone(),
+        port: options.port,
+        shadow_port: options.shadow_port,
+        requested_at,
+    };
+
+    println!("cluster rollout binary: {}", binary.display());
+    for target in targets {
+        match send_daemon_rollout_binary(&target, &request) {
+            Ok(response) => {
+                println!("{target}: {}", response.status);
+                if !response.detail.is_empty() {
+                    println!("  {}", response.detail);
+                }
+            }
+            Err(error) => {
+                println!("{target}: failed: {error}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollout_prepare_dev_binary(options: &RolloutOptions) -> Result<PathBuf, CliError> {
+    if let Some(binary) = &options.binary {
+        if !binary.exists() {
+            return Err(CliError::MissingArtifact {
+                artifact: binary.display().to_string(),
+            });
+        }
+        return Ok(binary.clone());
+    }
+    let repo = options
+        .repo
+        .clone()
+        .unwrap_or(env::current_dir().map_err(|source| CliError::Io {
+            path: ".".to_string(),
+            detail: source.to_string(),
+        })?);
+    let paths = rollout_paths_from_defaults()?;
+    rollout_ensure_layout(&paths)?;
+    let plan = SelfRolloutPaths::new(paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "rollout root has no data directory parent".to_string(),
+    })?)
+    .plan();
+    let build = Command::new("cargo")
+        .args(["build", "-p", "sinomo"])
+        .current_dir(&repo)
+        .output()
+        .map_err(|source| CliError::Io {
+            path: "cargo build -p sinomo".to_string(),
+            detail: source.to_string(),
+        })?;
+    let build_log = format!(
+        "command: cargo build -p sinomo\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+        repo.display(),
+        build.status,
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    fs::write(&plan.build_log, build_log).map_err(|source| CliError::Io {
+        path: plan.build_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if !build.status.success() {
+        return Err(CliError::Process {
+            command: "cargo build -p sinomo".to_string(),
+            status: build.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
+        });
+    }
+    Ok(repo
+        .join("target")
+        .join("debug")
+        .join(format!("sinomo{}", env::consts::EXE_SUFFIX)))
+}
+
+fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<String>, CliError> {
+    let mut targets = Vec::new();
+    if !options.skip_local {
+        if let Some(status) = default_main_daemon_status()? {
+            targets.push(status.address);
+        } else {
+            targets.push(daemon_connect_address(&options.host, options.port));
+        }
+    }
+    targets.extend(options.targets.iter().cloned());
+
+    if let Ok(state) = require_cluster_bootstrap_state() {
+        for member in state.members {
+            let is_main_daemon = member
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == "daemon.main.run");
+            if !is_main_daemon {
+                continue;
+            }
+            for endpoint in member.endpoints {
+                targets.push(endpoint.address);
+            }
+        }
+    }
+
+    let mut unique = Vec::new();
+    for target in targets {
+        if !unique.contains(&target) {
+            unique.push(target);
+        }
+    }
+    Ok(unique)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ClusterRolloutBinaryRequest {
+    source: String,
+    binary_base64: String,
+    host: String,
+    port: u16,
+    shadow_port: u16,
+    requested_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ClusterRolloutBinaryResponse {
+    status: String,
+    detail: String,
+    main_binary: PathBuf,
+    shadow_binary: PathBuf,
+}
+
+fn send_daemon_rollout_binary(
+    address: &str,
+    request: &ClusterRolloutBinaryRequest,
+) -> Result<ClusterRolloutBinaryResponse, CliError> {
+    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
+        path: "cluster rollout request".to_string(),
+        detail: source.to_string(),
+    })?;
+    let response = send_daemon_command(
+        address,
+        &format!("ROLLOUT_BINARY {payload}"),
+        DAEMON_ROLLOUT_TIMEOUT,
+    )?;
+    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
+        path: format!("rollout response from {address}"),
+        detail: source.to_string(),
+    })
 }
 
 fn ensure_source_repo(paths: &SelfRolloutPaths, repo: Option<&Path>) -> Result<(), CliError> {
@@ -1950,7 +3157,8 @@ pub fn run_cui() -> Result<(), CliError> {
 
 pub fn run_cui_with_io<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Result<(), CliError> {
     let handler = CliInteractionHandler::from_default_model()?;
-    run_cui_with_handler_io(&mut reader, &mut writer, handler)
+    let daemon = default_main_daemon_status()?;
+    run_cui_with_handler_io_and_daemon(&mut reader, &mut writer, handler, daemon)
 }
 
 pub fn run_cui_with_handler_io<R: BufRead, W: Write, H: InteractionEventHandler>(
@@ -1958,15 +3166,43 @@ pub fn run_cui_with_handler_io<R: BufRead, W: Write, H: InteractionEventHandler>
     mut writer: W,
     handler: H,
 ) -> Result<(), CliError> {
+    run_cui_with_handler_io_and_daemon(&mut reader, &mut writer, handler, None)
+}
+
+fn run_cui_with_handler_io_and_daemon<R: BufRead, W: Write, H: InteractionEventHandler>(
+    mut reader: R,
+    mut writer: W,
+    handler: H,
+    daemon: Option<DaemonStatus>,
+) -> Result<(), CliError> {
+    let node_id = daemon
+        .as_ref()
+        .and_then(|status| status.cluster.as_ref())
+        .map(|cluster| cluster.node_id.clone())
+        .unwrap_or_else(|| NodeId::new("node_cli").expect("valid node id"));
     let session = InteractionSession::new(
         SessionId::generate(),
-        NodeId::new("node_cli").expect("valid node id"),
+        node_id,
         InteractionSurface::new("surface.cli", InteractionSurfaceKind::CommandLine),
     );
     let mut runtime = InteractionRuntime::new(InMemoryEventStore::new(), handler, session.clone());
 
     writeln!(writer, "Sinomo CUI").map_err(CliError::stdio)?;
     writeln!(writer, "session: {}", session.session_id).map_err(CliError::stdio)?;
+    writeln!(writer, "node: {}", session.node_id).map_err(CliError::stdio)?;
+    if let Some(status) = &daemon {
+        writeln!(
+            writer,
+            "daemon: connected pid={} address={}",
+            status.pid, status.address
+        )
+        .map_err(CliError::stdio)?;
+        if let Some(cluster) = &status.cluster {
+            writeln!(writer, "cluster: {}", cluster.cluster_id).map_err(CliError::stdio)?;
+        }
+    } else {
+        writeln!(writer, "daemon: not connected").map_err(CliError::stdio)?;
+    }
     writeln!(writer, "Type /help for commands or /quit to exit.").map_err(CliError::stdio)?;
 
     loop {
@@ -6911,6 +8147,8 @@ pub fn print_usage() {
     println!("  sinomo");
     println!("  sinomo help");
     println!("  sinomo cluster");
+    println!("  sinomo install");
+    println!("  sinomo uninstall");
     println!("  sinomo daemon");
     println!("  sinomo rollout");
     println!("  sinomo dfs");
@@ -6922,7 +8160,9 @@ pub fn print_usage() {
     println!("Run `sinomo <subcommand> help` for detailed commands.");
     println!();
     println!("CUI:");
-    println!("  Run `sinomo` with no arguments to start the command-line user interface.");
+    println!(
+        "  Run `sinomo` with no arguments to connect the command-line user interface to the local daemon when available."
+    );
     println!("  Inside the CUI, prefix any CLI command with `/`, for example `/models list`.");
     println!("  Use `/quit` or `/exit` to end the session.");
     println!();
@@ -6955,10 +8195,16 @@ fn print_cluster_help() {
     );
     println!("      Bootstrap a new single-node cluster and clear orphan-node state.");
     println!(
+        "  sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]"
+    );
+    println!(
+        "      Create a portable join invite. Pass a LAN-reachable introducer address for remote nodes."
+    );
+    println!(
         "  sinomo cluster join <invite> [--name <name>] [--cluster-id cluster_...] [--node-id node_...]"
     );
     println!(
-        "      Record intent to join an existing cluster. Network reconciliation is handled by the cluster service."
+        "      Record intent to join an existing cluster from a sinomo-join URI, invite file, or legacy token."
     );
     println!("  sinomo cluster status");
     println!("      Show local cluster bootstrap state, or report that this node is orphaned.");
@@ -6966,6 +8212,18 @@ fn print_cluster_help() {
     println!("      List known peers. Fails while the node is orphaned.");
     println!("  sinomo cluster leave");
     println!("      Remove local cluster bootstrap state.");
+}
+
+fn print_install_help() {
+    println!("Install:");
+    println!(
+        "  sinomo install [--host <host>] [--port <port>] [--shadow-port <port>] [--no-start]"
+    );
+    println!(
+        "      Create the data directory, copy the current binary, add boot entries for the main and shadow daemons, then start them."
+    );
+    println!("  sinomo uninstall [--no-stop]");
+    println!("      Remove Sinomo boot entries and stop daemons. The data directory is retained.");
 }
 
 fn print_daemon_help() {
@@ -6995,6 +8253,12 @@ fn print_rollout_help() {
     println!("  sinomo rollout apply [--repo <path>] [--host <host>] [--port <port>]");
     println!(
         "      Build the data-directory source repo, install bin/sinomo-main and bin/sinomo-shadow, restart shadow supervision, then verify main health."
+    );
+    println!(
+        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--skip-local]"
+    );
+    println!(
+        "      Build or use a dev binary, push it to local and discovered cluster daemons, and restart each node through its shadow daemon."
     );
     println!("  sinomo rollout status");
     println!("      Show source, binary, and rollout state paths.");
@@ -7298,29 +8562,34 @@ impl std::error::Error for CliError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterJoinOptions,
-        ClusterPaths, DaemonCliCommand, DaemonProbeStatus, DaemonRunOptions, DfsCliCommand,
-        DfsCommonOptions, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths,
+        CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
+        ClusterJoinOptions, ClusterPaths, DaemonCliCommand, DaemonClusterStatus, DaemonProbeStatus,
+        DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsFilterOptions,
+        DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions,
         InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
         InteractionSurfaceKind, ModelBackedInteractionHandler, ModelDefaultRepoMode,
         ModelsCliCommand, ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutOptions,
-        cli_command_requires_cluster_state, cluster_init_with_paths, cluster_join_with_paths,
-        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
-        parse_cli_command, parse_cluster_command, parse_daemon_command, parse_dfs_command,
-        parse_model_default_options, parse_models_list_options, parse_propose_options,
-        parse_provider_command, parse_rollout_command, parse_slash_command, parse_usage_options,
-        read_cluster_state, run_cui_with_handler_io, run_evolve_command,
+        UninstallOptions, cli_command_requires_cluster_state, cluster_init_with_paths,
+        cluster_invite_with_paths, cluster_join_with_paths, decode_cluster_join_invite,
+        install_with_layout, is_terminal_status, models_default_with_data_dir,
+        normalize_model_provider, parse_cli_command, parse_cluster_command, parse_daemon_command,
+        parse_dfs_command, parse_install_options, parse_model_default_options,
+        parse_models_list_options, parse_propose_options, parse_provider_command,
+        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+        read_cluster_state, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
+        run_evolve_command, uninstall_with_layout,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
     };
     use sinomo_runtime::core::{
-        ClusterId, ClusterMemberRole, ClusterMemberState, EvolutionJobId, NodeId, SessionId,
-        TrustRing,
+        ClusterBootstrap, ClusterId, ClusterMemberRole, ClusterMemberState, EvolutionJobId, NodeId,
+        SessionId, TrustRing,
     };
     use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
     use sinomo_runtime::local::SinomoDataDir;
     use std::io::Cursor;
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -7374,6 +8643,19 @@ mod tests {
             CliCommand::Cluster(ClusterCliCommand::Status)
         ));
         assert!(matches!(
+            parse_cli_command(&["install".to_string(), "help".to_string()]).expect("install help"),
+            CliCommand::InstallHelp
+        ));
+        assert!(matches!(
+            parse_cli_command(&["install".to_string(), "--no-start".to_string()]).expect("install"),
+            CliCommand::Install(InstallOptions { start: false, .. })
+        ));
+        assert!(matches!(
+            parse_cli_command(&["uninstall".to_string(), "--no-stop".to_string()])
+                .expect("uninstall"),
+            CliCommand::Uninstall(UninstallOptions { stop: false })
+        ));
+        assert!(matches!(
             parse_cli_command(&[
                 "providers".to_string(),
                 "test".to_string(),
@@ -7419,6 +8701,77 @@ mod tests {
             parse_cli_command(&["evolve".to_string()]).expect("evolve help"),
             CliCommand::Evolve(super::EvolveCliCommand::Help)
         ));
+    }
+
+    #[test]
+    fn install_parser_accepts_custom_daemon_ports() {
+        assert_eq!(
+            parse_install_options(&[
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                "21400".to_string(),
+                "--shadow-port".to_string(),
+                "21401".to_string(),
+                "--no-start".to_string(),
+            ])
+            .expect("install options"),
+            InstallOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21400,
+                shadow_port: 21401,
+                start: false,
+            }
+        );
+        assert_eq!(
+            parse_uninstall_options(&["--no-stop".to_string()]).expect("uninstall options"),
+            UninstallOptions { stop: false }
+        );
+    }
+
+    #[test]
+    fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-install-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let layout = InstallLayout::new(&data_dir, root.join("startup"));
+
+        install_with_layout(
+            InstallOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21400,
+                shadow_port: 21401,
+                start: false,
+            },
+            &layout,
+        )
+        .expect("install");
+
+        let main_entry = std::fs::read_to_string(&layout.main_boot_entry).expect("main boot");
+        let shadow_entry = std::fs::read_to_string(&layout.shadow_boot_entry).expect("shadow boot");
+        assert!(layout.binary.exists());
+        assert!(main_entry.contains("SINOMO_DATA_DIR"));
+        if cfg!(windows) {
+            assert!(main_entry.contains("daemon start"));
+            assert!(shadow_entry.contains("daemon shadow start"));
+        } else {
+            assert!(main_entry.contains("daemon run"));
+            assert!(shadow_entry.contains("daemon shadow run"));
+        }
+        assert!(main_entry.contains("21400"));
+        assert!(shadow_entry.contains("21401"));
+
+        uninstall_with_layout(UninstallOptions { stop: false }, &layout).expect("uninstall");
+        assert!(!layout.main_boot_entry.exists());
+        assert!(!layout.shadow_boot_entry.exists());
+        assert!(layout.data_dir.exists());
+        assert!(layout.binary.exists());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -7528,6 +8881,23 @@ mod tests {
                 name: "laptop".to_string(),
             })
         );
+        assert_eq!(
+            parse_cluster_command(&[
+                "invite".to_string(),
+                "--introducer".to_string(),
+                "192.168.1.10:21353".to_string(),
+                "--ttl-seconds".to_string(),
+                "60".to_string(),
+                "--output".to_string(),
+                "invite.txt".to_string(),
+            ])
+            .expect("cluster invite"),
+            ClusterCliCommand::Invite(ClusterInviteOptions {
+                ttl_seconds: 60,
+                introducers: vec!["192.168.1.10:21353".to_string()],
+                output: Some(PathBuf::from("invite.txt")),
+            })
+        );
     }
 
     #[test]
@@ -7624,6 +8994,113 @@ mod tests {
     }
 
     #[test]
+    fn cluster_invite_generates_portable_join_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-invite-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        let output = root.join("join.txt");
+        cluster_init_with_paths(
+            ClusterInitOptions {
+                cluster_id: Some(ClusterId::new("cluster_invite").expect("cluster")),
+                node_id: Some(NodeId::new("node_host").expect("node")),
+                name: "invite cluster".to_string(),
+            },
+            &paths,
+        )
+        .expect("cluster init");
+
+        let rendered = cluster_invite_with_paths(
+            ClusterInviteOptions {
+                ttl_seconds: 120,
+                introducers: vec!["192.168.1.10:21353".to_string()],
+                output: Some(output.clone()),
+            },
+            &paths,
+        )
+        .expect("cluster invite");
+        let parsed = decode_cluster_join_invite(&rendered.uri).expect("decode invite");
+
+        assert!(rendered.uri.starts_with(super::SINOMO_JOIN_URI_PREFIX));
+        assert_eq!(
+            parsed.cluster_id,
+            ClusterId::new("cluster_invite").expect("cluster")
+        );
+        assert_eq!(parsed.cluster_name.as_deref(), Some("invite cluster"));
+        assert_eq!(parsed.introducers.len(), 1);
+        assert_eq!(parsed.introducers[0].address, "192.168.1.10:21353");
+        assert!(rendered.persisted_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(output).expect("invite file").trim(),
+            rendered.uri
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_join_uses_structured_invite_cluster_identity() {
+        let host_root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-host-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let join_root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-join-invite-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let host_paths = ClusterPaths::new(&SinomoDataDir::new(&host_root));
+        let join_paths = ClusterPaths::new(&SinomoDataDir::new(&join_root));
+        cluster_init_with_paths(
+            ClusterInitOptions {
+                cluster_id: Some(ClusterId::new("cluster_remote").expect("cluster")),
+                node_id: Some(NodeId::new("node_host").expect("node")),
+                name: "remote cluster".to_string(),
+            },
+            &host_paths,
+        )
+        .expect("cluster init");
+        let rendered = cluster_invite_with_paths(
+            ClusterInviteOptions {
+                ttl_seconds: 120,
+                introducers: vec!["192.168.1.10:21353".to_string()],
+                output: None,
+            },
+            &host_paths,
+        )
+        .expect("cluster invite");
+
+        cluster_join_with_paths(
+            ClusterJoinOptions {
+                invite: rendered.uri,
+                cluster_id: None,
+                node_id: Some(NodeId::new("node_remote").expect("node")),
+                name: "remote".to_string(),
+            },
+            &join_paths,
+        )
+        .expect("cluster join");
+        let state = read_cluster_state(&join_paths).expect("cluster state");
+
+        assert_eq!(
+            state.cluster_id,
+            ClusterId::new("cluster_remote").expect("cluster")
+        );
+        assert_eq!(state.cluster_name, "remote cluster");
+        assert!(matches!(state.bootstrap, ClusterBootstrap::Joined { .. }));
+        std::fs::remove_dir_all(host_root).ok();
+        std::fs::remove_dir_all(join_root).ok();
+    }
+
+    #[test]
     fn rollout_parser_accepts_apply_status_and_init_source() {
         assert_eq!(
             parse_rollout_command(&["status".to_string()]).expect("status"),
@@ -7644,6 +9121,27 @@ mod tests {
                 repo: Some(std::path::PathBuf::from("/work/sinomo")),
                 host: "127.0.0.1".to_string(),
                 port: 21_353,
+                ..RolloutOptions::default()
+            })
+        );
+        assert_eq!(
+            parse_rollout_command(&[
+                "cluster".to_string(),
+                "--repo".to_string(),
+                "/work/sinomo".to_string(),
+                "--target".to_string(),
+                "192.168.1.20:21353".to_string(),
+                "--shadow-port".to_string(),
+                "21454".to_string(),
+                "--skip-local".to_string(),
+            ])
+            .expect("cluster"),
+            RolloutCliCommand::Cluster(RolloutOptions {
+                repo: Some(std::path::PathBuf::from("/work/sinomo")),
+                targets: vec!["192.168.1.20:21353".to_string()],
+                shadow_port: 21_454,
+                skip_local: true,
+                ..RolloutOptions::default()
             })
         );
     }
@@ -7663,6 +9161,7 @@ mod tests {
                 repo: None,
                 host: "0.0.0.0".to_string(),
                 port: 21_400,
+                ..RolloutOptions::default()
             })
         );
     }
@@ -8417,6 +9916,40 @@ mod tests {
         let output = String::from_utf8(output).expect("utf8");
         assert!(output.contains("Sinomo CUI"));
         assert!(output.contains("ending session"));
+    }
+
+    #[test]
+    fn cui_loop_uses_connected_daemon_cluster_node_when_available() {
+        let mut output = Vec::new();
+        let daemon = DaemonStatus {
+            pid: 4242,
+            host: "0.0.0.0".to_string(),
+            port: 21_353,
+            address: "127.0.0.1:21353".to_string(),
+            started_at: "2026-05-04T00:00:00Z".to_string(),
+            data_dir: PathBuf::from("data"),
+            lock_file: PathBuf::from("data/daemon/daemon.lock"),
+            cluster: Some(DaemonClusterStatus {
+                cluster_id: ClusterId::new("cluster_cui").expect("cluster"),
+                node_id: NodeId::new("node_daemon").expect("node"),
+                process: super::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+                member_role: ClusterMemberRole::Voter,
+                member_state: ClusterMemberState::Active,
+            }),
+        };
+
+        run_cui_with_handler_io_and_daemon(
+            Cursor::new("/quit\n"),
+            &mut output,
+            fixture_handler("unused"),
+            Some(daemon),
+        )
+        .expect("cui");
+
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(output.contains("node: node_daemon"));
+        assert!(output.contains("daemon: connected pid=4242 address=127.0.0.1:21353"));
+        assert!(output.contains("cluster: cluster_cui"));
     }
 
     fn fixture_handler(

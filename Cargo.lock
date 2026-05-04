@@ -3089,6 +3089,7 @@ dependencies = [
 name = "sinomo-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "fs2",
  "serde",
  "serde_json",
