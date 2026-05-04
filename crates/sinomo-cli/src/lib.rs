@@ -45,7 +45,8 @@ use sinomo_runtime::core::{
     CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, CapabilityName,
     ClusterBootstrap, ClusterBootstrapState, ClusterEndpointId, ClusterEndpointPrivacy,
     ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterJoinInvite,
-    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterTransportKind, Confidence,
+    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
+    ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind, Confidence,
     DfsFileSystemId, DfsObjectId, EvaluationGate, EvaluationOutcome, EvaluationScorecard,
     EventEnvelope, EventId, EventKind, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
     LatencyClass, MutationPacket, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
@@ -209,6 +210,7 @@ const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const DAEMON_CLUSTER_SYNC_INTERVAL: Duration = Duration::from_secs(2);
+const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 15;
 const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
@@ -307,6 +309,7 @@ enum ClusterCliCommand {
     Invite(ClusterInviteOptions),
     Join(ClusterJoinOptions),
     Status,
+    Health,
     Peers,
     Leave,
 }
@@ -489,6 +492,9 @@ fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand, CliError>
             Ok(ClusterCliCommand::Join(parse_cluster_join_options(rest)?))
         }
         Some((command, [])) if command == "status" => Ok(ClusterCliCommand::Status),
+        Some((command, [])) if matches!(command.as_str(), "health" | "nodes") => {
+            Ok(ClusterCliCommand::Health)
+        }
         Some((command, [])) if command == "peers" => Ok(ClusterCliCommand::Peers),
         Some((command, [])) if command == "leave" => Ok(ClusterCliCommand::Leave),
         _ => Err(CliError::Usage),
@@ -1290,6 +1296,7 @@ fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), CliError> {
         ClusterCliCommand::Invite(options) => cluster_invite(options),
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Status => cluster_status(),
+        ClusterCliCommand::Health => cluster_health(),
         ClusterCliCommand::Peers => cluster_peers(),
         ClusterCliCommand::Leave => cluster_leave(),
     }
@@ -1965,6 +1972,19 @@ fn cluster_status() -> Result<(), CliError> {
             println!("kv revision: {}", kv_revision);
             println!("kv snapshot: {}", paths.kv_snapshot.display());
             println!("members: {}", state.members.len());
+            let health = cluster_health_rows(&paths, &state)?;
+            let online = health
+                .iter()
+                .filter(|row| row.availability == ClusterNodeAvailability::Online)
+                .count();
+            let offline = health
+                .iter()
+                .filter(|row| row.availability == ClusterNodeAvailability::Offline)
+                .count();
+            if !health.is_empty() {
+                println!("online nodes: {online}");
+                println!("offline nodes: {offline}");
+            }
             println!("state: {}", paths.state.display());
             Ok(())
         }
@@ -1975,6 +1995,226 @@ fn cluster_status() -> Result<(), CliError> {
             Ok(())
         }
         Err(error) => Err(error),
+    }
+}
+
+fn cluster_health() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
+    let state = read_cluster_state(&paths)?;
+    let rows = cluster_health_rows(&paths, &state)?;
+    if rows.is_empty() {
+        println!(
+            "node\tprocess\tmember\thealth\tversion\tplatform\tpid\taddress\tlast-seen\trollout"
+        );
+        return Ok(());
+    }
+    println!("node\tprocess\tmember\thealth\tversion\tplatform\tpid\taddress\tlast-seen\trollout");
+    for row in rows {
+        let platform = match (&row.status.target_os, &row.status.target_arch) {
+            (Some(os), Some(arch)) => format!("{os}/{arch}"),
+            _ => "-".to_string(),
+        };
+        let pid = row
+            .status
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let address = row
+            .status
+            .address
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        let rollout = row
+            .status
+            .rollout
+            .as_ref()
+            .map(format_rollout_status)
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.member.node_id,
+            row.status.process,
+            format_member_role(&row.member.role),
+            format_member_state(&row.member.state),
+            format_node_availability(&row.availability),
+            row.status.daemon_version,
+            platform,
+            pid,
+            address,
+            row.status.observed_at,
+            rollout
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ClusterHealthRow {
+    member: ClusterMemberRecord,
+    status: ClusterNodeStatusRecord,
+    availability: ClusterNodeAvailability,
+}
+
+fn cluster_health_rows(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterHealthRow>, CliError> {
+    let stored_statuses = read_cluster_node_statuses_from_kv(paths)?;
+    let mut rows = Vec::new();
+    for member in &state.members {
+        if matches!(member.state, ClusterMemberState::Removed) {
+            continue;
+        }
+        let live = probe_member_daemon_status(state, member);
+        let stored = stored_statuses
+            .iter()
+            .find(|status| status.node_id == member.node_id)
+            .cloned();
+        let live_online = live.is_some();
+        let mut status = if let Some(live) = live {
+            let mut live = live;
+            if live.rollout.is_none() {
+                live.rollout = stored.as_ref().and_then(|status| status.rollout.clone());
+            }
+            live
+        } else if let Some(stored) = stored {
+            stored
+        } else {
+            unknown_cluster_node_status(state, member, OffsetDateTime::now_utc())
+        };
+        let availability = if live_online
+            || (status.availability == ClusterNodeAvailability::Online
+                && !cluster_node_status_is_stale(&status))
+        {
+            ClusterNodeAvailability::Online
+        } else if live_probe_possible(state, member) {
+            ClusterNodeAvailability::Offline
+        } else {
+            ClusterNodeAvailability::Unknown
+        };
+        status.availability = availability.clone();
+        rows.push(ClusterHealthRow {
+            member: member.clone(),
+            status,
+            availability,
+        });
+    }
+    rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
+    Ok(rows)
+}
+
+fn probe_member_daemon_status(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> Option<ClusterNodeStatusRecord> {
+    let mut endpoints = member.endpoints.clone();
+    endpoints.sort_by_key(|endpoint| {
+        (
+            endpoint.privacy != ClusterEndpointPrivacy::Lan,
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+    for endpoint in endpoints {
+        if member.node_id != state.local_node_id
+            && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
+        {
+            continue;
+        }
+        if !matches!(
+            endpoint.transport,
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+        ) {
+            continue;
+        }
+        let Ok(response) = send_daemon_command(&endpoint.address, "STATUS", DAEMON_PROBE_TIMEOUT)
+        else {
+            continue;
+        };
+        let Ok(status) = serde_json::from_str::<DaemonStatus>(response.trim()) else {
+            continue;
+        };
+        let Some(cluster) = status.cluster.as_ref() else {
+            continue;
+        };
+        if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
+            continue;
+        }
+        return Some(cluster_node_status_from_daemon_status(
+            &status,
+            cluster,
+            None,
+            OffsetDateTime::now_utc(),
+        ));
+    }
+    None
+}
+
+fn live_probe_possible(state: &ClusterBootstrapState, member: &ClusterMemberRecord) -> bool {
+    member.endpoints.iter().any(|endpoint| {
+        (member.node_id == state.local_node_id
+            || !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
+            && matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+            )
+    })
+}
+
+fn unknown_cluster_node_status(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    observed_at: OffsetDateTime,
+) -> ClusterNodeStatusRecord {
+    ClusterNodeStatusRecord {
+        cluster_id: state.cluster_id.clone(),
+        node_id: member.node_id.clone(),
+        process: member
+            .capabilities
+            .iter()
+            .find_map(|capability| match capability.as_str() {
+                "daemon.main.run" => Some(DAEMON_MAIN_CLUSTER_ROLE.to_string()),
+                "daemon.shadow.supervise" => Some(DAEMON_SHADOW_CLUSTER_ROLE.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "unknown".to_string()),
+        availability: ClusterNodeAvailability::Unknown,
+        daemon_version: "unknown".to_string(),
+        target_os: None,
+        target_arch: None,
+        pid: None,
+        address: member
+            .endpoints
+            .iter()
+            .find(|endpoint| !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
+            .or_else(|| member.endpoints.first())
+            .map(|endpoint| endpoint.address.clone()),
+        bind_address: None,
+        executable: None,
+        rollout: None,
+        daemon_started_at: None,
+        observed_at,
+    }
+}
+
+fn cluster_node_status_is_stale(status: &ClusterNodeStatusRecord) -> bool {
+    (OffsetDateTime::now_utc() - status.observed_at).whole_seconds()
+        > CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS
+}
+
+fn format_node_availability(availability: &ClusterNodeAvailability) -> &'static str {
+    match availability {
+        ClusterNodeAvailability::Online => "online",
+        ClusterNodeAvailability::Offline => "offline",
+        ClusterNodeAvailability::Unknown => "unknown",
+    }
+}
+
+fn format_rollout_status(status: &ClusterNodeRolloutStatus) -> String {
+    match status.mode.as_deref() {
+        Some(mode) if !mode.is_empty() => format!("{} ({mode})", status.status),
+        _ => status.status.clone(),
     }
 }
 
@@ -2108,6 +2348,26 @@ fn read_cluster_members_from_kv(
     Ok(members)
 }
 
+fn read_cluster_node_statuses_from_kv(
+    paths: &ClusterPaths,
+) -> Result<Vec<ClusterNodeStatusRecord>, CliError> {
+    if !paths.kv_snapshot.exists() {
+        return Ok(Vec::new());
+    }
+    let store = read_cluster_kv_store(paths)?;
+    let mut statuses = Vec::new();
+    for entry in store.range_prefix("/cluster/node-status/") {
+        let status: ClusterNodeStatusRecord =
+            serde_json::from_slice(&entry.value).map_err(|source| CliError::Json {
+                path: entry.key,
+                detail: source.to_string(),
+            })?;
+        statuses.push(status);
+    }
+    statuses.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    Ok(statuses)
+}
+
 fn sync_cluster_state_to_kv(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -2121,6 +2381,26 @@ fn sync_cluster_state_to_kv(
     let snapshot = store.snapshot();
     write_cluster_kv_snapshot(paths, &snapshot)?;
     Ok(snapshot)
+}
+
+fn sync_cluster_node_status_to_kv(
+    paths: &ClusterPaths,
+    status: ClusterNodeStatusRecord,
+) -> Result<KvSnapshot, CliError> {
+    let mut store = read_cluster_kv_store(paths)?;
+    let key = cluster_node_status_key(&status.node_id);
+    let value = serde_json::to_vec(&status).map_err(|source| CliError::Json {
+        path: key.clone(),
+        detail: source.to_string(),
+    })?;
+    store.put(key, value, None)?;
+    let snapshot = store.snapshot();
+    write_cluster_kv_snapshot(paths, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn cluster_node_status_key(node_id: &NodeId) -> String {
+    format!("/cluster/node-status/{node_id}")
 }
 
 fn assign_local_node_public_keys(
@@ -2200,6 +2480,18 @@ impl ClusterNetworkMaintenance {
 
         self.process_discovery(&mut state);
         let mut snapshot = sync_cluster_state_to_kv(&cluster_paths, &state)?;
+        if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(paths)? {
+            snapshot = status_snapshot;
+        }
+        let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+        if matches!(
+            probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
+            DaemonProbeStatus::Running(_)
+        ) {
+            if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(&shadow_paths)? {
+                snapshot = status_snapshot;
+            }
+        }
 
         let now = Instant::now();
         if now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL {
@@ -2836,6 +3128,92 @@ fn register_daemon_cluster_node(
     })
 }
 
+fn refresh_daemon_node_status_in_kv(paths: &DaemonPaths) -> Result<Option<KvSnapshot>, CliError> {
+    let status = read_daemon_status(paths)?;
+    let Some(cluster) = status.cluster.as_ref() else {
+        return Ok(None);
+    };
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    let record = cluster_node_status_from_daemon_status(
+        &status,
+        cluster,
+        read_cluster_rollout_status(&rollout_paths)?,
+        OffsetDateTime::now_utc(),
+    );
+    sync_cluster_node_status_to_kv(&cluster_paths, record).map(Some)
+}
+
+fn cluster_node_status_from_daemon_status(
+    status: &DaemonStatus,
+    cluster: &DaemonClusterStatus,
+    rollout: Option<ClusterNodeRolloutStatus>,
+    observed_at: OffsetDateTime,
+) -> ClusterNodeStatusRecord {
+    ClusterNodeStatusRecord {
+        cluster_id: cluster.cluster_id.clone(),
+        node_id: cluster.node_id.clone(),
+        process: cluster.process.clone(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: status.version.clone(),
+        target_os: status.target_os.clone(),
+        target_arch: status.target_arch.clone(),
+        pid: Some(status.pid),
+        address: Some(status.address.clone()),
+        bind_address: Some(daemon_bind_address(status)),
+        executable: status
+            .executable
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        rollout: rollout.or_else(|| status.rollout.clone()),
+        daemon_started_at: Some(status.started_at.clone()),
+        observed_at,
+    }
+}
+
+fn read_cluster_rollout_status(
+    paths: &SelfRolloutPaths,
+) -> Result<Option<ClusterNodeRolloutStatus>, CliError> {
+    if !paths.state.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&paths.state).map_err(|source| CliError::Io {
+        path: paths.state.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|source| CliError::Json {
+            path: paths.state.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let Some(status) = json_string_field(&value, "status") else {
+        return Ok(None);
+    };
+    Ok(Some(ClusterNodeRolloutStatus {
+        status,
+        mode: json_string_field(&value, "mode"),
+        detail: json_string_field(&value, "detail"),
+        source: json_string_field(&value, "source")
+            .or_else(|| json_string_field(&value, "source_repo")),
+        requested_at: json_string_field(&value, "requested_at"),
+        staged_at: json_string_field(&value, "staged_at"),
+        updated_at: json_string_field(&value, "updated_at"),
+        failed_at: json_string_field(&value, "failed_at"),
+    }))
+}
+
+fn json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|field| match field {
+        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    })
+}
+
 fn daemon_cluster_registration(
     process: DaemonClusterProcess,
     main_options: DaemonRunOptions,
@@ -2926,10 +3304,16 @@ struct DaemonStatus {
     host: String,
     port: u16,
     address: String,
+    #[serde(default = "daemon_package_version")]
+    version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target_os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target_arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollout: Option<ClusterNodeRolloutStatus>,
     started_at: String,
     data_dir: PathBuf,
     lock_file: PathBuf,
@@ -3042,8 +3426,11 @@ impl DaemonStatus {
             host: options.host.clone(),
             port: options.port,
             address: daemon_connect_address(&options.host, options.port),
+            version: daemon_package_version(),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            executable: env::current_exe().ok(),
+            rollout: None,
             started_at: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| "unknown".to_string()),
@@ -3052,6 +3439,10 @@ impl DaemonStatus {
             cluster,
         }
     }
+}
+
+fn daemon_package_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 fn daemon_connect_address(host: &str, port: u16) -> String {
@@ -3265,6 +3656,7 @@ fn run_shadow_daemon_with_paths(
     let mut supervised_main: Option<Child> = None;
     let mut main_restart_suppressed = false;
     let mut pending_rollout: Option<ShadowMainRolloutMonitor> = None;
+    let mut next_status_tick = Instant::now();
     loop {
         match listener.accept() {
             Ok((mut stream, _address)) => {
@@ -3431,6 +3823,16 @@ fn run_shadow_daemon_with_paths(
                     main_restart_suppressed = true;
                 }
             }
+        }
+
+        if Instant::now() >= next_status_tick {
+            if !matches!(
+                probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT),
+                DaemonProbeStatus::Running(_)
+            ) {
+                let _ = refresh_daemon_node_status_in_kv(&shadow_paths);
+            }
+            next_status_tick = Instant::now() + DAEMON_CLUSTER_SYNC_INTERVAL;
         }
 
         thread::sleep(Duration::from_millis(200));
@@ -3688,9 +4090,16 @@ fn print_daemon_status_with_paths(
         DaemonProbeStatus::Running(status) => {
             println!("sinomo {label} is running");
             println!("  pid: {}", status.pid);
+            println!("  version: {}", status.version);
             println!("  bind: {}", daemon_bind_address(&status));
             println!("  control address: {}", status.address);
             print_daemon_platform(&status);
+            if let Some(executable) = &status.executable {
+                println!("  executable: {}", executable.display());
+            }
+            if let Some(rollout) = &status.rollout {
+                println!("  rollout: {}", format_rollout_status(rollout));
+            }
             if let Some(cluster) = &status.cluster {
                 println!("  cluster: {}", cluster.cluster_id);
                 println!("  node: {}", cluster.node_id);
@@ -3709,9 +4118,16 @@ fn print_daemon_status_with_paths(
             println!("sinomo {label} lock is held but the listener did not answer");
             if let Some(status) = status {
                 println!("  pid: {}", status.pid);
+                println!("  version: {}", status.version);
                 println!("  bind: {}", daemon_bind_address(&status));
                 println!("  control address: {}", status.address);
                 print_daemon_platform(&status);
+                if let Some(executable) = &status.executable {
+                    println!("  executable: {}", executable.display());
+                }
+                if let Some(rollout) = &status.rollout {
+                    println!("  rollout: {}", format_rollout_status(rollout));
+                }
                 if let Some(cluster) = &status.cluster {
                     println!("  cluster: {}", cluster.cluster_id);
                     println!("  node: {}", cluster.node_id);
@@ -4085,7 +4501,10 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
     let command = command.as_str();
     match command {
         "STATUS" => {
-            let status = read_daemon_status(paths)?;
+            let mut status = read_daemon_status(paths)?;
+            if let Some(data_dir) = paths.root.parent() {
+                status.rollout = read_cluster_rollout_status(&SelfRolloutPaths::new(data_dir))?;
+            }
             let body = serde_json::to_string_pretty(&status).map_err(|source| CliError::Json {
                 path: paths.status.display().to_string(),
                 detail: source.to_string(),
@@ -10560,7 +10979,11 @@ fn print_cluster_help() {
         "      Record intent to join an existing cluster from a signed sinomo-join URI or invite file."
     );
     println!("  sinomo cluster status");
-    println!("      Show local cluster bootstrap state, or report that this node is orphaned.");
+    println!("      Show local cluster bootstrap state and node health counts.");
+    println!("  sinomo cluster health");
+    println!(
+        "      Report node online/offline state, daemon version, platform, and rollout status."
+    );
     println!("  sinomo cluster peers");
     println!("      List known peers. Fails while the node is orphaned.");
     println!("  sinomo cluster leave");
@@ -10963,16 +11386,18 @@ mod tests {
         RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
         UninstallOptions, authenticate_daemon_command, cli_command_requires_cluster_state,
         cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
-        daemon_status_matches_options, decode_cluster_join_invite, encode_cluster_join_invite,
-        ensure_daemon_cluster_members, ensure_rollout_layout, handle_daemon_cluster_join,
-        handle_daemon_cluster_kv_txn, handle_daemon_cluster_sync, handle_daemon_rollout_build,
-        install_should_update_binary, install_with_layout, is_terminal_status,
-        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-        parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-        parse_dfs_command, parse_install_options, parse_model_default_options,
-        parse_models_list_options, parse_propose_options, parse_provider_command,
-        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-        read_cluster_members_from_kv, read_cluster_state, run_cui_with_handler_io,
+        daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
+        encode_cluster_join_invite, ensure_daemon_cluster_members, ensure_rollout_layout,
+        handle_daemon_cluster_join, handle_daemon_cluster_kv_txn, handle_daemon_cluster_sync,
+        handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
+        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
+        parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+        parse_daemon_command, parse_dfs_command, parse_install_options,
+        parse_model_default_options, parse_models_list_options, parse_propose_options,
+        parse_provider_command, parse_rollout_command, parse_slash_command,
+        parse_uninstall_options, parse_usage_options, read_cluster_members_from_kv,
+        read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
+        refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
         run_cui_with_handler_io_and_daemon, run_evolve_command, sign_cluster_join_invite,
         sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
         uninstall_with_layout,
@@ -10982,7 +11407,8 @@ mod tests {
     };
     use sinomo_runtime::core::{
         ClusterBootstrap, ClusterId, ClusterInviteId, ClusterJoinInvite, ClusterMemberRole,
-        ClusterMemberState, EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
+        ClusterMemberState, ClusterNodeAvailability, EvolutionJobId, NodeId, SessionId,
+        TrustDomain, TrustRing,
     };
     use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
     use sinomo_runtime::kv::{KvCompare, KvOp, KvTxn};
@@ -11040,6 +11466,11 @@ mod tests {
             parse_cli_command(&["cluster".to_string(), "status".to_string()])
                 .expect("cluster status"),
             CliCommand::Cluster(ClusterCliCommand::Status)
+        ));
+        assert!(matches!(
+            parse_cli_command(&["cluster".to_string(), "health".to_string()])
+                .expect("cluster health"),
+            CliCommand::Cluster(ClusterCliCommand::Health)
         ));
         assert!(matches!(
             parse_cli_command(&["install".to_string(), "help".to_string()]).expect("install help"),
@@ -11206,8 +11637,11 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 21_353,
             address: "127.0.0.1:21353".to_string(),
+            version: daemon_package_version(),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            executable: None,
+            rollout: None,
             started_at: "2026-05-04T00:00:00Z".to_string(),
             data_dir: PathBuf::from("data"),
             lock_file: PathBuf::from("data/daemon/daemon.lock"),
@@ -11763,6 +12197,87 @@ mod tests {
         let store = super::read_cluster_kv_store(&paths).expect("kv store");
         let service = store.get("/services/test").expect("service entry");
         assert_eq!(service.value, br#"{"healthy":true}"#.to_vec());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn daemon_node_status_publishes_version_and_rollout_to_kv() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-node-status-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_init_with_paths(
+            ClusterInitOptions {
+                cluster_id: Some(ClusterId::new("cluster_status").expect("cluster")),
+                node_id: Some(NodeId::new("node_status").expect("node")),
+                name: "status cluster".to_string(),
+            },
+            &cluster_paths,
+        )
+        .expect("cluster init");
+        let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout paths");
+        std::fs::write(
+            &rollout_paths.state,
+            r#"{"status":"accepted","mode":"cluster-remote-build","updated_at":"2026-05-04T00:00:00Z"}"#,
+        )
+        .expect("rollout state");
+        let status = DaemonStatus {
+            pid: 4242,
+            host: "0.0.0.0".to_string(),
+            port: 21_353,
+            address: "127.0.0.1:21353".to_string(),
+            version: daemon_package_version(),
+            target_os: Some(std::env::consts::OS.to_string()),
+            target_arch: Some(std::env::consts::ARCH.to_string()),
+            executable: None,
+            rollout: None,
+            started_at: "2026-05-04T00:00:00Z".to_string(),
+            data_dir: root.clone(),
+            lock_file: daemon_paths.lock.clone(),
+            cluster: Some(DaemonClusterStatus {
+                cluster_id: ClusterId::new("cluster_status").expect("cluster"),
+                node_id: NodeId::new("node_status").expect("node"),
+                process: super::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+                member_role: ClusterMemberRole::Voter,
+                member_state: ClusterMemberState::Active,
+            }),
+        };
+        std::fs::write(
+            &daemon_paths.status,
+            serde_json::to_vec_pretty(&status).expect("status json"),
+        )
+        .expect("write status");
+
+        refresh_daemon_node_status_in_kv(&daemon_paths).expect("refresh status");
+        let statuses =
+            read_cluster_node_statuses_from_kv(&cluster_paths).expect("node statuses from kv");
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(
+            statuses[0].node_id,
+            NodeId::new("node_status").expect("node")
+        );
+        assert_eq!(statuses[0].availability, ClusterNodeAvailability::Online);
+        assert_eq!(statuses[0].daemon_version, daemon_package_version());
+        assert_eq!(
+            statuses[0].rollout.as_ref().expect("rollout").status,
+            "accepted"
+        );
+        assert_eq!(
+            read_cluster_rollout_status(&rollout_paths)
+                .expect("read rollout")
+                .expect("rollout")
+                .mode,
+            Some("cluster-remote-build".to_string())
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -12829,8 +13344,11 @@ mod tests {
             host: "0.0.0.0".to_string(),
             port: 21_353,
             address: "127.0.0.1:21353".to_string(),
+            version: daemon_package_version(),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            executable: None,
+            rollout: None,
             started_at: "2026-05-04T00:00:00Z".to_string(),
             data_dir: PathBuf::from("data"),
             lock_file: PathBuf::from("data/daemon/daemon.lock"),

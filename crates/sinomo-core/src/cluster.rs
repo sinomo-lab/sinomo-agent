@@ -154,6 +154,60 @@ pub struct ClusterMemberRecord {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterNodeStatusRecord {
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    pub process: String,
+    pub availability: ClusterNodeAvailability,
+    pub daemon_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<ClusterNodeRolloutStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_started_at: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub observed_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterNodeAvailability {
+    Online,
+    Offline,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterNodeRolloutStatus {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<String>,
+}
+
 impl ClusterMemberRecord {
     pub fn local_voter(
         cluster_id: ClusterId,

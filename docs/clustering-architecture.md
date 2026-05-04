@@ -28,6 +28,7 @@ sinomo cluster init [--name <name>] [--cluster-id cluster_...] [--node-id node_.
 sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]
 sinomo cluster join <invite> [--name <name>] [--cluster-id cluster_...] [--node-id node_...]
 sinomo cluster status
+sinomo cluster health
 sinomo cluster peers
 sinomo cluster leave
 ```
@@ -59,7 +60,7 @@ The remote machine can run the command from the file directly, append `--name <r
 sinomo cluster join join.txt --name <remote-name>
 ```
 
-On join, the remote node builds local pending bootstrap state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining node's main and shadow daemon members, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If the invite contains introducers but none are reachable, join fails with an actionable connectivity error instead of silently recording an isolated pending state. `sinomo cluster peers` on a joined node retries introducer reconciliation before printing the local member view.
+On join, the remote node builds local pending bootstrap state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining node's main and shadow daemon members, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If the invite contains introducers but none are reachable, join fails with an actionable connectivity error instead of silently recording an isolated pending state. `sinomo cluster peers` on a joined node retries introducer reconciliation before printing the local member view. `sinomo cluster health` combines the KV member view, daemon-published node heartbeats, and live endpoint probes to report online/offline state, daemon version, platform, last-seen time, and rollout state for main and shadow daemon nodes.
 
 Initial local state lives at:
 
@@ -323,6 +324,7 @@ Use slash-delimited namespaces:
 ```text
 /cluster/meta
 /cluster/members/<node_id>
+/cluster/node-status/<node_id>
 /cluster/endpoints/<node_id>/<endpoint_id>
 /cluster/capabilities/<node_id>/<capability>
 /services/<service_name>/<node_id>
@@ -447,9 +449,9 @@ Phase 2, KV core:
 
 - Implement in-process Raft/KV simulation for tests. Implemented in `crates/sinomo-kv`.
 - Add WAL, snapshots, revisions, compare-and-swap transactions, and watches. Implemented as `KvLogEntry`, `KvSnapshot`, `KvRevision`, `KvTxn`, and prefix watches.
-- Store membership and service registry records in the KV. Implemented for cluster membership records under `/cluster/members/<node_id>`; service registry records use the same generic keyspace and lease primitives.
+- Store membership and service registry records in the KV. Implemented for cluster membership records under `/cluster/members/<node_id>` and runtime health records under `/cluster/node-status/<node_id>`; service registry records use the same generic keyspace and lease primitives.
 - Generate node identity key pairs and publish public keys in KV membership records. Implemented with node-local Ed25519 identity files under `$SINOMO_DATA_DIR/identity/`; the main daemon and shadow daemon have distinct public keys, and local CLI control messages are signed from the local main identity.
-- Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned `CLUSTER_KV_SNAPSHOT`, `CLUSTER_KV_TXN`, and `CLUSTER_KV_RANGE_PREFIX` control messages backed by `$SINOMO_DATA_DIR/cluster/kv-snapshot.json`. Cluster init, daemon registration, and join registration persist member records into the KV, and join responses carry the current snapshot to the joining node.
+- Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned `CLUSTER_KV_SNAPSHOT`, `CLUSTER_KV_TXN`, and `CLUSTER_KV_RANGE_PREFIX` control messages backed by `$SINOMO_DATA_DIR/cluster/kv-snapshot.json`. Cluster init, daemon registration, and join registration persist member records into the KV, daemon maintenance publishes version/health/rollout node-status records, and join responses carry the current snapshot to the joining node.
 
 Phase 3, real local network:
 
@@ -472,6 +474,6 @@ Phase 5, DFS integration:
 
 Phase 6, operations:
 
-- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local bootstrap invites, and `cluster status` / `cluster peers` read the daemon-backed KV membership view when available. Approval, revocation, promotion, doctor, and explicit KV inspection remain future work.
+- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local bootstrap invites, and `cluster status` / `cluster health` / `cluster peers` read the daemon-backed KV membership and node-status view when available. Approval, revocation, promotion, doctor, and explicit KV inspection remain future work.
 - Add snapshot export/import.
 - Add metrics and event traces for elections, watches, membership changes, and replication lag.
