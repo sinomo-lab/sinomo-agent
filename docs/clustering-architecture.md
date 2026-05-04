@@ -47,13 +47,13 @@ An uninitialized node is an orphan. Orphan nodes must not run distributed operat
 sinomo cluster invite --introducer 192.168.1.10:21353 --output join.txt
 ```
 
-The remote machine can then run:
+The command prints the raw invite URI and a ready-to-run join command. When `--output` is supplied, the output file contains the ready-to-run command:
 
 ```text
-sinomo cluster join <sinomo-join://v1/...> --name <remote-name>
+sinomo cluster join <sinomo-join://v1/...>
 ```
 
-or, if the invite was copied as a file:
+The remote machine can run the command from the file directly, append `--name <remote-name>` if it wants a custom display name, or pass the file to `cluster join`; the join parser accepts both raw invite files and command files:
 
 ```text
 sinomo cluster join join.txt --name <remote-name>

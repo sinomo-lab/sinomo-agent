@@ -597,7 +597,7 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
     if options.start {
         let main_args = vec![
             "daemon".to_string(),
-            "start".to_string(),
+            "run".to_string(),
             "--host".to_string(),
             options.host.clone(),
             "--port".to_string(),
@@ -612,7 +612,7 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
         let shadow_args = vec![
             "daemon".to_string(),
             "shadow".to_string(),
-            "start".to_string(),
+            "run".to_string(),
             "--host".to_string(),
             options.host.clone(),
             "--port".to_string(),
@@ -890,32 +890,59 @@ fn ensure_installed_daemon_started(
         println!("sinomo {label} already running");
         return Ok(());
     }
-    run_installed_sinomo(&layout.binary, &layout.data_dir, args)?;
-    println!("sinomo {label} start requested");
+    start_installed_sinomo_daemon(&layout.binary, &layout.data_dir, args, paths, label)?;
     Ok(())
 }
 
-fn run_installed_sinomo(binary: &Path, data_dir: &Path, args: &[String]) -> Result<(), CliError> {
-    let output = Command::new(binary)
+fn start_installed_sinomo_daemon(
+    binary: &Path,
+    data_dir: &Path,
+    args: &[String],
+    paths: &DaemonPaths,
+    label: &str,
+) -> Result<(), CliError> {
+    let mut child = Command::new(binary)
         .args(args)
         .env("SINOMO_DATA_DIR", data_dir)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|source| CliError::Io {
             path: binary.display().to_string(),
             detail: source.to_string(),
         })?;
-    if !output.status.success() {
-        return Err(CliError::Process {
-            command: format!("{} {}", binary.display(), args.join(" ")),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let DaemonProbeStatus::Running(status) = probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT)
+        {
+            println!(
+                "sinomo {label} started: pid={} address={}",
+                status.pid, status.address
+            );
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(|source| CliError::Io {
+            path: binary.display().to_string(),
+            detail: source.to_string(),
+        })? {
+            return Err(CliError::Process {
+                command: format!("{} {}", binary.display(), args.join(" ")),
+                status: status.code().unwrap_or(-1),
+                stderr: format!("{label} process exited before becoming ready"),
+            });
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.trim().is_empty() {
-        println!("{}", stdout.trim());
-    }
-    Ok(())
+
+    Err(CliError::Network {
+        address: paths.status.display().to_string(),
+        detail: format!(
+            "{label} process {} did not become ready after install",
+            child.id()
+        ),
+    })
 }
 
 fn stop_daemon_if_running(paths: &DaemonPaths, label: &str) -> Result<(), CliError> {
@@ -1023,6 +1050,7 @@ fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     let rendered = cluster_invite_with_paths(options, &paths)?;
     println!("invite: {}", rendered.uri);
+    println!("join command: {}", rendered.join_command);
     println!("cluster: {}", rendered.invite.cluster_id);
     println!("expires: {}", format_rfc3339(rendered.invite.expires_at));
     println!("saved: {}", rendered.persisted_path.display());
@@ -1036,6 +1064,7 @@ fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliError> {
 struct RenderedClusterInvite {
     invite: ClusterJoinInvite,
     uri: String,
+    join_command: String,
     persisted_path: PathBuf,
     output_path: Option<PathBuf>,
 }
@@ -1053,6 +1082,7 @@ fn cluster_invite_with_paths(
     let now = OffsetDateTime::now_utc();
     let invite = build_cluster_invite(&state, &options, now)?;
     let uri = encode_cluster_join_invite(&invite)?;
+    let join_command = cluster_join_command(&uri);
     let persisted_path = paths.invite_path(&invite.invite_id);
     write_json(&persisted_path, &invite)?;
     if let Some(output) = &options.output {
@@ -1062,7 +1092,7 @@ fn cluster_invite_with_paths(
                 detail: source.to_string(),
             })?;
         }
-        fs::write(output, format!("{uri}\n")).map_err(|source| CliError::Io {
+        fs::write(output, format!("{join_command}\n")).map_err(|source| CliError::Io {
             path: output.display().to_string(),
             detail: source.to_string(),
         })?;
@@ -1070,9 +1100,14 @@ fn cluster_invite_with_paths(
     Ok(RenderedClusterInvite {
         invite,
         uri,
+        join_command,
         persisted_path,
         output_path: options.output,
     })
+}
+
+fn cluster_join_command(uri: &str) -> String {
+    format!("sinomo cluster join \"{uri}\"")
 }
 
 fn build_cluster_invite(
@@ -1232,7 +1267,25 @@ fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, Cl
     } else {
         raw.to_string()
     };
-    decode_cluster_join_invite(invite.trim())
+    decode_cluster_join_invite(extract_invite_from_join_command(invite.trim()))
+}
+
+fn extract_invite_from_join_command(raw: &str) -> &str {
+    let first_line = raw
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(raw);
+    let trimmed = first_line.trim();
+    let Some(rest) = trimmed.strip_prefix("sinomo cluster join ") else {
+        return raw.trim();
+    };
+    let rest = rest.trim();
+    if let Some(after_quote) = rest.strip_prefix('"')
+        && let Some(end) = after_quote.find('"')
+    {
+        return &after_quote[..end];
+    }
+    rest.split_whitespace().next().unwrap_or(rest)
 }
 
 fn encode_cluster_join_invite(invite: &ClusterJoinInvite) -> Result<String, CliError> {
@@ -8572,12 +8625,12 @@ mod tests {
         UninstallOptions, cli_command_requires_cluster_state, cluster_init_with_paths,
         cluster_invite_with_paths, cluster_join_with_paths, decode_cluster_join_invite,
         install_with_layout, is_terminal_status, models_default_with_data_dir,
-        normalize_model_provider, parse_cli_command, parse_cluster_command, parse_daemon_command,
-        parse_dfs_command, parse_install_options, parse_model_default_options,
-        parse_models_list_options, parse_propose_options, parse_provider_command,
-        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-        read_cluster_state, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
-        run_evolve_command, uninstall_with_layout,
+        normalize_model_provider, parse_cli_command, parse_cluster_command,
+        parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
+        parse_install_options, parse_model_default_options, parse_models_list_options,
+        parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
+        parse_uninstall_options, parse_usage_options, read_cluster_state, run_cui_with_handler_io,
+        run_cui_with_handler_io_and_daemon, run_evolve_command, uninstall_with_layout,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -9036,7 +9089,12 @@ mod tests {
         assert!(rendered.persisted_path.exists());
         assert_eq!(
             std::fs::read_to_string(output).expect("invite file").trim(),
-            rendered.uri
+            rendered.join_command
+        );
+        assert!(rendered.join_command.starts_with("sinomo cluster join "));
+        assert_eq!(
+            parse_cluster_join_invite_argument(&rendered.join_command).expect("parse join command"),
+            parsed
         );
         std::fs::remove_dir_all(root).ok();
     }
