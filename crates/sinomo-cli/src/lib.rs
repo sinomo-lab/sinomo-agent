@@ -27,11 +27,14 @@ use sinomo_lm::{
     OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL, normalize_nvidia_model_id,
 };
 use sinomo_runtime::core::{
-    CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, ClusterBootstrap,
-    ClusterBootstrapState, ClusterId, ClusterJoinInvite, Confidence, EvaluationGate,
-    EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob,
-    EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustRing, VerificationCommand,
+    CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, CapabilityName,
+    ClusterBootstrap, ClusterBootstrapState, ClusterEndpointId, ClusterEndpointPrivacy,
+    ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterJoinInvite,
+    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterTransportKind, Confidence,
+    EvaluationGate, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind,
+    EvolutionJob, EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId,
+    PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustRing,
+    VerificationCommand,
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
@@ -144,6 +147,8 @@ const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const SHADOW_MAIN_HOST_ENV: &str = "SINOMO_SHADOW_MAIN_HOST";
 const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
+const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
+const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClusterCliCommand {
@@ -379,11 +384,17 @@ fn cluster_init_with_paths(
         ))
         .expect("generated cluster id")
     });
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         options.name.clone(),
         local_node_id.clone(),
         options.name,
+        timestamp,
+    );
+    ensure_daemon_cluster_members(
+        &mut state,
+        &DaemonRunOptions::default(),
+        &DaemonRunOptions::shadow_default(),
         timestamp,
     );
     write_json(&paths.state, &state)?;
@@ -418,12 +429,18 @@ fn cluster_join_with_paths(
         .cluster_id
         .unwrap_or_else(|| ClusterId::new("cluster_pending").expect("static cluster id"));
     let invite = ClusterJoinInvite::local_placeholder(options.invite.clone(), cluster_id.clone());
-    let state = ClusterBootstrapState::pending_join(
+    let mut state = ClusterBootstrapState::pending_join(
         cluster_id,
         options.name.clone(),
         local_node_id.clone(),
         options.name,
         invite,
+        timestamp,
+    );
+    ensure_daemon_cluster_members(
+        &mut state,
+        &DaemonRunOptions::default(),
+        &DaemonRunOptions::shadow_default(),
         timestamp,
     );
     write_json(&paths.state, &state)?;
@@ -491,10 +508,267 @@ fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, Cli
         path: paths.state.display().to_string(),
         detail: source.to_string(),
     })?;
-    serde_json::from_str(&content).map_err(|source| CliError::Json {
-        path: paths.state.display().to_string(),
-        detail: source.to_string(),
+    let mut state: ClusterBootstrapState =
+        serde_json::from_str(&content).map_err(|source| CliError::Json {
+            path: paths.state.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    ensure_daemon_cluster_members(
+        &mut state,
+        &DaemonRunOptions::default(),
+        &DaemonRunOptions::shadow_default(),
+        OffsetDateTime::now_utc(),
+    );
+    Ok(state)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonClusterProcess {
+    Main,
+    Shadow,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonClusterRegistration {
+    process: DaemonClusterProcess,
+    main_options: DaemonRunOptions,
+    shadow_options: DaemonRunOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DaemonClusterStatus {
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    process: String,
+    member_role: ClusterMemberRole,
+    member_state: ClusterMemberState,
+}
+
+fn ensure_daemon_cluster_members(
+    state: &mut ClusterBootstrapState,
+    main_options: &DaemonRunOptions,
+    shadow_options: &DaemonRunOptions,
+    timestamp: OffsetDateTime,
+) {
+    ensure_main_daemon_cluster_member(state, main_options, timestamp);
+    ensure_shadow_daemon_cluster_member(state, shadow_options, timestamp);
+    state.updated_at = timestamp;
+}
+
+fn ensure_main_daemon_cluster_member(
+    state: &mut ClusterBootstrapState,
+    options: &DaemonRunOptions,
+    timestamp: OffsetDateTime,
+) {
+    let role = match &state.bootstrap {
+        ClusterBootstrap::InitializedLocally => ClusterMemberRole::Voter,
+        ClusterBootstrap::Joined { .. } => ClusterMemberRole::Learner,
+    };
+    let member_state = match &state.bootstrap {
+        ClusterBootstrap::InitializedLocally => ClusterMemberState::Active,
+        ClusterBootstrap::Joined { .. } => ClusterMemberState::Pending,
+    };
+    let local_node_id = state.local_node_id.clone();
+    let mut member = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        local_node_id.clone(),
+        state.local_node_display_name.clone(),
+        timestamp,
+    );
+    let capabilities = main_daemon_capabilities(&role);
+    member.role = role;
+    member.state = member_state;
+    member.node_public_key = "pending-daemon-node-key".to_string();
+    upsert_daemon_member(
+        state,
+        member,
+        capabilities,
+        daemon_loopback_endpoint(&local_node_id, options, 0),
+        timestamp,
+    );
+}
+
+fn ensure_shadow_daemon_cluster_member(
+    state: &mut ClusterBootstrapState,
+    options: &DaemonRunOptions,
+    timestamp: OffsetDateTime,
+) {
+    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+    let mut member = match &state.bootstrap {
+        ClusterBootstrap::InitializedLocally => ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            shadow_node_id.clone(),
+            format!("{} shadow", state.local_node_display_name),
+            timestamp,
+        ),
+        ClusterBootstrap::Joined { .. } => ClusterMemberRecord::pending_non_voting(
+            state.cluster_id.clone(),
+            shadow_node_id.clone(),
+            format!("{} shadow", state.local_node_display_name),
+            timestamp,
+        ),
+    };
+    member.node_public_key = "pending-shadow-daemon-node-key".to_string();
+    upsert_daemon_member(
+        state,
+        member,
+        shadow_daemon_capabilities(),
+        daemon_loopback_endpoint(&shadow_node_id, options, 10),
+        timestamp,
+    );
+}
+
+fn upsert_daemon_member(
+    state: &mut ClusterBootstrapState,
+    replacement: ClusterMemberRecord,
+    capabilities: Vec<CapabilityName>,
+    endpoint: ClusterEndpointRecord,
+    timestamp: OffsetDateTime,
+) {
+    if let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == replacement.node_id)
+    {
+        member.display_name = replacement.display_name;
+        member.role = replacement.role;
+        member.state = replacement.state;
+        member.node_public_key = replacement.node_public_key;
+        member.capabilities = capabilities.clone();
+        member.allowed_capabilities = capabilities;
+        member
+            .endpoints
+            .retain(|candidate| candidate.endpoint_id != endpoint.endpoint_id);
+        member.endpoints.push(endpoint);
+        member.updated_at = timestamp;
+    } else {
+        let mut member = replacement;
+        member.capabilities = capabilities.clone();
+        member.allowed_capabilities = capabilities;
+        member.endpoints.push(endpoint);
+        state.members.push(member);
+    }
+}
+
+fn daemon_loopback_endpoint(
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: daemon_loopback_endpoint_id(node_id),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Loopback,
+        address: daemon_connect_address(&options.host, options.port),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::LocalOnly,
+        priority,
+        last_observed_latency_ms: None,
+    }
+}
+
+fn daemon_loopback_endpoint_id(node_id: &NodeId) -> ClusterEndpointId {
+    let body = node_id.as_str().trim_start_matches(NodeId::PREFIX);
+    ClusterEndpointId::new(format!("endpoint_{body}_daemon_loopback"))
+        .expect("derived daemon endpoint id")
+}
+
+fn shadow_daemon_node_id(main_node_id: &NodeId) -> NodeId {
+    NodeId::new(format!("{}-shadow", main_node_id.as_str())).expect("derived shadow daemon node id")
+}
+
+fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName> {
+    let mut capabilities = vec![
+        CapabilityName::new("cluster.message.receive").expect("static capability"),
+        CapabilityName::new("cluster.message.send").expect("static capability"),
+        CapabilityName::new("daemon.main.run").expect("static capability"),
+    ];
+    if matches!(role, ClusterMemberRole::Voter) {
+        capabilities.push(CapabilityName::new("cluster.kv.vote").expect("static capability"));
+    }
+    capabilities
+}
+
+fn shadow_daemon_capabilities() -> Vec<CapabilityName> {
+    vec![
+        CapabilityName::new("cluster.message.receive").expect("static capability"),
+        CapabilityName::new("cluster.message.send").expect("static capability"),
+        CapabilityName::new("daemon.shadow.supervise").expect("static capability"),
+    ]
+}
+
+fn daemon_cluster_status(
+    state: &ClusterBootstrapState,
+    process: DaemonClusterProcess,
+) -> Option<DaemonClusterStatus> {
+    let node_id = match process {
+        DaemonClusterProcess::Main => state.local_node_id.clone(),
+        DaemonClusterProcess::Shadow => shadow_daemon_node_id(&state.local_node_id),
+    };
+    let member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == node_id)?;
+    Some(DaemonClusterStatus {
+        cluster_id: state.cluster_id.clone(),
+        node_id,
+        process: match process {
+            DaemonClusterProcess::Main => DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            DaemonClusterProcess::Shadow => DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+        },
+        member_role: member.role.clone(),
+        member_state: member.state.clone(),
     })
+}
+
+fn register_daemon_cluster_node(
+    registration: &DaemonClusterRegistration,
+) -> Result<DaemonClusterStatus, CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    let mut state = read_cluster_state(&paths)?;
+    ensure_daemon_cluster_members(
+        &mut state,
+        &registration.main_options,
+        &registration.shadow_options,
+        OffsetDateTime::now_utc(),
+    );
+    write_json(&paths.state, &state)?;
+    daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
+        detail: "daemon cluster member could not be registered".to_string(),
+    })
+}
+
+fn daemon_cluster_registration(
+    process: DaemonClusterProcess,
+    main_options: DaemonRunOptions,
+    shadow_options: DaemonRunOptions,
+) -> DaemonClusterRegistration {
+    DaemonClusterRegistration {
+        process,
+        main_options,
+        shadow_options,
+    }
+}
+
+fn format_member_role(role: &ClusterMemberRole) -> &'static str {
+    match role {
+        ClusterMemberRole::Voter => "voter",
+        ClusterMemberRole::Learner => "learner",
+        ClusterMemberRole::NonVoting => "non-voting",
+    }
+}
+
+fn format_member_state(state: &ClusterMemberState) -> &'static str {
+    match state {
+        ClusterMemberState::Pending => "pending",
+        ClusterMemberState::Active => "active",
+        ClusterMemberState::Learner => "learner",
+        ClusterMemberState::Voter => "voter",
+        ClusterMemberState::NonVoting => "non-voting",
+        ClusterMemberState::Suspect => "suspect",
+        ClusterMemberState::Offline => "offline",
+        ClusterMemberState::Removed => "removed",
+    }
 }
 
 fn cluster_bootstrap_label(bootstrap: &ClusterBootstrap) -> &'static str {
@@ -557,6 +831,8 @@ struct DaemonStatus {
     started_at: String,
     data_dir: PathBuf,
     lock_file: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cluster: Option<DaemonClusterStatus>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -598,8 +874,13 @@ struct DaemonLock {
 }
 
 impl DaemonLock {
-    fn acquire(paths: &DaemonPaths, options: &DaemonRunOptions) -> Result<Self, CliError> {
+    fn acquire(
+        paths: &DaemonPaths,
+        options: &DaemonRunOptions,
+        registration: Option<&DaemonClusterRegistration>,
+    ) -> Result<Self, CliError> {
         paths.ensure()?;
+        let cluster = registration.map(register_daemon_cluster_node).transpose()?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -616,7 +897,7 @@ impl DaemonLock {
                 detail: source.to_string(),
             })?;
 
-        let status = DaemonStatus::new(options, paths);
+        let status = DaemonStatus::new(options, paths, cluster);
         let status_json = serde_json::to_vec_pretty(&status).map_err(|source| CliError::Json {
             path: paths.status.display().to_string(),
             detail: source.to_string(),
@@ -649,7 +930,11 @@ impl Drop for DaemonLock {
 }
 
 impl DaemonStatus {
-    fn new(options: &DaemonRunOptions, paths: &DaemonPaths) -> Self {
+    fn new(
+        options: &DaemonRunOptions,
+        paths: &DaemonPaths,
+        cluster: Option<DaemonClusterStatus>,
+    ) -> Self {
         Self {
             pid: std::process::id(),
             host: options.host.clone(),
@@ -660,6 +945,7 @@ impl DaemonStatus {
                 .unwrap_or_else(|_| "unknown".to_string()),
             data_dir: paths.root.parent().unwrap_or(&paths.root).to_path_buf(),
             lock_file: paths.lock.clone(),
+            cluster,
         }
     }
 }
@@ -781,7 +1067,17 @@ fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliError> {
 }
 
 fn run_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
-    run_daemon_with_paths(options, daemon_paths_from_defaults()?, "daemon")
+    let registration = daemon_cluster_registration(
+        DaemonClusterProcess::Main,
+        options.clone(),
+        DaemonRunOptions::shadow_default(),
+    );
+    run_daemon_with_paths(
+        options,
+        daemon_paths_from_defaults()?,
+        "daemon",
+        registration,
+    )
 }
 
 fn run_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
@@ -807,7 +1103,12 @@ fn run_shadow_daemon_with_paths(
     rollout_paths: SelfRolloutPaths,
     main_options: DaemonRunOptions,
 ) -> Result<(), CliError> {
-    let _lock = DaemonLock::acquire(&shadow_paths, &options)?;
+    let registration = daemon_cluster_registration(
+        DaemonClusterProcess::Shadow,
+        main_options.clone(),
+        options.clone(),
+    );
+    let _lock = DaemonLock::acquire(&shadow_paths, &options, Some(&registration))?;
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
@@ -932,8 +1233,9 @@ fn run_daemon_with_paths(
     options: DaemonRunOptions,
     paths: DaemonPaths,
     label: &str,
+    registration: DaemonClusterRegistration,
 ) -> Result<(), CliError> {
-    let _lock = DaemonLock::acquire(&paths, &options)?;
+    let _lock = DaemonLock::acquire(&paths, &options, Some(&registration))?;
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
@@ -1049,6 +1351,16 @@ fn print_daemon_status_with_paths(
             println!("sinomo {label} is running");
             println!("  pid: {}", status.pid);
             println!("  address: {}", status.address);
+            if let Some(cluster) = &status.cluster {
+                println!("  cluster: {}", cluster.cluster_id);
+                println!("  node: {}", cluster.node_id);
+                println!("  cluster process: {}", cluster.process);
+                println!(
+                    "  member: {} {}",
+                    format_member_role(&cluster.member_role),
+                    format_member_state(&cluster.member_state)
+                );
+            }
             println!("  lock: {}", status.lock_file.display());
             println!("  status: {}", paths.status.display());
             Ok(())
@@ -1058,6 +1370,16 @@ fn print_daemon_status_with_paths(
             if let Some(status) = status {
                 println!("  pid: {}", status.pid);
                 println!("  address: {}", status.address);
+                if let Some(cluster) = &status.cluster {
+                    println!("  cluster: {}", cluster.cluster_id);
+                    println!("  node: {}", cluster.node_id);
+                    println!("  cluster process: {}", cluster.process);
+                    println!(
+                        "  member: {} {}",
+                        format_member_role(&cluster.member_role),
+                        format_member_state(&cluster.member_state)
+                    );
+                }
             } else {
                 println!(
                     "  address: {}",
@@ -6507,7 +6829,23 @@ mod tests {
         );
         assert_eq!(state.term, 1);
         assert_eq!(state.kv_revision, 1);
-        assert_eq!(state.members.len(), 1);
+        assert_eq!(state.members.len(), 2);
+        let main = state
+            .members
+            .iter()
+            .find(|member| member.node_id == NodeId::new("node_local").expect("node"))
+            .expect("main daemon member");
+        assert_eq!(main.role, ClusterMemberRole::Voter);
+        assert_eq!(main.state, ClusterMemberState::Active);
+        assert_eq!(main.endpoints[0].address, "127.0.0.1:21353");
+        let shadow = state
+            .members
+            .iter()
+            .find(|member| member.node_id == NodeId::new("node_local-shadow").expect("node"))
+            .expect("shadow daemon member");
+        assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
+        assert_eq!(shadow.state, ClusterMemberState::Active);
+        assert_eq!(shadow.endpoints[0].address, "127.0.0.1:21354");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6542,6 +6880,13 @@ mod tests {
         assert_eq!(state.kv_revision, 0);
         assert_eq!(state.members[0].role, ClusterMemberRole::Learner);
         assert_eq!(state.members[0].state, ClusterMemberState::Pending);
+        let shadow = state
+            .members
+            .iter()
+            .find(|member| member.node_id == NodeId::new("node_joiner-shadow").expect("node"))
+            .expect("shadow daemon member");
+        assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
+        assert_eq!(shadow.state, ClusterMemberState::Pending);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6686,13 +7031,13 @@ mod tests {
         let paths = super::DaemonPaths::new(&SinomoDataDir::new(&root));
         paths.ensure().expect("daemon paths");
 
-        let lock = super::DaemonLock::acquire(&paths, &DaemonRunOptions::default())
+        let lock = super::DaemonLock::acquire(&paths, &DaemonRunOptions::default(), None)
             .expect("first daemon lock");
         assert!(matches!(
             super::probe_daemon_status(&paths, Duration::from_millis(1)),
             DaemonProbeStatus::Locked { .. }
         ));
-        assert!(super::DaemonLock::acquire(&paths, &DaemonRunOptions::default()).is_err());
+        assert!(super::DaemonLock::acquire(&paths, &DaemonRunOptions::default(), None).is_err());
 
         drop(lock);
         assert!(matches!(

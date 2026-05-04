@@ -195,6 +195,38 @@ impl ClusterMemberRecord {
         )
     }
 
+    pub fn local_non_voting(
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        display_name: impl Into<String>,
+        timestamp: OffsetDateTime,
+    ) -> Self {
+        Self::new(
+            cluster_id,
+            node_id,
+            display_name,
+            ClusterMemberRole::NonVoting,
+            ClusterMemberState::Active,
+            timestamp,
+        )
+    }
+
+    pub fn pending_non_voting(
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        display_name: impl Into<String>,
+        timestamp: OffsetDateTime,
+    ) -> Self {
+        Self::new(
+            cluster_id,
+            node_id,
+            display_name,
+            ClusterMemberRole::NonVoting,
+            ClusterMemberState::Pending,
+            timestamp,
+        )
+    }
+
     fn new(
         cluster_id: ClusterId,
         node_id: NodeId,

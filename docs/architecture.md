@@ -75,6 +75,8 @@ The daemon listens on `127.0.0.1:21353` by default. The bind host and port can b
 
 Each daemon instance owns `$SINOMO_DATA_DIR/daemon/daemon.lock` and writes `$SINOMO_DATA_DIR/daemon/status.json`. The lock prevents duplicate local daemons for the same data directory. The status file records the PID, bind address, start time, data directory, and lock path so CLI commands can distinguish three cases: running and reachable, locked but not reachable, or not running. This probe path is the first local control-plane primitive for long-running background work such as scheduled evolution campaigns.
 
+The main daemon and shadow daemon are separate cluster nodes that share the same local data directory. `sinomo cluster init` records the main daemon as the local voter node and records a derived `<main-node-id>-shadow` node for the shadow daemon. The shadow node is active but non-voting: it can receive and send cluster communications for supervision, recovery, and rollout coordination, but it does not participate in KV quorum, scheduling, DFS ownership, or normal workload placement.
+
 ### Self-Rollout Source and Shadow Daemon
 
 The first self-rollout path treats Sinomo's own source as durable node-local state. `sinomo rollout init-source` creates `$SINOMO_DATA_DIR/source/sinomo` by cloning the current repository unless a different `--repo` is supplied. When `sinomo evolve propose` does not receive an explicit `--repo` or configured repo, it uses this data-directory source repository so approved self-evolution work lands in Sinomo's maintained source rather than the operator's checkout.

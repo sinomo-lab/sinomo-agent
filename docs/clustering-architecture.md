@@ -48,6 +48,13 @@ $SINOMO_DATA_DIR/cluster/state.json
 
 The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core`. It is only a bootstrap artifact. Once the cluster service is implemented, durable membership and config state come from the replicated KV log. The file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
 
+Each local installation has two daemon process nodes in the cluster metadata:
+
+- Main daemon node: the user-visible local daemon, eligible to be the local voter when this installation owns a voting role.
+- Shadow daemon node: a derived `<main-node-id>-shadow` member that is active but non-voting.
+
+The shadow daemon intentionally advertises only communication and supervision capabilities. It can receive and send messages when rollout, recovery, or supervision flows need it, but it is not counted in consensus quorum and should not own DFS objects, run normal scheduled workloads, or publish routine cluster services.
+
 ## Identity Model
 
 Cluster identity:
@@ -70,6 +77,8 @@ Node identity:
 - `health`: available, degraded, suspect, offline, or removed.
 
 Cluster membership is explicit. Seeing a node on the LAN is never enough to trust it. Discovery can find candidates, but only signed membership records authorize cluster participation.
+
+Daemon and shadow daemon membership is process-scoped rather than machine-scoped. A workstation can therefore have both `node_desktop` and `node_desktop-shadow` in the same cluster. The main daemon carries normal local runtime capabilities, while the shadow daemon carries only `cluster.message.receive`, `cluster.message.send`, and `daemon.shadow.supervise`.
 
 ## Bootstrap and Join
 
@@ -405,6 +414,7 @@ Phase 1, contracts:
 - Add cluster identity, membership, endpoint, invite, and certificate structs. Implemented in `crates/sinomo-core/src/cluster.rs`.
 - Extend `sinomo-network` transport kinds for QUIC, iroh, and WebRTC candidate metadata. Implemented through `TransportKind`, `NodeEndpoint::from_cluster_endpoint`, and `PeerEndpointCandidate`.
 - Add cluster-aware peer registry records. Implemented through `PeerRegistry` cluster member and endpoint candidate indexes.
+- Represent the local main daemon and shadow daemon as separate cluster members. Implemented in `crates/sinomo-cli`: cluster bootstrap writes the main daemon as the local voter/learner and the derived shadow daemon as a non-voting communication-capable member.
 
 Phase 2, KV core:
 
