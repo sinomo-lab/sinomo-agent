@@ -50,7 +50,7 @@ use sinomo_runtime::rollout::{
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -1148,7 +1148,16 @@ fn cluster_invite_with_paths(
     })?;
     let state = read_cluster_state(paths)?;
     let now = OffsetDateTime::now_utc();
-    let invite = build_cluster_invite(&state, &options, now)?;
+    let invite = build_cluster_invite(&state, &options, paths, now)?;
+    if invite
+        .introducers
+        .iter()
+        .all(|endpoint| !is_remote_usable_invite_endpoint(endpoint))
+    {
+        println!(
+            "warning: invite only contains local-only introducers; remote machines should use `sinomo cluster invite --introducer <host-lan-ip>:21353`"
+        );
+    }
     let uri = encode_cluster_join_invite(&invite)?;
     let join_command = cluster_join_command(&uri);
     let persisted_path = paths.invite_path(&invite.invite_id);
@@ -1181,14 +1190,11 @@ fn cluster_join_command(uri: &str) -> String {
 fn build_cluster_invite(
     state: &ClusterBootstrapState,
     options: &ClusterInviteOptions,
+    paths: &ClusterPaths,
     now: OffsetDateTime,
 ) -> Result<ClusterJoinInvite, CliError> {
     let introducers = if options.introducers.is_empty() {
-        state
-            .members
-            .iter()
-            .flat_map(|member| member.endpoints.iter().cloned())
-            .collect()
+        default_invite_introducers(state, paths)
     } else {
         options
             .introducers
@@ -1210,11 +1216,120 @@ fn build_cluster_invite(
     })
 }
 
-fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterEndpointRecord {
-    let is_loopback = address.starts_with("127.")
+fn default_invite_introducers(
+    state: &ClusterBootstrapState,
+    paths: &ClusterPaths,
+) -> Vec<ClusterEndpointRecord> {
+    let mut introducers = Vec::new();
+    if let Some(data_dir) = paths.root.parent() {
+        let daemon_paths = DaemonPaths::with_root(data_dir.join("daemon"));
+        if let DaemonProbeStatus::Running(status) =
+            probe_daemon_status(&daemon_paths, DAEMON_PROBE_TIMEOUT)
+        {
+            for endpoint in invite_introducers_from_daemon_status(&state.local_node_id, &status) {
+                push_unique_introducer(&mut introducers, endpoint);
+            }
+        }
+    }
+
+    for endpoint in state
+        .members
+        .iter()
+        .filter(|member| member.node_id == state.local_node_id)
+        .flat_map(|member| member.endpoints.iter().cloned())
+    {
+        push_unique_introducer(&mut introducers, endpoint);
+    }
+    sort_default_invite_introducers(&mut introducers);
+    introducers
+}
+
+fn invite_introducers_from_daemon_status(
+    node_id: &NodeId,
+    status: &DaemonStatus,
+) -> Vec<ClusterEndpointRecord> {
+    if matches!(status.host.as_str(), "0.0.0.0" | "::") {
+        let mut endpoints = Vec::new();
+        for ip in discover_lan_ip_candidates() {
+            endpoints.push(invite_introducer_endpoint(
+                node_id,
+                format_ip_port(ip, status.port),
+            ));
+        }
+        endpoints.push(invite_introducer_endpoint(node_id, status.address.clone()));
+        endpoints
+    } else {
+        vec![invite_introducer_endpoint(node_id, status.address.clone())]
+    }
+}
+
+fn discover_lan_ip_candidates() -> Vec<IpAddr> {
+    let mut candidates = Vec::new();
+    for target in ["8.8.8.8:80", "1.1.1.1:80", "192.0.2.1:80"] {
+        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+        let Ok(address) = socket.local_addr() else {
+            continue;
+        };
+        let ip = address.ip();
+        if is_invitable_ip(ip) && !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    candidates
+}
+
+fn is_invitable_ip(ip: IpAddr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+}
+
+fn format_ip_port(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}:{port}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+    }
+}
+
+fn push_unique_introducer(
+    introducers: &mut Vec<ClusterEndpointRecord>,
+    endpoint: ClusterEndpointRecord,
+) {
+    if !introducers
+        .iter()
+        .any(|candidate| candidate.address == endpoint.address)
+    {
+        introducers.push(endpoint);
+    }
+}
+
+fn sort_default_invite_introducers(introducers: &mut [ClusterEndpointRecord]) {
+    introducers.sort_by_key(|endpoint| {
+        (
+            !is_remote_usable_invite_endpoint(endpoint),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+}
+
+fn is_remote_usable_invite_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
+    !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
+        && !is_loopback_connect_address(&endpoint.address)
+}
+
+fn is_loopback_connect_address(address: &str) -> bool {
+    address.starts_with("127.")
         || address.starts_with("localhost:")
         || address.starts_with("[::1]:")
-        || address.starts_with("::1:");
+        || address.starts_with("::1:")
+}
+
+fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterEndpointRecord {
+    let is_loopback = is_loopback_connect_address(&address);
     ClusterEndpointRecord {
         endpoint_id: ClusterEndpointId::generate(),
         node_id: node_id.clone(),
@@ -1380,7 +1495,12 @@ fn reconcile_cluster_join_with_introducers(
         }
     }
     if let Some(error) = last_error {
-        println!("warning: join recorded locally but introducer registration failed: {error}");
+        return Err(CliError::Network {
+            address: "cluster introducers".to_string(),
+            detail: format!(
+                "join registration failed for all introducers: {error}. If the invite contains 127.0.0.1 or localhost, create a new invite with `sinomo cluster invite --introducer <host-lan-ip>:21353`."
+            ),
+        });
     }
     Ok(())
 }
@@ -1535,7 +1655,11 @@ fn cluster_status() -> Result<(), CliError> {
 
 fn cluster_peers() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    let state = read_cluster_state(&paths)?;
+    let mut state = read_cluster_state(&paths)?;
+    if matches!(state.bootstrap, ClusterBootstrap::Joined { .. }) {
+        reconcile_cluster_join_with_introducers(&mut state)?;
+        write_json(&paths.state, &state)?;
+    }
     for member in state.members {
         println!(
             "{}\t{}\t{:?}\t{:?}",
@@ -8929,15 +9053,15 @@ mod tests {
         ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
         ProviderName, RolloutCliCommand, RolloutOptions, UninstallOptions,
         cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
-        cluster_join_with_paths, decode_cluster_join_invite, handle_daemon_cluster_join,
-        install_should_update_binary, install_with_layout, is_terminal_status,
-        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-        parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-        parse_dfs_command, parse_install_options, parse_model_default_options,
-        parse_models_list_options, parse_propose_options, parse_provider_command,
-        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-        read_cluster_state, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
-        run_evolve_command, uninstall_with_layout,
+        cluster_join_with_paths, decode_cluster_join_invite, encode_cluster_join_invite,
+        handle_daemon_cluster_join, install_should_update_binary, install_with_layout,
+        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
+        parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+        parse_daemon_command, parse_dfs_command, parse_install_options,
+        parse_model_default_options, parse_models_list_options, parse_propose_options,
+        parse_provider_command, parse_rollout_command, parse_slash_command,
+        parse_uninstall_options, parse_usage_options, read_cluster_state, run_cui_with_handler_io,
+        run_cui_with_handler_io_and_daemon, run_evolve_command, uninstall_with_layout,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -9464,10 +9588,13 @@ mod tests {
             &host_paths,
         )
         .expect("cluster invite");
+        let mut offline_invite = rendered.invite.clone();
+        offline_invite.introducers.clear();
+        let offline_uri = encode_cluster_join_invite(&offline_invite).expect("offline invite");
 
         cluster_join_with_paths(
             ClusterJoinOptions {
-                invite: rendered.uri,
+                invite: offline_uri,
                 cluster_id: None,
                 node_id: Some(NodeId::new("node_remote").expect("node")),
                 name: "remote".to_string(),
@@ -9523,9 +9650,12 @@ mod tests {
             &host_paths,
         )
         .expect("cluster invite");
+        let mut offline_invite = rendered.invite.clone();
+        offline_invite.introducers.clear();
+        let offline_uri = encode_cluster_join_invite(&offline_invite).expect("offline invite");
         cluster_join_with_paths(
             ClusterJoinOptions {
-                invite: rendered.uri,
+                invite: offline_uri,
                 cluster_id: None,
                 node_id: Some(NodeId::new("node_remote").expect("node")),
                 name: "remote".to_string(),

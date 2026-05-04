@@ -41,7 +41,7 @@ An uninitialized node is an orphan. Orphan nodes must not run distributed operat
 
 `sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves the node into pending learner state until the cluster control plane accepts it.
 
-`sinomo cluster invite` creates a portable `sinomo-join://v1/...` invite. For a remote machine on the same LAN, the initialized machine should include an address reachable from the remote host:
+`sinomo cluster invite` creates a portable `sinomo-join://v1/...` invite. When the main daemon is running on a wildcard bind address such as `0.0.0.0`, invite generation tries to add the host's LAN address before local loopback endpoints. If the command warns that only local-only introducers were found, or if the machine has multiple interfaces, the initialized machine should include an address reachable from the remote host:
 
 ```text
 sinomo cluster invite --introducer 192.168.1.10:21353 --output join.txt
@@ -59,7 +59,7 @@ The remote machine can run the command from the file directly, append `--name <r
 sinomo cluster join join.txt --name <remote-name>
 ```
 
-On join, the remote node writes local pending bootstrap state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining node's main and shadow daemon members, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If no introducer is reachable, the join remains recorded locally as pending so the operator can retry after fixing connectivity.
+On join, the remote node builds local pending bootstrap state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining node's main and shadow daemon members, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If the invite contains introducers but none are reachable, join fails with an actionable connectivity error instead of silently recording an isolated pending state. `sinomo cluster peers` on a joined node retries introducer reconciliation before printing the local member view.
 
 Initial local state lives at:
 
