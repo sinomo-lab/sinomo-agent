@@ -34,11 +34,12 @@ use sinomo_rollout::{
     MainExitKind, MainExitObservation, PendingShadowRolloutContext, RolloutError,
     RolloutMainActivation, SelfRolloutPaths, activate_staged_rollout_binary, classify_main_exit,
     deploy_managed_source_repo, discover_current_git_repo, ensure_rollout_layout,
-    read_pending_shadow_rollout, read_rollout_main_activation, record_activation_failure,
-    record_main_activation_staged, record_main_rollout_failure, record_shadow_rollout_finalized,
-    remove_shadow_finalize, restore_rollout_binary_from_backup, rollout_main_activation_path,
-    rollout_staged_main_binary, rollout_staged_shadow_binary, stage_pending_shadow_rollout,
-    stage_rollout_bytes, stage_rollout_file, write_main_activation,
+    managed_source_status, read_pending_shadow_rollout, read_rollout_main_activation,
+    record_activation_failure, record_main_activation_staged, record_main_rollout_failure,
+    record_shadow_rollout_finalized, remove_shadow_finalize, restore_rollout_binary_from_backup,
+    rollout_main_activation_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
+    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
+    sync_external_repo_from_managed, write_main_activation,
 };
 use sinomo_runtime::core::{
     CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, CapabilityName,
@@ -4187,6 +4188,9 @@ fn wait_for_shadow_rollout_health(
 enum RolloutCliCommand {
     Help,
     InitSource(RolloutOptions),
+    ImportSource(RolloutOptions),
+    ExportSource(RolloutOptions),
+    ApplyExternal(RolloutOptions),
     Apply(RolloutOptions),
     Cluster(RolloutOptions),
     Status,
@@ -4229,6 +4233,25 @@ fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand, CliError>
         }
         Some((command, rest)) if command == "init-source" => {
             Ok(RolloutCliCommand::InitSource(parse_rollout_options(rest)?))
+        }
+        Some((command, rest))
+            if matches!(command.as_str(), "import-source" | "sync-from-external") =>
+        {
+            Ok(RolloutCliCommand::ImportSource(parse_rollout_options(
+                rest,
+            )?))
+        }
+        Some((command, rest))
+            if matches!(command.as_str(), "export-source" | "sync-to-external") =>
+        {
+            Ok(RolloutCliCommand::ExportSource(parse_rollout_options(
+                rest,
+            )?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "apply-external" | "from-external") => {
+            Ok(RolloutCliCommand::ApplyExternal(parse_rollout_options(
+                rest,
+            )?))
         }
         Some((command, rest)) if command == "apply" => {
             Ok(RolloutCliCommand::Apply(parse_rollout_options(rest)?))
@@ -4315,6 +4338,9 @@ fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), CliError> {
             Ok(())
         }
         RolloutCliCommand::InitSource(options) => rollout_init_source(options),
+        RolloutCliCommand::ImportSource(options) => rollout_import_source(options),
+        RolloutCliCommand::ExportSource(options) => rollout_export_source(options),
+        RolloutCliCommand::ApplyExternal(options) => rollout_apply_external(options),
         RolloutCliCommand::Apply(options) => rollout_apply(options),
         RolloutCliCommand::Cluster(options) => rollout_cluster(options),
         RolloutCliCommand::Status => rollout_status(),
@@ -4335,6 +4361,38 @@ fn rollout_init_source(options: RolloutOptions) -> Result<(), CliError> {
     Ok(())
 }
 
+fn rollout_import_source(options: RolloutOptions) -> Result<(), CliError> {
+    let paths = rollout_paths_from_defaults()?;
+    ensure_rollout_layout(&paths)?;
+    ensure_source_repo(&paths, options.repo.as_deref())?;
+    println!("imported external source into managed repo");
+    println!("  managed source: {}", paths.source_repo.display());
+    print_managed_source_status(&paths)?;
+    Ok(())
+}
+
+fn rollout_export_source(options: RolloutOptions) -> Result<(), CliError> {
+    let Some(repo) = options.repo.as_deref() else {
+        return Err(CliError::Parse {
+            detail: "export-source requires --repo <external-repo>".to_string(),
+        });
+    };
+    let paths = rollout_paths_from_defaults()?;
+    ensure_rollout_layout(&paths)?;
+    sync_external_repo_from_managed(&paths, repo)?;
+    println!("exported managed source changes into external repo");
+    println!("  managed source: {}", paths.source_repo.display());
+    println!("  external repo: {}", repo.display());
+    Ok(())
+}
+
+fn rollout_apply_external(options: RolloutOptions) -> Result<(), CliError> {
+    rollout_import_source(options.clone())?;
+    let mut apply_options = options;
+    apply_options.repo = None;
+    rollout_apply(apply_options)
+}
+
 fn rollout_status() -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
     println!("rollout source: {}", paths.source_repo.display());
@@ -4347,6 +4405,20 @@ fn rollout_status() -> Result<(), CliError> {
     );
     println!("main binary exists: {}", paths.main_binary.exists());
     println!("shadow binary exists: {}", paths.shadow_binary.exists());
+    print_managed_source_status(&paths)?;
+    Ok(())
+}
+
+fn print_managed_source_status(paths: &SelfRolloutPaths) -> Result<(), CliError> {
+    let status = managed_source_status(paths)?;
+    println!("source git repo: {}", status.is_git_repo);
+    if let Some(head) = status.head {
+        println!("source head: {head}");
+    }
+    println!("source external remotes: {}", status.has_external_remotes);
+    if !status.remotes.is_empty() {
+        println!("source remotes: {}", status.remotes.join(", "));
+    }
     Ok(())
 }
 
@@ -9956,8 +10028,18 @@ fn print_rollout_help() {
     println!("  sinomo rollout");
     println!("      Show rollout commands.");
     println!("  sinomo rollout init-source [--repo <path>]");
+    println!("      Initialize or merge an external git checkout into the managed source repo.");
+    println!("  sinomo rollout import-source [--repo <path>]");
     println!(
-        "      Create or reuse the data-directory source repo at $SINOMO_DATA_DIR/source/sinomo."
+        "      Merge external repo changes into the managed source repo without retaining external remotes."
+    );
+    println!("  sinomo rollout export-source --repo <path>");
+    println!(
+        "      Merge managed source changes, including self-evolution commits, into an external repo."
+    );
+    println!("  sinomo rollout apply-external [--repo <path>] [--host <host>] [--port <port>]");
+    println!(
+        "      Import external repo changes into managed source, then build and apply the managed source."
     );
     println!("  sinomo rollout apply [--repo <path>] [--host <host>] [--port <port>]");
     println!(
@@ -11090,6 +11172,42 @@ mod tests {
         assert_eq!(
             parse_rollout_command(&["apply".to_string()]).expect("apply"),
             RolloutCliCommand::Apply(RolloutOptions::default())
+        );
+        assert_eq!(
+            parse_rollout_command(&[
+                "import-source".to_string(),
+                "--repo".to_string(),
+                "/work/sinomo".to_string()
+            ])
+            .expect("import-source"),
+            RolloutCliCommand::ImportSource(RolloutOptions {
+                repo: Some(std::path::PathBuf::from("/work/sinomo")),
+                ..RolloutOptions::default()
+            })
+        );
+        assert_eq!(
+            parse_rollout_command(&[
+                "export-source".to_string(),
+                "--repo".to_string(),
+                "/work/sinomo".to_string()
+            ])
+            .expect("export-source"),
+            RolloutCliCommand::ExportSource(RolloutOptions {
+                repo: Some(std::path::PathBuf::from("/work/sinomo")),
+                ..RolloutOptions::default()
+            })
+        );
+        assert_eq!(
+            parse_rollout_command(&[
+                "apply-external".to_string(),
+                "--repo".to_string(),
+                "/work/sinomo".to_string()
+            ])
+            .expect("apply-external"),
+            RolloutCliCommand::ApplyExternal(RolloutOptions {
+                repo: Some(std::path::PathBuf::from("/work/sinomo")),
+                ..RolloutOptions::default()
+            })
         );
         assert_eq!(
             parse_rollout_command(&[

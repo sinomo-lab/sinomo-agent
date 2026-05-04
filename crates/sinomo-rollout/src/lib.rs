@@ -23,7 +23,10 @@ pub use process::{MainExitKind, MainExitObservation, classify_main_exit};
 pub use protocol::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
 };
-pub use source::{deploy_managed_source_repo, discover_current_git_repo, remove_dir_if_exists};
+pub use source::{
+    ManagedSourceStatus, deploy_managed_source_repo, discover_current_git_repo,
+    managed_source_status, remove_dir_if_exists, sync_external_repo_from_managed,
+};
 pub use state::{
     PendingShadowRollout, PendingShadowRolloutContext, RolloutMainActivation,
     read_pending_shadow_rollout, read_rollout_main_activation, record_activation_failure,

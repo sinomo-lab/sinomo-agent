@@ -42,6 +42,9 @@ pub fn deploy_managed_source_repo(
     if same_path_if_exists(source_repo, &paths.source_repo) {
         return Ok(());
     }
+    if paths.source_repo.join(".git").exists() {
+        return merge_external_repo_into_managed(paths, source_repo);
+    }
     let Some(parent) = paths.source_repo.parent() else {
         return Err(RolloutError::Io {
             path: paths.source_repo.display().to_string(),
@@ -87,8 +90,159 @@ pub fn deploy_managed_source_repo(
         path: format!("{} -> {}", next.display(), paths.source_repo.display()),
         detail: source.to_string(),
     })?;
+    remove_all_git_remotes(&paths.source_repo)?;
     remove_dir_if_exists(&previous)?;
     Ok(())
+}
+
+pub fn sync_external_repo_from_managed(
+    paths: &SelfRolloutPaths,
+    external_repo: &Path,
+) -> Result<(), RolloutError> {
+    require_git_repo(&paths.source_repo, "managed source repo")?;
+    require_git_repo(external_repo, "external source repo")?;
+    merge_repo_head(external_repo, &paths.source_repo, "sinomo-internal")
+}
+
+pub fn managed_source_status(
+    paths: &SelfRolloutPaths,
+) -> Result<ManagedSourceStatus, RolloutError> {
+    let exists = paths.source_repo.exists();
+    let is_git_repo = paths.source_repo.join(".git").exists();
+    let remotes = if is_git_repo {
+        git_lines(&paths.source_repo, &["remote"])?
+    } else {
+        Vec::new()
+    };
+    let head = if is_git_repo {
+        Some(git_one_line(
+            &paths.source_repo,
+            &["rev-parse", "--short", "HEAD"],
+        )?)
+    } else {
+        None
+    };
+    Ok(ManagedSourceStatus {
+        path: paths.source_repo.clone(),
+        exists,
+        is_git_repo,
+        has_external_remotes: !remotes.is_empty(),
+        remotes,
+        head,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedSourceStatus {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub is_git_repo: bool,
+    pub has_external_remotes: bool,
+    pub remotes: Vec<String>,
+    pub head: Option<String>,
+}
+
+fn merge_external_repo_into_managed(
+    paths: &SelfRolloutPaths,
+    source_repo: &Path,
+) -> Result<(), RolloutError> {
+    require_git_repo(&paths.source_repo, "managed source repo")?;
+    require_git_repo(source_repo, "external source repo")?;
+    merge_repo_head(&paths.source_repo, source_repo, "sinomo-external")?;
+    remove_all_git_remotes(&paths.source_repo)
+}
+
+fn merge_repo_head(
+    destination_repo: &Path,
+    source_repo: &Path,
+    remote_name: &str,
+) -> Result<(), RolloutError> {
+    let _ = run_git(destination_repo, &["remote", "remove", remote_name]);
+    run_git_paths(
+        destination_repo,
+        &["remote", "add", remote_name],
+        &[source_repo],
+    )?;
+    let fetch_result = run_git(destination_repo, &["fetch", remote_name, "HEAD"]);
+    let remove_result = run_git(destination_repo, &["remote", "remove", remote_name]);
+    fetch_result?;
+    remove_result?;
+    run_git(destination_repo, &["merge", "--no-edit", "FETCH_HEAD"]).map(|_| ())
+}
+
+fn remove_all_git_remotes(repo: &Path) -> Result<(), RolloutError> {
+    for remote in git_lines(repo, &["remote"])? {
+        run_git(repo, &["remote", "remove", &remote])?;
+    }
+    let _ = run_git(repo, &["branch", "--unset-upstream"]);
+    Ok(())
+}
+
+fn require_git_repo(repo: &Path, label: &str) -> Result<(), RolloutError> {
+    if repo.join(".git").exists() {
+        Ok(())
+    } else {
+        Err(RolloutError::MissingArtifact {
+            artifact: format!("{label} at {} is not a git repository", repo.display()),
+        })
+    }
+}
+
+fn git_one_line(repo: &Path, args: &[&str]) -> Result<String, RolloutError> {
+    Ok(git_lines(repo, args)?
+        .into_iter()
+        .next()
+        .unwrap_or_default())
+}
+
+fn git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>, RolloutError> {
+    let output = run_git(repo, args)?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn run_git(repo: &Path, args: &[&str]) -> Result<String, RolloutError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|source| RolloutError::Io {
+            path: format!("git -C {} {}", repo.display(), args.join(" ")),
+            detail: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(RolloutError::Process {
+            command: format!("git -C {} {}", repo.display(), args.join(" ")),
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_git_paths(repo: &Path, args: &[&str], paths: &[&Path]) -> Result<String, RolloutError> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    for path in paths {
+        command.arg(path);
+    }
+    let output = command.output().map_err(|source| RolloutError::Io {
+        path: format!("git -C {} {}", repo.display(), args.join(" ")),
+        detail: source.to_string(),
+    })?;
+    if !output.status.success() {
+        return Err(RolloutError::Process {
+            command: format!("git -C {} {}", repo.display(), args.join(" ")),
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn remove_dir_if_exists(path: &Path) -> Result<(), RolloutError> {
@@ -110,4 +264,69 @@ fn same_path_if_exists(left: &Path, right: &Path) -> bool {
         return false;
     };
     left == right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SelfRolloutPaths;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn deploy_managed_source_removes_external_remotes() {
+        let root = unique_temp("sinomo-rollout-source");
+        let external = root.join("external");
+        let data = root.join("data");
+        fs::create_dir_all(&external).expect("external dir");
+        run_git_for_test(&external, &["init"]);
+        run_git_for_test(&external, &["config", "user.email", "test@example.invalid"]);
+        run_git_for_test(&external, &["config", "user.name", "Sinomo Test"]);
+        fs::write(external.join("Cargo.toml"), "[workspace]\n").expect("cargo");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "initial"]);
+        run_git_for_test(
+            &external,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+
+        let paths = SelfRolloutPaths::new(&data);
+        deploy_managed_source_repo(&paths, &external).expect("deploy");
+        let status = managed_source_status(&paths).expect("status");
+
+        assert!(status.is_git_repo);
+        assert!(!status.has_external_remotes);
+        assert!(paths.source_repo.join("Cargo.toml").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn unique_temp(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}",
+            prefix,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn run_git_for_test(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
