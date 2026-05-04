@@ -38,6 +38,7 @@ An uninitialized node is an orphan. Orphan nodes must not run distributed operat
 - `sinomo cluster status`
 - `sinomo cluster init`
 - `sinomo cluster join`
+- local daemon lifecycle and install commands, so a machine can be prepared before joining
 - local help and credential setup commands that do not mutate cluster state
 
 `sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves the node into pending learner state until the cluster control plane accepts it.

@@ -119,7 +119,6 @@ fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
         command,
         CliCommand::Cui
             | CliCommand::Evolve(_)
-            | CliCommand::Daemon(_)
             | CliCommand::Rollout(_)
             | CliCommand::Models(_)
             | CliCommand::Providers(_)
@@ -3128,8 +3127,20 @@ fn register_daemon_cluster_node(
     })
 }
 
+fn daemon_cluster_registration_if_initialized(
+    registration: DaemonClusterRegistration,
+) -> Result<Option<DaemonClusterRegistration>, CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    if paths.state.exists() {
+        Ok(Some(registration))
+    } else {
+        Ok(None)
+    }
+}
+
 fn refresh_daemon_node_status_in_kv(paths: &DaemonPaths) -> Result<Option<KvSnapshot>, CliError> {
-    let status = read_daemon_status(paths)?;
+    let mut status = read_daemon_status(paths)?;
+    ensure_daemon_status_cluster(paths, &mut status)?;
     let Some(cluster) = status.cluster.as_ref() else {
         return Ok(None);
     };
@@ -3146,6 +3157,74 @@ fn refresh_daemon_node_status_in_kv(paths: &DaemonPaths) -> Result<Option<KvSnap
         OffsetDateTime::now_utc(),
     );
     sync_cluster_node_status_to_kv(&cluster_paths, record).map(Some)
+}
+
+fn ensure_daemon_status_cluster(
+    paths: &DaemonPaths,
+    status: &mut DaemonStatus,
+) -> Result<(), CliError> {
+    if status.cluster.is_some() {
+        return Ok(());
+    }
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    if !cluster_paths.state.exists() {
+        return Ok(());
+    }
+    let mut state = read_cluster_state(&cluster_paths)?;
+    let process = daemon_cluster_process_from_paths(data_dir, paths);
+    let (main_options, shadow_options) =
+        daemon_cluster_options_from_status(data_dir, paths, status, process);
+    ensure_daemon_cluster_members(
+        &mut state,
+        &main_options,
+        &shadow_options,
+        OffsetDateTime::now_utc(),
+    );
+    assign_local_node_public_keys(&cluster_paths, &mut state)?;
+    write_json(&cluster_paths.state, &state)?;
+    sync_cluster_state_to_kv(&cluster_paths, &state)?;
+    if let Some(cluster) = daemon_cluster_status(&state, process) {
+        status.cluster = Some(cluster);
+        write_daemon_status(paths, status)?;
+    }
+    Ok(())
+}
+
+fn daemon_cluster_process_from_paths(data_dir: &Path, paths: &DaemonPaths) -> DaemonClusterProcess {
+    if paths.root == data_dir.join("shadow-daemon") {
+        DaemonClusterProcess::Shadow
+    } else {
+        DaemonClusterProcess::Main
+    }
+}
+
+fn daemon_cluster_options_from_status(
+    data_dir: &Path,
+    paths: &DaemonPaths,
+    status: &DaemonStatus,
+    process: DaemonClusterProcess,
+) -> (DaemonRunOptions, DaemonRunOptions) {
+    let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
+    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    let main_options = if process == DaemonClusterProcess::Main {
+        daemon_options_from_status(status)
+    } else {
+        read_daemon_status(&main_paths)
+            .map(|status| daemon_options_from_status(&status))
+            .unwrap_or_else(|_| DaemonRunOptions::default())
+    };
+    let shadow_options = if paths.root == shadow_paths.root {
+        daemon_options_from_status(status)
+    } else {
+        read_daemon_status(&shadow_paths)
+            .map(|status| daemon_options_from_status(&status))
+            .unwrap_or_else(|_| DaemonRunOptions::shadow_default())
+    };
+    (main_options, shadow_options)
 }
 
 fn cluster_node_status_from_daemon_status(
@@ -3580,11 +3659,11 @@ fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliError> {
 }
 
 fn run_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
-    let registration = daemon_cluster_registration(
+    let registration = daemon_cluster_registration_if_initialized(daemon_cluster_registration(
         DaemonClusterProcess::Main,
         options.clone(),
         DaemonRunOptions::shadow_default(),
-    );
+    ))?;
     run_daemon_with_paths(
         options,
         daemon_paths_from_defaults()?,
@@ -3602,6 +3681,11 @@ fn run_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
     let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
     let main_options = shadow_main_options_from_env()?;
     let main_binary = shadow_main_binary_from_env(&rollout_paths);
+    let registration = daemon_cluster_registration_if_initialized(daemon_cluster_registration(
+        DaemonClusterProcess::Shadow,
+        main_options.clone(),
+        options.clone(),
+    ))?;
     run_shadow_daemon_with_paths(
         options,
         shadow_paths,
@@ -3609,6 +3693,7 @@ fn run_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
         rollout_paths,
         main_options,
         main_binary,
+        registration,
     )
 }
 
@@ -3632,13 +3717,9 @@ fn run_shadow_daemon_with_paths(
     rollout_paths: SelfRolloutPaths,
     mut main_options: DaemonRunOptions,
     main_binary: PathBuf,
+    registration: Option<DaemonClusterRegistration>,
 ) -> Result<(), CliError> {
-    let registration = daemon_cluster_registration(
-        DaemonClusterProcess::Shadow,
-        main_options.clone(),
-        options.clone(),
-    );
-    let _lock = DaemonLock::acquire(&shadow_paths, &options, Some(&registration))?;
+    let _lock = DaemonLock::acquire(&shadow_paths, &options, registration.as_ref())?;
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
@@ -3925,9 +4006,9 @@ fn run_daemon_with_paths(
     options: DaemonRunOptions,
     paths: DaemonPaths,
     label: &str,
-    registration: DaemonClusterRegistration,
+    registration: Option<DaemonClusterRegistration>,
 ) -> Result<(), CliError> {
-    let _lock = DaemonLock::acquire(&paths, &options, Some(&registration))?;
+    let _lock = DaemonLock::acquire(&paths, &options, registration.as_ref())?;
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
@@ -4248,6 +4329,17 @@ fn read_daemon_status(paths: &DaemonPaths) -> Result<DaemonStatus, CliError> {
     })
 }
 
+fn write_daemon_status(paths: &DaemonPaths, status: &DaemonStatus) -> Result<(), CliError> {
+    let status_json = serde_json::to_vec_pretty(status).map_err(|source| CliError::Json {
+        path: paths.status.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    fs::write(&paths.status, status_json).map_err(|source| CliError::Io {
+        path: paths.status.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
 fn send_daemon_command(
     address: &str,
     command: &str,
@@ -4502,6 +4594,7 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
     match command {
         "STATUS" => {
             let mut status = read_daemon_status(paths)?;
+            ensure_daemon_status_cluster(paths, &mut status)?;
             if let Some(data_dir) = paths.root.parent() {
                 status.rollout = read_cluster_rollout_status(&SelfRolloutPaths::new(data_dir))?;
             }
@@ -11655,7 +11748,7 @@ mod tests {
 
     #[test]
     fn orphan_guard_applies_to_distributed_runtime_commands() {
-        assert!(cli_command_requires_cluster_state(&CliCommand::Daemon(
+        assert!(!cli_command_requires_cluster_state(&CliCommand::Daemon(
             DaemonCliCommand::Status(DaemonRunOptions::default())
         )));
         assert!(cli_command_requires_cluster_state(&CliCommand::Rollout(
