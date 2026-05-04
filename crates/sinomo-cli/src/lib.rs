@@ -2652,10 +2652,11 @@ fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRec
             )
         });
         targets.extend(endpoints.into_iter().filter(|endpoint| {
-            matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-            )
+            endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+                && matches!(
+                    endpoint.transport,
+                    ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+                )
         }));
     }
     targets
@@ -11500,17 +11501,17 @@ mod tests {
         RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
         UninstallOptions, authenticate_daemon_command, cli_command_requires_cluster_state,
         cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
-        cluster_peer_members, daemon_package_version, daemon_status_matches_options,
-        decode_cluster_join_invite, encode_cluster_join_invite, ensure_daemon_cluster_members,
-        ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_txn,
-        handle_daemon_cluster_sync, handle_daemon_rollout_build, install_should_update_binary,
-        install_with_layout, is_terminal_status, models_default_with_data_dir,
-        normalize_model_provider, parse_cli_command, parse_cluster_command,
-        parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
-        parse_install_options, parse_model_default_options, parse_models_list_options,
-        parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-        parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
-        read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
+        cluster_peer_members, cluster_sync_targets, daemon_package_version,
+        daemon_status_matches_options, decode_cluster_join_invite, encode_cluster_join_invite,
+        ensure_daemon_cluster_members, ensure_rollout_layout, handle_daemon_cluster_join,
+        handle_daemon_cluster_kv_txn, handle_daemon_cluster_sync, handle_daemon_rollout_build,
+        install_should_update_binary, install_with_layout, is_terminal_status,
+        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+        parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+        parse_dfs_command, parse_install_options, parse_model_default_options,
+        parse_models_list_options, parse_propose_options, parse_provider_command,
+        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+        read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
         read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
         run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
         sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
@@ -11520,8 +11521,9 @@ mod tests {
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
     };
     use sinomo_runtime::core::{
-        ClusterBootstrap, ClusterBootstrapState, ClusterId, ClusterInviteId, ClusterJoinInvite,
-        ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
+        CapabilityName, ClusterBootstrap, ClusterBootstrapState, ClusterEndpointPrivacy,
+        ClusterEndpointRecord, ClusterId, ClusterInviteId, ClusterJoinInvite, ClusterMemberRecord,
+        ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterTransportKind,
         EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
     };
     use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
@@ -11721,6 +11723,45 @@ mod tests {
         assert_eq!(state.cluster_id.as_str(), "cluster_legacy");
         assert!(matches!(state.bootstrap, ClusterBootstrap::Joined { .. }));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_sync_targets_skip_remote_local_only_endpoints() {
+        let cluster_id = ClusterId::new("cluster_sync_targets").expect("cluster");
+        let local_node = NodeId::new("node_sync_local").expect("node");
+        let remote_node = NodeId::new("node_sync_remote").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "sync targets",
+            local_node,
+            "local",
+            "local-public-key",
+            OffsetDateTime::now_utc(),
+        );
+        let mut remote = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            "remote-public-key",
+            OffsetDateTime::now_utc(),
+        );
+        remote
+            .capabilities
+            .push(CapabilityName::new("daemon.main.run").expect("capability"));
+        remote.endpoints.push(ClusterEndpointRecord::loopback(
+            remote_node.clone(),
+            "127.0.0.1:21353",
+        ));
+        let mut lan_endpoint = ClusterEndpointRecord::loopback(remote_node, "192.168.1.10:21353");
+        lan_endpoint.transport = ClusterTransportKind::LanTcp;
+        lan_endpoint.privacy = ClusterEndpointPrivacy::Lan;
+        remote.endpoints.push(lan_endpoint);
+        state.members.push(remote);
+
+        let targets = cluster_sync_targets(&state);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].address, "192.168.1.10:21353");
     }
 
     #[test]
