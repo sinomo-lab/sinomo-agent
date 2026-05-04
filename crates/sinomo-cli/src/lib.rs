@@ -50,7 +50,7 @@ use sinomo_runtime::rollout::{
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -186,6 +186,7 @@ const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
 const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
+const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
@@ -1178,6 +1179,10 @@ fn cluster_join_with_paths(
 ) -> Result<(), CliError> {
     paths.ensure()?;
     if paths.state.exists() {
+        let existing = read_cluster_state(paths)?;
+        if matches!(existing.bootstrap, ClusterBootstrap::Joined { .. }) {
+            return cluster_join_retry_with_paths(options, paths, existing);
+        }
         return Err(CliError::Parse {
             detail: format!(
                 "cluster is already initialized at {}; leave before joining another cluster",
@@ -1238,12 +1243,126 @@ fn cluster_join_with_paths(
         &DaemonRunOptions::shadow_default(),
         timestamp,
     );
+    reconcile_cluster_join_with_introducers(&mut state)?;
     write_json(&paths.state, &state)?;
     println!("cluster join recorded: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     println!("invite: {}", options.invite);
     println!("state: {}", paths.state.display());
     Ok(())
+}
+
+fn cluster_join_retry_with_paths(
+    options: ClusterJoinOptions,
+    paths: &ClusterPaths,
+    mut state: ClusterBootstrapState,
+) -> Result<(), CliError> {
+    let timestamp = OffsetDateTime::now_utc();
+    let invite = parse_cluster_join_invite_argument(&options.invite)?;
+    if invite.cluster_id != state.cluster_id {
+        return Err(CliError::Parse {
+            detail: format!(
+                "join retry invite cluster `{}` does not match local cluster `{}`",
+                invite.cluster_id, state.cluster_id
+            ),
+        });
+    }
+    state.bootstrap = ClusterBootstrap::Joined { invite };
+    ensure_daemon_cluster_members(
+        &mut state,
+        &DaemonRunOptions::default(),
+        &DaemonRunOptions::shadow_default(),
+        timestamp,
+    );
+    reconcile_cluster_join_with_introducers(&mut state)?;
+    state.updated_at = timestamp;
+    write_json(&paths.state, &state)?;
+    println!("cluster join reconciled: {}", state.cluster_id);
+    println!("local node: {}", state.local_node_id);
+    println!("invite: {}", options.invite);
+    println!("state: {}", paths.state.display());
+    Ok(())
+}
+
+fn reconcile_cluster_join_with_introducers(
+    state: &mut ClusterBootstrapState,
+) -> Result<(), CliError> {
+    let invite = match &state.bootstrap {
+        ClusterBootstrap::Joined { invite } => invite.clone(),
+        ClusterBootstrap::InitializedLocally => return Ok(()),
+    };
+    if invite.introducers.is_empty() {
+        return Ok(());
+    }
+    let request = ClusterJoinRegistrationRequest {
+        invite,
+        members: state.members.clone(),
+    };
+    let mut last_error = None;
+    for introducer in &request.invite.introducers {
+        match send_cluster_join_registration(&introducer.address, &request) {
+            Ok(response) => {
+                if response.accepted {
+                    merge_cluster_join_registration(state, response.state);
+                    println!("introducer accepted join: {}", introducer.address);
+                    return Ok(());
+                }
+                last_error = Some(response.detail);
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    if let Some(error) = last_error {
+        println!("warning: join recorded locally but introducer registration failed: {error}");
+    }
+    Ok(())
+}
+
+fn merge_cluster_join_registration(
+    local: &mut ClusterBootstrapState,
+    accepted: ClusterBootstrapState,
+) {
+    let bootstrap = local.bootstrap.clone();
+    let local_node_id = local.local_node_id.clone();
+    let local_node_display_name = local.local_node_display_name.clone();
+    let initialized_at = local.initialized_at;
+    *local = accepted;
+    local.bootstrap = bootstrap;
+    local.local_node_id = local_node_id;
+    local.local_node_display_name = local_node_display_name;
+    local.initialized_at = initialized_at;
+}
+
+fn send_cluster_join_registration(
+    address: &str,
+    request: &ClusterJoinRegistrationRequest,
+) -> Result<ClusterJoinRegistrationResponse, CliError> {
+    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
+        path: "cluster join registration".to_string(),
+        detail: source.to_string(),
+    })?;
+    let response = send_daemon_command(
+        address,
+        &format!("CLUSTER_JOIN {payload}"),
+        DAEMON_JOIN_TIMEOUT,
+    )?;
+    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
+        path: format!("cluster join response from {address}"),
+        detail: source.to_string(),
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ClusterJoinRegistrationRequest {
+    invite: ClusterJoinInvite,
+    members: Vec<ClusterMemberRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ClusterJoinRegistrationResponse {
+    accepted: bool,
+    detail: String,
+    state: ClusterBootstrapState,
 }
 
 fn is_legacy_placeholder_invite(invite: &ClusterJoinInvite) -> bool {
@@ -1438,7 +1557,13 @@ fn ensure_main_daemon_cluster_member(
     };
     let member_state = match &state.bootstrap {
         ClusterBootstrap::InitializedLocally => ClusterMemberState::Active,
-        ClusterBootstrap::Joined { .. } => ClusterMemberState::Pending,
+        ClusterBootstrap::Joined { .. } => state
+            .members
+            .iter()
+            .find(|member| member.node_id == state.local_node_id)
+            .map(|member| member.state.clone())
+            .filter(|state| *state != ClusterMemberState::Pending)
+            .unwrap_or(ClusterMemberState::Pending),
     };
     let local_node_id = state.local_node_id.clone();
     let mut member = ClusterMemberRecord::local_voter(
@@ -1466,6 +1591,12 @@ fn ensure_shadow_daemon_cluster_member(
     timestamp: OffsetDateTime,
 ) {
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+    let existing_shadow_state = state
+        .members
+        .iter()
+        .find(|member| member.node_id == shadow_node_id)
+        .map(|member| member.state.clone())
+        .filter(|state| *state != ClusterMemberState::Pending);
     let mut member = match &state.bootstrap {
         ClusterBootstrap::InitializedLocally => ClusterMemberRecord::local_non_voting(
             state.cluster_id.clone(),
@@ -1480,6 +1611,9 @@ fn ensure_shadow_daemon_cluster_member(
             timestamp,
         ),
     };
+    if let Some(existing_state) = existing_shadow_state {
+        member.state = existing_state;
+    }
     member.node_public_key = "pending-shadow-daemon-node-key".to_string();
     upsert_daemon_member(
         state,
@@ -2378,9 +2512,22 @@ fn send_daemon_command(
     command: &str,
     timeout: Duration,
 ) -> Result<String, CliError> {
-    let mut stream = TcpStream::connect(address).map_err(|source| CliError::Network {
-        address: address.to_string(),
-        detail: source.to_string(),
+    let socket_address = address
+        .to_socket_addrs()
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?
+        .next()
+        .ok_or_else(|| CliError::Network {
+            address: address.to_string(),
+            detail: "no socket addresses resolved".to_string(),
+        })?;
+    let mut stream = TcpStream::connect_timeout(&socket_address, timeout).map_err(|source| {
+        CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        }
     })?;
     stream
         .set_read_timeout(Some(timeout))
@@ -2449,6 +2596,25 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
                 })?;
             Ok(true)
         }
+        command if command.starts_with("CLUSTER_JOIN ") => {
+            let payload = command
+                .strip_prefix("CLUSTER_JOIN ")
+                .unwrap_or_default()
+                .trim();
+            let response = handle_daemon_cluster_join(paths, payload)?;
+            let body =
+                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                    path: "cluster join response".to_string(),
+                    detail: source.to_string(),
+                })?;
+            stream
+                .write_all(body.as_bytes())
+                .map_err(|source| CliError::Network {
+                    address: "daemon client".to_string(),
+                    detail: source.to_string(),
+                })?;
+            Ok(false)
+        }
         command if command.starts_with("ROLLOUT_BINARY ") => {
             let payload = command
                 .strip_prefix("ROLLOUT_BINARY ")
@@ -2477,6 +2643,78 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
                 })?;
             Ok(false)
         }
+    }
+}
+
+fn handle_daemon_cluster_join(
+    paths: &DaemonPaths,
+    payload: &str,
+) -> Result<ClusterJoinRegistrationResponse, CliError> {
+    let request: ClusterJoinRegistrationRequest =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "cluster join registration".to_string(),
+            detail: source.to_string(),
+        })?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let mut state = read_cluster_state(&cluster_paths)?;
+    if request.invite.cluster_id != state.cluster_id {
+        return Ok(ClusterJoinRegistrationResponse {
+            accepted: false,
+            detail: format!(
+                "invite cluster `{}` does not match introducer cluster `{}`",
+                request.invite.cluster_id, state.cluster_id
+            ),
+            state,
+        });
+    }
+    if request.invite.expires_at != OffsetDateTime::UNIX_EPOCH
+        && request.invite.expires_at <= OffsetDateTime::now_utc()
+    {
+        return Ok(ClusterJoinRegistrationResponse {
+            accepted: false,
+            detail: format!(
+                "invite expired at {}",
+                format_rfc3339(request.invite.expires_at)
+            ),
+            state,
+        });
+    }
+    let timestamp = OffsetDateTime::now_utc();
+    for mut member in request.members {
+        member.cluster_id = state.cluster_id.clone();
+        if matches!(member.state, ClusterMemberState::Pending) {
+            member.state = match member.role {
+                ClusterMemberRole::Learner => ClusterMemberState::Learner,
+                ClusterMemberRole::NonVoting => ClusterMemberState::NonVoting,
+                ClusterMemberRole::Voter => ClusterMemberState::Voter,
+            };
+        }
+        member.updated_at = timestamp;
+        upsert_member_record(&mut state, member);
+    }
+    state.kv_revision = state.kv_revision.saturating_add(1);
+    state.updated_at = timestamp;
+    write_json(&cluster_paths.state, &state)?;
+    Ok(ClusterJoinRegistrationResponse {
+        accepted: true,
+        detail: "join registered".to_string(),
+        state,
+    })
+}
+
+fn upsert_member_record(state: &mut ClusterBootstrapState, member: ClusterMemberRecord) {
+    if let Some(existing) = state
+        .members
+        .iter_mut()
+        .find(|existing| existing.node_id == member.node_id)
+    {
+        *existing = member;
+    } else {
+        state.members.push(member);
     }
 }
 
@@ -8616,14 +8854,15 @@ impl std::error::Error for CliError {}
 mod tests {
     use super::{
         CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
-        ClusterJoinOptions, ClusterPaths, DaemonCliCommand, DaemonClusterStatus, DaemonProbeStatus,
-        DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsFilterOptions,
-        DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions,
-        InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-        InteractionSurfaceKind, ModelBackedInteractionHandler, ModelDefaultRepoMode,
-        ModelsCliCommand, ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutOptions,
-        UninstallOptions, cli_command_requires_cluster_state, cluster_init_with_paths,
-        cluster_invite_with_paths, cluster_join_with_paths, decode_cluster_join_invite,
+        ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, DaemonCliCommand,
+        DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+        DfsCliCommand, DfsCommonOptions, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus,
+        EvolutionPaths, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
+        InteractionSession, InteractionSurface, InteractionSurfaceKind,
+        ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
+        ProviderName, RolloutCliCommand, RolloutOptions, UninstallOptions,
+        cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
+        cluster_join_with_paths, decode_cluster_join_invite, handle_daemon_cluster_join,
         install_with_layout, is_terminal_status, models_default_with_data_dir,
         normalize_model_provider, parse_cli_command, parse_cluster_command,
         parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
@@ -9154,6 +9393,83 @@ mod tests {
         );
         assert_eq!(state.cluster_name, "remote cluster");
         assert!(matches!(state.bootstrap, ClusterBootstrap::Joined { .. }));
+        std::fs::remove_dir_all(host_root).ok();
+        std::fs::remove_dir_all(join_root).ok();
+    }
+
+    #[test]
+    fn introducer_records_joined_members_and_returns_peer_view() {
+        let host_root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-introducer-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let join_root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-joining-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let host_paths = ClusterPaths::new(&SinomoDataDir::new(&host_root));
+        let join_paths = ClusterPaths::new(&SinomoDataDir::new(&join_root));
+        cluster_init_with_paths(
+            ClusterInitOptions {
+                cluster_id: Some(ClusterId::new("cluster_register").expect("cluster")),
+                node_id: Some(NodeId::new("node_host").expect("node")),
+                name: "registered cluster".to_string(),
+            },
+            &host_paths,
+        )
+        .expect("cluster init");
+        let rendered = cluster_invite_with_paths(
+            ClusterInviteOptions {
+                ttl_seconds: 120,
+                introducers: vec!["127.0.0.1:21353".to_string()],
+                output: None,
+            },
+            &host_paths,
+        )
+        .expect("cluster invite");
+        cluster_join_with_paths(
+            ClusterJoinOptions {
+                invite: rendered.uri,
+                cluster_id: None,
+                node_id: Some(NodeId::new("node_remote").expect("node")),
+                name: "remote".to_string(),
+            },
+            &join_paths,
+        )
+        .expect("cluster join local");
+        let remote_state = read_cluster_state(&join_paths).expect("remote state");
+        let invite = match &remote_state.bootstrap {
+            ClusterBootstrap::Joined { invite } => invite.clone(),
+            ClusterBootstrap::InitializedLocally => panic!("expected joined state"),
+        };
+        let request = ClusterJoinRegistrationRequest {
+            invite,
+            members: remote_state.members,
+        };
+        let payload = serde_json::to_string(&request).expect("request");
+        let response =
+            handle_daemon_cluster_join(&DaemonPaths::with_root(host_root.join("daemon")), &payload)
+                .expect("introducer join");
+
+        assert!(response.accepted);
+        let host_state = read_cluster_state(&host_paths).expect("host state");
+        assert!(host_state.members.iter().any(|member| {
+            member.node_id == NodeId::new("node_remote").expect("node")
+                && member.state == ClusterMemberState::Learner
+        }));
+        assert!(
+            response
+                .state
+                .members
+                .iter()
+                .any(|member| { member.node_id == NodeId::new("node_remote").expect("node") })
+        );
         std::fs::remove_dir_all(host_root).ok();
         std::fs::remove_dir_all(join_root).ok();
     }

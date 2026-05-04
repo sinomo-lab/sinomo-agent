@@ -59,6 +59,8 @@ The remote machine can run the command from the file directly, append `--name <r
 sinomo cluster join join.txt --name <remote-name>
 ```
 
+On join, the remote node writes local pending bootstrap state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining node's main and shadow daemon members, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If no introducer is reachable, the join remains recorded locally as pending so the operator can retry after fixing connectivity.
+
 Initial local state lives at:
 
 ```text
