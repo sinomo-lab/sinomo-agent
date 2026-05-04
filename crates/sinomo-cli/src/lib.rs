@@ -4404,6 +4404,12 @@ fn send_daemon_command_raw(
         }
     })?;
     stream
+        .set_nonblocking(false)
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    stream
         .set_read_timeout(Some(timeout))
         .map_err(|source| CliError::Network {
             address: address.to_string(),
@@ -11521,8 +11527,8 @@ mod tests {
         read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
         read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
         run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-        sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
-        sync_cluster_state_to_kv, uninstall_with_layout, write_json,
+        send_daemon_command_raw, sign_cluster_join_invite, sign_daemon_command_from_data_dir,
+        stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout, write_json,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -11536,7 +11542,7 @@ mod tests {
     use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
     use sinomo_runtime::kv::{KvCompare, KvOp, KvTxn};
     use sinomo_runtime::local::SinomoDataDir;
-    use std::io::{Cursor, Read, Write};
+    use std::io::{BufRead, Cursor, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::thread;
@@ -12941,6 +12947,28 @@ mod tests {
         assert_eq!(paths.root, root.join("daemon"));
         assert_eq!(paths.lock, root.join("daemon").join("daemon.lock"));
         assert_eq!(paths.status, root.join("daemon").join("status.json"));
+    }
+
+    #[test]
+    fn daemon_client_stream_is_blocking_after_connect_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("local addr").to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            std::io::BufReader::new(stream.try_clone().expect("clone"))
+                .read_line(&mut request)
+                .expect("read request");
+            assert_eq!(request.trim(), "PING");
+            thread::sleep(Duration::from_millis(50));
+            stream.write_all(b"PONG\n").expect("write response");
+        });
+
+        let response =
+            send_daemon_command_raw(&address, "PING", Duration::from_secs(1)).expect("response");
+        server.join().expect("server");
+
+        assert_eq!(response.trim(), "PONG");
     }
 
     #[test]
