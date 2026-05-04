@@ -79,6 +79,8 @@ The main daemon and shadow daemon are separate cluster nodes that share the same
 
 The default `sinomo` command is daemon-first. When the local main daemon is running and registered with a cluster, the CLI treats that daemon as the local cluster runtime for the orphan guard and starts the CUI session under the daemon's cluster node identity. If no daemon is reachable, the CLI falls back to the local bootstrap state and reports the normal orphan guidance when neither path exists. Explicit lifecycle commands such as `sinomo daemon run`, `sinomo daemon start`, and `sinomo install` remain opt-in process-management operations.
 
+The daemon also owns the first internal cluster KV service. The service is not exposed as a public API; Sinomo components use daemon control messages to read snapshots, submit KV transactions, and range over prefixes. The daemon persists the current local KV snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.json`. Cluster init, daemon registration, and join registration store member records under `/cluster/members/<node_id>`, so `sinomo cluster status` and `sinomo cluster peers` can report the KV-backed member view rather than only the bootstrap JSON file.
+
 `sinomo install` promotes the current binary into the local data directory and wires both daemons into local boot startup:
 
 - `sinomo install [--host <host>] [--port <port>] [--shadow-port <port>] [--no-start]`

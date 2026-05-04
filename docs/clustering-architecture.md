@@ -443,6 +443,7 @@ Phase 2, KV core:
 - Implement in-process Raft/KV simulation for tests. Implemented in `crates/sinomo-kv`.
 - Add WAL, snapshots, revisions, compare-and-swap transactions, and watches. Implemented as `KvLogEntry`, `KvSnapshot`, `KvRevision`, `KvTxn`, and prefix watches.
 - Store membership and service registry records in the KV. Implemented for cluster membership records under `/cluster/members/<node_id>`; service registry records use the same generic keyspace and lease primitives.
+- Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned `CLUSTER_KV_SNAPSHOT`, `CLUSTER_KV_TXN`, and `CLUSTER_KV_RANGE_PREFIX` control messages backed by `$SINOMO_DATA_DIR/cluster/kv-snapshot.json`. Cluster init, daemon registration, and join registration persist member records into the KV, and join responses carry the current snapshot to the joining node.
 
 Phase 3, real local network:
 
@@ -465,6 +466,6 @@ Phase 5, DFS integration:
 
 Phase 6, operations:
 
-- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local bootstrap invites; approval, revocation, and promotion remain future work.
+- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local bootstrap invites, and `cluster status` / `cluster peers` read the daemon-backed KV membership view when available. Approval, revocation, promotion, doctor, and explicit KV inspection remain future work.
 - Add snapshot export/import.
 - Add metrics and event traces for elections, watches, membership changes, and replication lag.
