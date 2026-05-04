@@ -81,6 +81,8 @@ The default `sinomo` command is daemon-first. When the local main daemon is runn
 
 The daemon also owns the first internal cluster KV service. The service is not exposed as a public API; Sinomo components use daemon control messages to read snapshots, submit KV transactions, and range over prefixes. The daemon persists the current local KV snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.json`. Cluster init, daemon registration, and join registration store member records under `/cluster/members/<node_id>`, so `sinomo cluster status` and `sinomo cluster peers` can report the KV-backed member view rather than only the bootstrap JSON file.
 
+Each local daemon node has an Ed25519 identity under `$SINOMO_DATA_DIR/identity/`. The main daemon and shadow daemon publish distinct public keys in their `/cluster/members/<node_id>` records. Daemon control traffic, including loopback traffic, is signed with `sinomo.daemon-auth.v1`; the daemon verifies the signature, timestamp, and signer public key against local identity or authorized cluster membership before executing control and KV commands.
+
 `sinomo install` promotes the current binary into the local data directory and wires both daemons into local boot startup:
 
 - `sinomo install [--host <host>] [--port <port>] [--shadow-port <port>] [--no-start]`

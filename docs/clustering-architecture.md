@@ -221,6 +221,7 @@ Baseline requirements:
 - Every transport session uses mutual authentication.
 - Cluster-issued certificates are short-lived and bound to `cluster_id`, `node_id`, and capability scope.
 - Membership records contain public keys or key references.
+- The local daemon control port is authenticated even on loopback. Each daemon command is wrapped in a signed `sinomo.daemon-auth.v1` envelope containing the node id, public key, timestamp, nonce, and command bytes. The daemon verifies the Ed25519 signature and authorizes the signer against the local node identity or the cluster membership key set before executing sensitive commands.
 - Removed members are rejected even if they still have an old endpoint.
 - Join tokens are short-lived and scoped.
 - All control-plane messages include cluster ID, node ID, term, log index or revision where applicable, and protocol version.
@@ -443,6 +444,7 @@ Phase 2, KV core:
 - Implement in-process Raft/KV simulation for tests. Implemented in `crates/sinomo-kv`.
 - Add WAL, snapshots, revisions, compare-and-swap transactions, and watches. Implemented as `KvLogEntry`, `KvSnapshot`, `KvRevision`, `KvTxn`, and prefix watches.
 - Store membership and service registry records in the KV. Implemented for cluster membership records under `/cluster/members/<node_id>`; service registry records use the same generic keyspace and lease primitives.
+- Generate node identity key pairs and publish public keys in KV membership records. Implemented with node-local Ed25519 identity files under `$SINOMO_DATA_DIR/identity/`; the main daemon and shadow daemon have distinct public keys, and local CLI control messages are signed from the local main identity.
 - Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned `CLUSTER_KV_SNAPSHOT`, `CLUSTER_KV_TXN`, and `CLUSTER_KV_RANGE_PREFIX` control messages backed by `$SINOMO_DATA_DIR/cluster/kv-snapshot.json`. Cluster init, daemon registration, and join registration persist member records into the KV, and join responses carry the current snapshot to the joining node.
 
 Phase 3, real local network:

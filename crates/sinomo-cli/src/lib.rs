@@ -2,6 +2,8 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
+use ring::rand::SystemRandom;
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
     BackgroundSchedulingPlan, BackgroundSchedulingRequest,
@@ -188,6 +190,8 @@ const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
+const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
+const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
@@ -362,6 +366,95 @@ impl ClusterPaths {
     fn invite_path(&self, invite_id: &sinomo_runtime::core::ClusterInviteId) -> PathBuf {
         self.invites.join(format!("{}.json", invite_id.as_str()))
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NodeIdentityPaths {
+    main: PathBuf,
+    shadow: PathBuf,
+}
+
+impl NodeIdentityPaths {
+    fn new(data_dir: &Path) -> Self {
+        let root = data_dir.join("identity");
+        Self {
+            main: root.join("main-ed25519.json"),
+            shadow: root.join("shadow-ed25519.json"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct NodeIdentity {
+    public_key: String,
+    private_key_pkcs8: String,
+    created_at: String,
+}
+
+impl NodeIdentity {
+    fn key_pair(&self) -> Result<Ed25519KeyPair, CliError> {
+        let pkcs8 = URL_SAFE_NO_PAD
+            .decode(self.private_key_pkcs8.as_bytes())
+            .map_err(|source| CliError::Parse {
+                detail: format!("invalid node identity private key encoding: {source}"),
+            })?;
+        Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|source| CliError::Parse {
+            detail: format!("invalid node identity private key: {source}"),
+        })
+    }
+}
+
+fn load_or_create_main_node_identity(data_dir: &Path) -> Result<NodeIdentity, CliError> {
+    load_or_create_node_identity(&NodeIdentityPaths::new(data_dir).main)
+}
+
+fn load_or_create_shadow_node_identity(data_dir: &Path) -> Result<NodeIdentity, CliError> {
+    load_or_create_node_identity(&NodeIdentityPaths::new(data_dir).shadow)
+}
+
+fn load_or_create_node_identity(path: &Path) -> Result<NodeIdentity, CliError> {
+    if path.exists() {
+        let content = fs::read_to_string(path).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        return serde_json::from_str(&content).map_err(|source| CliError::Json {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        });
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|source| CliError::Parse {
+        detail: format!("failed to generate node identity key: {source}"),
+    })?;
+    let key_pair =
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|source| CliError::Parse {
+            detail: format!("failed to load generated node identity key: {source}"),
+        })?;
+    let identity = NodeIdentity {
+        public_key: URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref()),
+        private_key_pkcs8: URL_SAFE_NO_PAD.encode(pkcs8.as_ref()),
+        created_at: OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string()),
+    };
+    write_json(path, &identity)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            CliError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+    }
+    Ok(identity)
 }
 
 fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand, CliError> {
@@ -1156,6 +1249,7 @@ fn cluster_init_with_paths(
         &DaemonRunOptions::shadow_default(),
         timestamp,
     );
+    assign_local_node_public_keys(paths, &mut state)?;
     write_json(&paths.state, &state)?;
     sync_cluster_state_to_kv(paths, &state)?;
     println!("cluster initialized: {}", state.cluster_id);
@@ -1471,6 +1565,7 @@ fn cluster_join_with_paths(
     );
     let (main_options, shadow_options) = local_daemon_cluster_options()?;
     ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
+    assign_local_node_public_keys(paths, &mut state)?;
     reconcile_cluster_join_with_introducers(&mut state, Some(paths))?;
     write_json(&paths.state, &state)?;
     sync_cluster_state_to_kv(paths, &state)?;
@@ -1499,6 +1594,7 @@ fn cluster_join_retry_with_paths(
     state.bootstrap = ClusterBootstrap::Joined { invite };
     let (main_options, shadow_options) = local_daemon_cluster_options()?;
     ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
+    assign_local_node_public_keys(paths, &mut state)?;
     reconcile_cluster_join_with_introducers(&mut state, Some(paths))?;
     state.updated_at = timestamp;
     write_json(&paths.state, &state)?;
@@ -1777,6 +1873,7 @@ fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, Cli
         &DaemonRunOptions::shadow_default(),
         OffsetDateTime::now_utc(),
     );
+    assign_local_node_public_keys(paths, &mut state)?;
     Ok(state)
 }
 
@@ -1844,12 +1941,35 @@ fn sync_cluster_state_to_kv(
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, CliError> {
     let mut store = read_cluster_kv_store(paths)?;
-    for member in &state.members {
+    let mut keyed_state = state.clone();
+    assign_local_node_public_keys(paths, &mut keyed_state)?;
+    for member in &keyed_state.members {
         store.put_cluster_member(member.clone())?;
     }
     let snapshot = store.snapshot();
     write_cluster_kv_snapshot(paths, &snapshot)?;
     Ok(snapshot)
+}
+
+fn assign_local_node_public_keys(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+) -> Result<(), CliError> {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "cluster paths have no data directory parent".to_string(),
+    })?;
+    let main_identity = load_or_create_main_node_identity(data_dir)?;
+    let shadow_identity = load_or_create_shadow_node_identity(data_dir)?;
+    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+    for member in &mut state.members {
+        if member.node_id == state.local_node_id {
+            member.node_public_key = main_identity.public_key.clone();
+        } else if member.node_id == shadow_node_id {
+            member.node_public_key = shadow_identity.public_key.clone();
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3139,6 +3259,19 @@ fn send_daemon_command(
     command: &str,
     timeout: Duration,
 ) -> Result<String, CliError> {
+    let signed = sign_daemon_command_for_local_node(command)?;
+    let response = send_daemon_command_raw(address, &signed, timeout)?;
+    if response.trim() == "unknown daemon command" {
+        return send_daemon_command_raw(address, command, timeout);
+    }
+    Ok(response)
+}
+
+fn send_daemon_command_raw(
+    address: &str,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, CliError> {
     let socket_address = address
         .to_socket_addrs()
         .map_err(|source| CliError::Network {
@@ -3185,6 +3318,166 @@ fn send_daemon_command(
     Ok(response)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SignedDaemonCommand {
+    protocol: String,
+    node_id: String,
+    public_key: String,
+    timestamp: String,
+    nonce: String,
+    command: String,
+    signature: String,
+}
+
+fn sign_daemon_command_for_local_node(command: &str) -> Result<String, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    sign_daemon_command_from_data_dir(&data_dir, command)
+}
+
+fn sign_daemon_command_from_data_dir(
+    data_dir: &SinomoDataDir,
+    command: &str,
+) -> Result<String, CliError> {
+    let identity = load_or_create_main_node_identity(&data_dir.root())?;
+    let node_id = read_cluster_state(&ClusterPaths::new(&data_dir))
+        .map(|state| state.local_node_id.to_string())
+        .unwrap_or_else(|_| "node_local".to_string());
+    let timestamp = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let nonce = format!("{}-{}", std::process::id(), rollout_artifact_suffix());
+    let key_pair = identity.key_pair()?;
+    let signing_payload =
+        daemon_auth_signing_payload(&node_id, &identity.public_key, &timestamp, &nonce, command);
+    let signature = key_pair.sign(signing_payload.as_bytes());
+    let envelope = SignedDaemonCommand {
+        protocol: DAEMON_AUTH_PROTOCOL.to_string(),
+        node_id,
+        public_key: identity.public_key,
+        timestamp,
+        nonce,
+        command: command.to_string(),
+        signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
+    };
+    let payload = serde_json::to_string(&envelope).map_err(|source| CliError::Json {
+        path: "daemon auth envelope".to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(format!("AUTH {payload}"))
+}
+
+fn authenticate_daemon_command(paths: &DaemonPaths, raw: &str) -> Result<String, CliError> {
+    let payload = raw
+        .strip_prefix("AUTH ")
+        .ok_or_else(|| CliError::AuthDenied)?;
+    let envelope: SignedDaemonCommand =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "daemon auth envelope".to_string(),
+            detail: source.to_string(),
+        })?;
+    verify_signed_daemon_command(paths, &envelope)?;
+    Ok(envelope.command)
+}
+
+fn verify_signed_daemon_command(
+    paths: &DaemonPaths,
+    envelope: &SignedDaemonCommand,
+) -> Result<(), CliError> {
+    if envelope.protocol != DAEMON_AUTH_PROTOCOL {
+        return Err(CliError::AuthDenied);
+    }
+    let signed_at =
+        OffsetDateTime::parse(&envelope.timestamp, &Rfc3339).map_err(|_| CliError::AuthDenied)?;
+    let now = OffsetDateTime::now_utc();
+    let skew = (now - signed_at).whole_seconds().abs();
+    if skew > DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS {
+        return Err(CliError::AuthExpired);
+    }
+    if envelope.nonce.trim().is_empty() || envelope.command.trim().is_empty() {
+        return Err(CliError::AuthDenied);
+    }
+    let public_key = URL_SAFE_NO_PAD
+        .decode(envelope.public_key.as_bytes())
+        .map_err(|_| CliError::AuthDenied)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(envelope.signature.as_bytes())
+        .map_err(|_| CliError::AuthDenied)?;
+    let signing_payload = daemon_auth_signing_payload(
+        &envelope.node_id,
+        &envelope.public_key,
+        &envelope.timestamp,
+        &envelope.nonce,
+        &envelope.command,
+    );
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(signing_payload.as_bytes(), &signature)
+        .map_err(|_| CliError::AuthDenied)?;
+    authorize_daemon_signer(paths, envelope)
+}
+
+fn daemon_auth_signing_payload(
+    node_id: &str,
+    public_key: &str,
+    timestamp: &str,
+    nonce: &str,
+    command: &str,
+) -> String {
+    format!("{DAEMON_AUTH_PROTOCOL}\n{node_id}\n{public_key}\n{timestamp}\n{nonce}\n{command}")
+}
+
+fn authorize_daemon_signer(
+    paths: &DaemonPaths,
+    envelope: &SignedDaemonCommand,
+) -> Result<(), CliError> {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let main_identity = load_or_create_main_node_identity(data_dir)?;
+    let shadow_identity = load_or_create_shadow_node_identity(data_dir)?;
+    if envelope.public_key == main_identity.public_key
+        || envelope.public_key == shadow_identity.public_key
+    {
+        return Ok(());
+    }
+
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    if cluster_paths.state.exists() {
+        let state = read_cluster_state(&cluster_paths)?;
+        if state.members.iter().any(|member| {
+            member.node_public_key == envelope.public_key && member.state.is_authorized()
+        }) {
+            return Ok(());
+        }
+    }
+
+    if envelope.command.starts_with("CLUSTER_JOIN ") {
+        return authorize_cluster_join_signer(&envelope.command, &envelope.public_key);
+    }
+    Err(CliError::AuthDenied)
+}
+
+fn authorize_cluster_join_signer(command: &str, public_key: &str) -> Result<(), CliError> {
+    let payload = command
+        .strip_prefix("CLUSTER_JOIN ")
+        .unwrap_or_default()
+        .trim();
+    let request: ClusterJoinRegistrationRequest =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "cluster join registration".to_string(),
+            detail: source.to_string(),
+        })?;
+    if request
+        .members
+        .iter()
+        .any(|member| member.node_public_key == public_key)
+    {
+        return Ok(());
+    }
+    Err(CliError::AuthDenied)
+}
+
 fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Result<bool, CliError> {
     let mut reader =
         io::BufReader::new(stream.try_clone().map_err(|source| CliError::Network {
@@ -3199,6 +3492,19 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
             detail: source.to_string(),
         })?;
     let command = request.lines().next().unwrap_or_default().trim();
+    let command = match authenticate_daemon_command(paths, command) {
+        Ok(command) => command,
+        Err(error) => {
+            stream
+                .write_all(format!("auth failed: {error}\n").as_bytes())
+                .map_err(|source| CliError::Network {
+                    address: "daemon client".to_string(),
+                    detail: source.to_string(),
+                })?;
+            return Ok(false);
+        }
+    };
+    let command = command.as_str();
     match command {
         "STATUS" => {
             let status = read_daemon_status(paths)?;
@@ -10027,19 +10333,19 @@ mod tests {
         InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
         ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand, ProviderName,
         RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
-        UninstallOptions, cli_command_requires_cluster_state, cluster_init_with_paths,
-        cluster_invite_with_paths, cluster_join_with_paths, daemon_status_matches_options,
-        decode_cluster_join_invite, encode_cluster_join_invite, handle_daemon_cluster_join,
-        handle_daemon_cluster_kv_txn, handle_daemon_rollout_build, install_should_update_binary,
-        install_with_layout, is_terminal_status, models_default_with_data_dir,
-        normalize_model_provider, parse_cli_command, parse_cluster_command,
-        parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
-        parse_install_options, parse_model_default_options, parse_models_list_options,
-        parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-        parse_uninstall_options, parse_usage_options, read_cluster_members_from_kv,
-        read_cluster_state, rollout_ensure_layout, run_cui_with_handler_io,
-        run_cui_with_handler_io_and_daemon, run_evolve_command, stage_rollout_main_activation,
-        uninstall_with_layout,
+        UninstallOptions, authenticate_daemon_command, cli_command_requires_cluster_state,
+        cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
+        daemon_status_matches_options, decode_cluster_join_invite, encode_cluster_join_invite,
+        handle_daemon_cluster_join, handle_daemon_cluster_kv_txn, handle_daemon_rollout_build,
+        install_should_update_binary, install_with_layout, is_terminal_status,
+        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+        parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+        parse_dfs_command, parse_install_options, parse_model_default_options,
+        parse_models_list_options, parse_propose_options, parse_provider_command,
+        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+        read_cluster_members_from_kv, read_cluster_state, rollout_ensure_layout,
+        run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
+        sign_daemon_command_from_data_dir, stage_rollout_main_activation, uninstall_with_layout,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -10445,6 +10751,8 @@ mod tests {
             .expect("main daemon member");
         assert_eq!(main.role, ClusterMemberRole::Voter);
         assert_eq!(main.state, ClusterMemberState::Active);
+        assert_ne!(main.node_public_key, "pending-daemon-node-key");
+        assert!(!main.node_public_key.trim().is_empty());
         assert_eq!(main.endpoints[0].address, "127.0.0.1:21353");
         let shadow = state
             .members
@@ -10453,13 +10761,58 @@ mod tests {
             .expect("shadow daemon member");
         assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
         assert_eq!(shadow.state, ClusterMemberState::Active);
+        assert_ne!(shadow.node_public_key, "pending-shadow-daemon-node-key");
+        assert_ne!(shadow.node_public_key, main.node_public_key);
         assert_eq!(shadow.endpoints[0].address, "127.0.0.1:21354");
         let kv_members = read_cluster_members_from_kv(&paths).expect("kv members");
         assert_eq!(kv_members.len(), 2);
-        assert!(kv_members.iter().any(|member| {
-            member.node_id == NodeId::new("node_local").expect("node")
-                && member.state == ClusterMemberState::Active
-        }));
+        let kv_main = kv_members
+            .iter()
+            .find(|member| member.node_id == NodeId::new("node_local").expect("node"))
+            .expect("kv main");
+        assert_eq!(kv_main.state, ClusterMemberState::Active);
+        assert_eq!(kv_main.node_public_key, main.node_public_key);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-cli-daemon-auth-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        cluster_init_with_paths(
+            ClusterInitOptions {
+                cluster_id: Some(ClusterId::new("cluster_auth").expect("cluster")),
+                node_id: Some(NodeId::new("node_auth").expect("node")),
+                name: "auth cluster".to_string(),
+            },
+            &paths,
+        )
+        .expect("cluster init");
+        let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
+
+        let signed =
+            sign_daemon_command_from_data_dir(&data_dir, "STATUS").expect("signed command");
+        assert_eq!(
+            authenticate_daemon_command(&daemon_paths, &signed).expect("auth command"),
+            "STATUS"
+        );
+        assert!(matches!(
+            authenticate_daemon_command(&daemon_paths, "STATUS"),
+            Err(CliError::AuthDenied)
+        ));
+
+        let tampered = signed.replace("\"command\":\"STATUS\"", "\"command\":\"SHUTDOWN\"");
+        assert!(matches!(
+            authenticate_daemon_command(&daemon_paths, &tampered),
+            Err(CliError::AuthDenied)
+        ));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -10494,6 +10847,7 @@ mod tests {
         assert_eq!(state.kv_revision, 0);
         assert_eq!(state.members[0].role, ClusterMemberRole::Learner);
         assert_eq!(state.members[0].state, ClusterMemberState::Pending);
+        assert_ne!(state.members[0].node_public_key, "pending-daemon-node-key");
         let shadow = state
             .members
             .iter()
