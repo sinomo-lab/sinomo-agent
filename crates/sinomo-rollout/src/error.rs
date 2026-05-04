@@ -1,0 +1,43 @@
+use std::fmt;
+
+#[derive(Debug)]
+pub enum RolloutError {
+    Io {
+        path: String,
+        detail: String,
+    },
+    Json {
+        path: String,
+        detail: String,
+    },
+    Process {
+        command: String,
+        status: i32,
+        stderr: String,
+    },
+    MissingArtifact {
+        artifact: String,
+    },
+}
+
+impl fmt::Display for RolloutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, detail } => write!(formatter, "filesystem error at {path}: {detail}"),
+            Self::Json { path, detail } => write!(formatter, "json error at {path}: {detail}"),
+            Self::Process {
+                command,
+                status,
+                stderr,
+            } => write!(
+                formatter,
+                "process `{command}` failed with status {status}: {stderr}"
+            ),
+            Self::MissingArtifact { artifact } => {
+                write!(formatter, "{artifact} has not been written")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RolloutError {}

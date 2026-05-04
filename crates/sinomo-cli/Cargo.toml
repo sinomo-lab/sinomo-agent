@@ -19,5 +19,6 @@ serde.workspace = true
 serde_json.workspace = true
 sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-lm = { path = "../sinomo-lm" }
+sinomo-rollout = { path = "../sinomo-rollout" }
 time.workspace = true
 sinomo-runtime = { path = "../sinomo-runtime" }

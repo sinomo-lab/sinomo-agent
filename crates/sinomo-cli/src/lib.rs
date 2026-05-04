@@ -29,6 +29,17 @@ use sinomo_lm::{
     NvidiaProvider, OpenAiConfig, OpenAiProvider, OpenAiResponsesCodexClient,
     OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL, normalize_nvidia_model_id,
 };
+use sinomo_rollout::{
+    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
+    MainExitKind, MainExitObservation, PendingShadowRolloutContext, RolloutError,
+    RolloutMainActivation, SelfRolloutPaths, activate_staged_rollout_binary, classify_main_exit,
+    deploy_managed_source_repo, discover_current_git_repo, ensure_rollout_layout,
+    read_pending_shadow_rollout, read_rollout_main_activation, record_activation_failure,
+    record_main_activation_staged, record_main_rollout_failure, record_shadow_rollout_finalized,
+    remove_shadow_finalize, restore_rollout_binary_from_backup, rollout_main_activation_path,
+    rollout_staged_main_binary, rollout_staged_shadow_binary, stage_pending_shadow_rollout,
+    stage_rollout_bytes, stage_rollout_file, write_main_activation,
+};
 use sinomo_runtime::core::{
     CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, CapabilityName,
     ClusterBootstrap, ClusterBootstrapState, ClusterEndpointId, ClusterEndpointPrivacy,
@@ -47,9 +58,6 @@ use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
 use sinomo_runtime::kv::{InProcessKvStore, KvEntry, KvError, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::rollout::{
-    MainExitKind, MainExitObservation, SelfRolloutPaths, classify_main_exit,
-};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
@@ -644,6 +652,7 @@ struct InstallLayout {
     data_dir: PathBuf,
     bin_dir: PathBuf,
     binary: PathBuf,
+    shadow_binary: PathBuf,
     boot_dir: PathBuf,
     main_boot_entry: PathBuf,
     shadow_boot_entry: PathBuf,
@@ -654,12 +663,14 @@ impl InstallLayout {
         let data_root = data_dir.root();
         let bin_dir = data_root.join("bin");
         let binary = bin_dir.join(format!("sinomo{}", env::consts::EXE_SUFFIX));
+        let shadow_binary = bin_dir.join(format!("sinomo-shadow{}", env::consts::EXE_SUFFIX));
         let main_boot_entry = boot_entry_path(&boot_dir, INSTALL_MAIN_BOOT_NAME);
         let shadow_boot_entry = boot_entry_path(&boot_dir, INSTALL_SHADOW_BOOT_NAME);
         Self {
             data_dir: data_root,
             bin_dir,
             binary,
+            shadow_binary,
             boot_dir,
             main_boot_entry,
             shadow_boot_entry,
@@ -686,7 +697,8 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
     })?;
     let main_paths = DaemonPaths::with_root(layout.data_dir.join("daemon"));
     let shadow_paths = DaemonPaths::with_root(layout.data_dir.join("shadow-daemon"));
-    let updating_binary = install_should_update_binary(&layout.binary)?;
+    let updating_binary = install_should_update_binary(&layout.binary)?
+        || install_should_update_binary(&layout.shadow_binary)?;
     let restarting_for_options =
         options.start && install_running_daemons_need_restart(&options, &main_paths, &shadow_paths);
     if updating_binary || restarting_for_options {
@@ -698,9 +710,21 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
         stop_installed_daemons_before_install(layout, reason)?;
     }
     install_current_binary(&layout.binary)?;
+    install_current_binary(&layout.shadow_binary)?;
+    install_managed_source_repo(layout)?;
     write_boot_entries(layout, &options)?;
     activate_boot_entries(layout);
     println!("installed binary: {}", layout.binary.display());
+    println!(
+        "installed shadow binary: {}",
+        layout.shadow_binary.display()
+    );
+    println!(
+        "managed source repo: {}",
+        SelfRolloutPaths::new(&layout.data_dir)
+            .source_repo
+            .display()
+    );
     println!("boot entry: {}", layout.main_boot_entry.display());
     println!("boot entry: {}", layout.shadow_boot_entry.display());
     println!("data directory retained at: {}", layout.data_dir.display());
@@ -714,7 +738,14 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
             "--port".to_string(),
             options.port.to_string(),
         ];
-        ensure_installed_daemon_started(layout, &main_args, &main_paths, "daemon")?;
+        ensure_installed_daemon_started(
+            layout,
+            &layout.binary,
+            &main_args,
+            &main_paths,
+            "daemon",
+            &[],
+        )?;
         let shadow_args = vec![
             "daemon".to_string(),
             "shadow".to_string(),
@@ -724,7 +755,19 @@ fn install_with_layout(options: InstallOptions, layout: &InstallLayout) -> Resul
             "--port".to_string(),
             options.shadow_port.to_string(),
         ];
-        ensure_installed_daemon_started(layout, &shadow_args, &shadow_paths, "shadow daemon")?;
+        let shadow_env = vec![
+            (SHADOW_MAIN_BINARY_ENV, layout.binary.display().to_string()),
+            (SHADOW_MAIN_HOST_ENV, options.host.clone()),
+            (SHADOW_MAIN_PORT_ENV, options.port.to_string()),
+        ];
+        ensure_installed_daemon_started(
+            layout,
+            &layout.shadow_binary,
+            &shadow_args,
+            &shadow_paths,
+            "shadow daemon",
+            &shadow_env,
+        )?;
     }
     Ok(())
 }
@@ -773,7 +816,30 @@ fn install_should_update_binary(destination: &Path) -> Result<bool, CliError> {
         return Ok(false);
     }
     let current = current_executable_path()?;
-    Ok(!same_path_if_exists(&current, destination))
+    if same_path_if_exists(&current, destination) {
+        return Ok(false);
+    }
+    let current_bytes = fs::read(&current).map_err(|source| CliError::Io {
+        path: current.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let destination_bytes = fs::read(destination).map_err(|source| CliError::Io {
+        path: destination.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(current_bytes != destination_bytes)
+}
+
+fn install_managed_source_repo(layout: &InstallLayout) -> Result<(), CliError> {
+    let rollout_paths = SelfRolloutPaths::new(&layout.data_dir);
+    ensure_rollout_layout(&rollout_paths)?;
+    let Some(source_repo) = discover_current_git_repo()? else {
+        println!(
+            "warning: managed source repo was not updated because the current directory is not inside a git checkout"
+        );
+        return Ok(());
+    };
+    Ok(deploy_managed_source_repo(&rollout_paths, &source_repo)?)
 }
 
 fn install_running_daemons_need_restart(
@@ -894,15 +960,22 @@ fn write_boot_entries(layout: &InstallLayout, options: &InstallOptions) -> Resul
         &options.host,
         options.port,
         "Sinomo daemon",
+        &[],
     )?;
+    let shadow_env = vec![
+        (SHADOW_MAIN_BINARY_ENV, layout.binary.display().to_string()),
+        (SHADOW_MAIN_HOST_ENV, options.host.clone()),
+        (SHADOW_MAIN_PORT_ENV, options.port.to_string()),
+    ];
     write_boot_entry(
         &layout.shadow_boot_entry,
         &layout.data_dir,
-        &layout.binary,
+        &layout.shadow_binary,
         &shadow_command_prefix,
         &options.host,
         options.shadow_port,
         "Sinomo shadow daemon",
+        &shadow_env,
     )
 }
 
@@ -914,6 +987,7 @@ fn write_boot_entry(
     host: &str,
     port: u16,
     description: &str,
+    extra_env: &[(&str, String)],
 ) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::Io {
@@ -921,7 +995,15 @@ fn write_boot_entry(
             detail: source.to_string(),
         })?;
     }
-    let content = boot_entry_content(data_dir, binary, command_prefix, host, port, description);
+    let content = boot_entry_content(
+        data_dir,
+        binary,
+        command_prefix,
+        host,
+        port,
+        description,
+        extra_env,
+    );
     fs::write(path, content).map_err(|source| CliError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
@@ -935,14 +1017,20 @@ fn boot_entry_content(
     host: &str,
     port: u16,
     description: &str,
+    extra_env: &[(&str, String)],
 ) -> String {
     let command = command_prefix.join(" ");
     #[cfg(windows)]
     {
         let _ = description;
+        let extra_env = extra_env
+            .iter()
+            .map(|(key, value)| format!("set \"{key}={value}\"\r\n"))
+            .collect::<String>();
         format!(
-            "@echo off\r\nset \"SINOMO_DATA_DIR={}\"\r\n\"{}\" {} --host {} --port {}\r\n",
+            "@echo off\r\nset \"SINOMO_DATA_DIR={}\"\r\n{}\"{}\" {} --host {} --port {}\r\n",
             data_dir.display(),
+            extra_env,
             binary.display(),
             command,
             host,
@@ -951,9 +1039,14 @@ fn boot_entry_content(
     }
     #[cfg(not(windows))]
     {
+        let extra_env = extra_env
+            .iter()
+            .map(|(key, value)| format!("Environment={key}={value}\n"))
+            .collect::<String>();
         format!(
-            "[Unit]\nDescription={description}\n\n[Service]\nEnvironment=SINOMO_DATA_DIR={}\nExecStart={} {} --host {} --port {}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription={description}\n\n[Service]\nEnvironment=SINOMO_DATA_DIR={}\n{}ExecStart={} {} --host {} --port {}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
             data_dir.display(),
+            extra_env,
             binary.display(),
             command,
             host,
@@ -1026,9 +1119,11 @@ fn systemctl_user_best_effort(args: &[&str]) {
 
 fn ensure_installed_daemon_started(
     layout: &InstallLayout,
+    binary: &Path,
     args: &[String],
     paths: &DaemonPaths,
     label: &str,
+    extra_env: &[(&str, String)],
 ) -> Result<(), CliError> {
     if matches!(
         probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT),
@@ -1037,7 +1132,7 @@ fn ensure_installed_daemon_started(
         println!("sinomo {label} already running");
         return Ok(());
     }
-    start_installed_sinomo_daemon(&layout.binary, &layout.data_dir, args, paths, label)?;
+    start_installed_sinomo_daemon(binary, &layout.data_dir, args, paths, label, extra_env)?;
     Ok(())
 }
 
@@ -1108,10 +1203,14 @@ fn start_installed_sinomo_daemon(
     args: &[String],
     paths: &DaemonPaths,
     label: &str,
+    extra_env: &[(&str, String)],
 ) -> Result<(), CliError> {
-    let mut child = Command::new(binary)
-        .args(args)
-        .env("SINOMO_DATA_DIR", data_dir)
+    let mut command = Command::new(binary);
+    command.args(args).env("SINOMO_DATA_DIR", data_dir);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2632,7 +2731,7 @@ fn run_shadow_daemon_with_paths(
     shadow_paths: DaemonPaths,
     main_paths: DaemonPaths,
     rollout_paths: SelfRolloutPaths,
-    main_options: DaemonRunOptions,
+    mut main_options: DaemonRunOptions,
     main_binary: PathBuf,
 ) -> Result<(), CliError> {
     let registration = daemon_cluster_registration(
@@ -2679,14 +2778,10 @@ fn run_shadow_daemon_with_paths(
                 probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT),
                 DaemonProbeStatus::Running(_)
             ) {
-                stage_pending_shadow_rollout(
-                    &rollout_paths,
-                    pending,
-                    &main_options,
-                    &options,
-                    &main_binary,
-                )?;
-                let main_address = daemon_connect_address(&main_options.host, main_options.port);
+                stage_pending_shadow_rollout(&rollout_paths, pending, &options.host, options.port)?;
+                let main_address =
+                    daemon_connect_address(&pending.main_options.host, pending.main_options.port);
+                let promoted_main_options = pending.main_options.clone();
                 thread::spawn(move || {
                     let _ = send_daemon_command(
                         &main_address,
@@ -2696,6 +2791,7 @@ fn run_shadow_daemon_with_paths(
                 });
                 let _ = fs::remove_file(rollout_main_activation_path(&rollout_paths));
                 pending_rollout = None;
+                main_options = promoted_main_options;
             } else if Instant::now() >= pending.deadline {
                 if let Some(child) = supervised_main.as_mut() {
                     let _ = child.kill();
@@ -2703,10 +2799,16 @@ fn run_shadow_daemon_with_paths(
                 }
                 record_main_rollout_failure(
                     &rollout_paths,
-                    pending,
+                    &pending.activation,
+                    &pending.previous_main_binary,
+                    &pending.previous_shadow_binary,
                     "candidate main did not become healthy before rollout timeout",
                 )?;
                 main_binary = pending.previous_main_binary.clone();
+                if let Some(backup) = pending.previous_main_backup.as_ref() {
+                    let _ = restore_rollout_binary_from_backup(backup, &main_binary);
+                }
+                main_options = pending.main_options.clone();
                 supervised_main = spawn_main_for_shadow(&main_binary, &main_options).ok();
                 pending_rollout = None;
                 let _ = fs::remove_file(rollout_main_activation_path(&rollout_paths));
@@ -2725,13 +2827,25 @@ fn run_shadow_daemon_with_paths(
                     .previous_main_binary
                     .clone()
                     .unwrap_or_else(|| main_binary.clone());
-                match spawn_main_for_shadow(&activation.main_binary, &main_options) {
+                let activation_main_options = DaemonRunOptions {
+                    host: activation.main_host.clone(),
+                    port: activation.main_port,
+                };
+                let previous_main_backup = activation
+                    .staged_main_binary
+                    .as_ref()
+                    .map(|staged| activate_staged_rollout_binary(staged, &activation.main_binary))
+                    .transpose()?
+                    .flatten();
+                match spawn_main_for_shadow(&activation.main_binary, &activation_main_options) {
                     Ok(child) => {
                         main_binary = activation.main_binary.clone();
                         supervised_main = Some(child);
                         pending_rollout = Some(ShadowMainRolloutMonitor {
                             activation,
+                            main_options: activation_main_options,
                             previous_main_binary,
+                            previous_main_backup,
                             previous_shadow_binary: env::current_exe().unwrap_or_default(),
                             deadline: Instant::now() + Duration::from_secs(10),
                         });
@@ -2744,6 +2858,10 @@ fn run_shadow_daemon_with_paths(
                             &format!("candidate main could not execute: {error}"),
                         )?;
                         main_binary = previous_main_binary;
+                        if let Some(backup) = previous_main_backup {
+                            let _ = restore_rollout_binary_from_backup(&backup, &main_binary);
+                        }
+                        main_options = activation_main_options;
                         supervised_main = spawn_main_for_shadow(&main_binary, &main_options).ok();
                         let _ = fs::remove_file(rollout_main_activation_path(&rollout_paths));
                     }
@@ -2762,13 +2880,19 @@ fn run_shadow_daemon_with_paths(
                     let observation = main_exit_observation_from_status(status);
                     record_main_rollout_failure(
                         &rollout_paths,
-                        &pending,
+                        &pending.activation,
+                        &pending.previous_main_binary,
+                        &pending.previous_shadow_binary,
                         &format!(
                             "candidate main exited before health check: exit_code={:?} signal={:?}",
                             observation.exit_code, observation.signal
                         ),
                     )?;
                     main_binary = pending.previous_main_binary;
+                    if let Some(backup) = pending.previous_main_backup {
+                        let _ = restore_rollout_binary_from_backup(&backup, &main_binary);
+                    }
+                    main_options = pending.main_options;
                     supervised_main = spawn_main_for_shadow(&main_binary, &main_options).ok();
                     let _ = fs::remove_file(rollout_main_activation_path(&rollout_paths));
                     thread::sleep(Duration::from_millis(200));
@@ -2824,136 +2948,36 @@ fn spawn_main_for_shadow(binary: &Path, options: &DaemonRunOptions) -> Result<Ch
         })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct RolloutMainActivation {
-    source: String,
-    main_binary: PathBuf,
-    shadow_binary: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    previous_main_binary: Option<PathBuf>,
-    shadow_port: u16,
-    requested_at: String,
-    mode: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct PendingShadowRollout {
-    source: String,
-    main_binary: PathBuf,
-    shadow_binary: PathBuf,
-    previous_shadow_binary: PathBuf,
-    main_host: String,
-    main_port: u16,
-    shadow_host: String,
-    shadow_port: u16,
-    requested_at: String,
-    main_healthy_at: String,
-    mode: String,
-}
-
 #[derive(Clone, Debug)]
 struct ShadowMainRolloutMonitor {
     activation: RolloutMainActivation,
+    main_options: DaemonRunOptions,
     previous_main_binary: PathBuf,
+    previous_main_backup: Option<PathBuf>,
     previous_shadow_binary: PathBuf,
     deadline: Instant,
 }
 
-fn rollout_main_activation_path(paths: &SelfRolloutPaths) -> PathBuf {
-    paths.root.join("pending-main-rollout.json")
-}
-
-fn rollout_shadow_finalize_path(paths: &SelfRolloutPaths) -> PathBuf {
-    paths.root.join("pending-shadow-rollout.json")
-}
-
-fn read_rollout_main_activation(
-    paths: &SelfRolloutPaths,
-) -> Result<Option<RolloutMainActivation>, CliError> {
-    let path = rollout_main_activation_path(paths);
-    if !path.exists() {
-        return Ok(None);
+impl PendingShadowRolloutContext for ShadowMainRolloutMonitor {
+    fn activation(&self) -> &RolloutMainActivation {
+        &self.activation
     }
-    let content = fs::read_to_string(&path).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|source| CliError::Json {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
-}
 
-fn stage_pending_shadow_rollout(
-    rollout_paths: &SelfRolloutPaths,
-    pending: &ShadowMainRolloutMonitor,
-    main_options: &DaemonRunOptions,
-    shadow_options: &DaemonRunOptions,
-    main_binary: &Path,
-) -> Result<(), CliError> {
-    let healthy_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string());
-    let finalize = PendingShadowRollout {
-        source: pending.activation.source.clone(),
-        main_binary: main_binary.to_path_buf(),
-        shadow_binary: pending.activation.shadow_binary.clone(),
-        previous_shadow_binary: pending.previous_shadow_binary.clone(),
-        main_host: main_options.host.clone(),
-        main_port: main_options.port,
-        shadow_host: shadow_options.host.clone(),
-        shadow_port: pending.activation.shadow_port,
-        requested_at: pending.activation.requested_at.clone(),
-        main_healthy_at: healthy_at,
-        mode: pending.activation.mode.clone(),
-    };
-    write_json(&rollout_shadow_finalize_path(rollout_paths), &finalize)
-}
+    fn main_binary(&self) -> &Path {
+        &self.activation.main_binary
+    }
 
-fn record_activation_failure(
-    rollout_paths: &SelfRolloutPaths,
-    activation: &RolloutMainActivation,
-    previous_main_binary: &Path,
-    detail: &str,
-) -> Result<(), CliError> {
-    write_json(
-        &rollout_paths.state,
-        &serde_json::json!({
-            "source": activation.source,
-            "main_binary": activation.main_binary,
-            "shadow_binary": activation.shadow_binary,
-            "previous_main_binary": previous_main_binary,
-            "status": "failed",
-            "detail": detail,
-            "requested_at": activation.requested_at,
-            "failed_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string()),
-            "mode": activation.mode
-        }),
-    )
-}
+    fn main_host(&self) -> &str {
+        &self.main_options.host
+    }
 
-fn record_main_rollout_failure(
-    rollout_paths: &SelfRolloutPaths,
-    pending: &ShadowMainRolloutMonitor,
-    detail: &str,
-) -> Result<(), CliError> {
-    write_json(
-        &rollout_paths.state,
-        &serde_json::json!({
-            "source": pending.activation.source,
-            "main_binary": pending.activation.main_binary,
-            "shadow_binary": pending.activation.shadow_binary,
-            "previous_main_binary": pending.previous_main_binary,
-            "previous_shadow_binary": pending.previous_shadow_binary,
-            "status": "failed",
-            "detail": detail,
-            "requested_at": pending.activation.requested_at,
-            "failed_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string()),
-            "mode": pending.activation.mode
-        }),
-    )
+    fn main_port(&self) -> u16 {
+        self.main_options.port
+    }
+
+    fn previous_shadow_binary(&self) -> &Path {
+        &self.previous_shadow_binary
+    }
 }
 
 fn main_exit_observation_from_status(status: ExitStatus) -> MainExitObservation {
@@ -3023,11 +3047,21 @@ fn start_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
 }
 
 fn start_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
-    start_daemon_with_paths(
+    let main_binary = env::current_exe().map_err(|source| CliError::Io {
+        path: "current executable".to_string(),
+        detail: source.to_string(),
+    })?;
+    let extra_env = vec![
+        (SHADOW_MAIN_BINARY_ENV, main_binary.display().to_string()),
+        (SHADOW_MAIN_HOST_ENV, options.host.clone()),
+        (SHADOW_MAIN_PORT_ENV, SINOMO_DAEMON_DEFAULT_PORT.to_string()),
+    ];
+    start_daemon_with_paths_with_env(
         options,
         shadow_daemon_paths_from_defaults()?,
         &["daemon", "shadow", "run"],
         "shadow daemon",
+        &extra_env,
     )
 }
 
@@ -3036,6 +3070,16 @@ fn start_daemon_with_paths(
     paths: DaemonPaths,
     command_prefix: &[&str],
     label: &str,
+) -> Result<(), CliError> {
+    start_daemon_with_paths_with_env(options, paths, command_prefix, label, &[])
+}
+
+fn start_daemon_with_paths_with_env(
+    options: DaemonRunOptions,
+    paths: DaemonPaths,
+    command_prefix: &[&str],
+    label: &str,
+    extra_env: &[(&str, String)],
 ) -> Result<(), CliError> {
     if matches!(
         probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT),
@@ -3053,6 +3097,9 @@ fn start_daemon_with_paths(
     })?;
     let mut command = Command::new(exe);
     command.args(command_prefix);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     let child = command
         .arg("--host")
         .arg(&options.host)
@@ -3829,21 +3876,18 @@ fn handle_daemon_rollout_binary(
         });
     }
     let rollout_paths = SelfRolloutPaths::new(data_dir);
-    rollout_ensure_layout(&rollout_paths)?;
+    ensure_rollout_layout(&rollout_paths)?;
     let binary = URL_SAFE_NO_PAD
         .decode(request.binary_base64.as_bytes())
         .map_err(|source| CliError::Parse {
             detail: format!("invalid rollout binary encoding: {source}"),
         })?;
-    let suffix = rollout_artifact_suffix();
-    let main_binary = rollout_paths
-        .bin
-        .join(format!("sinomo-main-{suffix}{}", env::consts::EXE_SUFFIX));
-    let shadow_binary = rollout_paths
-        .bin
-        .join(format!("sinomo-shadow-{suffix}{}", env::consts::EXE_SUFFIX));
-    write_executable_atomically(&binary, &main_binary)?;
-    write_executable_atomically(&binary, &shadow_binary)?;
+    let main_binary = rollout_paths.main_binary.clone();
+    let shadow_binary = rollout_paths.shadow_binary.clone();
+    let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
+    let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    stage_rollout_bytes(&binary, &staged_main_binary)?;
+    stage_rollout_bytes(&binary, &staged_shadow_binary)?;
 
     let current = read_daemon_status(paths)?;
     let previous_main_binary = env::current_exe().map_err(|source| CliError::Io {
@@ -3857,7 +3901,11 @@ fn handle_daemon_rollout_binary(
             source: request.source,
             main_binary: main_binary.clone(),
             shadow_binary: shadow_binary.clone(),
+            staged_main_binary: Some(staged_main_binary),
+            staged_shadow_binary: Some(staged_shadow_binary),
             previous_main_binary: Some(previous_main_binary),
+            main_host: current.host.clone(),
+            main_port: current.port,
             shadow_port: request.shadow_port,
             requested_at: request.requested_at,
             mode: "cluster-binary-push".to_string(),
@@ -3888,20 +3936,9 @@ fn stage_rollout_main_activation(
             detail: "safe rollout requires the existing shadow daemon to be running".to_string(),
         });
     }
-    write_json(&rollout_main_activation_path(rollout_paths), &activation)?;
-    write_json(
-        &rollout_paths.state,
-        &serde_json::json!({
-            "source": activation.source,
-            "main_binary": activation.main_binary,
-            "shadow_binary": activation.shadow_binary,
-            "previous_main_binary": activation.previous_main_binary,
-            "requested_at": activation.requested_at,
-            "staged_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string()),
-            "status": "main-staged",
-            "mode": activation.mode
-        }),
-    )
+    write_main_activation(rollout_paths, &activation)?;
+    record_main_activation_staged(rollout_paths, &activation)?;
+    Ok(())
 }
 
 fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<String, CliError> {
@@ -3910,26 +3947,16 @@ fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<String, 
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
-    let finalize_path = rollout_shadow_finalize_path(&rollout_paths);
-    if !finalize_path.exists() {
+    let Some(finalize) = read_pending_shadow_rollout(&rollout_paths)? else {
         return Ok("no pending shadow rollout\n".to_string());
-    }
-    let content = fs::read_to_string(&finalize_path).map_err(|source| CliError::Io {
-        path: finalize_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let finalize: PendingShadowRollout =
-        serde_json::from_str(&content).map_err(|source| CliError::Json {
-            path: finalize_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+    };
 
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     if let DaemonProbeStatus::Running(status) =
         probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT)
     {
         let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             if matches!(
                 probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
@@ -3943,42 +3970,60 @@ fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<String, 
 
     let mut detail = "shadow rollout finalized".to_string();
     let mut status = "accepted";
-    if let Err(error) = spawn_shadow_for_cluster_rollout(
+    let previous_shadow_backup = finalize
+        .staged_shadow_binary
+        .as_ref()
+        .map(|staged| activate_staged_rollout_binary(staged, &finalize.shadow_binary))
+        .transpose()?
+        .flatten();
+    let candidate_result = spawn_shadow_for_cluster_rollout(
         &finalize.shadow_binary,
         &finalize.main_binary,
         &finalize.main_host,
         finalize.main_port,
+        &finalize.shadow_host,
         finalize.shadow_port,
     )
-    .and_then(|()| wait_for_shadow_rollout_health(data_dir, finalize.shadow_port))
-    {
-        status = "recovered";
-        detail = format!("candidate shadow failed: {error}; restarting previous shadow");
-        let _ = spawn_shadow_for_cluster_rollout(
-            &finalize.previous_shadow_binary,
-            &finalize.main_binary,
-            &finalize.main_host,
-            finalize.main_port,
+    .and_then(|()| {
+        wait_for_shadow_rollout_health(
+            data_dir,
+            &finalize.shadow_host,
             finalize.shadow_port,
-        );
+            Duration::from_secs(30),
+        )
+    });
+    if let Err(error) = candidate_result {
+        if wait_for_shadow_rollout_health(
+            data_dir,
+            &finalize.shadow_host,
+            finalize.shadow_port,
+            Duration::from_secs(15),
+        )
+        .is_ok()
+        {
+            detail = format!("shadow rollout finalized after handoff grace period: {error}");
+        } else {
+            status = "recovered";
+            detail = format!("candidate shadow failed: {error}; restarting previous shadow");
+            let recovery_shadow_binary = if let Some(backup) = previous_shadow_backup.as_ref() {
+                let _ = restore_rollout_binary_from_backup(backup, &finalize.shadow_binary);
+                &finalize.shadow_binary
+            } else {
+                &finalize.previous_shadow_binary
+            };
+            let _ = spawn_shadow_for_cluster_rollout(
+                recovery_shadow_binary,
+                &finalize.main_binary,
+                &finalize.main_host,
+                finalize.main_port,
+                &finalize.shadow_host,
+                finalize.shadow_port,
+            );
+        }
     }
 
-    write_json(
-        &rollout_paths.state,
-        &serde_json::json!({
-            "source": finalize.source,
-            "main_binary": finalize.main_binary,
-            "shadow_binary": finalize.shadow_binary,
-            "previous_shadow_binary": finalize.previous_shadow_binary,
-            "requested_at": finalize.requested_at,
-            "main_healthy_at": finalize.main_healthy_at,
-            "updated_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string()),
-            "status": status,
-            "detail": detail,
-            "mode": finalize.mode
-        }),
-    )?;
-    let _ = fs::remove_file(finalize_path);
+    record_shadow_rollout_finalized(&rollout_paths, &finalize, status, &detail)?;
+    remove_shadow_finalize(&rollout_paths);
     Ok(format!("{status}: {detail}\n"))
 }
 
@@ -3996,7 +4041,7 @@ fn handle_daemon_rollout_build(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
-    rollout_ensure_layout(&rollout_paths)?;
+    ensure_rollout_layout(&rollout_paths)?;
     let repo = rollout_remote_repo_path(&rollout_paths, request.remote_repo.as_deref());
     if !repo.join("Cargo.toml").exists() {
         return Ok(ClusterRolloutBinaryResponse {
@@ -4021,15 +4066,12 @@ fn handle_daemon_rollout_build(
             });
         }
     };
-    let suffix = rollout_artifact_suffix();
-    let main_binary = rollout_paths
-        .bin
-        .join(format!("sinomo-main-{suffix}{}", env::consts::EXE_SUFFIX));
-    let shadow_binary = rollout_paths
-        .bin
-        .join(format!("sinomo-shadow-{suffix}{}", env::consts::EXE_SUFFIX));
-    install_rollout_binary(&built_binary, &main_binary)?;
-    install_rollout_binary(&built_binary, &shadow_binary)?;
+    let main_binary = rollout_paths.main_binary.clone();
+    let shadow_binary = rollout_paths.shadow_binary.clone();
+    let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
+    let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    stage_rollout_file(&built_binary, &staged_main_binary)?;
+    stage_rollout_file(&built_binary, &staged_shadow_binary)?;
 
     let current = read_daemon_status(paths)?;
     let previous_main_binary = env::current_exe().map_err(|source| CliError::Io {
@@ -4045,7 +4087,11 @@ fn handle_daemon_rollout_build(
             source: source.clone(),
             main_binary: main_binary.clone(),
             shadow_binary: shadow_binary.clone(),
+            staged_main_binary: Some(staged_main_binary),
+            staged_shadow_binary: Some(staged_shadow_binary),
             previous_main_binary: Some(previous_main_binary),
+            main_host: current.host.clone(),
+            main_port: current.port,
             shadow_port: request.shadow_port,
             requested_at: requested_at.clone(),
             mode: "cluster-remote-build".to_string(),
@@ -4085,44 +4131,18 @@ fn rollout_artifact_suffix() -> String {
     format!("{}-{nanos}", std::process::id())
 }
 
-fn write_executable_atomically(bytes: &[u8], destination: &Path) -> Result<(), CliError> {
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let next = destination.with_extension("next");
-    fs::write(&next, bytes).map_err(|source| CliError::Io {
-        path: next.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(&next, fs::Permissions::from_mode(0o755)).map_err(|source| {
-            CliError::Io {
-                path: next.display().to_string(),
-                detail: source.to_string(),
-            }
-        })?;
-    }
-    fs::rename(&next, destination).map_err(|source| CliError::Io {
-        path: format!("{} -> {}", next.display(), destination.display()),
-        detail: source.to_string(),
-    })
-}
-
 fn spawn_shadow_for_cluster_rollout(
     shadow_binary: &Path,
     main_binary: &Path,
     main_host: &str,
     main_port: u16,
+    shadow_host: &str,
     shadow_port: u16,
 ) -> Result<(), CliError> {
     Command::new(shadow_binary)
         .args(["daemon", "shadow", "run"])
         .arg("--host")
-        .arg(main_host)
+        .arg(shadow_host)
         .arg("--port")
         .arg(shadow_port.to_string())
         .env(SHADOW_MAIN_BINARY_ENV, main_binary)
@@ -4140,12 +4160,17 @@ fn spawn_shadow_for_cluster_rollout(
     Ok(())
 }
 
-fn wait_for_shadow_rollout_health(data_dir: &Path, _shadow_port: u16) -> Result<(), CliError> {
+fn wait_for_shadow_rollout_health(
+    data_dir: &Path,
+    shadow_host: &str,
+    shadow_port: u16,
+    timeout: Duration,
+) -> Result<(), CliError> {
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if matches!(
-            probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
+            probe_daemon_status(&shadow_paths, Duration::from_secs(2)),
             DaemonProbeStatus::Running(_)
         ) {
             return Ok(());
@@ -4153,7 +4178,7 @@ fn wait_for_shadow_rollout_health(data_dir: &Path, _shadow_port: u16) -> Result<
         thread::sleep(Duration::from_millis(100));
     }
     Err(CliError::Network {
-        address: daemon_connect_address("127.0.0.1", _shadow_port),
+        address: daemon_connect_address(shadow_host, shadow_port),
         detail: "rolled out shadow daemon did not become ready".to_string(),
     })
 }
@@ -4302,25 +4327,9 @@ fn rollout_paths_from_defaults() -> Result<SelfRolloutPaths, CliError> {
     Ok(SelfRolloutPaths::new(&data_dir.root()))
 }
 
-fn rollout_ensure_layout(paths: &SelfRolloutPaths) -> Result<(), CliError> {
-    for path in [&paths.root, &paths.bin] {
-        fs::create_dir_all(path).map_err(|source| CliError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    if let Some(parent) = paths.source_repo.parent() {
-        fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    Ok(())
-}
-
 fn rollout_init_source(options: RolloutOptions) -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
-    rollout_ensure_layout(&paths)?;
+    ensure_rollout_layout(&paths)?;
     ensure_source_repo(&paths, options.repo.as_deref())?;
     println!("source repo: {}", paths.source_repo.display());
     Ok(())
@@ -4343,7 +4352,7 @@ fn rollout_status() -> Result<(), CliError> {
 
 fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
-    rollout_ensure_layout(&paths)?;
+    ensure_rollout_layout(&paths)?;
     ensure_source_repo(&paths, options.repo.as_deref())?;
     let plan = paths.plan();
     let build = Command::new(&plan.build_program)
@@ -4376,7 +4385,11 @@ fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     install_binary_atomically(&plan.built_binary, &plan.install_main_binary)?;
     stop_main_daemon_if_running(&options)?;
     install_binary_atomically(&plan.built_binary, &plan.install_shadow_binary)?;
-    restart_shadow_daemon_from_binary(&plan.install_shadow_binary, &options)?;
+    restart_shadow_daemon_from_binary(
+        &plan.install_shadow_binary,
+        &plan.install_main_binary,
+        &options,
+    )?;
     wait_for_main_daemon_health(&options)?;
     write_json(
         &plan.state,
@@ -4504,7 +4517,7 @@ fn rollout_prepare_dev_binary(options: &RolloutOptions) -> Result<PathBuf, CliEr
             detail: source.to_string(),
         })?);
     let paths = rollout_paths_from_defaults()?;
-    rollout_ensure_layout(&paths)?;
+    ensure_rollout_layout(&paths)?;
     let plan = SelfRolloutPaths::new(paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "rollout root has no data directory parent".to_string(),
@@ -4567,6 +4580,10 @@ fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<String>, CliE
 
     if let Ok(state) = require_cluster_bootstrap_state() {
         for member in state.members {
+            let is_local_member = member.node_id == state.local_node_id;
+            if options.skip_local && is_local_member {
+                continue;
+            }
             let is_main_daemon = member
                 .capabilities
                 .iter()
@@ -4575,6 +4592,10 @@ fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<String>, CliE
                 continue;
             }
             for endpoint in member.endpoints {
+                if !is_local_member && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
+                {
+                    continue;
+                }
                 targets.push(endpoint.address);
             }
         }
@@ -4633,39 +4654,6 @@ fn ensure_rollout_target_platform_from_status(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ClusterRolloutBinaryRequest {
-    source: String,
-    binary_base64: String,
-    #[serde(default)]
-    target_os: String,
-    #[serde(default)]
-    target_arch: String,
-    host: String,
-    port: u16,
-    shadow_port: u16,
-    requested_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ClusterRolloutBuildRequest {
-    source: String,
-    #[serde(default)]
-    remote_repo: Option<PathBuf>,
-    host: String,
-    port: u16,
-    shadow_port: u16,
-    requested_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ClusterRolloutBinaryResponse {
-    status: String,
-    detail: String,
-    main_binary: PathBuf,
-    shadow_binary: PathBuf,
-}
-
 fn send_daemon_rollout_binary(
     address: &str,
     request: &ClusterRolloutBinaryRequest,
@@ -4705,9 +4693,6 @@ fn send_daemon_rollout_build(
 }
 
 fn ensure_source_repo(paths: &SelfRolloutPaths, repo: Option<&Path>) -> Result<(), CliError> {
-    if paths.source_repo.join(".git").exists() {
-        return Ok(());
-    }
     let source = match repo {
         Some(repo) => repo.to_path_buf(),
         None => env::current_dir().map_err(|source| CliError::Io {
@@ -4715,27 +4700,7 @@ fn ensure_source_repo(paths: &SelfRolloutPaths, repo: Option<&Path>) -> Result<(
             detail: source.to_string(),
         })?,
     };
-    let output = Command::new("git")
-        .arg("clone")
-        .arg(&source)
-        .arg(&paths.source_repo)
-        .output()
-        .map_err(|source| CliError::Io {
-            path: "git clone".to_string(),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(CliError::Process {
-            command: format!(
-                "git clone {} {}",
-                source.display(),
-                paths.source_repo.display()
-            ),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(())
+    Ok(deploy_managed_source_repo(paths, &source)?)
 }
 
 fn install_binary_atomically(source: &Path, destination: &Path) -> Result<(), CliError> {
@@ -4770,20 +4735,6 @@ fn install_binary_atomically(source: &Path, destination: &Path) -> Result<(), Cl
     Ok(())
 }
 
-fn install_rollout_binary(source: &Path, destination: &Path) -> Result<(), CliError> {
-    install_binary_atomically(source, destination)?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o755)).map_err(|source| {
-            CliError::Io {
-                path: destination.display().to_string(),
-                detail: source.to_string(),
-            }
-        })?;
-    }
-    Ok(())
-}
-
 fn stop_main_daemon_if_running(_options: &RolloutOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let paths = DaemonPaths::new(&data_dir);
@@ -4805,6 +4756,7 @@ fn stop_main_daemon_if_running(_options: &RolloutOptions) -> Result<(), CliError
 
 fn restart_shadow_daemon_from_binary(
     binary: &Path,
+    main_binary: &Path,
     options: &RolloutOptions,
 ) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
@@ -4824,6 +4776,7 @@ fn restart_shadow_daemon_from_binary(
     }
     start_daemon_binary(
         binary,
+        main_binary,
         &["daemon", "shadow", "run"],
         options,
         paths,
@@ -4833,6 +4786,7 @@ fn restart_shadow_daemon_from_binary(
 
 fn start_daemon_binary(
     binary: &Path,
+    main_binary: &Path,
     command_prefix: &[&str],
     options: &RolloutOptions,
     paths: DaemonPaths,
@@ -4840,6 +4794,7 @@ fn start_daemon_binary(
 ) -> Result<(), CliError> {
     let mut command = Command::new(binary);
     command.args(command_prefix);
+    command.env(SHADOW_MAIN_BINARY_ENV, main_binary);
     command.env(SHADOW_MAIN_HOST_ENV, &options.host);
     command.env(SHADOW_MAIN_PORT_ENV, options.port.to_string());
     let child = command
@@ -5931,7 +5886,7 @@ fn evolve_propose(args: &[String]) -> Result<(), CliError> {
         repo
     } else {
         let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
-        rollout_ensure_layout(&rollout_paths)?;
+        ensure_rollout_layout(&rollout_paths)?;
         let current_repo = env::current_dir().map_err(|source| CliError::Io {
             path: ".".to_string(),
             detail: source.to_string(),
@@ -10006,7 +9961,7 @@ fn print_rollout_help() {
     );
     println!("  sinomo rollout apply [--repo <path>] [--host <host>] [--port <port>]");
     println!(
-        "      Build the data-directory source repo, install bin/sinomo-main and bin/sinomo-shadow, restart shadow supervision, then verify main health."
+        "      Build the data-directory source repo, install bin/sinomo and bin/sinomo-shadow, restart shadow supervision, then verify main health."
     );
     println!(
         "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--remote-repo <path>] [--skip-local]"
@@ -10248,6 +10203,25 @@ impl From<sinomo_evolution::EvolutionError> for CliError {
     }
 }
 
+impl From<RolloutError> for CliError {
+    fn from(error: RolloutError) -> Self {
+        match error {
+            RolloutError::Io { path, detail } => Self::Io { path, detail },
+            RolloutError::Json { path, detail } => Self::Json { path, detail },
+            RolloutError::Process {
+                command,
+                status,
+                stderr,
+            } => Self::Process {
+                command,
+                status,
+                stderr,
+            },
+            RolloutError::MissingArtifact { artifact } => Self::MissingArtifact { artifact },
+        }
+    }
+}
+
 impl From<sinomo_runtime::eval::EvalError> for CliError {
     fn from(error: sinomo_runtime::eval::EvalError) -> Self {
         Self::Eval(error)
@@ -10336,16 +10310,17 @@ mod tests {
         UninstallOptions, authenticate_daemon_command, cli_command_requires_cluster_state,
         cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
         daemon_status_matches_options, decode_cluster_join_invite, encode_cluster_join_invite,
-        handle_daemon_cluster_join, handle_daemon_cluster_kv_txn, handle_daemon_rollout_build,
-        install_should_update_binary, install_with_layout, is_terminal_status,
-        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-        parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-        parse_dfs_command, parse_install_options, parse_model_default_options,
-        parse_models_list_options, parse_propose_options, parse_provider_command,
-        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-        read_cluster_members_from_kv, read_cluster_state, rollout_ensure_layout,
-        run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-        sign_daemon_command_from_data_dir, stage_rollout_main_activation, uninstall_with_layout,
+        ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_txn,
+        handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
+        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
+        parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+        parse_daemon_command, parse_dfs_command, parse_install_options,
+        parse_model_default_options, parse_models_list_options, parse_propose_options,
+        parse_provider_command, parse_rollout_command, parse_slash_command,
+        parse_uninstall_options, parse_usage_options, read_cluster_members_from_kv,
+        read_cluster_state, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
+        run_evolve_command, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
+        uninstall_with_layout,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -10524,7 +10499,10 @@ mod tests {
         let main_entry = std::fs::read_to_string(&layout.main_boot_entry).expect("main boot");
         let shadow_entry = std::fs::read_to_string(&layout.shadow_boot_entry).expect("shadow boot");
         assert!(layout.binary.exists());
+        assert!(layout.shadow_binary.exists());
         assert!(main_entry.contains("SINOMO_DATA_DIR"));
+        assert!(shadow_entry.contains("SINOMO_SHADOW_MAIN_BINARY"));
+        assert!(shadow_entry.contains(&layout.shadow_binary.display().to_string()));
         if cfg!(windows) {
             assert!(main_entry.contains("daemon start"));
             assert!(shadow_entry.contains("daemon shadow start"));
@@ -10540,6 +10518,7 @@ mod tests {
         assert!(!layout.shadow_boot_entry.exists());
         assert!(layout.data_dir.exists());
         assert!(layout.binary.exists());
+        assert!(layout.shadow_binary.exists());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -11208,7 +11187,7 @@ mod tests {
                 .as_nanos()
         ));
         let rollout_paths = SelfRolloutPaths::new(&root);
-        rollout_ensure_layout(&rollout_paths).expect("layout");
+        ensure_rollout_layout(&rollout_paths).expect("layout");
         let error = stage_rollout_main_activation(
             &root,
             &rollout_paths,
@@ -11216,7 +11195,11 @@ mod tests {
                 source: "test".to_string(),
                 main_binary: root.join("bin").join("candidate-main"),
                 shadow_binary: root.join("bin").join("candidate-shadow"),
+                staged_main_binary: None,
+                staged_shadow_binary: None,
                 previous_main_binary: Some(root.join("bin").join("previous-main")),
+                main_host: "0.0.0.0".to_string(),
+                main_port: 21_353,
                 shadow_port: 21_354,
                 requested_at: "now".to_string(),
                 mode: "test".to_string(),

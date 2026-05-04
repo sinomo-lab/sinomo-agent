@@ -3096,6 +3096,7 @@ dependencies = [
  "serde_json",
  "sinomo-evolution",
  "sinomo-lm",
+ "sinomo-rollout",
  "sinomo-runtime",
  "time",
 ]
