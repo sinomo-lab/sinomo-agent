@@ -2281,7 +2281,15 @@ fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, Cli
             path: paths.state.display().to_string(),
             detail: source.to_string(),
         })?;
-    let kv_members = read_cluster_members_from_kv(paths)?;
+    let kv_members = match read_cluster_members_from_kv(paths) {
+        Ok(members) => members,
+        Err(error) => {
+            eprintln!(
+                "warning: ignoring unreadable cluster kv snapshot while loading members: {error}"
+            );
+            Vec::new()
+        }
+    };
     if !kv_members.is_empty() {
         state.members = kv_members;
     }
@@ -2378,7 +2386,13 @@ fn sync_cluster_state_to_kv(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, CliError> {
-    let mut store = read_cluster_kv_store(paths)?;
+    let mut store = match read_cluster_kv_store(paths) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("warning: replacing unreadable cluster kv snapshot: {error}");
+            InProcessKvStore::new()
+        }
+    };
     let mut keyed_state = state.clone();
     assign_local_node_public_keys(paths, &mut keyed_state)?;
     for member in &keyed_state.members {
@@ -11495,12 +11509,12 @@ mod tests {
         parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
         parse_install_options, parse_model_default_options, parse_models_list_options,
         parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-        parse_uninstall_options, parse_usage_options, read_cluster_members_from_kv,
-        read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
-        refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
-        run_cui_with_handler_io_and_daemon, run_evolve_command, sign_cluster_join_invite,
-        sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
-        uninstall_with_layout, write_json,
+        parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
+        read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
+        read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
+        run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
+        sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
+        sync_cluster_state_to_kv, uninstall_with_layout, write_json,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -11756,6 +11770,7 @@ mod tests {
         ));
         write_json(&paths.state, &state).expect("write joined state");
         sync_cluster_state_to_kv(&paths, &state).expect("sync kv");
+        std::fs::write(&paths.kv_snapshot, "{\"revision\":1}trailing").expect("corrupt kv");
 
         let members = cluster_peer_members(&paths).expect("peer members");
 
@@ -11764,6 +11779,7 @@ mod tests {
                 .iter()
                 .any(|member| member.node_id == NodeId::new("node_peers_joined").expect("node"))
         );
+        read_cluster_kv_snapshot(&paths).expect("repaired kv snapshot");
         std::fs::remove_dir_all(root).ok();
     }
 
