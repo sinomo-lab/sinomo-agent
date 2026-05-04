@@ -11,6 +11,8 @@ use sinomo_kv::{KvEntry, KvOp, LeaseId};
 use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::rc::Rc;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -481,6 +483,166 @@ impl MdnsDiscoveryCache {
     }
 }
 
+pub const SINOMO_LAN_DISCOVERY_PROTOCOL: &str = "sinomo.lan-discovery.v1";
+pub const SINOMO_LAN_DISCOVERY_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
+pub const SINOMO_LAN_DISCOVERY_PORT: u16 = 21_359;
+pub const SINOMO_LAN_DISCOVERY_TTL_TICKS: u64 = 10;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MdnsDiscoveryAdvertisement {
+    pub protocol: String,
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<ClusterEndpointRecord>,
+    pub advertised_tick: u64,
+    pub ttl_ticks: u64,
+}
+
+impl MdnsDiscoveryAdvertisement {
+    pub fn new(
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        endpoints: Vec<ClusterEndpointRecord>,
+        advertised_tick: u64,
+    ) -> Self {
+        Self {
+            protocol: SINOMO_LAN_DISCOVERY_PROTOCOL.to_string(),
+            cluster_id,
+            node_id,
+            endpoints,
+            advertised_tick,
+            ttl_ticks: SINOMO_LAN_DISCOVERY_TTL_TICKS,
+        }
+    }
+
+    pub fn records(&self) -> Vec<MdnsDiscoveryRecord> {
+        self.endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.node_id == self.node_id
+                    && matches!(
+                        endpoint.transport,
+                        ClusterTransportKind::LanTcp | ClusterTransportKind::LanQuic
+                    )
+                    && endpoint.privacy == ClusterEndpointPrivacy::Lan
+            })
+            .map(|endpoint| {
+                let mut endpoint = endpoint.clone();
+                endpoint.source = ClusterEndpointSource::Mdns;
+                MdnsDiscoveryRecord {
+                    record_id: format!(
+                        "{}:{}:{}:{}",
+                        self.cluster_id,
+                        self.node_id,
+                        cluster_transport_kind_label(&endpoint.transport),
+                        endpoint.address
+                    ),
+                    cluster_id: self.cluster_id.clone(),
+                    endpoint,
+                    advertised_tick: self.advertised_tick,
+                    expires_after_tick: self.advertised_tick.saturating_add(self.ttl_ticks),
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct MdnsDiscoverySocket {
+    socket: UdpSocket,
+    multicast_address: SocketAddrV4,
+}
+
+impl MdnsDiscoverySocket {
+    pub fn bind_default() -> Result<Self, NetworkError> {
+        Self::bind_port(SINOMO_LAN_DISCOVERY_PORT)
+    }
+
+    pub fn bind_port(port: u16) -> Result<Self, NetworkError> {
+        let socket =
+            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).map_err(|source| {
+                NetworkError::Io {
+                    operation: "bind lan discovery socket".to_string(),
+                    detail: source.to_string(),
+                }
+            })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|source| NetworkError::Io {
+                operation: "set lan discovery nonblocking".to_string(),
+                detail: source.to_string(),
+            })?;
+        socket
+            .set_multicast_loop_v4(true)
+            .map_err(|source| NetworkError::Io {
+                operation: "enable lan discovery multicast loopback".to_string(),
+                detail: source.to_string(),
+            })?;
+        socket
+            .set_multicast_ttl_v4(16)
+            .map_err(|source| NetworkError::Io {
+                operation: "set lan discovery multicast ttl".to_string(),
+                detail: source.to_string(),
+            })?;
+        socket
+            .join_multicast_v4(&SINOMO_LAN_DISCOVERY_MULTICAST, &Ipv4Addr::UNSPECIFIED)
+            .map_err(|source| NetworkError::Io {
+                operation: "join lan discovery multicast group".to_string(),
+                detail: source.to_string(),
+            })?;
+
+        Ok(Self {
+            socket,
+            multicast_address: SocketAddrV4::new(SINOMO_LAN_DISCOVERY_MULTICAST, port),
+        })
+    }
+
+    pub fn announce(
+        &self,
+        advertisement: &MdnsDiscoveryAdvertisement,
+    ) -> Result<usize, NetworkError> {
+        let bytes =
+            serde_json::to_vec(advertisement).map_err(|source| NetworkError::Serialization {
+                detail: source.to_string(),
+            })?;
+        self.socket
+            .send_to(&bytes, self.multicast_address)
+            .map_err(|source| NetworkError::Io {
+                operation: "send lan discovery advertisement".to_string(),
+                detail: source.to_string(),
+            })
+    }
+
+    pub fn drain(&self) -> Result<Vec<MdnsDiscoveryAdvertisement>, NetworkError> {
+        let mut advertisements = Vec::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            match self.socket.recv_from(&mut buffer) {
+                Ok((received, _source)) => {
+                    let advertisement: MdnsDiscoveryAdvertisement =
+                        serde_json::from_slice(&buffer[..received]).map_err(|source| {
+                            NetworkError::Serialization {
+                                detail: source.to_string(),
+                            }
+                        })?;
+                    if advertisement.protocol == SINOMO_LAN_DISCOVERY_PROTOCOL {
+                        advertisements.push(advertisement);
+                    }
+                }
+                Err(source) if source.kind() == io::ErrorKind::WouldBlock => break,
+                Err(source) => {
+                    return Err(NetworkError::Io {
+                        operation: "receive lan discovery advertisement".to_string(),
+                        detail: source.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(advertisements)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MdnsDiscoveryRecord {
     pub record_id: String,
@@ -488,6 +650,19 @@ pub struct MdnsDiscoveryRecord {
     pub endpoint: ClusterEndpointRecord,
     pub advertised_tick: u64,
     pub expires_after_tick: u64,
+}
+
+fn cluster_transport_kind_label(transport: &ClusterTransportKind) -> &'static str {
+    match transport {
+        ClusterTransportKind::InProcess => "in-process",
+        ClusterTransportKind::Loopback => "loopback",
+        ClusterTransportKind::LanTcp => "lan-tcp",
+        ClusterTransportKind::LanQuic => "lan-quic",
+        ClusterTransportKind::Iroh => "iroh",
+        ClusterTransportKind::WebRtc => "webrtc",
+        ClusterTransportKind::TurnRelay => "turn-relay",
+        ClusterTransportKind::HttpsRelay => "https-relay",
+    }
 }
 
 impl MdnsDiscoveryRecord {
@@ -1774,6 +1949,8 @@ pub enum NetworkError {
     },
     #[error("network serialization error: {detail}")]
     Serialization { detail: String },
+    #[error("network I/O error during {operation}: {detail}")]
+    Io { operation: String, detail: String },
     #[error(transparent)]
     EventStore(#[from] EventStoreError),
 }

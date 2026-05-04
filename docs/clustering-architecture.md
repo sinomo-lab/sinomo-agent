@@ -449,9 +449,9 @@ Phase 2, KV core:
 
 Phase 3, real local network:
 
-- Add QUIC transport for LAN direct connections. Implemented the LAN QUIC endpoint config and bounded frame codec in `sinomo-network`; the async socket runtime is deferred until the daemon transport loop exists.
-- Add mDNS discovery. Implemented an mDNS-style discovery cache that records LAN QUIC endpoint advertisements, TTL expiry, and endpoint candidate conversion.
-- Add mutual auth using node identity and cluster certificates. Implemented cluster-auth material, certificate/member verification, and authenticated session establishment against cluster membership records.
+- Add direct LAN transport. Implemented daemon-to-daemon signed TCP control messages for local network synchronization and rollout control. Daemons bound to `0.0.0.0` or another non-loopback host advertise LAN TCP endpoints alongside loopback endpoints, and the main daemon continuously exchanges cluster membership and KV snapshots with reachable peer daemon endpoints.
+- Add LAN discovery. Implemented a real UDP multicast discovery socket in `sinomo-network` using the `sinomo.lan-discovery.v1` advertisement envelope. The daemon publishes its current LAN endpoints, drains peer advertisements, records them in the discovery cache, and promotes discovered endpoints into known member records only when the advertised node is already trusted by cluster membership.
+- Add mutual auth using node identity and cluster certificates. Implemented cluster-auth material, certificate/member verification, authenticated session establishment against cluster membership records, and signed daemon control envelopes for LAN peer sync. Discovery finds paths only; signed cluster membership still authorizes use.
 
 Phase 4, roaming:
 

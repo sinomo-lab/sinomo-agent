@@ -59,6 +59,9 @@ use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
 use sinomo_runtime::kv::{InProcessKvStore, KvEntry, KvError, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::{
+    MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoverySocket,
+};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
@@ -202,6 +205,9 @@ const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
 const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
 const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
+const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_millis(500);
+const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const DAEMON_CLUSTER_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
@@ -2072,6 +2078,367 @@ fn assign_local_node_public_keys(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ClusterSyncRequest {
+    state: ClusterBootstrapState,
+    kv_snapshot: KvSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ClusterSyncResponse {
+    accepted: bool,
+    detail: String,
+    state: ClusterBootstrapState,
+    kv_snapshot: KvSnapshot,
+}
+
+struct ClusterNetworkMaintenance {
+    discovery: Option<MdnsDiscoverySocket>,
+    discovery_cache: MdnsDiscoveryCache,
+    tick: u64,
+    last_discovery: Instant,
+    last_sync: Instant,
+}
+
+impl ClusterNetworkMaintenance {
+    fn new() -> Self {
+        Self {
+            discovery: MdnsDiscoverySocket::bind_default().ok(),
+            discovery_cache: MdnsDiscoveryCache::new(),
+            tick: 0,
+            last_discovery: Instant::now() - DAEMON_CLUSTER_DISCOVERY_INTERVAL,
+            last_sync: Instant::now() - DAEMON_CLUSTER_SYNC_INTERVAL,
+        }
+    }
+
+    fn tick(&mut self, paths: &DaemonPaths, options: &DaemonRunOptions) -> Result<(), CliError> {
+        self.tick = self.tick.saturating_add(1);
+        let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+            path: paths.root.display().to_string(),
+            detail: "daemon paths have no data directory parent".to_string(),
+        })?;
+        let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+        if !cluster_paths.state.exists() {
+            return Ok(());
+        }
+
+        let mut state = read_cluster_state(&cluster_paths)?;
+        let shadow_options = current_shadow_daemon_options(data_dir);
+        ensure_daemon_cluster_members(
+            &mut state,
+            options,
+            &shadow_options,
+            OffsetDateTime::now_utc(),
+        );
+        assign_local_node_public_keys(&cluster_paths, &mut state)?;
+
+        self.process_discovery(&mut state);
+        let mut snapshot = sync_cluster_state_to_kv(&cluster_paths, &state)?;
+
+        let now = Instant::now();
+        if now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL {
+            self.last_discovery = now;
+            self.announce(&state);
+        }
+
+        if now.duration_since(self.last_sync) >= DAEMON_CLUSTER_SYNC_INTERVAL {
+            self.last_sync = now;
+            sync_cluster_with_reachable_peers(&cluster_paths, &mut state, &mut snapshot)?;
+        }
+
+        write_json(&cluster_paths.state, &state)?;
+        write_cluster_kv_snapshot(&cluster_paths, &snapshot)?;
+        Ok(())
+    }
+
+    fn process_discovery(&mut self, state: &mut ClusterBootstrapState) {
+        let Some(discovery) = &self.discovery else {
+            return;
+        };
+        let Ok(advertisements) = discovery.drain() else {
+            return;
+        };
+        for advertisement in advertisements {
+            if advertisement.cluster_id != state.cluster_id
+                || advertisement.node_id == state.local_node_id
+            {
+                continue;
+            }
+            for record in advertisement.records() {
+                self.discovery_cache.upsert(record.clone());
+                if let Some(member) = state
+                    .members
+                    .iter_mut()
+                    .find(|member| member.node_id == record.endpoint.node_id)
+                {
+                    upsert_member_endpoint(member, record.endpoint);
+                }
+            }
+        }
+        self.discovery_cache.expire_after_tick(self.tick);
+    }
+
+    fn announce(&self, state: &ClusterBootstrapState) {
+        let Some(discovery) = &self.discovery else {
+            return;
+        };
+        let Some(member) = state
+            .members
+            .iter()
+            .find(|member| member.node_id == state.local_node_id)
+        else {
+            return;
+        };
+        let endpoints: Vec<_> = member
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.privacy == ClusterEndpointPrivacy::Lan
+                    && matches!(
+                        endpoint.transport,
+                        ClusterTransportKind::LanTcp | ClusterTransportKind::LanQuic
+                    )
+            })
+            .cloned()
+            .collect();
+        if endpoints.is_empty() {
+            return;
+        }
+        let advertisement = MdnsDiscoveryAdvertisement::new(
+            state.cluster_id.clone(),
+            state.local_node_id.clone(),
+            endpoints,
+            self.tick,
+        );
+        let _ = discovery.announce(&advertisement);
+    }
+}
+
+fn current_shadow_daemon_options(data_dir: &Path) -> DaemonRunOptions {
+    match probe_daemon_status(
+        &DaemonPaths::with_root(data_dir.join("shadow-daemon")),
+        DAEMON_PROBE_TIMEOUT,
+    ) {
+        DaemonProbeStatus::Running(status)
+        | DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => daemon_options_from_status(&status),
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+            DaemonRunOptions::shadow_default()
+        }
+    }
+}
+
+fn sync_cluster_with_reachable_peers(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    snapshot: &mut KvSnapshot,
+) -> Result<(), CliError> {
+    let request = ClusterSyncRequest {
+        state: state.clone(),
+        kv_snapshot: snapshot.clone(),
+    };
+    for endpoint in cluster_sync_targets(state) {
+        let Ok(response) = send_cluster_sync(&endpoint.address, &request) else {
+            continue;
+        };
+        if !response.accepted {
+            continue;
+        }
+        merge_cluster_state_from_peer(state, response.state);
+        merge_cluster_kv_snapshot(paths, &response.kv_snapshot)?;
+        *snapshot = read_cluster_kv_snapshot(paths)?;
+    }
+    Ok(())
+}
+
+fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
+    let mut targets = Vec::new();
+    for member in &state.members {
+        if member.node_id == state.local_node_id || !member.state.is_authorized() {
+            continue;
+        }
+        if !member
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "daemon.main.run")
+        {
+            continue;
+        }
+        let mut endpoints = member.endpoints.clone();
+        endpoints.sort_by_key(|endpoint| {
+            (
+                endpoint.privacy != ClusterEndpointPrivacy::Lan,
+                endpoint.priority,
+                endpoint.address.clone(),
+            )
+        });
+        targets.extend(endpoints.into_iter().filter(|endpoint| {
+            matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+            )
+        }));
+    }
+    targets
+}
+
+fn send_cluster_sync(
+    address: &str,
+    request: &ClusterSyncRequest,
+) -> Result<ClusterSyncResponse, CliError> {
+    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
+        path: "cluster sync request".to_string(),
+        detail: source.to_string(),
+    })?;
+    let response = send_daemon_command(
+        address,
+        &format!("CLUSTER_SYNC {payload}"),
+        DAEMON_JOIN_TIMEOUT,
+    )?;
+    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
+        path: format!("cluster sync response from {address}"),
+        detail: source.to_string(),
+    })
+}
+
+fn handle_daemon_cluster_sync(
+    paths: &DaemonPaths,
+    payload: &str,
+) -> Result<ClusterSyncResponse, CliError> {
+    let request: ClusterSyncRequest =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "cluster sync request".to_string(),
+            detail: source.to_string(),
+        })?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let mut state = read_cluster_state(&cluster_paths)?;
+    if request.state.cluster_id != state.cluster_id {
+        let snapshot = read_cluster_kv_store(&cluster_paths)?.snapshot();
+        return Ok(ClusterSyncResponse {
+            accepted: false,
+            detail: format!(
+                "peer cluster `{}` does not match local cluster `{}`",
+                request.state.cluster_id, state.cluster_id
+            ),
+            state,
+            kv_snapshot: snapshot,
+        });
+    }
+    merge_cluster_state_from_peer(&mut state, request.state);
+    write_json(&cluster_paths.state, &state)?;
+    merge_cluster_kv_snapshot(&cluster_paths, &request.kv_snapshot)?;
+    let snapshot = sync_cluster_state_to_kv(&cluster_paths, &state)?;
+    Ok(ClusterSyncResponse {
+        accepted: true,
+        detail: "cluster sync applied".to_string(),
+        state,
+        kv_snapshot: snapshot,
+    })
+}
+
+fn merge_cluster_state_from_peer(
+    local: &mut ClusterBootstrapState,
+    peer: ClusterBootstrapState,
+) -> bool {
+    if peer.cluster_id != local.cluster_id {
+        return false;
+    }
+    let mut changed = false;
+    for member in peer.members {
+        changed |= merge_member_record(local, member);
+    }
+    if peer.kv_revision > local.kv_revision {
+        local.kv_revision = peer.kv_revision;
+    }
+    if peer.updated_at > local.updated_at {
+        local.updated_at = peer.updated_at;
+    }
+    changed
+}
+
+fn merge_member_record(local: &mut ClusterBootstrapState, incoming: ClusterMemberRecord) -> bool {
+    if incoming.cluster_id != local.cluster_id {
+        return false;
+    }
+    if let Some(existing) = local
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == incoming.node_id)
+    {
+        let mut changed = false;
+        if incoming.updated_at > existing.updated_at {
+            *existing = incoming;
+            return true;
+        }
+        for endpoint in incoming.endpoints {
+            changed |= upsert_member_endpoint(existing, endpoint);
+        }
+        changed
+    } else {
+        local.members.push(incoming);
+        true
+    }
+}
+
+fn upsert_member_endpoint(
+    member: &mut ClusterMemberRecord,
+    endpoint: ClusterEndpointRecord,
+) -> bool {
+    if let Some(existing) = member
+        .endpoints
+        .iter_mut()
+        .find(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+    {
+        if *existing == endpoint {
+            false
+        } else {
+            *existing = endpoint;
+            true
+        }
+    } else if member.endpoints.iter().any(|candidate| {
+        candidate.transport == endpoint.transport && candidate.address == endpoint.address
+    }) {
+        false
+    } else {
+        member.endpoints.push(endpoint);
+        true
+    }
+}
+
+fn merge_cluster_kv_snapshot(
+    paths: &ClusterPaths,
+    incoming: &KvSnapshot,
+) -> Result<KvSnapshot, CliError> {
+    let mut store = read_cluster_kv_store(paths)?;
+    for lease in &incoming.leases {
+        let _ = store.apply_command(sinomo_runtime::kv::KvCommand::Op(
+            sinomo_runtime::kv::KvOp::LeaseGrant {
+                lease_id: lease.lease_id,
+                ttl_ticks: lease.ttl_ticks.max(1),
+            },
+        ));
+    }
+    for entry in &incoming.entries {
+        let should_put = store
+            .get(&entry.key)
+            .map(|existing| {
+                entry.modify_revision > existing.modify_revision || entry.value != existing.value
+            })
+            .unwrap_or(true);
+        if should_put {
+            store.put(entry.key.clone(), entry.value.clone(), entry.lease_id)?;
+        }
+    }
+    let snapshot = store.snapshot();
+    write_cluster_kv_snapshot(paths, &snapshot)?;
+    Ok(snapshot)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DaemonClusterProcess {
     Main,
@@ -2164,7 +2531,7 @@ fn ensure_main_daemon_cluster_member(
         state,
         member,
         capabilities,
-        daemon_loopback_endpoint(&local_node_id, options, 0),
+        daemon_advertised_endpoints(&local_node_id, options, 0),
         timestamp,
     );
 }
@@ -2203,7 +2570,7 @@ fn ensure_shadow_daemon_cluster_member(
         state,
         member,
         shadow_daemon_capabilities(),
-        daemon_loopback_endpoint(&shadow_node_id, options, 10),
+        daemon_advertised_endpoints(&shadow_node_id, options, 10),
         timestamp,
     );
 }
@@ -2212,7 +2579,7 @@ fn upsert_daemon_member(
     state: &mut ClusterBootstrapState,
     replacement: ClusterMemberRecord,
     capabilities: Vec<CapabilityName>,
-    endpoint: ClusterEndpointRecord,
+    endpoints: Vec<ClusterEndpointRecord>,
     timestamp: OffsetDateTime,
 ) {
     if let Some(member) = state
@@ -2226,18 +2593,47 @@ fn upsert_daemon_member(
         member.node_public_key = replacement.node_public_key;
         member.capabilities = capabilities.clone();
         member.allowed_capabilities = capabilities;
-        member
-            .endpoints
-            .retain(|candidate| candidate.endpoint_id != endpoint.endpoint_id);
-        member.endpoints.push(endpoint);
+        for endpoint in endpoints {
+            member
+                .endpoints
+                .retain(|candidate| candidate.endpoint_id != endpoint.endpoint_id);
+            member.endpoints.push(endpoint);
+        }
         member.updated_at = timestamp;
     } else {
         let mut member = replacement;
         member.capabilities = capabilities.clone();
         member.allowed_capabilities = capabilities;
-        member.endpoints.push(endpoint);
+        member.endpoints = endpoints;
         state.members.push(member);
     }
+}
+
+fn daemon_advertised_endpoints(
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints = vec![daemon_loopback_endpoint(node_id, options, priority)];
+    let mut lan_addresses = Vec::new();
+    if matches!(options.host.as_str(), "0.0.0.0" | "::") {
+        for ip in discover_lan_ip_candidates() {
+            lan_addresses.push(format_ip_port(ip, options.port));
+        }
+    } else if options.host.parse::<IpAddr>().is_ok_and(is_invitable_ip)
+        || !is_loopback_connect_address(&daemon_connect_address(&options.host, options.port))
+    {
+        lan_addresses.push(format!("{}:{}", options.host, options.port));
+    }
+
+    for address in lan_addresses {
+        endpoints.push(daemon_lan_endpoint(
+            node_id,
+            address,
+            priority.saturating_add(20),
+        ));
+    }
+    endpoints
 }
 
 fn daemon_loopback_endpoint(
@@ -2257,10 +2653,43 @@ fn daemon_loopback_endpoint(
     }
 }
 
+fn daemon_lan_endpoint(node_id: &NodeId, address: String, priority: u16) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: daemon_lan_endpoint_id(node_id, &address),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address,
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority,
+        last_observed_latency_ms: None,
+    }
+}
+
 fn daemon_loopback_endpoint_id(node_id: &NodeId) -> ClusterEndpointId {
     let body = node_id.as_str().trim_start_matches(NodeId::PREFIX);
     ClusterEndpointId::new(format!("endpoint_{body}_daemon_loopback"))
         .expect("derived daemon endpoint id")
+}
+
+fn daemon_lan_endpoint_id(node_id: &NodeId, address: &str) -> ClusterEndpointId {
+    let node = node_id.as_str().trim_start_matches(NodeId::PREFIX);
+    let address = sanitize_endpoint_id_body(address);
+    ClusterEndpointId::new(format!("endpoint_{node}_daemon_lan_{address}"))
+        .expect("derived daemon lan endpoint id")
+}
+
+fn sanitize_endpoint_id_body(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn shadow_daemon_node_id(main_node_id: &NodeId) -> NodeId {
@@ -3024,16 +3453,39 @@ fn run_daemon_with_paths(
         address: bind_address.clone(),
         detail: source.to_string(),
     })?;
-    println!("sinomo {label} listening on {bind_address}");
-
-    for stream in listener.incoming() {
-        let mut stream = stream.map_err(|source| CliError::Network {
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CliError::Network {
             address: bind_address.clone(),
             detail: source.to_string(),
         })?;
-        if handle_daemon_connection(&mut stream, &paths)? {
-            break;
+    println!("sinomo {label} listening on {bind_address}");
+
+    let mut cluster_network = ClusterNetworkMaintenance::new();
+    let mut next_cluster_tick = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _address)) => {
+                if handle_daemon_connection(&mut stream, &paths)? {
+                    break;
+                }
+            }
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
+            Err(source) => {
+                return Err(CliError::Network {
+                    address: bind_address.clone(),
+                    detail: source.to_string(),
+                });
+            }
         }
+
+        if Instant::now() >= next_cluster_tick {
+            if let Err(error) = cluster_network.tick(&paths, &options) {
+                eprintln!("sinomo {label} cluster network tick failed: {error}");
+            }
+            next_cluster_tick = Instant::now() + DAEMON_CLUSTER_TICK_INTERVAL;
+        }
+        thread::sleep(Duration::from_millis(25));
     }
     Ok(())
 }
@@ -3649,6 +4101,25 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
             let body =
                 serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
                     path: "cluster kv range response".to_string(),
+                    detail: source.to_string(),
+                })?;
+            stream
+                .write_all(body.as_bytes())
+                .map_err(|source| CliError::Network {
+                    address: "daemon client".to_string(),
+                    detail: source.to_string(),
+                })?;
+            Ok(false)
+        }
+        command if command.starts_with("CLUSTER_SYNC ") => {
+            let payload = command
+                .strip_prefix("CLUSTER_SYNC ")
+                .unwrap_or_default()
+                .trim();
+            let response = handle_daemon_cluster_sync(paths, payload)?;
+            let body =
+                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                    path: "cluster sync response".to_string(),
                     detail: source.to_string(),
                 })?;
             stream
@@ -10382,34 +10853,34 @@ mod tests {
     use super::{
         CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
         ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths,
-        ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
-        DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
-        DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout,
-        InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
+        ClusterRolloutBuildRequest, ClusterSyncRequest, DaemonCliCommand, DaemonClusterStatus,
+        DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand,
+        DfsCommonOptions, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths,
+        InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
         InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
         ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand, ProviderName,
         RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
         UninstallOptions, authenticate_daemon_command, cli_command_requires_cluster_state,
         cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
         daemon_status_matches_options, decode_cluster_join_invite, encode_cluster_join_invite,
-        ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_txn,
-        handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
-        is_terminal_status, models_default_with_data_dir, normalize_model_provider,
-        parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-        parse_daemon_command, parse_dfs_command, parse_install_options,
-        parse_model_default_options, parse_models_list_options, parse_propose_options,
-        parse_provider_command, parse_rollout_command, parse_slash_command,
-        parse_uninstall_options, parse_usage_options, read_cluster_members_from_kv,
-        read_cluster_state, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
-        run_evolve_command, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
-        uninstall_with_layout,
+        ensure_daemon_cluster_members, ensure_rollout_layout, handle_daemon_cluster_join,
+        handle_daemon_cluster_kv_txn, handle_daemon_cluster_sync, handle_daemon_rollout_build,
+        install_should_update_binary, install_with_layout, is_terminal_status,
+        models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+        parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+        parse_dfs_command, parse_install_options, parse_model_default_options,
+        parse_models_list_options, parse_propose_options, parse_provider_command,
+        parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+        read_cluster_members_from_kv, read_cluster_state, run_cui_with_handler_io,
+        run_cui_with_handler_io_and_daemon, run_evolve_command, sign_daemon_command_from_data_dir,
+        stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout,
     };
     use sinomo_lm::{
         LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
     };
     use sinomo_runtime::core::{
-        ClusterBootstrap, ClusterId, ClusterMemberRole, ClusterMemberState, EvolutionJobId, NodeId,
-        SessionId, TrustRing,
+        ClusterBootstrap, ClusterId, ClusterInviteId, ClusterJoinInvite, ClusterMemberRole,
+        ClusterMemberState, EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
     };
     use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
     use sinomo_runtime::kv::{KvCompare, KvOp, KvTxn};
@@ -11161,6 +11632,117 @@ mod tests {
         let service = store.get("/services/test").expect("service entry");
         assert_eq!(service.value, br#"{"healthy":true}"#.to_vec());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn daemon_cluster_sync_merges_peer_members_and_kv_snapshot() {
+        let host_root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-sync-host-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let peer_root = std::env::temp_dir().join(format!(
+            "sinomo-cli-cluster-sync-peer-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let host_paths = ClusterPaths::new(&SinomoDataDir::new(&host_root));
+        let peer_paths = ClusterPaths::new(&SinomoDataDir::new(&peer_root));
+        let cluster_id = ClusterId::new("cluster_sync").expect("cluster");
+        cluster_init_with_paths(
+            ClusterInitOptions {
+                cluster_id: Some(cluster_id.clone()),
+                node_id: Some(NodeId::new("node_host").expect("node")),
+                name: "sync cluster".to_string(),
+            },
+            &host_paths,
+        )
+        .expect("cluster init");
+
+        let invite = ClusterJoinInvite {
+            invite_id: ClusterInviteId::new("invite_sync").expect("invite"),
+            cluster_id: cluster_id.clone(),
+            cluster_name: Some("sync cluster".to_string()),
+            introducers: Vec::new(),
+            token_id: "token_sync".to_string(),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            trust_domain: TrustDomain::new("trust.local").expect("trust"),
+            allowed_member_roles: vec![ClusterMemberRole::Learner],
+            signature: "test-signature".to_string(),
+        };
+        cluster_join_with_paths(
+            ClusterJoinOptions {
+                invite: encode_cluster_join_invite(&invite).expect("invite uri"),
+                cluster_id: None,
+                node_id: Some(NodeId::new("node_peer").expect("node")),
+                name: "peer".to_string(),
+            },
+            &peer_paths,
+        )
+        .expect("cluster join");
+
+        let mut peer_state = read_cluster_state(&peer_paths).expect("peer state");
+        for member in &mut peer_state.members {
+            member.state = match member.role {
+                ClusterMemberRole::Learner => ClusterMemberState::Learner,
+                ClusterMemberRole::NonVoting => ClusterMemberState::NonVoting,
+                ClusterMemberRole::Voter => ClusterMemberState::Voter,
+            };
+        }
+        ensure_daemon_cluster_members(
+            &mut peer_state,
+            &DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 22_353,
+            },
+            &DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 22_354,
+            },
+            time::OffsetDateTime::now_utc(),
+        );
+        let peer_snapshot = sync_cluster_state_to_kv(&peer_paths, &peer_state).expect("peer kv");
+        let request = ClusterSyncRequest {
+            state: peer_state,
+            kv_snapshot: peer_snapshot,
+        };
+        let response = handle_daemon_cluster_sync(
+            &DaemonPaths::with_root(host_root.join("daemon")),
+            &serde_json::to_string(&request).expect("sync request"),
+        )
+        .expect("host sync");
+
+        assert!(response.accepted);
+        let host_members = read_cluster_members_from_kv(&host_paths).expect("host kv members");
+        assert!(
+            host_members
+                .iter()
+                .any(|member| member.node_id == NodeId::new("node_peer").expect("node"))
+        );
+
+        let response_request = ClusterSyncRequest {
+            state: response.state,
+            kv_snapshot: response.kv_snapshot,
+        };
+        let peer_response = handle_daemon_cluster_sync(
+            &DaemonPaths::with_root(peer_root.join("daemon")),
+            &serde_json::to_string(&response_request).expect("sync response request"),
+        )
+        .expect("peer sync");
+
+        assert!(peer_response.accepted);
+        let peer_members = read_cluster_members_from_kv(&peer_paths).expect("peer kv members");
+        assert!(
+            peer_members
+                .iter()
+                .any(|member| member.node_id == NodeId::new("node_host").expect("node"))
+        );
+        std::fs::remove_dir_all(host_root).ok();
+        std::fs::remove_dir_all(peer_root).ok();
     }
 
     #[test]
