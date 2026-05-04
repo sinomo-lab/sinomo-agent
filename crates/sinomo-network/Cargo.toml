@@ -24,4 +24,5 @@ iroh = { version = "0.98.2", optional = true }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }
+sinomo-local = { path = "../sinomo-local" }
 sinomo-node = { path = "../sinomo-node" }

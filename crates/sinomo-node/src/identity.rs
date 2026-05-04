@@ -1,0 +1,133 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ring::rand::SystemRandom;
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use serde::{Deserialize, Serialize};
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeIdentityPaths {
+    pub main: PathBuf,
+    pub shadow: PathBuf,
+}
+
+impl NodeIdentityPaths {
+    pub fn new(data_dir: &Path) -> Self {
+        let root = data_dir.join("identity");
+        Self {
+            main: root.join("main-ed25519.json"),
+            shadow: root.join("shadow-ed25519.json"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeIdentity {
+    pub public_key: String,
+    private_key_pkcs8: String,
+    created_at: String,
+}
+
+impl NodeIdentity {
+    pub fn key_pair(&self) -> Result<Ed25519KeyPair, NodeIdentityError> {
+        let pkcs8 = URL_SAFE_NO_PAD
+            .decode(self.private_key_pkcs8.as_bytes())
+            .map_err(|source| NodeIdentityError::Parse {
+                detail: format!("invalid node identity private key encoding: {source}"),
+            })?;
+        Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|source| NodeIdentityError::Parse {
+            detail: format!("invalid node identity private key: {source}"),
+        })
+    }
+}
+
+pub fn load_or_create_main_node_identity(
+    data_dir: &Path,
+) -> Result<NodeIdentity, NodeIdentityError> {
+    load_or_create_node_identity(&NodeIdentityPaths::new(data_dir).main)
+}
+
+pub fn load_or_create_shadow_node_identity(
+    data_dir: &Path,
+) -> Result<NodeIdentity, NodeIdentityError> {
+    load_or_create_node_identity(&NodeIdentityPaths::new(data_dir).shadow)
+}
+
+pub fn load_or_create_node_identity(path: &Path) -> Result<NodeIdentity, NodeIdentityError> {
+    if path.exists() {
+        let content = fs::read_to_string(path).map_err(|source| NodeIdentityError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        return serde_json::from_str(&content).map_err(|source| NodeIdentityError::Json {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        });
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NodeIdentityError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let rng = SystemRandom::new();
+    let pkcs8 =
+        Ed25519KeyPair::generate_pkcs8(&rng).map_err(|source| NodeIdentityError::Parse {
+            detail: format!("failed to generate node identity key: {source}"),
+        })?;
+    let key_pair =
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|source| NodeIdentityError::Parse {
+            detail: format!("failed to load generated node identity key: {source}"),
+        })?;
+    let identity = NodeIdentity {
+        public_key: URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref()),
+        private_key_pkcs8: URL_SAFE_NO_PAD.encode(pkcs8.as_ref()),
+        created_at: OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string()),
+    };
+    write_json(path, &identity)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            NodeIdentityError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+    }
+    Ok(identity)
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), NodeIdentityError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NodeIdentityError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let content =
+        serde_json::to_string_pretty(value).map_err(|source| NodeIdentityError::Json {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    fs::write(path, content).map_err(|source| NodeIdentityError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+#[derive(Debug, Error, Clone, Eq, PartialEq)]
+pub enum NodeIdentityError {
+    #[error("node identity parse error: {detail}")]
+    Parse { detail: String },
+    #[error("node identity I/O error at {path}: {detail}")]
+    Io { path: String, detail: String },
+    #[error("node identity JSON error at {path}: {detail}")]
+    Json { path: String, detail: String },
+}

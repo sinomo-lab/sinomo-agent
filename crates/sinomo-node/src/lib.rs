@@ -1,5 +1,11 @@
 //! Node identity, capability, and health metadata.
 
+mod daemon;
+mod identity;
+
+pub use daemon::*;
+pub use identity::*;
+
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
     CapabilityName, ModelCapability, NodeCapability, NodeId, ScalarError, TrustDomain,
@@ -162,5 +168,54 @@ mod tests {
         profile.set_health(NodeHealth::degraded("high load"));
 
         assert_eq!(profile.health.availability, NodeAvailability::Degraded);
+    }
+
+    #[test]
+    fn node_identity_persists_main_and_shadow_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-node-identity-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let main = load_or_create_main_node_identity(&root).expect("main identity");
+        let shadow = load_or_create_shadow_node_identity(&root).expect("shadow identity");
+        let main_again = load_or_create_main_node_identity(&root).expect("main identity reload");
+
+        assert!(!main.public_key.trim().is_empty());
+        assert!(!shadow.public_key.trim().is_empty());
+        assert_eq!(main.public_key, main_again.public_key);
+        assert_ne!(main.public_key, shadow.public_key);
+        main.key_pair().expect("main key pair");
+        shadow.key_pair().expect("shadow key pair");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn daemon_node_helpers_are_stable() {
+        let main_node = NodeId::new("node_test_main").expect("node");
+        let shadow_node = shadow_daemon_node_id(&main_node);
+
+        assert_eq!(shadow_node.as_str(), "node_test_main-shadow");
+        assert!(
+            main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter)
+                .iter()
+                .any(|capability| capability.as_str() == "cluster.kv.vote")
+        );
+        assert!(
+            shadow_daemon_capabilities()
+                .iter()
+                .any(|capability| capability.as_str() == "daemon.shadow.supervise")
+        );
+        assert_eq!(
+            daemon_loopback_endpoint_id(&main_node).as_str(),
+            "endpoint_test_main_daemon_loopback"
+        );
+        assert_eq!(
+            daemon_lan_endpoint_id(&main_node, "192.168.1.5:21353").as_str(),
+            "endpoint_test_main_daemon_lan_192.168.1.5_21353"
+        );
     }
 }

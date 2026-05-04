@@ -3265,6 +3265,7 @@ dependencies = [
  "sinomo-core",
  "sinomo-events",
  "sinomo-kv",
+ "sinomo-local",
  "sinomo-node",
  "thiserror",
  "time",
@@ -3274,9 +3275,13 @@ dependencies = [
 name = "sinomo-node"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "ring",
  "serde",
  "serde_json",
  "sinomo-core",
+ "thiserror",
+ "time",
 ]
 
 [[package]]
