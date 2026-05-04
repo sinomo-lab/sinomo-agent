@@ -1,5 +1,21 @@
 //! Local-first distributed filesystem metadata skeleton.
 
+pub mod content_store;
+pub mod distributed;
+pub mod kv_metadata;
+
+pub use content_store::{ContentManifest, ContentStoreError, LocalContentStore};
+pub use distributed::{
+    DfsDistributedError, DfsReplicaReceiptState, DfsReplicationPolicy, DfsWriteIntentState,
+    DistributedEventualCoordinator, DistributedRepairJob, DistributedReplicaReceipt,
+    DistributedWriteIntent,
+};
+pub use kv_metadata::{
+    DfsConflictRecord, DfsConflictStatus, DfsReplicaReceiptRecord, DfsReplicationJobRecord,
+    DfsReplicationJobStatus, DfsVersionRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    KvDfsMetadataStore,
+};
+
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
     Confidence, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteReceipt, DfsWriteRequest,
@@ -240,6 +256,15 @@ impl DfsMetadataStore {
         let action = match &object.policy {
             DfsObjectPolicy::LocalOwned => {
                 if &object.owner_node_id == requester_node_id {
+                    ReadRouteAction::ReadLocally
+                } else {
+                    ReadRouteAction::RouteToOwner {
+                        owner_node_id: object.owner_node_id.clone(),
+                    }
+                }
+            }
+            DfsObjectPolicy::ReplicatedConfirmed | DfsObjectPolicy::ReplicatedEventual => {
+                if object.current_locations.contains(requester_node_id) {
                     ReadRouteAction::ReadLocally
                 } else {
                     ReadRouteAction::RouteToOwner {
@@ -742,12 +767,7 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
 }
 
 fn content_hash(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("fnv1a64:{hash:016x}")
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]

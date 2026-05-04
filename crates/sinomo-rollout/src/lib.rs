@@ -346,8 +346,14 @@ mod tests {
         assert_eq!(paths.root, root.join("rollout"));
         assert_eq!(paths.source_repo, root.join("source").join("sinomo"));
         assert_eq!(paths.bin, root.join("bin"));
-        assert_eq!(paths.main_binary, root.join("bin").join("sinomo-main"));
-        assert_eq!(paths.shadow_binary, root.join("bin").join("sinomo-shadow"));
+        assert_eq!(
+            paths.main_binary,
+            root.join("bin").join(executable_name("sinomo-main"))
+        );
+        assert_eq!(
+            paths.shadow_binary,
+            root.join("bin").join(executable_name("sinomo-shadow"))
+        );
         assert_eq!(paths.state, root.join("rollout").join("state.json"));
         assert_eq!(paths.build_log, root.join("rollout").join("build.log"));
     }
@@ -365,7 +371,10 @@ mod tests {
         assert_eq!(plan.build_dir, paths.source_repo);
         assert_eq!(
             plan.built_binary,
-            plan.build_dir.join("target").join("debug").join("sinomo")
+            plan.build_dir
+                .join("target")
+                .join("debug")
+                .join(executable_name("sinomo"))
         );
         assert_eq!(plan.install_main_binary, paths.main_binary);
         assert_eq!(plan.install_shadow_binary, paths.shadow_binary);

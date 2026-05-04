@@ -5110,7 +5110,7 @@ mod tests {
             Some(vec!["patched.txt".to_string()])
         );
         let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
-        assert_eq!(patched, "new\n");
+        assert_eq!(patched.replace("\r\n", "\n"), "new\n");
         let _ = fs::remove_dir_all(root);
     }
 

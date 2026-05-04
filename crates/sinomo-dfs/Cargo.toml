@@ -12,11 +12,13 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-core = { path = "../sinomo-core" }
+sinomo-kv = { path = "../sinomo-kv" }
 sinomo-network = { path = "../sinomo-network" }
 
 [dev-dependencies]
