@@ -132,6 +132,10 @@ pub(super) fn print_rollout_help() {
     println!(
         "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then restart each node through its shadow daemon."
     );
+    println!("  sinomo rollout diagnostics [--target <host:port>]");
+    println!(
+        "      Fetch rollout state, build logs, and candidate stdout/stderr tails from a daemon."
+    );
     println!("  sinomo rollout status");
     println!("      Show source, binary, and rollout state paths.");
 }

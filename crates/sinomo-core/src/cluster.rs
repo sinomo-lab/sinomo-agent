@@ -213,6 +213,16 @@ pub struct ClusterNodeRolloutStatus {
     pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
 }
 
 impl ClusterMemberRecord {

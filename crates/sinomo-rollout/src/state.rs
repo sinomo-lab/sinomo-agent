@@ -42,6 +42,19 @@ pub struct PendingShadowRollout {
     pub mode: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RolloutFailureDiagnostics {
+    pub diagnostics_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_log: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_log: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+}
+
 pub trait PendingShadowRolloutContext {
     fn activation(&self) -> &RolloutMainActivation;
     fn main_binary(&self) -> &Path;
@@ -187,21 +200,52 @@ pub fn record_main_rollout_failure(
     previous_shadow_binary: &Path,
     detail: &str,
 ) -> Result<(), RolloutError> {
-    write_json(
-        &rollout_paths.state,
-        &serde_json::json!({
-            "source": activation.source,
-            "main_binary": activation.main_binary,
-            "shadow_binary": activation.shadow_binary,
-            "previous_main_binary": previous_main_binary,
-            "previous_shadow_binary": previous_shadow_binary,
-            "status": "failed",
-            "detail": detail,
-            "requested_at": activation.requested_at,
-            "failed_at": format_now(),
-            "mode": activation.mode
-        }),
+    record_main_rollout_failure_with_diagnostics(
+        rollout_paths,
+        activation,
+        previous_main_binary,
+        previous_shadow_binary,
+        detail,
+        None,
     )
+}
+
+pub fn record_main_rollout_failure_with_diagnostics(
+    rollout_paths: &SelfRolloutPaths,
+    activation: &RolloutMainActivation,
+    previous_main_binary: &Path,
+    previous_shadow_binary: &Path,
+    detail: &str,
+    diagnostics: Option<&RolloutFailureDiagnostics>,
+) -> Result<(), RolloutError> {
+    let mut value = serde_json::json!({
+        "source": activation.source,
+        "main_binary": activation.main_binary,
+        "shadow_binary": activation.shadow_binary,
+        "previous_main_binary": previous_main_binary,
+        "previous_shadow_binary": previous_shadow_binary,
+        "status": "failed",
+        "detail": detail,
+        "requested_at": activation.requested_at,
+        "failed_at": format_now(),
+        "mode": activation.mode
+    });
+    if let Some(diagnostics) = diagnostics {
+        value["diagnostics"] = serde_json::json!(diagnostics.diagnostics_path);
+        if let Some(stdout_log) = &diagnostics.stdout_log {
+            value["stdout_log"] = serde_json::json!(stdout_log);
+        }
+        if let Some(stderr_log) = &diagnostics.stderr_log {
+            value["stderr_log"] = serde_json::json!(stderr_log);
+        }
+        if let Some(stdout_tail) = &diagnostics.stdout_tail {
+            value["stdout_tail"] = serde_json::json!(stdout_tail);
+        }
+        if let Some(stderr_tail) = &diagnostics.stderr_tail {
+            value["stderr_tail"] = serde_json::json!(stderr_tail);
+        }
+    }
+    write_json(&rollout_paths.state, &value)
 }
 
 pub fn record_shadow_rollout_finalized(

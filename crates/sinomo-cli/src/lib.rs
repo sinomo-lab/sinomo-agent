@@ -35,10 +35,11 @@ use sinomo_lm::{
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
     MainExitKind, MainExitObservation, PendingShadowRolloutContext, RolloutError,
-    RolloutMainActivation, SelfRolloutPaths, activate_staged_rollout_binary, classify_main_exit,
-    deploy_managed_source_repo, discover_current_git_repo, ensure_rollout_layout,
-    managed_source_status, read_pending_shadow_rollout, read_rollout_main_activation,
-    record_activation_failure, record_main_activation_staged, record_main_rollout_failure,
+    RolloutFailureDiagnostics, RolloutMainActivation, SelfRolloutPaths,
+    activate_staged_rollout_binary, classify_main_exit, deploy_managed_source_repo,
+    discover_current_git_repo, ensure_rollout_layout, managed_source_status,
+    read_pending_shadow_rollout, read_rollout_main_activation, record_activation_failure,
+    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
     record_shadow_rollout_finalized, remove_shadow_finalize, restore_rollout_binary_from_backup,
     rollout_main_activation_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
     stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
@@ -213,7 +214,7 @@ fn is_help_args(args: &[String]) -> bool {
 const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
 const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
-const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const SHADOW_MAIN_HOST_ENV: &str = "SINOMO_SHADOW_MAIN_HOST";
 const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
 const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
@@ -225,10 +226,12 @@ const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
 const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
 const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
+const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const DAEMON_CLUSTER_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 15;
+const ROLLOUT_DIAGNOSTIC_TAIL_BYTES: usize = 8 * 1024;
 const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
@@ -1991,6 +1994,7 @@ fn probe_member_daemon_status(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Option<ClusterNodeStatusRecord> {
+    let is_local_process = cluster_member_is_local_process(state, member);
     let mut endpoints = member.endpoints.clone();
     endpoints.sort_by_key(|endpoint| {
         (
@@ -2000,9 +2004,7 @@ fn probe_member_daemon_status(
         )
     });
     for endpoint in endpoints {
-        if member.node_id != state.local_node_id
-            && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
-        {
+        if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
             continue;
         }
         if !matches!(
@@ -2011,7 +2013,8 @@ fn probe_member_daemon_status(
         ) {
             continue;
         }
-        let Ok(response) = send_daemon_command(&endpoint.address, "STATUS", DAEMON_PROBE_TIMEOUT)
+        let Ok(response) =
+            send_daemon_command(&endpoint.address, "STATUS", CLUSTER_HEALTH_PROBE_TIMEOUT)
         else {
             continue;
         };
@@ -2035,14 +2038,22 @@ fn probe_member_daemon_status(
 }
 
 fn live_probe_possible(state: &ClusterBootstrapState, member: &ClusterMemberRecord) -> bool {
+    let is_local_process = cluster_member_is_local_process(state, member);
     member.endpoints.iter().any(|endpoint| {
-        (member.node_id == state.local_node_id
-            || !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
+        (is_local_process || !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
             && matches!(
                 endpoint.transport,
                 ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
             )
     })
+}
+
+fn cluster_member_is_local_process(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> bool {
+    member.node_id == state.local_node_id
+        || member.node_id == shadow_daemon_node_id(&state.local_node_id)
 }
 
 fn unknown_cluster_node_status(
@@ -2931,6 +2942,11 @@ fn read_cluster_rollout_status(
         staged_at: json_string_field(&value, "staged_at"),
         updated_at: json_string_field(&value, "updated_at"),
         failed_at: json_string_field(&value, "failed_at"),
+        diagnostics: json_string_field(&value, "diagnostics"),
+        stdout_log: json_string_field(&value, "stdout_log"),
+        stderr_log: json_string_field(&value, "stderr_log"),
+        stdout_tail: json_string_field(&value, "stdout_tail"),
+        stderr_tail: json_string_field(&value, "stderr_tail"),
     }))
 }
 
@@ -3423,16 +3439,20 @@ fn run_shadow_daemon_with_paths(
                 pending_rollout = None;
                 main_options = promoted_main_options;
             } else if Instant::now() >= pending.deadline {
+                let detail = "candidate main did not become healthy before rollout timeout";
                 if let Some(child) = supervised_main.as_mut() {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
-                record_main_rollout_failure(
+                let diagnostics =
+                    write_rollout_main_failure_diagnostics(&rollout_paths, pending, detail, None)?;
+                record_main_rollout_failure_with_diagnostics(
                     &rollout_paths,
                     &pending.activation,
                     &pending.previous_main_binary,
                     &pending.previous_shadow_binary,
-                    "candidate main did not become healthy before rollout timeout",
+                    detail,
+                    Some(&diagnostics),
                 )?;
                 main_binary = pending.previous_main_binary.clone();
                 if let Some(backup) = pending.previous_main_backup.as_ref() {
@@ -3467,8 +3487,12 @@ fn run_shadow_daemon_with_paths(
                     .map(|staged| activate_staged_rollout_binary(staged, &activation.main_binary))
                     .transpose()?
                     .flatten();
-                match spawn_main_for_shadow(&activation.main_binary, &activation_main_options) {
-                    Ok(child) => {
+                match spawn_candidate_main_for_shadow(
+                    &activation.main_binary,
+                    &activation_main_options,
+                    &rollout_paths,
+                ) {
+                    Ok((child, diagnostics)) => {
                         main_binary = activation.main_binary.clone();
                         supervised_main = Some(child);
                         pending_rollout = Some(ShadowMainRolloutMonitor {
@@ -3477,6 +3501,7 @@ fn run_shadow_daemon_with_paths(
                             previous_main_binary,
                             previous_main_backup,
                             previous_shadow_binary: env::current_exe().unwrap_or_default(),
+                            diagnostics,
                             deadline: Instant::now() + Duration::from_secs(10),
                         });
                     }
@@ -3508,15 +3533,23 @@ fn run_shadow_daemon_with_paths(
             })? {
                 if let Some(pending) = pending_rollout.take() {
                     let observation = main_exit_observation_from_status(status);
-                    record_main_rollout_failure(
+                    let detail = format!(
+                        "candidate main exited before health check: exit_code={:?} signal={:?}",
+                        observation.exit_code, observation.signal
+                    );
+                    let diagnostics = write_rollout_main_failure_diagnostics(
+                        &rollout_paths,
+                        &pending,
+                        &detail,
+                        Some(observation),
+                    )?;
+                    record_main_rollout_failure_with_diagnostics(
                         &rollout_paths,
                         &pending.activation,
                         &pending.previous_main_binary,
                         &pending.previous_shadow_binary,
-                        &format!(
-                            "candidate main exited before health check: exit_code={:?} signal={:?}",
-                            observation.exit_code, observation.signal
-                        ),
+                        &detail,
+                        Some(&diagnostics),
                     )?;
                     main_binary = pending.previous_main_binary;
                     if let Some(backup) = pending.previous_main_backup {
@@ -3556,12 +3589,7 @@ fn run_shadow_daemon_with_paths(
         }
 
         if Instant::now() >= next_status_tick {
-            if !matches!(
-                probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT),
-                DaemonProbeStatus::Running(_)
-            ) {
-                let _ = refresh_daemon_node_status_in_kv(&shadow_paths);
-            }
+            let _ = refresh_daemon_node_status_in_kv(&shadow_paths);
             next_status_tick = Instant::now() + DAEMON_CLUSTER_SYNC_INTERVAL;
         }
 
@@ -3588,6 +3616,60 @@ fn spawn_main_for_shadow(binary: &Path, options: &DaemonRunOptions) -> Result<Ch
         })
 }
 
+fn spawn_candidate_main_for_shadow(
+    binary: &Path,
+    options: &DaemonRunOptions,
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<(Child, CandidateMainDiagnostics), CliError> {
+    let logs_dir = rollout_paths.root.join("logs");
+    fs::create_dir_all(&logs_dir).map_err(|source| CliError::Io {
+        path: logs_dir.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let suffix = rollout_artifact_suffix();
+    let stdout_log = logs_dir.join(format!("candidate-main-{suffix}.stdout.log"));
+    let stderr_log = logs_dir.join(format!("candidate-main-{suffix}.stderr.log"));
+    let diagnostics_path = logs_dir.join(format!("candidate-main-{suffix}.diagnostics.json"));
+    let stdout = File::create(&stdout_log).map_err(|source| CliError::Io {
+        path: stdout_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let stderr = File::create(&stderr_log).map_err(|source| CliError::Io {
+        path: stderr_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let child = Command::new(binary)
+        .arg("daemon")
+        .arg("run")
+        .arg("--host")
+        .arg(&options.host)
+        .arg("--port")
+        .arg(options.port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|source| CliError::Io {
+            path: binary.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok((
+        child,
+        CandidateMainDiagnostics {
+            stdout_log,
+            stderr_log,
+            diagnostics_path,
+        },
+    ))
+}
+
+#[derive(Clone, Debug)]
+struct CandidateMainDiagnostics {
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+    diagnostics_path: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 struct ShadowMainRolloutMonitor {
     activation: RolloutMainActivation,
@@ -3595,6 +3677,7 @@ struct ShadowMainRolloutMonitor {
     previous_main_binary: PathBuf,
     previous_main_backup: Option<PathBuf>,
     previous_shadow_binary: PathBuf,
+    diagnostics: CandidateMainDiagnostics,
     deadline: Instant,
 }
 
@@ -3628,6 +3711,64 @@ fn main_exit_observation_from_status(status: ExitStatus) -> MainExitObservation 
         }
     }
     MainExitObservation::exit_code(status.code().unwrap_or(1))
+}
+
+fn write_rollout_main_failure_diagnostics(
+    rollout_paths: &SelfRolloutPaths,
+    pending: &ShadowMainRolloutMonitor,
+    detail: &str,
+    observation: Option<MainExitObservation>,
+) -> Result<RolloutFailureDiagnostics, CliError> {
+    let stdout_tail = read_tail_lossy(
+        &pending.diagnostics.stdout_log,
+        ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
+    )?;
+    let stderr_tail = read_tail_lossy(
+        &pending.diagnostics.stderr_log,
+        ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
+    )?;
+    let diagnostics = RolloutFailureDiagnostics {
+        diagnostics_path: pending.diagnostics.diagnostics_path.clone(),
+        stdout_log: Some(pending.diagnostics.stdout_log.clone()),
+        stderr_log: Some(pending.diagnostics.stderr_log.clone()),
+        stdout_tail: stdout_tail.clone().filter(|tail| !tail.trim().is_empty()),
+        stderr_tail: stderr_tail.clone().filter(|tail| !tail.trim().is_empty()),
+    };
+    write_json(
+        &pending.diagnostics.diagnostics_path,
+        &serde_json::json!({
+            "status": "failed",
+            "detail": detail,
+            "source": pending.activation.source,
+            "mode": pending.activation.mode,
+            "main_binary": pending.activation.main_binary,
+            "previous_main_binary": pending.previous_main_binary,
+            "stdout_log": pending.diagnostics.stdout_log,
+            "stderr_log": pending.diagnostics.stderr_log,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "exit_code": observation.and_then(|observation| observation.exit_code),
+            "signal": observation.and_then(|observation| observation.signal),
+            "requested_shutdown": observation.map(|observation| observation.requested_shutdown),
+            "observed_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string()),
+            "rollout_state": rollout_paths.state
+        }),
+    )?;
+    Ok(diagnostics)
+}
+
+fn read_tail_lossy(path: &Path, max_bytes: usize) -> Result<Option<String>, CliError> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let start = bytes.len().saturating_sub(max_bytes);
+            Ok(Some(String::from_utf8_lossy(&bytes[start..]).to_string()))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
 }
 
 fn shadow_main_options_from_env() -> Result<DaemonRunOptions, CliError> {
@@ -4290,6 +4431,16 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
                 })?;
             Ok(false)
         }
+        "ROLLOUT_DIAGNOSTICS" => {
+            let response = handle_daemon_rollout_diagnostics(paths)?;
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|source| CliError::Network {
+                    address: "daemon client".to_string(),
+                    detail: source.to_string(),
+                })?;
+            Ok(false)
+        }
         command if command.starts_with("CLUSTER_JOIN ") => {
             let payload = command
                 .strip_prefix("CLUSTER_JOIN ")
@@ -4386,7 +4537,15 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
                 .strip_prefix("ROLLOUT_BINARY ")
                 .unwrap_or_default()
                 .trim();
-            let response = handle_daemon_rollout_binary(paths, payload)?;
+            let response = match handle_daemon_rollout_binary(paths, payload) {
+                Ok(response) => response,
+                Err(error) => ClusterRolloutBinaryResponse {
+                    status: "failed".to_string(),
+                    detail: error.to_string(),
+                    main_binary: PathBuf::new(),
+                    shadow_binary: PathBuf::new(),
+                },
+            };
             let body =
                 serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
                     path: "rollout response".to_string(),
@@ -4398,14 +4557,27 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
                     address: "daemon client".to_string(),
                     detail: source.to_string(),
                 })?;
-            Ok(true)
+            stream.flush().map_err(|source| CliError::Network {
+                address: "daemon client".to_string(),
+                detail: source.to_string(),
+            })?;
+            let _ = stream.shutdown(Shutdown::Write);
+            Ok(response.status == "accepted")
         }
         command if command.starts_with("ROLLOUT_BUILD ") => {
             let payload = command
                 .strip_prefix("ROLLOUT_BUILD ")
                 .unwrap_or_default()
                 .trim();
-            let response = handle_daemon_rollout_build(paths, payload)?;
+            let response = match handle_daemon_rollout_build(paths, payload) {
+                Ok(response) => response,
+                Err(error) => ClusterRolloutBinaryResponse {
+                    status: "failed".to_string(),
+                    detail: error.to_string(),
+                    main_binary: PathBuf::new(),
+                    shadow_binary: PathBuf::new(),
+                },
+            };
             let body =
                 serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
                     path: "rollout response".to_string(),
@@ -4417,6 +4589,11 @@ fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Resu
                     address: "daemon client".to_string(),
                     detail: source.to_string(),
                 })?;
+            stream.flush().map_err(|source| CliError::Network {
+                address: "daemon client".to_string(),
+                detail: source.to_string(),
+            })?;
+            let _ = stream.shutdown(Shutdown::Write);
             Ok(response.status == "accepted")
         }
         _ => {
@@ -4675,7 +4852,7 @@ fn stage_rollout_main_activation(
 ) -> Result<(), CliError> {
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     if !matches!(
-        probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
+        probe_daemon_status(&shadow_paths, CLUSTER_HEALTH_PROBE_TIMEOUT),
         DaemonProbeStatus::Running(_)
     ) {
         return Err(CliError::DaemonNotRunning {
@@ -4684,6 +4861,84 @@ fn stage_rollout_main_activation(
     }
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
+    Ok(())
+}
+
+fn handle_daemon_rollout_diagnostics(paths: &DaemonPaths) -> Result<String, CliError> {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    let mut output = String::new();
+    output.push_str(&format!("rollout root: {}\n", rollout_paths.root.display()));
+    append_rollout_diagnostic_file(&mut output, "state", &rollout_paths.state)?;
+    append_rollout_diagnostic_file(&mut output, "build log", &rollout_paths.build_log)?;
+    append_rollout_diagnostic_file(
+        &mut output,
+        "pending main",
+        &rollout_main_activation_path(&rollout_paths),
+    )?;
+    append_rollout_diagnostic_file(
+        &mut output,
+        "pending shadow",
+        &sinomo_rollout::rollout_shadow_finalize_path(&rollout_paths),
+    )?;
+    append_rollout_diagnostic_file(
+        &mut output,
+        "last main exit",
+        &rollout_paths.root.join("last-main-exit.json"),
+    )?;
+
+    if let Ok(Some(status)) = read_cluster_rollout_status(&rollout_paths) {
+        if let Some(path) = status.diagnostics.as_deref() {
+            append_rollout_diagnostic_file(&mut output, "failure diagnostics", Path::new(path))?;
+        }
+        if let Some(path) = status.stdout_log.as_deref() {
+            append_rollout_diagnostic_file(&mut output, "candidate stdout", Path::new(path))?;
+        }
+        if let Some(path) = status.stderr_log.as_deref() {
+            append_rollout_diagnostic_file(&mut output, "candidate stderr", Path::new(path))?;
+        }
+    }
+
+    let logs_dir = rollout_paths.root.join("logs");
+    if logs_dir.exists() {
+        output.push_str("\n[rollout logs]\n");
+        let mut entries = fs::read_dir(&logs_dir)
+            .map_err(|source| CliError::Io {
+                path: logs_dir.display().to_string(),
+                detail: source.to_string(),
+            })?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = entry.metadata().ok()?;
+                Some((entry.path(), metadata.modified().ok(), metadata.len()))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, modified, _)| *modified);
+        for (path, _, len) in entries.into_iter().rev().take(8) {
+            output.push_str(&format!("{} ({} bytes)\n", path.display(), len));
+        }
+    }
+
+    Ok(output)
+}
+
+fn append_rollout_diagnostic_file(
+    output: &mut String,
+    label: &str,
+    path: &Path,
+) -> Result<(), CliError> {
+    output.push_str(&format!("\n[{label}] {}\n", path.display()));
+    match read_tail_lossy(path, ROLLOUT_DIAGNOSTIC_TAIL_BYTES)? {
+        Some(content) if !content.is_empty() => output.push_str(&content),
+        Some(_) => output.push_str("<empty>\n"),
+        None => output.push_str("<missing>\n"),
+    }
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
     Ok(())
 }
 
@@ -4938,6 +5193,7 @@ enum RolloutCliCommand {
     ApplyExternal(RolloutOptions),
     Apply(RolloutOptions),
     Cluster(RolloutOptions),
+    Diagnostics(RolloutOptions),
     Status,
 }
 
@@ -5003,6 +5259,9 @@ fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand, CliError>
         }
         Some((command, rest)) if matches!(command.as_str(), "cluster" | "apply-cluster") => {
             Ok(RolloutCliCommand::Cluster(parse_rollout_options(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "diagnostics" | "diag") => {
+            Ok(RolloutCliCommand::Diagnostics(parse_rollout_options(rest)?))
         }
         Some((command, [])) if command == "status" => Ok(RolloutCliCommand::Status),
         _ => Err(CliError::Usage),
@@ -5088,6 +5347,7 @@ fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), CliError> {
         RolloutCliCommand::ApplyExternal(options) => rollout_apply_external(options),
         RolloutCliCommand::Apply(options) => rollout_apply(options),
         RolloutCliCommand::Cluster(options) => rollout_cluster(options),
+        RolloutCliCommand::Diagnostics(options) => rollout_diagnostics(options),
         RolloutCliCommand::Status => rollout_status(),
     }
 }
@@ -5151,6 +5411,26 @@ fn rollout_status() -> Result<(), CliError> {
     println!("main binary exists: {}", paths.main_binary.exists());
     println!("shadow binary exists: {}", paths.shadow_binary.exists());
     print_managed_source_status(&paths)?;
+    Ok(())
+}
+
+fn rollout_diagnostics(options: RolloutOptions) -> Result<(), CliError> {
+    let targets = if options.targets.is_empty() {
+        vec![
+            default_main_daemon_status()?
+                .map(|status| status.address)
+                .unwrap_or_else(|| daemon_connect_address(&options.host, options.port)),
+        ]
+    } else {
+        unique_rollout_targets(options.targets)
+    };
+    for target in targets {
+        println!("== {target} ==");
+        match send_daemon_command(&target, "ROLLOUT_DIAGNOSTICS", CLUSTER_HEALTH_PROBE_TIMEOUT) {
+            Ok(response) => print!("{response}"),
+            Err(error) => println!("failed: {error}"),
+        }
+    }
     Ok(())
 }
 
@@ -5385,6 +5665,10 @@ fn rollout_remote_repo_path(paths: &SelfRolloutPaths, repo: Option<&Path>) -> Pa
 }
 
 fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<String>, CliError> {
+    if !options.targets.is_empty() {
+        return Ok(unique_rollout_targets(options.targets.clone()));
+    }
+
     let mut targets = Vec::new();
     if !options.skip_local {
         if let Some(status) = default_main_daemon_status()? {
@@ -5398,7 +5682,7 @@ fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<String>, CliE
     if let Ok(state) = require_cluster_bootstrap_state() {
         for member in state.members {
             let is_local_member = member.node_id == state.local_node_id;
-            if options.skip_local && is_local_member {
+            if is_local_member {
                 continue;
             }
             let is_main_daemon = member
@@ -5418,13 +5702,17 @@ fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<String>, CliE
         }
     }
 
+    Ok(unique_rollout_targets(targets))
+}
+
+fn unique_rollout_targets(targets: Vec<String>) -> Vec<String> {
     let mut unique = Vec::new();
     for target in targets {
         if !unique.contains(&target) {
             unique.push(target);
         }
     }
-    Ok(unique)
+    unique
 }
 
 fn read_rollout_target_status(address: &str) -> Result<DaemonStatus, CliError> {

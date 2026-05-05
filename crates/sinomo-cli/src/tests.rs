@@ -1267,6 +1267,18 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
             ..RolloutOptions::default()
         })
     );
+    assert_eq!(
+        parse_rollout_command(&[
+            "diagnostics".to_string(),
+            "--target".to_string(),
+            "10.14.1.11:21353".to_string(),
+        ])
+        .expect("diagnostics"),
+        RolloutCliCommand::Diagnostics(RolloutOptions {
+            targets: vec!["10.14.1.11:21353".to_string()],
+            ..RolloutOptions::default()
+        })
+    );
 }
 
 #[test]
