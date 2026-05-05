@@ -1,20 +1,20 @@
 use super::{
     CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
     ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRolloutBuildRequest,
-    ClusterSyncRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus,
-    DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsFilterOptions,
-    DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions,
-    InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand,
-    ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    SelfRolloutPaths, UninstallOptions, authenticate_daemon_command,
+    DaemonCliCommand, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
+    DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsFilterOptions, DfsPinCliCommand,
+    EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions, InteractionModel,
+    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
+    ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
+    UninstallOptions, authenticate_daemon_command, build_cluster_raft_append_request,
     cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
     cluster_join_with_paths, cluster_peer_members, cluster_sync_targets, daemon_package_version,
     daemon_status_matches_options, decode_cluster_join_invite, encode_cluster_join_invite,
-    ensure_daemon_cluster_members, ensure_rollout_layout, handle_daemon_cluster_join,
-    handle_daemon_cluster_kv_txn, handle_daemon_cluster_sync, handle_daemon_connection,
-    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
-    is_terminal_status, models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+    ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_txn,
+    handle_daemon_cluster_raft_append, handle_daemon_connection, handle_daemon_rollout_build,
+    install_should_update_binary, install_with_layout, is_terminal_status,
+    models_default_with_data_dir, normalize_model_provider, parse_cli_command,
     parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
     parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_models_list_options, parse_propose_options, parse_provider_command,
@@ -1217,7 +1217,7 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
 }
 
 #[test]
-fn daemon_cluster_sync_merges_peer_members_and_kv_snapshot() {
+fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let host_root = std::env::temp_dir().join(format!(
         "sinomo-cli-cluster-sync-host-{}",
         SystemTime::now()
@@ -1275,54 +1275,14 @@ fn daemon_cluster_sync_merges_peer_members_and_kv_snapshot() {
     )
     .expect("cluster join");
 
-    let mut peer_state = read_cluster_state(&peer_paths).expect("peer state");
-    for member in &mut peer_state.members {
-        member.state = match member.role {
-            ClusterMemberRole::Learner => ClusterMemberState::Learner,
-            ClusterMemberRole::NonVoting => ClusterMemberState::NonVoting,
-            ClusterMemberRole::Voter => ClusterMemberState::Voter,
-        };
-    }
-    ensure_daemon_cluster_members(
-        &mut peer_state,
-        &DaemonRunOptions {
-            host: "127.0.0.1".to_string(),
-            port: 22_353,
-        },
-        &DaemonRunOptions {
-            host: "127.0.0.1".to_string(),
-            port: 22_354,
-        },
-        time::OffsetDateTime::now_utc(),
-    );
-    let peer_snapshot = sync_cluster_state_to_kv(&peer_paths, &peer_state).expect("peer kv");
-    let request = ClusterSyncRequest {
-        state: peer_state,
-        kv_snapshot: peer_snapshot,
-    };
-    let response = handle_daemon_cluster_sync(
-        &DaemonPaths::with_root(host_root.join("daemon")),
-        &serde_json::to_string(&request).expect("sync request"),
-    )
-    .expect("host sync");
-
-    assert!(response.accepted);
-    let host_members = read_cluster_members_from_kv(&host_paths).expect("host kv members");
-    assert!(
-        host_members
-            .iter()
-            .any(|member| member.node_id == NodeId::new("node_peer").expect("node"))
-    );
-
-    let response_request = ClusterSyncRequest {
-        state: response.state,
-        kv_snapshot: response.kv_snapshot,
-    };
-    let peer_response = handle_daemon_cluster_sync(
+    let host_state = read_cluster_state(&host_paths).expect("host state");
+    sync_cluster_state_to_kv(&host_paths, &host_state).expect("host kv");
+    let request = build_cluster_raft_append_request(&host_paths, &host_state).expect("raft append");
+    let peer_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
-        &serde_json::to_string(&response_request).expect("sync response request"),
+        &serde_json::to_string(&request).expect("raft append request"),
     )
-    .expect("peer sync");
+    .expect("peer append");
 
     assert!(peer_response.accepted);
     let peer_members = read_cluster_members_from_kv(&peer_paths).expect("peer kv members");

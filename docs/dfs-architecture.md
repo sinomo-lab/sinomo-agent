@@ -42,9 +42,9 @@ The current repository already has the first useful slice:
 - `sinomo-dfs` defines the default `sifs` filesystem, subtree policies, object
   metadata, read/write routing, network messages, policy violation events, and
   a local-owned service.
-- `sinomo-kv` provides the in-process etcd-like control-plane surface:
-  revisions, transactions, leases, watches, snapshots, and a Raft-style test
-  harness.
+- `sinomo-kv` provides the etcd-like control-plane core: revisions,
+  compare-and-swap transactions, leases, watches, snapshots, durable WAL
+  replay, hard-state persistence, and deterministic Raft replication tests.
 - `sinomo-network` has local/in-process transport, peer registry, health,
   endpoint candidates, LAN/roaming metadata, and protocol-message framing.
 - `sinomo-local` reserves `$SINOMO_DATA_DIR/dfs`.
@@ -117,10 +117,10 @@ that are replicated only to the nodes responsible for those shards.
 
 ### Control Plane
 
-DFS uses the existing `sinomo-kv` Raft-style control plane for small, duplicated
+DFS uses the existing `sinomo-kv` Raft control-plane core for small, duplicated
 configuration only. The DFS service talks to it through a small control-plane KV
 client interface so production can bind the same code to the networked KV
-service and tests can use the deterministic Raft harness.
+service and tests can use the deterministic durable Raft harness.
 
 Properties:
 

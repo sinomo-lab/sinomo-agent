@@ -8,7 +8,11 @@ use sinomo_core::{
     RoutingScope, SessionId,
 };
 use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
-use sinomo_kv::{InProcessKvStore, KvCommand, KvEntry, KvError, KvOp, KvSnapshot, LeaseId};
+use sinomo_kv::{
+    DurableRaftKvNode, InProcessKvStore, KvCommand, KvEntry, KvError, KvOp, KvSnapshot,
+    KvTxnResponse, KvWalPaths, LeaseId, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+    RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
+};
 use sinomo_local::SinomoDataDir;
 use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
 use std::cell::RefCell;
@@ -27,6 +31,7 @@ pub struct ClusterPaths {
     pub state: PathBuf,
     pub invites: PathBuf,
     pub kv_snapshot: PathBuf,
+    pub kv_raft: PathBuf,
 }
 
 impl ClusterPaths {
@@ -36,6 +41,7 @@ impl ClusterPaths {
             state: root.join("state.json"),
             invites: root.join("invites"),
             kv_snapshot: root.join("kv-snapshot.json"),
+            kv_raft: root.join("kv-raft"),
             root,
         }
     }
@@ -69,17 +75,33 @@ pub struct ClusterJoinRegistrationResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterSyncRequest {
+pub struct ClusterRaftAppendRequest {
     pub state: ClusterBootstrapState,
-    pub kv_snapshot: KvSnapshot,
+    pub append: RaftAppendEntriesRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<RaftSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterSyncResponse {
+pub struct ClusterRaftAppendResponse {
     pub accepted: bool,
     pub detail: String,
     pub state: ClusterBootstrapState,
-    pub kv_snapshot: KvSnapshot,
+    pub append: RaftAppendEntriesResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRaftVoteRequest {
+    pub state: ClusterBootstrapState,
+    pub vote: RaftRequestVoteRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRaftVoteResponse {
+    pub accepted: bool,
+    pub detail: String,
+    pub state: ClusterBootstrapState,
+    pub vote: RaftRequestVoteResponse,
 }
 
 pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, NetworkError> {
@@ -137,10 +159,107 @@ pub fn write_cluster_kv_snapshot(
 }
 
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
-    if !paths.kv_snapshot.exists() {
-        return Ok(InProcessKvStore::new());
+    if paths.kv_raft.exists() {
+        let state = read_cluster_state_without_kv(paths)?;
+        let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
+        return Ok(node.store().clone());
     }
-    read_cluster_kv_snapshot(paths).map(InProcessKvStore::restore)
+    if paths.kv_snapshot.exists() {
+        return read_cluster_kv_snapshot(paths).map(InProcessKvStore::restore);
+    }
+    Ok(InProcessKvStore::new())
+}
+
+pub fn cluster_raft_wal_paths(paths: &ClusterPaths, node_id: &NodeId) -> KvWalPaths {
+    KvWalPaths::new(paths.kv_raft.join(node_id.as_str()))
+}
+
+pub fn open_cluster_raft_kv_node(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<DurableRaftKvNode, NetworkError> {
+    let wal_paths = cluster_raft_wal_paths(paths, node_id);
+    let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths)?;
+    if node.hard_state().commit_index == 0 && paths.kv_snapshot.exists() {
+        let snapshot = read_cluster_kv_snapshot(paths)?;
+        node.restore_snapshot(RaftSnapshot {
+            last_included_index: snapshot.revision.0,
+            last_included_term: 1,
+            kv: snapshot,
+        })?;
+    }
+    mirror_cluster_raft_snapshot(paths, &node)?;
+    Ok(node)
+}
+
+pub fn append_cluster_raft_command(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: KvCommand,
+) -> Result<KvSnapshot, NetworkError> {
+    append_cluster_raft_command_with_response(paths, node_id, command).map(|(snapshot, _)| snapshot)
+}
+
+pub fn append_cluster_raft_command_with_response(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: KvCommand,
+) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    let term = node.hard_state().current_term.max(1);
+    let entry = node.append_local_command(term, command)?;
+    node.commit_to(entry.index)?;
+    let txn_response = node.txn_response_at(entry.index).cloned();
+    mirror_cluster_raft_snapshot(paths, &node).map(|snapshot| (snapshot, txn_response))
+}
+
+pub fn apply_cluster_raft_append(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    snapshot: Option<RaftSnapshot>,
+    append: RaftAppendEntriesRequest,
+) -> Result<RaftAppendEntriesResponse, NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    if let Some(snapshot) = snapshot {
+        node.restore_snapshot(snapshot)?;
+    }
+    let response = node.append_entries(append)?;
+    mirror_cluster_raft_snapshot(paths, &node)?;
+    Ok(response)
+}
+
+pub fn apply_cluster_raft_vote(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    vote: RaftRequestVoteRequest,
+) -> Result<RaftRequestVoteResponse, NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    node.request_vote(vote).map_err(Into::into)
+}
+
+pub fn mirror_cluster_raft_snapshot(
+    paths: &ClusterPaths,
+    node: &DurableRaftKvNode,
+) -> Result<KvSnapshot, NetworkError> {
+    let snapshot = node.store().snapshot();
+    write_cluster_kv_snapshot(paths, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn read_cluster_state_without_kv(
+    paths: &ClusterPaths,
+) -> Result<ClusterBootstrapState, NetworkError> {
+    if !paths.state.exists() {
+        return Err(NetworkError::ClusterOrphan);
+    }
+    let content = fs::read_to_string(&paths.state).map_err(|source| NetworkError::StorageIo {
+        path: paths.state.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| NetworkError::Json {
+        path: paths.state.display().to_string(),
+        detail: source.to_string(),
+    })
 }
 
 pub fn read_cluster_members_from_kv(
@@ -187,18 +306,17 @@ pub fn sync_cluster_state_to_kv(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, NetworkError> {
-    let mut store = match read_cluster_kv_store(paths) {
-        Ok(store) => store,
-        Err(error) => {
-            eprintln!("warning: replacing unreadable cluster kv snapshot: {error}");
-            InProcessKvStore::new()
-        }
-    };
+    let mut snapshot = open_cluster_raft_kv_node(paths, &state.local_node_id)
+        .map(|node| node.store().snapshot())
+        .or_else(|error| {
+            eprintln!("warning: replacing unreadable cluster kv raft state: {error}");
+            write_cluster_kv_snapshot(paths, &InProcessKvStore::new().snapshot())?;
+            Ok::<KvSnapshot, NetworkError>(InProcessKvStore::new().snapshot())
+        })?;
     for member in &state.members {
-        store.put_cluster_member(member.clone())?;
+        let command = KvCommand::PutClusterMember(member.clone());
+        snapshot = append_cluster_raft_command(paths, &state.local_node_id, command)?;
     }
-    let snapshot = store.snapshot();
-    write_cluster_kv_snapshot(paths, &snapshot)?;
     Ok(snapshot)
 }
 
@@ -206,16 +324,21 @@ pub fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
 ) -> Result<KvSnapshot, NetworkError> {
-    let mut store = read_cluster_kv_store(paths)?;
+    let state = read_cluster_state_without_kv(paths)?;
     let key = cluster_node_status_key(&status.node_id);
     let value = serde_json::to_vec(&status).map_err(|source| NetworkError::Json {
         path: key.clone(),
         detail: source.to_string(),
     })?;
-    store.put(key, value, None)?;
-    let snapshot = store.snapshot();
-    write_cluster_kv_snapshot(paths, &snapshot)?;
-    Ok(snapshot)
+    append_cluster_raft_command(
+        paths,
+        &state.local_node_id,
+        KvCommand::Op(KvOp::Put {
+            key,
+            value,
+            lease_id: None,
+        }),
+    )
 }
 
 pub fn cluster_node_status_key(node_id: &NodeId) -> String {
@@ -246,16 +369,21 @@ pub fn sync_cluster_invitation_to_kv(
     paths: &ClusterPaths,
     invite: &sinomo_core::ClusterJoinInvite,
 ) -> Result<KvSnapshot, NetworkError> {
-    let mut store = read_cluster_kv_store(paths)?;
+    let state = read_cluster_state_without_kv(paths)?;
     let key = cluster_invitation_key(&invite.invite_id);
     let value = serde_json::to_vec(invite).map_err(|source| NetworkError::Json {
         path: key.clone(),
         detail: source.to_string(),
     })?;
-    store.put(key, value, None)?;
-    let snapshot = store.snapshot();
-    write_cluster_kv_snapshot(paths, &snapshot)?;
-    Ok(snapshot)
+    append_cluster_raft_command(
+        paths,
+        &state.local_node_id,
+        KvCommand::Op(KvOp::Put {
+            key,
+            value,
+            lease_id: None,
+        }),
+    )
 }
 
 pub fn merge_cluster_state_from_peer(
@@ -328,33 +456,6 @@ pub fn upsert_member_endpoint(
         member.endpoints.push(endpoint);
         true
     }
-}
-
-pub fn merge_cluster_kv_snapshot(
-    paths: &ClusterPaths,
-    incoming: &KvSnapshot,
-) -> Result<KvSnapshot, NetworkError> {
-    let mut store = read_cluster_kv_store(paths)?;
-    for lease in &incoming.leases {
-        let _ = store.apply_command(KvCommand::Op(KvOp::LeaseGrant {
-            lease_id: lease.lease_id,
-            ttl_ticks: lease.ttl_ticks.max(1),
-        }));
-    }
-    for entry in &incoming.entries {
-        let should_put = store
-            .get(&entry.key)
-            .map(|existing| {
-                entry.modify_revision > existing.modify_revision || entry.value != existing.value
-            })
-            .unwrap_or(true);
-        if should_put {
-            store.put(entry.key.clone(), entry.value.clone(), entry.lease_id)?;
-        }
-    }
-    let snapshot = store.snapshot();
-    write_cluster_kv_snapshot(paths, &snapshot)?;
-    Ok(snapshot)
 }
 
 pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {

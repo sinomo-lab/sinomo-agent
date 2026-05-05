@@ -407,7 +407,7 @@ pub(crate) fn run_shadow_daemon_with_paths(
 
         if Instant::now() >= next_status_tick {
             let _ = refresh_daemon_node_status_in_kv(&shadow_paths);
-            next_status_tick = Instant::now() + DAEMON_CLUSTER_SYNC_INTERVAL;
+            next_status_tick = Instant::now() + DAEMON_CLUSTER_RAFT_INTERVAL;
         }
 
         thread::sleep(Duration::from_millis(200));
@@ -1025,15 +1025,34 @@ pub(crate) fn handle_daemon_connection(
                     })?;
                 Ok(false)
             }
-            command if command.starts_with("CLUSTER_SYNC ") => {
+            command if command.starts_with("CLUSTER_RAFT_APPEND ") => {
                 let payload = command
-                    .strip_prefix("CLUSTER_SYNC ")
+                    .strip_prefix("CLUSTER_RAFT_APPEND ")
                     .unwrap_or_default()
                     .trim();
-                let response = handle_daemon_cluster_sync(paths, payload)?;
+                let response = handle_daemon_cluster_raft_append(paths, payload)?;
                 let body =
                     serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                        path: "cluster sync response".to_string(),
+                        path: "cluster raft append response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            command if command.starts_with("CLUSTER_RAFT_VOTE ") => {
+                let payload = command
+                    .strip_prefix("CLUSTER_RAFT_VOTE ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = handle_daemon_cluster_raft_vote(paths, payload)?;
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "cluster raft vote response".to_string(),
                         detail: source.to_string(),
                     })?;
                 stream
@@ -1137,10 +1156,17 @@ pub(crate) fn handle_daemon_cluster_kv_txn(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let mut store = read_cluster_kv_store(&cluster_paths)?;
-    let response = store.txn(txn)?;
-    write_cluster_kv_snapshot(&cluster_paths, &store.snapshot())?;
-    Ok(response)
+    let state = read_cluster_state(&cluster_paths)?;
+    let (_snapshot, response) = network::append_cluster_raft_command_with_response(
+        &cluster_paths,
+        &state.local_node_id,
+        KvCommand::Txn(txn.clone()),
+    )?;
+    Ok(response.unwrap_or(KvTxnResponse {
+        succeeded: true,
+        revision: read_cluster_kv_snapshot(&cluster_paths)?.revision,
+        responses: Vec::new(),
+    }))
 }
 
 pub(crate) fn handle_daemon_cluster_kv_range_prefix(

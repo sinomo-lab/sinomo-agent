@@ -262,12 +262,17 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::JoinCandidate
             )
         }
-        command if command.starts_with("CLUSTER_SYNC ") => matches!(
-            authenticated.signer,
-            DaemonSignerAuthority::Local
-                | DaemonSignerAuthority::Voter
-                | DaemonSignerAuthority::Member
-        ),
+        command
+            if command.starts_with("CLUSTER_RAFT_APPEND ")
+                || command.starts_with("CLUSTER_RAFT_VOTE ") =>
+        {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         command if command.starts_with("CLUSTER_KV_RANGE_PREFIX ") => matches!(
             authenticated.signer,
             DaemonSignerAuthority::Local

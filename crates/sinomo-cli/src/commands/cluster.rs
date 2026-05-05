@@ -1462,7 +1462,7 @@ impl ClusterNetworkMaintenance {
             discovery_cache: MdnsDiscoveryCache::new(),
             tick: 0,
             last_discovery: Instant::now() - DAEMON_CLUSTER_DISCOVERY_INTERVAL,
-            last_sync: Instant::now() - DAEMON_CLUSTER_SYNC_INTERVAL,
+            last_sync: Instant::now() - DAEMON_CLUSTER_RAFT_INTERVAL,
         }
     }
 
@@ -1512,7 +1512,7 @@ impl ClusterNetworkMaintenance {
             self.announce(&state);
         }
 
-        if now.duration_since(self.last_sync) >= DAEMON_CLUSTER_SYNC_INTERVAL {
+        if now.duration_since(self.last_sync) >= DAEMON_CLUSTER_RAFT_INTERVAL {
             self.last_sync = now;
             sync_cluster_with_reachable_peers(&cluster_paths, &mut state, &mut snapshot)?;
         }
@@ -1605,54 +1605,116 @@ pub(crate) fn sync_cluster_with_reachable_peers(
     state: &mut ClusterBootstrapState,
     snapshot: &mut KvSnapshot,
 ) -> Result<(), CliError> {
-    let request = ClusterSyncRequest {
-        state: state.clone(),
-        kv_snapshot: snapshot.clone(),
+    let Some(leader_id) = cluster_raft_leader_id(state) else {
+        return Ok(());
     };
+    if leader_id != state.local_node_id {
+        return Ok(());
+    }
+    let request = build_cluster_raft_append_request(paths, state)?;
     for endpoint in cluster_sync_targets(state) {
-        let Ok(response) = send_cluster_sync(&endpoint.address, &request) else {
+        let Ok(response) = send_cluster_raft_append(&endpoint.address, &request) else {
             continue;
         };
         if !response.accepted {
             continue;
         }
         network::merge_cluster_state_from_peer(state, response.state);
-        merge_cluster_kv_snapshot(paths, &response.kv_snapshot)?;
         *snapshot = read_cluster_kv_snapshot(paths)?;
     }
     Ok(())
+}
+
+pub(crate) fn cluster_raft_leader_id(state: &ClusterBootstrapState) -> Option<NodeId> {
+    let mut voters = state
+        .members
+        .iter()
+        .filter(|member| {
+            member.cluster_id == state.cluster_id
+                && member.state.is_authorized()
+                && matches!(member.role, ClusterMemberRole::Voter)
+                && member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == "daemon.main.run")
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<Vec<_>>();
+    voters.sort();
+    voters.into_iter().next()
+}
+
+pub(crate) fn build_cluster_raft_append_request(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<ClusterRaftAppendRequest, CliError> {
+    let node = network::open_cluster_raft_kv_node(paths, &state.local_node_id)?;
+    let include_snapshot = node.log().is_empty() || node.snapshot_index() > 0;
+    let (snapshot, prev_log_index, entries) = if include_snapshot {
+        let snapshot = RaftSnapshot {
+            last_included_index: node.applied_index(),
+            last_included_term: node.term_at(node.applied_index()).unwrap_or(1),
+            kv: node.store().snapshot(),
+        };
+        let entries = node
+            .log()
+            .iter()
+            .filter(|entry| entry.index > snapshot.last_included_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        (Some(snapshot), node.applied_index(), entries)
+    } else {
+        let first_entry = node.log().first();
+        let prev_log_index = first_entry
+            .map(|entry| entry.index.saturating_sub(1))
+            .unwrap_or(node.last_log_index());
+        (None, prev_log_index, node.log().to_vec())
+    };
+    let prev_log_term = node.term_at(prev_log_index).unwrap_or(0);
+    Ok(ClusterRaftAppendRequest {
+        state: state.clone(),
+        snapshot,
+        append: RaftAppendEntriesRequest {
+            term: node.hard_state().current_term,
+            leader_id: state.local_node_id.clone(),
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit: node.hard_state().commit_index,
+        },
+    })
 }
 
 pub(crate) fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
     network::cluster_sync_targets(state)
 }
 
-pub(crate) fn send_cluster_sync(
+pub(crate) fn send_cluster_raft_append(
     address: &str,
-    request: &ClusterSyncRequest,
-) -> Result<ClusterSyncResponse, CliError> {
+    request: &ClusterRaftAppendRequest,
+) -> Result<ClusterRaftAppendResponse, CliError> {
     let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
-        path: "cluster sync request".to_string(),
+        path: "cluster raft append request".to_string(),
         detail: source.to_string(),
     })?;
     let response = send_daemon_command(
         address,
-        &format!("CLUSTER_SYNC {payload}"),
+        &format!("CLUSTER_RAFT_APPEND {payload}"),
         DAEMON_JOIN_TIMEOUT,
     )?;
     serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster sync response from {address}"),
+        path: format!("cluster raft append response from {address}"),
         detail: source.to_string(),
     })
 }
 
-pub(crate) fn handle_daemon_cluster_sync(
+pub(crate) fn handle_daemon_cluster_raft_append(
     paths: &DaemonPaths,
     payload: &str,
-) -> Result<ClusterSyncResponse, CliError> {
-    let request: ClusterSyncRequest =
+) -> Result<ClusterRaftAppendResponse, CliError> {
+    let request: ClusterRaftAppendRequest =
         serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "cluster sync request".to_string(),
+            path: "cluster raft append request".to_string(),
             detail: source.to_string(),
         })?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
@@ -1662,34 +1724,135 @@ pub(crate) fn handle_daemon_cluster_sync(
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let mut state = read_cluster_state(&cluster_paths)?;
     if request.state.cluster_id != state.cluster_id {
-        let snapshot = read_cluster_kv_store(&cluster_paths)?.snapshot();
-        return Ok(ClusterSyncResponse {
+        let node = network::open_cluster_raft_kv_node(&cluster_paths, &state.local_node_id)?;
+        return Ok(ClusterRaftAppendResponse {
             accepted: false,
             detail: format!(
                 "peer cluster `{}` does not match local cluster `{}`",
                 request.state.cluster_id, state.cluster_id
             ),
             state,
-            kv_snapshot: snapshot,
+            append: sinomo_runtime::kv::RaftAppendEntriesResponse {
+                term: node.hard_state().current_term,
+                success: false,
+                match_index: node.last_log_index(),
+            },
         });
     }
     network::merge_cluster_state_from_peer(&mut state, request.state);
     network::write_cluster_state(&cluster_paths, &state)?;
-    merge_cluster_kv_snapshot(&cluster_paths, &request.kv_snapshot)?;
-    let snapshot = sync_cluster_state_to_kv(&cluster_paths, &state)?;
-    Ok(ClusterSyncResponse {
-        accepted: true,
-        detail: "cluster sync applied".to_string(),
+    let Some(leader_id) = cluster_raft_leader_id(&state) else {
+        let node = network::open_cluster_raft_kv_node(&cluster_paths, &state.local_node_id)?;
+        return Ok(ClusterRaftAppendResponse {
+            accepted: false,
+            detail: "cluster has no authorized raft voter leader".to_string(),
+            state,
+            append: sinomo_runtime::kv::RaftAppendEntriesResponse {
+                term: node.hard_state().current_term,
+                success: false,
+                match_index: node.last_log_index(),
+            },
+        });
+    };
+    if request.append.leader_id != leader_id {
+        let node = network::open_cluster_raft_kv_node(&cluster_paths, &state.local_node_id)?;
+        return Ok(ClusterRaftAppendResponse {
+            accepted: false,
+            detail: format!(
+                "raft append rejected from {}; expected leader {}",
+                request.append.leader_id, leader_id
+            ),
+            state,
+            append: sinomo_runtime::kv::RaftAppendEntriesResponse {
+                term: node.hard_state().current_term,
+                success: false,
+                match_index: node.last_log_index(),
+            },
+        });
+    }
+    let append = network::apply_cluster_raft_append(
+        &cluster_paths,
+        &state.local_node_id,
+        request.snapshot,
+        request.append,
+    )?;
+    Ok(ClusterRaftAppendResponse {
+        accepted: append.success,
+        detail: if append.success {
+            "raft append applied".to_string()
+        } else {
+            "raft append rejected by local log".to_string()
+        },
         state,
-        kv_snapshot: snapshot,
+        append,
     })
 }
 
-pub(crate) fn merge_cluster_kv_snapshot(
-    paths: &ClusterPaths,
-    incoming: &KvSnapshot,
-) -> Result<KvSnapshot, CliError> {
-    network::merge_cluster_kv_snapshot(paths, incoming).map_err(Into::into)
+pub(crate) fn handle_daemon_cluster_raft_vote(
+    paths: &DaemonPaths,
+    payload: &str,
+) -> Result<ClusterRaftVoteResponse, CliError> {
+    let request: ClusterRaftVoteRequest =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "cluster raft vote request".to_string(),
+            detail: source.to_string(),
+        })?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let mut state = read_cluster_state(&cluster_paths)?;
+    let local_node_id = state.local_node_id.clone();
+    if request.state.cluster_id != state.cluster_id {
+        let node = network::open_cluster_raft_kv_node(&cluster_paths, &local_node_id)?;
+        return Ok(ClusterRaftVoteResponse {
+            accepted: false,
+            detail: format!(
+                "peer cluster `{}` does not match local cluster `{}`",
+                request.state.cluster_id, state.cluster_id
+            ),
+            state,
+            vote: RaftRequestVoteResponse {
+                term: node.hard_state().current_term,
+                vote_granted: false,
+            },
+        });
+    }
+    network::merge_cluster_state_from_peer(&mut state, request.state);
+    network::write_cluster_state(&cluster_paths, &state)?;
+    let candidate_is_authorized_voter = state.members.iter().any(|member| {
+        member.node_id == request.vote.candidate_id
+            && member.cluster_id == state.cluster_id
+            && member.state.is_authorized()
+            && matches!(member.role, ClusterMemberRole::Voter)
+    });
+    if !candidate_is_authorized_voter {
+        let node = network::open_cluster_raft_kv_node(&cluster_paths, &local_node_id)?;
+        return Ok(ClusterRaftVoteResponse {
+            accepted: false,
+            detail: format!(
+                "raft vote rejected for unauthorized candidate {}",
+                request.vote.candidate_id
+            ),
+            state,
+            vote: RaftRequestVoteResponse {
+                term: node.hard_state().current_term,
+                vote_granted: false,
+            },
+        });
+    }
+    let vote = network::apply_cluster_raft_vote(&cluster_paths, &local_node_id, request.vote)?;
+    Ok(ClusterRaftVoteResponse {
+        accepted: vote.vote_granted,
+        detail: if vote.vote_granted {
+            "raft vote granted".to_string()
+        } else {
+            "raft vote rejected by local hard state".to_string()
+        },
+        state,
+        vote,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

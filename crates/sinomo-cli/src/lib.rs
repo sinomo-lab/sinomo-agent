@@ -62,12 +62,16 @@ use sinomo_runtime::dfs::{
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
-use sinomo_runtime::kv::{KvEntry, KvError, KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{
+    KvCommand, KvEntry, KvError, KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesRequest,
+    RaftRequestVoteResponse, RaftSnapshot,
+};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{
     self, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterPaths,
-    ClusterSyncRequest, ClusterSyncResponse, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache,
-    MdnsDiscoverySocket, sync_cluster_invitation_to_kv,
+    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
+    ClusterRaftVoteResponse, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoverySocket,
+    sync_cluster_invitation_to_kv,
 };
 use sinomo_runtime::node::{
     NodeIdentity, daemon_lan_endpoint_id, daemon_loopback_endpoint_id,
@@ -244,7 +248,7 @@ const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
-const DAEMON_CLUSTER_SYNC_INTERVAL: Duration = Duration::from_secs(2);
+const DAEMON_CLUSTER_RAFT_INTERVAL: Duration = Duration::from_secs(2);
 const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 15;
 const ROLLOUT_DIAGNOSTIC_TAIL_BYTES: usize = 8 * 1024;
 const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
