@@ -34,6 +34,8 @@ pub struct SignedDaemonCommand {
 pub struct AuthenticatedDaemonCommand {
     pub command: String,
     pub signer: DaemonSignerAuthority,
+    pub signer_node_id: String,
+    pub signer_public_key: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -128,6 +130,8 @@ pub fn authenticate_daemon_command(
     let authenticated = AuthenticatedDaemonCommand {
         command: envelope.command,
         signer,
+        signer_node_id: envelope.node_id,
+        signer_public_key: envelope.public_key,
     };
     authorize_authenticated_daemon_command(&authenticated)?;
     Ok(authenticated)
@@ -268,9 +272,7 @@ pub fn authorize_authenticated_daemon_command(
         {
             matches!(
                 authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
+                DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
             )
         }
         command if command.starts_with("CLUSTER_KV_RANGE_PREFIX ") => matches!(

@@ -10,13 +10,14 @@ use super::{
     UninstallOptions, authenticate_daemon_command, build_cluster_raft_append_request,
     cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
     cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_sync_targets, daemon_package_version, daemon_status_matches_options,
-    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
-    ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_txn,
-    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
-    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
-    handle_daemon_connection, handle_daemon_rollout_build, install_should_update_binary,
-    install_with_layout, is_terminal_status, models_default_with_data_dir,
+    cluster_sync_targets, daemon_lan_endpoint, daemon_package_version,
+    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
+    encode_cluster_join_invite, ensure_rollout_layout, handle_daemon_cluster_join,
+    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
+    handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
+    handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
+    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
+    is_terminal_status, main_daemon_capabilities, models_default_with_data_dir,
     normalize_model_provider, parse_cli_command, parse_cluster_command,
     parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
     parse_install_options, parse_model_default_options, parse_models_list_options,
@@ -46,6 +47,46 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
+
+fn authenticated_test_command(
+    command: impl Into<String>,
+    signer: super::DaemonSignerAuthority,
+    signer_node_id: impl Into<String>,
+    signer_public_key: impl Into<String>,
+) -> super::AuthenticatedDaemonCommand {
+    super::AuthenticatedDaemonCommand {
+        command: command.into(),
+        signer,
+        signer_node_id: signer_node_id.into(),
+        signer_public_key: signer_public_key.into(),
+    }
+}
+
+fn start_one_shot_raft_append_responder(
+    state: ClusterBootstrapState,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake raft responder");
+    let address = listener.local_addr().expect("fake raft responder address");
+    let handle = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&mut stream).read_line(&mut line);
+            let response = sinomo_runtime::network::ClusterRaftAppendResponse {
+                accepted: true,
+                detail: "fake raft append accepted".to_string(),
+                state,
+                append: sinomo_runtime::kv::RaftAppendEntriesResponse {
+                    term: 1,
+                    success: true,
+                    match_index: 1,
+                },
+            };
+            let body = serde_json::to_string(&response).expect("fake response json");
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    (address.to_string(), handle)
+}
 
 #[test]
 fn provider_commands_parse_action_before_provider() {
@@ -679,14 +720,17 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
     )
     .expect("cluster init");
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
+    let identity = super::load_or_create_main_node_identity(&root).expect("identity");
 
     let signed = sign_daemon_command_from_data_dir(&data_dir, "STATUS").expect("signed command");
     assert_eq!(
         authenticate_daemon_command(&daemon_paths, &signed).expect("auth command"),
-        super::AuthenticatedDaemonCommand {
-            command: "STATUS".to_string(),
-            signer: super::DaemonSignerAuthority::Local,
-        }
+        authenticated_test_command(
+            "STATUS",
+            super::DaemonSignerAuthority::Local,
+            "node_auth",
+            identity.public_key
+        )
     );
     assert!(matches!(
         authenticate_daemon_command(&daemon_paths, "STATUS"),
@@ -790,45 +834,57 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
 #[test]
 fn daemon_authorization_restricts_admin_and_local_commands() {
     assert!(
-        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
-            command: "STATUS".to_string(),
-            signer: super::DaemonSignerAuthority::Member,
-        })
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            "STATUS",
+            super::DaemonSignerAuthority::Member,
+            "node_member",
+            "pk_member"
+        ))
         .is_ok()
     );
     assert!(
-        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
-            command: "ROLLOUT_BUILD {}".to_string(),
-            signer: super::DaemonSignerAuthority::Member,
-        })
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            "ROLLOUT_BUILD {}",
+            super::DaemonSignerAuthority::Member,
+            "node_member",
+            "pk_member"
+        ))
         .is_err()
     );
     assert!(
-        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
-            command: "ROLLOUT_BUILD {}".to_string(),
-            signer: super::DaemonSignerAuthority::Voter,
-        })
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            "ROLLOUT_BUILD {}",
+            super::DaemonSignerAuthority::Voter,
+            "node_voter",
+            "pk_voter"
+        ))
         .is_ok()
     );
     assert!(
-        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
-            command: "SHUTDOWN".to_string(),
-            signer: super::DaemonSignerAuthority::Voter,
-        })
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            "SHUTDOWN",
+            super::DaemonSignerAuthority::Voter,
+            "node_voter",
+            "pk_voter"
+        ))
         .is_err()
     );
     assert!(
-        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
-            command: "SHUTDOWN".to_string(),
-            signer: super::DaemonSignerAuthority::Local,
-        })
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            "SHUTDOWN",
+            super::DaemonSignerAuthority::Local,
+            "node_local",
+            "pk_local"
+        ))
         .is_ok()
     );
     assert!(
-        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
-            command: "UNKNOWN_PROBE".to_string(),
-            signer: super::DaemonSignerAuthority::Local,
-        })
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            "UNKNOWN_PROBE",
+            super::DaemonSignerAuthority::Local,
+            "node_local",
+            "pk_local"
+        ))
         .is_err()
     );
 }
@@ -1154,6 +1210,197 @@ fn daemon_cluster_kv_txn_persists_snapshot() {
 }
 
 #[test]
+fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-kv-no-quorum-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_kv_no_quorum").expect("cluster")),
+            node_id: Some(NodeId::new("node_kv_no_quorum").expect("node")),
+            name: "kv no quorum cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let mut state = read_cluster_state(&paths).expect("cluster state");
+    let (peer_address, responder) = start_one_shot_raft_append_responder(state.clone());
+    let peer_node_id = NodeId::new("node_kv_no_quorum_peer").expect("node");
+    let mut peer = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        peer_node_id.clone(),
+        "peer",
+        "pk_peer",
+        OffsetDateTime::now_utc(),
+    );
+    peer.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    peer.allowed_capabilities = peer.capabilities.clone();
+    peer.endpoints = vec![daemon_lan_endpoint(&peer_node_id, peer_address, 0)];
+    state.members.push(peer);
+    write_json(&paths.state, &state).expect("write cluster state");
+    sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+
+    let txn = KvTxn {
+        compares: Vec::new(),
+        success: vec![KvOp::Put {
+            key: "/config/unsafe".to_string(),
+            value: b"must-not-commit".to_vec(),
+            lease_id: None,
+        }],
+        failure: Vec::new(),
+    };
+    let result = handle_daemon_cluster_kv_txn(
+        &DaemonPaths::with_root(root.join("daemon")),
+        &serde_json::to_string(&txn).expect("txn json"),
+    );
+
+    assert!(result.is_err());
+    assert!(
+        !read_cluster_kv_snapshot(&paths)
+            .expect("cluster snapshot")
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/config/unsafe")
+    );
+    responder.join().expect("join fake responder");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-raft-auth-binding-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_raft_auth").expect("cluster")),
+            node_id: Some(NodeId::new("node_raft_auth").expect("node")),
+            name: "raft auth cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let state = read_cluster_state(&paths).expect("cluster state");
+    sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+    let bad_auth = authenticated_test_command(
+        "CLUSTER_RAFT_APPEND",
+        super::DaemonSignerAuthority::Voter,
+        "node_other",
+        "pk_other",
+    );
+
+    let append_request = build_cluster_raft_append_request(&paths, &state).expect("append request");
+    let append_response = handle_daemon_cluster_raft_append(
+        &DaemonPaths::with_root(root.join("daemon")),
+        &serde_json::to_string(&append_request).expect("append request json"),
+        &bad_auth,
+    )
+    .expect("append response");
+    assert!(!append_response.accepted);
+
+    let node =
+        super::network::open_cluster_raft_kv_node(&paths, &state.local_node_id).expect("raft node");
+    let vote_request = sinomo_runtime::network::ClusterRaftVoteRequest {
+        state: state.clone(),
+        vote: sinomo_runtime::kv::RaftRequestVoteRequest {
+            term: node.hard_state().current_term.saturating_add(1),
+            candidate_id: state.local_node_id.clone(),
+            last_log_index: node.last_log_index(),
+            last_log_term: node.last_log_term(),
+        },
+    };
+    let vote_response = handle_daemon_cluster_raft_vote(
+        &DaemonPaths::with_root(root.join("daemon")),
+        &serde_json::to_string(&vote_request).expect("vote request json"),
+        &bad_auth,
+    )
+    .expect("vote response");
+    assert!(!vote_response.accepted);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-stale-snapshot-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_stale_snapshot").expect("cluster")),
+            node_id: Some(NodeId::new("node_stale_snapshot").expect("node")),
+            name: "stale snapshot cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let state = read_cluster_state(&paths).expect("cluster state");
+    sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+    let stale_snapshot = read_cluster_kv_snapshot(&paths).expect("stale snapshot");
+    super::network::append_cluster_raft_command_with_response(
+        &paths,
+        &state.local_node_id,
+        sinomo_runtime::kv::KvCommand::Op(KvOp::Put {
+            key: "/config/current".to_string(),
+            value: b"current".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("current write");
+    assert!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("current snapshot")
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/config/current")
+    );
+
+    let node =
+        super::network::open_cluster_raft_kv_node(&paths, &state.local_node_id).expect("raft node");
+    let response = super::network::apply_cluster_raft_append(
+        &paths,
+        &state.local_node_id,
+        Some(sinomo_runtime::kv::RaftSnapshot {
+            last_included_index: stale_snapshot.revision.0,
+            last_included_term: node.term_at(stale_snapshot.revision.0).unwrap_or(1),
+            kv: stale_snapshot.clone(),
+        }),
+        sinomo_runtime::kv::RaftAppendEntriesRequest {
+            term: node.hard_state().current_term,
+            leader_id: state.local_node_id.clone(),
+            prev_log_index: stale_snapshot.revision.0,
+            prev_log_term: node.term_at(stale_snapshot.revision.0).unwrap_or(1),
+            entries: Vec::new(),
+            leader_commit: stale_snapshot.revision.0,
+        },
+    )
+    .expect("stale append response");
+    assert!(response.success);
+    assert!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("snapshot after stale append")
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/config/current" && entry.value == b"current")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn daemon_node_status_publishes_version_and_rollout_to_kv() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-node-status-{}",
@@ -1294,11 +1541,18 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     .expect("cluster join");
 
     let host_state = read_cluster_state(&host_paths).expect("host state");
+    let host_auth = authenticated_test_command(
+        "CLUSTER_RAFT_APPEND",
+        super::DaemonSignerAuthority::Voter,
+        host_state.local_node_id.as_str(),
+        host_identity.public_key.clone(),
+    );
     sync_cluster_state_to_kv(&host_paths, &host_state).expect("host kv");
     let request = build_cluster_raft_append_request(&host_paths, &host_state).expect("raft append");
     let peer_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
         &serde_json::to_string(&request).expect("raft append request"),
+        &host_auth,
     )
     .expect("peer append");
 
@@ -1329,6 +1583,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let current_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
         &serde_json::to_string(&current_request).expect("current append request"),
+        &host_auth,
     )
     .expect("peer current append");
     assert!(current_response.accepted);
@@ -1343,6 +1598,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let delayed_stale_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
         &serde_json::to_string(&request).expect("stale append request"),
+        &host_auth,
     )
     .expect("peer stale append");
     assert!(delayed_stale_response.accepted);
@@ -1383,6 +1639,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         handle_daemon_cluster_raft_append(
             &DaemonPaths::with_root(peer_root.join("daemon")),
             &serde_json::to_string(&watch_append).expect("watch append request"),
+            &host_auth,
         )
         .expect("peer watch append")
         .accepted

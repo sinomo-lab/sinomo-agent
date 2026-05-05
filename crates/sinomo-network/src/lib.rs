@@ -9,8 +9,8 @@ use sinomo_core::{
 };
 use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
 use sinomo_kv::{
-    DurableRaftKvNode, InProcessKvStore, KvCommand, KvEntry, KvError, KvEvent, KvOp, KvRevision,
-    KvSnapshot, KvTxnResponse, KvWalPaths, LeaseId, RaftAppendEntriesRequest,
+    DurableRaftKvNode, InProcessKvStore, KvCommand, KvEntry, KvError, KvEvent, KvLogEntry, KvOp,
+    KvRevision, KvSnapshot, KvTxnResponse, KvWalPaths, LeaseId, RaftAppendEntriesRequest,
     RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
     WatchId,
 };
@@ -259,6 +259,29 @@ pub fn append_cluster_raft_command_with_response(
     mirror_cluster_raft_snapshot(paths, &node).map(|snapshot| (snapshot, txn_response))
 }
 
+pub fn append_cluster_raft_command_uncommitted(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: KvCommand,
+) -> Result<KvLogEntry, NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    let term = node.hard_state().current_term.max(1);
+    let entry = node.append_local_command(term, command)?;
+    mirror_cluster_raft_snapshot(paths, &node)?;
+    Ok(entry)
+}
+
+pub fn commit_cluster_raft_index(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    commit_index: u64,
+) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    node.commit_to(commit_index)?;
+    let txn_response = node.txn_response_at(commit_index).cloned();
+    mirror_cluster_raft_snapshot(paths, &node).map(|snapshot| (snapshot, txn_response))
+}
+
 pub fn apply_cluster_raft_append(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -267,7 +290,14 @@ pub fn apply_cluster_raft_append(
 ) -> Result<RaftAppendEntriesResponse, NetworkError> {
     let mut node = open_cluster_raft_kv_node(paths, node_id)?;
     if let Some(snapshot) = snapshot {
-        node.restore_snapshot(snapshot)?;
+        let snapshot_matches_append = append.prev_log_index >= snapshot.last_included_index
+            && (append.prev_log_index != snapshot.last_included_index
+                || append.prev_log_term == snapshot.last_included_term);
+        let snapshot_is_newer = snapshot.last_included_index > node.applied_index();
+        let append_term_is_current = append.term >= node.hard_state().current_term;
+        if append_term_is_current && snapshot_is_newer && snapshot_matches_append {
+            node.restore_snapshot(snapshot)?;
+        }
     }
     let response = node.append_entries(append)?;
     mirror_cluster_raft_snapshot(paths, &node)?;

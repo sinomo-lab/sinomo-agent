@@ -1068,7 +1068,7 @@ pub(crate) fn handle_daemon_connection(
                     .strip_prefix("CLUSTER_RAFT_APPEND ")
                     .unwrap_or_default()
                     .trim();
-                let response = handle_daemon_cluster_raft_append(paths, payload)?;
+                let response = handle_daemon_cluster_raft_append(paths, payload, &authenticated)?;
                 let body =
                     serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
                         path: "cluster raft append response".to_string(),
@@ -1106,7 +1106,7 @@ pub(crate) fn handle_daemon_connection(
                     .strip_prefix("CLUSTER_RAFT_VOTE ")
                     .unwrap_or_default()
                     .trim();
-                let response = handle_daemon_cluster_raft_vote(paths, payload)?;
+                let response = handle_daemon_cluster_raft_vote(paths, payload, &authenticated)?;
                 let body =
                     serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
                         path: "cluster raft vote response".to_string(),
@@ -1230,9 +1230,9 @@ pub(crate) fn handle_daemon_cluster_kv_txn(
             detail: "local daemon lost Raft quorum before committing the transaction".to_string(),
         });
     }
-    let (_snapshot, response) = network::append_cluster_raft_command_with_response(
+    let (_snapshot, response) = commit_cluster_raft_command_with_quorum(
         &cluster_paths,
-        &state.local_node_id,
+        &mut state,
         KvCommand::Txn(txn.clone()),
     )?;
     let mut replicated_snapshot = read_cluster_kv_snapshot(&cluster_paths)?;
