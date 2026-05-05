@@ -3406,8 +3406,10 @@ fn run_shadow_daemon_with_paths(
     loop {
         match listener.accept() {
             Ok((mut stream, _address)) => {
-                if handle_daemon_connection(&mut stream, &shadow_paths)? {
-                    break;
+                match handle_daemon_connection(&mut stream, &shadow_paths) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => eprintln!("sinomo shadow daemon client error: {error}"),
                 }
             }
             Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
@@ -3817,14 +3819,20 @@ fn run_daemon_with_paths(
     loop {
         match listener.accept() {
             Ok((mut stream, _address)) => {
-                stream
-                    .set_nonblocking(false)
-                    .map_err(|source| CliError::Network {
-                        address: "daemon client".to_string(),
-                        detail: source.to_string(),
-                    })?;
-                if handle_daemon_connection(&mut stream, &paths)? {
-                    break;
+                if let Err(source) = stream.set_nonblocking(false) {
+                    eprintln!(
+                        "sinomo {label} client error: {}",
+                        CliError::Network {
+                            address: "daemon client".to_string(),
+                            detail: source.to_string(),
+                        }
+                    );
+                    continue;
+                }
+                match handle_daemon_connection(&mut stream, &paths) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => eprintln!("sinomo {label} client error: {error}"),
                 }
             }
             Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
