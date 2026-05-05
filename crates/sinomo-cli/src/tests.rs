@@ -662,19 +662,65 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
     let signed = sign_daemon_command_from_data_dir(&data_dir, "STATUS").expect("signed command");
     assert_eq!(
         authenticate_daemon_command(&daemon_paths, &signed).expect("auth command"),
-        "STATUS"
+        super::AuthenticatedDaemonCommand {
+            command: "STATUS".to_string(),
+            signer: super::DaemonSignerAuthority::Local,
+        }
     );
     assert!(matches!(
         authenticate_daemon_command(&daemon_paths, "STATUS"),
-        Err(CliError::AuthDenied)
+        Err(super::DaemonError::AuthDenied)
+    ));
+    assert!(matches!(
+        authenticate_daemon_command(&daemon_paths, &signed),
+        Err(super::DaemonError::AuthDenied)
     ));
 
     let tampered = signed.replace("\"command\":\"STATUS\"", "\"command\":\"SHUTDOWN\"");
     assert!(matches!(
         authenticate_daemon_command(&daemon_paths, &tampered),
-        Err(CliError::AuthDenied)
+        Err(super::DaemonError::AuthDenied)
     ));
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn daemon_authorization_restricts_admin_and_local_commands() {
+    assert!(
+        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
+            command: "STATUS".to_string(),
+            signer: super::DaemonSignerAuthority::Member,
+        })
+        .is_ok()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
+            command: "ROLLOUT_BUILD {}".to_string(),
+            signer: super::DaemonSignerAuthority::Member,
+        })
+        .is_err()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
+            command: "ROLLOUT_BUILD {}".to_string(),
+            signer: super::DaemonSignerAuthority::Voter,
+        })
+        .is_ok()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
+            command: "SHUTDOWN".to_string(),
+            signer: super::DaemonSignerAuthority::Voter,
+        })
+        .is_err()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
+            command: "SHUTDOWN".to_string(),
+            signer: super::DaemonSignerAuthority::Local,
+        })
+        .is_ok()
+    );
 }
 
 #[test]

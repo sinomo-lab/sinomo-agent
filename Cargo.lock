@@ -3090,7 +3090,6 @@ name = "sinomo-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
- "fs2",
  "ring",
  "serde",
  "serde_json",
@@ -3110,6 +3109,23 @@ dependencies = [
  "thiserror",
  "time",
  "ulid",
+]
+
+[[package]]
+name = "sinomo-daemon"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "fs2",
+ "ring",
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-local",
+ "sinomo-network",
+ "sinomo-node",
+ "thiserror",
+ "time",
 ]
 
 [[package]]
@@ -3319,6 +3335,7 @@ version = "0.1.0"
 dependencies = [
  "sinomo-api",
  "sinomo-core",
+ "sinomo-daemon",
  "sinomo-device",
  "sinomo-dfs",
  "sinomo-eval",

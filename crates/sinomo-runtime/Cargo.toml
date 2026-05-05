@@ -12,6 +12,7 @@ ring = "r0-r1-boundary"
 [dependencies]
 sinomo-api = { path = "../sinomo-api" }
 sinomo-core = { path = "../sinomo-core" }
+sinomo-daemon = { path = "../sinomo-daemon" }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-eval = { path = "../sinomo-eval" }

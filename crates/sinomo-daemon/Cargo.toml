@@ -1,0 +1,25 @@
+[package]
+name = "sinomo-daemon"
+version.workspace = true
+description = "Sinomo daemon control protocol, status, locking, and local client utilities"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+base64 = "0.22"
+fs2.workspace = true
+ring = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-local = { path = "../sinomo-local" }
+sinomo-network = { path = "../sinomo-network" }
+sinomo-node = { path = "../sinomo-node" }
+thiserror.workspace = true
+time.workspace = true

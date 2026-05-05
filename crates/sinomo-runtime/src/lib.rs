@@ -24,6 +24,7 @@ pub mod r0 {
 /// must not depend back on R2 service crates.
 pub mod r1 {
     pub use sinomo_api as api;
+    pub use sinomo_daemon as daemon;
     pub use sinomo_device as device;
     pub use sinomo_dfs as dfs;
     pub use sinomo_eval as eval;
@@ -43,6 +44,6 @@ pub mod r1 {
 
 pub use r0::core;
 pub use r1::{
-    api, device, dfs, eval, events, kv, local, module, network, node, policy, registry, rollout,
-    sandbox, supervision, sync,
+    api, daemon, device, dfs, eval, events, kv, local, module, network, node, policy, registry,
+    rollout, sandbox, supervision, sync,
 };

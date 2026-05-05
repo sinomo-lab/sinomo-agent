@@ -1,7 +1,6 @@
 //! Shared Sinomo command-line handlers.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use fs2::FileExt;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
@@ -55,6 +54,18 @@ use sinomo_runtime::core::{
     LatencyClass, MutationPacket, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
     SessionId, Source, TrustDomain, TrustRing, VerificationCommand,
 };
+#[cfg(test)]
+use sinomo_runtime::daemon::{
+    AuthenticatedDaemonCommand, DaemonError, DaemonSignerAuthority, authenticate_daemon_command,
+    authorize_authenticated_daemon_command, daemon_package_version, send_daemon_command_raw,
+    sign_daemon_command_from_data_dir,
+};
+use sinomo_runtime::daemon::{
+    DaemonClusterStatus, DaemonLock, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
+    DaemonStatus, daemon_bind_address, daemon_connect_address,
+    handle_authenticated_daemon_connection, probe_daemon_status, read_daemon_status,
+    send_daemon_command, write_daemon_status,
+};
 use sinomo_runtime::dfs::{
     DfsMetadataShardId, DfsOperatorInspector, DfsPinMode, DfsPinRecord, LocalDfsPinStore,
     LocalJsonMetadataBackend,
@@ -74,9 +85,9 @@ use sinomo_runtime::node::{
     main_daemon_capabilities, shadow_daemon_capabilities, shadow_daemon_node_id,
 };
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
-use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::fs::{self, File};
+use std::io::{self, BufRead, Write};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -222,9 +233,7 @@ const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
-const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
 const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
-const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -1084,7 +1093,7 @@ fn stop_daemon_before_install(
                     ) {
                         return Ok(());
                     }
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -2519,15 +2528,6 @@ struct DaemonClusterRegistration {
     shadow_options: DaemonRunOptions,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct DaemonClusterStatus {
-    cluster_id: ClusterId,
-    node_id: NodeId,
-    process: String,
-    member_role: ClusterMemberRole,
-    member_state: ClusterMemberState,
-}
-
 fn ensure_daemon_cluster_members(
     state: &mut ClusterBootstrapState,
     main_options: &DaemonRunOptions,
@@ -3011,196 +3011,6 @@ enum DaemonCliCommand {
     ShadowStop(DaemonRunOptions),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct DaemonRunOptions {
-    host: String,
-    port: u16,
-}
-
-impl Default for DaemonRunOptions {
-    fn default() -> Self {
-        Self {
-            host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
-            port: SINOMO_DAEMON_DEFAULT_PORT,
-        }
-    }
-}
-
-impl DaemonRunOptions {
-    fn shadow_default() -> Self {
-        Self {
-            host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
-            port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DaemonProbeStatus {
-    Running(DaemonStatus),
-    Locked { status: Option<DaemonStatus> },
-    NotRunning,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct DaemonStatus {
-    pid: u32,
-    host: String,
-    port: u16,
-    address: String,
-    #[serde(default = "daemon_package_version")]
-    version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    target_os: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    target_arch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    executable: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    rollout: Option<ClusterNodeRolloutStatus>,
-    started_at: String,
-    data_dir: PathBuf,
-    lock_file: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cluster: Option<DaemonClusterStatus>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DaemonPaths {
-    root: PathBuf,
-    lock: PathBuf,
-    status: PathBuf,
-}
-
-impl DaemonPaths {
-    fn new(data_dir: &SinomoDataDir) -> Self {
-        Self::with_root(data_dir.root().join("daemon"))
-    }
-
-    fn for_shadow(data_dir: &SinomoDataDir) -> Self {
-        Self::with_root(data_dir.root().join("shadow-daemon"))
-    }
-
-    fn with_root(root: PathBuf) -> Self {
-        Self {
-            lock: root.join("daemon.lock"),
-            status: root.join("status.json"),
-            root,
-        }
-    }
-
-    fn ensure(&self) -> Result<(), CliError> {
-        fs::create_dir_all(&self.root).map_err(|source| CliError::Io {
-            path: self.root.display().to_string(),
-            detail: source.to_string(),
-        })
-    }
-}
-
-#[derive(Debug)]
-struct DaemonLock {
-    file: File,
-    paths: DaemonPaths,
-}
-
-impl DaemonLock {
-    fn acquire(
-        paths: &DaemonPaths,
-        options: &DaemonRunOptions,
-        registration: Option<&DaemonClusterRegistration>,
-    ) -> Result<Self, CliError> {
-        paths.ensure()?;
-        let cluster = registration.map(register_daemon_cluster_node).transpose()?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&paths.lock)
-            .map_err(|source| CliError::Io {
-                path: paths.lock.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        file.try_lock_exclusive()
-            .map_err(|source| CliError::DaemonAlreadyRunning {
-                lock_file: paths.lock.display().to_string(),
-                detail: source.to_string(),
-            })?;
-
-        let status = DaemonStatus::new(options, paths, cluster);
-        let status_json = serde_json::to_vec_pretty(&status).map_err(|source| CliError::Json {
-            path: paths.status.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        fs::write(&paths.status, status_json).map_err(|source| CliError::Io {
-            path: paths.status.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        file.set_len(0).map_err(|source| CliError::Io {
-            path: paths.lock.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        serde_json::to_writer_pretty(&file, &status).map_err(|source| CliError::Json {
-            path: paths.lock.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        Ok(Self {
-            file,
-            paths: paths.clone(),
-        })
-    }
-}
-
-impl Drop for DaemonLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.paths.status);
-        let _ = self.file.unlock();
-        let _ = fs::remove_file(&self.paths.lock);
-    }
-}
-
-impl DaemonStatus {
-    fn new(
-        options: &DaemonRunOptions,
-        paths: &DaemonPaths,
-        cluster: Option<DaemonClusterStatus>,
-    ) -> Self {
-        Self {
-            pid: std::process::id(),
-            host: options.host.clone(),
-            port: options.port,
-            address: daemon_connect_address(&options.host, options.port),
-            version: daemon_package_version(),
-            target_os: Some(std::env::consts::OS.to_string()),
-            target_arch: Some(std::env::consts::ARCH.to_string()),
-            executable: env::current_exe().ok(),
-            rollout: None,
-            started_at: OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "unknown".to_string()),
-            data_dir: paths.root.parent().unwrap_or(&paths.root).to_path_buf(),
-            lock_file: paths.lock.clone(),
-            cluster,
-        }
-    }
-}
-
-fn daemon_package_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
-}
-
-fn daemon_connect_address(host: &str, port: u16) -> String {
-    let connect_host = match host {
-        "0.0.0.0" | "::" => SINOMO_DAEMON_DEFAULT_HOST,
-        value => value,
-    };
-    format!("{connect_host}:{port}")
-}
-
-fn daemon_bind_address(status: &DaemonStatus) -> String {
-    format!("{}:{}", status.host, status.port)
-}
-
 fn print_daemon_platform(status: &DaemonStatus) {
     if let (Some(target_os), Some(target_arch)) = (&status.target_os, &status.target_arch) {
         println!("  platform: {target_os}/{target_arch}");
@@ -3384,7 +3194,10 @@ fn run_shadow_daemon_with_paths(
     main_binary: PathBuf,
     registration: Option<DaemonClusterRegistration>,
 ) -> Result<(), CliError> {
-    let _lock = DaemonLock::acquire(&shadow_paths, &options, registration.as_ref())?;
+    let cluster = registration
+        .map(|registration| register_daemon_cluster_node(&registration))
+        .transpose()?;
+    let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster)?;
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
@@ -3800,7 +3613,10 @@ fn run_daemon_with_paths(
     label: &str,
     registration: Option<DaemonClusterRegistration>,
 ) -> Result<(), CliError> {
-    let _lock = DaemonLock::acquire(&paths, &options, registration.as_ref())?;
+    let cluster = registration
+        .map(|registration| register_daemon_cluster_node(&registration))
+        .transpose()?;
+    let _lock = DaemonLock::acquire(&paths, &options, cluster)?;
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
@@ -4077,543 +3893,224 @@ fn stop_daemon_with_paths(
     }
 }
 
-fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProbeStatus {
-    let status = read_daemon_status(paths).ok();
-    if let Some(status) = &status {
-        if send_daemon_command(&status.address, "STATUS", timeout)
-            .ok()
-            .and_then(|response| serde_json::from_str::<DaemonStatus>(&response).ok())
-            .is_some_and(|remote_status| daemon_status_matches_probe(status, &remote_status))
-        {
-            return DaemonProbeStatus::Running(status.clone());
-        }
-    }
-
-    if !paths.lock.exists() {
-        let _ = fs::remove_file(&paths.status);
-        return DaemonProbeStatus::NotRunning;
-    }
-
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&paths.lock)
-    else {
-        return DaemonProbeStatus::Locked { status };
-    };
-
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = file.unlock();
-            let _ = fs::remove_file(&paths.lock);
-            let _ = fs::remove_file(&paths.status);
-            DaemonProbeStatus::NotRunning
-        }
-        Err(_) => DaemonProbeStatus::Locked { status },
-    }
-}
-
-fn daemon_status_matches_probe(expected: &DaemonStatus, actual: &DaemonStatus) -> bool {
-    expected.pid == actual.pid
-        && expected.data_dir == actual.data_dir
-        && expected.lock_file == actual.lock_file
-        && expected.port == actual.port
-}
-
-fn read_daemon_status(paths: &DaemonPaths) -> Result<DaemonStatus, CliError> {
-    let content = fs::read_to_string(&paths.status).map_err(|source| CliError::Io {
-        path: paths.status.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content).map_err(|source| CliError::Json {
-        path: paths.status.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-fn write_daemon_status(paths: &DaemonPaths, status: &DaemonStatus) -> Result<(), CliError> {
-    let status_json = serde_json::to_vec_pretty(status).map_err(|source| CliError::Json {
-        path: paths.status.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::write(&paths.status, status_json).map_err(|source| CliError::Io {
-        path: paths.status.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-fn send_daemon_command(
-    address: &str,
-    command: &str,
-    timeout: Duration,
-) -> Result<String, CliError> {
-    let signed = sign_daemon_command_for_local_node(command)?;
-    let response = send_daemon_command_raw(address, &signed, timeout)?;
-    if response.trim() == "unknown daemon command" {
-        return send_daemon_command_raw(address, command, timeout);
-    }
-    Ok(response)
-}
-
-fn send_daemon_command_raw(
-    address: &str,
-    command: &str,
-    timeout: Duration,
-) -> Result<String, CliError> {
-    let socket_address = address
-        .to_socket_addrs()
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?
-        .next()
-        .ok_or_else(|| CliError::Network {
-            address: address.to_string(),
-            detail: "no socket addresses resolved".to_string(),
-        })?;
-    let mut stream = TcpStream::connect_timeout(&socket_address, timeout).map_err(|source| {
-        CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        }
-    })?;
-    stream
-        .set_nonblocking(false)
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    stream
-        .write_all(format!("{command}\n").as_bytes())
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    let _ = stream.shutdown(Shutdown::Write);
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    Ok(response)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SignedDaemonCommand {
-    protocol: String,
-    node_id: String,
-    public_key: String,
-    timestamp: String,
-    nonce: String,
-    command: String,
-    signature: String,
-}
-
-fn sign_daemon_command_for_local_node(command: &str) -> Result<String, CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_root_layout()?;
-    sign_daemon_command_from_data_dir(&data_dir, command)
-}
-
-fn sign_daemon_command_from_data_dir(
-    data_dir: &SinomoDataDir,
-    command: &str,
-) -> Result<String, CliError> {
-    let identity = load_or_create_main_node_identity(&data_dir.root())?;
-    let node_id = read_cluster_state(&ClusterPaths::new(&data_dir))
-        .map(|state| state.local_node_id.to_string())
-        .unwrap_or_else(|_| "node_local".to_string());
-    let timestamp = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string());
-    let nonce = format!("{}-{}", std::process::id(), rollout_artifact_suffix());
-    let key_pair = identity.key_pair()?;
-    let signing_payload =
-        daemon_auth_signing_payload(&node_id, &identity.public_key, &timestamp, &nonce, command);
-    let signature = key_pair.sign(signing_payload.as_bytes());
-    let envelope = SignedDaemonCommand {
-        protocol: DAEMON_AUTH_PROTOCOL.to_string(),
-        node_id,
-        public_key: identity.public_key,
-        timestamp,
-        nonce,
-        command: command.to_string(),
-        signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
-    };
-    let payload = serde_json::to_string(&envelope).map_err(|source| CliError::Json {
-        path: "daemon auth envelope".to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(format!("AUTH {payload}"))
-}
-
-fn authenticate_daemon_command(paths: &DaemonPaths, raw: &str) -> Result<String, CliError> {
-    let payload = raw
-        .strip_prefix("AUTH ")
-        .ok_or_else(|| CliError::AuthDenied)?;
-    let envelope: SignedDaemonCommand =
-        serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "daemon auth envelope".to_string(),
-            detail: source.to_string(),
-        })?;
-    verify_signed_daemon_command(paths, &envelope)?;
-    Ok(envelope.command)
-}
-
-fn verify_signed_daemon_command(
-    paths: &DaemonPaths,
-    envelope: &SignedDaemonCommand,
-) -> Result<(), CliError> {
-    if envelope.protocol != DAEMON_AUTH_PROTOCOL {
-        return Err(CliError::AuthDenied);
-    }
-    let signed_at =
-        OffsetDateTime::parse(&envelope.timestamp, &Rfc3339).map_err(|_| CliError::AuthDenied)?;
-    let now = OffsetDateTime::now_utc();
-    let skew = (now - signed_at).whole_seconds().abs();
-    if skew > DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS {
-        return Err(CliError::AuthExpired);
-    }
-    if envelope.nonce.trim().is_empty() || envelope.command.trim().is_empty() {
-        return Err(CliError::AuthDenied);
-    }
-    let public_key = URL_SAFE_NO_PAD
-        .decode(envelope.public_key.as_bytes())
-        .map_err(|_| CliError::AuthDenied)?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(envelope.signature.as_bytes())
-        .map_err(|_| CliError::AuthDenied)?;
-    let signing_payload = daemon_auth_signing_payload(
-        &envelope.node_id,
-        &envelope.public_key,
-        &envelope.timestamp,
-        &envelope.nonce,
-        &envelope.command,
-    );
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(signing_payload.as_bytes(), &signature)
-        .map_err(|_| CliError::AuthDenied)?;
-    authorize_daemon_signer(paths, envelope)
-}
-
-fn daemon_auth_signing_payload(
-    node_id: &str,
-    public_key: &str,
-    timestamp: &str,
-    nonce: &str,
-    command: &str,
-) -> String {
-    format!("{DAEMON_AUTH_PROTOCOL}\n{node_id}\n{public_key}\n{timestamp}\n{nonce}\n{command}")
-}
-
-fn authorize_daemon_signer(
-    paths: &DaemonPaths,
-    envelope: &SignedDaemonCommand,
-) -> Result<(), CliError> {
-    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
-        path: paths.root.display().to_string(),
-        detail: "daemon paths have no data directory parent".to_string(),
-    })?;
-    let main_identity = load_or_create_main_node_identity(data_dir)?;
-    let shadow_identity = load_or_create_shadow_node_identity(data_dir)?;
-    if envelope.public_key == main_identity.public_key
-        || envelope.public_key == shadow_identity.public_key
-    {
-        return Ok(());
-    }
-
-    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    if cluster_paths.state.exists() {
-        let state = read_cluster_state(&cluster_paths)?;
-        if state.members.iter().any(|member| {
-            member.node_public_key == envelope.public_key && member.state.is_authorized()
-        }) {
-            return Ok(());
-        }
-    }
-
-    if envelope.command.starts_with("CLUSTER_JOIN ") {
-        return authorize_cluster_join_signer(&envelope.command, &envelope.public_key);
-    }
-    Err(CliError::AuthDenied)
-}
-
-fn authorize_cluster_join_signer(command: &str, public_key: &str) -> Result<(), CliError> {
-    let payload = command
-        .strip_prefix("CLUSTER_JOIN ")
-        .unwrap_or_default()
-        .trim();
-    let request: ClusterJoinRegistrationRequest =
-        serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "cluster join registration".to_string(),
-            detail: source.to_string(),
-        })?;
-    if request
-        .members
-        .iter()
-        .any(|member| member.node_public_key == public_key)
-    {
-        return Ok(());
-    }
-    Err(CliError::AuthDenied)
-}
-
 fn handle_daemon_connection(stream: &mut TcpStream, paths: &DaemonPaths) -> Result<bool, CliError> {
-    let mut reader =
-        io::BufReader::new(stream.try_clone().map_err(|source| CliError::Network {
-            address: "daemon client".to_string(),
-            detail: source.to_string(),
-        })?);
-    let mut request = String::new();
-    reader
-        .read_line(&mut request)
-        .map_err(|source| CliError::Network {
-            address: "daemon client".to_string(),
-            detail: source.to_string(),
-        })?;
-    let command = request.lines().next().unwrap_or_default().trim();
-    let command = match authenticate_daemon_command(paths, command) {
-        Ok(command) => command,
-        Err(error) => {
-            stream
-                .write_all(format!("auth failed: {error}\n").as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            return Ok(false);
-        }
-    };
-    let command = command.as_str();
-    match command {
-        "STATUS" => {
-            let mut status = read_daemon_status(paths)?;
-            ensure_daemon_status_cluster(paths, &mut status)?;
-            if let Some(data_dir) = paths.root.parent() {
-                status.rollout = read_cluster_rollout_status(&SelfRolloutPaths::new(data_dir))?;
+    handle_authenticated_daemon_connection(stream, paths, |authenticated, stream| {
+        let command = authenticated.command.as_str();
+        match command {
+            "STATUS" => {
+                let mut status = read_daemon_status(paths)?;
+                ensure_daemon_status_cluster(paths, &mut status)?;
+                if let Some(data_dir) = paths.root.parent() {
+                    status.rollout = read_cluster_rollout_status(&SelfRolloutPaths::new(data_dir))?;
+                }
+                let body =
+                    serde_json::to_string_pretty(&status).map_err(|source| CliError::Json {
+                        path: paths.status.display().to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: status.address.clone(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
             }
-            let body = serde_json::to_string_pretty(&status).map_err(|source| CliError::Json {
-                path: paths.status.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            stream
-                .write_all(body.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: status.address.clone(),
-                    detail: source.to_string(),
-                })?;
-            Ok(false)
-        }
-        "SHUTDOWN" => {
-            stream
-                .write_all(b"sinomo daemon stopping\n")
-                .map_err(|source| CliError::Network {
+            "SHUTDOWN" => {
+                stream
+                    .write_all(b"sinomo daemon stopping\n")
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(true)
+            }
+            "FINALIZE_SHADOW_ROLLOUT" => {
+                let response = handle_daemon_finalize_shadow_rollout(paths)?;
+                stream
+                    .write_all(response.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            "ROLLOUT_DIAGNOSTICS" => {
+                let response = handle_daemon_rollout_diagnostics(paths)?;
+                stream
+                    .write_all(response.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            command if command.starts_with("CLUSTER_JOIN ") => {
+                let payload = command
+                    .strip_prefix("CLUSTER_JOIN ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = handle_daemon_cluster_join(paths, payload)?;
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "cluster join response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            "CLUSTER_KV_SNAPSHOT" => {
+                let snapshot = handle_daemon_cluster_kv_snapshot(paths)?;
+                let body =
+                    serde_json::to_string_pretty(&snapshot).map_err(|source| CliError::Json {
+                        path: "cluster kv snapshot response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            command if command.starts_with("CLUSTER_KV_TXN ") => {
+                let payload = command
+                    .strip_prefix("CLUSTER_KV_TXN ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = handle_daemon_cluster_kv_txn(paths, payload)?;
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "cluster kv txn response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            command if command.starts_with("CLUSTER_KV_RANGE_PREFIX ") => {
+                let prefix = command
+                    .strip_prefix("CLUSTER_KV_RANGE_PREFIX ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = handle_daemon_cluster_kv_range_prefix(paths, prefix)?;
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "cluster kv range response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            command if command.starts_with("CLUSTER_SYNC ") => {
+                let payload = command
+                    .strip_prefix("CLUSTER_SYNC ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = handle_daemon_cluster_sync(paths, payload)?;
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "cluster sync response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            command if command.starts_with("ROLLOUT_BINARY ") => {
+                let payload = command
+                    .strip_prefix("ROLLOUT_BINARY ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = match handle_daemon_rollout_binary(paths, payload) {
+                    Ok(response) => response,
+                    Err(error) => ClusterRolloutBinaryResponse {
+                        status: "failed".to_string(),
+                        detail: error.to_string(),
+                        main_binary: PathBuf::new(),
+                        shadow_binary: PathBuf::new(),
+                    },
+                };
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "rollout response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream.flush().map_err(|source| CliError::Network {
                     address: "daemon client".to_string(),
                     detail: source.to_string(),
                 })?;
-            Ok(true)
-        }
-        "FINALIZE_SHADOW_ROLLOUT" => {
-            let response = handle_daemon_finalize_shadow_rollout(paths)?;
-            stream
-                .write_all(response.as_bytes())
-                .map_err(|source| CliError::Network {
+                let _ = stream.shutdown(Shutdown::Write);
+                Ok(response.status == "accepted")
+            }
+            command if command.starts_with("ROLLOUT_BUILD ") => {
+                let payload = command
+                    .strip_prefix("ROLLOUT_BUILD ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = match handle_daemon_rollout_build(paths, payload) {
+                    Ok(response) => response,
+                    Err(error) => ClusterRolloutBinaryResponse {
+                        status: "failed".to_string(),
+                        detail: error.to_string(),
+                        main_binary: PathBuf::new(),
+                        shadow_binary: PathBuf::new(),
+                    },
+                };
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "rollout response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream.flush().map_err(|source| CliError::Network {
                     address: "daemon client".to_string(),
                     detail: source.to_string(),
                 })?;
-            Ok(false)
+                let _ = stream.shutdown(Shutdown::Write);
+                Ok(response.status == "accepted")
+            }
+            _ => {
+                stream
+                    .write_all(b"unknown daemon command\n")
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
         }
-        "ROLLOUT_DIAGNOSTICS" => {
-            let response = handle_daemon_rollout_diagnostics(paths)?;
-            stream
-                .write_all(response.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            Ok(false)
-        }
-        command if command.starts_with("CLUSTER_JOIN ") => {
-            let payload = command
-                .strip_prefix("CLUSTER_JOIN ")
-                .unwrap_or_default()
-                .trim();
-            let response = handle_daemon_cluster_join(paths, payload)?;
-            let body =
-                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                    path: "cluster join response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream
-                .write_all(body.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            Ok(false)
-        }
-        "CLUSTER_KV_SNAPSHOT" => {
-            let snapshot = handle_daemon_cluster_kv_snapshot(paths)?;
-            let body =
-                serde_json::to_string_pretty(&snapshot).map_err(|source| CliError::Json {
-                    path: "cluster kv snapshot response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream
-                .write_all(body.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            Ok(false)
-        }
-        command if command.starts_with("CLUSTER_KV_TXN ") => {
-            let payload = command
-                .strip_prefix("CLUSTER_KV_TXN ")
-                .unwrap_or_default()
-                .trim();
-            let response = handle_daemon_cluster_kv_txn(paths, payload)?;
-            let body =
-                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                    path: "cluster kv txn response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream
-                .write_all(body.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            Ok(false)
-        }
-        command if command.starts_with("CLUSTER_KV_RANGE_PREFIX ") => {
-            let prefix = command
-                .strip_prefix("CLUSTER_KV_RANGE_PREFIX ")
-                .unwrap_or_default()
-                .trim();
-            let response = handle_daemon_cluster_kv_range_prefix(paths, prefix)?;
-            let body =
-                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                    path: "cluster kv range response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream
-                .write_all(body.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            Ok(false)
-        }
-        command if command.starts_with("CLUSTER_SYNC ") => {
-            let payload = command
-                .strip_prefix("CLUSTER_SYNC ")
-                .unwrap_or_default()
-                .trim();
-            let response = handle_daemon_cluster_sync(paths, payload)?;
-            let body =
-                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                    path: "cluster sync response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream
-                .write_all(body.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            Ok(false)
-        }
-        command if command.starts_with("ROLLOUT_BINARY ") => {
-            let payload = command
-                .strip_prefix("ROLLOUT_BINARY ")
-                .unwrap_or_default()
-                .trim();
-            let response = match handle_daemon_rollout_binary(paths, payload) {
-                Ok(response) => response,
-                Err(error) => ClusterRolloutBinaryResponse {
-                    status: "failed".to_string(),
-                    detail: error.to_string(),
-                    main_binary: PathBuf::new(),
-                    shadow_binary: PathBuf::new(),
-                },
-            };
-            let body =
-                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                    path: "rollout response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream
-                .write_all(body.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream.flush().map_err(|source| CliError::Network {
-                address: "daemon client".to_string(),
-                detail: source.to_string(),
-            })?;
-            let _ = stream.shutdown(Shutdown::Write);
-            Ok(response.status == "accepted")
-        }
-        command if command.starts_with("ROLLOUT_BUILD ") => {
-            let payload = command
-                .strip_prefix("ROLLOUT_BUILD ")
-                .unwrap_or_default()
-                .trim();
-            let response = match handle_daemon_rollout_build(paths, payload) {
-                Ok(response) => response,
-                Err(error) => ClusterRolloutBinaryResponse {
-                    status: "failed".to_string(),
-                    detail: error.to_string(),
-                    main_binary: PathBuf::new(),
-                    shadow_binary: PathBuf::new(),
-                },
-            };
-            let body =
-                serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                    path: "rollout response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream
-                .write_all(body.as_bytes())
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            stream.flush().map_err(|source| CliError::Network {
-                address: "daemon client".to_string(),
-                detail: source.to_string(),
-            })?;
-            let _ = stream.shutdown(Shutdown::Write);
-            Ok(response.status == "accepted")
-        }
-        _ => {
-            stream
-                .write_all(b"unknown daemon command\n")
-                .map_err(|source| CliError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-            Ok(false)
-        }
-    }
+    })
 }
 
 fn handle_daemon_cluster_kv_snapshot(paths: &DaemonPaths) -> Result<KvSnapshot, CliError> {

@@ -13,7 +13,6 @@ ring = "application"
 
 [dependencies]
 base64 = "0.22"
-fs2.workspace = true
 ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true

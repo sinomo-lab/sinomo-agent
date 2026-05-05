@@ -111,6 +111,27 @@ impl From<network::NetworkError> for CliError {
     }
 }
 
+impl From<sinomo_runtime::daemon::DaemonError> for CliError {
+    fn from(error: sinomo_runtime::daemon::DaemonError) -> Self {
+        match error {
+            sinomo_runtime::daemon::DaemonError::AuthDenied => Self::AuthDenied,
+            sinomo_runtime::daemon::DaemonError::AuthExpired => Self::AuthExpired,
+            sinomo_runtime::daemon::DaemonError::Io { path, detail } => Self::Io { path, detail },
+            sinomo_runtime::daemon::DaemonError::Json { path, detail } => {
+                Self::Json { path, detail }
+            }
+            sinomo_runtime::daemon::DaemonError::Parse { detail } => Self::Parse { detail },
+            sinomo_runtime::daemon::DaemonError::Network { address, detail } => {
+                Self::Network { address, detail }
+            }
+            sinomo_runtime::daemon::DaemonError::AlreadyRunning { lock_file, detail } => {
+                Self::DaemonAlreadyRunning { lock_file, detail }
+            }
+            sinomo_runtime::daemon::DaemonError::ClusterOrphan => Self::ClusterOrphan,
+        }
+    }
+}
+
 impl From<sinomo_runtime::node::NodeIdentityError> for CliError {
     fn from(error: sinomo_runtime::node::NodeIdentityError) -> Self {
         match error {
