@@ -323,11 +323,17 @@ Watches:
 Use slash-delimited namespaces:
 
 ```text
-/cluster/meta
+/cluster/config/identity
+/cluster/raft/config
 /cluster/members/<node_id>
 /cluster/node-status/<node_id>
 /cluster/endpoints/<node_id>/<endpoint_id>
-/cluster/capabilities/<node_id>/<capability>
+/cluster/policy/capabilities/<node_id>
+/cluster/certificates/<certificate_id>
+/cluster/invitations/<invite_id>
+/cluster/invitations/<invite_id>/state
+/cluster/rollout/desired
+/cluster/rollout/nodes/<node_id>
 /services/<service_name>/<node_id>
 /sessions/<session_id>/summary
 /sessions/<session_id>/participants/<node_id>
@@ -336,7 +342,6 @@ Use slash-delimited namespaces:
 /dfs/paths/<workspace_id>/<escaped_path>
 /dfs/locks/<workspace_id>/<object_id>
 /policy/<domain>/<key>
-/rollout/desired/<node_id>/<artifact_id>
 ```
 
 Large or frequently changing values should store references to event log entries or DFS objects rather than embedding payloads directly.
@@ -450,7 +455,7 @@ Phase 2, KV core:
 
 - Implement a real Raft/KV core for tests, local development, and daemon integration. Implemented in `crates/sinomo-kv` with voter quorum commit, append-entries validation, vote requests, leader transfer, follower catch-up, committed-index tracking, hard-state records, and deterministic multi-node tests.
 - Add WAL, snapshots, revisions, compare-and-swap transactions, and watches. Implemented as `DurableRaftKvNode`, `KvWalPaths`, `RaftHardState`, `KvLogEntry`, `RaftSnapshot`, `KvRevision`, `KvTxn`, and prefix watches; durable nodes replay JSONL WAL entries, persist hard state, save and restore snapshots, preserve watchable event history across snapshot restore, and compact WAL after snapshots.
-- Store membership and service registry records in the KV. Implemented for cluster membership records under `/cluster/members/<node_id>` and runtime health records under `/cluster/node-status/<node_id>`; service registry records use the same generic keyspace and lease primitives.
+- Store membership and service registry records in the KV. Implemented for cluster identity under `/cluster/config/identity`, Raft role config under `/cluster/raft/config`, membership records under `/cluster/members/<node_id>`, split endpoint records under `/cluster/endpoints/<node_id>/<endpoint_id>`, capability policy under `/cluster/policy/capabilities/<node_id>`, invitations and invite state under `/cluster/invitations/...`, rollout desired/node state under `/cluster/rollout/...`, and runtime health records under `/cluster/node-status/<node_id>`; service registry records use the same generic keyspace and lease primitives.
 - Generate node identity key pairs and publish public keys in KV membership records. Implemented with node-local Ed25519 identity files under `$SINOMO_DATA_DIR/identity/`; the main daemon and shadow daemon have distinct public keys, and local CLI control messages are signed from the local main identity.
 - Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned `CLUSTER_KV_SNAPSHOT`, `CLUSTER_KV_TXN`, and `CLUSTER_KV_RANGE_PREFIX` control messages backed by a per-node durable Raft WAL under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/`; `$SINOMO_DATA_DIR/cluster/kv-snapshot.json` is retained as a read-compatibility mirror. Cluster init, daemon registration, and join registration persist member records into the KV, daemon maintenance publishes version/health/rollout node-status records, and join responses carry the current snapshot to the joining node.
 - Integrate the daemon's cluster KV transport with the durable Raft core. Implemented with authenticated `CLUSTER_RAFT_APPEND`, `CLUSTER_RAFT_VOTE`, and `CLUSTER_KV_WATCH_EVENTS` daemon messages. The periodic cluster path no longer exchanges and merges whole KV snapshots; the current durable Raft leader sends append-entries with optional Raft snapshot-install payloads to followers, and vote requests are handled against durable local hard state. Daemon maintenance checks leader reachability, starts a new election when the known leader is missing, persists the elected leader after quorum, steps down when it cannot observe quorum during replication, and fans out watch event history over the authenticated transport so local daemon-backed prefix watches can resume and drain committed changes.

@@ -2,10 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ClusterBootstrapState, ClusterCertificate, ClusterEndpointPrivacy, ClusterEndpointRecord,
-    ClusterEndpointSource, ClusterId, ClusterInviteId, ClusterMemberRecord,
-    ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, EventId, LatencyClass, NodeId,
-    RoutingScope, SessionId,
+    CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointPrivacy,
+    ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterInviteId, ClusterMemberRecord,
+    ClusterMemberRole, ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, EventId,
+    LatencyClass, NodeId, RoutingScope, SessionId,
 };
 use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
 use sinomo_kv::{
@@ -148,6 +148,71 @@ pub struct ClusterKvWatchDrainResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<KvEvent>,
     pub next_revision: KvRevision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterIdentityRecord {
+    pub cluster_id: ClusterId,
+    pub cluster_name: String,
+    pub local_node_id: NodeId,
+    pub local_node_display_name: String,
+    pub term: u64,
+    pub kv_revision: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub initialized_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRaftConfigRecord {
+    pub cluster_id: ClusterId,
+    pub term: u64,
+    pub kv_revision: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voters: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learners: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_voting: Vec<NodeId>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterCapabilityPolicyRecord {
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<CapabilityName>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_capabilities: Vec<CapabilityName>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterInvitationStateRecord {
+    pub cluster_id: ClusterId,
+    pub invite_id: ClusterInviteId,
+    pub state: String,
+    pub issuer_node_id: NodeId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutDesiredRecord {
+    pub cluster_id: ClusterId,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
 }
 
 pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, NetworkError> {
@@ -556,8 +621,86 @@ pub fn read_cluster_members_from_kv(
             })?;
         members.push(member);
     }
+    let endpoints = read_cluster_endpoints_from_store(&store)?;
+    let policies = read_cluster_capability_policies_from_store(&store)?;
+    for member in &mut members {
+        if let Some(policy) = policies.get(&member.node_id) {
+            member.capabilities = policy.capabilities.clone();
+            member.allowed_capabilities = policy.allowed_capabilities.clone();
+        }
+        if let Some(member_endpoints) = endpoints.get(&member.node_id) {
+            for endpoint in member_endpoints {
+                if !member
+                    .endpoints
+                    .iter()
+                    .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+                {
+                    member.endpoints.push(endpoint.clone());
+                }
+            }
+        }
+    }
     members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(members)
+}
+
+pub fn read_cluster_endpoints_from_kv(
+    paths: &ClusterPaths,
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    if !paths.kv_snapshot.exists() {
+        return Ok(Vec::new());
+    }
+    let store = read_cluster_kv_store(paths)?;
+    let mut endpoints = read_cluster_endpoints_from_store(&store)?
+        .into_values()
+        .flatten()
+        .collect::<Vec<_>>();
+    endpoints.sort_by(|left, right| {
+        (
+            left.node_id.as_str(),
+            left.priority,
+            left.endpoint_id.as_str(),
+        )
+            .cmp(&(
+                right.node_id.as_str(),
+                right.priority,
+                right.endpoint_id.as_str(),
+            ))
+    });
+    Ok(endpoints)
+}
+
+fn read_cluster_endpoints_from_store(
+    store: &InProcessKvStore,
+) -> Result<BTreeMap<NodeId, Vec<ClusterEndpointRecord>>, NetworkError> {
+    let mut endpoints: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> = BTreeMap::new();
+    for entry in store.range_prefix("/cluster/endpoints/") {
+        let endpoint: ClusterEndpointRecord =
+            serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
+                path: entry.key,
+                detail: source.to_string(),
+            })?;
+        endpoints
+            .entry(endpoint.node_id.clone())
+            .or_default()
+            .push(endpoint);
+    }
+    Ok(endpoints)
+}
+
+fn read_cluster_capability_policies_from_store(
+    store: &InProcessKvStore,
+) -> Result<BTreeMap<NodeId, ClusterCapabilityPolicyRecord>, NetworkError> {
+    let mut policies = BTreeMap::new();
+    for entry in store.range_prefix("/cluster/policy/capabilities/") {
+        let policy: ClusterCapabilityPolicyRecord =
+            serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
+                path: entry.key,
+                detail: source.to_string(),
+            })?;
+        policies.insert(policy.node_id.clone(), policy);
+    }
+    Ok(policies)
 }
 
 pub fn read_cluster_node_statuses_from_kv(
@@ -584,16 +727,60 @@ pub fn sync_cluster_state_to_kv(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, NetworkError> {
-    let mut snapshot = open_cluster_raft_kv_node(paths, &state.local_node_id)
+    let initial_snapshot = open_cluster_raft_kv_node(paths, &state.local_node_id)
         .map(|node| node.store().snapshot())
         .or_else(|error| {
             eprintln!("warning: replacing unreadable cluster kv raft state: {error}");
             write_cluster_kv_snapshot(paths, &InProcessKvStore::new().snapshot())?;
             Ok::<KvSnapshot, NetworkError>(InProcessKvStore::new().snapshot())
         })?;
+    let rollout_desired_exists = initial_snapshot
+        .entries
+        .iter()
+        .any(|entry| entry.key == cluster_rollout_desired_key());
+    put_cluster_kv_json(
+        paths,
+        &state.local_node_id,
+        cluster_identity_key(),
+        &ClusterIdentityRecord::from(state),
+    )?;
+    let mut snapshot = put_cluster_kv_json(
+        paths,
+        &state.local_node_id,
+        cluster_raft_config_key(),
+        &ClusterRaftConfigRecord::from(state),
+    )?;
+    if !rollout_desired_exists {
+        snapshot = put_cluster_kv_json(
+            paths,
+            &state.local_node_id,
+            cluster_rollout_desired_key(),
+            &ClusterRolloutDesiredRecord {
+                cluster_id: state.cluster_id.clone(),
+                state: "idle".to_string(),
+                source: None,
+                mode: None,
+                updated_at: state.updated_at,
+            },
+        )?;
+    }
     for member in &state.members {
         let command = KvCommand::PutClusterMember(member.clone());
-        snapshot = append_cluster_raft_command(paths, &state.local_node_id, command)?;
+        append_cluster_raft_command(paths, &state.local_node_id, command)?;
+        snapshot = put_cluster_kv_json(
+            paths,
+            &state.local_node_id,
+            cluster_capability_policy_key(&member.node_id),
+            &ClusterCapabilityPolicyRecord::from(member),
+        )?;
+        for endpoint in &member.endpoints {
+            snapshot = put_cluster_kv_json(
+                paths,
+                &state.local_node_id,
+                cluster_endpoint_key(&member.node_id, endpoint),
+                endpoint,
+            )?;
+        }
     }
     Ok(snapshot)
 }
@@ -604,11 +791,13 @@ pub fn sync_cluster_node_status_to_kv(
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
     let key = cluster_node_status_key(&status.node_id);
+    let node_id = status.node_id.clone();
+    let rollout = status.rollout.clone();
     let value = serde_json::to_vec(&status).map_err(|source| NetworkError::Json {
         path: key.clone(),
         detail: source.to_string(),
     })?;
-    append_cluster_raft_command(
+    let snapshot = append_cluster_raft_command(
         paths,
         &state.local_node_id,
         KvCommand::Op(KvOp::Put {
@@ -616,15 +805,51 @@ pub fn sync_cluster_node_status_to_kv(
             value,
             lease_id: None,
         }),
-    )
+    )?;
+    if let Some(rollout) = rollout {
+        return sync_cluster_rollout_node_to_kv(paths, &rollout, &node_id);
+    }
+    Ok(snapshot)
 }
 
 pub fn cluster_node_status_key(node_id: &NodeId) -> String {
     format!("/cluster/node-status/{node_id}")
 }
 
+pub fn cluster_identity_key() -> String {
+    "/cluster/config/identity".to_string()
+}
+
+pub fn cluster_raft_config_key() -> String {
+    "/cluster/raft/config".to_string()
+}
+
+pub fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
+    format!("/cluster/endpoints/{node_id}/{}", endpoint.endpoint_id)
+}
+
+pub fn cluster_capability_policy_key(node_id: &NodeId) -> String {
+    format!("/cluster/policy/capabilities/{node_id}")
+}
+
+pub fn cluster_certificate_key(certificate: &ClusterCertificate) -> String {
+    format!("/cluster/certificates/{}", certificate.certificate_id)
+}
+
 pub fn cluster_invitation_key(invite_id: &ClusterInviteId) -> String {
     format!("/cluster/invitations/{invite_id}")
+}
+
+pub fn cluster_invitation_state_key(invite_id: &ClusterInviteId) -> String {
+    format!("/cluster/invitations/{invite_id}/state")
+}
+
+pub fn cluster_rollout_desired_key() -> String {
+    "/cluster/rollout/desired".to_string()
+}
+
+pub fn cluster_rollout_node_key(node_id: &NodeId) -> String {
+    format!("/cluster/rollout/nodes/{node_id}")
 }
 
 pub fn read_cluster_invitation_from_kv(
@@ -648,20 +873,130 @@ pub fn sync_cluster_invitation_to_kv(
     invite: &sinomo_core::ClusterJoinInvite,
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
-    let key = cluster_invitation_key(&invite.invite_id);
-    let value = serde_json::to_vec(invite).map_err(|source| NetworkError::Json {
+    put_cluster_kv_json(
+        paths,
+        &state.local_node_id,
+        cluster_invitation_key(&invite.invite_id),
+        invite,
+    )?;
+    put_cluster_kv_json(
+        paths,
+        &state.local_node_id,
+        cluster_invitation_state_key(&invite.invite_id),
+        &ClusterInvitationStateRecord {
+            cluster_id: invite.cluster_id.clone(),
+            invite_id: invite.invite_id.clone(),
+            state: "active".to_string(),
+            issuer_node_id: invite.issuer_node_id.clone(),
+            expires_at: invite.expires_at,
+            updated_at: OffsetDateTime::now_utc(),
+        },
+    )
+}
+
+pub fn sync_cluster_certificate_to_kv(
+    paths: &ClusterPaths,
+    certificate: &ClusterCertificate,
+) -> Result<KvSnapshot, NetworkError> {
+    let state = read_cluster_state_without_kv(paths)?;
+    put_cluster_kv_json(
+        paths,
+        &state.local_node_id,
+        cluster_certificate_key(certificate),
+        certificate,
+    )
+}
+
+pub fn sync_cluster_rollout_node_to_kv(
+    paths: &ClusterPaths,
+    status: &sinomo_core::ClusterNodeRolloutStatus,
+    node_id: &NodeId,
+) -> Result<KvSnapshot, NetworkError> {
+    let state = read_cluster_state_without_kv(paths)?;
+    put_cluster_kv_json(
+        paths,
+        &state.local_node_id,
+        cluster_rollout_node_key(node_id),
+        status,
+    )
+}
+
+fn put_cluster_kv_json<T: Serialize>(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    key: String,
+    value: &T,
+) -> Result<KvSnapshot, NetworkError> {
+    let value = serde_json::to_vec(value).map_err(|source| NetworkError::Json {
         path: key.clone(),
         detail: source.to_string(),
     })?;
     append_cluster_raft_command(
         paths,
-        &state.local_node_id,
+        node_id,
         KvCommand::Op(KvOp::Put {
             key,
             value,
             lease_id: None,
         }),
     )
+}
+
+impl From<&ClusterBootstrapState> for ClusterIdentityRecord {
+    fn from(state: &ClusterBootstrapState) -> Self {
+        Self {
+            cluster_id: state.cluster_id.clone(),
+            cluster_name: state.cluster_name.clone(),
+            local_node_id: state.local_node_id.clone(),
+            local_node_display_name: state.local_node_display_name.clone(),
+            term: state.term,
+            kv_revision: state.kv_revision,
+            initialized_at: state.initialized_at,
+            updated_at: state.updated_at,
+        }
+    }
+}
+
+impl From<&ClusterBootstrapState> for ClusterRaftConfigRecord {
+    fn from(state: &ClusterBootstrapState) -> Self {
+        let mut voters = Vec::new();
+        let mut learners = Vec::new();
+        let mut non_voting = Vec::new();
+        for member in &state.members {
+            if !member.state.is_authorized() {
+                continue;
+            }
+            match member.role {
+                ClusterMemberRole::Voter => voters.push(member.node_id.clone()),
+                ClusterMemberRole::Learner => learners.push(member.node_id.clone()),
+                ClusterMemberRole::NonVoting => non_voting.push(member.node_id.clone()),
+            }
+        }
+        voters.sort();
+        learners.sort();
+        non_voting.sort();
+        Self {
+            cluster_id: state.cluster_id.clone(),
+            term: state.term,
+            kv_revision: state.kv_revision,
+            voters,
+            learners,
+            non_voting,
+            updated_at: state.updated_at,
+        }
+    }
+}
+
+impl From<&ClusterMemberRecord> for ClusterCapabilityPolicyRecord {
+    fn from(member: &ClusterMemberRecord) -> Self {
+        Self {
+            cluster_id: member.cluster_id.clone(),
+            node_id: member.node_id.clone(),
+            capabilities: member.capabilities.clone(),
+            allowed_capabilities: member.allowed_capabilities.clone(),
+            updated_at: member.updated_at,
+        }
+    }
 }
 
 pub fn merge_cluster_state_from_peer(
@@ -2735,11 +3070,11 @@ pub enum NetworkError {
 mod tests {
     use super::*;
     use sinomo_core::{
-        ClusterCertificate, ClusterCertificateId, ClusterEndpointPrivacy, ClusterEndpointRecord,
-        ClusterEndpointSource, ClusterId, ClusterMemberRecord, ClusterNodeAvailability,
-        ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind, Confidence,
-        EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass, RoutingMetadata,
-        RoutingScope, Salience, SessionId, Source,
+        CapabilityName, ClusterCertificate, ClusterCertificateId, ClusterEndpointPrivacy,
+        ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterMemberRecord,
+        ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
+        ClusterTransportKind, Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId,
+        PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
     };
     use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
 
@@ -2759,7 +3094,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let cluster_id = ClusterId::new("cluster_network_storage").expect("cluster");
         let node_id = NodeId::new("node_network_storage").expect("node");
-        let state = ClusterBootstrapState::initialized_locally(
+        let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "network storage",
             node_id.clone(),
@@ -2767,6 +3102,24 @@ mod tests {
             "public-key",
             now,
         );
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == node_id)
+            .expect("local member");
+        member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![ClusterEndpointRecord {
+            endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_network_storage_daemon_lan")
+                .expect("endpoint id"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "127.0.0.1:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }];
 
         write_cluster_state(&paths, &state).expect("write state");
         assert_eq!(
@@ -2778,6 +3131,40 @@ mod tests {
         let members = read_cluster_members_from_kv(&paths).expect("members");
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].node_id, node_id);
+        let store = read_cluster_kv_store(&paths).expect("cluster kv store");
+        let identity: ClusterIdentityRecord = serde_json::from_slice(
+            &store
+                .get(&cluster_identity_key())
+                .expect("identity record")
+                .value,
+        )
+        .expect("identity json");
+        assert_eq!(identity.cluster_name, "network storage");
+        let raft_config: ClusterRaftConfigRecord = serde_json::from_slice(
+            &store
+                .get(&cluster_raft_config_key())
+                .expect("raft config record")
+                .value,
+        )
+        .expect("raft config json");
+        assert_eq!(raft_config.voters, vec![node_id.clone()]);
+        assert!(
+            store
+                .get(&cluster_endpoint_key(
+                    &node_id,
+                    &state.members[0].endpoints[0]
+                ))
+                .is_some()
+        );
+        let policy: ClusterCapabilityPolicyRecord = serde_json::from_slice(
+            &store
+                .get(&cluster_capability_policy_key(&node_id))
+                .expect("capability policy record")
+                .value,
+        )
+        .expect("policy json");
+        assert_eq!(policy.capabilities, state.members[0].capabilities);
+        assert!(store.get(&cluster_rollout_desired_key()).is_some());
 
         let status = ClusterNodeStatusRecord {
             cluster_id: state.cluster_id.clone(),
@@ -2813,6 +3200,12 @@ mod tests {
         let statuses = read_cluster_node_statuses_from_kv(&paths).expect("statuses");
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].availability, ClusterNodeAvailability::Online);
+        assert!(
+            read_cluster_kv_store(&paths)
+                .expect("cluster kv store")
+                .get(&cluster_rollout_node_key(&state.local_node_id))
+                .is_some()
+        );
 
         std::fs::remove_dir_all(root).ok();
     }

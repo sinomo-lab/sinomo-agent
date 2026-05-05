@@ -987,6 +987,16 @@ fn cluster_invite_generates_portable_join_payload() {
             .expect("published invite"),
         parsed
     );
+    let invite_state_entry = super::network::read_cluster_kv_store(&paths)
+        .expect("cluster kv store")
+        .get(&super::network::cluster_invitation_state_key(
+            &parsed.invite_id,
+        ))
+        .expect("invite state")
+        .clone();
+    let invite_state: super::network::ClusterInvitationStateRecord =
+        serde_json::from_slice(&invite_state_entry.value).expect("invite state json");
+    assert_eq!(invite_state.state, "active");
     assert!(rendered.persisted_path.exists());
     assert_eq!(
         std::fs::read_to_string(output).expect("invite file").trim(),
