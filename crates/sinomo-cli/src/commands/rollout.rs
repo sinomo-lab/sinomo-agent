@@ -295,31 +295,130 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
             stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
         });
     }
-    install_binary_atomically(&plan.built_binary, &plan.install_main_binary)?;
-    stop_main_daemon_if_running(&options)?;
-    install_binary_atomically(&plan.built_binary, &plan.install_shadow_binary)?;
-    restart_shadow_daemon_from_binary(
+
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let main_paths = DaemonPaths::new(&data_dir);
+    let previous_main_status = match probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => Some(status),
+        DaemonProbeStatus::Locked { status } => status,
+        DaemonProbeStatus::NotRunning => None,
+    };
+    let previous_main_binary = previous_main_status
+        .as_ref()
+        .and_then(|status| status.executable.clone())
+        .unwrap_or_else(|| plan.install_main_binary.clone());
+    let staged_main_binary = rollout_staged_main_binary(&paths);
+    let staged_shadow_binary = rollout_staged_shadow_binary(&paths);
+    stage_rollout_file(&plan.built_binary, &staged_main_binary)?;
+    stage_rollout_file(&plan.built_binary, &staged_shadow_binary)?;
+
+    let main_host = previous_main_status
+        .as_ref()
+        .map(|status| status.host.clone())
+        .unwrap_or_else(|| options.host.clone());
+    let main_port = previous_main_status
+        .as_ref()
+        .map(|status| status.port)
+        .unwrap_or(options.port);
+    restart_local_shadow_for_rollout(
+        &plan.built_binary,
         &plan.install_shadow_binary,
         &plan.install_main_binary,
+        &data_dir,
         &options,
+        &main_host,
+        main_port,
     )?;
-    wait_for_main_daemon_health(&options)?;
-    write_json(
-        &plan.state,
-        &serde_json::json!({
-            "source_repo": paths.source_repo,
-            "main_binary": plan.install_main_binary,
-            "shadow_binary": plan.install_shadow_binary,
-            "built_binary": plan.built_binary,
-            "build_log": plan.build_log,
-            "updated_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string())
-        }),
+    stage_rollout_main_activation(
+        &data_dir.root(),
+        &paths,
+        RolloutMainActivation {
+            source: paths.source_repo.display().to_string(),
+            main_binary: plan.install_main_binary.clone(),
+            shadow_binary: plan.install_shadow_binary.clone(),
+            staged_main_binary: Some(staged_main_binary),
+            staged_shadow_binary: Some(staged_shadow_binary),
+            previous_main_binary: Some(previous_main_binary),
+            main_host,
+            main_port,
+            shadow_port: options.shadow_port,
+            requested_at: OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            mode: "local-apply".to_string(),
+        },
     )?;
+    if let Some(status) = previous_main_status.as_ref() {
+        let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+    }
+    wait_for_main_daemon_health(
+        &options,
+        previous_main_status.as_ref().map(|status| status.pid),
+    )?;
+    wait_for_local_shadow_rollout_completion(&data_dir, &options)?;
     println!("rollout applied");
     println!("  source: {}", plan.build_dir.display());
     println!("  main binary: {}", plan.install_main_binary.display());
     println!("  shadow binary: {}", plan.install_shadow_binary.display());
     Ok(())
+}
+
+pub(crate) fn restart_local_shadow_for_rollout(
+    built_binary: &Path,
+    shadow_binary: &Path,
+    main_binary: &Path,
+    data_dir: &SinomoDataDir,
+    options: &RolloutOptions,
+    main_host: &str,
+    main_port: u16,
+) -> Result<(), CliError> {
+    let shadow_paths = DaemonPaths::for_shadow(data_dir);
+    let shadow_options = match probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => DaemonRunOptions {
+            host: status.host,
+            port: status.port,
+        },
+        DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => DaemonRunOptions {
+            host: status.host,
+            port: status.port,
+        },
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+            DaemonRunOptions {
+                host: options.host.clone(),
+                port: options.shadow_port,
+            }
+        }
+    };
+    stop_daemon_before_install(
+        &shadow_paths,
+        "shadow daemon",
+        "local rollout shadow update",
+    )?;
+    install_binary_atomically(built_binary, shadow_binary)?;
+    let args = vec![
+        "daemon".to_string(),
+        "shadow".to_string(),
+        "run".to_string(),
+        "--host".to_string(),
+        shadow_options.host.clone(),
+        "--port".to_string(),
+        shadow_options.port.to_string(),
+    ];
+    let extra_env = vec![
+        (SHADOW_MAIN_BINARY_ENV, main_binary.display().to_string()),
+        (SHADOW_MAIN_HOST_ENV, main_host.to_string()),
+        (SHADOW_MAIN_PORT_ENV, main_port.to_string()),
+    ];
+    start_installed_sinomo_daemon(
+        shadow_binary,
+        &data_dir.root(),
+        &args,
+        &shadow_paths,
+        "shadow daemon",
+        &extra_env,
+    )
 }
 
 pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
@@ -659,125 +758,68 @@ pub(crate) fn install_binary_atomically(source: &Path, destination: &Path) -> Re
     Ok(())
 }
 
-pub(crate) fn stop_main_daemon_if_running(_options: &RolloutOptions) -> Result<(), CliError> {
+pub(crate) fn wait_for_main_daemon_health(
+    options: &RolloutOptions,
+    previous_pid: Option<u32>,
+) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let paths = DaemonPaths::new(&data_dir);
-    if let DaemonProbeStatus::Running(status) = probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
-        let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if matches!(
-                probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT),
-                DaemonProbeStatus::NotRunning
-            ) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if let DaemonProbeStatus::Running(status) =
+            probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
+        {
+            if previous_pid.is_none_or(|pid| status.pid != pid) {
+                println!(
+                    "main daemon healthy: pid={} bind={} control={}",
+                    status.pid,
+                    daemon_bind_address(&status),
+                    status.address
+                );
                 return Ok(());
             }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn restart_shadow_daemon_from_binary(
-    binary: &Path,
-    main_binary: &Path,
-    options: &RolloutOptions,
-) -> Result<(), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    let paths = DaemonPaths::for_shadow(&data_dir);
-    if let DaemonProbeStatus::Running(status) = probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
-        let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if matches!(
-                probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT),
-                DaemonProbeStatus::NotRunning
-            ) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-    start_daemon_binary(
-        binary,
-        main_binary,
-        &["daemon", "shadow", "run"],
-        options,
-        paths,
-        "shadow daemon",
-    )
-}
-
-pub(crate) fn start_daemon_binary(
-    binary: &Path,
-    main_binary: &Path,
-    command_prefix: &[&str],
-    options: &RolloutOptions,
-    paths: DaemonPaths,
-    label: &str,
-) -> Result<(), CliError> {
-    let mut command = Command::new(binary);
-    command.args(command_prefix);
-    command.env(SHADOW_MAIN_BINARY_ENV, main_binary);
-    command.env(SHADOW_MAIN_HOST_ENV, &options.host);
-    command.env(SHADOW_MAIN_PORT_ENV, options.port.to_string());
-    let child = command
-        .arg("--host")
-        .arg(&options.host)
-        .arg("--port")
-        .arg(SINOMO_SHADOW_DAEMON_DEFAULT_PORT.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| CliError::Io {
-            path: binary.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let DaemonProbeStatus::Running(status) =
-            probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
-        {
-            println!(
-                "{label} healthy: pid={} bind={} control={}",
-                status.pid,
-                daemon_bind_address(&status),
-                status.address
-            );
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(CliError::Network {
-        address: daemon_connect_address(&options.host, SINOMO_SHADOW_DAEMON_DEFAULT_PORT),
-        detail: format!(
-            "rolled out {label} process {} did not become ready",
-            child.id()
-        ),
-    })
-}
-
-pub(crate) fn wait_for_main_daemon_health(options: &RolloutOptions) -> Result<(), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    let paths = DaemonPaths::new(&data_dir);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let DaemonProbeStatus::Running(status) =
-            probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
-        {
-            println!(
-                "main daemon healthy: pid={} bind={} control={}",
-                status.pid,
-                daemon_bind_address(&status),
-                status.address
-            );
-            return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
     Err(CliError::Network {
         address: daemon_connect_address(&options.host, options.port),
         detail: "rolled out main daemon did not become ready under shadow supervision".to_string(),
+    })
+}
+
+pub(crate) fn wait_for_local_shadow_rollout_completion(
+    data_dir: &SinomoDataDir,
+    options: &RolloutOptions,
+) -> Result<(), CliError> {
+    let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+    let shadow_paths = DaemonPaths::for_shadow(data_dir);
+    let main_paths = DaemonPaths::new(data_dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_restart_nudge = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let pending_main = rollout_main_activation_path(&rollout_paths).exists();
+        let pending_shadow = rollout_shadow_finalize_path(&rollout_paths).exists();
+        if !pending_main
+            && !pending_shadow
+            && matches!(
+                probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
+                DaemonProbeStatus::Running(_)
+            )
+        {
+            return Ok(());
+        }
+        if pending_main && Instant::now() >= next_restart_nudge {
+            if let DaemonProbeStatus::Running(status) =
+                probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT)
+            {
+                let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+            }
+            next_restart_nudge = Instant::now() + Duration::from_secs(2);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(CliError::Network {
+        address: daemon_connect_address(&options.host, options.shadow_port),
+        detail: "rolled out shadow daemon did not complete local rollout finalization".to_string(),
     })
 }

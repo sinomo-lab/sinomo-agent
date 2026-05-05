@@ -592,7 +592,7 @@ pub(crate) fn stop_daemon_before_install(
         DaemonProbeStatus::NotRunning => return Ok(()),
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if matches!(
             probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT),
@@ -623,6 +623,7 @@ pub(crate) fn start_installed_sinomo_daemon(
     for (key, value) in extra_env {
         command.env(key, value);
     }
+    prepare_background_command(&mut command);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -633,7 +634,7 @@ pub(crate) fn start_installed_sinomo_daemon(
             detail: source.to_string(),
         })?;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let DaemonProbeStatus::Running(status) = probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT)
         {

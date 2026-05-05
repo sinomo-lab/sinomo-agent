@@ -5,6 +5,7 @@
 //! watches, snapshots, and a deterministic Raft replication core for tests,
 //! local development, and daemon integration.
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::{ClusterMemberRecord, NodeId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1345,11 +1346,15 @@ impl DurableRaftKvNode {
                 txn_responses: BTreeMap::new(),
             }
         };
-        for entry in read_wal_entries(&paths.wal)? {
+        let WalRead { entries, truncated } = read_wal_entries(&paths.wal)?;
+        for entry in entries {
             node.append_entries(vec![entry])?;
         }
         let commit_index = node.hard_state.commit_index.min(node.last_log_index());
         node.commit_to(commit_index)?;
+        if truncated {
+            rewrite_wal_entries(&paths.wal, &node.log)?;
+        }
         Ok(Self {
             node_id,
             paths,
@@ -1483,16 +1488,27 @@ impl DurableRaftKvNode {
     }
 }
 
-fn read_wal_entries(path: &Path) -> Result<Vec<KvLogEntry>, KvError> {
+#[derive(Clone, Debug, Default)]
+struct WalRead {
+    entries: Vec<KvLogEntry>,
+    truncated: bool,
+}
+
+fn read_wal_entries(path: &Path) -> Result<WalRead, KvError> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(WalRead::default());
     }
     let file = File::open(path).map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    file.lock_shared().map_err(|source| KvError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
     let mut entries = Vec::new();
-    for line in BufReader::new(file).lines() {
+    let mut truncated = false;
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|source| KvError::Io {
             path: path.display().to_string(),
             detail: source.to_string(),
@@ -1500,13 +1516,20 @@ fn read_wal_entries(path: &Path) -> Result<Vec<KvLogEntry>, KvError> {
         if line.trim().is_empty() {
             continue;
         }
-        entries.push(
-            serde_json::from_str(&line).map_err(|source| KvError::Serialization {
-                detail: format!("{}: {source}", path.display()),
-            })?,
-        );
+        match serde_json::from_str(&line) {
+            Ok(entry) => entries.push(entry),
+            Err(source) => {
+                eprintln!(
+                    "warning: truncating cluster kv WAL at unreadable record {} in {}: {source}",
+                    line_number + 1,
+                    path.display()
+                );
+                truncated = true;
+                break;
+            }
+        }
     }
-    Ok(entries)
+    Ok(WalRead { entries, truncated })
 }
 
 fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
@@ -1521,12 +1544,17 @@ fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError
     }
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|source| KvError::Io {
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
+    file.lock_exclusive().map_err(|source| KvError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
     for entry in entries {
         serde_json::to_writer(&mut file, entry).map_err(|source| KvError::Serialization {
             detail: source.to_string(),
@@ -1543,13 +1571,39 @@ fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError
 }
 
 fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| KvError::Io {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| KvError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|source| KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    file.lock_exclusive().map_err(|source| KvError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    for entry in entries {
+        serde_json::to_writer(&mut file, entry).map_err(|source| KvError::Serialization {
+            detail: source.to_string(),
+        })?;
+        writeln!(file).map_err(|source| KvError::Io {
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
     }
-    append_wal_entries(path, entries)
+    file.sync_data().map_err(|source| KvError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
 }
 
 fn read_optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, KvError> {
@@ -2248,6 +2302,61 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].key, "/watch/a");
+    }
+
+    #[test]
+    fn durable_raft_node_recovers_by_truncating_corrupt_wal_tail() {
+        let root = temp_raft_root("sinomo-kv-corrupt-wal");
+        let node_id = NodeId::new("node_corrupt_wal").expect("node id");
+        let paths = KvWalPaths::new(&root);
+        let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
+        let before_snapshot = node
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/before-snapshot".to_string(),
+                    value: b"one".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append before snapshot");
+        node.commit_to(before_snapshot.index)
+            .expect("commit before snapshot");
+        node.save_snapshot().expect("snapshot");
+        let after_snapshot = node
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/after-snapshot".to_string(),
+                    value: b"two".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append after snapshot");
+        node.commit_to(after_snapshot.index)
+            .expect("commit after snapshot");
+        drop(node);
+
+        let mut wal = OpenOptions::new()
+            .append(true)
+            .open(&paths.wal)
+            .expect("open wal");
+        writeln!(wal, "{{\"index\":{{broken").expect("corrupt wal");
+        writeln!(wal, "still broken").expect("corrupt wal continuation");
+        drop(wal);
+
+        let recovered = DurableRaftKvNode::open(node_id, paths.clone()).expect("recover node");
+        assert_eq!(
+            recovered
+                .store()
+                .get("/after-snapshot")
+                .expect("valid entry after snapshot")
+                .value,
+            b"two"
+        );
+        let rewritten = std::fs::read_to_string(&paths.wal).expect("rewritten wal");
+        assert!(!rewritten.contains("broken"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn temp_raft_root(prefix: &str) -> std::path::PathBuf {

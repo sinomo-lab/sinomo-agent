@@ -419,7 +419,9 @@ pub(crate) fn spawn_main_for_shadow(
     binary: &Path,
     options: &DaemonRunOptions,
 ) -> Result<Child, CliError> {
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    prepare_background_command(&mut command);
+    command
         .arg("daemon")
         .arg("run")
         .arg("--host")
@@ -428,12 +430,11 @@ pub(crate) fn spawn_main_for_shadow(
         .arg(options.port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| CliError::Io {
-            path: binary.display().to_string(),
-            detail: source.to_string(),
-        })
+        .stderr(Stdio::null());
+    command.spawn().map_err(|source| CliError::Io {
+        path: binary.display().to_string(),
+        detail: source.to_string(),
+    })
 }
 
 pub(crate) fn spawn_candidate_main_for_shadow(
@@ -458,7 +459,9 @@ pub(crate) fn spawn_candidate_main_for_shadow(
         path: stderr_log.display().to_string(),
         detail: source.to_string(),
     })?;
-    let child = Command::new(binary)
+    let mut command = Command::new(binary);
+    prepare_background_command(&mut command);
+    let child = command
         .arg("daemon")
         .arg("run")
         .arg("--host")
@@ -635,8 +638,18 @@ pub(crate) fn run_daemon_with_paths(
         })?;
     println!("sinomo {label} listening on {bind_address}");
 
-    let mut cluster_network = ClusterNetworkMaintenance::new();
-    let mut next_cluster_tick = Instant::now();
+    let maintenance_paths = paths.clone();
+    let maintenance_options = options.clone();
+    let maintenance_label = label.to_string();
+    thread::spawn(move || {
+        let mut cluster_network = ClusterNetworkMaintenance::new();
+        loop {
+            if let Err(error) = cluster_network.tick(&maintenance_paths, &maintenance_options) {
+                eprintln!("sinomo {maintenance_label} cluster network tick failed: {error}");
+            }
+            thread::sleep(DAEMON_CLUSTER_TICK_INTERVAL);
+        }
+    });
     loop {
         match listener.accept() {
             Ok((mut stream, _address)) => {
@@ -665,12 +678,6 @@ pub(crate) fn run_daemon_with_paths(
             }
         }
 
-        if Instant::now() >= next_cluster_tick {
-            if let Err(error) = cluster_network.tick(&paths, &options) {
-                eprintln!("sinomo {label} cluster network tick failed: {error}");
-            }
-            next_cluster_tick = Instant::now() + DAEMON_CLUSTER_TICK_INTERVAL;
-        }
         thread::sleep(Duration::from_millis(25));
     }
     Ok(())
@@ -739,6 +746,7 @@ pub(crate) fn start_daemon_with_paths_with_env(
     for (key, value) in extra_env {
         command.env(key, value);
     }
+    prepare_background_command(&mut command);
     let child = command
         .arg("--host")
         .arg(&options.host)
@@ -1810,7 +1818,9 @@ pub(crate) fn spawn_shadow_for_cluster_rollout(
     shadow_host: &str,
     shadow_port: u16,
 ) -> Result<(), CliError> {
-    Command::new(shadow_binary)
+    let mut command = Command::new(shadow_binary);
+    prepare_background_command(&mut command);
+    command
         .args(["daemon", "shadow", "run"])
         .arg("--host")
         .arg(shadow_host)
