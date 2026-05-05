@@ -457,6 +457,9 @@ fn signed_test_invite_uri(
         invite_id: ClusterInviteId::generate(),
         cluster_id: ClusterId::new(cluster_id).expect("cluster"),
         cluster_name: Some("test cluster".to_string()),
+        cluster_public_key: identity.public_key.clone(),
+        invitation_secret: "secret_test".to_string(),
+        communication_channels: Vec::new(),
         introducers: Vec::new(),
         token_id: "token_test".to_string(),
         expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
@@ -732,6 +735,7 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
         OffsetDateTime::now_utc(),
     );
     let request = ClusterJoinRegistrationRequest {
+        invitation_secret: rendered.invite.invitation_secret.clone(),
         invite: rendered.invite.clone(),
         members: vec![joined_member],
     };
@@ -891,8 +895,24 @@ fn cluster_invite_generates_portable_join_payload() {
         ClusterId::new("cluster_invite").expect("cluster")
     );
     assert_eq!(parsed.cluster_name.as_deref(), Some("invite cluster"));
+    assert!(!parsed.cluster_public_key.trim().is_empty());
+    assert!(!parsed.invitation_secret.trim().is_empty());
+    assert_eq!(parsed.communication_channels.len(), 1);
+    assert_eq!(
+        parsed.communication_channels[0].endpoint.address,
+        "192.168.1.10:21353"
+    );
+    assert_eq!(
+        parsed.communication_channels[0].node_public_key,
+        parsed.cluster_public_key
+    );
     assert_eq!(parsed.introducers.len(), 1);
     assert_eq!(parsed.introducers[0].address, "192.168.1.10:21353");
+    assert_eq!(
+        super::network::read_cluster_invitation_from_kv(&paths, &parsed.invite_id)
+            .expect("published invite"),
+        parsed
+    );
     assert!(rendered.persisted_path.exists());
     assert_eq!(
         std::fs::read_to_string(output).expect("invite file").trim(),
@@ -944,6 +964,7 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
     .expect("cluster invite");
     let mut offline_invite = rendered.invite.clone();
     offline_invite.introducers.clear();
+    offline_invite.communication_channels.clear();
     let host_identity =
         super::load_or_create_main_node_identity(&host_root).expect("host identity");
     offline_invite.signature =
@@ -1010,10 +1031,18 @@ fn introducer_records_joined_members_and_returns_peer_view() {
     .expect("cluster invite");
     let mut offline_invite = rendered.invite.clone();
     offline_invite.introducers.clear();
+    offline_invite.communication_channels.clear();
     let host_identity =
         super::load_or_create_main_node_identity(&host_root).expect("host identity");
     offline_invite.signature =
         sign_cluster_join_invite(&offline_invite, &host_identity).expect("resign invite");
+    write_json(
+        &host_paths.invite_path(&offline_invite.invite_id),
+        &offline_invite,
+    )
+    .expect("active offline invite");
+    super::sync_cluster_invitation_to_kv(&host_paths, &offline_invite)
+        .expect("active offline invite kv");
     let offline_uri = encode_cluster_join_invite(&offline_invite).expect("offline invite");
     cluster_join_with_paths(
         ClusterJoinOptions {
@@ -1031,6 +1060,7 @@ fn introducer_records_joined_members_and_returns_peer_view() {
         ClusterBootstrap::InitializedLocally => panic!("expected joined state"),
     };
     let request = ClusterJoinRegistrationRequest {
+        invitation_secret: invite.invitation_secret.clone(),
         invite,
         members: remote_state.members,
     };
@@ -1221,6 +1251,9 @@ fn daemon_cluster_sync_merges_peer_members_and_kv_snapshot() {
         invite_id: ClusterInviteId::new("invite_sync").expect("invite"),
         cluster_id: cluster_id.clone(),
         cluster_name: Some("sync cluster".to_string()),
+        cluster_public_key: host_identity.public_key.clone(),
+        invitation_secret: "secret_sync".to_string(),
+        communication_channels: Vec::new(),
         introducers: Vec::new(),
         token_id: "token_sync".to_string(),
         expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
@@ -1650,6 +1683,60 @@ fn daemon_accepted_stream_is_reset_to_blocking_for_delayed_client_input() {
     };
     accepted.set_nonblocking(false).expect("blocking stream");
 
+    let should_shutdown = handle_daemon_connection(&mut accepted, &paths).expect("handle");
+    drop(accepted);
+    let response = client.join().expect("client");
+
+    assert!(!should_shutdown);
+    assert!(response.is_empty());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn daemon_invalid_invite_hello_is_silent() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-daemon-invalid-invite-hello-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_invalid_invite_hello").expect("cluster")),
+            node_id: Some(NodeId::new("node_invalid_invite_hello").expect("node")),
+            name: "invalid invite hello".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+    let paths = DaemonPaths::new(&data_dir);
+    paths.ensure().expect("daemon paths");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("local addr");
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).expect("connect");
+        stream
+            .write_all(
+                br#"INVITE_HELLO {"protocol":"sinomo.cluster-invite-challenge.v1","invite_id":"invite_missing","challenge":"probe"}
+"#,
+            )
+            .expect("write invite hello");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
+        let mut response = String::new();
+        match stream.read_to_string(&mut response) {
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionReset && response.is_empty() => {}
+            Err(error) => panic!("read: {error}"),
+        }
+        response
+    });
+    let (mut accepted, _) = listener.accept().expect("accept");
     let should_shutdown = handle_daemon_connection(&mut accepted, &paths).expect("handle");
     drop(accepted);
     let response = client.join().expect("client");

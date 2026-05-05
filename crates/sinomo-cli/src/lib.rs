@@ -1,6 +1,7 @@
 //! Shared Sinomo command-line handlers.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
@@ -31,28 +32,16 @@ use sinomo_lm::{
     NvidiaProvider, OpenAiConfig, OpenAiProvider, OpenAiResponsesCodexClient,
     OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL, normalize_nvidia_model_id,
 };
-use sinomo_rollout::{
-    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    MainExitKind, MainExitObservation, PendingShadowRolloutContext, RolloutError,
-    RolloutFailureDiagnostics, RolloutMainActivation, SelfRolloutPaths,
-    activate_staged_rollout_binary, classify_main_exit, deploy_managed_source_repo,
-    discover_current_git_repo, ensure_rollout_layout, managed_source_status,
-    read_pending_shadow_rollout, read_rollout_main_activation, record_activation_failure,
-    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
-    record_shadow_rollout_finalized, remove_shadow_finalize, restore_rollout_binary_from_backup,
-    rollout_main_activation_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
-    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
-    sync_external_repo_from_managed, write_main_activation,
-};
 use sinomo_runtime::core::{
     CandidateDecision, CandidateDecisionOutcome, CapabilityName, ClusterBootstrap,
     ClusterBootstrapState, ClusterEndpointId, ClusterEndpointPrivacy, ClusterEndpointRecord,
-    ClusterEndpointSource, ClusterId, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
-    ClusterMemberState, ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
-    ClusterTransportKind, Confidence, DfsFileSystemId, DfsObjectId, EvaluationGate,
-    EvaluationOutcome, EventEnvelope, EventId, EventKind, EvolutionJobId, EvolutionJobStatus,
-    LatencyClass, MutationPacket, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
-    SessionId, Source, TrustDomain, TrustRing, VerificationCommand,
+    ClusterEndpointSource, ClusterId, ClusterInvitationChannel, ClusterJoinInvite,
+    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
+    ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind, Confidence,
+    DfsFileSystemId, DfsObjectId, EvaluationGate, EvaluationOutcome, EventEnvelope, EventId,
+    EventKind, EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId,
+    PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustDomain,
+    TrustRing, VerificationCommand,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
@@ -61,10 +50,11 @@ use sinomo_runtime::daemon::{
     sign_daemon_command_from_data_dir,
 };
 use sinomo_runtime::daemon::{
-    DaemonClusterStatus, DaemonLock, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
-    DaemonStatus, daemon_bind_address, daemon_connect_address,
-    handle_authenticated_daemon_connection, probe_daemon_status, read_daemon_status,
-    send_daemon_command, write_daemon_status,
+    ClusterInviteChallengeProof, ClusterInviteChallengeRequest, DaemonClusterStatus, DaemonLock,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, daemon_bind_address,
+    daemon_connect_address, handle_authenticated_daemon_connection, probe_daemon_status,
+    read_daemon_status, send_daemon_command, sign_daemon_command_for_local_node,
+    verify_cluster_invite_challenge_proof, write_daemon_status,
 };
 use sinomo_runtime::dfs::{
     DfsMetadataShardId, DfsOperatorInspector, DfsPinMode, DfsPinRecord, LocalDfsPinStore,
@@ -77,17 +67,30 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{
     self, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterPaths,
     ClusterSyncRequest, ClusterSyncResponse, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache,
-    MdnsDiscoverySocket,
+    MdnsDiscoverySocket, sync_cluster_invitation_to_kv,
 };
 use sinomo_runtime::node::{
     NodeIdentity, daemon_lan_endpoint_id, daemon_loopback_endpoint_id,
     load_or_create_main_node_identity, load_or_create_shadow_node_identity,
     main_daemon_capabilities, shadow_daemon_capabilities, shadow_daemon_node_id,
 };
+use sinomo_runtime::rollout::{
+    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
+    MainExitKind, MainExitObservation, PendingShadowRolloutContext, RolloutError,
+    RolloutFailureDiagnostics, RolloutMainActivation, SelfRolloutPaths,
+    activate_staged_rollout_binary, classify_main_exit, deploy_managed_source_repo,
+    discover_current_git_repo, ensure_rollout_layout, managed_source_status,
+    read_pending_shadow_rollout, read_rollout_main_activation, record_activation_failure,
+    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
+    record_shadow_rollout_finalized, remove_shadow_finalize, restore_rollout_binary_from_backup,
+    rollout_main_activation_path, rollout_shadow_finalize_path, rollout_staged_main_binary,
+    rollout_staged_shadow_binary, stage_pending_shadow_rollout, stage_rollout_bytes,
+    stage_rollout_file, sync_external_repo_from_managed, write_main_activation,
+};
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, Write};
-use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::io::{self, BufRead, Read, Write};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};

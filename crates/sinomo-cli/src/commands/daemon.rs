@@ -1171,6 +1171,32 @@ pub(crate) fn handle_daemon_cluster_join(
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let mut state = read_cluster_state(&cluster_paths)?;
+    let persisted_invite =
+        network::read_cluster_invitation_from_kv(&cluster_paths, &request.invite.invite_id)
+            .or_else(|_| {
+                let invite_path = cluster_paths.invite_path(&request.invite.invite_id);
+                let content = fs::read_to_string(&invite_path).map_err(|source| CliError::Io {
+                    path: invite_path.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+                serde_json::from_str::<ClusterJoinInvite>(&content).map_err(|source| {
+                    CliError::Json {
+                        path: invite_path.display().to_string(),
+                        detail: source.to_string(),
+                    }
+                })
+            })?;
+    if persisted_invite != request.invite
+        || request.invitation_secret.trim().is_empty()
+        || request.invitation_secret != persisted_invite.invitation_secret
+    {
+        return Ok(ClusterJoinRegistrationResponse {
+            accepted: false,
+            detail: "invitation rejected".to_string(),
+            state,
+            kv_snapshot: None,
+        });
+    }
     if let Err(error) = verify_cluster_join_invite_signature(&request.invite) {
         return Ok(ClusterJoinRegistrationResponse {
             accepted: false,
@@ -1389,7 +1415,7 @@ pub(crate) fn handle_daemon_rollout_diagnostics(paths: &DaemonPaths) -> Result<S
     append_rollout_diagnostic_file(
         &mut output,
         "pending shadow",
-        &sinomo_rollout::rollout_shadow_finalize_path(&rollout_paths),
+        &rollout_shadow_finalize_path(&rollout_paths),
     )?;
     append_rollout_diagnostic_file(
         &mut output,

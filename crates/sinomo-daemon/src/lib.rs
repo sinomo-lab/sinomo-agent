@@ -6,9 +6,11 @@ mod paths;
 mod status;
 
 pub use auth::{
-    AuthenticatedDaemonCommand, DaemonSignerAuthority, SignedDaemonCommand,
-    authenticate_daemon_command, authorize_authenticated_daemon_command,
+    AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
+    DaemonSignerAuthority, SignedDaemonCommand, authenticate_daemon_command,
+    authorize_authenticated_daemon_command, create_cluster_invite_challenge_proof,
     sign_daemon_command_for_local_node, sign_daemon_command_from_data_dir,
+    verify_cluster_invite_challenge_proof,
 };
 pub use client::{send_daemon_command, send_daemon_command_raw};
 pub use control::{

@@ -1,5 +1,8 @@
-use crate::{AuthenticatedDaemonCommand, DaemonError, DaemonPaths, authenticate_daemon_command};
-use std::io::Read;
+use crate::{
+    AuthenticatedDaemonCommand, DaemonError, DaemonPaths, authenticate_daemon_command,
+    create_cluster_invite_challenge_proof,
+};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -17,9 +20,31 @@ where
     E: From<DaemonError>,
 {
     prepare_daemon_client_stream(stream)?;
-    let request = read_daemon_command_line(stream)?;
-    let command = request.trim();
-    let authenticated = match authenticate_daemon_command(paths, command) {
+    let mut request = read_daemon_command_line(stream)?;
+    let mut command = request.trim().to_string();
+    if let Some(payload) = command.strip_prefix("INVITE_HELLO ") {
+        let proof = match create_cluster_invite_challenge_proof(paths, payload.trim()) {
+            Ok(proof) => proof,
+            Err(_error) => return Ok(false),
+        };
+        let body = serde_json::to_string(&proof).map_err(|source| DaemonError::Json {
+            path: "cluster invite challenge proof".to_string(),
+            detail: source.to_string(),
+        })?;
+        stream
+            .write_all(format!("INVITE_PROOF {body}\n").as_bytes())
+            .map_err(|source| DaemonError::Network {
+                address: "daemon client".to_string(),
+                detail: source.to_string(),
+            })?;
+        stream.flush().map_err(|source| DaemonError::Network {
+            address: "daemon client".to_string(),
+            detail: source.to_string(),
+        })?;
+        request = read_daemon_command_line(stream)?;
+        command = request.trim().to_string();
+    }
+    let authenticated = match authenticate_daemon_command(paths, &command) {
         Ok(authenticated) => authenticated,
         Err(_error) => {
             return Ok(false);

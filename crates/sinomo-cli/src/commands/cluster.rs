@@ -375,6 +375,7 @@ pub(crate) fn cluster_invite_with_paths(
     let join_command = cluster_join_command(&uri);
     let persisted_path = paths.invite_path(&invite.invite_id);
     write_json(&persisted_path, &invite)?;
+    sync_cluster_invitation_to_kv(paths, &invite)?;
     if let Some(output) = &options.output {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent).map_err(|source| CliError::Io {
@@ -444,16 +445,24 @@ pub(crate) fn cluster_invite_signing_payload(
             path: "cluster invite introducers".to_string(),
             detail: source.to_string(),
         })?;
+    let channels =
+        serde_json::to_string(&invite.communication_channels).map_err(|source| CliError::Json {
+            path: "cluster invite communication channels".to_string(),
+            detail: source.to_string(),
+        })?;
     let allowed_roles =
         serde_json::to_string(&invite.allowed_member_roles).map_err(|source| CliError::Json {
             path: "cluster invite allowed roles".to_string(),
             detail: source.to_string(),
         })?;
     Ok(format!(
-        "{CLUSTER_INVITE_AUTH_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{CLUSTER_INVITE_AUTH_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         invite.invite_id,
         invite.cluster_id,
         invite.cluster_name.clone().unwrap_or_default(),
+        invite.cluster_public_key,
+        invite.invitation_secret,
+        channels,
         introducers,
         invite.token_id,
         expires_at,
@@ -485,10 +494,15 @@ pub(crate) fn build_cluster_invite(
         detail: "cluster paths have no data directory parent".to_string(),
     })?;
     let issuer_identity = load_or_create_main_node_identity(data_dir)?;
+    let invitation_secret = random_url_secret(32)?;
+    let communication_channels = invite_communication_channels(state, &introducers);
     let mut invite = ClusterJoinInvite {
         invite_id: invite_id.clone(),
         cluster_id: state.cluster_id.clone(),
         cluster_name: Some(state.cluster_name.clone()),
+        cluster_public_key: issuer_identity.public_key.clone(),
+        invitation_secret: invitation_secret.clone(),
+        communication_channels,
         introducers,
         token_id: format!("token_{}", invite_id.as_str().trim_start_matches("invite_")),
         expires_at: now + time::Duration::seconds(options.ttl_seconds),
@@ -500,6 +514,33 @@ pub(crate) fn build_cluster_invite(
     };
     invite.signature = sign_cluster_join_invite(&invite, &issuer_identity)?;
     Ok(invite)
+}
+
+pub(crate) fn random_url_secret(byte_len: usize) -> Result<String, CliError> {
+    let rng = SystemRandom::new();
+    let mut bytes = vec![0_u8; byte_len];
+    rng.fill(&mut bytes).map_err(|_| CliError::Parse {
+        detail: "failed to generate secure random invitation secret".to_string(),
+    })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub(crate) fn invite_communication_channels(
+    state: &ClusterBootstrapState,
+    endpoints: &[ClusterEndpointRecord],
+) -> Vec<ClusterInvitationChannel> {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let member = state.members.iter().find(|member| {
+                member.node_id == endpoint.node_id && member.state.is_authorized()
+            })?;
+            Some(ClusterInvitationChannel {
+                endpoint: endpoint.clone(),
+                node_public_key: member.node_public_key.clone(),
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn default_invite_introducers(
@@ -521,7 +562,7 @@ pub(crate) fn default_invite_introducers(
     for endpoint in state
         .members
         .iter()
-        .filter(|member| member.node_id == state.local_node_id)
+        .filter(|member| member.state.is_authorized())
         .flat_map(|member| member.endpoints.iter().cloned())
     {
         push_unique_introducer(&mut introducers, endpoint);
@@ -758,12 +799,13 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         return Ok(());
     }
     let request = ClusterJoinRegistrationRequest {
+        invitation_secret: invite.invitation_secret.clone(),
         invite,
         members: state.members.clone(),
     };
     let mut last_error = None;
-    for introducer in &request.invite.introducers {
-        match send_cluster_join_registration(&introducer.address, &request) {
+    for channel in invite_channels(&request.invite) {
+        match send_cluster_join_registration(&channel.endpoint.address, &request) {
             Ok(response) => {
                 if response.accepted {
                     if let Some(snapshot) = response.kv_snapshot.clone()
@@ -772,7 +814,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
                         write_cluster_kv_snapshot(paths, &snapshot)?;
                     }
                     merge_cluster_join_registration(state, response.state);
-                    println!("introducer accepted join: {}", introducer.address);
+                    println!("introducer accepted join: {}", channel.endpoint.address);
                     return Ok(());
                 }
                 last_error = Some(response.detail);
@@ -814,11 +856,88 @@ pub(crate) fn send_cluster_join_registration(
         path: "cluster join registration".to_string(),
         detail: source.to_string(),
     })?;
-    let response = send_daemon_command(
-        address,
-        &format!("CLUSTER_JOIN {payload}"),
-        DAEMON_JOIN_TIMEOUT,
-    )?;
+    let challenge = random_url_secret(32)?;
+    let challenge_request = ClusterInviteChallengeRequest {
+        protocol: "sinomo.cluster-invite-challenge.v1".to_string(),
+        invite_id: request.invite.invite_id.clone(),
+        challenge: challenge.clone(),
+    };
+    let challenge_payload =
+        serde_json::to_string(&challenge_request).map_err(|source| CliError::Json {
+            path: "cluster invite challenge request".to_string(),
+            detail: source.to_string(),
+        })?;
+    let socket_address = address
+        .to_socket_addrs()
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?
+        .next()
+        .ok_or_else(|| CliError::Network {
+            address: address.to_string(),
+            detail: "no socket addresses resolved".to_string(),
+        })?;
+    let mut stream =
+        TcpStream::connect_timeout(&socket_address, DAEMON_JOIN_TIMEOUT).map_err(|source| {
+            CliError::Network {
+                address: address.to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+    stream
+        .set_read_timeout(Some(DAEMON_JOIN_TIMEOUT))
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    stream
+        .set_write_timeout(Some(DAEMON_JOIN_TIMEOUT))
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    stream
+        .write_all(format!("INVITE_HELLO {challenge_payload}\n").as_bytes())
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    let mut proof_line = String::new();
+    io::BufReader::new(stream.try_clone().map_err(|source| CliError::Network {
+        address: address.to_string(),
+        detail: source.to_string(),
+    })?)
+    .read_line(&mut proof_line)
+    .map_err(|source| CliError::Network {
+        address: address.to_string(),
+        detail: source.to_string(),
+    })?;
+    let proof_payload = proof_line
+        .trim()
+        .strip_prefix("INVITE_PROOF ")
+        .ok_or_else(|| CliError::AuthDenied)?;
+    let proof: ClusterInviteChallengeProof =
+        serde_json::from_str(proof_payload).map_err(|source| CliError::Json {
+            path: format!("cluster invite proof from {address}"),
+            detail: source.to_string(),
+        })?;
+    verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
+    let signed = sign_daemon_command_for_local_node(&format!("CLUSTER_JOIN {payload}"))?;
+    stream
+        .write_all(format!("{signed}\n").as_bytes())
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
+    let _ = stream.shutdown(Shutdown::Write);
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|source| CliError::Network {
+            address: address.to_string(),
+            detail: source.to_string(),
+        })?;
     serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
         path: format!("cluster join response from {address}"),
         detail: source.to_string(),
@@ -2067,4 +2186,19 @@ pub(crate) fn cluster_bootstrap_label(bootstrap: &ClusterBootstrap) -> &'static 
         ClusterBootstrap::InitializedLocally => "initialized-locally",
         ClusterBootstrap::Joined { .. } => "joined",
     }
+}
+
+pub(crate) fn invite_channels(invite: &ClusterJoinInvite) -> Vec<ClusterInvitationChannel> {
+    if !invite.communication_channels.is_empty() {
+        return invite.communication_channels.clone();
+    }
+    invite
+        .introducers
+        .iter()
+        .cloned()
+        .map(|endpoint| ClusterInvitationChannel {
+            endpoint,
+            node_public_key: invite.issuer_public_key.clone(),
+        })
+        .collect()
 }

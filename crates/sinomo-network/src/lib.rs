@@ -55,6 +55,7 @@ impl ClusterPaths {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterJoinRegistrationRequest {
     pub invite: sinomo_core::ClusterJoinInvite,
+    pub invitation_secret: String,
     pub members: Vec<ClusterMemberRecord>,
 }
 
@@ -219,6 +220,42 @@ pub fn sync_cluster_node_status_to_kv(
 
 pub fn cluster_node_status_key(node_id: &NodeId) -> String {
     format!("/cluster/node-status/{node_id}")
+}
+
+pub fn cluster_invitation_key(invite_id: &ClusterInviteId) -> String {
+    format!("/cluster/invitations/{invite_id}")
+}
+
+pub fn read_cluster_invitation_from_kv(
+    paths: &ClusterPaths,
+    invite_id: &ClusterInviteId,
+) -> Result<sinomo_core::ClusterJoinInvite, NetworkError> {
+    let store = read_cluster_kv_store(paths)?;
+    let key = cluster_invitation_key(invite_id);
+    let entry = store.get(&key).ok_or_else(|| NetworkError::StorageIo {
+        path: key.clone(),
+        detail: "cluster invitation is not published".to_string(),
+    })?;
+    serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
+        path: key,
+        detail: source.to_string(),
+    })
+}
+
+pub fn sync_cluster_invitation_to_kv(
+    paths: &ClusterPaths,
+    invite: &sinomo_core::ClusterJoinInvite,
+) -> Result<KvSnapshot, NetworkError> {
+    let mut store = read_cluster_kv_store(paths)?;
+    let key = cluster_invitation_key(&invite.invite_id);
+    let value = serde_json::to_vec(invite).map_err(|source| NetworkError::Json {
+        path: key.clone(),
+        detail: source.to_string(),
+    })?;
+    store.put(key, value, None)?;
+    let snapshot = store.snapshot();
+    write_cluster_kv_snapshot(paths, &snapshot)?;
+    Ok(snapshot)
 }
 
 pub fn merge_cluster_state_from_peer(

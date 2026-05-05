@@ -118,8 +118,15 @@ pub struct ClusterJoinInvite {
     pub cluster_id: ClusterId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_name: Option<String>,
+    #[serde(default)]
+    pub cluster_public_key: String,
+    #[serde(default)]
+    pub invitation_secret: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub communication_channels: Vec<ClusterInvitationChannel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub introducers: Vec<ClusterEndpointRecord>,
+    #[serde(default)]
     pub token_id: String,
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
@@ -136,6 +143,12 @@ pub struct ClusterJoinInvite {
 
 fn legacy_unsigned_invite_issuer_node_id() -> NodeId {
     NodeId::new("node_legacy_unsigned_invite").expect("static legacy node id")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterInvitationChannel {
+    pub endpoint: ClusterEndpointRecord,
+    pub node_public_key: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -468,6 +481,15 @@ mod tests {
             invite_id: ClusterInviteId::new("invite_phone").expect("invite"),
             cluster_id: ClusterId::new("cluster_home").expect("cluster"),
             cluster_name: Some("home".to_string()),
+            cluster_public_key: "pk_desktop".to_string(),
+            invitation_secret: "secret_1".to_string(),
+            communication_channels: vec![ClusterInvitationChannel {
+                endpoint: ClusterEndpointRecord::loopback(
+                    NodeId::new("node_desktop").expect("node"),
+                    "127.0.0.1:21353",
+                ),
+                node_public_key: "pk_desktop".to_string(),
+            }],
             introducers: vec![ClusterEndpointRecord::loopback(
                 NodeId::new("node_desktop").expect("node"),
                 "127.0.0.1:21353",
