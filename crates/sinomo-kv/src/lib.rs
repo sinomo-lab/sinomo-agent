@@ -207,6 +207,8 @@ pub struct RaftHardState {
     pub current_term: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voted_for: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_id: Option<NodeId>,
     pub commit_index: u64,
 }
 
@@ -215,6 +217,7 @@ impl Default for RaftHardState {
         Self {
             current_term: 1,
             voted_for: None,
+            leader_id: None,
             commit_index: 0,
         }
     }
@@ -965,8 +968,58 @@ impl InProcessRaftKvCluster {
         for node in self.nodes.values_mut() {
             node.hard_state.current_term = term;
             node.hard_state.voted_for = Some(new_leader_id.clone());
+            node.hard_state.leader_id = Some(new_leader_id.clone());
         }
         Ok(())
+    }
+
+    pub fn elect_leader(&mut self, candidate_id: NodeId) -> Result<bool, KvError> {
+        if !self.voters.contains(&candidate_id) {
+            return Err(KvError::UnknownNode {
+                node_id: candidate_id,
+            });
+        }
+        if !self.online.contains(&candidate_id) {
+            return Err(KvError::LeaderOffline {
+                leader_id: candidate_id,
+            });
+        }
+        self.catch_up_node(&candidate_id)?;
+        let candidate = self.node(&candidate_id)?.clone();
+        let election_term = self.term.saturating_add(1);
+        let request = RaftRequestVoteRequest {
+            term: election_term,
+            candidate_id: candidate_id.clone(),
+            last_log_index: candidate.last_log_index(),
+            last_log_term: candidate.last_log_term(),
+        };
+        let mut granted = 0;
+        for voter_id in self
+            .voters
+            .intersection(&self.online)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let response = self.request_vote(&voter_id, request.clone())?;
+            if response.term > self.term {
+                self.term = response.term;
+            }
+            if response.vote_granted {
+                granted += 1;
+            }
+        }
+        if granted < self.quorum_size() {
+            return Ok(false);
+        }
+        self.term = election_term.max(self.term);
+        self.leader_id = candidate_id.clone();
+        for node in self.nodes.values_mut() {
+            if node.hard_state.current_term <= self.term {
+                node.hard_state.current_term = self.term;
+                node.hard_state.leader_id = Some(candidate_id.clone());
+            }
+        }
+        Ok(true)
     }
 
     fn node(&self, node_id: &NodeId) -> Result<&ReplicatedKvNode, KvError> {
@@ -1050,6 +1103,7 @@ impl InProcessRaftKvCluster {
                 hard_state: RaftHardState {
                     current_term: self.term,
                     voted_for: None,
+                    leader_id: Some(self.leader_id.clone()),
                     commit_index: self.commit_index,
                 },
                 applied_index: self.commit_index,
@@ -1149,7 +1203,11 @@ impl ReplicatedKvNode {
                 match_index: self.last_log_index(),
             });
         }
+        if request.term > self.hard_state.current_term {
+            self.hard_state.voted_for = None;
+        }
         self.hard_state.current_term = request.term;
+        self.hard_state.leader_id = Some(request.leader_id.clone());
         if self.term_at(request.prev_log_index) != Some(request.prev_log_term) {
             return Ok(RaftAppendEntriesResponse {
                 term: self.hard_state.current_term,
@@ -1180,6 +1238,7 @@ impl ReplicatedKvNode {
         if request.term > self.hard_state.current_term {
             self.hard_state.current_term = request.term;
             self.hard_state.voted_for = None;
+            self.hard_state.leader_id = None;
         }
         let candidate_log_is_current = (request.last_log_term, request.last_log_index)
             >= (self.last_log_term(), self.last_log_index());
@@ -1191,6 +1250,7 @@ impl ReplicatedKvNode {
         let vote_granted = can_vote && candidate_log_is_current;
         if vote_granted {
             self.hard_state.voted_for = Some(request.candidate_id);
+            self.hard_state.leader_id = None;
         }
         Ok(RaftRequestVoteResponse {
             term: self.hard_state.current_term,
@@ -1270,6 +1330,7 @@ impl DurableRaftKvNode {
             node.install_snapshot(snapshot);
             node.hard_state.current_term = hard_state.current_term;
             node.hard_state.voted_for = hard_state.voted_for;
+            node.hard_state.leader_id = hard_state.leader_id;
             node.hard_state.commit_index =
                 hard_state.commit_index.max(node.hard_state.commit_index);
             node
@@ -1358,6 +1419,18 @@ impl DurableRaftKvNode {
         Ok(response)
     }
 
+    pub fn become_leader(&mut self, term: u64) -> Result<(), KvError> {
+        self.node.hard_state.current_term = term.max(self.node.hard_state.current_term);
+        self.node.hard_state.voted_for = Some(self.node_id.clone());
+        self.node.hard_state.leader_id = Some(self.node_id.clone());
+        self.persist_hard_state()
+    }
+
+    pub fn clear_known_leader(&mut self) -> Result<(), KvError> {
+        self.node.hard_state.leader_id = None;
+        self.persist_hard_state()
+    }
+
     pub fn append_local_command(
         &mut self,
         term: u64,
@@ -1370,6 +1443,7 @@ impl DurableRaftKvNode {
             revision: KvRevision::ZERO,
         };
         self.node.hard_state.current_term = term;
+        self.node.hard_state.leader_id = Some(self.node_id.clone());
         self.node.append_entries(vec![entry.clone()])?;
         append_wal_entries(&self.paths.wal, std::slice::from_ref(&entry))?;
         self.persist_hard_state()?;
@@ -1795,6 +1869,134 @@ mod tests {
     }
 
     #[test]
+    fn raft_cluster_partition_blocks_isolated_leader_and_recovers_after_majority_leader_change() {
+        let node_a = NodeId::new("node_partition_a").expect("node");
+        let node_b = NodeId::new("node_partition_b").expect("node");
+        let node_c = NodeId::new("node_partition_c").expect("node");
+        let mut cluster =
+            InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
+                .expect("cluster");
+        cluster
+            .put("/config/epoch", b"one".to_vec())
+            .expect("initial put");
+
+        cluster.set_node_online(&node_a, false);
+        let isolated_write = cluster.put("/config/minority", b"blocked".to_vec());
+        assert!(matches!(
+            isolated_write,
+            Err(KvError::LeaderOffline { leader_id }) if leader_id == node_a
+        ));
+
+        cluster
+            .transfer_leader(node_b.clone())
+            .expect("majority leader transfer");
+        cluster
+            .put("/config/majority", b"committed".to_vec())
+            .expect("majority write");
+        assert!(
+            cluster
+                .store(&node_a)
+                .expect("isolated old leader")
+                .get("/config/majority")
+                .is_none()
+        );
+
+        cluster.set_node_online(&node_a, true);
+
+        assert_eq!(
+            cluster
+                .store(&node_a)
+                .expect("healed old leader")
+                .get("/config/majority")
+                .expect("caught up majority write")
+                .value,
+            b"committed"
+        );
+        assert_eq!(
+            cluster
+                .hard_state(&node_a)
+                .expect("old leader hard state")
+                .commit_index,
+            cluster.commit_index()
+        );
+    }
+
+    #[test]
+    fn raft_cluster_autonomous_election_replaces_lost_leader_with_majority_quorum() {
+        let node_a = NodeId::new("node_elect_a").expect("node");
+        let node_b = NodeId::new("node_elect_b").expect("node");
+        let node_c = NodeId::new("node_elect_c").expect("node");
+        let mut cluster =
+            InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
+                .expect("cluster");
+        cluster
+            .put("/config/a", b"one".to_vec())
+            .expect("initial write");
+
+        cluster.set_node_online(&node_a, false);
+
+        assert!(
+            cluster
+                .elect_leader(node_b.clone())
+                .expect("elect majority leader")
+        );
+        assert_eq!(cluster.leader_id(), &node_b);
+        assert_eq!(
+            cluster
+                .hard_state(&node_b)
+                .expect("new leader hard state")
+                .leader_id
+                .as_ref(),
+            Some(&node_b)
+        );
+        cluster
+            .put("/config/b", b"two".to_vec())
+            .expect("write through elected leader");
+        assert!(
+            cluster
+                .store(&node_a)
+                .expect("offline old leader")
+                .get("/config/b")
+                .is_none()
+        );
+
+        cluster.set_node_online(&node_a, true);
+
+        assert_eq!(
+            cluster
+                .store(&node_a)
+                .expect("healed old leader")
+                .get("/config/b")
+                .expect("caught up write")
+                .value,
+            b"two"
+        );
+    }
+
+    #[test]
+    fn raft_cluster_autonomous_election_fails_without_majority() {
+        let node_a = NodeId::new("node_elect_fail_a").expect("node");
+        let node_b = NodeId::new("node_elect_fail_b").expect("node");
+        let node_c = NodeId::new("node_elect_fail_c").expect("node");
+        let mut cluster =
+            InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
+                .expect("cluster");
+        cluster.set_node_online(&node_a, false);
+        cluster.set_node_online(&node_c, false);
+
+        assert!(
+            !cluster
+                .elect_leader(node_b.clone())
+                .expect("minority election")
+        );
+        assert_ne!(cluster.leader_id(), &node_b);
+        assert!(matches!(
+            cluster.put("/config/blocked", b"blocked".to_vec()),
+            Err(KvError::LeaderOffline { .. })
+        ));
+    }
+
+    #[test]
     fn raft_votes_require_current_candidate_log() {
         let voter = NodeId::new("node_voter").expect("node");
         let stale = NodeId::new("node_stale").expect("node");
@@ -1831,13 +2033,7 @@ mod tests {
 
     #[test]
     fn durable_raft_node_replays_wal_and_snapshot() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-wal-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = temp_raft_root("sinomo-kv-wal");
         let node_id = NodeId::new("node_wal").expect("node");
         let paths = KvWalPaths::new(&root);
         {
@@ -1878,6 +2074,167 @@ mod tests {
     }
 
     #[test]
+    fn durable_raft_power_loss_before_commit_does_not_apply_uncommitted_wal() {
+        let root = temp_raft_root("sinomo-kv-powerloss-uncommitted");
+        let node_id = NodeId::new("node_powerloss_uncommitted").expect("node");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
+            node.append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/config/uncommitted".to_string(),
+                    value: b"lost".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append uncommitted");
+        }
+
+        let mut node = DurableRaftKvNode::open(node_id, paths).expect("reopen after power loss");
+
+        assert!(node.store().get("/config/uncommitted").is_none());
+        assert_eq!(node.hard_state().commit_index, 0);
+        assert_eq!(node.last_log_index(), 1);
+        node.commit_to(1).expect("commit recovered wal entry");
+        assert_eq!(
+            node.store()
+                .get("/config/uncommitted")
+                .expect("committed after recovery")
+                .value,
+            b"lost"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_power_loss_after_commit_replays_committed_state() {
+        let root = temp_raft_root("sinomo-kv-powerloss-committed");
+        let node_id = NodeId::new("node_powerloss_committed").expect("node");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/config/committed".to_string(),
+                        value: b"survives".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append committed");
+            node.commit_to(entry.index).expect("persist commit");
+        }
+
+        let node = DurableRaftKvNode::open(node_id, paths).expect("reopen after power loss");
+
+        assert_eq!(node.hard_state().commit_index, 1);
+        assert_eq!(
+            node.store()
+                .get("/config/committed")
+                .expect("committed value")
+                .value,
+            b"survives"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn delayed_stale_append_entries_do_not_roll_back_committed_state() {
+        let leader_root = temp_raft_root("sinomo-kv-latency-leader");
+        let follower_root = temp_raft_root("sinomo-kv-latency-follower");
+        let leader_id = NodeId::new("node_latency_leader").expect("node");
+        let follower_id = NodeId::new("node_latency_follower").expect("node");
+        let leader_paths = KvWalPaths::new(&leader_root);
+        let follower_paths = KvWalPaths::new(&follower_root);
+        let mut leader =
+            DurableRaftKvNode::open(leader_id.clone(), leader_paths).expect("leader open");
+        let mut follower =
+            DurableRaftKvNode::open(follower_id.clone(), follower_paths).expect("follower open");
+
+        let first = leader
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/config/a".to_string(),
+                    value: b"one".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append first");
+        leader.commit_to(first.index).expect("commit first");
+        let stale_append = RaftAppendEntriesRequest {
+            term: 1,
+            leader_id: leader_id.clone(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: leader.log().to_vec(),
+            leader_commit: 1,
+        };
+        let second = leader
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/config/b".to_string(),
+                    value: b"two".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append second");
+        leader.commit_to(second.index).expect("commit second");
+        let current_append = RaftAppendEntriesRequest {
+            term: 1,
+            leader_id,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: leader.log().to_vec(),
+            leader_commit: 2,
+        };
+
+        assert!(
+            follower
+                .append_entries(current_append)
+                .expect("current append")
+                .success
+        );
+        assert_eq!(
+            follower
+                .store()
+                .get("/config/b")
+                .expect("second value")
+                .value,
+            b"two"
+        );
+        assert!(
+            follower
+                .append_entries(stale_append)
+                .expect("stale append")
+                .success
+        );
+
+        assert_eq!(follower.hard_state().commit_index, 2);
+        assert_eq!(
+            follower
+                .store()
+                .get("/config/a")
+                .expect("first value")
+                .value,
+            b"one"
+        );
+        assert_eq!(
+            follower
+                .store()
+                .get("/config/b")
+                .expect("second value")
+                .value,
+            b"two"
+        );
+        std::fs::remove_dir_all(leader_root).ok();
+        std::fs::remove_dir_all(follower_root).ok();
+    }
+
+    #[test]
     fn snapshot_restore_preserves_watchable_event_history() {
         let mut store = InProcessKvStore::new();
         store.put("/watch/a", b"one".to_vec(), None).expect("put");
@@ -1891,5 +2248,15 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].key, "/watch/a");
+    }
+
+    fn temp_raft_root(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
     }
 }

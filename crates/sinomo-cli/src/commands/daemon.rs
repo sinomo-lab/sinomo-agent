@@ -1156,12 +1156,30 @@ pub(crate) fn handle_daemon_cluster_kv_txn(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let state = read_cluster_state(&cluster_paths)?;
+    let mut state = read_cluster_state(&cluster_paths)?;
+    if !cluster_raft_local_is_leader(&cluster_paths, &state)?
+        && !elect_cluster_raft_leader(&cluster_paths, &state)?
+    {
+        return Err(CliError::Network {
+            address: "cluster raft quorum".to_string(),
+            detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
+        });
+    }
+    let mut snapshot = read_cluster_kv_store(&cluster_paths)?.snapshot();
+    sync_cluster_with_reachable_peers(&cluster_paths, &mut state, &mut snapshot)?;
+    if !cluster_raft_local_is_leader(&cluster_paths, &state)? {
+        return Err(CliError::Network {
+            address: "cluster raft quorum".to_string(),
+            detail: "local daemon lost Raft quorum before committing the transaction".to_string(),
+        });
+    }
     let (_snapshot, response) = network::append_cluster_raft_command_with_response(
         &cluster_paths,
         &state.local_node_id,
         KvCommand::Txn(txn.clone()),
     )?;
+    let mut replicated_snapshot = read_cluster_kv_snapshot(&cluster_paths)?;
+    let _ = sync_cluster_with_reachable_peers(&cluster_paths, &mut state, &mut replicated_snapshot);
     Ok(response.unwrap_or(KvTxnResponse {
         succeeded: true,
         revision: read_cluster_kv_snapshot(&cluster_paths)?.revision,

@@ -237,6 +237,25 @@ pub fn apply_cluster_raft_vote(
     node.request_vote(vote).map_err(Into::into)
 }
 
+pub fn set_cluster_raft_leader(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    term: u64,
+) -> Result<KvSnapshot, NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    node.become_leader(term)?;
+    mirror_cluster_raft_snapshot(paths, &node)
+}
+
+pub fn clear_cluster_raft_leader(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<KvSnapshot, NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    node.clear_known_leader()?;
+    mirror_cluster_raft_snapshot(paths, &node)
+}
+
 pub fn mirror_cluster_raft_snapshot(
     paths: &ClusterPaths,
     node: &DurableRaftKvNode,

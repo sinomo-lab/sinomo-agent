@@ -9,8 +9,9 @@ use super::{
     ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
     UninstallOptions, authenticate_daemon_command, build_cluster_raft_append_request,
     cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_peer_members, cluster_sync_targets, daemon_package_version,
-    daemon_status_matches_options, decode_cluster_join_invite, encode_cluster_join_invite,
+    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_sync_targets, daemon_package_version, daemon_status_matches_options,
+    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
     ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_txn,
     handle_daemon_cluster_raft_append, handle_daemon_connection, handle_daemon_rollout_build,
     install_should_update_binary, install_with_layout, is_terminal_status,
@@ -637,6 +638,21 @@ fn cluster_init_persists_local_bootstrap_state() {
         .expect("kv main");
     assert_eq!(kv_main.state, ClusterMemberState::Active);
     assert_eq!(kv_main.node_public_key, main.node_public_key);
+    assert_eq!(
+        cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+        Some(NodeId::new("node_local").expect("node"))
+    );
+    sinomo_runtime::network::clear_cluster_raft_leader(&paths, &state.local_node_id)
+        .expect("clear leader");
+    assert_eq!(
+        cluster_raft_known_leader_id(&paths, &state).expect("cleared leader"),
+        None
+    );
+    assert!(elect_cluster_raft_leader(&paths, &state).expect("single-voter election"));
+    assert_eq!(
+        cluster_raft_known_leader_id(&paths, &state).expect("reelected leader"),
+        Some(NodeId::new("node_local").expect("node"))
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -1290,6 +1306,50 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         peer_members
             .iter()
             .any(|member| member.node_id == NodeId::new("node_host").expect("node"))
+    );
+
+    let latency_txn = KvTxn {
+        compares: Vec::new(),
+        success: vec![KvOp::Put {
+            key: "/config/latency".to_string(),
+            value: b"current".to_vec(),
+            lease_id: None,
+        }],
+        failure: Vec::new(),
+    };
+    handle_daemon_cluster_kv_txn(
+        &DaemonPaths::with_root(host_root.join("daemon")),
+        &serde_json::to_string(&latency_txn).expect("latency txn"),
+    )
+    .expect("host latency txn");
+    let current_request =
+        build_cluster_raft_append_request(&host_paths, &host_state).expect("current raft append");
+    let current_response = handle_daemon_cluster_raft_append(
+        &DaemonPaths::with_root(peer_root.join("daemon")),
+        &serde_json::to_string(&current_request).expect("current append request"),
+    )
+    .expect("peer current append");
+    assert!(current_response.accepted);
+    assert!(
+        read_cluster_kv_snapshot(&peer_paths)
+            .expect("peer current snapshot")
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/config/latency" && entry.value == b"current")
+    );
+
+    let delayed_stale_response = handle_daemon_cluster_raft_append(
+        &DaemonPaths::with_root(peer_root.join("daemon")),
+        &serde_json::to_string(&request).expect("stale append request"),
+    )
+    .expect("peer stale append");
+    assert!(delayed_stale_response.accepted);
+    assert!(
+        read_cluster_kv_snapshot(&peer_paths)
+            .expect("peer after stale snapshot")
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/config/latency" && entry.value == b"current")
     );
     std::fs::remove_dir_all(host_root).ok();
     std::fs::remove_dir_all(peer_root).ok();
