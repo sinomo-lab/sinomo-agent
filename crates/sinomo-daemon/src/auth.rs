@@ -280,6 +280,18 @@ pub fn authorize_authenticated_daemon_command(
                 | DaemonSignerAuthority::Member
         ),
         command
+            if command.starts_with("CLUSTER_KV_WATCH_PREFIX ")
+                || command.starts_with("CLUSTER_KV_WATCH_DRAIN ")
+                || command.starts_with("CLUSTER_KV_WATCH_EVENTS ") =>
+        {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
+        command
             if command.starts_with("CLUSTER_KV_TXN ")
                 || command.starts_with("ROLLOUT_BINARY ")
                 || command.starts_with("ROLLOUT_BUILD ") =>

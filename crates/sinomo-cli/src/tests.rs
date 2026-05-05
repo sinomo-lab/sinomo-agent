@@ -13,18 +13,20 @@ use super::{
     cluster_sync_targets, daemon_package_version, daemon_status_matches_options,
     decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
     ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_txn,
-    handle_daemon_cluster_raft_append, handle_daemon_connection, handle_daemon_rollout_build,
-    install_should_update_binary, install_with_layout, is_terminal_status,
-    models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_models_list_options, parse_propose_options, parse_provider_command,
-    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
-    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
-    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-    send_daemon_command_raw, sign_cluster_join_invite, sign_daemon_command_from_data_dir,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout, write_json,
+    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
+    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
+    handle_daemon_connection, handle_daemon_rollout_build, install_should_update_binary,
+    install_with_layout, is_terminal_status, models_default_with_data_dir,
+    normalize_model_provider, parse_cli_command, parse_cluster_command,
+    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
+    parse_install_options, parse_model_default_options, parse_models_list_options,
+    parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
+    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
+    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
+    read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
+    run_cui_with_handler_io_and_daemon, run_evolve_command, send_daemon_command_raw,
+    sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, uninstall_with_layout, write_json,
 };
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -36,7 +38,7 @@ use sinomo_runtime::core::{
     EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
 };
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
-use sinomo_runtime::kv::{KvCompare, KvOp, KvTxn};
+use sinomo_runtime::kv::{KvCompare, KvOp, KvRevision, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
 use std::io::{BufRead, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -1351,6 +1353,77 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
             .iter()
             .any(|entry| entry.key == "/config/latency" && entry.value == b"current")
     );
+
+    let watch = handle_daemon_cluster_kv_watch_prefix(
+        &DaemonPaths::with_root(peer_root.join("daemon")),
+        &serde_json::to_string(&sinomo_runtime::network::ClusterKvWatchPrefixRequest {
+            prefix: "/config/watch/".to_string(),
+            start_revision: KvRevision(1),
+        })
+        .expect("watch request"),
+    )
+    .expect("create peer watch");
+    let watch_txn = KvTxn {
+        compares: Vec::new(),
+        success: vec![KvOp::Put {
+            key: "/config/watch/a".to_string(),
+            value: b"watch-value".to_vec(),
+            lease_id: None,
+        }],
+        failure: Vec::new(),
+    };
+    handle_daemon_cluster_kv_txn(
+        &DaemonPaths::with_root(host_root.join("daemon")),
+        &serde_json::to_string(&watch_txn).expect("watch txn"),
+    )
+    .expect("host watch txn");
+    let watch_append =
+        build_cluster_raft_append_request(&host_paths, &host_state).expect("watch raft append");
+    assert!(
+        handle_daemon_cluster_raft_append(
+            &DaemonPaths::with_root(peer_root.join("daemon")),
+            &serde_json::to_string(&watch_append).expect("watch append request"),
+        )
+        .expect("peer watch append")
+        .accepted
+    );
+    let host_events = read_cluster_kv_snapshot(&host_paths)
+        .expect("host watch snapshot")
+        .events;
+    let watch_fanout = handle_daemon_cluster_kv_watch_events(
+        &DaemonPaths::with_root(peer_root.join("daemon")),
+        &serde_json::to_string(&sinomo_runtime::network::ClusterKvWatchEventsRequest {
+            state: host_state.clone(),
+            leader_id: host_state.local_node_id.clone(),
+            events: host_events,
+        })
+        .expect("watch events request"),
+    )
+    .expect("watch event fanout");
+    assert!(watch_fanout.accepted);
+    let drained = handle_daemon_cluster_kv_watch_drain(
+        &DaemonPaths::with_root(peer_root.join("daemon")),
+        &serde_json::to_string(&sinomo_runtime::network::ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+        })
+        .expect("watch drain request"),
+    )
+    .expect("drain peer watch");
+    assert!(
+        drained
+            .events
+            .iter()
+            .any(|event| event.key == "/config/watch/a")
+    );
+    let drained_again = handle_daemon_cluster_kv_watch_drain(
+        &DaemonPaths::with_root(peer_root.join("daemon")),
+        &serde_json::to_string(&sinomo_runtime::network::ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+        })
+        .expect("watch drain request"),
+    )
+    .expect("drain peer watch again");
+    assert!(drained_again.events.is_empty());
     std::fs::remove_dir_all(host_root).ok();
     std::fs::remove_dir_all(peer_root).ok();
 }

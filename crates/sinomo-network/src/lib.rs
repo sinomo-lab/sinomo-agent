@@ -9,16 +9,17 @@ use sinomo_core::{
 };
 use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
 use sinomo_kv::{
-    DurableRaftKvNode, InProcessKvStore, KvCommand, KvEntry, KvError, KvOp, KvSnapshot,
-    KvTxnResponse, KvWalPaths, LeaseId, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
-    RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
+    DurableRaftKvNode, InProcessKvStore, KvCommand, KvEntry, KvError, KvEvent, KvOp, KvRevision,
+    KvSnapshot, KvTxnResponse, KvWalPaths, LeaseId, RaftAppendEntriesRequest,
+    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
+    WatchId,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -32,6 +33,8 @@ pub struct ClusterPaths {
     pub invites: PathBuf,
     pub kv_snapshot: PathBuf,
     pub kv_raft: PathBuf,
+    pub kv_watches: PathBuf,
+    pub kv_watch_events: PathBuf,
 }
 
 impl ClusterPaths {
@@ -42,6 +45,8 @@ impl ClusterPaths {
             invites: root.join("invites"),
             kv_snapshot: root.join("kv-snapshot.json"),
             kv_raft: root.join("kv-raft"),
+            kv_watches: root.join("watches"),
+            kv_watch_events: root.join("watch-events.jsonl"),
             root,
         }
     }
@@ -102,6 +107,47 @@ pub struct ClusterRaftVoteResponse {
     pub detail: String,
     pub state: ClusterBootstrapState,
     pub vote: RaftRequestVoteResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchEventsRequest {
+    pub state: ClusterBootstrapState,
+    pub leader_id: NodeId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<KvEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchEventsResponse {
+    pub accepted: bool,
+    pub detail: String,
+    pub stored_events: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchPrefixRequest {
+    pub prefix: String,
+    pub start_revision: KvRevision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchRegistration {
+    pub watch_id: WatchId,
+    pub prefix: String,
+    pub next_revision: KvRevision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchDrainRequest {
+    pub watch_id: WatchId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchDrainResponse {
+    pub watch_id: WatchId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<KvEvent>,
+    pub next_revision: KvRevision,
 }
 
 pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, NetworkError> {
@@ -263,6 +309,189 @@ pub fn mirror_cluster_raft_snapshot(
     let snapshot = node.store().snapshot();
     write_cluster_kv_snapshot(paths, &snapshot)?;
     Ok(snapshot)
+}
+
+pub fn create_cluster_kv_watch(
+    paths: &ClusterPaths,
+    request: ClusterKvWatchPrefixRequest,
+) -> Result<ClusterKvWatchRegistration, NetworkError> {
+    let snapshot = read_cluster_kv_snapshot(paths)?;
+    if request.start_revision <= snapshot.compacted_revision
+        && snapshot.compacted_revision != KvRevision::ZERO
+    {
+        return Err(NetworkError::Kv(KvError::Compacted {
+            requested: request.start_revision,
+            compacted: snapshot.compacted_revision,
+        }));
+    }
+    fs::create_dir_all(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
+        path: paths.kv_watches.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let watch_id = next_cluster_kv_watch_id(paths)?;
+    let registration = ClusterKvWatchRegistration {
+        watch_id,
+        prefix: request.prefix,
+        next_revision: request.start_revision,
+    };
+    write_json_file(&cluster_kv_watch_path(paths, watch_id), &registration)?;
+    Ok(registration)
+}
+
+pub fn drain_cluster_kv_watch(
+    paths: &ClusterPaths,
+    request: ClusterKvWatchDrainRequest,
+) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
+    let watch_path = cluster_kv_watch_path(paths, request.watch_id);
+    let content = fs::read_to_string(&watch_path).map_err(|source| NetworkError::StorageIo {
+        path: watch_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut registration: ClusterKvWatchRegistration =
+        serde_json::from_str(&content).map_err(|source| NetworkError::Json {
+            path: watch_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let snapshot = read_cluster_kv_snapshot(paths)?;
+    if registration.next_revision <= snapshot.compacted_revision
+        && snapshot.compacted_revision != KvRevision::ZERO
+    {
+        return Err(NetworkError::Kv(KvError::Compacted {
+            requested: registration.next_revision,
+            compacted: snapshot.compacted_revision,
+        }));
+    }
+    let mut events = cluster_kv_watch_events(paths)?;
+    events.extend(snapshot.events);
+    events.sort_by(|left, right| {
+        (left.revision, left.key.as_str()).cmp(&(right.revision, right.key.as_str()))
+    });
+    events.dedup_by(|left, right| {
+        left.revision == right.revision && left.key == right.key && left.kind == right.kind
+    });
+    let events = events
+        .into_iter()
+        .filter(|event| {
+            event.revision >= registration.next_revision
+                && event.key.starts_with(&registration.prefix)
+        })
+        .collect::<Vec<_>>();
+    if let Some(last) = events.last() {
+        registration.next_revision = KvRevision(last.revision.0.saturating_add(1));
+        write_json_file(&watch_path, &registration)?;
+    }
+    Ok(ClusterKvWatchDrainResponse {
+        watch_id: registration.watch_id,
+        events,
+        next_revision: registration.next_revision,
+    })
+}
+
+pub fn append_cluster_kv_watch_events(
+    paths: &ClusterPaths,
+    incoming: &[KvEvent],
+) -> Result<usize, NetworkError> {
+    if incoming.is_empty() {
+        return Ok(0);
+    }
+    if let Some(parent) = paths.kv_watch_events.parent() {
+        fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let mut existing = cluster_kv_watch_events(paths)?;
+    let mut stored = 0;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.kv_watch_events)
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    for event in incoming {
+        if existing.iter().any(|candidate| {
+            candidate.revision == event.revision
+                && candidate.key == event.key
+                && candidate.kind == event.kind
+        }) {
+            continue;
+        }
+        serde_json::to_writer(&mut file, event).map_err(|source| NetworkError::Json {
+            path: paths.kv_watch_events.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        writeln!(file).map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        existing.push(event.clone());
+        stored += 1;
+    }
+    file.sync_data().map_err(|source| NetworkError::StorageIo {
+        path: paths.kv_watch_events.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(stored)
+}
+
+pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, NetworkError> {
+    if !paths.kv_watch_events.exists() {
+        return Ok(Vec::new());
+    }
+    let file =
+        fs::File::open(&paths.kv_watch_events).map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let mut events = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.push(
+            serde_json::from_str(&line).map_err(|source| NetworkError::Json {
+                path: paths.kv_watch_events.display().to_string(),
+                detail: source.to_string(),
+            })?,
+        );
+    }
+    Ok(events)
+}
+
+fn cluster_kv_watch_path(paths: &ClusterPaths, watch_id: WatchId) -> PathBuf {
+    paths.kv_watches.join(format!("watch-{}.json", watch_id.0))
+}
+
+fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkError> {
+    let mut max_id = 0_u64;
+    if paths.kv_watches.exists() {
+        for entry in fs::read_dir(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watches.display().to_string(),
+            detail: source.to_string(),
+        })? {
+            let entry = entry.map_err(|source| NetworkError::StorageIo {
+                path: paths.kv_watches.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if let Some(id) = name
+                .strip_prefix("watch-")
+                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|id| id.parse::<u64>().ok())
+            {
+                max_id = max_id.max(id);
+            }
+        }
+    }
+    Ok(WatchId(max_id.saturating_add(1).max(1)))
 }
 
 fn read_cluster_state_without_kv(

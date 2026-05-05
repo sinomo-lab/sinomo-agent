@@ -1629,6 +1629,14 @@ pub(crate) fn sync_cluster_with_reachable_peers(
         if cluster_raft_node_is_voter(state, &endpoint.node_id) {
             voter_acks += 1;
         }
+        let _ = send_cluster_kv_watch_events(
+            &endpoint.address,
+            &ClusterKvWatchEventsRequest {
+                state: state.clone(),
+                leader_id: state.local_node_id.clone(),
+                events: snapshot.events.clone(),
+            },
+        );
         network::merge_cluster_state_from_peer(state, response.state);
         *snapshot = read_cluster_kv_snapshot(paths)?;
     }
@@ -1832,6 +1840,32 @@ pub(crate) fn send_cluster_raft_vote(
     })
 }
 
+pub(crate) fn send_cluster_kv_watch_events(
+    address: &str,
+    request: &ClusterKvWatchEventsRequest,
+) -> Result<ClusterKvWatchEventsResponse, CliError> {
+    if request.events.is_empty() {
+        return Ok(ClusterKvWatchEventsResponse {
+            accepted: true,
+            detail: "no watch events to fan out".to_string(),
+            stored_events: 0,
+        });
+    }
+    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
+        path: "cluster kv watch events request".to_string(),
+        detail: source.to_string(),
+    })?;
+    let response = send_daemon_command(
+        address,
+        &format!("CLUSTER_KV_WATCH_EVENTS {payload}"),
+        DAEMON_JOIN_TIMEOUT,
+    )?;
+    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
+        path: format!("cluster kv watch events response from {address}"),
+        detail: source.to_string(),
+    })
+}
+
 pub(crate) fn handle_daemon_cluster_raft_append(
     paths: &DaemonPaths,
     payload: &str,
@@ -1963,6 +1997,49 @@ pub(crate) fn handle_daemon_cluster_raft_vote(
         },
         state,
         vote,
+    })
+}
+
+pub(crate) fn handle_daemon_cluster_kv_watch_events(
+    paths: &DaemonPaths,
+    payload: &str,
+) -> Result<ClusterKvWatchEventsResponse, CliError> {
+    let request: ClusterKvWatchEventsRequest =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "cluster kv watch events request".to_string(),
+            detail: source.to_string(),
+        })?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state = read_cluster_state(&cluster_paths)?;
+    if request.state.cluster_id != state.cluster_id {
+        return Ok(ClusterKvWatchEventsResponse {
+            accepted: false,
+            detail: format!(
+                "peer cluster `{}` does not match local cluster `{}`",
+                request.state.cluster_id, state.cluster_id
+            ),
+            stored_events: 0,
+        });
+    }
+    if !cluster_raft_node_is_voter(&state, &request.leader_id) {
+        return Ok(ClusterKvWatchEventsResponse {
+            accepted: false,
+            detail: format!(
+                "watch event fan-out rejected from unauthorized leader {}",
+                request.leader_id
+            ),
+            stored_events: 0,
+        });
+    }
+    let stored_events = network::append_cluster_kv_watch_events(&cluster_paths, &request.events)?;
+    Ok(ClusterKvWatchEventsResponse {
+        accepted: true,
+        detail: "cluster kv watch events stored".to_string(),
+        stored_events,
     })
 }
 

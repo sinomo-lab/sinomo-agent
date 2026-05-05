@@ -68,8 +68,10 @@ use sinomo_runtime::kv::{
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{
-    self, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterPaths,
-    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
+    self, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse,
+    ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse, ClusterKvWatchEventsRequest,
+    ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
+    ClusterPaths, ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
     ClusterRaftVoteResponse, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoverySocket,
     sync_cluster_invitation_to_kv,
 };

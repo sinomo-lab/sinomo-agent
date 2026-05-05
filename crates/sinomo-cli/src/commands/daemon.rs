@@ -1025,6 +1025,44 @@ pub(crate) fn handle_daemon_connection(
                     })?;
                 Ok(false)
             }
+            command if command.starts_with("CLUSTER_KV_WATCH_PREFIX ") => {
+                let payload = command
+                    .strip_prefix("CLUSTER_KV_WATCH_PREFIX ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = handle_daemon_cluster_kv_watch_prefix(paths, payload)?;
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "cluster kv watch prefix response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            command if command.starts_with("CLUSTER_KV_WATCH_DRAIN ") => {
+                let payload = command
+                    .strip_prefix("CLUSTER_KV_WATCH_DRAIN ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = handle_daemon_cluster_kv_watch_drain(paths, payload)?;
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "cluster kv watch drain response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
             command if command.starts_with("CLUSTER_RAFT_APPEND ") => {
                 let payload = command
                     .strip_prefix("CLUSTER_RAFT_APPEND ")
@@ -1034,6 +1072,25 @@ pub(crate) fn handle_daemon_connection(
                 let body =
                     serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
                         path: "cluster raft append response".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            command if command.starts_with("CLUSTER_KV_WATCH_EVENTS ") => {
+                let payload = command
+                    .strip_prefix("CLUSTER_KV_WATCH_EVENTS ")
+                    .unwrap_or_default()
+                    .trim();
+                let response = handle_daemon_cluster_kv_watch_events(paths, payload)?;
+                let body =
+                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
+                        path: "cluster kv watch events response".to_string(),
                         detail: source.to_string(),
                     })?;
                 stream
@@ -1198,6 +1255,40 @@ pub(crate) fn handle_daemon_cluster_kv_range_prefix(
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let store = read_cluster_kv_store(&cluster_paths)?;
     Ok(store.range_prefix(prefix))
+}
+
+pub(crate) fn handle_daemon_cluster_kv_watch_prefix(
+    paths: &DaemonPaths,
+    payload: &str,
+) -> Result<ClusterKvWatchRegistration, CliError> {
+    let request: ClusterKvWatchPrefixRequest =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "cluster kv watch prefix".to_string(),
+            detail: source.to_string(),
+        })?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    network::create_cluster_kv_watch(&cluster_paths, request).map_err(Into::into)
+}
+
+pub(crate) fn handle_daemon_cluster_kv_watch_drain(
+    paths: &DaemonPaths,
+    payload: &str,
+) -> Result<ClusterKvWatchDrainResponse, CliError> {
+    let request: ClusterKvWatchDrainRequest =
+        serde_json::from_str(payload).map_err(|source| CliError::Json {
+            path: "cluster kv watch drain".to_string(),
+            detail: source.to_string(),
+        })?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    network::drain_cluster_kv_watch(&cluster_paths, request).map_err(Into::into)
 }
 
 pub(crate) fn handle_daemon_cluster_join(
