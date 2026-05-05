@@ -1,5 +1,5 @@
 use crate::{AuthenticatedDaemonCommand, DaemonError, DaemonPaths, authenticate_daemon_command};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -21,14 +21,7 @@ where
     let command = request.trim();
     let authenticated = match authenticate_daemon_command(paths, command) {
         Ok(authenticated) => authenticated,
-        Err(error) => {
-            eprintln!("sinomo daemon auth failed: {error}");
-            stream
-                .write_all(b"auth failed\n")
-                .map_err(|source| DaemonError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
+        Err(_error) => {
             return Ok(false);
         }
     };

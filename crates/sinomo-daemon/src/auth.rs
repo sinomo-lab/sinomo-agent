@@ -2,7 +2,7 @@ use crate::{DaemonError, DaemonPaths};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use sinomo_core::ClusterMemberRole;
+use sinomo_core::{ClusterJoinInvite, ClusterMemberRole};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
 use sinomo_node::{NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity};
@@ -14,6 +14,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
+pub const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS * 2;
 
@@ -148,7 +149,7 @@ pub fn authorize_authenticated_daemon_command(
         {
             authenticated.signer.can_run_admin_command()
         }
-        _ => true,
+        _ => false,
     };
     if allowed {
         Ok(())
@@ -239,13 +240,17 @@ fn authorize_daemon_signer(
     }
 
     if envelope.command.starts_with("CLUSTER_JOIN ") {
-        authorize_cluster_join_signer(&envelope.command, &envelope.public_key)?;
+        authorize_cluster_join_signer(paths, &envelope.command, &envelope.public_key)?;
         return Ok(DaemonSignerAuthority::JoinCandidate);
     }
     Err(DaemonError::AuthDenied)
 }
 
-fn authorize_cluster_join_signer(command: &str, public_key: &str) -> Result<(), DaemonError> {
+fn authorize_cluster_join_signer(
+    paths: &DaemonPaths,
+    command: &str,
+    public_key: &str,
+) -> Result<(), DaemonError> {
     let payload = command
         .strip_prefix("CLUSTER_JOIN ")
         .unwrap_or_default()
@@ -255,14 +260,108 @@ fn authorize_cluster_join_signer(command: &str, public_key: &str) -> Result<(), 
             path: "cluster join registration".to_string(),
             detail: source.to_string(),
         })?;
-    if request
+    let requested_member = request
         .members
         .iter()
-        .any(|member| member.node_public_key == public_key)
+        .find(|member| member.node_public_key == public_key)
+        .ok_or(DaemonError::AuthDenied)?;
+    if !request
+        .invite
+        .allowed_member_roles
+        .contains(&requested_member.role)
     {
-        return Ok(());
+        return Err(DaemonError::AuthDenied);
     }
-    Err(DaemonError::AuthDenied)
+
+    verify_cluster_join_invite_signature(&request.invite)?;
+    if request.invite.expires_at <= OffsetDateTime::now_utc() {
+        return Err(DaemonError::AuthExpired);
+    }
+
+    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state = sinomo_network::read_cluster_state(&cluster_paths)?;
+    if request.invite.cluster_id != state.cluster_id {
+        return Err(DaemonError::AuthDenied);
+    }
+    if !state.members.iter().any(|member| {
+        member.node_id == request.invite.issuer_node_id
+            && member.node_public_key == request.invite.issuer_public_key
+            && member.state.is_authorized()
+    }) {
+        return Err(DaemonError::AuthDenied);
+    }
+
+    let persisted_invite_path = cluster_paths.invite_path(&request.invite.invite_id);
+    let persisted_invite =
+        fs::read_to_string(&persisted_invite_path).map_err(|source| DaemonError::Io {
+            path: persisted_invite_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let persisted_invite: ClusterJoinInvite =
+        serde_json::from_str(&persisted_invite).map_err(|source| DaemonError::Json {
+            path: persisted_invite_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if persisted_invite != request.invite {
+        return Err(DaemonError::AuthDenied);
+    }
+    Ok(())
+}
+
+fn verify_cluster_join_invite_signature(invite: &ClusterJoinInvite) -> Result<(), DaemonError> {
+    if invite.signature.trim().is_empty()
+        || invite.issuer_public_key.trim().is_empty()
+        || invite.issuer_node_id.as_str().trim().is_empty()
+    {
+        return Err(DaemonError::AuthDenied);
+    }
+    let public_key = URL_SAFE_NO_PAD
+        .decode(invite.issuer_public_key.as_bytes())
+        .map_err(|_| DaemonError::AuthDenied)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(invite.signature.as_bytes())
+        .map_err(|_| DaemonError::AuthDenied)?;
+    let payload = cluster_invite_signing_payload(invite)?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| DaemonError::AuthDenied)
+}
+
+fn cluster_invite_signing_payload(invite: &ClusterJoinInvite) -> Result<String, DaemonError> {
+    let expires_at = invite
+        .expires_at
+        .format(&Rfc3339)
+        .map_err(|source| DaemonError::Parse {
+            detail: format!("invalid invite expiry timestamp: {source}"),
+        })?;
+    let introducers =
+        serde_json::to_string(&invite.introducers).map_err(|source| DaemonError::Json {
+            path: "cluster invite introducers".to_string(),
+            detail: source.to_string(),
+        })?;
+    let allowed_roles = serde_json::to_string(&invite.allowed_member_roles).map_err(|source| {
+        DaemonError::Json {
+            path: "cluster invite allowed roles".to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    Ok(format!(
+        "{CLUSTER_INVITE_AUTH_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        invite.invite_id,
+        invite.cluster_id,
+        invite.cluster_name.clone().unwrap_or_default(),
+        introducers,
+        invite.token_id,
+        expires_at,
+        invite.trust_domain,
+        allowed_roles,
+        invite.issuer_node_id,
+        invite.issuer_public_key
+    ))
 }
 
 fn load_existing_node_identity(path: &Path) -> Result<NodeIdentity, DaemonError> {

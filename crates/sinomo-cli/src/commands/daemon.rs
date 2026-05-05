@@ -1108,15 +1108,7 @@ pub(crate) fn handle_daemon_connection(
                 let _ = stream.shutdown(Shutdown::Write);
                 Ok(response.status == "accepted")
             }
-            _ => {
-                stream
-                    .write_all(b"unknown daemon command\n")
-                    .map_err(|source| CliError::Network {
-                        address: "daemon client".to_string(),
-                        detail: source.to_string(),
-                    })?;
-                Ok(false)
-            }
+            _ => Ok(false),
         }
     })
 }

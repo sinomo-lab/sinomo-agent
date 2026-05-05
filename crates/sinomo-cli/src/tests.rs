@@ -685,6 +685,87 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
 }
 
 #[test]
+fn daemon_auth_only_accepts_active_signed_join_invites() {
+    let host_root = std::env::temp_dir().join(format!(
+        "sinomo-cli-daemon-join-auth-host-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let join_root = std::env::temp_dir().join(format!(
+        "sinomo-cli-daemon-join-auth-join-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let host_data_dir = SinomoDataDir::new(&host_root);
+    let host_cluster_paths = ClusterPaths::new(&host_data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_join_auth").expect("cluster")),
+            node_id: Some(NodeId::new("node_join_auth_host").expect("node")),
+            name: "join auth cluster".to_string(),
+        },
+        &host_cluster_paths,
+    )
+    .expect("cluster init");
+    let rendered = cluster_invite_with_paths(
+        ClusterInviteOptions {
+            ttl_seconds: 120,
+            introducers: vec!["127.0.0.1:21353".to_string()],
+            output: None,
+        },
+        &host_cluster_paths,
+    )
+    .expect("cluster invite");
+
+    let join_data_dir = SinomoDataDir::new(&join_root);
+    let join_identity =
+        super::load_or_create_main_node_identity(&join_root).expect("join identity");
+    let joined_member = ClusterMemberRecord::pending_learner(
+        rendered.invite.cluster_id.clone(),
+        NodeId::new("node_join_auth_candidate").expect("node"),
+        "join candidate",
+        join_identity.public_key.clone(),
+        OffsetDateTime::now_utc(),
+    );
+    let request = ClusterJoinRegistrationRequest {
+        invite: rendered.invite.clone(),
+        members: vec![joined_member],
+    };
+    let payload = serde_json::to_string(&request).expect("join request");
+    let signed =
+        sign_daemon_command_from_data_dir(&join_data_dir, &format!("CLUSTER_JOIN {payload}"))
+            .expect("signed join");
+    assert_eq!(
+        authenticate_daemon_command(&DaemonPaths::with_root(host_root.join("daemon")), &signed)
+            .expect("active invite auth")
+            .signer,
+        super::DaemonSignerAuthority::JoinCandidate
+    );
+
+    let mut tampered = request;
+    tampered.invite.token_id.push_str("_tampered");
+    let tampered_payload = serde_json::to_string(&tampered).expect("tampered join request");
+    let tampered_signed = sign_daemon_command_from_data_dir(
+        &join_data_dir,
+        &format!("CLUSTER_JOIN {tampered_payload}"),
+    )
+    .expect("signed tampered join");
+    assert!(matches!(
+        authenticate_daemon_command(
+            &DaemonPaths::with_root(host_root.join("daemon")),
+            &tampered_signed
+        ),
+        Err(super::DaemonError::AuthDenied)
+    ));
+    std::fs::remove_dir_all(host_root).ok();
+    std::fs::remove_dir_all(join_root).ok();
+}
+
+#[test]
 fn daemon_authorization_restricts_admin_and_local_commands() {
     assert!(
         super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
@@ -720,6 +801,13 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             signer: super::DaemonSignerAuthority::Local,
         })
         .is_ok()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&super::AuthenticatedDaemonCommand {
+            command: "UNKNOWN_PROBE".to_string(),
+            signer: super::DaemonSignerAuthority::Local,
+        })
+        .is_err()
     );
 }
 
@@ -1567,7 +1655,7 @@ fn daemon_accepted_stream_is_reset_to_blocking_for_delayed_client_input() {
     let response = client.join().expect("client");
 
     assert!(!should_shutdown);
-    assert!(response.contains("auth failed"));
+    assert!(response.is_empty());
     std::fs::remove_dir_all(root).ok();
 }
 
