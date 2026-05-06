@@ -80,12 +80,14 @@ Padding bytes are encoded as `0x00` and are ignored only where this specificatio
 A document is the top-level unit.
 
 ```text
-document := magic metadata padding* schema payload padding*
+document := magic metadata schema payload padding*
 magic    := byte[4] ; "SOBJ"
 payload  := element | schema_payload
 ```
 
 Metadata is a fixed prelude so readers can determine the length width before parsing later sections.
+
+When the schema section has `type_count == 0`, the payload is a dynamic `element`. When the schema section has one or more schema types, the payload is a `schema_payload`.
 
 ```text
 metadata :=
@@ -359,6 +361,8 @@ byte[12 * product(dimensions)]
 Padding is represented by one or more `0x00` bytes in positions where `padding*` is allowed.
 
 Parsers must ignore padding in those positions. Parsers must not treat `0x00` as padding inside raw payloads such as strings, bytes, or array raw data.
+
+Padding is not allowed before length-prefixed sections such as the schema section, object keys, strings, bytes, or array dimensions because a valid little-endian length may begin with zero bytes.
 
 When `alignment_hint` is `1`, serializers should insert padding so each basic type begins at an offset divisible by its encoded size:
 
