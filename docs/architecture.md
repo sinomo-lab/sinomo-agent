@@ -8,7 +8,7 @@ The foundation is a network of cooperating nodes. Each node may have one or more
 
 The initial architecture favors a Rust workspace with small, focused crates that can run together on one machine first, then distribute across desktops, phones, small servers, and LAN devices as workload, privacy, latency, and hardware needs grow.
 
-The detailed cluster bootstrap, discovery, roaming transport, membership, and distributed KV design lives in [clustering-architecture.md](clustering-architecture.md). The detailed distributed filesystem design lives in [dfs-architecture.md](dfs-architecture.md). The binary communication and serialization format is specified in [sinomo-object-format.md](sinomo-object-format.md).
+The detailed cluster bootstrap, discovery, roaming transport, membership, and distributed KV design lives in [clustering-architecture.md](clustering-architecture.md). The detailed distributed filesystem design lives in [dfs-architecture.md](dfs-architecture.md). The binary communication and serialization format is specified in [sinomo-object-format.md](sinomo-object-format.md). Rollout operator procedures and examples are documented in [rollout-operations.md](rollout-operations.md).
 
 Self-evolution is treated as controlled live mutation: Sinomo should be able to change running behavior autonomously without bringing down the system. The detailed design for sandboxed mutation, evaluation, hot-swap, progressive rollout, and rollback lives in [self-evolution-architecture.md](self-evolution-architecture.md).
 
