@@ -1256,10 +1256,19 @@ impl From<&ClusterBootstrapState> for ClusterRaftConfigRecord {
             if !member.state.is_authorized() {
                 continue;
             }
-            match member.role {
-                ClusterMemberRole::Voter => voters.push(member.node_id.clone()),
-                ClusterMemberRole::Learner => learners.push(member.node_id.clone()),
-                ClusterMemberRole::NonVoting => non_voting.push(member.node_id.clone()),
+            match member.state {
+                ClusterMemberState::Voter => voters.push(member.node_id.clone()),
+                ClusterMemberState::Learner => learners.push(member.node_id.clone()),
+                ClusterMemberState::NonVoting => non_voting.push(member.node_id.clone()),
+                ClusterMemberState::Active => match member.role {
+                    ClusterMemberRole::Voter => voters.push(member.node_id.clone()),
+                    ClusterMemberRole::Learner => learners.push(member.node_id.clone()),
+                    ClusterMemberRole::NonVoting => non_voting.push(member.node_id.clone()),
+                },
+                ClusterMemberState::Pending
+                | ClusterMemberState::Suspect
+                | ClusterMemberState::Offline
+                | ClusterMemberState::Removed => {}
             }
         }
         voters.sort();

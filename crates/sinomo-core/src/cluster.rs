@@ -140,6 +140,8 @@ pub struct ClusterMemberRecord {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "ClusterNodeRole::is_default")]
+    pub node_role: ClusterNodeRole,
     pub role: ClusterMemberRole,
     pub state: ClusterMemberState,
     pub trust_domain: TrustDomain,
@@ -236,7 +238,7 @@ impl ClusterMemberRecord {
             display_name,
             node_public_key,
             ClusterMemberRole::Voter,
-            ClusterMemberState::Active,
+            ClusterMemberState::Voter,
             timestamp,
         )
     }
@@ -272,7 +274,7 @@ impl ClusterMemberRecord {
             display_name,
             node_public_key,
             ClusterMemberRole::NonVoting,
-            ClusterMemberState::Active,
+            ClusterMemberState::NonVoting,
             timestamp,
         )
     }
@@ -308,6 +310,7 @@ impl ClusterMemberRecord {
             cluster_id,
             node_id,
             display_name: display_name.into(),
+            node_role: ClusterNodeRole::default(),
             role,
             state,
             trust_domain: TrustDomain::new("trust.local").expect("static trust domain"),
@@ -319,6 +322,23 @@ impl ClusterMemberRecord {
             joined_at: timestamp,
             updated_at: timestamp,
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterNodeRole {
+    #[default]
+    Workstation,
+    Mobile,
+    Server,
+    Sensor,
+    Test,
+}
+
+impl ClusterNodeRole {
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Workstation)
     }
 }
 
@@ -450,8 +470,9 @@ mod tests {
 
         assert_eq!(json["cluster_id"], "cluster_home");
         assert!(json.get("bootstrap").is_none());
+        assert!(json["members"][0].get("node_role").is_none());
         assert_eq!(json["members"][0]["role"], "voter");
-        assert_eq!(json["members"][0]["state"], "active");
+        assert_eq!(json["members"][0]["state"], "voter");
     }
 
     #[test]

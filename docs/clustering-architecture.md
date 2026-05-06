@@ -69,7 +69,7 @@ Initial local state lives at:
 $SINOMO_DATA_DIR/cluster/state.json
 ```
 
-The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core` for the local cluster identity, local node identity, current Raft term/revision, and current member records. It records the current cluster status through member role/state data instead of storing how the node reached that status. Durable membership and config state come from the replicated KV log; the file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
+The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core` for the local cluster identity, local node identity, current Raft term/revision, and current member records. It records the current cluster status through member records, keeping the documented node role separate from Raft membership state. Durable membership and config state come from the replicated KV log; the file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
 
 Each local installation has two daemon process nodes in the cluster metadata:
 
@@ -481,6 +481,6 @@ Phase 5, DFS integration:
 
 Phase 6, operations:
 
-- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local signed invites, and `cluster status` / `cluster health` / `cluster peers` read the daemon-backed KV membership and node-status view when available. Approval, revocation, promotion, doctor, and explicit KV inspection remain future work.
+- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local signed invites; `cluster role` updates the documented node role; `cluster raft-role` and `cluster promote` update Raft membership state; and `cluster status` / `cluster health` / `cluster peers` read the daemon-backed KV membership and node-status view when available. Approval, revocation, demotion, removal, and explicit KV inspection remain future work.
 - Add snapshot export/import.
 - Add metrics and event traces for elections, watches, membership changes, and replication lag.

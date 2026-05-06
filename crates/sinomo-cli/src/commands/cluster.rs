@@ -7,6 +7,7 @@ pub(crate) enum ClusterCliCommand {
     Invite(ClusterInviteOptions),
     Join(ClusterJoinOptions),
     Role(ClusterRoleOptions),
+    RaftRole(ClusterRaftRoleOptions),
     Status,
     Health,
     Doctor,
@@ -49,6 +50,12 @@ pub(crate) struct ClusterInviteOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClusterRoleOptions {
     pub(crate) node_id: NodeId,
+    pub(crate) role: ClusterNodeRole,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterRaftRoleOptions {
+    pub(crate) node_id: NodeId,
     pub(crate) role: ClusterMemberRole,
 }
 
@@ -77,9 +84,15 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         Some((command, rest)) if command == "join" => {
             Ok(ClusterCliCommand::Join(parse_cluster_join_options(rest)?))
         }
-        Some((command, rest)) if matches!(command.as_str(), "role" | "set-role" | "promote") => {
+        Some((command, rest)) if matches!(command.as_str(), "role" | "set-role") => {
             Ok(ClusterCliCommand::Role(parse_cluster_role_options(rest)?))
         }
+        Some((command, rest)) if matches!(command.as_str(), "raft-role" | "set-raft-role") => Ok(
+            ClusterCliCommand::RaftRole(parse_cluster_raft_role_options(rest)?),
+        ),
+        Some((command, rest)) if command == "promote" => Ok(ClusterCliCommand::RaftRole(
+            parse_cluster_promote_options(rest)?,
+        )),
         Some((command, [])) if command == "status" => Ok(ClusterCliCommand::Status),
         Some((command, [])) if matches!(command.as_str(), "health" | "nodes") => {
             Ok(ClusterCliCommand::Health)
@@ -231,8 +244,51 @@ pub(crate) fn parse_cluster_role_options(args: &[String]) -> Result<ClusterRoleO
         node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
             detail: format!("invalid node id `{node_id}`: {source}"),
         })?,
+        role: parse_cluster_node_role(role)?,
+    })
+}
+
+pub(crate) fn parse_cluster_raft_role_options(
+    args: &[String],
+) -> Result<ClusterRaftRoleOptions, CliError> {
+    let [node_id, role] = args else {
+        return Err(CliError::Usage);
+    };
+    Ok(ClusterRaftRoleOptions {
+        node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
+            detail: format!("invalid node id `{node_id}`: {source}"),
+        })?,
         role: parse_cluster_member_role(role)?,
     })
+}
+
+pub(crate) fn parse_cluster_promote_options(
+    args: &[String],
+) -> Result<ClusterRaftRoleOptions, CliError> {
+    match args {
+        [node_id] => Ok(ClusterRaftRoleOptions {
+            node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
+                detail: format!("invalid node id `{node_id}`: {source}"),
+            })?,
+            role: ClusterMemberRole::Voter,
+        }),
+        _ => parse_cluster_raft_role_options(args),
+    }
+}
+
+pub(crate) fn parse_cluster_node_role(role: &str) -> Result<ClusterNodeRole, CliError> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "workstation" => Ok(ClusterNodeRole::Workstation),
+        "mobile" => Ok(ClusterNodeRole::Mobile),
+        "server" => Ok(ClusterNodeRole::Server),
+        "sensor" => Ok(ClusterNodeRole::Sensor),
+        "test" => Ok(ClusterNodeRole::Test),
+        _ => Err(CliError::Parse {
+            detail: format!(
+                "invalid cluster node role `{role}`; expected workstation, mobile, server, sensor, or test"
+            ),
+        }),
+    }
 }
 
 pub(crate) fn parse_cluster_member_role(role: &str) -> Result<ClusterMemberRole, CliError> {
@@ -284,6 +340,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Invite(options) => cluster_invite(options),
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Role(options) => cluster_role(options),
+        ClusterCliCommand::RaftRole(options) => cluster_raft_role(options),
         ClusterCliCommand::Status => cluster_status(),
         ClusterCliCommand::Health => cluster_health(),
         ClusterCliCommand::Doctor => cluster_doctor(),
@@ -1631,11 +1688,13 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
     let rows = cluster_health_rows(&paths, &state)?;
     if rows.is_empty() {
         println!(
-            "node\tprocess\tmember\thealth\tversion\tplatform\tpid\taddress\tlast-seen\trollout"
+            "node\tprocess\trole\tmember\thealth\tversion\tplatform\tpid\taddress\tlast-seen\trollout"
         );
         return Ok(());
     }
-    println!("node\tprocess\tmember\thealth\tversion\tplatform\tpid\taddress\tlast-seen\trollout");
+    println!(
+        "node\tprocess\trole\tmember\thealth\tversion\tplatform\tpid\taddress\tlast-seen\trollout"
+    );
     for row in rows {
         let platform = match (&row.status.target_os, &row.status.target_arch) {
             (Some(os), Some(arch)) => format!("{os}/{arch}"),
@@ -1658,9 +1717,10 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
             .map(format_rollout_status)
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.member.node_id,
             row.status.process,
+            format_node_role(&row.member.node_role),
             format_member_role(&row.member.role),
             format_member_state(&row.member.state),
             format_node_availability(&row.availability),
@@ -1986,8 +2046,11 @@ pub(crate) fn cluster_peers() -> Result<(), CliError> {
     let members = cluster_peer_members(&paths)?;
     for member in members {
         println!(
-            "{}\t{}\t{:?}\t{:?}",
-            member.node_id, member.display_name, member.role, member.state
+            "{}\t{}\t{}\t{}",
+            member.node_id,
+            member.display_name,
+            format_node_role(&member.node_role),
+            format_member_state(&member.state)
         );
     }
     Ok(())
@@ -2005,43 +2068,95 @@ pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> 
             detail: format!("cluster member `{}` was not found", options.node_id),
         });
     };
-    let previous_role = member.role.clone();
+    let previous_role = member.node_role.clone();
     if previous_role == options.role {
         println!(
             "cluster member {} already has role {}",
             options.node_id,
-            format_member_role(&options.role)
+            format_node_role(&options.role)
         );
         return Ok(());
     }
 
-    apply_cluster_member_role(member, options.role.clone(), OffsetDateTime::now_utc());
+    apply_cluster_node_role(member, options.role.clone(), OffsetDateTime::now_utc());
     state.updated_at = OffsetDateTime::now_utc();
     sync_cluster_state_to_kv(&paths, &state)?;
     network::write_cluster_state(&paths, &state)?;
     println!(
         "cluster member {} role changed: {} -> {}",
         options.node_id,
-        format_member_role(&previous_role),
-        format_member_role(&options.role)
+        format_node_role(&previous_role),
+        format_node_role(&options.role)
     );
     Ok(())
 }
 
-pub(crate) fn apply_cluster_member_role(
+pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    let mut state = read_cluster_state(&paths)?;
+    let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == options.node_id)
+    else {
+        return Err(CliError::Parse {
+            detail: format!("cluster member `{}` was not found", options.node_id),
+        });
+    };
+    let previous_role = member.role.clone();
+    let previous_state = member.state.clone();
+    if previous_role == options.role && previous_state == cluster_raft_state_for_role(&options.role)
+    {
+        println!(
+            "cluster member {} already has raft role {}",
+            options.node_id,
+            format_member_role(&options.role)
+        );
+        return Ok(());
+    }
+
+    apply_cluster_raft_role(member, options.role.clone(), OffsetDateTime::now_utc());
+    state.updated_at = OffsetDateTime::now_utc();
+    sync_cluster_state_to_kv(&paths, &state)?;
+    network::write_cluster_state(&paths, &state)?;
+    println!(
+        "cluster member {} raft role changed: {} {} -> {} {}",
+        options.node_id,
+        format_member_role(&previous_role),
+        format_member_state(&previous_state),
+        format_member_role(&options.role),
+        format_member_state(&cluster_raft_state_for_role(&options.role))
+    );
+    Ok(())
+}
+
+pub(crate) fn apply_cluster_node_role(
+    member: &mut ClusterMemberRecord,
+    role: ClusterNodeRole,
+    timestamp: OffsetDateTime,
+) {
+    member.node_role = role;
+    member.updated_at = timestamp;
+}
+
+pub(crate) fn apply_cluster_raft_role(
     member: &mut ClusterMemberRecord,
     role: ClusterMemberRole,
     timestamp: OffsetDateTime,
 ) {
     member.role = role.clone();
-    member.state = match role {
-        ClusterMemberRole::Voter => ClusterMemberState::Active,
-        ClusterMemberRole::Learner => ClusterMemberState::Learner,
-        ClusterMemberRole::NonVoting => ClusterMemberState::NonVoting,
-    };
+    member.state = cluster_raft_state_for_role(&role);
     member.capabilities = main_daemon_capabilities(&role);
     member.allowed_capabilities = member.capabilities.clone();
     member.updated_at = timestamp;
+}
+
+pub(crate) fn cluster_raft_state_for_role(role: &ClusterMemberRole) -> ClusterMemberState {
+    match role {
+        ClusterMemberRole::Voter => ClusterMemberState::Voter,
+        ClusterMemberRole::Learner => ClusterMemberState::Learner,
+        ClusterMemberRole::NonVoting => ClusterMemberState::NonVoting,
+    }
 }
 
 pub(crate) fn cluster_peer_members(
@@ -2593,6 +2708,7 @@ fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMemberRec
     left.cluster_id == right.cluster_id
         && left.node_id == right.node_id
         && left.display_name == right.display_name
+        && left.node_role == right.node_role
         && left.role == right.role
         && left.state == right.state
         && left.trust_domain == right.trust_domain
@@ -3186,12 +3302,18 @@ pub(crate) fn cluster_raft_node_is_voter(state: &ClusterBootstrapState, node_id:
         member.node_id == *node_id
             && member.cluster_id == state.cluster_id
             && member.state.is_authorized()
-            && matches!(member.role, ClusterMemberRole::Voter)
+            && cluster_member_has_raft_vote(member)
             && member
                 .capabilities
                 .iter()
                 .any(|capability| capability.as_str() == "daemon.main.run")
     })
+}
+
+pub(crate) fn cluster_member_has_raft_vote(member: &ClusterMemberRecord) -> bool {
+    matches!(member.state, ClusterMemberState::Voter)
+        || (matches!(member.state, ClusterMemberState::Active)
+            && matches!(member.role, ClusterMemberRole::Voter))
 }
 
 pub(crate) fn cluster_raft_quorum_size(state: &ClusterBootstrapState) -> usize {
@@ -3581,7 +3703,7 @@ pub(crate) fn handle_daemon_cluster_raft_vote(
         member.node_id == request.vote.candidate_id
             && member.cluster_id == state.cluster_id
             && member.state.is_authorized()
-            && matches!(member.role, ClusterMemberRole::Voter)
+            && cluster_member_has_raft_vote(member)
     });
     if !candidate_is_authorized_voter
         || !authenticated_signer_matches_cluster_node(
@@ -3960,6 +4082,9 @@ pub(crate) fn ensure_main_daemon_cluster_member(
     let role = existing
         .map(|member| member.role.clone())
         .unwrap_or(ClusterMemberRole::Learner);
+    let node_role = existing
+        .map(|member| member.node_role.clone())
+        .unwrap_or_default();
     let member_state = existing
         .map(|member| member.state.clone())
         .unwrap_or(ClusterMemberState::Pending);
@@ -3972,6 +4097,7 @@ pub(crate) fn ensure_main_daemon_cluster_member(
         timestamp,
     );
     let capabilities = main_daemon_capabilities(&role);
+    member.node_role = node_role;
     member.role = role;
     member.state = member_state;
     upsert_daemon_member(
@@ -4075,6 +4201,7 @@ pub(crate) fn upsert_daemon_member(
         }
         next_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
         let changed = member.display_name != replacement.display_name
+            || member.node_role != replacement.node_role
             || member.role != replacement.role
             || member.state != replacement.state
             || member.node_public_key != replacement.node_public_key
@@ -4083,6 +4210,7 @@ pub(crate) fn upsert_daemon_member(
             || member.endpoints != next_endpoints;
         if changed {
             member.display_name = replacement.display_name;
+            member.node_role = replacement.node_role;
             member.role = replacement.role;
             member.state = replacement.state;
             member.node_public_key = replacement.node_public_key;
@@ -4509,6 +4637,16 @@ pub(crate) fn format_member_role(role: &ClusterMemberRole) -> &'static str {
         ClusterMemberRole::Voter => "voter",
         ClusterMemberRole::Learner => "learner",
         ClusterMemberRole::NonVoting => "non-voting",
+    }
+}
+
+pub(crate) fn format_node_role(role: &ClusterNodeRole) -> &'static str {
+    match role {
+        ClusterNodeRole::Workstation => "workstation",
+        ClusterNodeRole::Mobile => "mobile",
+        ClusterNodeRole::Server => "server",
+        ClusterNodeRole::Sensor => "sensor",
+        ClusterNodeRole::Test => "test",
     }
 }
 

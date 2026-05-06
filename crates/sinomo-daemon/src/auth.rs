@@ -2,7 +2,7 @@ use crate::{DaemonError, DaemonPaths};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use sinomo_core::{ClusterInviteId, ClusterJoinInvite, ClusterMemberRole};
+use sinomo_core::{ClusterInviteId, ClusterJoinInvite, ClusterMemberRole, ClusterMemberState};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
 use sinomo_node::{NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity};
@@ -390,11 +390,16 @@ fn authorize_daemon_signer(
                 && member.node_public_key == envelope.public_key
                 && member.state.is_authorized()
         }) {
-            return Ok(if member.role == ClusterMemberRole::Voter {
-                DaemonSignerAuthority::Voter
-            } else {
-                DaemonSignerAuthority::Member
-            });
+            return Ok(
+                if matches!(member.state, ClusterMemberState::Voter)
+                    || (matches!(member.state, ClusterMemberState::Active)
+                        && matches!(member.role, ClusterMemberRole::Voter))
+                {
+                    DaemonSignerAuthority::Voter
+                } else {
+                    DaemonSignerAuthority::Member
+                },
+            );
         }
     }
 

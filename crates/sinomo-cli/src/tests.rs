@@ -1,41 +1,41 @@
 use super::{
     CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
-    ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRoleOptions,
-    ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
-    DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths,
-    InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler, ModelsCliCommand,
-    ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets, apply_cluster_member_role,
-    authenticate_daemon_command, build_cluster_raft_append_request_from_next_index,
-    cli_command_requires_cluster_state, cluster_connectivity_sync_ops, cluster_doctor_findings,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_publish_targets,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
-    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
-    create_source_repo_bundle, daemon_advertised_endpoints_for_state, daemon_lan_endpoint,
-    daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
-    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
-    expire_cluster_network_records_in_kv, handle_daemon_cluster_join,
-    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
-    handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
-    handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
-    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    main_daemon_capabilities, managed_source_status, models_default_with_data_dir,
-    normalize_model_provider, parse_cli_command, parse_cluster_command,
-    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
-    parse_install_options, parse_model_default_options, parse_models_list_options,
-    parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
-    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
-    read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
-    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
-    send_daemon_command_raw, shadow_daemon_node_id, sign_cluster_join_invite,
-    sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
-    uninstall_with_layout, write_json,
+    ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRaftRoleOptions,
+    ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand,
+    DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus,
+    EvolutionPaths, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
+    ModelsCliCommand, ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutMainActivation,
+    RolloutOptions, SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets,
+    apply_cluster_node_role, apply_cluster_raft_role, authenticate_daemon_command,
+    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
+    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
+    cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_state_sync_txn, cluster_sync_targets, create_source_repo_bundle,
+    daemon_advertised_endpoints_for_state, daemon_lan_endpoint, daemon_package_version,
+    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
+    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
+    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn,
+    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
+    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
+    handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
+    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, is_terminal_status, main_daemon_capabilities,
+    managed_source_status, models_default_with_data_dir, normalize_model_provider,
+    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    parse_models_list_options, parse_propose_options, parse_provider_command,
+    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
+    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
+    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
+    run_shadow_daemon_with_paths, send_daemon_command_raw, shadow_daemon_node_id,
+    sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, uninstall_with_layout, write_json,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -45,7 +45,8 @@ use sinomo_runtime::core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointId, ClusterEndpointPrivacy,
     ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterInviteId, ClusterJoinInvite,
     ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
-    ClusterTransportKind, EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
+    ClusterNodeRole, ClusterTransportKind, EvolutionJobId, NodeId, SessionId, TrustDomain,
+    TrustRing,
 };
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
 use sinomo_runtime::kv::{InProcessKvStore, KvCompare, KvOp, KvRevision, KvTxn};
@@ -388,7 +389,7 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
 }
 
 #[test]
-fn cluster_member_role_update_sets_state_and_capabilities() {
+fn cluster_node_role_update_keeps_raft_state_and_capabilities() {
     let cluster_id = ClusterId::new("cluster_role_update").expect("cluster");
     let node_id = NodeId::new("node_role_update").expect("node");
     let timestamp = OffsetDateTime::now_utc();
@@ -404,14 +405,47 @@ fn cluster_member_role_update_sets_state_and_capabilities() {
     member.capabilities = main_daemon_capabilities(&ClusterMemberRole::Learner);
     member.allowed_capabilities = member.capabilities.clone();
 
-    apply_cluster_member_role(
+    apply_cluster_node_role(
+        &mut member,
+        ClusterNodeRole::Server,
+        timestamp + time::Duration::seconds(1),
+    );
+
+    assert_eq!(member.node_role, ClusterNodeRole::Server);
+    assert_eq!(member.role, ClusterMemberRole::Learner);
+    assert_eq!(member.state, ClusterMemberState::Learner);
+    assert!(
+        !member
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "cluster.kv.vote")
+    );
+    assert_eq!(member.allowed_capabilities, member.capabilities);
+}
+
+#[test]
+fn cluster_raft_role_update_sets_state_and_capabilities() {
+    let cluster_id = ClusterId::new("cluster_raft_role_update").expect("cluster");
+    let node_id = NodeId::new("node_raft_role_update").expect("node");
+    let timestamp = OffsetDateTime::now_utc();
+    let mut member = ClusterMemberRecord::pending_learner(
+        cluster_id,
+        node_id,
+        "raft role update",
+        "public-key",
+        timestamp,
+    );
+    member.node_role = ClusterNodeRole::Server;
+
+    apply_cluster_raft_role(
         &mut member,
         ClusterMemberRole::Voter,
         timestamp + time::Duration::seconds(1),
     );
 
+    assert_eq!(member.node_role, ClusterNodeRole::Server);
     assert_eq!(member.role, ClusterMemberRole::Voter);
-    assert_eq!(member.state, ClusterMemberState::Active);
+    assert_eq!(member.state, ClusterMemberState::Voter);
     assert!(
         member
             .capabilities
@@ -993,24 +1027,32 @@ fn cluster_parser_accepts_init_and_join_options() {
         parse_cluster_command(&[
             "role".to_string(),
             "node_laptop".to_string(),
-            "voter".to_string(),
+            "server".to_string(),
         ])
         .expect("cluster role"),
         ClusterCliCommand::Role(ClusterRoleOptions {
             node_id: NodeId::new("node_laptop").expect("node"),
-            role: ClusterMemberRole::Voter,
+            role: ClusterNodeRole::Server,
         })
     );
     assert_eq!(
         parse_cluster_command(&[
-            "set-role".to_string(),
+            "raft-role".to_string(),
             "node_laptop".to_string(),
             "non_voting".to_string(),
         ])
-        .expect("cluster set-role"),
-        ClusterCliCommand::Role(ClusterRoleOptions {
+        .expect("cluster raft-role"),
+        ClusterCliCommand::RaftRole(ClusterRaftRoleOptions {
             node_id: NodeId::new("node_laptop").expect("node"),
             role: ClusterMemberRole::NonVoting,
+        })
+    );
+    assert_eq!(
+        parse_cluster_command(&["promote".to_string(), "node_laptop".to_string()])
+            .expect("cluster promote"),
+        ClusterCliCommand::RaftRole(ClusterRaftRoleOptions {
+            node_id: NodeId::new("node_laptop").expect("node"),
+            role: ClusterMemberRole::Voter,
         })
     );
 }
@@ -1054,7 +1096,7 @@ fn cluster_init_persists_local_cluster_state() {
         .find(|member| member.node_id == NodeId::new("node_local").expect("node"))
         .expect("main daemon member");
     assert_eq!(main.role, ClusterMemberRole::Voter);
-    assert_eq!(main.state, ClusterMemberState::Active);
+    assert_eq!(main.state, ClusterMemberState::Voter);
     assert!(!main.node_public_key.trim().is_empty());
     assert_eq!(main.endpoints[0].address, "127.0.0.1:21353");
     let shadow = state
@@ -1063,7 +1105,7 @@ fn cluster_init_persists_local_cluster_state() {
         .find(|member| member.node_id == NodeId::new("node_local-shadow").expect("node"))
         .expect("shadow daemon member");
     assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
-    assert_eq!(shadow.state, ClusterMemberState::Active);
+    assert_eq!(shadow.state, ClusterMemberState::NonVoting);
     assert!(!shadow.node_public_key.trim().is_empty());
     assert_ne!(shadow.node_public_key, main.node_public_key);
     assert_eq!(shadow.endpoints[0].address, "127.0.0.1:21354");
@@ -1073,7 +1115,7 @@ fn cluster_init_persists_local_cluster_state() {
         .iter()
         .find(|member| member.node_id == NodeId::new("node_local").expect("node"))
         .expect("kv main");
-    assert_eq!(kv_main.state, ClusterMemberState::Active);
+    assert_eq!(kv_main.state, ClusterMemberState::Voter);
     assert_eq!(kv_main.node_public_key, main.node_public_key);
     assert_eq!(
         cluster_raft_known_leader_id(&paths, &state).expect("known leader"),

@@ -64,8 +64,10 @@ pub(super) fn print_cluster_help() {
     println!(
         "      Record intent to join an existing cluster from a signed sinomo-join URI or invite file."
     );
-    println!("  sinomo cluster role <node-id> <voter|learner|non-voting>");
-    println!("      Change a cluster member role through the quorum-backed cluster state.");
+    println!("  sinomo cluster role <node-id> <workstation|mobile|server|sensor|test>");
+    println!("      Change the documented node role in quorum-backed cluster membership.");
+    println!("  sinomo cluster raft-role <node-id> <voter|learner|non-voting>");
+    println!("      Change the Raft membership state through quorum-backed cluster membership.");
     println!("  sinomo cluster status");
     println!("      Show local cluster status and node health counts.");
     println!("  sinomo cluster health");

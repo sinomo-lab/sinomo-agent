@@ -19,9 +19,9 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_core::{
         CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointId,
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterId,
-        ClusterInviteId, ClusterMemberRecord, ClusterMemberRole, ClusterNodeStatusRecord,
-        ClusterTransportKind, EventEnvelope, EventId, LatencyClass, NodeId, RoutingScope,
-        SessionId,
+        ClusterInviteId, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
+        ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, EventId, LatencyClass,
+        NodeId, RoutingScope, SessionId,
     };
     pub(crate) use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
     pub(crate) use sinomo_kv::{
