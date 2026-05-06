@@ -8,26 +8,27 @@ use super::{
     InteractionSurfaceKind, ModelBackedInteractionHandler, ModelsCliCommand, ProviderCliCommand,
     ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
     UninstallOptions, authenticate_daemon_command, build_cluster_raft_append_request,
-    cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_sync_targets, daemon_lan_endpoint, daemon_package_version,
-    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
-    encode_cluster_join_invite, ensure_rollout_layout, handle_daemon_cluster_join,
-    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
-    handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
-    handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
-    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
-    is_terminal_status, main_daemon_capabilities, models_default_with_data_dir,
-    normalize_model_provider, parse_cli_command, parse_cluster_command,
-    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
-    parse_install_options, parse_model_default_options, parse_models_list_options,
-    parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
-    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
-    read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
-    run_cui_with_handler_io_and_daemon, run_evolve_command, send_daemon_command_raw,
-    sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, uninstall_with_layout, write_json,
+    cli_command_requires_cluster_state, cluster_has_local_quorum, cluster_init_with_paths,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
+    cluster_raft_known_leader_id, cluster_sync_targets, daemon_lan_endpoint,
+    daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
+    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
+    handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
+    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn,
+    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
+    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
+    handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
+    install_should_update_binary, install_with_layout, is_terminal_status,
+    main_daemon_capabilities, models_default_with_data_dir, normalize_model_provider,
+    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    parse_models_list_options, parse_propose_options, parse_provider_command,
+    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
+    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
+    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
+    send_daemon_command_raw, sign_cluster_join_invite, sign_daemon_command_from_data_dir,
+    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout, write_json,
 };
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -437,8 +438,11 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
     assert!(!cli_command_requires_cluster_state(&CliCommand::Dfs(
         DfsCliCommand::Help
     )));
-    assert!(cli_command_requires_cluster_state(&CliCommand::Models(
+    assert!(!cli_command_requires_cluster_state(&CliCommand::Models(
         ModelsCliCommand::Help
+    )));
+    assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(
+        ProviderCliCommand::Help
     )));
 }
 
@@ -1242,7 +1246,7 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
         &serde_json::to_string(&txn).expect("txn json"),
     );
 
-    assert!(result.is_err());
+    assert!(matches!(result, Err(CliError::ClusterReadOnly { .. })));
     assert!(
         !read_cluster_kv_snapshot(&paths)
             .expect("cluster snapshot")
@@ -1251,6 +1255,70 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
             .any(|entry| entry.key == "/config/unsafe")
     );
     responder.join().expect("join fake responder");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn daemon_cluster_kv_is_read_only_without_cluster_state() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-kv-no-cluster-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
+    let txn = KvTxn {
+        compares: Vec::new(),
+        success: vec![KvOp::Put {
+            key: "/config/no-cluster".to_string(),
+            value: b"blocked".to_vec(),
+            lease_id: None,
+        }],
+        failure: Vec::new(),
+    };
+
+    let result = handle_daemon_cluster_kv_txn(
+        &daemon_paths,
+        &serde_json::to_string(&txn).expect("txn json"),
+    );
+
+    assert!(matches!(result, Err(CliError::ClusterReadOnly { .. })));
+    assert_eq!(
+        handle_daemon_cluster_kv_snapshot(&daemon_paths)
+            .expect("snapshot")
+            .entries,
+        Vec::new()
+    );
+    assert_eq!(
+        handle_daemon_cluster_kv_range_prefix(&daemon_paths, "/config").expect("range"),
+        Vec::new()
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn single_node_cluster_has_local_quorum() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-single-node-quorum-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_single_quorum").expect("cluster")),
+            node_id: Some(NodeId::new("node_single_quorum").expect("node")),
+            name: "single node quorum cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let state = read_cluster_state(&paths).expect("cluster state");
+
+    assert!(cluster_has_local_quorum(&paths, &state));
     std::fs::remove_dir_all(root).ok();
 }
 

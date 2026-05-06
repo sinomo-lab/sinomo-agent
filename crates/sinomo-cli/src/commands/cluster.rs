@@ -262,13 +262,26 @@ pub(crate) fn require_cluster_bootstrap_state() -> Result<ClusterBootstrapState,
     read_cluster_state(&paths)
 }
 
-pub(crate) fn require_cluster_runtime_state() -> Result<(), CliError> {
-    if let Some(status) = default_main_daemon_status()? {
-        if status.cluster.is_some() {
-            return Ok(());
-        }
+pub(crate) fn require_cluster_runtime_quorum() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    let state = read_cluster_state(&paths).map_err(|error| match error {
+        CliError::ClusterOrphan => CliError::ClusterReadOnly {
+            detail: "local node has no cluster state; cluster-dependent operations are paused"
+                .to_string(),
+        },
+        other => other,
+    })?;
+    if cluster_has_local_quorum(&paths, &state) {
+        Ok(())
+    } else {
+        Err(CliError::ClusterReadOnly {
+            detail: format!(
+                "quorum unavailable; cluster-dependent operations are paused ({} reachable voters, {} required)",
+                cluster_reachable_voter_count(&paths, &state),
+                cluster_raft_quorum_size(&state)
+            ),
+        })
     }
-    require_cluster_bootstrap_state().map(|_| ())
 }
 
 pub(crate) fn cluster_init(options: ClusterInitOptions) -> Result<(), CliError> {
@@ -1510,34 +1523,37 @@ impl ClusterNetworkMaintenance {
 
         if publish_due {
             self.last_publish = now;
-            sync_cluster_state_to_kv(&cluster_paths, &state)?;
-            let local_network_info = build_local_cluster_network_info(
-                &state,
-                &state.local_node_id,
-                OffsetDateTime::now_utc(),
-            );
-            if self
-                .environment_id
-                .as_ref()
-                .is_some_and(|known| known != &local_network_info.environment_id)
-            {
-                self.connectivity.clear();
-            }
-            self.environment_id = Some(local_network_info.environment_id.clone());
-            snapshot = Some(network::sync_cluster_network_info_to_kv(
-                &cluster_paths,
-                local_network_info,
-            )?);
-            if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(paths)? {
-                snapshot = Some(status_snapshot);
-            }
-            let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
-            if matches!(
-                probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
-                DaemonProbeStatus::Running(_)
-            ) {
-                if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(&shadow_paths)? {
+            if cluster_has_local_quorum(&cluster_paths, &state) {
+                sync_cluster_state_to_kv(&cluster_paths, &state)?;
+                let local_network_info = build_local_cluster_network_info(
+                    &state,
+                    &state.local_node_id,
+                    OffsetDateTime::now_utc(),
+                );
+                if self
+                    .environment_id
+                    .as_ref()
+                    .is_some_and(|known| known != &local_network_info.environment_id)
+                {
+                    self.connectivity.clear();
+                }
+                self.environment_id = Some(local_network_info.environment_id.clone());
+                snapshot = Some(network::sync_cluster_network_info_to_kv(
+                    &cluster_paths,
+                    local_network_info,
+                )?);
+                if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(paths)? {
                     snapshot = Some(status_snapshot);
+                }
+                let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+                if matches!(
+                    probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
+                    DaemonProbeStatus::Running(_)
+                ) {
+                    if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(&shadow_paths)?
+                    {
+                        snapshot = Some(status_snapshot);
+                    }
                 }
             }
         }
@@ -1549,16 +1565,18 @@ impl ClusterNetworkMaintenance {
 
         if probe_due {
             self.last_probe = now;
-            let records = self.probe_connectivity(&state);
-            let _ = network::sync_cluster_connectivity_records_to_kv(
-                &cluster_paths,
-                &state.local_node_id,
-                records,
-            )?;
-            snapshot = Some(network::expire_cluster_network_records(
-                &cluster_paths,
-                OffsetDateTime::now_utc(),
-            )?);
+            if cluster_has_local_quorum(&cluster_paths, &state) {
+                let records = self.probe_connectivity(&state);
+                let _ = network::sync_cluster_connectivity_records_to_kv(
+                    &cluster_paths,
+                    &state.local_node_id,
+                    records,
+                )?;
+                snapshot = Some(network::expire_cluster_network_records(
+                    &cluster_paths,
+                    OffsetDateTime::now_utc(),
+                )?);
+            }
         }
 
         if sync_due {
@@ -1906,6 +1924,32 @@ pub(crate) fn sync_cluster_with_reachable_peers(
     Ok(())
 }
 
+pub(crate) fn cluster_has_local_quorum(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> bool {
+    cluster_reachable_voter_count(paths, state) >= cluster_raft_quorum_size(state)
+}
+
+pub(crate) fn cluster_reachable_voter_count(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> usize {
+    let mut voters = std::collections::BTreeSet::new();
+    if cluster_raft_local_is_voter(state) {
+        voters.insert(state.local_node_id.clone());
+    }
+    for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
+        if !cluster_raft_node_is_voter(state, &endpoint.node_id) {
+            continue;
+        }
+        if send_daemon_command_to_endpoint(&endpoint, "STATUS", DAEMON_JOIN_TIMEOUT).is_ok() {
+            voters.insert(endpoint.node_id);
+        }
+    }
+    voters.len()
+}
+
 pub(crate) fn commit_cluster_raft_command_with_quorum(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
@@ -1932,8 +1976,7 @@ pub(crate) fn commit_cluster_raft_command_with_quorum(
     }
     if voter_acks.len() < cluster_raft_quorum_size(state) {
         let _ = network::clear_cluster_raft_leader(paths, &state.local_node_id);
-        return Err(CliError::Network {
-            address: "cluster raft quorum".to_string(),
+        return Err(CliError::ClusterReadOnly {
             detail: format!(
                 "raft command at index {} replicated to {} voters, {} required",
                 entry.index,
@@ -2130,15 +2173,6 @@ pub(crate) fn cluster_sync_targets_with_connectivity(
 ) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = cluster_sync_targets(state);
     let graph = network::read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
-    endpoints.retain(|endpoint| {
-        !graph.iter().any(|record| {
-            record.source_node_id == state.local_node_id
-                && record.target_node_id == endpoint.node_id
-                && record.endpoint_id == endpoint.endpoint_id
-                && matches!(record.state, network::ClusterConnectivityState::Unreachable)
-                && record.expires_at > OffsetDateTime::now_utc()
-        })
-    });
     endpoints.sort_by_key(|endpoint| {
         let score = graph
             .iter()
@@ -2741,6 +2775,9 @@ pub(crate) fn refresh_daemon_node_status_in_kv(
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let state = read_cluster_state(&cluster_paths)?;
+    if !cluster_has_local_quorum(&cluster_paths, &state) {
+        return Ok(None);
+    }
     let _ = network::sync_cluster_network_info_to_kv(
         &cluster_paths,
         build_local_cluster_network_info(&state, &cluster.node_id, OffsetDateTime::now_utc()),

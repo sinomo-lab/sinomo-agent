@@ -125,15 +125,7 @@ mod commands;
 pub(crate) use commands::*;
 
 pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
-    matches!(
-        command,
-        CliCommand::Cui
-            | CliCommand::Evolve(_)
-            | CliCommand::Rollout(_)
-            | CliCommand::Models(_)
-            | CliCommand::Providers(_)
-            | CliCommand::Usage(_)
-    )
+    matches!(command, CliCommand::Evolve(_) | CliCommand::Rollout(_))
 }
 
 #[derive(Debug, Clone)]
@@ -211,7 +203,7 @@ fn run_cli_command(args: &[String]) -> Result<(), CliError> {
 
 fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
     if cli_command_requires_cluster_state(&command) {
-        require_cluster_runtime_state()?;
+        require_cluster_runtime_quorum()?;
     }
 
     match command {

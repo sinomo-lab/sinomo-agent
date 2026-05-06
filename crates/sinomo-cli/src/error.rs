@@ -18,6 +18,9 @@ pub enum CliError {
         expected: String,
     },
     ClusterOrphan,
+    ClusterReadOnly {
+        detail: String,
+    },
     MissingArtifact {
         artifact: String,
     },
@@ -230,6 +233,9 @@ impl std::fmt::Display for CliError {
                 formatter,
                 "this node is not part of a cluster; run `sinomo cluster init` or `sinomo cluster join <invite>`"
             ),
+            Self::ClusterReadOnly { detail } => {
+                write!(formatter, "cluster KV is read-only: {detail}")
+            }
             Self::MissingArtifact { artifact } => {
                 write!(formatter, "{artifact} has not been written")
             }

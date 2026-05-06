@@ -1319,6 +1319,9 @@ pub(crate) fn ensure_default_distributed_dfs(
             })?;
         }
     }
+    if !cluster_has_local_quorum(&cluster_paths, &state) {
+        return Ok(());
+    }
 
     put_dfs_control_record(
         &cluster_paths,
@@ -1400,20 +1403,32 @@ pub(crate) fn handle_daemon_cluster_kv_txn(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let mut state = read_cluster_state(&cluster_paths)?;
+    let mut state = read_cluster_state(&cluster_paths).map_err(|error| match error {
+        CliError::ClusterOrphan => CliError::ClusterReadOnly {
+            detail: "local node has no cluster state".to_string(),
+        },
+        other => other,
+    })?;
+    if !cluster_has_local_quorum(&cluster_paths, &state) {
+        return Err(CliError::ClusterReadOnly {
+            detail: format!(
+                "quorum unavailable ({} reachable voters, {} required)",
+                cluster_reachable_voter_count(&cluster_paths, &state),
+                cluster_raft_quorum_size(&state)
+            ),
+        });
+    }
     if !cluster_raft_local_is_leader(&cluster_paths, &state)?
         && !elect_cluster_raft_leader(&cluster_paths, &state)?
     {
-        return Err(CliError::Network {
-            address: "cluster raft quorum".to_string(),
+        return Err(CliError::ClusterReadOnly {
             detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
         });
     }
     let mut snapshot = read_cluster_kv_store(&cluster_paths)?.snapshot();
     sync_cluster_with_reachable_peers(&cluster_paths, &mut state, &mut snapshot)?;
     if !cluster_raft_local_is_leader(&cluster_paths, &state)? {
-        return Err(CliError::Network {
-            address: "cluster raft quorum".to_string(),
+        return Err(CliError::ClusterReadOnly {
             detail: "local daemon lost Raft quorum before committing the transaction".to_string(),
         });
     }
