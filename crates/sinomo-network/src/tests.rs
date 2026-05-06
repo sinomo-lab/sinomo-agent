@@ -11,6 +11,52 @@ use sinomo_core::{
 use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
 use sinomo_kv::{InProcessKvStore, KvCommand, KvEventKind, KvOp};
 
+#[cfg(feature = "iroh-transport")]
+#[test]
+fn iroh_daemon_proxy_round_trips_control_command() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind daemon fixture");
+    let daemon_address = listener
+        .local_addr()
+        .expect("daemon fixture address")
+        .to_string();
+    let fixture = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept daemon fixture");
+        let mut request = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut request)
+            .expect("read daemon fixture request");
+        assert_eq!(request.trim(), "PING");
+        std::io::Write::write_all(&mut stream, b"PONG\n").expect("write daemon fixture response");
+    });
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-iroh-proxy-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let record = start_iroh_daemon_proxy(
+        paths.clone(),
+        ClusterId::new("cluster_iroh_proxy").expect("cluster"),
+        NodeId::new("node_iroh_proxy").expect("node"),
+        daemon_address,
+    )
+    .expect("start iroh proxy");
+
+    let response = send_daemon_command_to_cluster_endpoint(
+        &record.endpoint(),
+        "PING",
+        std::time::Duration::from_secs(5),
+    )
+    .expect("send iroh daemon command");
+
+    assert_eq!(response.trim(), "PONG");
+    fixture.join().expect("daemon fixture");
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
     let root = std::env::temp_dir().join(format!(

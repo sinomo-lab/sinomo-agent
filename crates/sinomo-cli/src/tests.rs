@@ -34,9 +34,9 @@ use super::{
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
     run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
-    send_daemon_command_raw, shadow_daemon_node_id, sign_cluster_join_invite,
-    sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
-    uninstall_with_layout, write_json,
+    send_cluster_join_registration_over_iroh, send_daemon_command_raw, shadow_daemon_node_id,
+    sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, uninstall_with_layout, write_json,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -360,6 +360,144 @@ fn default_invite_compaction_keeps_iroh_fallback() {
     assert_eq!(endpoints[0].address, "10.14.1.11:21353");
     assert_eq!(endpoints[1].address, "10.14.1.12:21353");
     assert_eq!(endpoints[2].transport, ClusterTransportKind::Iroh);
+}
+
+#[test]
+fn cluster_join_registration_works_over_iroh() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-iroh-join-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let cluster_id = ClusterId::new("cluster_iroh_join").expect("cluster");
+    let responder_node_id = NodeId::new("node_iroh_join_responder").expect("node");
+    let responder_identity =
+        super::load_or_create_main_node_identity(&root).expect("responder identity");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake iroh join daemon");
+    let daemon_address = listener
+        .local_addr()
+        .expect("fake iroh join daemon address")
+        .to_string();
+    let invite_id = ClusterInviteId::new("invite_iroh_join").expect("invite");
+    let response_state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "iroh join",
+        responder_node_id.clone(),
+        "responder",
+        responder_identity.public_key.clone(),
+        OffsetDateTime::now_utc(),
+    );
+    let fixture_identity = responder_identity.clone();
+    let fixture_invite_id = invite_id.clone();
+    let fixture_cluster_id = cluster_id.clone();
+    let fixture_node_id = responder_node_id.clone();
+    let fixture_response_state = response_state.clone();
+    let fixture = thread::spawn(move || {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept fake iroh join daemon");
+            let mut request_line = String::new();
+            BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut request_line)
+                .expect("read fake iroh join command");
+            let request_line = request_line.trim();
+            if index == 0 {
+                let payload = request_line
+                    .strip_prefix("INVITE_HELLO ")
+                    .expect("invite hello");
+                let challenge: super::ClusterInviteChallengeRequest =
+                    sinomo_runtime::network::decode_object_text_payload(payload)
+                        .expect("challenge request");
+                assert_eq!(challenge.invite_id, fixture_invite_id);
+                let timestamp = OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .expect("timestamp");
+                let signing_payload = format!(
+                    "sinomo.cluster-invite-challenge.v1\n{}\n{}\n{}\n{}\n{}\n{}",
+                    challenge.invite_id,
+                    fixture_cluster_id,
+                    fixture_node_id,
+                    fixture_identity.public_key,
+                    challenge.challenge,
+                    timestamp
+                );
+                let signature = fixture_identity
+                    .key_pair()
+                    .expect("responder key pair")
+                    .sign(signing_payload.as_bytes());
+                let proof = super::ClusterInviteChallengeProof {
+                    protocol: "sinomo.cluster-invite-challenge.v1".to_string(),
+                    invite_id: challenge.invite_id,
+                    cluster_id: fixture_cluster_id.clone(),
+                    responder_node_id: fixture_node_id.to_string(),
+                    responder_public_key: fixture_identity.public_key.clone(),
+                    challenge: challenge.challenge,
+                    timestamp,
+                    signature: super::URL_SAFE_NO_PAD.encode(signature.as_ref()),
+                };
+                let proof_payload =
+                    sinomo_runtime::network::encode_object_text_payload(&proof).expect("proof");
+                Write::write_all(
+                    &mut stream,
+                    format!("INVITE_PROOF {proof_payload}\n").as_bytes(),
+                )
+                .expect("write proof");
+            } else {
+                assert!(request_line.starts_with("AUTH "));
+                let response = super::ClusterJoinRegistrationResponse {
+                    accepted: true,
+                    detail: "join registered".to_string(),
+                    state: fixture_response_state.clone(),
+                    kv_snapshot: None,
+                };
+                let payload = sinomo_runtime::network::encode_object_text_payload(&response)
+                    .expect("response");
+                Write::write_all(&mut stream, format!("{payload}\n").as_bytes())
+                    .expect("write join response");
+            }
+        }
+    });
+    let record = sinomo_runtime::network::start_iroh_daemon_proxy(
+        paths.clone(),
+        cluster_id.clone(),
+        responder_node_id,
+        daemon_address,
+    )
+    .expect("start iroh daemon proxy");
+    let invite = ClusterJoinInvite {
+        invite_id: invite_id.clone(),
+        cluster_id: ClusterId::new("cluster_pending_join").expect("pending cluster"),
+        cluster_name: None,
+        cluster_public_key: responder_identity.public_key.clone(),
+        invitation_secret: "secret_iroh_join".to_string(),
+        communication_channels: vec![sinomo_runtime::core::ClusterInvitationChannel {
+            endpoint: record.endpoint(),
+            node_public_key: responder_identity.public_key.clone(),
+        }],
+        introducers: Vec::new(),
+        token_id: String::new(),
+        expires_at: OffsetDateTime::UNIX_EPOCH,
+        trust_domain: TrustDomain::new("trust.local").expect("trust"),
+        allowed_member_roles: Vec::new(),
+        issuer_node_id: NodeId::new("node_pending_invite").expect("pending node"),
+        issuer_public_key: String::new(),
+        signature: String::new(),
+    };
+    let request = ClusterJoinRegistrationRequest {
+        invitation_secret: invite.invitation_secret.clone(),
+        invite,
+        members: Vec::new(),
+    };
+
+    let response = send_cluster_join_registration_over_iroh(&record.endpoint(), &request)
+        .expect("iroh join registration");
+
+    assert!(response.accepted);
+    assert_eq!(response.state.cluster_id, cluster_id);
+    fixture.join().expect("fake iroh join daemon");
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
