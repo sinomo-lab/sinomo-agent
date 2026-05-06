@@ -5,8 +5,10 @@
 //! watches, snapshots, and a deterministic Raft replication core for tests,
 //! local development, and daemon integration.
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sinomo_core::{ClusterMemberRecord, NodeId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -38,6 +40,7 @@ pub struct WatchId(pub u64);
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KvEntry {
     pub key: String,
+    #[serde(with = "base64_bytes")]
     pub value: Vec<u8>,
     pub create_revision: KvRevision,
     pub modify_revision: KvRevision,
@@ -76,6 +79,7 @@ pub enum KvCompare {
     },
     ValueEquals {
         key: String,
+        #[serde(with = "base64_bytes")]
         value: Vec<u8>,
     },
     VersionEquals {
@@ -100,6 +104,7 @@ pub enum KvCompare {
 pub enum KvOp {
     Put {
         key: String,
+        #[serde(with = "base64_bytes")]
         value: Vec<u8>,
         lease_id: Option<LeaseId>,
     },
@@ -167,7 +172,10 @@ pub enum KvOpResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum KvEventKind {
-    Put { value: Vec<u8> },
+    Put {
+        #[serde(with = "base64_bytes")]
+        value: Vec<u8>,
+    },
     Delete,
 }
 
@@ -193,6 +201,60 @@ pub struct KvSnapshot {
     pub leases: Vec<KvLease>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<KvEvent>,
+}
+
+mod base64_bytes {
+    use super::*;
+    use std::fmt;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BytesVisitor)
+    }
+
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a base64url string or a legacy byte array")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            URL_SAFE_NO_PAD.decode(value).map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
