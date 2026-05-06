@@ -20,7 +20,7 @@ sinomo-events = { path = "../sinomo-events" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-module = { path = "../sinomo-module" }
-sinomo-network = { path = "../sinomo-network" }
+sinomo-network = { path = "../sinomo-network", features = ["iroh-transport"] }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }

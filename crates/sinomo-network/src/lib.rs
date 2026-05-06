@@ -20,9 +20,18 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+#[cfg(feature = "iroh-transport")]
+use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+#[cfg(feature = "iroh-transport")]
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::rc::Rc;
+#[cfg(feature = "iroh-transport")]
+use std::sync::mpsc;
+#[cfg(feature = "iroh-transport")]
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -31,6 +40,7 @@ pub struct ClusterPaths {
     pub root: PathBuf,
     pub state: PathBuf,
     pub invites: PathBuf,
+    pub iroh: PathBuf,
     pub kv_snapshot: PathBuf,
     pub kv_raft: PathBuf,
     pub kv_watches: PathBuf,
@@ -43,6 +53,7 @@ impl ClusterPaths {
         Self {
             state: root.join("state.json"),
             invites: root.join("invites"),
+            iroh: root.join("iroh"),
             kv_snapshot: root.join("kv-snapshot.json"),
             kv_raft: root.join("kv-raft"),
             kv_watches: root.join("watches"),
@@ -1096,7 +1107,9 @@ pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpoin
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && matches!(
                     endpoint.transport,
-                    ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+                    ClusterTransportKind::LanTcp
+                        | ClusterTransportKind::Loopback
+                        | ClusterTransportKind::Iroh
                 )
         }));
     }
@@ -1799,6 +1812,8 @@ impl MdnsDiscoveryRecord {
 
 pub const WEBRTC_SIGNALING_PROTOCOL: &str = "sinomo.webrtc-signaling.v1";
 pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
+pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
+pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct WebRtcSignalingEnvelope {
@@ -2013,14 +2028,15 @@ pub struct IrohEndpointRecord {
 impl IrohEndpointRecord {
     pub fn endpoint(&self) -> ClusterEndpointRecord {
         let has_direct_address = !self.direct_addresses.is_empty();
-        let address = if has_direct_address {
-            format!(
-                "iroh://{}?direct={}",
-                self.endpoint_public_key,
-                self.direct_addresses.join(",")
-            )
-        } else if let Some(relay_url) = &self.relay_url {
-            format!("iroh://{}?relay={relay_url}", self.endpoint_public_key)
+        let address = if has_direct_address || self.relay_url.is_some() {
+            let mut query = Vec::new();
+            if has_direct_address {
+                query.push(format!("direct={}", self.direct_addresses.join(",")));
+            }
+            if let Some(relay_url) = &self.relay_url {
+                query.push(format!("relay={relay_url}"));
+            }
+            format!("iroh://{}?{}", self.endpoint_public_key, query.join("&"))
         } else {
             format!("iroh://{}", self.endpoint_public_key)
         };
@@ -2110,6 +2126,486 @@ impl IrohKvExchange {
             detail: source.to_string(),
         })
     }
+}
+
+pub fn iroh_endpoint_key_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
+    paths.iroh.join(format!("{}.secret.json", node_id.as_str()))
+}
+
+pub fn iroh_endpoint_record_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
+    paths.iroh.join(format!("{}.endpoint.json", node_id.as_str()))
+}
+
+#[cfg(feature = "iroh-transport")]
+pub fn load_or_create_iroh_secret_key(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<iroh::SecretKey, NetworkError> {
+    let key_path = iroh_endpoint_key_path(paths, node_id);
+    if key_path.exists() {
+        let content = fs::read_to_string(&key_path).map_err(|source| NetworkError::StorageIo {
+            path: key_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        return serde_json::from_str(&content).map_err(|source| NetworkError::Json {
+            path: key_path.display().to_string(),
+            detail: source.to_string(),
+        });
+    }
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let key = iroh::SecretKey::generate();
+    let content = serde_json::to_string_pretty(&key).map_err(|source| NetworkError::Json {
+        path: key_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    fs::write(&key_path, format!("{content}\n")).map_err(|source| NetworkError::StorageIo {
+        path: key_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(key)
+}
+
+#[cfg(not(feature = "iroh-transport"))]
+pub fn load_or_create_iroh_secret_key(
+    _paths: &ClusterPaths,
+    _node_id: &NodeId,
+) -> Result<(), NetworkError> {
+    Err(NetworkError::Io {
+        operation: "iroh secret key".to_string(),
+        detail: "sinomo-network was built without iroh-transport".to_string(),
+    })
+}
+
+#[cfg(feature = "iroh-transport")]
+pub fn iroh_public_key_for_node(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<String, NetworkError> {
+    Ok(load_or_create_iroh_secret_key(paths, node_id)?
+        .public()
+        .to_string())
+}
+
+#[cfg(not(feature = "iroh-transport"))]
+pub fn iroh_public_key_for_node(
+    _paths: &ClusterPaths,
+    _node_id: &NodeId,
+) -> Result<String, NetworkError> {
+    Err(NetworkError::Io {
+        operation: "iroh public key".to_string(),
+        detail: "sinomo-network was built without iroh-transport".to_string(),
+    })
+}
+
+pub fn read_iroh_endpoint_record(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<IrohEndpointRecord, NetworkError> {
+    let path = iroh_endpoint_record_path(paths, node_id);
+    let content = fs::read_to_string(&path).map_err(|source| NetworkError::StorageIo {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| NetworkError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub fn write_iroh_endpoint_record(
+    paths: &ClusterPaths,
+    record: &IrohEndpointRecord,
+) -> Result<(), NetworkError> {
+    write_json_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
+}
+
+#[cfg(feature = "iroh-transport")]
+pub fn start_iroh_daemon_proxy(
+    paths: ClusterPaths,
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    daemon_address: String,
+) -> Result<IrohEndpointRecord, NetworkError> {
+    let secret_key = load_or_create_iroh_secret_key(&paths, &node_id)?;
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name(format!("sinomo-iroh-{}", node_id.as_str()))
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(source) => {
+                    let _ = tx.send(Err(NetworkError::Io {
+                        operation: "start iroh runtime".to_string(),
+                        detail: source.to_string(),
+                    }));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let result = run_iroh_daemon_proxy(
+                    paths,
+                    cluster_id,
+                    node_id,
+                    daemon_address,
+                    secret_key,
+                    tx,
+                )
+                .await;
+                if let Err(error) = result {
+                    eprintln!("sinomo iroh daemon proxy stopped: {error}");
+                }
+            });
+        })
+        .map_err(|source| NetworkError::Io {
+            operation: "spawn iroh daemon proxy".to_string(),
+            detail: source.to_string(),
+        })?;
+    rx.recv().map_err(|source| NetworkError::Io {
+        operation: "start iroh daemon proxy".to_string(),
+        detail: source.to_string(),
+    })?
+}
+
+#[cfg(not(feature = "iroh-transport"))]
+pub fn start_iroh_daemon_proxy(
+    _paths: ClusterPaths,
+    _cluster_id: ClusterId,
+    _node_id: NodeId,
+    _daemon_address: String,
+) -> Result<IrohEndpointRecord, NetworkError> {
+    Err(NetworkError::Io {
+        operation: "start iroh daemon proxy".to_string(),
+        detail: "sinomo-network was built without iroh-transport".to_string(),
+    })
+}
+
+#[cfg(feature = "iroh-transport")]
+async fn run_iroh_daemon_proxy(
+    paths: ClusterPaths,
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    daemon_address: String,
+    secret_key: iroh::SecretKey,
+    ready: mpsc::Sender<Result<IrohEndpointRecord, NetworkError>>,
+) -> Result<(), NetworkError> {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret_key)
+        .alpns(vec![IROH_ROAMING_PROTOCOL.as_bytes().to_vec()])
+        .bind()
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "bind iroh endpoint".to_string(),
+            detail: source.to_string(),
+        })?;
+    let _ = tokio::time::timeout(IROH_DAEMON_ONLINE_TIMEOUT, endpoint.online()).await;
+    let record = iroh_endpoint_record_from_addr(&cluster_id, &node_id, endpoint.addr());
+    write_iroh_endpoint_record(&paths, &record)?;
+    let _ = ready.send(Ok(record));
+
+    while let Some(connecting) = endpoint.accept().await {
+        let daemon_address = daemon_address.clone();
+        tokio::spawn(async move {
+            let Ok(connection) = connecting.await else {
+                return;
+            };
+            loop {
+                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                    break;
+                };
+                let daemon_address = daemon_address.clone();
+                tokio::spawn(async move {
+                    let Ok(request) = recv.read_to_end(IROH_DAEMON_COMMAND_MAX_BYTES).await else {
+                        return;
+                    };
+                    let Ok(response) = tokio::task::spawn_blocking(move || {
+                        forward_daemon_control_payload(
+                            &daemon_address,
+                            &request,
+                            Duration::from_secs(60),
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|source| {
+                        Err(NetworkError::Io {
+                            operation: "forward iroh daemon command".to_string(),
+                            detail: source.to_string(),
+                        })
+                    }) else {
+                        return;
+                    };
+                    if send.write_all(&response).await.is_ok() {
+                        let _ = send.finish();
+                    }
+                });
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "iroh-transport")]
+pub fn iroh_endpoint_record_from_addr(
+    cluster_id: &ClusterId,
+    node_id: &NodeId,
+    addr: iroh::EndpointAddr,
+) -> IrohEndpointRecord {
+    let relay_url = addr.relay_urls().next().map(|relay| relay.to_string());
+    let direct_addresses = addr.ip_addrs().map(|address| address.to_string()).collect();
+    let relay_mode = relay_url
+        .as_ref()
+        .map(|relay_url| IrohRelayMode::Custom {
+            relay_url: relay_url.clone(),
+        })
+        .unwrap_or(IrohRelayMode::Default);
+    IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        endpoint_public_key: addr.id.to_string(),
+        direct_addresses,
+        relay_url,
+        relay_mode,
+        expires_after_tick: 0,
+    }
+}
+
+pub fn iroh_endpoint_record_from_cluster_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    cluster_id: &ClusterId,
+) -> Result<IrohEndpointRecord, NetworkError> {
+    if endpoint.transport != ClusterTransportKind::Iroh {
+        return Err(NetworkError::Io {
+            operation: "parse iroh endpoint".to_string(),
+            detail: format!("endpoint {} is not an iroh endpoint", endpoint.endpoint_id),
+        });
+    }
+    iroh_endpoint_record_from_address(&endpoint.address, cluster_id, &endpoint.node_id)
+}
+
+pub fn iroh_endpoint_record_from_address(
+    address: &str,
+    cluster_id: &ClusterId,
+    node_id: &NodeId,
+) -> Result<IrohEndpointRecord, NetworkError> {
+    let rest = address
+        .strip_prefix("iroh://")
+        .ok_or_else(|| NetworkError::Serialization {
+            detail: format!("invalid iroh endpoint address `{address}`"),
+        })?;
+    let (public_key, query) = rest.split_once('?').unwrap_or((rest, ""));
+    if public_key.trim().is_empty() {
+        return Err(NetworkError::Serialization {
+            detail: format!("invalid iroh endpoint address `{address}`"),
+        });
+    }
+    let mut direct_addresses = Vec::new();
+    let mut relay_url = None;
+    for part in query.split('&').filter(|part| !part.trim().is_empty()) {
+        if let Some(value) = part.strip_prefix("direct=") {
+            direct_addresses.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned),
+            );
+        } else if let Some(value) = part.strip_prefix("relay=") {
+            if !value.trim().is_empty() {
+                relay_url = Some(value.to_string());
+            }
+        }
+    }
+    let relay_mode = relay_url
+        .as_ref()
+        .map(|relay_url| IrohRelayMode::Custom {
+            relay_url: relay_url.clone(),
+        })
+        .unwrap_or(IrohRelayMode::Default);
+    Ok(IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        endpoint_public_key: public_key.to_string(),
+        direct_addresses,
+        relay_url,
+        relay_mode,
+        expires_after_tick: 0,
+    })
+}
+
+#[cfg(feature = "iroh-transport")]
+pub fn send_iroh_daemon_command_raw(
+    address: &str,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, NetworkError> {
+    let record = iroh_endpoint_record_from_address(
+        address,
+        &ClusterId::new("cluster_iroh_dial_placeholder").expect("static cluster id"),
+        &NodeId::new("node_iroh_dial_placeholder").expect("static node id"),
+    )?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| NetworkError::Io {
+            operation: "start iroh client runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    let response = runtime.block_on(async move {
+        tokio::time::timeout(timeout, send_iroh_daemon_command_raw_async(record, command)).await
+    });
+    match response {
+        Ok(result) => result,
+        Err(_) => Err(NetworkError::Io {
+            operation: "send iroh daemon command".to_string(),
+            detail: format!("timed out after {}s", timeout.as_secs()),
+        }),
+    }
+}
+
+#[cfg(not(feature = "iroh-transport"))]
+pub fn send_iroh_daemon_command_raw(
+    address: &str,
+    _command: &str,
+    _timeout: Duration,
+) -> Result<String, NetworkError> {
+    Err(NetworkError::Io {
+        operation: "send iroh daemon command".to_string(),
+        detail: format!(
+            "cannot dial {address}; sinomo-network was built without iroh-transport"
+        ),
+    })
+}
+
+#[cfg(feature = "iroh-transport")]
+async fn send_iroh_daemon_command_raw_async(
+    record: IrohEndpointRecord,
+    command: &str,
+) -> Result<String, NetworkError> {
+    let remote_addr = iroh_endpoint_addr_from_record(&record)?;
+    let endpoint = iroh::Endpoint::bind(iroh::endpoint::presets::N0)
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "bind iroh client endpoint".to_string(),
+            detail: source.to_string(),
+        })?;
+    let connection = endpoint
+        .connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes())
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "connect iroh endpoint".to_string(),
+            detail: source.to_string(),
+        })?;
+    let (mut send, mut recv) = connection.open_bi().await.map_err(|source| NetworkError::Io {
+        operation: "open iroh daemon stream".to_string(),
+        detail: source.to_string(),
+    })?;
+    send.write_all(format!("{command}\n").as_bytes())
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "write iroh daemon command".to_string(),
+            detail: source.to_string(),
+        })?;
+    send.finish().map_err(|source| NetworkError::Io {
+        operation: "finish iroh daemon command".to_string(),
+        detail: source.to_string(),
+    })?;
+    let response = recv
+        .read_to_end(IROH_DAEMON_COMMAND_MAX_BYTES)
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: source.to_string(),
+        })?;
+    connection.close(0_u8.into(), b"done");
+    endpoint.close().await;
+    String::from_utf8(response).map_err(|source| NetworkError::Serialization {
+        detail: source.to_string(),
+    })
+}
+
+#[cfg(feature = "iroh-transport")]
+fn iroh_endpoint_addr_from_record(
+    record: &IrohEndpointRecord,
+) -> Result<iroh::EndpointAddr, NetworkError> {
+    let public_key = record
+        .endpoint_public_key
+        .parse()
+        .map_err(|source| NetworkError::Serialization {
+            detail: format!("invalid iroh public key: {source}"),
+        })?;
+    let mut addr = iroh::EndpointAddr::new(public_key);
+    for direct in &record.direct_addresses {
+        let socket = direct.parse().map_err(|source| NetworkError::Serialization {
+            detail: format!("invalid iroh direct address `{direct}`: {source}"),
+        })?;
+        addr = addr.with_ip_addr(socket);
+    }
+    if let Some(relay_url) = &record.relay_url {
+        let relay = relay_url
+            .parse()
+            .map_err(|source| NetworkError::Serialization {
+                detail: format!("invalid iroh relay url `{relay_url}`: {source}"),
+            })?;
+        addr = addr.with_relay_url(relay);
+    }
+    Ok(addr)
+}
+
+#[cfg(feature = "iroh-transport")]
+fn forward_daemon_control_payload(
+    address: &str,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, NetworkError> {
+    let socket_address = address
+        .to_socket_addrs()
+        .map_err(|source| NetworkError::Io {
+            operation: format!("resolve daemon control address {address}"),
+            detail: source.to_string(),
+        })?
+        .next()
+        .ok_or_else(|| NetworkError::Io {
+            operation: format!("resolve daemon control address {address}"),
+            detail: "no socket addresses resolved".to_string(),
+        })?;
+    let mut stream =
+        TcpStream::connect_timeout(&socket_address, timeout).map_err(|source| NetworkError::Io {
+            operation: format!("connect daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|source| NetworkError::Io {
+            operation: format!("configure daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|source| NetworkError::Io {
+            operation: format!("configure daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    stream.write_all(payload).map_err(|source| NetworkError::Io {
+        operation: format!("write daemon control address {address}"),
+        detail: source.to_string(),
+    })?;
+    let _ = stream.shutdown(Shutdown::Write);
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|source| NetworkError::Io {
+            operation: format!("read daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    Ok(response)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -3633,6 +4129,16 @@ mod tests {
                 .address
                 .contains("direct=203.0.113.10:21356")
         );
+        assert!(
+            cluster_endpoint
+                .address
+                .contains("relay=https://relay.example")
+        );
+        let parsed_endpoint =
+            iroh_endpoint_record_from_cluster_endpoint(&cluster_endpoint, &cluster_id)
+                .expect("cluster endpoint parse");
+        assert_eq!(parsed_endpoint.direct_addresses, endpoint.direct_addresses);
+        assert_eq!(parsed_endpoint.relay_url, endpoint.relay_url);
     }
 
     #[test]

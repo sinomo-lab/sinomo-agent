@@ -557,13 +557,22 @@ pub(crate) fn default_invite_introducers(
             for endpoint in invite_introducers_from_daemon_status(&state.local_node_id, &status) {
                 push_unique_introducer(&mut introducers, endpoint);
             }
+            if let Ok(record) = network::read_iroh_endpoint_record(paths, &state.local_node_id) {
+                push_unique_introducer(&mut introducers, record.endpoint());
+            }
         }
     }
 
     for endpoint in state
         .members
         .iter()
-        .filter(|member| member.state.is_authorized())
+        .filter(|member| {
+            member.state.is_authorized()
+                && member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == "daemon.main.run")
+        })
         .flat_map(|member| member.endpoints.iter().cloned())
     {
         push_unique_introducer(&mut introducers, endpoint);
@@ -806,7 +815,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
     };
     let mut last_error = None;
     for channel in invite_channels(&request.invite) {
-        match send_cluster_join_registration(&channel.endpoint.address, &request) {
+        match send_cluster_join_registration_to_channel(&channel.endpoint, &request) {
             Ok(response) => {
                 if response.accepted {
                     if let Some(snapshot) = response.kv_snapshot.clone()
@@ -832,6 +841,16 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         });
     }
     Ok(())
+}
+
+pub(crate) fn send_cluster_join_registration_to_channel(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterJoinRegistrationRequest,
+) -> Result<ClusterJoinRegistrationResponse, CliError> {
+    match endpoint.transport {
+        ClusterTransportKind::Iroh => send_cluster_join_registration_over_iroh(endpoint, request),
+        _ => send_cluster_join_registration(&endpoint.address, request),
+    }
 }
 
 pub(crate) fn merge_cluster_join_registration(
@@ -941,6 +960,49 @@ pub(crate) fn send_cluster_join_registration(
         })?;
     serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
         path: format!("cluster join response from {address}"),
+        detail: source.to_string(),
+    })
+}
+
+pub(crate) fn send_cluster_join_registration_over_iroh(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterJoinRegistrationRequest,
+) -> Result<ClusterJoinRegistrationResponse, CliError> {
+    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
+        path: "cluster join registration".to_string(),
+        detail: source.to_string(),
+    })?;
+    let challenge = random_url_secret(32)?;
+    let challenge_request = ClusterInviteChallengeRequest {
+        protocol: "sinomo.cluster-invite-challenge.v1".to_string(),
+        invite_id: request.invite.invite_id.clone(),
+        challenge: challenge.clone(),
+    };
+    let challenge_payload =
+        serde_json::to_string(&challenge_request).map_err(|source| CliError::Json {
+            path: "cluster invite challenge request".to_string(),
+            detail: source.to_string(),
+        })?;
+    let proof_response = network::send_iroh_daemon_command_raw(
+        &endpoint.address,
+        &format!("INVITE_HELLO {challenge_payload}"),
+        DAEMON_JOIN_TIMEOUT,
+    )?;
+    let proof_payload = proof_response
+        .trim()
+        .strip_prefix("INVITE_PROOF ")
+        .ok_or_else(|| CliError::AuthDenied)?;
+    let proof: ClusterInviteChallengeProof =
+        serde_json::from_str(proof_payload).map_err(|source| CliError::Json {
+            path: format!("cluster invite proof from {}", endpoint.address),
+            detail: source.to_string(),
+        })?;
+    verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
+    let signed = sign_daemon_command_for_local_node(&format!("CLUSTER_JOIN {payload}"))?;
+    let response =
+        network::send_iroh_daemon_command_raw(&endpoint.address, &signed, DAEMON_JOIN_TIMEOUT)?;
+    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
+        path: format!("cluster join response from {}", endpoint.address),
         detail: source.to_string(),
     })
 }
@@ -1182,14 +1244,11 @@ pub(crate) fn probe_member_daemon_status(
         if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
             continue;
         }
-        if !matches!(
-            endpoint.transport,
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-        ) {
-            continue;
-        }
-        let Ok(response) =
-            send_daemon_command(&endpoint.address, "STATUS", CLUSTER_HEALTH_PROBE_TIMEOUT)
+        let Ok(response) = send_daemon_command_to_endpoint(
+            &endpoint,
+            "STATUS",
+            CLUSTER_HEALTH_PROBE_TIMEOUT,
+        )
         else {
             continue;
         };
@@ -1221,7 +1280,9 @@ pub(crate) fn live_probe_possible(
         (is_local_process || !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
             && matches!(
                 endpoint.transport,
-                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+                ClusterTransportKind::LanTcp
+                    | ClusterTransportKind::Loopback
+                    | ClusterTransportKind::Iroh
             )
     })
 }
@@ -1618,19 +1679,22 @@ pub(crate) fn sync_cluster_with_reachable_peers(
         return Ok(());
     }
     let request = build_cluster_raft_append_request(paths, state)?;
-    let mut voter_acks = usize::from(cluster_raft_local_is_voter(state));
+    let mut voter_acks = std::collections::BTreeSet::new();
+    if cluster_raft_local_is_voter(state) {
+        voter_acks.insert(state.local_node_id.clone());
+    }
     for endpoint in cluster_sync_targets(state) {
-        let Ok(response) = send_cluster_raft_append(&endpoint.address, &request) else {
+        let Ok(response) = send_cluster_raft_append(&endpoint, &request) else {
             continue;
         };
         if !response.accepted {
             continue;
         }
         if cluster_raft_node_is_voter(state, &endpoint.node_id) {
-            voter_acks += 1;
+            voter_acks.insert(endpoint.node_id.clone());
         }
         let _ = send_cluster_kv_watch_events(
-            &endpoint.address,
+            &endpoint,
             &ClusterKvWatchEventsRequest {
                 state: state.clone(),
                 leader_id: state.local_node_id.clone(),
@@ -1640,7 +1704,7 @@ pub(crate) fn sync_cluster_with_reachable_peers(
         network::merge_cluster_state_from_peer(state, response.state);
         *snapshot = read_cluster_kv_snapshot(paths)?;
     }
-    if voter_acks < cluster_raft_quorum_size(state) {
+    if voter_acks.len() < cluster_raft_quorum_size(state) {
         *snapshot = network::clear_cluster_raft_leader(paths, &state.local_node_id)?;
     }
     Ok(())
@@ -1654,26 +1718,30 @@ pub(crate) fn commit_cluster_raft_command_with_quorum(
     let entry =
         network::append_cluster_raft_command_uncommitted(paths, &state.local_node_id, command)?;
     let append_request = build_cluster_raft_append_request(paths, state)?;
-    let mut voter_acks = usize::from(cluster_raft_local_is_voter(state));
+    let mut voter_acks = std::collections::BTreeSet::new();
+    if cluster_raft_local_is_voter(state) {
+        voter_acks.insert(state.local_node_id.clone());
+    }
     for endpoint in cluster_sync_targets(state) {
-        let Ok(response) = send_cluster_raft_append(&endpoint.address, &append_request) else {
+        let Ok(response) = send_cluster_raft_append(&endpoint, &append_request) else {
             continue;
         };
         if !response.accepted {
             continue;
         }
         if cluster_raft_node_is_voter(state, &endpoint.node_id) {
-            voter_acks += 1;
+            voter_acks.insert(endpoint.node_id.clone());
         }
         network::merge_cluster_state_from_peer(state, response.state);
     }
-    if voter_acks < cluster_raft_quorum_size(state) {
+    if voter_acks.len() < cluster_raft_quorum_size(state) {
         let _ = network::clear_cluster_raft_leader(paths, &state.local_node_id);
         return Err(CliError::Network {
             address: "cluster raft quorum".to_string(),
             detail: format!(
-                "raft command at index {} replicated to {voter_acks} voters, {} required",
+                "raft command at index {} replicated to {} voters, {} required",
                 entry.index,
+                voter_acks.len(),
                 cluster_raft_quorum_size(state)
             ),
         });
@@ -1683,10 +1751,10 @@ pub(crate) fn commit_cluster_raft_command_with_quorum(
         network::commit_cluster_raft_index(paths, &state.local_node_id, entry.index)?;
     let commit_request = build_cluster_raft_append_request(paths, state)?;
     for endpoint in cluster_sync_targets(state) {
-        if let Ok(response) = send_cluster_raft_append(&endpoint.address, &commit_request) {
+        if let Ok(response) = send_cluster_raft_append(&endpoint, &commit_request) {
             if response.accepted {
                 let _ = send_cluster_kv_watch_events(
-                    &endpoint.address,
+                    &endpoint,
                     &ClusterKvWatchEventsRequest {
                         state: state.clone(),
                         leader_id: state.local_node_id.clone(),
@@ -1762,7 +1830,7 @@ pub(crate) fn cluster_raft_leader_is_reachable(
         .flat_map(|member| member.endpoints.iter())
         .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
         .any(|endpoint| {
-            send_daemon_command(&endpoint.address, "STATUS", DAEMON_JOIN_TIMEOUT).is_ok()
+            send_daemon_command_to_endpoint(endpoint, "STATUS", DAEMON_JOIN_TIMEOUT).is_ok()
         })
 }
 
@@ -1786,16 +1854,19 @@ pub(crate) fn elect_cluster_raft_leader(
     };
     let local_vote =
         network::apply_cluster_raft_vote(paths, &state.local_node_id, vote_request.vote.clone())?;
-    let mut granted = usize::from(local_vote.vote_granted);
+    let mut granted = std::collections::BTreeSet::new();
+    if local_vote.vote_granted {
+        granted.insert(state.local_node_id.clone());
+    }
     for endpoint in cluster_raft_vote_targets(state) {
-        let Ok(response) = send_cluster_raft_vote(&endpoint.address, &vote_request) else {
+        let Ok(response) = send_cluster_raft_vote(&endpoint, &vote_request) else {
             continue;
         };
         if response.vote.vote_granted {
-            granted += 1;
+            granted.insert(endpoint.node_id.clone());
         }
     }
-    if granted < cluster_raft_quorum_size(state) {
+    if granted.len() < cluster_raft_quorum_size(state) {
         return Ok(false);
     }
     network::set_cluster_raft_leader(paths, &state.local_node_id, election_term)?;
@@ -1856,46 +1927,70 @@ pub(crate) fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<Cluster
     network::cluster_sync_targets(state)
 }
 
+pub(crate) fn send_daemon_command_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, CliError> {
+    match endpoint.transport {
+        ClusterTransportKind::Iroh => {
+            let signed = sign_daemon_command_for_local_node(command)?;
+            network::send_iroh_daemon_command_raw(&endpoint.address, &signed, timeout)
+                .map_err(Into::into)
+        }
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            Ok(send_daemon_command(&endpoint.address, command, timeout)?)
+        }
+        _ => Err(CliError::Network {
+            address: endpoint.address.clone(),
+            detail: format!(
+                "unsupported daemon command transport {:?}",
+                endpoint.transport
+            ),
+        }),
+    }
+}
+
 pub(crate) fn send_cluster_raft_append(
-    address: &str,
+    endpoint: &ClusterEndpointRecord,
     request: &ClusterRaftAppendRequest,
 ) -> Result<ClusterRaftAppendResponse, CliError> {
     let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
         path: "cluster raft append request".to_string(),
         detail: source.to_string(),
     })?;
-    let response = send_daemon_command(
-        address,
+    let response = send_daemon_command_to_endpoint(
+        endpoint,
         &format!("CLUSTER_RAFT_APPEND {payload}"),
         DAEMON_JOIN_TIMEOUT,
     )?;
     serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster raft append response from {address}"),
+        path: format!("cluster raft append response from {}", endpoint.address),
         detail: source.to_string(),
     })
 }
 
 pub(crate) fn send_cluster_raft_vote(
-    address: &str,
+    endpoint: &ClusterEndpointRecord,
     request: &ClusterRaftVoteRequest,
 ) -> Result<ClusterRaftVoteResponse, CliError> {
     let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
         path: "cluster raft vote request".to_string(),
         detail: source.to_string(),
     })?;
-    let response = send_daemon_command(
-        address,
+    let response = send_daemon_command_to_endpoint(
+        endpoint,
         &format!("CLUSTER_RAFT_VOTE {payload}"),
         DAEMON_JOIN_TIMEOUT,
     )?;
     serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster raft vote response from {address}"),
+        path: format!("cluster raft vote response from {}", endpoint.address),
         detail: source.to_string(),
     })
 }
 
 pub(crate) fn send_cluster_kv_watch_events(
-    address: &str,
+    endpoint: &ClusterEndpointRecord,
     request: &ClusterKvWatchEventsRequest,
 ) -> Result<ClusterKvWatchEventsResponse, CliError> {
     if request.events.is_empty() {
@@ -1909,13 +2004,16 @@ pub(crate) fn send_cluster_kv_watch_events(
         path: "cluster kv watch events request".to_string(),
         detail: source.to_string(),
     })?;
-    let response = send_daemon_command(
-        address,
+    let response = send_daemon_command_to_endpoint(
+        endpoint,
         &format!("CLUSTER_KV_WATCH_EVENTS {payload}"),
         DAEMON_JOIN_TIMEOUT,
     )?;
     serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster kv watch events response from {address}"),
+        path: format!(
+            "cluster kv watch events response from {}",
+            endpoint.address
+        ),
         detail: source.to_string(),
     })
 }
@@ -2409,6 +2507,30 @@ pub(crate) fn register_daemon_cluster_node(
     daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
         detail: "daemon cluster member could not be registered".to_string(),
     })
+}
+
+pub(crate) fn advertise_daemon_iroh_endpoint(
+    paths: &DaemonPaths,
+    record: network::IrohEndpointRecord,
+) -> Result<(), CliError> {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let mut state = read_cluster_state(&cluster_paths)?;
+    let endpoint = record.endpoint();
+    if let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == endpoint.node_id)
+    {
+        network::upsert_member_endpoint(member, endpoint);
+        state.updated_at = OffsetDateTime::now_utc();
+        network::write_cluster_state(&cluster_paths, &state)?;
+        sync_cluster_state_to_kv(&cluster_paths, &state)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn daemon_cluster_registration_if_initialized(
