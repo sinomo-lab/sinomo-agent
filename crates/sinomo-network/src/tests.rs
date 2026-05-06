@@ -64,21 +64,17 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].node_id, node_id);
     let store = read_cluster_kv_store(&paths).expect("cluster kv store");
-    let identity: ClusterIdentityRecord = serde_json::from_slice(
-        &store
-            .get(&cluster_identity_key())
-            .expect("identity record")
-            .value,
-    )
-    .expect("identity json");
+    let identity: ClusterIdentityRecord = store
+        .get(&cluster_identity_key())
+        .expect("identity record")
+        .decode()
+        .expect("identity record");
     assert_eq!(identity.cluster_name, "network storage");
-    let raft_config: ClusterRaftConfigRecord = serde_json::from_slice(
-        &store
-            .get(&cluster_raft_config_key())
-            .expect("raft config record")
-            .value,
-    )
-    .expect("raft config json");
+    let raft_config: ClusterRaftConfigRecord = store
+        .get(&cluster_raft_config_key())
+        .expect("raft config record")
+        .decode()
+        .expect("raft config record");
     assert_eq!(raft_config.voters, vec![node_id.clone()]);
     assert!(
         store
@@ -88,13 +84,11 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
             ))
             .is_some()
     );
-    let policy: ClusterCapabilityPolicyRecord = serde_json::from_slice(
-        &store
-            .get(&cluster_capability_policy_key(&node_id))
-            .expect("capability policy record")
-            .value,
-    )
-    .expect("policy json");
+    let policy: ClusterCapabilityPolicyRecord = store
+        .get(&cluster_capability_policy_key(&node_id))
+        .expect("capability policy record")
+        .decode()
+        .expect("capability policy record");
     assert_eq!(policy.capabilities, state.members[0].capabilities);
     assert!(store.get(&cluster_rollout_desired_key()).is_some());
 

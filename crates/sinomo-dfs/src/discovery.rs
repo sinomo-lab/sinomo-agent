@@ -7,7 +7,7 @@
 use crate::control_plane::DfsControlPlaneStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::NodeId;
-use sinomo_kv::{KvEntry, KvError};
+use sinomo_kv::{KvEntry, KvError, encode_kv_value};
 use time::OffsetDateTime;
 
 const DFS_KV_PREFIX: &str = "/dfs";
@@ -91,67 +91,62 @@ impl<'a> DfsControlPlaneStore<'a> {
         &mut self,
         advertisement: &DfsNodeAdvertisement,
     ) -> Result<(), KvError> {
-        self.put_control_json(&metadata_service_key(&advertisement.node_id), advertisement)
+        self.put_control_value(&metadata_service_key(&advertisement.node_id), advertisement)
     }
 
     pub fn advertise_content_service(
         &mut self,
         advertisement: &DfsNodeAdvertisement,
     ) -> Result<(), KvError> {
-        self.put_control_json(&content_service_key(&advertisement.node_id), advertisement)
+        self.put_control_value(&content_service_key(&advertisement.node_id), advertisement)
     }
 
     pub fn metadata_service(
         &self,
         node_id: &NodeId,
     ) -> Result<Option<DfsNodeAdvertisement>, KvError> {
-        self.get_control_json(&metadata_service_key(node_id))
+        self.get_control_value(&metadata_service_key(node_id))
     }
 
     pub fn content_service(
         &self,
         node_id: &NodeId,
     ) -> Result<Option<DfsNodeAdvertisement>, KvError> {
-        self.get_control_json(&content_service_key(node_id))
+        self.get_control_value(&content_service_key(node_id))
     }
 
     pub fn cluster_view(&self) -> Result<DfsClusterView, KvError> {
         Ok(DfsClusterView {
-            metadata_nodes: self.list_control_json(metadata_services_prefix())?,
-            content_nodes: self.list_control_json(content_services_prefix())?,
+            metadata_nodes: self.list_control_values(metadata_services_prefix())?,
+            content_nodes: self.list_control_values(content_services_prefix())?,
         })
     }
 
-    fn put_control_json<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
+    fn put_control_value<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
     where
         T: Serialize,
     {
-        self.kv_put(
-            key.to_string(),
-            serde_json::to_vec(value).map_err(kv_serde)?,
-        )
-        .map(|_| ())
+        self.kv_put(key.to_string(), encode_kv_value(value)?)
+            .map(|_| ())
     }
 
-    fn get_control_json<T>(&self, key: &str) -> Result<Option<T>, KvError>
+    fn get_control_value<T>(&self, key: &str) -> Result<Option<T>, KvError>
     where
         T: DeserializeOwned,
     {
         let Some(entry) = self.kv_get(key)? else {
             return Ok(None);
         };
-        serde_json::from_slice(&entry.value)
-            .map(Some)
-            .map_err(kv_serde)
+        entry.decode().map(Some)
     }
 
-    fn list_control_json<T>(&self, prefix: &str) -> Result<Vec<T>, KvError>
+    fn list_control_values<T>(&self, prefix: &str) -> Result<Vec<T>, KvError>
     where
         T: DeserializeOwned,
     {
         let mut values = Vec::new();
         for entry in self.kv_range_prefix(prefix)? {
-            values.push(serde_json::from_slice(&entry.value).map_err(kv_serde)?);
+            values.push(entry.decode()?);
         }
         Ok(values)
     }
@@ -173,11 +168,5 @@ impl<'a> DfsControlPlaneStore<'a> {
         // through advertised membership records. In-process tests use the
         // default empty range plus explicit gets.
         self.kv.range_prefix(prefix)
-    }
-}
-
-fn kv_serde(source: serde_json::Error) -> KvError {
-    KvError::Serialization {
-        detail: source.to_string(),
     }
 }

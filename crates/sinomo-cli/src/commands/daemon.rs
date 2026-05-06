@@ -1369,18 +1369,10 @@ fn put_dfs_control_record<T: Serialize>(
     key: String,
     value: &T,
 ) -> Result<(), CliError> {
-    let value = serde_json::to_vec(value).map_err(|source| CliError::Json {
-        path: key.clone(),
-        detail: source.to_string(),
-    })?;
     network::append_cluster_raft_command(
         paths,
         node_id,
-        KvCommand::Op(KvOp::Put {
-            key,
-            value,
-            lease_id: None,
-        }),
+        KvCommand::Op(KvOp::put_serde(key, value, None)?),
     )?;
     Ok(())
 }

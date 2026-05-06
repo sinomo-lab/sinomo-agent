@@ -180,18 +180,18 @@ impl<'a> DfsControlPlaneStore<'a> {
     }
 
     pub fn put_file_system_config(&mut self, config: &DfsFileSystemConfig) -> Result<(), KvError> {
-        self.put_json(&file_system_config_key(&config.file_system_id), config)
+        self.put_serde(&file_system_config_key(&config.file_system_id), config)
     }
 
     pub fn get_file_system_config(
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Option<DfsFileSystemConfig>, KvError> {
-        self.get_json(&file_system_config_key(file_system_id))
+        self.get_serde(&file_system_config_key(file_system_id))
     }
 
     pub fn put_metadata_shard(&mut self, shard: &DfsMetadataShardConfig) -> Result<(), KvError> {
-        self.put_json(
+        self.put_serde(
             &metadata_shard_key(&shard.file_system_id, &shard.shard_id),
             shard,
         )
@@ -202,7 +202,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         file_system_id: &DfsFileSystemId,
         shard_id: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
-        self.get_json(&metadata_shard_key(file_system_id, shard_id))
+        self.get_serde(&metadata_shard_key(file_system_id, shard_id))
     }
 
     pub fn transfer_metadata_shard_primary(
@@ -216,63 +216,43 @@ impl<'a> DfsControlPlaneStore<'a> {
         let Some(entry) = self.kv.get(&key)? else {
             return Ok(None);
         };
-        let mut current: DfsMetadataShardConfig =
-            serde_json::from_slice(&entry.value).map_err(|source| KvError::Serialization {
-                detail: source.to_string(),
-            })?;
+        let mut current: DfsMetadataShardConfig = entry.decode()?;
         if current.epoch != expected_epoch {
             return Ok(None);
         }
 
         current.primary_node_id = new_primary_node_id;
         current.epoch = current.epoch.saturating_add(1);
-        let updated_value = to_json_vec(&current)?;
         let response = self.kv.txn(KvTxn {
             compares: vec![KvCompare::ValueEquals {
                 key: key.clone(),
                 value: entry.value,
             }],
-            success: vec![KvOp::Put {
-                key,
-                value: updated_value,
-                lease_id: None,
-            }],
+            success: vec![KvOp::put_serde(key, &current, None)?],
             failure: Vec::new(),
         })?;
 
         Ok(response.succeeded.then_some(current))
     }
 
-    fn put_json<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
+    fn put_serde<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
     where
         T: Serialize,
     {
-        self.kv.put(key.to_string(), to_json_vec(value)?)?;
+        self.kv
+            .put(key.to_string(), sinomo_kv::encode_kv_value(value)?)?;
         Ok(())
     }
 
-    fn get_json<T>(&self, key: &str) -> Result<Option<T>, KvError>
+    fn get_serde<T>(&self, key: &str) -> Result<Option<T>, KvError>
     where
         T: DeserializeOwned,
     {
         let Some(entry) = self.kv.get(key)? else {
             return Ok(None);
         };
-        serde_json::from_slice(&entry.value)
-            .map(Some)
-            .map_err(|source| KvError::Serialization {
-                detail: source.to_string(),
-            })
+        entry.decode().map(Some)
     }
-}
-
-fn to_json_vec<T>(value: &T) -> Result<Vec<u8>, KvError>
-where
-    T: Serialize,
-{
-    serde_json::to_vec(value).map_err(|source| KvError::Serialization {
-        detail: source.to_string(),
-    })
 }
 
 fn normalize_segment(segment: &str) -> String {

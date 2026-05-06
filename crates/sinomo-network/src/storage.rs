@@ -664,14 +664,9 @@ pub fn read_cluster_members_from_kv(
         return Ok(Vec::new());
     }
     let store = read_cluster_kv_store(paths)?;
-    let mut members = Vec::new();
+    let mut members: Vec<ClusterMemberRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/members/") {
-        let member: ClusterMemberRecord =
-            serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
-                path: entry.key,
-                detail: source.to_string(),
-            })?;
-        members.push(member);
+        members.push(entry.decode()?);
     }
     let endpoints = read_cluster_endpoints_from_store(&store)?;
     let policies = read_cluster_capability_policies_from_store(&store)?;
@@ -727,11 +722,7 @@ fn read_cluster_endpoints_from_store(
 ) -> Result<BTreeMap<NodeId, Vec<ClusterEndpointRecord>>, NetworkError> {
     let mut endpoints: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> = BTreeMap::new();
     for entry in store.range_prefix("/cluster/endpoints/") {
-        let endpoint: ClusterEndpointRecord =
-            serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
-                path: entry.key,
-                detail: source.to_string(),
-            })?;
+        let endpoint: ClusterEndpointRecord = entry.decode()?;
         endpoints
             .entry(endpoint.node_id.clone())
             .or_default()
@@ -745,11 +736,7 @@ fn read_cluster_capability_policies_from_store(
 ) -> Result<BTreeMap<NodeId, ClusterCapabilityPolicyRecord>, NetworkError> {
     let mut policies = BTreeMap::new();
     for entry in store.range_prefix("/cluster/policy/capabilities/") {
-        let policy: ClusterCapabilityPolicyRecord =
-            serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
-                path: entry.key,
-                detail: source.to_string(),
-            })?;
+        let policy: ClusterCapabilityPolicyRecord = entry.decode()?;
         policies.insert(policy.node_id.clone(), policy);
     }
     Ok(policies)
@@ -762,14 +749,9 @@ pub fn read_cluster_node_statuses_from_kv(
         return Ok(Vec::new());
     }
     let store = read_cluster_kv_store(paths)?;
-    let mut statuses = Vec::new();
+    let mut statuses: Vec<ClusterNodeStatusRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/node-status/") {
-        let status: ClusterNodeStatusRecord =
-            serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
-                path: entry.key,
-                detail: source.to_string(),
-            })?;
-        statuses.push(status);
+        statuses.push(entry.decode()?);
     }
     statuses.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(statuses)
@@ -782,14 +764,9 @@ pub fn read_cluster_network_info_from_kv(
         return Ok(Vec::new());
     }
     let store = read_cluster_kv_store(paths)?;
-    let mut records = Vec::new();
+    let mut records: Vec<ClusterNetworkInfoRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/network/info/") {
-        let record: ClusterNetworkInfoRecord =
-            serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
-                path: entry.key,
-                detail: source.to_string(),
-            })?;
-        records.push(record);
+        records.push(entry.decode()?);
     }
     records.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(records)
@@ -802,14 +779,9 @@ pub fn read_cluster_connectivity_graph_from_kv(
         return Ok(Vec::new());
     }
     let store = read_cluster_kv_store(paths)?;
-    let mut records = Vec::new();
+    let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/network/connectivity/") {
-        let record: ClusterConnectivityRecord =
-            serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
-                path: entry.key,
-                detail: source.to_string(),
-            })?;
-        records.push(record);
+        records.push(entry.decode()?);
     }
     records.sort_by(|left, right| {
         (
@@ -841,20 +813,20 @@ pub fn sync_cluster_state_to_kv(
         .entries
         .iter()
         .any(|entry| entry.key == cluster_rollout_desired_key());
-    put_cluster_kv_json(
+    put_cluster_kv_value(
         paths,
         &state.local_node_id,
         cluster_identity_key(),
         &ClusterIdentityRecord::from(state),
     )?;
-    let mut snapshot = put_cluster_kv_json(
+    let mut snapshot = put_cluster_kv_value(
         paths,
         &state.local_node_id,
         cluster_raft_config_key(),
         &ClusterRaftConfigRecord::from(state),
     )?;
     if !rollout_desired_exists {
-        snapshot = put_cluster_kv_json(
+        snapshot = put_cluster_kv_value(
             paths,
             &state.local_node_id,
             cluster_rollout_desired_key(),
@@ -870,14 +842,14 @@ pub fn sync_cluster_state_to_kv(
     for member in &state.members {
         let command = KvCommand::PutClusterMember(member.clone());
         append_cluster_raft_command(paths, &state.local_node_id, command)?;
-        snapshot = put_cluster_kv_json(
+        snapshot = put_cluster_kv_value(
             paths,
             &state.local_node_id,
             cluster_capability_policy_key(&member.node_id),
             &ClusterCapabilityPolicyRecord::from(member),
         )?;
         for endpoint in &member.endpoints {
-            snapshot = put_cluster_kv_json(
+            snapshot = put_cluster_kv_value(
                 paths,
                 &state.local_node_id,
                 cluster_endpoint_key(&member.node_id, endpoint),
@@ -896,18 +868,10 @@ pub fn sync_cluster_node_status_to_kv(
     let key = cluster_node_status_key(&status.node_id);
     let node_id = status.node_id.clone();
     let rollout = status.rollout.clone();
-    let value = serde_json::to_vec(&status).map_err(|source| NetworkError::Json {
-        path: key.clone(),
-        detail: source.to_string(),
-    })?;
     let snapshot = append_cluster_raft_command(
         paths,
         &state.local_node_id,
-        KvCommand::Op(KvOp::Put {
-            key,
-            value,
-            lease_id: None,
-        }),
+        KvCommand::Op(KvOp::put_serde(key, &status, None)?),
     )?;
     if let Some(rollout) = rollout {
         return sync_cluster_rollout_node_to_kv(paths, &rollout, &node_id);
@@ -921,18 +885,10 @@ pub fn sync_cluster_network_info_to_kv(
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
     let key = cluster_network_info_key(&info.node_id);
-    let value = serde_json::to_vec(&info).map_err(|source| NetworkError::Json {
-        path: key.clone(),
-        detail: source.to_string(),
-    })?;
     append_cluster_raft_command(
         paths,
         &state.local_node_id,
-        KvCommand::Op(KvOp::Put {
-            key,
-            value,
-            lease_id: None,
-        }),
+        KvCommand::Op(KvOp::put_serde(key, &info, None)?),
     )
 }
 
@@ -951,15 +907,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
             &record.target_node_id,
             &record.endpoint_id,
         );
-        let value = serde_json::to_vec(&record).map_err(|source| NetworkError::Json {
-            path: key.clone(),
-            detail: source.to_string(),
-        })?;
-        success.push(KvOp::Put {
-            key,
-            value,
-            lease_id: None,
-        });
+        success.push(KvOp::put_serde(key, &record, None)?);
     }
     append_cluster_raft_command(
         paths,
@@ -980,7 +928,7 @@ pub fn expire_cluster_network_records(
     let store = read_cluster_kv_store(paths)?;
     let mut success = Vec::new();
     for entry in store.range_prefix("/cluster/network/info/") {
-        let Ok(record) = serde_json::from_slice::<ClusterNetworkInfoRecord>(&entry.value) else {
+        let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
             continue;
         };
         if record.expires_at <= now {
@@ -988,7 +936,7 @@ pub fn expire_cluster_network_records(
         }
     }
     for entry in store.range_prefix("/cluster/network/connectivity/") {
-        let Ok(record) = serde_json::from_slice::<ClusterConnectivityRecord>(&entry.value) else {
+        let Ok(record) = entry.decode::<ClusterConnectivityRecord>() else {
             continue;
         };
         if record.expires_at <= now {
@@ -1075,10 +1023,7 @@ pub fn read_cluster_invitation_from_kv(
         path: key.clone(),
         detail: "cluster invitation is not published".to_string(),
     })?;
-    serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Json {
-        path: key,
-        detail: source.to_string(),
-    })
+    entry.decode().map_err(Into::into)
 }
 
 pub fn sync_cluster_invitation_to_kv(
@@ -1086,13 +1031,13 @@ pub fn sync_cluster_invitation_to_kv(
     invite: &sinomo_core::ClusterJoinInvite,
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
-    put_cluster_kv_json(
+    put_cluster_kv_value(
         paths,
         &state.local_node_id,
         cluster_invitation_key(&invite.invite_id),
         invite,
     )?;
-    put_cluster_kv_json(
+    put_cluster_kv_value(
         paths,
         &state.local_node_id,
         cluster_invitation_state_key(&invite.invite_id),
@@ -1112,7 +1057,7 @@ pub fn sync_cluster_certificate_to_kv(
     certificate: &ClusterCertificate,
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
-    put_cluster_kv_json(
+    put_cluster_kv_value(
         paths,
         &state.local_node_id,
         cluster_certificate_key(certificate),
@@ -1126,7 +1071,7 @@ pub fn sync_cluster_rollout_node_to_kv(
     node_id: &NodeId,
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
-    put_cluster_kv_json(
+    put_cluster_kv_value(
         paths,
         &state.local_node_id,
         cluster_rollout_node_key(node_id),
@@ -1134,24 +1079,16 @@ pub fn sync_cluster_rollout_node_to_kv(
     )
 }
 
-fn put_cluster_kv_json<T: Serialize>(
+fn put_cluster_kv_value<T: Serialize + ?Sized>(
     paths: &ClusterPaths,
     node_id: &NodeId,
     key: String,
     value: &T,
 ) -> Result<KvSnapshot, NetworkError> {
-    let value = serde_json::to_vec(value).map_err(|source| NetworkError::Json {
-        path: key.clone(),
-        detail: source.to_string(),
-    })?;
     append_cluster_raft_command(
         paths,
         node_id,
-        KvCommand::Op(KvOp::Put {
-            key,
-            value,
-            lease_id: None,
-        }),
+        KvCommand::Op(KvOp::put_serde(key, value, None)?),
     )
 }
 

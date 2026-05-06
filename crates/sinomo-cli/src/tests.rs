@@ -1016,7 +1016,7 @@ fn cluster_invite_generates_portable_join_payload() {
         .expect("invite state")
         .clone();
     let invite_state: super::network::ClusterInvitationStateRecord =
-        serde_json::from_slice(&invite_state_entry.value).expect("invite state json");
+        invite_state_entry.decode().expect("invite state record");
     assert_eq!(invite_state.state, "active");
     assert!(rendered.persisted_path.exists());
     assert_eq!(

@@ -3226,6 +3226,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-object",
  "thiserror",
  "time",
 ]

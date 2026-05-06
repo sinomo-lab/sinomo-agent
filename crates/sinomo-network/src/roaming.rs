@@ -160,15 +160,7 @@ impl WebRtcKvExchange {
             &envelope.exchange_id,
             envelope.sequence,
         );
-        let value =
-            serde_json::to_vec(&envelope).map_err(|source| NetworkError::Serialization {
-                detail: source.to_string(),
-            })?;
-        Ok(KvOp::Put {
-            key,
-            value,
-            lease_id,
-        })
+        KvOp::put_serde(key, &envelope, lease_id).map_err(Into::into)
     }
 
     pub fn put_candidate(
@@ -181,27 +173,15 @@ impl WebRtcKvExchange {
             &candidate.node_id,
             &candidate.candidate_id,
         );
-        let value =
-            serde_json::to_vec(&candidate).map_err(|source| NetworkError::Serialization {
-                detail: source.to_string(),
-            })?;
-        Ok(KvOp::Put {
-            key,
-            value,
-            lease_id,
-        })
+        KvOp::put_serde(key, &candidate, lease_id).map_err(Into::into)
     }
 
     pub fn signal_from_entry(entry: &KvEntry) -> Result<WebRtcSignalingEnvelope, NetworkError> {
-        serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Serialization {
-            detail: source.to_string(),
-        })
+        entry.decode().map_err(Into::into)
     }
 
     pub fn candidate_from_entry(entry: &KvEntry) -> Result<IceCandidateRecord, NetworkError> {
-        serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Serialization {
-            detail: source.to_string(),
-        })
+        entry.decode().map_err(Into::into)
     }
 }
 
@@ -303,21 +283,11 @@ impl IrohKvExchange {
         lease_id: Option<LeaseId>,
     ) -> Result<KvOp, NetworkError> {
         let key = Self::endpoint_key(&endpoint.cluster_id, &endpoint.node_id);
-        let value =
-            serde_json::to_vec(&endpoint).map_err(|source| NetworkError::Serialization {
-                detail: source.to_string(),
-            })?;
-        Ok(KvOp::Put {
-            key,
-            value,
-            lease_id,
-        })
+        KvOp::put_serde(key, &endpoint, lease_id).map_err(Into::into)
     }
 
     pub fn endpoint_from_entry(entry: &KvEntry) -> Result<IrohEndpointRecord, NetworkError> {
-        serde_json::from_slice(&entry.value).map_err(|source| NetworkError::Serialization {
-            detail: source.to_string(),
-        })
+        entry.decode().map_err(Into::into)
     }
 }
 

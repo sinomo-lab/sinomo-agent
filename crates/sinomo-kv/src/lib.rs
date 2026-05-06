@@ -7,15 +7,37 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
-use serde::de::{self, SeqAccess, Visitor};
+use serde::de::{self, DeserializeOwned, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sinomo_core::{ClusterMemberRecord, NodeId};
+use sinomo_object::{LengthMode, MAGIC, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
+
+pub const KV_OBJECT_VERSION_ID: u16 = 1;
+
+pub fn encode_kv_value<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, KvError> {
+    sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32).map_err(|source| {
+        KvError::Serialization {
+            detail: source.to_string(),
+        }
+    })
+}
+
+pub fn decode_kv_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, KvError> {
+    if bytes.starts_with(MAGIC) {
+        return sinomo_object_serde::from_bytes(bytes).map_err(|source| KvError::Serialization {
+            detail: source.to_string(),
+        });
+    }
+    serde_json::from_slice(bytes).map_err(|source| KvError::Serialization {
+        detail: source.to_string(),
+    })
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
 pub struct KvRevision(pub u64);
@@ -47,6 +69,12 @@ pub struct KvEntry {
     pub version: KvVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_id: Option<LeaseId>,
+}
+
+impl KvEntry {
+    pub fn decode<T: DeserializeOwned>(&self) -> Result<T, KvError> {
+        decode_kv_value(&self.value)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -124,6 +152,20 @@ pub enum KvOp {
     LeaseRevoke {
         lease_id: LeaseId,
     },
+}
+
+impl KvOp {
+    pub fn put_serde<T: Serialize + ?Sized>(
+        key: impl Into<String>,
+        value: &T,
+        lease_id: Option<LeaseId>,
+    ) -> Result<Self, KvError> {
+        Ok(Self::Put {
+            key: key.into(),
+            value: encode_kv_value(value)?,
+            lease_id,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -409,6 +451,27 @@ impl InProcessKvStore {
         .map(|response| response.revision())
     }
 
+    pub fn put_serde<T: Serialize + ?Sized>(
+        &mut self,
+        key: impl Into<String>,
+        value: &T,
+        lease_id: Option<LeaseId>,
+    ) -> Result<KvRevision, KvError> {
+        self.apply_op(KvOp::put_serde(key, value, lease_id)?)
+            .map(|response| response.revision())
+    }
+
+    pub fn get_serde<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, KvError> {
+        self.get(key).map(KvEntry::decode).transpose()
+    }
+
+    pub fn range_prefix_serde<T: DeserializeOwned>(&self, prefix: &str) -> Result<Vec<T>, KvError> {
+        self.range_prefix(prefix)
+            .iter()
+            .map(KvEntry::decode)
+            .collect()
+    }
+
     pub fn delete(&mut self, key: impl Into<String>) -> Result<bool, KvError> {
         match self.apply_op(KvOp::Delete { key: key.into() })? {
             KvOpResponse::Delete { deleted, .. } => Ok(deleted),
@@ -463,25 +526,14 @@ impl InProcessKvStore {
         &mut self,
         member: ClusterMemberRecord,
     ) -> Result<KvRevision, KvError> {
-        let key = cluster_member_key(&member.node_id);
-        let value = serde_json::to_vec(&member).map_err(|source| KvError::Serialization {
-            detail: source.to_string(),
-        })?;
-        self.put(key, value, None)
+        self.put_serde(cluster_member_key(&member.node_id), &member, None)
     }
 
     pub fn read_cluster_member(
         &self,
         node_id: &NodeId,
     ) -> Result<Option<ClusterMemberRecord>, KvError> {
-        let Some(entry) = self.get(&cluster_member_key(node_id)) else {
-            return Ok(None);
-        };
-        serde_json::from_slice(&entry.value)
-            .map(Some)
-            .map_err(|source| KvError::Serialization {
-                detail: source.to_string(),
-            })
+        self.get_serde(&cluster_member_key(node_id))
     }
 
     pub fn watch_prefix(
@@ -1745,6 +1797,47 @@ pub enum KvError {
 mod tests {
     use super::*;
     use sinomo_core::{ClusterId, ClusterMemberRecord};
+
+    #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+    struct TestRecord {
+        name: String,
+        count: u64,
+    }
+
+    #[test]
+    fn serde_values_use_sinomo_object_and_decode_legacy_json() {
+        let mut store = InProcessKvStore::new();
+        let record = TestRecord {
+            name: "alpha".to_string(),
+            count: 7,
+        };
+
+        store
+            .put_serde("/typed/object", &record, None)
+            .expect("put object value");
+        let object_entry = store.get("/typed/object").expect("object entry");
+        assert!(object_entry.value.starts_with(MAGIC));
+        assert_eq!(
+            store
+                .get_serde::<TestRecord>("/typed/object")
+                .expect("decode object"),
+            Some(record.clone())
+        );
+
+        store
+            .put(
+                "/typed/legacy-json",
+                serde_json::to_vec(&record).expect("legacy json"),
+                None,
+            )
+            .expect("put legacy json");
+        assert_eq!(
+            store
+                .get_serde::<TestRecord>("/typed/legacy-json")
+                .expect("decode legacy json"),
+            Some(record)
+        );
+    }
 
     #[test]
     fn put_and_compare_swap_txn_updates_revision_and_version() {
