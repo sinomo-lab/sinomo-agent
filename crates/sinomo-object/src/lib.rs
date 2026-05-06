@@ -11,6 +11,7 @@ use thiserror::Error;
 
 #[cfg(feature = "serde")]
 pub mod serde_ext;
+pub mod text;
 
 pub const MAGIC: &[u8; 4] = b"SOBJ";
 
@@ -48,6 +49,8 @@ pub enum Error {
     ArrayByteLengthMismatch,
     #[error("integer overflow while calculating size")]
     SizeOverflow,
+    #[error("text format error: {0}")]
+    Text(String),
     #[cfg(feature = "serde")]
     #[error("serde error: {0}")]
     Serde(String),
