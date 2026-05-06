@@ -501,10 +501,11 @@ pub(crate) fn cluster_invite_publish_targets(
 ) -> Vec<ClusterEndpointRecord> {
     let mut seen = std::collections::BTreeSet::new();
     let mut targets = Vec::new();
-    for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
-        if !cluster_raft_node_is_voter(state, &endpoint.node_id) {
-            continue;
-        }
+    for endpoint in prefer_bounded_daemon_command_targets(
+        cluster_sync_targets_with_connectivity(paths, state)
+            .into_iter()
+            .filter(|endpoint| cluster_raft_node_is_voter(state, &endpoint.node_id)),
+    ) {
         let key = cluster_invite_publish_target_key(&endpoint);
         if seen.insert(key) {
             targets.push(endpoint);
@@ -1435,9 +1436,10 @@ pub(crate) fn probe_member_daemon_status(
     member: &ClusterMemberRecord,
 ) -> Option<ClusterNodeStatusRecord> {
     let is_local_process = cluster_member_is_local_process(state, member);
-    let mut endpoints = member.endpoints.clone();
+    let mut endpoints = prefer_bounded_daemon_command_targets(member.endpoints.clone());
     endpoints.sort_by_key(|endpoint| {
         (
+            cluster_daemon_command_transport_rank(endpoint),
             endpoint.privacy != ClusterEndpointPrivacy::Lan,
             endpoint.priority,
             endpoint.address.clone(),
@@ -2596,7 +2598,9 @@ pub(crate) fn cluster_reachable_voter_count(
             return voters.len();
         }
     }
-    for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
+    for endpoint in
+        prefer_bounded_daemon_command_targets(cluster_sync_targets_with_connectivity(paths, state))
+    {
         if !cluster_raft_node_is_voter(state, &endpoint.node_id) {
             continue;
         }
@@ -2923,9 +2927,39 @@ pub(crate) fn cluster_sync_targets_with_connectivity(
                 network::ClusterConnectivityState::Unreachable => 3,
             })
             .unwrap_or(2);
-        (score, endpoint.priority, endpoint.address.clone())
+        (
+            cluster_daemon_command_transport_rank(endpoint),
+            score,
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
     });
     endpoints
+}
+
+pub(crate) fn prefer_bounded_daemon_command_targets(
+    endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints: Vec<_> = endpoints.into_iter().collect();
+    let mut nodes_with_bounded_transport = std::collections::BTreeSet::new();
+    for endpoint in &endpoints {
+        if cluster_daemon_command_transport_rank(endpoint) == 0 {
+            nodes_with_bounded_transport.insert(endpoint.node_id.clone());
+        }
+    }
+    endpoints.retain(|endpoint| {
+        cluster_daemon_command_transport_rank(endpoint) == 0
+            || !nodes_with_bounded_transport.contains(&endpoint.node_id)
+    });
+    endpoints
+}
+
+pub(crate) fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    match endpoint.transport {
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => 0,
+        ClusterTransportKind::Iroh => 1,
+        _ => 2,
+    }
 }
 
 pub(crate) fn send_daemon_command_to_endpoint(

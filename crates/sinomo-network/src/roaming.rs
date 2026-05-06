@@ -626,7 +626,6 @@ pub fn send_iroh_daemon_command_raw(
     command: &str,
     timeout: Duration,
 ) -> Result<String, NetworkError> {
-    let timeout = timeout.max(IROH_DAEMON_ONLINE_TIMEOUT);
     let record = iroh_endpoint_record_from_address(
         address,
         &ClusterId::new("cluster_iroh_dial_placeholder").expect("static cluster id"),
