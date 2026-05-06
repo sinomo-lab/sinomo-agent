@@ -1773,6 +1773,12 @@ fn open_node_lock(paths: &KvWalPaths) -> Result<File, KvError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), KvError> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
     File::open(path)
         .and_then(|dir| dir.sync_all())
         .map_err(|source| KvError::Io {

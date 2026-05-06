@@ -296,13 +296,58 @@ pub fn write_cluster_kv_snapshot(
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
     if paths.kv_raft.exists() {
         let state = read_cluster_state_without_kv(paths)?;
-        let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
-        return Ok(node.store().clone());
+        match open_cluster_raft_kv_node(paths, &state.local_node_id) {
+            Ok(node) => return Ok(node.store().clone()),
+            Err(error) if paths.kv_snapshot.exists() => {
+                eprintln!(
+                    "warning: ignoring unreadable local cluster raft view and using materialized snapshot: {error}"
+                );
+                let snapshot = read_cluster_kv_snapshot(paths)?;
+                quarantine_unreadable_cluster_raft_view(paths, &state.local_node_id);
+                return Ok(InProcessKvStore::restore(snapshot));
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: ignoring unreadable local cluster raft view with no materialized snapshot: {error}"
+                );
+                return Ok(InProcessKvStore::new());
+            }
+        }
     }
     if paths.kv_snapshot.exists() {
         return read_cluster_kv_snapshot(paths).map(InProcessKvStore::restore);
     }
     Ok(InProcessKvStore::new())
+}
+
+fn quarantine_unreadable_cluster_raft_view(paths: &ClusterPaths, node_id: &NodeId) {
+    let wal_paths = cluster_raft_wal_paths(paths, node_id);
+    if !wal_paths.root.exists() {
+        return;
+    }
+    for suffix in 0..10 {
+        let candidate = wal_paths.root.with_file_name(format!(
+            "{}.corrupt-{}-{suffix}",
+            wal_paths
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("raft"),
+            std::process::id()
+        ));
+        if candidate.exists() {
+            continue;
+        }
+        if let Err(error) = fs::rename(&wal_paths.root, &candidate) {
+            eprintln!(
+                "warning: could not quarantine unreadable local cluster raft view {} -> {}: {}",
+                wal_paths.root.display(),
+                candidate.display(),
+                error
+            );
+        }
+        return;
+    }
 }
 
 pub fn cluster_raft_wal_paths(paths: &ClusterPaths, node_id: &NodeId) -> KvWalPaths {
@@ -1369,6 +1414,12 @@ pub(crate) fn write_json_file<T: Serialize>(path: &PathBuf, value: &T) -> Result
 }
 
 fn sync_directory(path: &std::path::Path) -> Result<(), NetworkError> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
     fs::File::open(path)
         .and_then(|dir| dir.sync_all())
         .map_err(|source| NetworkError::StorageIo {

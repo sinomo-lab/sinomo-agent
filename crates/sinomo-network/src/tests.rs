@@ -138,6 +138,42 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
 }
 
 #[test]
+fn cluster_read_view_falls_back_to_snapshot_when_local_raft_state_is_corrupt() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-corrupt-read-view-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::new("cluster_corrupt_read_view").expect("cluster");
+    let node_id = NodeId::new("node_corrupt_read_view").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "corrupt read view",
+        node_id.clone(),
+        "read view node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
+
+    let wal_paths = cluster_raft_wal_paths(&paths, &node_id);
+    std::fs::write(&wal_paths.hard_state, b"\0\0\0").expect("corrupt hard state");
+    let members = read_cluster_members_from_kv(&paths).expect("members from snapshot fallback");
+
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].node_id, node_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_network_records_publish_overwrite_and_expire() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-graph-{}",

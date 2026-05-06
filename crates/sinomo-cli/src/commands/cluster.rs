@@ -1437,6 +1437,9 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
     else {
         return Ok(());
     };
+    if response.trim().is_empty() {
+        return Ok(());
+    }
     let snapshot: KvSnapshot =
         serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
             path: "cluster kv snapshot response".to_string(),
@@ -1446,7 +1449,15 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
 }
 
 pub(crate) fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
-    network::read_cluster_kv_snapshot(paths).map_err(Into::into)
+    match network::read_cluster_kv_snapshot(paths) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => {
+            eprintln!("warning: ignoring unreadable cluster kv snapshot: {error}");
+            read_cluster_kv_store(paths)
+                .map(|store| store.snapshot())
+                .or_else(|_| Ok(sinomo_runtime::kv::InProcessKvStore::new().snapshot()))
+        }
+    }
 }
 
 pub(crate) fn write_cluster_kv_snapshot(
