@@ -655,13 +655,17 @@ Responsibilities:
 
 Peer discovery, transport, and cross-node routing.
 
+See [Sinomo Network](network-architecture.md) for the communication boundary and
+wire-format rules.
+
 Responsibilities:
 
 - Discover known or nearby nodes.
 - Authenticate node-to-node communication.
 - Route events, commands, and state updates.
 - Support local network operation first.
-- Provide transport abstractions over direct peer links, home-node sync APIs, or future protocols.
+- Own the Sinomo Object wire codec for cluster communication.
+- Provide message and streaming abstractions over direct peer links, home-node sync APIs, or future protocols.
 
 ### `sinomo-sync`
 

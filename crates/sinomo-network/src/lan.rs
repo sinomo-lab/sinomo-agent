@@ -1,4 +1,5 @@
 use crate::error::NetworkError;
+use crate::object::SinomoObjectCodec;
 use crate::peer::{NetworkFrame, PeerEndpointCandidate};
 use crate::prelude::*;
 
@@ -34,9 +35,7 @@ impl Default for LanQuicFrameCodec {
 
 impl LanQuicFrameCodec {
     pub fn encode(&self, frame: &NetworkFrame) -> Result<Vec<u8>, NetworkError> {
-        let bytes = serde_json::to_vec(frame).map_err(|source| NetworkError::Serialization {
-            detail: source.to_string(),
-        })?;
+        let bytes = SinomoObjectCodec::default().encode(frame)?;
         if bytes.len() > self.max_frame_bytes {
             return Err(NetworkError::FrameTooLarge {
                 actual_bytes: bytes.len(),
@@ -53,9 +52,7 @@ impl LanQuicFrameCodec {
                 max_bytes: self.max_frame_bytes,
             });
         }
-        serde_json::from_slice(bytes).map_err(|source| NetworkError::Serialization {
-            detail: source.to_string(),
-        })
+        SinomoObjectCodec::default().decode(bytes)
     }
 }
 
@@ -216,10 +213,7 @@ impl MdnsDiscoverySocket {
         &self,
         advertisement: &MdnsDiscoveryAdvertisement,
     ) -> Result<usize, NetworkError> {
-        let bytes =
-            serde_json::to_vec(advertisement).map_err(|source| NetworkError::Serialization {
-                detail: source.to_string(),
-            })?;
+        let bytes = SinomoObjectCodec::default().encode(advertisement)?;
         self.socket
             .send_to(&bytes, self.multicast_address)
             .map_err(|source| NetworkError::Io {
@@ -234,12 +228,8 @@ impl MdnsDiscoverySocket {
         loop {
             match self.socket.recv_from(&mut buffer) {
                 Ok((received, _source)) => {
-                    let advertisement: MdnsDiscoveryAdvertisement =
-                        serde_json::from_slice(&buffer[..received]).map_err(|source| {
-                            NetworkError::Serialization {
-                                detail: source.to_string(),
-                            }
-                        })?;
+                let advertisement: MdnsDiscoveryAdvertisement =
+                    SinomoObjectCodec::default().decode(&buffer[..received])?;
                     if advertisement.protocol == SINOMO_LAN_DISCOVERY_PROTOCOL {
                         advertisements.push(advertisement);
                     }

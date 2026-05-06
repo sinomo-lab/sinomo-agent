@@ -67,3 +67,11 @@ pub enum NetworkError {
     #[error(transparent)]
     Kv(#[from] KvError),
 }
+
+impl NetworkError {
+    pub(crate) fn object(error: sinomo_object::Error) -> Self {
+        Self::Serialization {
+            detail: error.to_string(),
+        }
+    }
+}

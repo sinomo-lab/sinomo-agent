@@ -416,11 +416,50 @@ fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
     let encoded = codec.encode(&frame).expect("encode");
     let decoded = codec.decode(&encoded).expect("decode");
 
+    assert_eq!(&encoded[..4], sinomo_object::MAGIC);
     assert_eq!(decoded, frame);
     assert!(matches!(
         LanQuicFrameCodec { max_frame_bytes: 1 }.encode(&frame),
         Err(NetworkError::FrameTooLarge { .. })
     ));
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct FixtureProtocolPayload {
+    path: String,
+    bytes: Vec<u8>,
+}
+
+#[test]
+fn protocol_and_stream_metadata_use_sinomo_object_payloads() {
+    let payload = FixtureProtocolPayload {
+        path: "/users/alice/readme.txt".to_string(),
+        bytes: vec![1, 2, 3, 4],
+    };
+
+    let message = ProtocolMessage::encode("fixture.protocol.v1", &payload).expect("payload");
+    assert_eq!(message.protocol, "fixture.protocol.v1");
+    assert_eq!(&message.payload[..4], sinomo_object::MAGIC);
+    assert_eq!(
+        message
+            .decode::<FixtureProtocolPayload>()
+            .expect("decode payload"),
+        payload
+    );
+
+    let open = NetworkStreamOpen::encode_metadata(
+        NetworkStreamId(42),
+        "fixture.stream.v1",
+        &payload,
+    )
+    .expect("metadata");
+    assert_eq!(open.stream_id, NetworkStreamId(42));
+    assert_eq!(&open.metadata[..4], sinomo_object::MAGIC);
+    assert_eq!(
+        open.decode_metadata::<FixtureProtocolPayload>()
+            .expect("decode metadata"),
+        payload
+    );
 }
 
 #[test]

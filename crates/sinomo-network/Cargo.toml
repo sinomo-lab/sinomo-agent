@@ -27,3 +27,4 @@ sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-node = { path = "../sinomo-node" }
+sinomo-object = { path = "../sinomo-object", features = ["serde"] }

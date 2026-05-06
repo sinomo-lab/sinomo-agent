@@ -3283,6 +3283,7 @@ dependencies = [
  "sinomo-kv",
  "sinomo-local",
  "sinomo-node",
+ "sinomo-object",
  "thiserror",
  "time",
  "tokio",

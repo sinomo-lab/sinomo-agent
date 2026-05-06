@@ -2,12 +2,14 @@
 
 mod error;
 mod lan;
+mod object;
 mod peer;
 mod roaming;
 mod storage;
 
 pub use error::*;
 pub use lan::*;
+pub use object::*;
 pub use peer::*;
 pub use roaming::*;
 pub use storage::*;

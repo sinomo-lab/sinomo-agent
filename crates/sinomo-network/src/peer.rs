@@ -470,15 +470,29 @@ pub enum MeshMessageBody {
 pub struct ProtocolMessage {
     pub protocol: String,
     #[serde(default)]
-    pub payload: serde_json::Value,
+    pub payload: Vec<u8>,
 }
 
 impl ProtocolMessage {
-    pub fn new(protocol: impl Into<String>, payload: serde_json::Value) -> Self {
+    pub fn new(protocol: impl Into<String>, payload: Vec<u8>) -> Self {
         Self {
             protocol: protocol.into(),
             payload,
         }
+    }
+
+    pub fn encode<T: serde::Serialize + ?Sized>(
+        protocol: impl Into<String>,
+        payload: &T,
+    ) -> Result<Self, NetworkError> {
+        Ok(Self::new(
+            protocol,
+            crate::object::SinomoObjectCodec::default().encode(payload)?,
+        ))
+    }
+
+    pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
+        crate::object::SinomoObjectCodec::default().decode(&self.payload)
     }
 }
 
@@ -503,6 +517,66 @@ pub trait NetworkTransport {
     fn local_node_id(&self) -> &NodeId;
     fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError>;
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct NetworkStreamId(pub u64);
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NetworkStreamChunkId(pub u64);
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NetworkStreamOpen {
+    pub stream_id: NetworkStreamId,
+    pub protocol: String,
+    #[serde(default)]
+    pub metadata: Vec<u8>,
+}
+
+impl NetworkStreamOpen {
+    pub fn encode_metadata<T: serde::Serialize + ?Sized>(
+        stream_id: NetworkStreamId,
+        protocol: impl Into<String>,
+        metadata: &T,
+    ) -> Result<Self, NetworkError> {
+        Ok(Self {
+            stream_id,
+            protocol: protocol.into(),
+            metadata: crate::object::SinomoObjectCodec::default().encode(metadata)?,
+        })
+    }
+
+    pub fn decode_metadata<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
+        crate::object::SinomoObjectCodec::default().decode(&self.metadata)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkStreamFrame {
+    Open(NetworkStreamOpen),
+    Data {
+        stream_id: NetworkStreamId,
+        chunk_id: NetworkStreamChunkId,
+        bytes: Vec<u8>,
+    },
+    End {
+        stream_id: NetworkStreamId,
+    },
+    Reset {
+        stream_id: NetworkStreamId,
+        reason: String,
+    },
+}
+
+pub trait NetworkStreamTransport: NetworkTransport {
+    fn send_stream_frame(
+        &mut self,
+        target_node_id: &NodeId,
+        frame: NetworkStreamFrame,
+    ) -> Result<(), NetworkError>;
+
+    fn drain_stream_frames(&mut self) -> Result<Vec<(NodeId, NetworkStreamFrame)>, NetworkError>;
 }
 
 #[derive(Clone, Debug, Default)]

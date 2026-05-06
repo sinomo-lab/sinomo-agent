@@ -138,7 +138,9 @@ impl ser::Serializer for ValueSerializer {
     }
 
     fn serialize_unit(self) -> Result<Value> {
-        Ok(Value::Object(Object::new(Vec::new())))
+        Ok(Value::Optional(OptionalValue::none(ElementType::Builtin(
+            TypeId::Bytes,
+        ))))
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<Value> {
@@ -634,8 +636,17 @@ where
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         match self.value {
             Value::Object(object) if object.fields.is_empty() => visitor.visit_unit(),
+            Value::Optional(optional) if optional.value.is_none() => visitor.visit_unit(),
             _ => Err(Error::Serde("expected unit".to_owned())),
         }
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value> {
+        visitor.visit_newtype_struct(self)
     }
 
     fn deserialize_struct<V: Visitor<'de>>(
@@ -667,7 +678,7 @@ where
 
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
-        unit_struct newtype_struct tuple tuple_struct identifier ignored_any
+        unit_struct tuple tuple_struct identifier ignored_any
     }
 }
 

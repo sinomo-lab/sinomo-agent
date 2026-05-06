@@ -713,7 +713,7 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
             }
 
             let message: DfsNetworkMessage =
-                serde_json::from_value(protocol_message.payload).map_err(DfsError::from_serde)?;
+                protocol_message.decode().map_err(DfsError::from_network)?;
 
             match message {
                 DfsNetworkMessage::ReadRequest(request) => {
@@ -894,7 +894,8 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> Result<(), DfsError> {
-        let payload = serde_json::to_value(message).map_err(DfsError::from_serde)?;
+        let protocol_message =
+            ProtocolMessage::encode(DFS_PROTOCOL, &message).map_err(DfsError::from_network)?;
         let frame = NetworkFrame {
             frame_id: NetworkFrameId(self.next_frame_id),
             source_node_id: self.node_id.clone(),
@@ -903,7 +904,7 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
                 message_id: MeshMessageId(self.next_message_id),
                 origin_node_id: self.node_id.clone(),
                 target_node_id: target_node_id.clone(),
-                body: MeshMessageBody::Protocol(ProtocolMessage::new(DFS_PROTOCOL, payload)),
+                body: MeshMessageBody::Protocol(protocol_message),
             },
         };
         self.next_frame_id += 1;
@@ -1568,7 +1569,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 continue;
             }
             let message: DfsNetworkMessage =
-                serde_json::from_value(protocol_message.payload).map_err(DfsError::from_serde)?;
+                protocol_message.decode().map_err(DfsError::from_network)?;
 
             match message {
                 DfsNetworkMessage::StageBlob(command) => {
@@ -2711,7 +2712,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> Result<bool, DfsError> {
-        let payload = serde_json::to_value(message).map_err(DfsError::from_serde)?;
+        let protocol_message =
+            ProtocolMessage::encode(DFS_PROTOCOL, &message).map_err(DfsError::from_network)?;
         let frame = NetworkFrame {
             frame_id: NetworkFrameId(self.next_frame_id),
             source_node_id: self.node_id.clone(),
@@ -2720,7 +2722,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 message_id: MeshMessageId(self.next_message_id),
                 origin_node_id: self.node_id.clone(),
                 target_node_id: target_node_id.clone(),
-                body: MeshMessageBody::Protocol(ProtocolMessage::new(DFS_PROTOCOL, payload)),
+                body: MeshMessageBody::Protocol(protocol_message),
             },
         };
         self.next_frame_id += 1;
@@ -2874,11 +2876,6 @@ impl DfsError {
         }
     }
 
-    fn from_serde(error: serde_json::Error) -> Self {
-        Self::Serialization {
-            message: error.to_string(),
-        }
-    }
 }
 
 impl From<ContentStoreError> for DfsError {
