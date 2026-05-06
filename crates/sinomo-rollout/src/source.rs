@@ -221,10 +221,7 @@ pub fn managed_source_status(
         Vec::new()
     };
     let head = if is_git_repo {
-        Some(git_one_line(
-            &paths.source_repo,
-            &["rev-parse", "--short", "HEAD"],
-        )?)
+        Some(git_one_line(&paths.source_repo, &["rev-parse", "HEAD"])?)
     } else {
         None
     };
@@ -422,8 +419,7 @@ mod tests {
         fs::write(external.join("Cargo.toml"), "[workspace]\n").expect("cargo");
         run_git_for_test(&external, &["add", "-A"]);
         run_git_for_test(&external, &["commit", "-m", "initial"]);
-        let expected_head =
-            git_one_line(&external, &["rev-parse", "--short", "HEAD"]).expect("expected head");
+        let expected_head = git_one_line(&external, &["rev-parse", "HEAD"]).expect("expected head");
 
         let paths = SelfRolloutPaths::new(&data);
         create_source_repo_bundle(&external, &bundle).expect("source bundle");
@@ -459,8 +455,7 @@ mod tests {
         .expect("cargo update");
         run_git_for_test(&external, &["add", "-A"]);
         run_git_for_test(&external, &["commit", "-m", "second"]);
-        let expected_head =
-            git_one_line(&external, &["rev-parse", "--short", "HEAD"]).expect("expected head");
+        let expected_head = git_one_line(&external, &["rev-parse", "HEAD"]).expect("expected head");
 
         create_source_repo_bundle(&external, &bundle).expect("source bundle");
         deploy_managed_source_bundle(&paths, &bundle).expect("bundle deploy");

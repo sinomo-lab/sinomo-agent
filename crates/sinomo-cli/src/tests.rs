@@ -2652,7 +2652,7 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
             .success()
     );
     let expected_head = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .current_dir(&source_repo)
         .output()
         .expect("git rev-parse");

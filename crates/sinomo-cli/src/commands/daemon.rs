@@ -2071,7 +2071,7 @@ pub(crate) fn handle_daemon_rollout_build(
         deploy_managed_source_bundle(&rollout_paths, &bundle_path)?;
         if let Some(expected_head) = request.source_head.as_deref() {
             let status = managed_source_status(&rollout_paths)?;
-            if status.head.as_deref() != Some(expected_head) {
+            if !source_heads_match(status.head.as_deref(), expected_head) {
                 return Ok(ClusterRolloutBinaryResponse {
                     status: "rejected".to_string(),
                     detail: format!(

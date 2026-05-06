@@ -480,7 +480,10 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                 Ok(response) => {
                     let source_head_mismatch = response.status == "accepted"
                         && request.source_head.is_some()
-                        && response.source_head != request.source_head;
+                        && !source_heads_match(
+                            response.source_head.as_deref(),
+                            request.source_head.as_deref().unwrap_or_default(),
+                        );
                     if source_head_mismatch {
                         println!("{target}: rejected");
                         println!(
@@ -566,20 +569,27 @@ pub(crate) fn rollout_source_head(repo: &Path) -> Result<String, CliError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "--short=8", "HEAD"])
         .output()
         .map_err(|source| CliError::Io {
-            path: format!("git -C {} rev-parse --short HEAD", repo.display()),
+            path: format!("git -C {} rev-parse --short=8 HEAD", repo.display()),
             detail: source.to_string(),
         })?;
     if !output.status.success() {
         return Err(CliError::Process {
-            command: format!("git -C {} rev-parse --short HEAD", repo.display()),
+            command: format!("git -C {} rev-parse --short=8 HEAD", repo.display()),
             status: output.status.code().unwrap_or(-1),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub(crate) fn source_heads_match(actual: Option<&str>, expected: &str) -> bool {
+    let Some(actual) = actual else {
+        return false;
+    };
+    actual == expected || actual.starts_with(expected) || expected.starts_with(actual)
 }
 
 pub(crate) fn rollout_prepare_dev_binary(options: &RolloutOptions) -> Result<PathBuf, CliError> {
