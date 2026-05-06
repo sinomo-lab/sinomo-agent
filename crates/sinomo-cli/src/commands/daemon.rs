@@ -348,8 +348,10 @@ pub(crate) fn run_shadow_daemon_with_paths(
                             previous_main_backup,
                             previous_shadow_binary: env::current_exe().unwrap_or_default(),
                             diagnostics,
-                            deadline: Instant::now() + Duration::from_secs(10),
+                            deadline: Instant::now() + Duration::from_secs(60),
                         });
+                        main_probe_status = DaemonProbeStatus::NotRunning;
+                        last_main_probe = Instant::now() - main_probe_interval;
                     }
                     Err(error) => {
                         record_activation_failure(
