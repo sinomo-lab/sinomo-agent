@@ -18,17 +18,18 @@ use super::{
     handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
     handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
     handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
-    install_should_update_binary, install_with_layout, is_terminal_status,
-    main_daemon_capabilities, models_default_with_data_dir, normalize_model_provider,
-    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_models_list_options, parse_propose_options, parse_provider_command,
-    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
-    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
-    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-    send_daemon_command_raw, sign_cluster_join_invite, sign_daemon_command_from_data_dir,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout, write_json,
+    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
+    is_terminal_status, main_daemon_capabilities, models_default_with_data_dir,
+    normalize_model_provider, parse_cli_command, parse_cluster_command,
+    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
+    parse_install_options, parse_model_default_options, parse_models_list_options,
+    parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
+    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
+    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
+    read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
+    run_cui_with_handler_io_and_daemon, run_evolve_command, send_daemon_command_raw,
+    sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, uninstall_with_layout, write_json,
 };
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -983,6 +984,81 @@ fn cluster_invite_generates_portable_join_payload() {
         parse_cluster_join_invite_argument(&rendered.join_command).expect("parse join command"),
         parsed
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn join_registration_skips_loopback_when_remote_invite_channels_exist() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-invite-channel-filter-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_invite_filter").expect("cluster")),
+            node_id: Some(NodeId::new("node_host").expect("node")),
+            name: "invite filter cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+
+    let rendered = cluster_invite_with_paths(
+        ClusterInviteOptions {
+            ttl_seconds: 120,
+            introducers: vec![
+                "127.0.0.1:21353".to_string(),
+                "192.168.1.10:21353".to_string(),
+            ],
+            output: None,
+        },
+        &paths,
+    )
+    .expect("cluster invite");
+    let channels = invite_channels_for_join_registration(&rendered.invite);
+
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].endpoint.address, "192.168.1.10:21353");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn join_registration_keeps_loopback_when_it_is_the_only_invite_channel() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-invite-loopback-only-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_loopback_only").expect("cluster")),
+            node_id: Some(NodeId::new("node_host").expect("node")),
+            name: "loopback only cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+
+    let rendered = cluster_invite_with_paths(
+        ClusterInviteOptions {
+            ttl_seconds: 120,
+            introducers: vec!["127.0.0.1:21353".to_string()],
+            output: None,
+        },
+        &paths,
+    )
+    .expect("cluster invite");
+    let channels = invite_channels_for_join_registration(&rendered.invite);
+
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].endpoint.address, "127.0.0.1:21353");
     std::fs::remove_dir_all(root).ok();
 }
 

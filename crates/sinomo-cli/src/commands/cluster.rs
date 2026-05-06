@@ -826,8 +826,8 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         invite,
         members: state.members.clone(),
     };
-    let mut last_error = None;
-    for channel in invite_channels(&request.invite) {
+    let mut failures = Vec::new();
+    for channel in invite_channels_for_join_registration(&request.invite) {
         match send_cluster_join_registration_to_channel(&channel.endpoint, &request) {
             Ok(response) => {
                 if response.accepted {
@@ -840,20 +840,49 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
                     println!("introducer accepted join: {}", channel.endpoint.address);
                     return Ok(());
                 }
-                last_error = Some(response.detail);
+                failures.push(format!(
+                    "{} ({:?}) rejected join: {}",
+                    channel.endpoint.address, channel.endpoint.transport, response.detail
+                ));
             }
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => failures.push(format!(
+                "{} ({:?}) failed: {}",
+                channel.endpoint.address, channel.endpoint.transport, error
+            )),
         }
     }
-    if let Some(error) = last_error {
+    if !failures.is_empty() {
         return Err(CliError::Network {
             address: "cluster introducers".to_string(),
             detail: format!(
-                "join registration failed for all introducers: {error}. If the invite contains 127.0.0.1 or localhost, create a new invite with `sinomo cluster invite --introducer <host-lan-ip>:21353`."
+                "join registration failed for all introducers: {}. If the invite only contains 127.0.0.1 or localhost, create a new invite with `sinomo cluster invite --introducer <host-lan-ip>:21353`.",
+                failures.join("; ")
             ),
         });
     }
     Ok(())
+}
+
+pub(crate) fn invite_channels_for_join_registration(
+    invite: &ClusterJoinInvite,
+) -> Vec<ClusterInvitationChannel> {
+    let channels = invite_channels(invite);
+    if channels
+        .iter()
+        .any(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
+    {
+        channels
+            .into_iter()
+            .filter(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
+            .collect()
+    } else {
+        channels
+    }
+}
+
+pub(crate) fn is_remote_join_registration_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
+    matches!(endpoint.transport, ClusterTransportKind::Iroh)
+        || is_remote_usable_invite_endpoint(endpoint)
 }
 
 pub(crate) fn send_cluster_join_registration_to_channel(

@@ -114,6 +114,10 @@ impl From<network::NetworkError> for CliError {
             network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
             network::NetworkError::Kv(error) => Self::Kv(error),
+            network::NetworkError::Io { operation, detail } => Self::Network {
+                address: operation,
+                detail,
+            },
             other => Self::Parse {
                 detail: other.to_string(),
             },
