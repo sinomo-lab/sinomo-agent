@@ -573,7 +573,7 @@ pub(crate) fn ensure_windows_user_path_contains(
     bin_dir: &Path,
 ) -> Result<UserPathUpdate, CliError> {
     let script = r#"
-$bin = [System.IO.Path]::GetFullPath($args[0])
+$bin = [System.IO.Path]::GetFullPath($env:SINOMO_INSTALL_BIN_DIR)
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ([string]::IsNullOrEmpty($userPath)) {
     $entries = @()
@@ -602,7 +602,7 @@ if ($exists) {
 "#;
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .arg(bin_dir)
+        .env("SINOMO_INSTALL_BIN_DIR", bin_dir)
         .output()
         .map_err(|source| CliError::Io {
             path: "powershell user PATH update".to_string(),
