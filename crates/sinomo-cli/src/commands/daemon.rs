@@ -233,7 +233,10 @@ pub(crate) fn run_shadow_daemon_with_paths(
     let mut supervised_main: Option<Child> = None;
     let mut main_restart_suppressed = false;
     let mut pending_rollout: Option<ShadowMainRolloutMonitor> = None;
+    let mut last_main_probe = Instant::now() - Duration::from_secs(2);
+    let mut main_probe_status = DaemonProbeStatus::NotRunning;
     loop {
+        let now = Instant::now();
         match listener.accept() {
             Ok((mut stream, _address)) => {
                 if let Err(source) = stream.set_nonblocking(false) {
@@ -261,11 +264,13 @@ pub(crate) fn run_shadow_daemon_with_paths(
             }
         }
 
+        if now.duration_since(last_main_probe) >= Duration::from_secs(2) {
+            main_probe_status = probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT);
+            last_main_probe = now;
+        }
+
         if let Some(pending) = pending_rollout.as_ref() {
-            if matches!(
-                probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT),
-                DaemonProbeStatus::Running(_)
-            ) {
+            if matches!(main_probe_status, DaemonProbeStatus::Running(_)) {
                 stage_pending_shadow_rollout(&rollout_paths, pending, &options.host, options.port)?;
                 let main_address =
                     daemon_connect_address(&pending.main_options.host, pending.main_options.port);
@@ -309,10 +314,7 @@ pub(crate) fn run_shadow_daemon_with_paths(
 
         if !main_restart_suppressed
             && supervised_main.is_none()
-            && matches!(
-                probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT),
-                DaemonProbeStatus::NotRunning
-            )
+            && matches!(main_probe_status, DaemonProbeStatus::NotRunning)
         {
             if let Some(activation) = read_rollout_main_activation(&rollout_paths)? {
                 let previous_main_binary = activation
