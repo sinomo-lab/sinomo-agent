@@ -1,0 +1,20 @@
+[package]
+name = "sinomo-object"
+version.workspace = true
+description = "Sinomo Object binary serialization format"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml", "README.md"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }
+thiserror.workspace = true

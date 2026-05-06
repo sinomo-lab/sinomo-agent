@@ -199,7 +199,7 @@ pub(crate) fn run_shadow_daemon_with_paths(
     let cluster = registration
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
-    let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster)?;
+    let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster.clone())?;
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
@@ -212,6 +212,12 @@ pub(crate) fn run_shadow_daemon_with_paths(
             detail: source.to_string(),
         })?;
     println!("sinomo shadow daemon listening on {bind_address}");
+    start_daemon_iroh_proxy_if_clustered(
+        &shadow_paths,
+        &options,
+        cluster.as_ref(),
+        "shadow daemon",
+    );
 
     let status_paths = shadow_paths.clone();
     thread::spawn(move || {
@@ -638,7 +644,7 @@ pub(crate) fn run_daemon_with_paths(
     let cluster = registration
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
-    let _lock = DaemonLock::acquire(&paths, &options, cluster)?;
+    let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
     if label == "daemon" {
         ensure_default_local_dfs_expose(&paths)?;
         if let Err(error) = ensure_default_distributed_dfs(&paths, &options) {
@@ -657,6 +663,7 @@ pub(crate) fn run_daemon_with_paths(
             detail: source.to_string(),
         })?;
     println!("sinomo {label} listening on {bind_address}");
+    start_daemon_iroh_proxy_if_clustered(&paths, &options, cluster.as_ref(), label);
 
     let maintenance_paths = paths.clone();
     let maintenance_options = options.clone();
@@ -701,6 +708,39 @@ pub(crate) fn run_daemon_with_paths(
         thread::sleep(Duration::from_millis(25));
     }
     Ok(())
+}
+
+pub(crate) fn start_daemon_iroh_proxy_if_clustered(
+    paths: &DaemonPaths,
+    options: &DaemonRunOptions,
+    cluster: Option<&DaemonClusterStatus>,
+    label: &str,
+) {
+    let Some(cluster) = cluster else {
+        return;
+    };
+    let Some(data_dir) = paths.root.parent() else {
+        eprintln!("sinomo {label} iroh proxy disabled: daemon paths have no data directory parent");
+        return;
+    };
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let daemon_address = daemon_connect_address(&options.host, options.port);
+    match network::start_iroh_daemon_proxy(
+        cluster_paths,
+        cluster.cluster_id.clone(),
+        cluster.node_id.clone(),
+        daemon_address,
+    ) {
+        Ok(record) => {
+            let endpoint = record.endpoint();
+            if let Err(error) = advertise_daemon_iroh_endpoint(paths, record) {
+                eprintln!("sinomo {label} iroh endpoint advertisement failed: {error}");
+            } else {
+                println!("sinomo {label} iroh endpoint: {}", endpoint.address);
+            }
+        }
+        Err(error) => eprintln!("sinomo {label} iroh proxy disabled: {error}"),
+    }
 }
 
 pub(crate) fn start_daemon(options: DaemonRunOptions) -> Result<(), CliError> {

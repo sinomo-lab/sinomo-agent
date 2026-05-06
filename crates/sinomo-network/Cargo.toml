@@ -13,7 +13,7 @@ ring = "r1"
 
 [features]
 default = []
-iroh-transport = ["dep:iroh"]
+iroh-transport = ["dep:iroh", "dep:tokio"]
 
 [dependencies]
 serde.workspace = true
@@ -21,6 +21,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 iroh = { version = "0.98.2", optional = true }
+tokio = { version = "1.44", features = ["io-util", "net", "rt-multi-thread", "time"], optional = true }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }

@@ -1,0 +1,1343 @@
+use crate::prelude::*;
+use crate::*;
+
+use sinomo_core::{
+    CapabilityName, ClusterCertificate, ClusterCertificateId, ClusterEndpointPrivacy,
+    ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterMemberRecord,
+    ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
+    ClusterTransportKind, Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId,
+    PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
+};
+use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
+
+#[test]
+fn cluster_storage_syncs_members_and_node_status_to_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-storage-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::new("cluster_network_storage").expect("cluster");
+    let node_id = NodeId::new("node_network_storage").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network storage",
+        node_id.clone(),
+        "network node",
+        "public-key",
+        now,
+    );
+    let member = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == node_id)
+        .expect("local member");
+    member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_network_storage_daemon_lan")
+            .expect("endpoint id"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.1:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    }];
+
+    write_cluster_state(&paths, &state).expect("write state");
+    assert_eq!(
+        read_cluster_state(&paths).expect("read state").cluster_id,
+        cluster_id
+    );
+
+    sync_cluster_state_to_kv(&paths, &state).expect("sync members");
+    let members = read_cluster_members_from_kv(&paths).expect("members");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].node_id, node_id);
+    let store = read_cluster_kv_store(&paths).expect("cluster kv store");
+    let identity: ClusterIdentityRecord = serde_json::from_slice(
+        &store
+            .get(&cluster_identity_key())
+            .expect("identity record")
+            .value,
+    )
+    .expect("identity json");
+    assert_eq!(identity.cluster_name, "network storage");
+    let raft_config: ClusterRaftConfigRecord = serde_json::from_slice(
+        &store
+            .get(&cluster_raft_config_key())
+            .expect("raft config record")
+            .value,
+    )
+    .expect("raft config json");
+    assert_eq!(raft_config.voters, vec![node_id.clone()]);
+    assert!(
+        store
+            .get(&cluster_endpoint_key(
+                &node_id,
+                &state.members[0].endpoints[0]
+            ))
+            .is_some()
+    );
+    let policy: ClusterCapabilityPolicyRecord = serde_json::from_slice(
+        &store
+            .get(&cluster_capability_policy_key(&node_id))
+            .expect("capability policy record")
+            .value,
+    )
+    .expect("policy json");
+    assert_eq!(policy.capabilities, state.members[0].capabilities);
+    assert!(store.get(&cluster_rollout_desired_key()).is_some());
+
+    let status = ClusterNodeStatusRecord {
+        cluster_id: state.cluster_id.clone(),
+        node_id: state.local_node_id.clone(),
+        process: "daemon-main".to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        pid: Some(42),
+        address: Some("127.0.0.1:21353".to_string()),
+        bind_address: Some("0.0.0.0:21353".to_string()),
+        executable: Some("sinomo".to_string()),
+        rollout: Some(ClusterNodeRolloutStatus {
+            status: "healthy".to_string(),
+            mode: None,
+            detail: None,
+            source: None,
+            requested_at: None,
+            staged_at: None,
+            updated_at: Some("2026-05-04T00:00:00Z".to_string()),
+            failed_at: None,
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        }),
+        daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+    sync_cluster_node_status_to_kv(&paths, status).expect("sync status");
+    let statuses = read_cluster_node_statuses_from_kv(&paths).expect("statuses");
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].availability, ClusterNodeAvailability::Online);
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("cluster kv store")
+            .get(&cluster_rollout_node_key(&state.local_node_id))
+            .is_some()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_network_records_publish_overwrite_and_expire() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-graph-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::new("cluster_network_graph").expect("cluster");
+    let node_a = NodeId::new("node_network_graph_a").expect("node a");
+    let node_b = NodeId::new("node_network_graph_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network graph",
+        node_a.clone(),
+        "node a",
+        "public-key-a",
+        now,
+    );
+    let mut member_b =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "node b", "pk-b", now);
+    member_b.endpoints = vec![ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_network_graph_b")
+            .expect("endpoint"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "192.0.2.20:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 10,
+        last_observed_latency_ms: None,
+    }];
+    state.members.push(member_b.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_kv(&paths, &state).expect("sync state");
+
+    sync_cluster_network_info_to_kv(
+        &paths,
+        ClusterNetworkInfoRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_a.clone(),
+            environment_id: "env_lan_a".to_string(),
+            observed_addresses: vec!["192.0.2.10".to_string()],
+            endpoints: Vec::new(),
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        },
+    )
+    .expect("sync network info");
+    sync_cluster_network_info_to_kv(
+        &paths,
+        ClusterNetworkInfoRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_a.clone(),
+            environment_id: "env_lan_b".to_string(),
+            observed_addresses: vec!["198.51.100.10".to_string()],
+            endpoints: Vec::new(),
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        },
+    )
+    .expect("overwrite network info");
+
+    let infos = read_cluster_network_info_from_kv(&paths).expect("read infos");
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].environment_id, "env_lan_b");
+
+    let endpoint = member_b.endpoints[0].clone();
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &node_a,
+        vec![ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(7),
+            consecutive_failures: 0,
+            last_success_at: Some("now".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        }],
+    )
+    .expect("sync connectivity");
+    let graph = read_cluster_connectivity_graph_from_kv(&paths).expect("graph");
+    assert_eq!(graph.len(), 1);
+    assert_eq!(graph[0].state, ClusterConnectivityState::Healthy);
+
+    expire_cluster_network_records(&paths, now + time::Duration::seconds(31))
+        .expect("expire network");
+    assert!(
+        read_cluster_network_info_from_kv(&paths)
+            .expect("read expired infos")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_connectivity_graph_from_kv(&paths)
+            .expect("read expired graph")
+            .is_empty()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+fn node(id: &str) -> NodeProfile {
+    let mut profile = NodeProfile::local(id).expect("profile");
+    profile.node_id = NodeId::new(id).expect("node id");
+    profile
+}
+
+fn fixture_event(id: &str, origin_node_id: NodeId) -> EventEnvelope {
+    EventEnvelope::new(
+        EventId::new(id).expect("event"),
+        time::OffsetDateTime::now_utc(),
+        origin_node_id,
+        Source::new("test.network").expect("source"),
+        EventKind::new("network.test.event").expect("kind"),
+        Salience::new(0.5).expect("salience"),
+        Confidence::new(1.0).expect("confidence"),
+        RoutingMetadata::new(
+            RoutingScope::Session,
+            LatencyClass::Interactive,
+            PrivacyClass::Derived,
+        ),
+    )
+}
+
+fn certificate(
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    issuer_node_id: NodeId,
+    public_key: &str,
+    expires_at: time::OffsetDateTime,
+) -> ClusterCertificate {
+    ClusterCertificate {
+        certificate_id: ClusterCertificateId::generate(),
+        cluster_id,
+        node_id,
+        issuer_node_id,
+        public_key: public_key.to_string(),
+        capability_scope: Vec::new(),
+        issued_at: time::OffsetDateTime::now_utc(),
+        expires_at,
+        signature: "sig".to_string(),
+    }
+}
+
+#[test]
+fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
+    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+    let node_id = NodeId::new("node_desktop").expect("node");
+    let timestamp = time::OffsetDateTime::now_utc();
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        node_id.clone(),
+        "desktop",
+        "pk_desktop",
+        timestamp,
+    );
+    member.endpoints.push(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_lan").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanQuic,
+        address: "192.168.1.20:21353".to_string(),
+        source: ClusterEndpointSource::Mdns,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 10,
+        last_observed_latency_ms: None,
+    });
+    member.endpoints.push(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::WebRtc,
+        address: "webrtc://candidate".to_string(),
+        source: ClusterEndpointSource::Ice,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 50,
+        last_observed_latency_ms: None,
+    });
+    let mut registry = PeerRegistry::new();
+
+    registry.upsert_cluster_member(member.clone());
+
+    assert_eq!(registry.cluster_id(), Some(&cluster_id));
+    assert_eq!(registry.cluster_member(&node_id), Some(&member));
+    assert_eq!(registry.endpoint_candidates(&node_id).len(), 2);
+    assert_eq!(
+        registry
+            .best_endpoint_candidate(&node_id)
+            .expect("best endpoint")
+            .endpoint
+            .transport,
+        ClusterTransportKind::LanQuic
+    );
+}
+
+#[test]
+fn node_endpoint_maps_cluster_roaming_transports() {
+    let node_id = NodeId::new("node_phone").expect("node");
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_ice").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::WebRtc,
+        address: "webrtc://candidate".to_string(),
+        source: ClusterEndpointSource::Ice,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 20,
+        last_observed_latency_ms: Some(40),
+    };
+
+    let network_endpoint = NodeEndpoint::from_cluster_endpoint(&endpoint);
+
+    assert_eq!(network_endpoint.node_id, node_id);
+    assert_eq!(network_endpoint.transport, TransportKind::WebRtc);
+    assert_eq!(network_endpoint.address, "webrtc://candidate");
+}
+
+#[test]
+fn node_endpoint_maps_iroh_transport() {
+    let node_id = NodeId::new("node_phone").expect("node");
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_iroh").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_pk".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 40,
+        last_observed_latency_ms: None,
+    };
+
+    let network_endpoint = NodeEndpoint::from_cluster_endpoint(&endpoint);
+
+    assert_eq!(network_endpoint.node_id, node_id);
+    assert_eq!(network_endpoint.transport, TransportKind::Iroh);
+    assert_eq!(network_endpoint.address, "iroh://iroh_pk");
+}
+
+#[test]
+fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let event = fixture_event("evt_codec", node_a.clone());
+    let frame = NetworkFrame {
+        frame_id: NetworkFrameId(7),
+        source_node_id: node_a.clone(),
+        target_node_id: node_b.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(8),
+            origin_node_id: node_a,
+            target_node_id: node_b,
+            body: MeshMessageBody::Event {
+                delivery_id: RouteDeliveryId(9),
+                event: Box::new(event),
+            },
+        },
+    };
+    let codec = LanQuicFrameCodec {
+        max_frame_bytes: 16 * 1024,
+    };
+
+    let encoded = codec.encode(&frame).expect("encode");
+    let decoded = codec.decode(&encoded).expect("decode");
+
+    assert_eq!(decoded, frame);
+    assert!(matches!(
+        LanQuicFrameCodec { max_frame_bytes: 1 }.encode(&frame),
+        Err(NetworkError::FrameTooLarge { .. })
+    ));
+}
+
+#[test]
+fn mdns_discovery_cache_returns_lan_quic_candidates_and_expires_records() {
+    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+    let node_id = NodeId::new("node_desktop").expect("node");
+    let mut cache = MdnsDiscoveryCache::new();
+    cache.upsert(MdnsDiscoveryRecord::lan_quic(
+        cluster_id.clone(),
+        node_id.clone(),
+        "192.168.1.20:21355",
+        10,
+        5,
+    ));
+
+    let candidates = cache.endpoint_candidates_for_node(&node_id);
+
+    assert_eq!(cache.endpoints_for_cluster(&cluster_id).len(), 1);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].endpoint.transport,
+        ClusterTransportKind::LanQuic
+    );
+    assert_eq!(cache.expire_after_tick(14), 0);
+    assert_eq!(cache.expire_after_tick(15), 1);
+    assert!(cache.endpoint_candidates_for_node(&node_id).is_empty());
+}
+
+#[test]
+fn cluster_auth_verifier_establishes_mutual_session_for_authorized_members() {
+    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let now = time::OffsetDateTime::now_utc();
+    let expires_at = now + time::Duration::hours(1);
+    let member_a =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", "pk_a", now);
+    let member_b =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "b", "pk_b", now);
+    let verifier = ClusterAuthVerifier::new(vec![member_a, member_b]);
+    let material_a = ClusterAuthMaterial {
+        cluster_id: cluster_id.clone(),
+        node_id: node_a.clone(),
+        node_public_key: "pk_a".to_string(),
+        certificate: certificate(
+            cluster_id.clone(),
+            node_a.clone(),
+            node_a.clone(),
+            "pk_a",
+            expires_at,
+        ),
+    };
+    let material_b = ClusterAuthMaterial {
+        cluster_id: cluster_id.clone(),
+        node_id: node_b.clone(),
+        node_public_key: "pk_b".to_string(),
+        certificate: certificate(
+            cluster_id.clone(),
+            node_b.clone(),
+            node_a.clone(),
+            "pk_b",
+            expires_at,
+        ),
+    };
+
+    let session = verifier
+        .establish_mutual_session(&material_a, &material_b, now)
+        .expect("mutual auth");
+
+    assert_eq!(session.cluster_id, cluster_id);
+    assert_eq!(session.local_node_id, node_a);
+    assert_eq!(session.remote_node_id, node_b);
+}
+
+#[test]
+fn cluster_auth_verifier_rejects_expired_or_wrong_key_certificate() {
+    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+    let node_a = NodeId::new("node_a").expect("node");
+    let now = time::OffsetDateTime::now_utc();
+    let member =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", "pk_a", now);
+    let verifier = ClusterAuthVerifier::new(vec![member]);
+    let wrong_key = ClusterAuthMaterial {
+        cluster_id: cluster_id.clone(),
+        node_id: node_a.clone(),
+        node_public_key: "pk_a".to_string(),
+        certificate: certificate(
+            cluster_id.clone(),
+            node_a.clone(),
+            node_a.clone(),
+            "pk_other",
+            now + time::Duration::hours(1),
+        ),
+    };
+    let expired = ClusterAuthMaterial {
+        cluster_id: cluster_id.clone(),
+        node_id: node_a.clone(),
+        node_public_key: "pk_a".to_string(),
+        certificate: certificate(cluster_id, node_a.clone(), node_a, "pk_a", now),
+    };
+
+    assert!(matches!(
+        verifier.verify_peer(&wrong_key.cluster_id, &wrong_key, now),
+        Err(NetworkError::CertificateKeyMismatch { .. })
+    ));
+    assert!(matches!(
+        verifier.verify_peer(&expired.cluster_id, &expired, now),
+        Err(NetworkError::CertificateExpired { .. })
+    ));
+}
+
+#[test]
+fn lan_connection_planner_prefers_lan_quic_over_relays() {
+    let node_id = NodeId::new("node_desktop").expect("node");
+    let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_relay").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::TurnRelay,
+        address: "turn://relay".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 1,
+        last_observed_latency_ms: None,
+    });
+    let lan = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_lan").expect("endpoint"),
+        node_id,
+        transport: ClusterTransportKind::LanQuic,
+        address: "192.168.1.20:21355".to_string(),
+        source: ClusterEndpointSource::Mdns,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 10,
+        last_observed_latency_ms: None,
+    });
+
+    let candidates = [relay, lan];
+    let selected =
+        LanConnectionPlanner::select_direct_candidate(&candidates).expect("direct candidate");
+
+    assert_eq!(selected.endpoint.transport, ClusterTransportKind::LanQuic);
+}
+
+#[test]
+fn webrtc_kv_exchange_round_trips_offer_answer_and_ice_candidates() {
+    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let exchange_id = "exchange_1";
+    let mut store = sinomo_kv::InProcessKvStore::new();
+    store
+        .apply_command(sinomo_kv::KvCommand::Op(
+            WebRtcKvExchange::put_signal(
+                WebRtcSignalingEnvelope::offer(
+                    cluster_id.clone(),
+                    exchange_id,
+                    node_a.clone(),
+                    node_b.clone(),
+                    "v=0 offer",
+                    10,
+                ),
+                None,
+            )
+            .expect("offer op"),
+        ))
+        .expect("put offer");
+    store
+        .apply_command(sinomo_kv::KvCommand::Op(
+            WebRtcKvExchange::put_signal(
+                WebRtcSignalingEnvelope::answer(
+                    cluster_id.clone(),
+                    exchange_id,
+                    node_b.clone(),
+                    node_a.clone(),
+                    "v=0 answer",
+                    10,
+                ),
+                None,
+            )
+            .expect("answer op"),
+        ))
+        .expect("put answer");
+    let relay_candidate = IceCandidateRecord {
+        cluster_id: cluster_id.clone(),
+        exchange_id: exchange_id.to_string(),
+        node_id: node_b.clone(),
+        candidate_id: "relay_1".to_string(),
+        candidate_type: IceCandidateType::Relay,
+        address: "turn://relay.example:3478".to_string(),
+        priority: 10,
+        raw_candidate: "candidate:relay".to_string(),
+        expires_after_tick: 10,
+    };
+    store
+        .apply_command(sinomo_kv::KvCommand::Op(
+            WebRtcKvExchange::put_candidate(relay_candidate.clone(), None).expect("candidate op"),
+        ))
+        .expect("put candidate");
+
+    let signals = store.range_prefix(&WebRtcKvExchange::signal_prefix(&cluster_id, exchange_id));
+    let candidates = store.range_prefix(&WebRtcKvExchange::candidate_prefix(
+        &cluster_id,
+        exchange_id,
+    ));
+    let parsed_offer = WebRtcKvExchange::signal_from_entry(&signals[0]).expect("offer");
+    let parsed_candidate =
+        WebRtcKvExchange::candidate_from_entry(&candidates[0]).expect("candidate");
+
+    assert_eq!(signals.len(), 2);
+    assert!(matches!(
+        parsed_offer.message,
+        WebRtcSignalMessage::Offer { .. }
+    ));
+    assert_eq!(parsed_candidate, relay_candidate);
+    assert_eq!(
+        parsed_candidate.endpoint().transport,
+        ClusterTransportKind::TurnRelay
+    );
+}
+
+#[test]
+fn iroh_kv_exchange_round_trips_endpoint_records() {
+    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+    let node_id = NodeId::new("node_mobile").expect("node");
+    let endpoint = IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        endpoint_public_key: "iroh_public_key".to_string(),
+        direct_addresses: vec!["203.0.113.10:21356".to_string()],
+        relay_url: Some("https://relay.example".to_string()),
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 50,
+    };
+    let mut store = sinomo_kv::InProcessKvStore::new();
+    store
+        .apply_command(sinomo_kv::KvCommand::Op(
+            IrohKvExchange::put_endpoint(endpoint.clone(), None).expect("endpoint op"),
+        ))
+        .expect("put endpoint");
+
+    let entries = store.range_prefix(&IrohKvExchange::endpoint_prefix(&cluster_id));
+    let parsed = IrohKvExchange::endpoint_from_entry(&entries[0]).expect("endpoint");
+    let cluster_endpoint = parsed.endpoint();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(parsed, endpoint);
+    assert_eq!(cluster_endpoint.node_id, node_id);
+    assert_eq!(cluster_endpoint.transport, ClusterTransportKind::Iroh);
+    assert_eq!(
+        cluster_endpoint.privacy,
+        ClusterEndpointPrivacy::InternetDirect
+    );
+    assert!(
+        cluster_endpoint
+            .address
+            .contains("direct=203.0.113.10:21356")
+    );
+    assert!(
+        cluster_endpoint
+            .address
+            .contains("relay=https://relay.example")
+    );
+    let parsed_endpoint =
+        iroh_endpoint_record_from_cluster_endpoint(&cluster_endpoint, &cluster_id)
+            .expect("cluster endpoint parse");
+    assert_eq!(parsed_endpoint.direct_addresses, endpoint.direct_addresses);
+    assert_eq!(parsed_endpoint.relay_url, endpoint.relay_url);
+}
+
+#[test]
+fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() {
+    let node_id = NodeId::new("node_mobile").expect("node");
+    let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::WebRtc,
+        address: "webrtc://srflx".to_string(),
+        source: ClusterEndpointSource::Ice,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 60,
+        last_observed_latency_ms: None,
+    })
+    .healthy(35);
+    let turn = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_turn").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::TurnRelay,
+        address: "turn://relay".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 120,
+        last_observed_latency_ms: None,
+    });
+    let selected = RoamingConnectionPlanner::select_path(&[turn.clone(), webrtc.clone()])
+        .expect("roaming path");
+
+    assert!(matches!(
+        selected,
+        RoamingPathSelection::WebRtc(PeerEndpointCandidate { endpoint, .. })
+            if endpoint.address == "webrtc://srflx"
+    ));
+
+    let failed_webrtc = webrtc.failed("ice failed");
+    let fallback =
+        RoamingConnectionPlanner::select_path(&[failed_webrtc, turn]).expect("fallback path");
+
+    assert!(matches!(
+        fallback,
+        RoamingPathSelection::Relay(PeerEndpointCandidate { endpoint, .. })
+            if endpoint.transport == ClusterTransportKind::TurnRelay
+    ));
+}
+
+#[test]
+fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
+    let node_id = NodeId::new("node_mobile").expect("node");
+    let iroh = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_iroh").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key?relay=https://relay.example".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    });
+    let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::WebRtc,
+        address: "webrtc://srflx".to_string(),
+        source: ClusterEndpointSource::Ice,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 10,
+        last_observed_latency_ms: None,
+    });
+    let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_turn").expect("endpoint"),
+        node_id,
+        transport: ClusterTransportKind::TurnRelay,
+        address: "turn://relay".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 5,
+        last_observed_latency_ms: None,
+    });
+
+    let selected =
+        RoamingConnectionPlanner::select_path(&[relay, webrtc, iroh]).expect("roaming path");
+
+    assert!(matches!(
+        selected,
+        RoamingPathSelection::Iroh(PeerEndpointCandidate { endpoint, .. })
+            if endpoint.transport == ClusterTransportKind::Iroh
+    ));
+}
+
+#[test]
+fn routes_session_events_to_participants() {
+    let session_id = SessionId::new("sess_demo").expect("session");
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_mobile"));
+    registry.register_node(node("node_desktop"));
+    registry
+        .join_session(
+            session_id.clone(),
+            NodeId::new("node_mobile").expect("node"),
+        )
+        .expect("join mobile");
+    registry
+        .join_session(
+            session_id.clone(),
+            NodeId::new("node_desktop").expect("node"),
+        )
+        .expect("join desktop");
+
+    let event = EventEnvelope::new(
+        EventId::new("evt_route").expect("event"),
+        time::OffsetDateTime::now_utc(),
+        NodeId::new("node_mobile").expect("node"),
+        Source::new("test.route").expect("source"),
+        EventKind::new("evolution.job.scoped").expect("kind"),
+        Salience::new(0.8).expect("salience"),
+        Confidence::new(1.0).expect("confidence"),
+        RoutingMetadata::new(
+            RoutingScope::Session,
+            LatencyClass::Background,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_session(session_id);
+
+    let mut store = InMemoryEventStore::new();
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored event");
+
+    let mut router = InProcessRouter::new(registry);
+    let deliveries = router.route_event(&stored).expect("route");
+    assert_eq!(deliveries.len(), 2);
+}
+
+#[test]
+fn in_process_transport_delivers_typed_frames() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let event = fixture_event("evt_transport", node_a.clone());
+
+    let frame = NetworkFrame {
+        frame_id: NetworkFrameId(1),
+        source_node_id: node_a.clone(),
+        target_node_id: node_b.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(1),
+            origin_node_id: node_a,
+            target_node_id: node_b.clone(),
+            body: MeshMessageBody::Event {
+                delivery_id: RouteDeliveryId(1),
+                event: Box::new(event.clone()),
+            },
+        },
+    };
+
+    transport_a
+        .send(&node_b, frame.clone())
+        .expect("send frame");
+    let inbound = transport_b.drain_incoming().expect("drain");
+
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].received_by, node_b);
+    assert_eq!(inbound[0].frame, frame);
+}
+
+#[test]
+fn in_process_transport_rejects_unknown_targets() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_missing = NodeId::new("node_missing").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let event = fixture_event("evt_missing_target", node_a.clone());
+
+    let error = transport_a
+        .send(
+            &node_missing,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_a.clone(),
+                target_node_id: node_missing.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_a,
+                    target_node_id: node_missing.clone(),
+                    body: MeshMessageBody::Event {
+                        delivery_id: RouteDeliveryId(1),
+                        event: Box::new(event),
+                    },
+                },
+            },
+        )
+        .expect_err("missing target should fail");
+
+    assert_eq!(
+        error,
+        NetworkError::UnknownNode {
+            node_id: node_missing
+        }
+    );
+}
+
+#[test]
+fn network_service_delivers_event_and_processes_ack() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let session_id = SessionId::new("sess_network").expect("session");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry.register_node(node("node_b"));
+    registry
+        .join_session(session_id.clone(), node_a.clone())
+        .expect("join a");
+    registry
+        .join_session(session_id.clone(), node_b.clone())
+        .expect("join b");
+    let mut service_a = NetworkService::new(registry.clone(), transport_a);
+    let mut service_b = NetworkService::new(registry, transport_b);
+    let mut store_a = InMemoryEventStore::new();
+    let mut store_b = InMemoryEventStore::new();
+    let event = fixture_event("evt_service_delivery", node_a.clone()).with_session(session_id);
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+
+    let deliveries = service_a.enqueue_event(&stored).expect("enqueue");
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(service_a.pump_outbound().expect("send"), 2);
+
+    let outcomes = service_b
+        .process_incoming(&mut store_b)
+        .expect("process event");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(store_b.len(), 1);
+
+    let ack_outcomes = service_a
+        .process_incoming(&mut store_a)
+        .expect("process ack");
+    assert_eq!(ack_outcomes.len(), 2);
+    assert_eq!(store_a.len(), 1);
+    assert_eq!(
+        ack_outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, InboundOutcome::AckAccepted { .. }))
+            .count(),
+        1
+    );
+    let delivered = service_a
+        .ledger()
+        .records()
+        .into_iter()
+        .filter(|record| record.delivery.status == DeliveryStatus::Delivered)
+        .count();
+    assert_eq!(delivered, 1);
+}
+
+#[test]
+fn delivery_ledger_suppresses_duplicate_event_targets() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry.register_node(node("node_b"));
+    let mut service = NetworkService::new(registry, transport_a);
+    let mut store = InMemoryEventStore::new();
+    let event = fixture_event("evt_duplicate_delivery", node_a.clone()).with_target_node(node_b);
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+
+    assert_eq!(service.enqueue_event(&stored).expect("first").len(), 1);
+    assert_eq!(service.enqueue_event(&stored).expect("duplicate").len(), 0);
+    assert_eq!(service.ledger().records().len(), 1);
+}
+
+#[test]
+fn inbound_duplicate_event_is_acked_without_duplicate_append() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry.register_node(node("node_b"));
+    let mut service_a = NetworkService::new(registry.clone(), transport_a);
+    let mut service_b = NetworkService::new(registry, transport_b);
+    let event = fixture_event("evt_duplicate_inbound", node_a.clone()).with_target_node(node_b);
+    let mut store_b = InMemoryEventStore::new();
+
+    for frame_id in [1, 2] {
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(frame_id),
+            source_node_id: node_a.clone(),
+            target_node_id: service_b.transport.local_node_id().clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(frame_id),
+                origin_node_id: node_a.clone(),
+                target_node_id: service_b.transport.local_node_id().clone(),
+                body: MeshMessageBody::Event {
+                    delivery_id: RouteDeliveryId(1),
+                    event: Box::new(event.clone()),
+                },
+            },
+        };
+        service_a
+            .transport
+            .send(service_b.transport.local_node_id(), frame)
+            .expect("send duplicate");
+    }
+
+    let outcomes = service_b
+        .process_incoming(&mut store_b)
+        .expect("process duplicates");
+    assert!(matches!(outcomes[0], InboundOutcome::EventAccepted { .. }));
+    assert!(matches!(outcomes[1], InboundOutcome::EventDuplicate { .. }));
+    assert_eq!(store_b.len(), 1);
+}
+
+#[test]
+fn retry_policy_marks_delivery_failed_after_max_attempts() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry.register_node(node("node_b"));
+    let mut service = NetworkService::new(registry, transport_a)
+        .with_retry_policy(RetryPolicy { max_attempts: 2 });
+    let mut store = InMemoryEventStore::new();
+    let event = fixture_event("evt_retry_failed", node_a.clone()).with_target_node(node_b);
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let delivery = service.enqueue_event(&stored).expect("enqueue")[0].clone();
+
+    assert!(service.pump_outbound().is_ok());
+    assert_eq!(
+        service
+            .ledger()
+            .record(&delivery.delivery_id)
+            .unwrap()
+            .delivery
+            .status,
+        DeliveryStatus::Retrying
+    );
+    let error = service
+        .pump_outbound()
+        .expect_err("final attempt should return send failure");
+    assert!(matches!(error, NetworkError::UnknownNode { .. }));
+    assert_eq!(
+        service
+            .ledger()
+            .record(&delivery.delivery_id)
+            .unwrap()
+            .delivery
+            .status,
+        DeliveryStatus::Failed
+    );
+}
+
+#[test]
+fn ack_rejects_wrong_target_node() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let node_c = NodeId::new("node_c").expect("node");
+    let mut ledger = DeliveryLedger::new(RetryPolicy::default());
+    let event = fixture_event("evt_wrong_ack", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    ledger.enqueue(delivery, event).expect("enqueue");
+
+    let error = ledger
+        .ack(RouteDeliveryId(1), &node_c)
+        .expect_err("wrong target should fail");
+    assert!(matches!(error, NetworkError::AckTargetMismatch { .. }));
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .unwrap()
+            .delivery
+            .target_node_id,
+        node_b
+    );
+}
+
+#[test]
+fn heartbeat_marks_peer_healthy_and_updates_node_health() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+
+    let status = registry.record_heartbeat(&node_a, 7).expect("heartbeat");
+
+    assert_eq!(status, PeerStatus::Healthy);
+    assert_eq!(
+        registry
+            .peer_state(&node_a)
+            .expect("peer state")
+            .link
+            .last_seen_tick,
+        Some(7)
+    );
+    assert_eq!(
+        registry.node(&node_a).expect("node").health.availability,
+        NodeAvailability::Available
+    );
+}
+
+#[test]
+fn missed_heartbeats_degrade_then_mark_offline_without_removing_session() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let session_id = SessionId::new("sess_heartbeat").expect("session");
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry
+        .join_session(session_id.clone(), node_a.clone())
+        .expect("join");
+
+    assert_eq!(
+        registry
+            .record_missed_heartbeat(&node_a, HeartbeatPolicy::default())
+            .expect("missed one"),
+        PeerStatus::Degraded
+    );
+    assert_eq!(
+        registry
+            .record_missed_heartbeat(&node_a, HeartbeatPolicy::default())
+            .expect("missed two"),
+        PeerStatus::Suspect
+    );
+    assert_eq!(
+        registry
+            .record_missed_heartbeat(&node_a, HeartbeatPolicy::default())
+            .expect("missed three"),
+        PeerStatus::Offline
+    );
+    assert_eq!(
+        registry.node(&node_a).expect("node").health.availability,
+        NodeAvailability::Offline
+    );
+    assert_eq!(registry.session_nodes(&session_id), vec![node_a]);
+}
+
+#[test]
+fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry.register_node(node("node_b"));
+    let mut service_a = NetworkService::new(registry.clone(), transport_a)
+        .with_retry_policy(RetryPolicy { max_attempts: 2 });
+    let mut store_a = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_recovery_requeue", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let delivery_id = service_a.enqueue_event(&stored).expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().expect("first attempt"), 0);
+    assert!(service_a.pump_outbound().is_err());
+    assert_eq!(
+        service_a
+            .ledger()
+            .record(&delivery_id)
+            .expect("record")
+            .delivery
+            .status,
+        DeliveryStatus::Failed
+    );
+
+    let transport_b = network.add_node(node_b.clone());
+    let mut service_b = NetworkService::new(registry, transport_b);
+    let mut store_b = InMemoryEventStore::new();
+    service_b
+        .send_heartbeat(&node_a, 42)
+        .expect("send heartbeat");
+
+    let outcomes = service_a
+        .process_incoming(&mut store_a)
+        .expect("process heartbeat");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::HeartbeatReceived {
+            status: PeerStatus::Healthy,
+            requeued: 1,
+            ..
+        }]
+    ));
+    assert_eq!(
+        service_a
+            .ledger()
+            .record(&delivery_id)
+            .expect("record")
+            .delivery
+            .status,
+        DeliveryStatus::Retrying
+    );
+
+    assert_eq!(service_a.pump_outbound().expect("drain recovered"), 1);
+    service_b
+        .process_incoming(&mut store_b)
+        .expect("receive recovered event");
+    assert_eq!(store_b.len(), 1);
+}
+
+#[test]
+fn session_routing_excludes_offline_participants() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let session_id = SessionId::new("sess_offline_route").expect("session");
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry.register_node(node("node_b"));
+    registry
+        .join_session(session_id.clone(), node_a.clone())
+        .expect("join a");
+    registry
+        .join_session(session_id.clone(), node_b.clone())
+        .expect("join b");
+    for _ in 0..3 {
+        registry
+            .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+            .expect("miss heartbeat");
+    }
+    let mut store = InMemoryEventStore::new();
+    let event = fixture_event("evt_skip_offline", node_a.clone()).with_session(session_id);
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+
+    let mut router = InProcessRouter::new(registry);
+    let deliveries = router.route_event(&stored).expect("route");
+
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].target_node_id, node_a);
+}
+
+#[test]
+fn direct_target_offline_buffers_instead_of_sending() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry.register_node(node("node_b"));
+    for _ in 0..3 {
+        registry
+            .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+            .expect("miss heartbeat");
+    }
+    let mut service = NetworkService::new(registry, transport_a);
+    let mut store = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_direct_offline", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let delivery_id = service.enqueue_event(&stored).expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service.pump_outbound().expect("buffer offline"), 0);
+    assert_eq!(transport_b.drain_incoming().expect("drain").len(), 0);
+    assert_eq!(
+        service
+            .ledger()
+            .record(&delivery_id)
+            .expect("record")
+            .delivery
+            .status,
+        DeliveryStatus::Retrying
+    );
+}
+
+#[test]
+fn trusted_network_routing_skips_offline_peers() {
+    let node_a = NodeId::new("node_a").expect("node");
+    let node_b = NodeId::new("node_b").expect("node");
+    let node_c = NodeId::new("node_c").expect("node");
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_a"));
+    registry.register_node(node("node_b"));
+    registry.register_node(node("node_c"));
+    for _ in 0..3 {
+        registry
+            .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+            .expect("miss heartbeat");
+    }
+    registry
+        .record_heartbeat(&node_c, 1)
+        .expect("mark c healthy");
+    let mut event = fixture_event("evt_trusted_network", node_a);
+    event.routing.scope = RoutingScope::TrustedNetwork;
+    let mut store = InMemoryEventStore::new();
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+
+    let mut router = InProcessRouter::new(registry);
+    let deliveries = router.route_event(&stored).expect("route");
+    let targets: BTreeSet<NodeId> = deliveries
+        .into_iter()
+        .map(|delivery| delivery.target_node_id)
+        .collect();
+
+    assert_eq!(
+        targets,
+        BTreeSet::from([stored.event.origin_node_id, node_c])
+    );
+}
