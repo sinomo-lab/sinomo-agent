@@ -58,6 +58,36 @@ fn iroh_daemon_proxy_round_trips_control_command() {
 }
 
 #[test]
+fn sinomo_default_iroh_relays_use_stable_network_hosts() {
+    let urls = crate::roaming::sinomo_iroh_relay_url_strings_from_env(None);
+
+    assert_eq!(
+        urls,
+        vec![
+            "https://use1-1.relay.iroh.network./".to_string(),
+            "https://euw1-1.relay.iroh.network./".to_string(),
+            "https://aps1-1.relay.iroh.network./".to_string(),
+        ]
+    );
+    assert!(urls.iter().all(|url| !url.contains("iroh-canary")));
+}
+
+#[test]
+fn sinomo_iroh_relay_env_ignores_empty_entries() {
+    let urls = crate::roaming::sinomo_iroh_relay_url_strings_from_env(Some(
+        " https://relay-a.example./, ,https://relay-b.example./ ".to_string(),
+    ));
+
+    assert_eq!(
+        urls,
+        vec![
+            "https://relay-a.example./".to_string(),
+            "https://relay-b.example./".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-uncommitted-raft-snapshot-{}",

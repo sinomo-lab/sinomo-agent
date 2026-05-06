@@ -7,6 +7,12 @@ pub const WEBRTC_SIGNALING_PROTOCOL: &str = "sinomo.webrtc-signaling.v1";
 pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
 pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
+const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
+    "https://use1-1.relay.iroh.network./",
+    "https://euw1-1.relay.iroh.network./",
+    "https://aps1-1.relay.iroh.network./",
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct WebRtcSignalingEnvelope {
@@ -254,6 +260,54 @@ pub enum IrohRelayMode {
     Custom { relay_url: String },
 }
 
+pub fn default_sinomo_iroh_relay_urls() -> Vec<String> {
+    sinomo_iroh_relay_url_strings_from_env(std::env::var(SINOMO_IROH_RELAY_URLS_ENV).ok())
+}
+
+pub(crate) fn sinomo_iroh_relay_url_strings_from_env(value: Option<String>) -> Vec<String> {
+    let Some(value) = value else {
+        return SINOMO_DEFAULT_IROH_RELAY_URLS
+            .iter()
+            .map(|url| (*url).to_string())
+            .collect();
+    };
+    let urls: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if urls.is_empty() {
+        SINOMO_DEFAULT_IROH_RELAY_URLS
+            .iter()
+            .map(|url| (*url).to_string())
+            .collect()
+    } else {
+        urls
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
+fn sinomo_iroh_relay_mode() -> Result<iroh::RelayMode, NetworkError> {
+    let relay_urls = default_sinomo_iroh_relay_urls();
+    let parsed = relay_urls
+        .iter()
+        .map(|url| {
+            url.parse().map_err(|source| NetworkError::Serialization {
+                detail: format!(
+                    "invalid iroh relay url `{url}` from {SINOMO_IROH_RELAY_URLS_ENV}: {source}"
+                ),
+            })
+        })
+        .collect::<Result<Vec<iroh::RelayUrl>, NetworkError>>()?;
+    Ok(iroh::RelayMode::custom(parsed))
+}
+
+#[cfg(feature = "iroh-transport")]
+fn sinomo_iroh_endpoint_builder() -> Result<iroh::endpoint::Builder, NetworkError> {
+    Ok(iroh::Endpoint::builder(iroh::endpoint::presets::N0).relay_mode(sinomo_iroh_relay_mode()?))
+}
+
 #[cfg(feature = "iroh-transport")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrohEndpointDialConfig {
@@ -477,7 +531,7 @@ async fn run_iroh_daemon_proxy(
     secret_key: iroh::SecretKey,
     ready: mpsc::Sender<Result<IrohEndpointRecord, NetworkError>>,
 ) -> Result<(), NetworkError> {
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let endpoint = sinomo_iroh_endpoint_builder()?
         .secret_key(secret_key)
         .alpns(vec![IROH_ROAMING_PROTOCOL.as_bytes().to_vec()])
         .bind()
@@ -668,10 +722,13 @@ async fn send_iroh_daemon_command_raw_async(
             .checked_sub(started.elapsed())
             .unwrap_or_else(|| Duration::from_millis(1))
     };
-    let endpoint = match tokio::time::timeout(
-        remaining(),
-        iroh::Endpoint::bind(iroh::endpoint::presets::N0),
-    )
+    let endpoint = match tokio::time::timeout(remaining(), async {
+        sinomo_iroh_endpoint_builder()
+            .map_err(|source| source.to_string())?
+            .bind()
+            .await
+            .map_err(|source| source.to_string())
+    })
     .await
     {
         Ok(Ok(endpoint)) => endpoint,
