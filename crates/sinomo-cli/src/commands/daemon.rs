@@ -210,9 +210,14 @@ pub(crate) fn run_shadow_daemon_with_paths(
         .map_err(|source| CliError::Network {
             address: bind_address.clone(),
             detail: source.to_string(),
-    })?;
+        })?;
     println!("sinomo shadow daemon listening on {bind_address}");
-    start_daemon_iroh_proxy_if_clustered(&shadow_paths, &options, cluster.as_ref(), "shadow daemon");
+    start_daemon_iroh_proxy_if_clustered(
+        &shadow_paths,
+        &options,
+        cluster.as_ref(),
+        "shadow daemon",
+    );
 
     let mut main_binary = main_binary;
     let mut supervised_main: Option<Child> = None;
@@ -636,7 +641,7 @@ pub(crate) fn run_daemon_with_paths(
         .map_err(|source| CliError::Network {
             address: bind_address.clone(),
             detail: source.to_string(),
-    })?;
+        })?;
     println!("sinomo {label} listening on {bind_address}");
     start_daemon_iroh_proxy_if_clustered(&paths, &options, cluster.as_ref(), label);
 

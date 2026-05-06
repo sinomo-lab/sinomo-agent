@@ -142,6 +142,120 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn cluster_network_records_publish_overwrite_and_expire() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-graph-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::new("cluster_network_graph").expect("cluster");
+    let node_a = NodeId::new("node_network_graph_a").expect("node a");
+    let node_b = NodeId::new("node_network_graph_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network graph",
+        node_a.clone(),
+        "node a",
+        "public-key-a",
+        now,
+    );
+    let mut member_b =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "node b", "pk-b", now);
+    member_b.endpoints = vec![ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_network_graph_b")
+            .expect("endpoint"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "192.0.2.20:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 10,
+        last_observed_latency_ms: None,
+    }];
+    state.members.push(member_b.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_kv(&paths, &state).expect("sync state");
+
+    sync_cluster_network_info_to_kv(
+        &paths,
+        ClusterNetworkInfoRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_a.clone(),
+            environment_id: "env_lan_a".to_string(),
+            observed_addresses: vec!["192.0.2.10".to_string()],
+            endpoints: Vec::new(),
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        },
+    )
+    .expect("sync network info");
+    sync_cluster_network_info_to_kv(
+        &paths,
+        ClusterNetworkInfoRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_a.clone(),
+            environment_id: "env_lan_b".to_string(),
+            observed_addresses: vec!["198.51.100.10".to_string()],
+            endpoints: Vec::new(),
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        },
+    )
+    .expect("overwrite network info");
+
+    let infos = read_cluster_network_info_from_kv(&paths).expect("read infos");
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].environment_id, "env_lan_b");
+
+    let endpoint = member_b.endpoints[0].clone();
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &node_a,
+        vec![ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(7),
+            consecutive_failures: 0,
+            last_success_at: Some("now".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        }],
+    )
+    .expect("sync connectivity");
+    let graph = read_cluster_connectivity_graph_from_kv(&paths).expect("graph");
+    assert_eq!(graph.len(), 1);
+    assert_eq!(graph[0].state, ClusterConnectivityState::Healthy);
+
+    expire_cluster_network_records(&paths, now + time::Duration::seconds(31))
+        .expect("expire network");
+    assert!(
+        read_cluster_network_info_from_kv(&paths)
+            .expect("read expired infos")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_connectivity_graph_from_kv(&paths)
+            .expect("read expired graph")
+            .is_empty()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn node(id: &str) -> NodeProfile {
     let mut profile = NodeProfile::local(id).expect("profile");
     profile.node_id = NodeId::new(id).expect("node id");

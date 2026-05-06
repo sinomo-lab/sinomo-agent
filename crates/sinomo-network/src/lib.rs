@@ -15,17 +15,18 @@ pub use storage::*;
 pub(crate) mod prelude {
     pub(crate) use serde::{Deserialize, Serialize};
     pub(crate) use sinomo_core::{
-        CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointPrivacy,
-        ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterInviteId,
-        ClusterMemberRecord, ClusterMemberRole, ClusterNodeStatusRecord, ClusterTransportKind,
-        EventEnvelope, EventId, LatencyClass, NodeId, RoutingScope, SessionId,
+        CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointId,
+        ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterId,
+        ClusterInviteId, ClusterMemberRecord, ClusterMemberRole, ClusterNodeStatusRecord,
+        ClusterTransportKind, EventEnvelope, EventId, LatencyClass, NodeId, RoutingScope,
+        SessionId,
     };
     pub(crate) use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
     pub(crate) use sinomo_kv::{
         DurableRaftKvNode, InProcessKvStore, KvCommand, KvEntry, KvError, KvEvent, KvLogEntry,
-        KvOp, KvRevision, KvSnapshot, KvTxnResponse, KvWalPaths, LeaseId, RaftAppendEntriesRequest,
-        RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
-        WatchId,
+        KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvWalPaths, LeaseId,
+        RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
+        RaftRequestVoteResponse, RaftSnapshot, WatchId,
     };
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
