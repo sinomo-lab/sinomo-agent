@@ -490,8 +490,8 @@ pub fn compact_cluster_raft_node_if_needed(
     paths: &ClusterPaths,
     node: &mut DurableRaftKvNode,
 ) -> Result<(), NetworkError> {
-    const MAX_UNCOMPACTED_LOG_ENTRIES: usize = 1024;
-    const MAX_WAL_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_UNCOMPACTED_LOG_ENTRIES: usize = 128;
+    const MAX_WAL_BYTES: u64 = 512 * 1024;
     const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
     let wal_paths = cluster_raft_wal_paths(paths, node.node_id());
