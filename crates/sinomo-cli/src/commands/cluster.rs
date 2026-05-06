@@ -2617,53 +2617,6 @@ pub(crate) fn current_shadow_daemon_options(data_dir: &Path) -> DaemonRunOptions
     }
 }
 
-pub(crate) fn sync_cluster_with_reachable_peers(
-    paths: &ClusterPaths,
-    state: &mut ClusterBootstrapState,
-    snapshot: &mut KvSnapshot,
-) -> Result<(), CliError> {
-    if !cluster_raft_local_is_leader(paths, state)? {
-        let leader_reachable = cluster_raft_known_leader_id(paths, state)?
-            .as_ref()
-            .is_some_and(|leader_id| cluster_raft_leader_is_reachable(state, leader_id));
-        if !leader_reachable && elect_cluster_raft_leader(paths, state)? {
-            *snapshot = read_cluster_kv_snapshot(paths)?;
-        }
-    }
-    if !cluster_raft_local_is_leader(paths, state)? {
-        return Ok(());
-    }
-    let mut voter_acks = std::collections::BTreeSet::new();
-    if cluster_raft_local_is_voter(state) {
-        voter_acks.insert(state.local_node_id.clone());
-    }
-    for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
-        let Ok(response) = replicate_cluster_raft_to_endpoint(paths, state, &endpoint) else {
-            continue;
-        };
-        if !response.accepted {
-            continue;
-        }
-        if cluster_raft_node_is_voter(state, &endpoint.node_id) {
-            voter_acks.insert(endpoint.node_id.clone());
-        }
-        let _ = send_cluster_kv_watch_events(
-            &endpoint,
-            &ClusterKvWatchEventsRequest {
-                state: state.clone(),
-                leader_id: state.local_node_id.clone(),
-                events: snapshot.events.clone(),
-            },
-        );
-        network::merge_cluster_state_from_peer(state, response.state);
-        *snapshot = read_cluster_kv_snapshot(paths)?;
-    }
-    if voter_acks.len() < cluster_raft_quorum_size(state) {
-        *snapshot = network::clear_cluster_raft_leader(paths, &state.local_node_id)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn cluster_has_local_quorum(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -2793,13 +2746,6 @@ pub(crate) fn commit_cluster_kv_txn_with_quorum(
             detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
         });
     }
-    let mut snapshot = read_cluster_kv_store(paths)?.snapshot();
-    sync_cluster_with_reachable_peers(paths, state, &mut snapshot)?;
-    if !cluster_raft_local_is_leader(paths, state)? {
-        return Err(CliError::ClusterReadOnly {
-            detail: "local daemon lost Raft quorum before committing the transaction".to_string(),
-        });
-    }
     commit_cluster_raft_command_with_quorum(paths, state, KvCommand::Txn(txn))
         .map(|(snapshot, _)| snapshot)
 }
@@ -2852,22 +2798,6 @@ pub(crate) fn cluster_raft_quorum_size(state: &ClusterBootstrapState) -> usize {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     voters / 2 + 1
-}
-
-pub(crate) fn cluster_raft_leader_is_reachable(
-    state: &ClusterBootstrapState,
-    leader_id: &NodeId,
-) -> bool {
-    state
-        .members
-        .iter()
-        .find(|member| member.node_id == *leader_id)
-        .into_iter()
-        .flat_map(|member| member.endpoints.iter())
-        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-        .any(|endpoint| {
-            send_daemon_command_to_endpoint(endpoint, "STATUS", DAEMON_JOIN_TIMEOUT).is_ok()
-        })
 }
 
 pub(crate) fn elect_cluster_raft_leader(

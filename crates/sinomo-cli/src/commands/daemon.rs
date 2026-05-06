@@ -1563,20 +1563,11 @@ pub(crate) fn handle_daemon_cluster_kv_txn(
             detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
         });
     }
-    let mut snapshot = read_cluster_kv_store(&cluster_paths)?.snapshot();
-    sync_cluster_with_reachable_peers(&cluster_paths, &mut state, &mut snapshot)?;
-    if !cluster_raft_local_is_leader(&cluster_paths, &state)? {
-        return Err(CliError::ClusterReadOnly {
-            detail: "local daemon lost Raft quorum before committing the transaction".to_string(),
-        });
-    }
     let (_snapshot, response) = commit_cluster_raft_command_with_quorum(
         &cluster_paths,
         &mut state,
         KvCommand::Txn(txn.clone()),
     )?;
-    let mut replicated_snapshot = read_cluster_kv_snapshot(&cluster_paths)?;
-    let _ = sync_cluster_with_reachable_peers(&cluster_paths, &mut state, &mut replicated_snapshot);
     Ok(response.unwrap_or(KvTxnResponse {
         succeeded: true,
         revision: read_cluster_kv_snapshot(&cluster_paths)?.revision,
