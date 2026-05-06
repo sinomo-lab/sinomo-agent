@@ -13,29 +13,30 @@ use super::{
     cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
     cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
     cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_state_sync_txn, cluster_sync_targets, create_source_repo_bundle,
-    daemon_advertised_endpoints_for_state, daemon_lan_endpoint, daemon_package_version,
-    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
-    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn,
-    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
-    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
-    handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
-    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
-    invite_communication_channels, invite_introducer_endpoint,
-    invite_introducer_endpoint_from_state, is_terminal_status, main_daemon_capabilities,
-    managed_source_status, models_default_with_data_dir, normalize_model_provider,
-    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_models_list_options, parse_propose_options, parse_provider_command,
-    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
-    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
-    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-    run_shadow_daemon_with_paths, send_daemon_command_raw, shadow_daemon_node_id,
-    sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, uninstall_with_layout, write_json,
+    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
+    create_source_repo_bundle, daemon_advertised_endpoints_for_state, daemon_lan_endpoint,
+    daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
+    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
+    expire_cluster_network_records_in_kv, handle_daemon_cluster_join,
+    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
+    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
+    handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
+    handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
+    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
+    invite_channels_for_join_registration, invite_communication_channels,
+    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
+    main_daemon_capabilities, managed_source_status, models_default_with_data_dir,
+    normalize_model_provider, parse_cli_command, parse_cluster_command,
+    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
+    parse_install_options, parse_model_default_options, parse_models_list_options,
+    parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
+    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
+    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
+    read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
+    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
+    send_daemon_command_raw, shadow_daemon_node_id, sign_cluster_join_invite,
+    sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
+    uninstall_with_layout, write_json,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -332,6 +333,33 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
     assert_eq!(targets[0].transport, ClusterTransportKind::LanTcp);
     assert_eq!(targets[0].address, "10.14.1.11:21353");
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn default_invite_compaction_keeps_iroh_fallback() {
+    let node_id = NodeId::new("node_invite_compact").expect("node");
+    let mut endpoints = vec![
+        daemon_lan_endpoint(&node_id, "10.14.1.11:21353".to_string(), 0),
+        daemon_lan_endpoint(&node_id, "10.14.1.12:21353".to_string(), 1),
+        daemon_lan_endpoint(&node_id, "10.14.1.13:21353".to_string(), 2),
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::new("endpoint_invite_compact_iroh").expect("endpoint"),
+            node_id,
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://invite_compact_key?relay=https://relay.example/".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 3,
+            last_observed_latency_ms: None,
+        },
+    ];
+
+    compact_default_invite_introducers(&mut endpoints);
+
+    assert_eq!(endpoints.len(), 3);
+    assert_eq!(endpoints[0].address, "10.14.1.11:21353");
+    assert_eq!(endpoints[1].address, "10.14.1.12:21353");
+    assert_eq!(endpoints[2].transport, ClusterTransportKind::Iroh);
 }
 
 #[test]
@@ -1460,6 +1488,12 @@ fn cluster_invite_generates_portable_join_payload() {
     assert!(rendered.uri.contains("&secret="));
     assert!(rendered.uri.contains("&channel="));
     assert!(rendered.uri.contains("192.168.1.10:21353"));
+    assert!(
+        rendered
+            .uri
+            .contains("&channel=lan-tcp,192.168.1.10:21353,")
+    );
+    assert!(!rendered.uri.contains("&channel=node_host,"));
     assert!(!rendered.uri.contains("&cluster_id="));
     assert!(!rendered.uri.contains("&cluster_name="));
     assert!(!rendered.uri.contains("&introducer="));

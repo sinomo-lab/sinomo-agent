@@ -984,22 +984,23 @@ pub(crate) fn compact_default_invite_introducers(introducers: &mut Vec<ClusterEn
         .take(2)
         .cloned()
         .collect::<Vec<_>>();
-    if !remote_direct.is_empty() {
-        *introducers = remote_direct;
-        return;
-    }
-
     let remote_iroh = introducers
         .iter()
-        .filter(|endpoint| {
+        .find(|endpoint| {
             is_remote_usable_invite_endpoint(endpoint)
                 && matches!(endpoint.transport, ClusterTransportKind::Iroh)
         })
-        .take(1)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !remote_iroh.is_empty() {
-        *introducers = remote_iroh;
+        .cloned();
+    if !remote_direct.is_empty() {
+        *introducers = remote_direct;
+        if let Some(iroh) = remote_iroh {
+            push_unique_introducer(introducers, iroh);
+        }
+        return;
+    }
+
+    if let Some(iroh) = remote_iroh {
+        *introducers = vec![iroh];
         return;
     }
 
@@ -1540,7 +1541,6 @@ fn parse_invite_query(payload: &str) -> Result<Vec<(String, String)>, CliError> 
 
 fn encode_invite_channel(channel: &ClusterInvitationChannel) -> Result<String, CliError> {
     Ok(join_invite_parts(&[
-        channel.endpoint.node_id.as_str().to_string(),
         query_enum(&channel.endpoint.transport)?,
         channel.endpoint.address.clone(),
         channel.node_public_key.clone(),
@@ -1549,6 +1549,21 @@ fn encode_invite_channel(channel: &ClusterInvitationChannel) -> Result<String, C
 
 fn decode_invite_channel(value: &str) -> Result<ClusterInvitationChannel, CliError> {
     let parts = split_invite_parts(value)?;
+    if parts.len() == 3 {
+        return Ok(ClusterInvitationChannel {
+            endpoint: ClusterEndpointRecord {
+                endpoint_id: ClusterEndpointId::generate(),
+                node_id: NodeId::new("node_invite_channel").expect("static invite channel node id"),
+                transport: parse_query_enum(&parts[0])?,
+                address: parts[1].clone(),
+                source: ClusterEndpointSource::Static,
+                privacy: ClusterEndpointPrivacy::InternetDirect,
+                priority: 0,
+                last_observed_latency_ms: None,
+            },
+            node_public_key: parts[2].clone(),
+        });
+    }
     if parts.len() == 4 {
         let node_id = NodeId::new(&parts[0]).map_err(|source| CliError::Parse {
             detail: format!("invalid invite channel node_id `{}`: {source}", parts[0]),
@@ -1570,7 +1585,7 @@ fn decode_invite_channel(value: &str) -> Result<ClusterInvitationChannel, CliErr
     if parts.len() != 9 {
         return Err(CliError::Parse {
             detail: format!(
-                "cluster invite channel expected 4 fields, found {}",
+                "cluster invite channel expected 3 fields, found {}",
                 parts.len()
             ),
         });
