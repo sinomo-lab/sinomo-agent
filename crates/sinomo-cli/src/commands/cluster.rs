@@ -8,6 +8,7 @@ pub(crate) enum ClusterCliCommand {
     Join(ClusterJoinOptions),
     Status,
     Health,
+    Doctor,
     Peers,
     Leave,
 }
@@ -72,6 +73,9 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         Some((command, [])) if command == "status" => Ok(ClusterCliCommand::Status),
         Some((command, [])) if matches!(command.as_str(), "health" | "nodes") => {
             Ok(ClusterCliCommand::Health)
+        }
+        Some((command, [])) if matches!(command.as_str(), "doctor" | "diagnose") => {
+            Ok(ClusterCliCommand::Doctor)
         }
         Some((command, [])) if command == "peers" => Ok(ClusterCliCommand::Peers),
         Some((command, [])) if command == "leave" => Ok(ClusterCliCommand::Leave),
@@ -246,6 +250,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Status => cluster_status(),
         ClusterCliCommand::Health => cluster_health(),
+        ClusterCliCommand::Doctor => cluster_doctor(),
         ClusterCliCommand::Peers => cluster_peers(),
         ClusterCliCommand::Leave => cluster_leave(),
     }
@@ -1419,6 +1424,129 @@ pub(crate) fn format_rollout_status(status: &ClusterNodeRolloutStatus) -> String
         Some(mode) if !mode.is_empty() => format!("{} ({mode})", status.status),
         _ => status.status.clone(),
     }
+}
+
+pub(crate) fn cluster_doctor() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
+    let state = read_cluster_state(&paths)?;
+    let rows = cluster_health_rows(&paths, &state)?;
+    let graph = network::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
+    let findings = cluster_doctor_findings(&state, &graph, &rows);
+    println!(
+        "cluster doctor: {}",
+        if findings.is_empty() {
+            "ok"
+        } else {
+            "warnings"
+        }
+    );
+    println!("cluster: {}", state.cluster_id);
+    println!("local node: {}", state.local_node_id);
+    if findings.is_empty() {
+        println!("no findings");
+    } else {
+        println!("severity\tcode\tdetail");
+        for finding in findings {
+            println!("{}\t{}\t{}", finding.severity, finding.code, finding.detail);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterDoctorFinding {
+    pub(crate) severity: String,
+    pub(crate) code: String,
+    pub(crate) detail: String,
+}
+
+impl ClusterDoctorFinding {
+    fn warning(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            severity: "warning".to_string(),
+            code: code.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+pub(crate) fn cluster_doctor_findings(
+    state: &ClusterBootstrapState,
+    connectivity: &[network::ClusterConnectivityRecord],
+    health: &[ClusterHealthRow],
+) -> Vec<ClusterDoctorFinding> {
+    let mut findings = Vec::new();
+    for row in health {
+        if row.availability == ClusterNodeAvailability::Offline {
+            findings.push(ClusterDoctorFinding::warning(
+                "node-offline",
+                format!(
+                    "{} is offline from {} using advertised endpoints",
+                    row.member.node_id, state.local_node_id
+                ),
+            ));
+        } else if row.availability == ClusterNodeAvailability::Unknown {
+            findings.push(ClusterDoctorFinding::warning(
+                "node-unknown",
+                format!("{} has no recent reachable status", row.member.node_id),
+            ));
+        }
+    }
+
+    for record in connectivity {
+        if record.state == network::ClusterConnectivityState::Unreachable {
+            findings.push(ClusterDoctorFinding::warning(
+                "endpoint-unreachable",
+                format!(
+                    "{} cannot reach {} at {} via {:?} ({} consecutive failures)",
+                    record.source_node_id,
+                    record.target_node_id,
+                    record.address,
+                    record.transport,
+                    record.consecutive_failures
+                ),
+            ));
+        }
+    }
+
+    for member in &state.members {
+        let mut by_public_key: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for endpoint in &member.endpoints {
+            if let Some(public_key) = network::iroh_endpoint_public_key(endpoint) {
+                *by_public_key.entry(public_key).or_default() += 1;
+            }
+        }
+        for (public_key, count) in by_public_key {
+            if count > 1 {
+                findings.push(ClusterDoctorFinding::warning(
+                    "duplicate-iroh-endpoint",
+                    format!(
+                        "{} has {count} Iroh endpoint records for public key {public_key}",
+                        member.node_id
+                    ),
+                ));
+            }
+        }
+    }
+
+    let route_targets = advertised_peer_route_targets(state);
+    if !route_targets.is_empty() {
+        let route_ips = discover_peer_route_ip_candidates(state);
+        if route_ips.is_empty() {
+            findings.push(ClusterDoctorFinding::warning(
+                "peer-route-unadvertised",
+                format!(
+                    "{} peer route target(s) exist, but no routable local source address could be discovered",
+                    route_targets.len()
+                ),
+            ));
+        }
+    }
+
+    findings.sort_by(|left, right| (&left.code, &left.detail).cmp(&(&right.code, &right.detail)));
+    findings
 }
 
 pub(crate) fn cluster_peers() -> Result<(), CliError> {
@@ -3111,7 +3239,14 @@ pub(crate) fn ensure_main_daemon_cluster_member(
         state,
         member,
         capabilities,
-        daemon_advertised_endpoints(&local_node_id, options, 0),
+        daemon_advertised_endpoints_for_state(
+            state,
+            &local_node_id,
+            options,
+            0,
+            &discover_lan_ip_candidates(),
+            &discover_peer_route_ip_candidates(state),
+        ),
         timestamp,
     );
 }
@@ -3158,7 +3293,14 @@ pub(crate) fn ensure_shadow_daemon_cluster_member(
         state,
         member,
         shadow_daemon_capabilities(),
-        daemon_advertised_endpoints(&shadow_node_id, options, 10),
+        daemon_advertised_endpoints_for_state(
+            state,
+            &shadow_node_id,
+            options,
+            10,
+            &discover_lan_ip_candidates(),
+            &discover_peer_route_ip_candidates(state),
+        ),
         timestamp,
     );
 }
@@ -3209,21 +3351,39 @@ pub(crate) fn upsert_daemon_member(
     }
 }
 
-pub(crate) fn daemon_advertised_endpoints(
+pub(crate) fn daemon_advertised_endpoints_for_state(
+    _state: &ClusterBootstrapState,
     node_id: &NodeId,
     options: &DaemonRunOptions,
     priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+) -> Vec<ClusterEndpointRecord> {
+    daemon_advertised_endpoints_from_ips(node_id, options, priority, lan_ips, route_ips)
+}
+
+pub(crate) fn daemon_advertised_endpoints_from_ips(
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = vec![daemon_loopback_endpoint(node_id, options, priority)];
     let mut lan_addresses = Vec::new();
     if matches!(options.host.as_str(), "0.0.0.0" | "::") {
-        for ip in discover_lan_ip_candidates() {
-            lan_addresses.push(format_ip_port(ip, options.port));
+        for ip in lan_ips.iter().chain(route_ips.iter()).copied() {
+            if is_invitable_ip(ip) {
+                push_unique_address(&mut lan_addresses, format_ip_port(ip, options.port));
+            }
         }
     } else if options.host.parse::<IpAddr>().is_ok_and(is_invitable_ip)
         || !is_loopback_connect_address(&daemon_connect_address(&options.host, options.port))
     {
-        lan_addresses.push(format!("{}:{}", options.host, options.port));
+        push_unique_address(
+            &mut lan_addresses,
+            format!("{}:{}", options.host, options.port),
+        );
     }
 
     for address in lan_addresses {
@@ -3234,6 +3394,65 @@ pub(crate) fn daemon_advertised_endpoints(
         ));
     }
     endpoints
+}
+
+pub(crate) fn push_unique_address(addresses: &mut Vec<String>, address: String) {
+    if !addresses.iter().any(|candidate| candidate == &address) {
+        addresses.push(address);
+    }
+}
+
+pub(crate) fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Vec<SocketAddr> {
+    let mut targets = Vec::new();
+    for member in &state.members {
+        if member.node_id == state.local_node_id || !member.state.is_authorized() {
+            continue;
+        }
+        for endpoint in &member.endpoints {
+            if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly {
+                continue;
+            }
+            if !matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+            ) {
+                continue;
+            }
+            let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
+                continue;
+            };
+            if is_invitable_ip(address.ip()) && !targets.contains(&address) {
+                targets.push(address);
+            }
+        }
+    }
+    targets.sort();
+    targets
+}
+
+pub(crate) fn discover_peer_route_ip_candidates(state: &ClusterBootstrapState) -> Vec<IpAddr> {
+    let mut candidates = Vec::new();
+    for target in advertised_peer_route_targets(state) {
+        let bind = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let Ok(socket) = UdpSocket::bind(bind) else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+        let Ok(address) = socket.local_addr() else {
+            continue;
+        };
+        let ip = address.ip();
+        if is_invitable_ip(ip) && !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    candidates
 }
 
 pub(crate) fn daemon_loopback_endpoint(

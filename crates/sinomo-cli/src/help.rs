@@ -70,6 +70,10 @@ pub(super) fn print_cluster_help() {
     println!(
         "      Report node online/offline state, daemon version, platform, and rollout status."
     );
+    println!("  sinomo cluster doctor");
+    println!(
+        "      Diagnose endpoint advertisement, reachability records, stale status, and duplicated roaming endpoints."
+    );
     println!("  sinomo cluster peers");
     println!("      List known peers. Fails while the node is orphaned.");
     println!("  sinomo cluster leave");

@@ -1313,13 +1313,25 @@ pub fn upsert_member_endpoint(
     member: &mut ClusterMemberRecord,
     endpoint: ClusterEndpointRecord,
 ) -> bool {
+    let incoming_iroh_public_key = iroh_endpoint_public_key(&endpoint);
+    let mut changed = false;
+    if let Some(public_key) = incoming_iroh_public_key.as_deref() {
+        let endpoint_id = endpoint.endpoint_id.clone();
+        let before = member.endpoints.len();
+        member.endpoints.retain(|candidate| {
+            candidate.endpoint_id == endpoint_id
+                || iroh_endpoint_public_key(candidate).as_deref() != Some(public_key)
+        });
+        changed |= member.endpoints.len() != before;
+    }
+
     if let Some(existing) = member
         .endpoints
         .iter_mut()
         .find(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
     {
         if *existing == endpoint {
-            false
+            changed
         } else {
             *existing = endpoint;
             true
@@ -1327,10 +1339,23 @@ pub fn upsert_member_endpoint(
     } else if member.endpoints.iter().any(|candidate| {
         candidate.transport == endpoint.transport && candidate.address == endpoint.address
     }) {
-        false
+        changed
     } else {
         member.endpoints.push(endpoint);
         true
+    }
+}
+
+pub fn iroh_endpoint_public_key(endpoint: &ClusterEndpointRecord) -> Option<String> {
+    if endpoint.transport != ClusterTransportKind::Iroh {
+        return None;
+    }
+    let rest = endpoint.address.strip_prefix("iroh://")?;
+    let public_key = rest.split(['?', '#']).next()?.trim();
+    if public_key.is_empty() {
+        None
+    } else {
+        Some(public_key.to_string())
     }
 }
 

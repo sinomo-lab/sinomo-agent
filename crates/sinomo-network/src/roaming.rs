@@ -215,7 +215,7 @@ impl IrohEndpointRecord {
         };
 
         ClusterEndpointRecord {
-            endpoint_id: sinomo_core::ClusterEndpointId::generate(),
+            endpoint_id: stable_iroh_endpoint_id(&self.node_id, &self.endpoint_public_key),
             node_id: self.node_id.clone(),
             transport: ClusterTransportKind::Iroh,
             address,
@@ -229,6 +229,21 @@ impl IrohEndpointRecord {
             last_observed_latency_ms: None,
         }
     }
+}
+
+pub fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in node_id
+        .as_str()
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0))
+        .chain(endpoint_public_key.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    ClusterEndpointId::new(format!("endpoint_iroh_{hash:016x}")).expect("stable iroh endpoint id")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

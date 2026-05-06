@@ -7,23 +7,24 @@ use super::{
     InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
     InteractionSurfaceKind, ModelBackedInteractionHandler, ModelsCliCommand, ProviderCliCommand,
     ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
-    UninstallOptions, authenticate_daemon_command,
+    UninstallOptions, advertised_peer_route_targets, authenticate_daemon_command,
     build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_sync_targets, daemon_lan_endpoint, daemon_package_version,
-    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
-    encode_cluster_join_invite, ensure_rollout_layout, handle_daemon_cluster_join,
-    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
-    handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
-    handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
-    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    main_daemon_capabilities, models_default_with_data_dir, normalize_model_provider,
-    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    cluster_doctor_findings, cluster_has_local_quorum, cluster_init_with_paths,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
+    cluster_raft_known_leader_id, cluster_sync_targets, daemon_advertised_endpoints_for_state,
+    daemon_lan_endpoint, daemon_package_version, daemon_status_matches_options,
+    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
+    ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
+    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn,
+    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
+    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
+    handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
+    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, is_terminal_status, main_daemon_capabilities,
+    models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_models_list_options, parse_propose_options, parse_provider_command,
     parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
     read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
@@ -36,10 +37,10 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
 use sinomo_runtime::core::{
-    CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
-    ClusterId, ClusterInviteId, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
-    ClusterMemberState, ClusterNodeAvailability, ClusterTransportKind, EvolutionJobId, NodeId,
-    SessionId, TrustDomain, TrustRing,
+    CapabilityName, ClusterBootstrapState, ClusterEndpointId, ClusterEndpointPrivacy,
+    ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterInviteId, ClusterJoinInvite,
+    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
+    ClusterTransportKind, EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
 };
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
 use sinomo_runtime::kv::{KvCompare, KvOp, KvRevision, KvTxn};
@@ -143,6 +144,10 @@ fn top_level_cli_parser_routes_subcommands() {
     assert!(matches!(
         parse_cli_command(&["cluster".to_string(), "health".to_string()]).expect("cluster health"),
         CliCommand::Cluster(ClusterCliCommand::Health)
+    ));
+    assert!(matches!(
+        parse_cli_command(&["cluster".to_string(), "doctor".to_string()]).expect("cluster doctor"),
+        CliCommand::Cluster(ClusterCliCommand::Doctor)
     ));
     assert!(matches!(
         parse_cli_command(&["install".to_string(), "help".to_string()]).expect("install help"),
@@ -267,6 +272,110 @@ fn cluster_sync_targets_skip_remote_local_only_endpoints() {
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].address, "192.168.1.10:21353");
+}
+
+#[test]
+fn daemon_advertised_endpoints_use_route_addresses_for_known_peers() {
+    let cluster_id = ClusterId::new("cluster_route_advertise").expect("cluster");
+    let local_node = NodeId::new("node_route_local").expect("node");
+    let remote_node = NodeId::new("node_route_remote").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "route advertise",
+        local_node.clone(),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node.clone(),
+        "remote",
+        "remote-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    remote.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints = vec![daemon_lan_endpoint(
+        &remote_node,
+        "10.14.1.11:21353".to_string(),
+        20,
+    )];
+    state.members.push(remote);
+
+    let route_targets = advertised_peer_route_targets(&state);
+    assert_eq!(route_targets.len(), 1);
+    assert_eq!(route_targets[0].to_string(), "10.14.1.11:21353");
+
+    let endpoints = daemon_advertised_endpoints_for_state(
+        &state,
+        &local_node,
+        &DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 21353,
+        },
+        0,
+        &["192.168.1.154".parse().expect("lan ip")],
+        &["10.14.5.15".parse().expect("wireguard ip")],
+    );
+
+    assert!(
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "192.168.1.154:21353")
+    );
+    assert!(
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "10.14.5.15:21353")
+    );
+}
+
+#[test]
+fn cluster_doctor_reports_duplicate_iroh_endpoint_public_keys() {
+    let cluster_id = ClusterId::new("cluster_doctor_iroh").expect("cluster");
+    let local_node = NodeId::new("node_doctor_local").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "doctor",
+        local_node.clone(),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    let member = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == local_node)
+        .expect("local member");
+    member.endpoints.push(ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::new("endpoint_iroh_old").expect("endpoint"),
+        node_id: local_node.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://same_public_key?direct=203.0.113.10:21353".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 40,
+        last_observed_latency_ms: None,
+    });
+    member.endpoints.push(ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::new("endpoint_iroh_new").expect("endpoint"),
+        node_id: local_node.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://same_public_key?direct=203.0.113.11:21353".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 40,
+        last_observed_latency_ms: None,
+    });
+
+    let findings = cluster_doctor_findings(&state, &[], &[]);
+
+    assert!(findings.iter().any(|finding| {
+        finding.code == "duplicate-iroh-endpoint"
+            && finding.detail.contains("same_public_key")
+            && finding.detail.contains("node_doctor_local")
+    }));
 }
 
 #[test]
