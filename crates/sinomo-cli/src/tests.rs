@@ -30,7 +30,7 @@ use super::{
     parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
     parse_install_options, parse_model_default_options, parse_models_list_options,
     parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
+    parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
     run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
@@ -323,7 +323,7 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
             priority: 1,
             last_observed_latency_ms: None,
         },
-        daemon_lan_endpoint(&voter_node, "10.14.1.11:21353".to_string(), 20),
+        daemon_lan_endpoint(&voter_node, "192.0.2.11:21353".to_string(), 20),
     ];
     state.members.push(voter);
 
@@ -331,7 +331,7 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].transport, ClusterTransportKind::LanTcp);
-    assert_eq!(targets[0].address, "10.14.1.11:21353");
+    assert_eq!(targets[0].address, "192.0.2.11:21353");
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -339,9 +339,9 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
 fn default_invite_compaction_keeps_iroh_fallback() {
     let node_id = NodeId::new("node_invite_compact").expect("node");
     let mut endpoints = vec![
-        daemon_lan_endpoint(&node_id, "10.14.1.11:21353".to_string(), 0),
-        daemon_lan_endpoint(&node_id, "10.14.1.12:21353".to_string(), 1),
-        daemon_lan_endpoint(&node_id, "10.14.1.13:21353".to_string(), 2),
+        daemon_lan_endpoint(&node_id, "192.0.2.11:21353".to_string(), 0),
+        daemon_lan_endpoint(&node_id, "192.0.2.12:21353".to_string(), 1),
+        daemon_lan_endpoint(&node_id, "192.0.2.13:21353".to_string(), 2),
         ClusterEndpointRecord {
             endpoint_id: ClusterEndpointId::new("endpoint_invite_compact_iroh").expect("endpoint"),
             node_id,
@@ -357,9 +357,41 @@ fn default_invite_compaction_keeps_iroh_fallback() {
     compact_default_invite_introducers(&mut endpoints);
 
     assert_eq!(endpoints.len(), 3);
-    assert_eq!(endpoints[0].address, "10.14.1.11:21353");
-    assert_eq!(endpoints[1].address, "10.14.1.12:21353");
+    assert_eq!(endpoints[0].address, "192.0.2.11:21353");
+    assert_eq!(endpoints[1].address, "192.0.2.12:21353");
     assert_eq!(endpoints[2].transport, ClusterTransportKind::Iroh);
+}
+
+#[test]
+fn invite_introducers_keep_fresh_iroh_endpoint_for_same_key() {
+    let node_id = NodeId::new("node_invite_iroh_fresh").expect("node");
+    let fresh = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::new("endpoint_invite_iroh_fresh").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://same_key?direct=192.0.2.11:32001&relay=https://relay.example/".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let stale = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::new("endpoint_invite_iroh_stale").expect("endpoint"),
+        node_id,
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://same_key?direct=192.0.2.11:32002&relay=https://relay.example/".to_string(),
+        source: ClusterEndpointSource::KvMembership,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let mut endpoints = Vec::new();
+
+    push_unique_introducer(&mut endpoints, fresh);
+    push_unique_introducer(&mut endpoints, stale);
+
+    assert_eq!(endpoints.len(), 1);
+    assert!(endpoints[0].address.contains("32001"));
 }
 
 #[test]
@@ -527,7 +559,7 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
         endpoint_id: ClusterEndpointId::new("endpoint_cleanup_current").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::LanTcp,
-        address: "10.14.1.11:21353".to_string(),
+        address: "192.0.2.11:21353".to_string(),
         source: ClusterEndpointSource::Static,
         privacy: ClusterEndpointPrivacy::Lan,
         priority: 20,
@@ -655,7 +687,7 @@ fn cluster_network_expiration_keeps_local_owned_records() {
             cluster_id: cluster_id.clone(),
             node_id: node_id.clone(),
             environment_id: "env_local".to_string(),
-            observed_addresses: vec!["10.14.1.11:21353".to_string()],
+            observed_addresses: vec!["192.0.2.11:21353".to_string()],
             endpoints: Vec::new(),
             observed_at: expired,
             expires_at: expired,
@@ -674,7 +706,7 @@ fn cluster_network_expiration_keeps_local_owned_records() {
         target_node_id: remote_node_id.clone(),
         endpoint_id: ClusterEndpointId::new("endpoint_remote").expect("endpoint"),
         transport: ClusterTransportKind::LanTcp,
-        address: "10.14.1.12:21353".to_string(),
+        address: "192.0.2.12:21353".to_string(),
         state: sinomo_runtime::network::ClusterConnectivityState::Unreachable,
         latency_ms: None,
         consecutive_failures: 3,
@@ -733,7 +765,7 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
         target_node_id,
         endpoint_id: ClusterEndpointId::new("endpoint_stable_connectivity").expect("endpoint"),
         transport: ClusterTransportKind::LanTcp,
-        address: "10.14.1.12:21353".to_string(),
+        address: "192.0.2.12:21353".to_string(),
         state: sinomo_runtime::network::ClusterConnectivityState::Healthy,
         latency_ms: Some(12),
         consecutive_failures: 0,
@@ -793,14 +825,14 @@ fn daemon_advertised_endpoints_use_route_addresses_for_known_peers() {
     remote.allowed_capabilities = remote.capabilities.clone();
     remote.endpoints = vec![daemon_lan_endpoint(
         &remote_node,
-        "10.14.1.11:21353".to_string(),
+        "192.0.2.11:21353".to_string(),
         20,
     )];
     state.members.push(remote);
 
     let route_targets = advertised_peer_route_targets(&state);
     assert_eq!(route_targets.len(), 1);
-    assert_eq!(route_targets[0].to_string(), "10.14.1.11:21353");
+    assert_eq!(route_targets[0].to_string(), "192.0.2.11:21353");
 
     let endpoints = daemon_advertised_endpoints_for_state(
         &state,
@@ -810,19 +842,19 @@ fn daemon_advertised_endpoints_use_route_addresses_for_known_peers() {
             port: 21353,
         },
         0,
-        &["192.168.1.154".parse().expect("lan ip")],
-        &["10.14.5.15".parse().expect("wireguard ip")],
+        &["198.51.100.154".parse().expect("lan ip")],
+        &["203.0.113.15".parse().expect("wireguard ip")],
     );
 
     assert!(
         endpoints
             .iter()
-            .any(|endpoint| endpoint.address == "192.168.1.154:21353")
+            .any(|endpoint| endpoint.address == "198.51.100.154:21353")
     );
     assert!(
         endpoints
             .iter()
-            .any(|endpoint| endpoint.address == "10.14.5.15:21353")
+            .any(|endpoint| endpoint.address == "203.0.113.15:21353")
     );
 }
 
@@ -1806,11 +1838,11 @@ fn explicit_invite_introducer_uses_known_member_endpoint_identity() {
     );
     remote.endpoints.push(invite_introducer_endpoint(
         &remote_node,
-        "10.14.1.11:21353".to_string(),
+        "192.0.2.11:21353".to_string(),
     ));
     state.members.push(remote);
 
-    let endpoint = invite_introducer_endpoint_from_state(&state, "10.14.1.11:21353".to_string());
+    let endpoint = invite_introducer_endpoint_from_state(&state, "192.0.2.11:21353".to_string());
     let channels = invite_communication_channels(&state, &[endpoint]);
 
     assert_eq!(channels.len(), 1);
@@ -2841,14 +2873,14 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
             "--remote-repo".to_string(),
             "/srv/sinomo-agent".to_string(),
             "--target".to_string(),
-            "10.14.1.11:21353".to_string(),
+            "192.0.2.11:21353".to_string(),
             "--skip-local".to_string(),
         ])
         .expect("remote-build cluster"),
         RolloutCliCommand::Cluster(RolloutOptions {
             remote_build: true,
             remote_repo: Some(std::path::PathBuf::from("/srv/sinomo-agent")),
-            targets: vec!["10.14.1.11:21353".to_string()],
+            targets: vec!["192.0.2.11:21353".to_string()],
             skip_local: true,
             ..RolloutOptions::default()
         })
@@ -2857,11 +2889,11 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         parse_rollout_command(&[
             "diagnostics".to_string(),
             "--target".to_string(),
-            "10.14.1.11:21353".to_string(),
+            "192.0.2.11:21353".to_string(),
         ])
         .expect("diagnostics"),
         RolloutCliCommand::Diagnostics(RolloutOptions {
-            targets: vec!["10.14.1.11:21353".to_string()],
+            targets: vec!["192.0.2.11:21353".to_string()],
             ..RolloutOptions::default()
         })
     );
