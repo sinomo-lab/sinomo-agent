@@ -242,7 +242,8 @@ pub(crate) fn rollout_diagnostics(options: RolloutOptions) -> Result<(), CliErro
     };
     for target in targets {
         println!("== {target} ==");
-        match send_daemon_command(&target, "ROLLOUT_DIAGNOSTICS", CLUSTER_HEALTH_PROBE_TIMEOUT) {
+        let signed = sign_daemon_command_for_local_node("ROLLOUT_DIAGNOSTICS")?;
+        match network::send_daemon_command_raw(&target, &signed, CLUSTER_HEALTH_PROBE_TIMEOUT) {
             Ok(response) => print!("{response}"),
             Err(error) => println!("failed: {error}"),
         }
@@ -631,7 +632,8 @@ pub(crate) fn unique_rollout_targets(targets: Vec<String>) -> Vec<String> {
 }
 
 pub(crate) fn read_rollout_target_status(address: &str) -> Result<DaemonStatus, CliError> {
-    let response = send_daemon_command(address, "STATUS", DAEMON_JOIN_TIMEOUT)?;
+    let signed = sign_daemon_command_for_local_node("STATUS")?;
+    let response = network::send_daemon_command_raw(address, &signed, DAEMON_JOIN_TIMEOUT)?;
     serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
         path: format!("daemon status from {address}"),
         detail: source.to_string(),
@@ -678,38 +680,20 @@ pub(crate) fn send_daemon_rollout_binary(
     address: &str,
     request: &ClusterRolloutBinaryRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
-        path: "cluster rollout request".to_string(),
-        detail: source.to_string(),
-    })?;
-    let response = send_daemon_command(
-        address,
-        &format!("ROLLOUT_BINARY {payload}"),
-        DAEMON_ROLLOUT_TIMEOUT,
-    )?;
-    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("rollout response from {address}"),
-        detail: source.to_string(),
-    })
+    let payload = network::encode_object_text_payload(request)?;
+    let signed = sign_daemon_command_for_local_node(&format!("ROLLOUT_BINARY {payload}"))?;
+    let response = network::send_daemon_command_raw(address, &signed, DAEMON_ROLLOUT_TIMEOUT)?;
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
 pub(crate) fn send_daemon_rollout_build(
     address: &str,
     request: &ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
-        path: "cluster rollout build request".to_string(),
-        detail: source.to_string(),
-    })?;
-    let response = send_daemon_command(
-        address,
-        &format!("ROLLOUT_BUILD {payload}"),
-        DAEMON_ROLLOUT_TIMEOUT,
-    )?;
-    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("rollout response from {address}"),
-        detail: source.to_string(),
-    })
+    let payload = network::encode_object_text_payload(request)?;
+    let signed = sign_daemon_command_for_local_node(&format!("ROLLOUT_BUILD {payload}"))?;
+    let response = network::send_daemon_command_raw(address, &signed, DAEMON_ROLLOUT_TIMEOUT)?;
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
 pub(crate) fn ensure_source_repo(

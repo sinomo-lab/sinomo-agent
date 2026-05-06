@@ -142,10 +142,7 @@ pub fn create_cluster_invite_challenge_proof(
     payload: &str,
 ) -> Result<ClusterInviteChallengeProof, DaemonError> {
     let request: ClusterInviteChallengeRequest =
-        serde_json::from_str(payload).map_err(|source| DaemonError::Json {
-            path: "cluster invite challenge request".to_string(),
-            detail: source.to_string(),
-        })?;
+        sinomo_network::decode_object_text_payload(payload)?;
     if request.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL || request.challenge.trim().is_empty()
     {
         return Err(DaemonError::AuthDenied);
@@ -406,11 +403,8 @@ fn authorize_cluster_join_signer(
         .strip_prefix("CLUSTER_JOIN ")
         .unwrap_or_default()
         .trim();
-    let request: sinomo_network::ClusterJoinRegistrationRequest = serde_json::from_str(payload)
-        .map_err(|source| DaemonError::Json {
-            path: "cluster join registration".to_string(),
-            detail: source.to_string(),
-        })?;
+    let request: sinomo_network::ClusterJoinRegistrationRequest =
+        sinomo_network::decode_object_text_payload(payload)?;
     let requested_member = request
         .members
         .iter()

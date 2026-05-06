@@ -27,10 +27,7 @@ where
             Ok(proof) => proof,
             Err(_error) => return Ok(false),
         };
-        let body = serde_json::to_string(&proof).map_err(|source| DaemonError::Json {
-            path: "cluster invite challenge proof".to_string(),
-            detail: source.to_string(),
-        })?;
+        let body = sinomo_network::encode_object_text_payload(&proof).map_err(DaemonError::from)?;
         stream
             .write_all(format!("INVITE_PROOF {body}\n").as_bytes())
             .map_err(|source| DaemonError::Network {

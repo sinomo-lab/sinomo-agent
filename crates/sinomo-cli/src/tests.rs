@@ -820,7 +820,8 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
         invite: rendered.invite.clone(),
         members: vec![joined_member],
     };
-    let payload = serde_json::to_string(&request).expect("join request");
+    let payload =
+        sinomo_runtime::network::encode_object_text_payload(&request).expect("join request");
     let signed =
         sign_daemon_command_from_data_dir(&join_data_dir, &format!("CLUSTER_JOIN {payload}"))
             .expect("signed join");
@@ -833,7 +834,8 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
 
     let mut tampered = request;
     tampered.invite.token_id.push_str("_tampered");
-    let tampered_payload = serde_json::to_string(&tampered).expect("tampered join request");
+    let tampered_payload = sinomo_runtime::network::encode_object_text_payload(&tampered)
+        .expect("tampered join request");
     let tampered_signed = sign_daemon_command_from_data_dir(
         &join_data_dir,
         &format!("CLUSTER_JOIN {tampered_payload}"),
@@ -1167,7 +1169,8 @@ fn introducer_records_joined_members_and_returns_peer_view() {
         invite,
         members: remote_state.members,
     };
-    let payload = serde_json::to_string(&request).expect("request");
+    let payload =
+        sinomo_runtime::network::encode_object_text_payload(&request).expect("request object");
     let response =
         handle_daemon_cluster_join(&DaemonPaths::with_root(host_root.join("daemon")), &payload)
             .expect("introducer join");
@@ -1331,7 +1334,8 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
     let append_request = build_cluster_raft_append_request(&paths, &state).expect("append request");
     let append_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(root.join("daemon")),
-        &serde_json::to_string(&append_request).expect("append request json"),
+        &sinomo_runtime::network::encode_object_text_payload(&append_request)
+            .expect("append request object"),
         &bad_auth,
     )
     .expect("append response");
@@ -1350,7 +1354,8 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
     };
     let vote_response = handle_daemon_cluster_raft_vote(
         &DaemonPaths::with_root(root.join("daemon")),
-        &serde_json::to_string(&vote_request).expect("vote request json"),
+        &sinomo_runtime::network::encode_object_text_payload(&vote_request)
+            .expect("vote request object"),
         &bad_auth,
     )
     .expect("vote response");
@@ -1580,7 +1585,8 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let request = build_cluster_raft_append_request(&host_paths, &host_state).expect("raft append");
     let peer_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
-        &serde_json::to_string(&request).expect("raft append request"),
+        &sinomo_runtime::network::encode_object_text_payload(&request)
+            .expect("raft append request"),
         &host_auth,
     )
     .expect("peer append");
@@ -1611,7 +1617,8 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         build_cluster_raft_append_request(&host_paths, &host_state).expect("current raft append");
     let current_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
-        &serde_json::to_string(&current_request).expect("current append request"),
+        &sinomo_runtime::network::encode_object_text_payload(&current_request)
+            .expect("current append request"),
         &host_auth,
     )
     .expect("peer current append");
@@ -1626,7 +1633,8 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
 
     let delayed_stale_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
-        &serde_json::to_string(&request).expect("stale append request"),
+        &sinomo_runtime::network::encode_object_text_payload(&request)
+            .expect("stale append request"),
         &host_auth,
     )
     .expect("peer stale append");
@@ -1667,7 +1675,8 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     assert!(
         handle_daemon_cluster_raft_append(
             &DaemonPaths::with_root(peer_root.join("daemon")),
-            &serde_json::to_string(&watch_append).expect("watch append request"),
+            &sinomo_runtime::network::encode_object_text_payload(&watch_append)
+                .expect("watch append request"),
             &host_auth,
         )
         .expect("peer watch append")
@@ -1678,11 +1687,13 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         .events;
     let watch_fanout = handle_daemon_cluster_kv_watch_events(
         &DaemonPaths::with_root(peer_root.join("daemon")),
-        &serde_json::to_string(&sinomo_runtime::network::ClusterKvWatchEventsRequest {
-            state: host_state.clone(),
-            leader_id: host_state.local_node_id.clone(),
-            events: host_events,
-        })
+        &sinomo_runtime::network::encode_object_text_payload(
+            &sinomo_runtime::network::ClusterKvWatchEventsRequest {
+                state: host_state.clone(),
+                leader_id: host_state.local_node_id.clone(),
+                events: host_events,
+            },
+        )
         .expect("watch events request"),
     )
     .expect("watch event fanout");
@@ -1844,7 +1855,8 @@ fn daemon_rollout_build_rejects_missing_remote_repo() {
         shadow_port: 21_354,
         requested_at: "now".to_string(),
     };
-    let payload = serde_json::to_string(&request).expect("request json");
+    let payload =
+        sinomo_runtime::network::encode_object_text_payload(&request).expect("request object");
     let response =
         handle_daemon_rollout_build(&DaemonPaths::with_root(root.join("daemon")), &payload)
             .expect("build response");

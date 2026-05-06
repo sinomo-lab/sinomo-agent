@@ -447,17 +447,21 @@ fn protocol_and_stream_metadata_use_sinomo_object_payloads() {
         payload
     );
 
-    let open = NetworkStreamOpen::encode_metadata(
-        NetworkStreamId(42),
-        "fixture.stream.v1",
-        &payload,
-    )
-    .expect("metadata");
+    let open =
+        NetworkStreamOpen::encode_metadata(NetworkStreamId(42), "fixture.stream.v1", &payload)
+            .expect("metadata");
     assert_eq!(open.stream_id, NetworkStreamId(42));
     assert_eq!(&open.metadata[..4], sinomo_object::MAGIC);
     assert_eq!(
         open.decode_metadata::<FixtureProtocolPayload>()
             .expect("decode metadata"),
+        payload
+    );
+
+    let text = encode_object_text_payload(&payload).expect("text payload");
+    assert!(!text.contains(char::is_whitespace));
+    assert_eq!(
+        decode_object_text_payload::<FixtureProtocolPayload>(&text).expect("decode text"),
         payload
     );
 }

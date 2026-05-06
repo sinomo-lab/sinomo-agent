@@ -228,8 +228,8 @@ impl MdnsDiscoverySocket {
         loop {
             match self.socket.recv_from(&mut buffer) {
                 Ok((received, _source)) => {
-                let advertisement: MdnsDiscoveryAdvertisement =
-                    SinomoObjectCodec::default().decode(&buffer[..received])?;
+                    let advertisement: MdnsDiscoveryAdvertisement =
+                        SinomoObjectCodec::default().decode(&buffer[..received])?;
                     if advertisement.protocol == SINOMO_LAN_DISCOVERY_PROTOCOL {
                         advertisements.push(advertisement);
                     }

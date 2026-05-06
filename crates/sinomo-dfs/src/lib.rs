@@ -2875,7 +2875,6 @@ impl DfsError {
             message: error.to_string(),
         }
     }
-
 }
 
 impl From<ContentStoreError> for DfsError {

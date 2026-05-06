@@ -1037,11 +1037,7 @@ pub(crate) fn handle_daemon_connection(
                     .unwrap_or_default()
                     .trim();
                 let response = handle_daemon_cluster_join(paths, payload)?;
-                let body =
-                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                        path: "cluster join response".to_string(),
-                        detail: source.to_string(),
-                    })?;
+                let body = network::encode_object_text_payload(&response)?;
                 stream
                     .write_all(body.as_bytes())
                     .map_err(|source| CliError::Network {
@@ -1147,11 +1143,7 @@ pub(crate) fn handle_daemon_connection(
                     .unwrap_or_default()
                     .trim();
                 let response = handle_daemon_cluster_raft_append(paths, payload, &authenticated)?;
-                let body =
-                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                        path: "cluster raft append response".to_string(),
-                        detail: source.to_string(),
-                    })?;
+                let body = network::encode_object_text_payload(&response)?;
                 stream
                     .write_all(body.as_bytes())
                     .map_err(|source| CliError::Network {
@@ -1166,11 +1158,7 @@ pub(crate) fn handle_daemon_connection(
                     .unwrap_or_default()
                     .trim();
                 let response = handle_daemon_cluster_kv_watch_events(paths, payload)?;
-                let body =
-                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                        path: "cluster kv watch events response".to_string(),
-                        detail: source.to_string(),
-                    })?;
+                let body = network::encode_object_text_payload(&response)?;
                 stream
                     .write_all(body.as_bytes())
                     .map_err(|source| CliError::Network {
@@ -1185,11 +1173,7 @@ pub(crate) fn handle_daemon_connection(
                     .unwrap_or_default()
                     .trim();
                 let response = handle_daemon_cluster_raft_vote(paths, payload, &authenticated)?;
-                let body =
-                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                        path: "cluster raft vote response".to_string(),
-                        detail: source.to_string(),
-                    })?;
+                let body = network::encode_object_text_payload(&response)?;
                 stream
                     .write_all(body.as_bytes())
                     .map_err(|source| CliError::Network {
@@ -1212,11 +1196,7 @@ pub(crate) fn handle_daemon_connection(
                         shadow_binary: PathBuf::new(),
                     },
                 };
-                let body =
-                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                        path: "rollout response".to_string(),
-                        detail: source.to_string(),
-                    })?;
+                let body = network::encode_object_text_payload(&response)?;
                 stream
                     .write_all(body.as_bytes())
                     .map_err(|source| CliError::Network {
@@ -1244,11 +1224,7 @@ pub(crate) fn handle_daemon_connection(
                         shadow_binary: PathBuf::new(),
                     },
                 };
-                let body =
-                    serde_json::to_string_pretty(&response).map_err(|source| CliError::Json {
-                        path: "rollout response".to_string(),
-                        detail: source.to_string(),
-                    })?;
+                let body = network::encode_object_text_payload(&response)?;
                 stream
                     .write_all(body.as_bytes())
                     .map_err(|source| CliError::Network {
@@ -1525,11 +1501,7 @@ pub(crate) fn handle_daemon_cluster_join(
     paths: &DaemonPaths,
     payload: &str,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    let request: ClusterJoinRegistrationRequest =
-        serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "cluster join registration".to_string(),
-            detail: source.to_string(),
-        })?;
+    let request: ClusterJoinRegistrationRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -1671,11 +1643,7 @@ pub(crate) fn handle_daemon_rollout_binary(
     paths: &DaemonPaths,
     payload: &str,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    let request: ClusterRolloutBinaryRequest =
-        serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "cluster rollout request".to_string(),
-            detail: source.to_string(),
-        })?;
+    let request: ClusterRolloutBinaryRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -1932,11 +1900,7 @@ pub(crate) fn handle_daemon_rollout_build(
     paths: &DaemonPaths,
     payload: &str,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    let request: ClusterRolloutBuildRequest =
-        serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "cluster rollout build request".to_string(),
-            detail: source.to_string(),
-        })?;
+    let request: ClusterRolloutBuildRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),

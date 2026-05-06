@@ -18,6 +18,12 @@ This keeps crates such as `sinomo-dfs` protocol agnostic. DFS sends
 codec, discovery advertisements, and typed protocol payloads are encoded as
 `SOBJ` documents by the network layer.
 
+For legacy line-oriented daemon control sockets that still need printable
+command bodies, `sinomo-network` exposes object text payload helpers. They
+base64url-wrap `SOBJ` bytes so cluster join, Raft replication, and watch fanout
+commands still carry Sinomo Object payloads while the transport is being moved
+behind the network crate.
+
 ## Interfaces
 
 `sinomo-network` exposes two communication shapes:
@@ -41,3 +47,8 @@ cluster storage may still use its own stable storage representation, but live
 peer discovery, peer routing, protocol messages, and stream traffic should not
 reach around the network crate to open ad hoc sockets or choose a wire format in
 higher-level crates.
+
+Cluster daemon endpoint selection also belongs to `sinomo-network`. CLI and
+daemon code may sign or authorize commands, but choosing loopback, LAN TCP, or
+Iroh and opening the transport should happen through network helpers rather than
+inside higher-level command handlers.

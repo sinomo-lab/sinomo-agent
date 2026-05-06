@@ -758,7 +758,114 @@ fn iroh_endpoint_addr_from_record(
     Ok(addr)
 }
 
-#[cfg(feature = "iroh-transport")]
+pub fn send_daemon_command_to_cluster_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, NetworkError> {
+    match endpoint.transport {
+        #[cfg(feature = "iroh-transport")]
+        ClusterTransportKind::Iroh => {
+            send_iroh_daemon_command_raw(&endpoint.address, command, timeout)
+        }
+        #[cfg(not(feature = "iroh-transport"))]
+        ClusterTransportKind::Iroh => Err(NetworkError::Io {
+            operation: format!("send daemon command to {}", endpoint.address),
+            detail: "iroh transport feature is disabled".to_string(),
+        }),
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            send_daemon_command_raw(&endpoint.address, command, timeout)
+        }
+        _ => Err(NetworkError::Io {
+            operation: format!("send daemon command to {}", endpoint.address),
+            detail: format!(
+                "unsupported daemon command transport {:?}",
+                endpoint.transport
+            ),
+        }),
+    }
+}
+
+pub fn send_daemon_command_raw(
+    address: &str,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, NetworkError> {
+    let response =
+        forward_daemon_control_payload(address, format!("{command}\n").as_bytes(), timeout)?;
+    String::from_utf8(response).map_err(|source| NetworkError::Serialization {
+        detail: source.to_string(),
+    })
+}
+
+pub fn send_daemon_command_pair_raw(
+    address: &str,
+    first_command: &str,
+    second_command: &str,
+    timeout: Duration,
+) -> Result<(String, String), NetworkError> {
+    let socket_address = address
+        .to_socket_addrs()
+        .map_err(|source| NetworkError::Io {
+            operation: format!("resolve daemon control address {address}"),
+            detail: source.to_string(),
+        })?
+        .next()
+        .ok_or_else(|| NetworkError::Io {
+            operation: format!("resolve daemon control address {address}"),
+            detail: "no socket addresses resolved".to_string(),
+        })?;
+    let mut stream = TcpStream::connect_timeout(&socket_address, timeout).map_err(|source| {
+        NetworkError::Io {
+            operation: format!("connect daemon control address {address}"),
+            detail: source.to_string(),
+        }
+    })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|source| NetworkError::Io {
+            operation: format!("configure daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|source| NetworkError::Io {
+            operation: format!("configure daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    stream
+        .write_all(format!("{first_command}\n").as_bytes())
+        .map_err(|source| NetworkError::Io {
+            operation: format!("write daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    let mut first_response = String::new();
+    BufReader::new(stream.try_clone().map_err(|source| NetworkError::Io {
+        operation: format!("clone daemon control address {address}"),
+        detail: source.to_string(),
+    })?)
+    .read_line(&mut first_response)
+    .map_err(|source| NetworkError::Io {
+        operation: format!("read daemon control address {address}"),
+        detail: source.to_string(),
+    })?;
+    stream
+        .write_all(format!("{second_command}\n").as_bytes())
+        .map_err(|source| NetworkError::Io {
+            operation: format!("write daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    let _ = stream.shutdown(Shutdown::Write);
+    let mut second_response = String::new();
+    stream
+        .read_to_string(&mut second_response)
+        .map_err(|source| NetworkError::Io {
+            operation: format!("read daemon control address {address}"),
+            detail: source.to_string(),
+        })?;
+    Ok((first_response, second_response))
+}
+
 fn forward_daemon_control_payload(
     address: &str,
     payload: &[u8],

@@ -872,119 +872,44 @@ pub(crate) fn send_cluster_join_registration(
     address: &str,
     request: &ClusterJoinRegistrationRequest,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
-        path: "cluster join registration".to_string(),
-        detail: source.to_string(),
-    })?;
+    let payload = network::encode_object_text_payload(request)?;
     let challenge = random_url_secret(32)?;
     let challenge_request = ClusterInviteChallengeRequest {
         protocol: "sinomo.cluster-invite-challenge.v1".to_string(),
         invite_id: request.invite.invite_id.clone(),
         challenge: challenge.clone(),
     };
-    let challenge_payload =
-        serde_json::to_string(&challenge_request).map_err(|source| CliError::Json {
-            path: "cluster invite challenge request".to_string(),
-            detail: source.to_string(),
-        })?;
-    let socket_address = address
-        .to_socket_addrs()
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?
-        .next()
-        .ok_or_else(|| CliError::Network {
-            address: address.to_string(),
-            detail: "no socket addresses resolved".to_string(),
-        })?;
-    let mut stream =
-        TcpStream::connect_timeout(&socket_address, DAEMON_JOIN_TIMEOUT).map_err(|source| {
-            CliError::Network {
-                address: address.to_string(),
-                detail: source.to_string(),
-            }
-        })?;
-    stream
-        .set_read_timeout(Some(DAEMON_JOIN_TIMEOUT))
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    stream
-        .set_write_timeout(Some(DAEMON_JOIN_TIMEOUT))
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    stream
-        .write_all(format!("INVITE_HELLO {challenge_payload}\n").as_bytes())
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    let mut proof_line = String::new();
-    io::BufReader::new(stream.try_clone().map_err(|source| CliError::Network {
-        address: address.to_string(),
-        detail: source.to_string(),
-    })?)
-    .read_line(&mut proof_line)
-    .map_err(|source| CliError::Network {
-        address: address.to_string(),
-        detail: source.to_string(),
-    })?;
+    let challenge_payload = network::encode_object_text_payload(&challenge_request)?;
+    let signed = sign_daemon_command_for_local_node(&format!("CLUSTER_JOIN {payload}"))?;
+    let (proof_line, response) = network::send_daemon_command_pair_raw(
+        address,
+        &format!("INVITE_HELLO {challenge_payload}"),
+        &signed,
+        DAEMON_JOIN_TIMEOUT,
+    )?;
     let proof_payload = proof_line
         .trim()
         .strip_prefix("INVITE_PROOF ")
         .ok_or_else(|| CliError::AuthDenied)?;
-    let proof: ClusterInviteChallengeProof =
-        serde_json::from_str(proof_payload).map_err(|source| CliError::Json {
-            path: format!("cluster invite proof from {address}"),
-            detail: source.to_string(),
-        })?;
+    let proof: ClusterInviteChallengeProof = network::decode_object_text_payload(proof_payload)?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
-    let signed = sign_daemon_command_for_local_node(&format!("CLUSTER_JOIN {payload}"))?;
-    stream
-        .write_all(format!("{signed}\n").as_bytes())
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    let _ = stream.shutdown(Shutdown::Write);
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|source| CliError::Network {
-            address: address.to_string(),
-            detail: source.to_string(),
-        })?;
-    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster join response from {address}"),
-        detail: source.to_string(),
-    })
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_join_registration_over_iroh(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterJoinRegistrationRequest,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
-        path: "cluster join registration".to_string(),
-        detail: source.to_string(),
-    })?;
+    let payload = network::encode_object_text_payload(request)?;
     let challenge = random_url_secret(32)?;
     let challenge_request = ClusterInviteChallengeRequest {
         protocol: "sinomo.cluster-invite-challenge.v1".to_string(),
         invite_id: request.invite.invite_id.clone(),
         challenge: challenge.clone(),
     };
-    let challenge_payload =
-        serde_json::to_string(&challenge_request).map_err(|source| CliError::Json {
-            path: "cluster invite challenge request".to_string(),
-            detail: source.to_string(),
-        })?;
-    let proof_response = network::send_iroh_daemon_command_raw(
-        &endpoint.address,
+    let challenge_payload = network::encode_object_text_payload(&challenge_request)?;
+    let proof_response = network::send_daemon_command_to_cluster_endpoint(
+        endpoint,
         &format!("INVITE_HELLO {challenge_payload}"),
         DAEMON_JOIN_TIMEOUT,
     )?;
@@ -992,19 +917,12 @@ pub(crate) fn send_cluster_join_registration_over_iroh(
         .trim()
         .strip_prefix("INVITE_PROOF ")
         .ok_or_else(|| CliError::AuthDenied)?;
-    let proof: ClusterInviteChallengeProof =
-        serde_json::from_str(proof_payload).map_err(|source| CliError::Json {
-            path: format!("cluster invite proof from {}", endpoint.address),
-            detail: source.to_string(),
-        })?;
+    let proof: ClusterInviteChallengeProof = network::decode_object_text_payload(proof_payload)?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
     let signed = sign_daemon_command_for_local_node(&format!("CLUSTER_JOIN {payload}"))?;
     let response =
-        network::send_iroh_daemon_command_raw(&endpoint.address, &signed, DAEMON_JOIN_TIMEOUT)?;
-    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster join response from {}", endpoint.address),
-        detail: source.to_string(),
-    })
+        network::send_daemon_command_to_cluster_endpoint(endpoint, &signed, DAEMON_JOIN_TIMEOUT)?;
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
 pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
@@ -2201,61 +2119,34 @@ pub(crate) fn send_daemon_command_to_endpoint(
     command: &str,
     timeout: Duration,
 ) -> Result<String, CliError> {
-    match endpoint.transport {
-        ClusterTransportKind::Iroh => {
-            let signed = sign_daemon_command_for_local_node(command)?;
-            network::send_iroh_daemon_command_raw(&endpoint.address, &signed, timeout)
-                .map_err(Into::into)
-        }
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            Ok(send_daemon_command(&endpoint.address, command, timeout)?)
-        }
-        _ => Err(CliError::Network {
-            address: endpoint.address.clone(),
-            detail: format!(
-                "unsupported daemon command transport {:?}",
-                endpoint.transport
-            ),
-        }),
-    }
+    let signed = sign_daemon_command_for_local_node(command)?;
+    network::send_daemon_command_to_cluster_endpoint(endpoint, &signed, timeout).map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_raft_append(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterRaftAppendRequest,
 ) -> Result<ClusterRaftAppendResponse, CliError> {
-    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
-        path: "cluster raft append request".to_string(),
-        detail: source.to_string(),
-    })?;
+    let payload = network::encode_object_text_payload(request)?;
     let response = send_daemon_command_to_endpoint(
         endpoint,
         &format!("CLUSTER_RAFT_APPEND {payload}"),
         DAEMON_JOIN_TIMEOUT,
     )?;
-    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster raft append response from {}", endpoint.address),
-        detail: source.to_string(),
-    })
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_raft_vote(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterRaftVoteRequest,
 ) -> Result<ClusterRaftVoteResponse, CliError> {
-    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
-        path: "cluster raft vote request".to_string(),
-        detail: source.to_string(),
-    })?;
+    let payload = network::encode_object_text_payload(request)?;
     let response = send_daemon_command_to_endpoint(
         endpoint,
         &format!("CLUSTER_RAFT_VOTE {payload}"),
         DAEMON_JOIN_TIMEOUT,
     )?;
-    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster raft vote response from {}", endpoint.address),
-        detail: source.to_string(),
-    })
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_kv_watch_events(
@@ -2269,19 +2160,13 @@ pub(crate) fn send_cluster_kv_watch_events(
             stored_events: 0,
         });
     }
-    let payload = serde_json::to_string(request).map_err(|source| CliError::Json {
-        path: "cluster kv watch events request".to_string(),
-        detail: source.to_string(),
-    })?;
+    let payload = network::encode_object_text_payload(request)?;
     let response = send_daemon_command_to_endpoint(
         endpoint,
         &format!("CLUSTER_KV_WATCH_EVENTS {payload}"),
         DAEMON_JOIN_TIMEOUT,
     )?;
-    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("cluster kv watch events response from {}", endpoint.address),
-        detail: source.to_string(),
-    })
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
 pub(crate) fn handle_daemon_cluster_raft_append(
@@ -2289,11 +2174,7 @@ pub(crate) fn handle_daemon_cluster_raft_append(
     payload: &str,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<ClusterRaftAppendResponse, CliError> {
-    let request: ClusterRaftAppendRequest =
-        serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "cluster raft append request".to_string(),
-            detail: source.to_string(),
-        })?;
+    let request: ClusterRaftAppendRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -2363,11 +2244,7 @@ pub(crate) fn handle_daemon_cluster_raft_vote(
     payload: &str,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<ClusterRaftVoteResponse, CliError> {
-    let request: ClusterRaftVoteRequest =
-        serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "cluster raft vote request".to_string(),
-            detail: source.to_string(),
-        })?;
+    let request: ClusterRaftVoteRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -2456,11 +2333,7 @@ pub(crate) fn handle_daemon_cluster_kv_watch_events(
     paths: &DaemonPaths,
     payload: &str,
 ) -> Result<ClusterKvWatchEventsResponse, CliError> {
-    let request: ClusterKvWatchEventsRequest =
-        serde_json::from_str(payload).map_err(|source| CliError::Json {
-            path: "cluster kv watch events request".to_string(),
-            detail: source.to_string(),
-        })?;
+    let request: ClusterKvWatchEventsRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),

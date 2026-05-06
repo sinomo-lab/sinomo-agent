@@ -35,11 +35,8 @@ pub(crate) mod prelude {
     pub(crate) use std::cell::RefCell;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
     pub(crate) use std::fs;
-    #[cfg(feature = "iroh-transport")]
-    pub(crate) use std::io::Read;
-    pub(crate) use std::io::{self, BufRead, BufReader, Write};
+    pub(crate) use std::io::{self, BufRead, BufReader, Read, Write};
     pub(crate) use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-    #[cfg(feature = "iroh-transport")]
     pub(crate) use std::net::{Shutdown, TcpStream, ToSocketAddrs};
     pub(crate) use std::path::PathBuf;
     pub(crate) use std::rc::Rc;
