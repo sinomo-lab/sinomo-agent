@@ -9,7 +9,7 @@ use sinomo_core::{
     PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
 };
 use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
-use sinomo_kv::KvEventKind;
+use sinomo_kv::{InProcessKvStore, KvEventKind};
 
 #[test]
 fn cluster_storage_syncs_members_and_node_status_to_kv() {
@@ -882,6 +882,88 @@ fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
         .collect();
     assert_eq!(iroh.len(), 1);
     assert!(iroh[0].address.contains("203.0.113.11:21356"));
+}
+
+#[test]
+fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-iroh-kv-cleanup-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::new("cluster_iroh_kv_cleanup").expect("cluster");
+    let node_id = NodeId::new("node_iroh_kv_cleanup").expect("node");
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        node_id.clone(),
+        "iroh cleanup",
+        "public-key",
+        now,
+    );
+    member.endpoints.push(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_legacy_iroh_a")
+            .expect("legacy endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://same_public_key?direct=203.0.113.9:21356".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 40,
+        last_observed_latency_ms: None,
+    });
+    let stable = IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        endpoint_public_key: "same_public_key".to_string(),
+        direct_addresses: vec!["203.0.113.11:21356".to_string()],
+        relay_url: None,
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 51,
+    }
+    .endpoint();
+    let legacy_b = ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_legacy_iroh_b")
+            .expect("legacy endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://same_public_key?direct=203.0.113.10:21356".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 40,
+        last_observed_latency_ms: None,
+    };
+
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(sinomo_kv::cluster_member_key(&node_id), &member, None)
+        .expect("put member");
+    store
+        .put_serde(cluster_endpoint_key(&node_id, &legacy_b), &legacy_b, None)
+        .expect("put legacy endpoint");
+    store
+        .put_serde(cluster_endpoint_key(&node_id, &stable), &stable, None)
+        .expect("put stable endpoint");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let members = read_cluster_members_from_kv(&paths).expect("members");
+    let iroh: Vec<_> = members[0]
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.transport == ClusterTransportKind::Iroh)
+        .collect();
+
+    assert_eq!(iroh.len(), 1);
+    assert_eq!(iroh[0].endpoint_id, stable.endpoint_id);
+    assert!(iroh[0].address.contains("203.0.113.11:21356"));
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

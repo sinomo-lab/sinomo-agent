@@ -264,6 +264,7 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
     if !kv_members.is_empty() {
         state.members = kv_members;
     }
+    cleanup_cluster_iroh_endpoints(&mut state);
     Ok(state)
 }
 
@@ -802,6 +803,7 @@ pub fn read_cluster_members_from_kv(
                 }
             }
         }
+        cleanup_member_iroh_endpoints(member);
     }
     members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(members)
@@ -962,13 +964,22 @@ pub fn sync_cluster_state_to_local_raft_unchecked(
         )?;
     }
     for member in &state.members {
+        let mut member = member.clone();
+        cleanup_member_iroh_endpoints(&mut member);
         let command = KvCommand::PutClusterMember(member.clone());
         append_cluster_raft_command(paths, &state.local_node_id, command)?;
-        snapshot = put_cluster_kv_value(
+        let _ = put_cluster_kv_value(
             paths,
             &state.local_node_id,
             cluster_capability_policy_key(&member.node_id),
-            &ClusterCapabilityPolicyRecord::from(member),
+            &ClusterCapabilityPolicyRecord::from(&member),
+        )?;
+        snapshot = append_cluster_raft_command(
+            paths,
+            &state.local_node_id,
+            KvCommand::Op(KvOp::DeletePrefix {
+                prefix: cluster_endpoint_prefix(&member.node_id),
+            }),
         )?;
         for endpoint in &member.endpoints {
             snapshot = put_cluster_kv_value(
@@ -1108,7 +1119,15 @@ pub fn cluster_raft_config_key() -> String {
 }
 
 pub fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
-    format!("/cluster/endpoints/{node_id}/{}", endpoint.endpoint_id)
+    format!(
+        "{}{}",
+        cluster_endpoint_prefix(node_id),
+        endpoint.endpoint_id
+    )
+}
+
+pub fn cluster_endpoint_prefix(node_id: &NodeId) -> String {
+    format!("/cluster/endpoints/{node_id}/")
 }
 
 pub fn cluster_capability_policy_key(node_id: &NodeId) -> String {
@@ -1306,22 +1325,97 @@ pub fn merge_member_record(
         let mut changed = false;
         if incoming.updated_at > existing.updated_at {
             *existing = incoming;
+            cleanup_member_iroh_endpoints(existing);
             return true;
         }
         for endpoint in incoming.endpoints {
             changed |= upsert_member_endpoint(existing, endpoint);
         }
+        changed |= cleanup_member_iroh_endpoints(existing);
         changed
     } else {
+        let mut incoming = incoming;
+        cleanup_member_iroh_endpoints(&mut incoming);
         local.members.push(incoming);
         true
     }
 }
 
+pub fn cleanup_cluster_iroh_endpoints(state: &mut ClusterBootstrapState) -> bool {
+    state.members.iter_mut().fold(false, |changed, member| {
+        cleanup_member_iroh_endpoints(member) || changed
+    })
+}
+
+pub fn cleanup_member_iroh_endpoints(member: &mut ClusterMemberRecord) -> bool {
+    let original = member.endpoints.clone();
+    let mut endpoints: Vec<ClusterEndpointRecord> = Vec::new();
+    let mut iroh_stable_flags: Vec<bool> = Vec::new();
+    let mut iroh_by_public_key: BTreeMap<String, usize> = BTreeMap::new();
+
+    for mut endpoint in original.iter().cloned() {
+        let Some(public_key) = iroh_endpoint_public_key(&endpoint) else {
+            endpoints.push(endpoint);
+            iroh_stable_flags.push(false);
+            continue;
+        };
+        let was_stable =
+            endpoint.endpoint_id == crate::stable_iroh_endpoint_id(&endpoint.node_id, &public_key);
+        endpoint.endpoint_id = crate::stable_iroh_endpoint_id(&endpoint.node_id, &public_key);
+        if let Some(index) = iroh_by_public_key.get(&public_key).copied() {
+            if iroh_endpoint_should_replace(
+                &endpoints[index],
+                iroh_stable_flags[index],
+                &endpoint,
+                was_stable,
+            ) {
+                endpoints[index] = endpoint;
+                iroh_stable_flags[index] = was_stable;
+            }
+        } else {
+            iroh_by_public_key.insert(public_key, endpoints.len());
+            endpoints.push(endpoint);
+            iroh_stable_flags.push(was_stable);
+        }
+    }
+
+    if member.endpoints == endpoints {
+        false
+    } else {
+        member.endpoints = endpoints;
+        true
+    }
+}
+
+fn iroh_endpoint_should_replace(
+    current: &ClusterEndpointRecord,
+    current_was_stable: bool,
+    candidate: &ClusterEndpointRecord,
+    candidate_was_stable: bool,
+) -> bool {
+    let current_rank = iroh_endpoint_preference_rank(current, current_was_stable);
+    let candidate_rank = iroh_endpoint_preference_rank(candidate, candidate_was_stable);
+    candidate_rank >= current_rank
+}
+
+fn iroh_endpoint_preference_rank(endpoint: &ClusterEndpointRecord, was_stable: bool) -> (u8, u8) {
+    let stable_rank = u8::from(was_stable);
+    let reachability_rank = match endpoint.privacy {
+        ClusterEndpointPrivacy::InternetDirect => 3,
+        ClusterEndpointPrivacy::Lan => 2,
+        ClusterEndpointPrivacy::Relayed => 1,
+        ClusterEndpointPrivacy::LocalOnly => 0,
+    };
+    (stable_rank, reachability_rank)
+}
+
 pub fn upsert_member_endpoint(
     member: &mut ClusterMemberRecord,
-    endpoint: ClusterEndpointRecord,
+    mut endpoint: ClusterEndpointRecord,
 ) -> bool {
+    if let Some(public_key) = iroh_endpoint_public_key(&endpoint) {
+        endpoint.endpoint_id = crate::stable_iroh_endpoint_id(&endpoint.node_id, &public_key);
+    }
     let incoming_iroh_public_key = iroh_endpoint_public_key(&endpoint);
     let mut changed = false;
     if let Some(public_key) = incoming_iroh_public_key.as_deref() {

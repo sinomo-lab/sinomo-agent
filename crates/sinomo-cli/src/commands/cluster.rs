@@ -595,16 +595,21 @@ pub(crate) fn cluster_member_publish_txn(
 ) -> Result<KvTxn, CliError> {
     let mut success = Vec::new();
     for member in members {
+        let mut member = member.clone();
+        network::cleanup_member_iroh_endpoints(&mut member);
         success.push(KvOp::put_serde(
             cluster_member_key(&member.node_id),
-            member,
+            &member,
             None,
         )?);
         success.push(KvOp::put_serde(
             network::cluster_capability_policy_key(&member.node_id),
-            &network::ClusterCapabilityPolicyRecord::from(member),
+            &network::ClusterCapabilityPolicyRecord::from(&member),
             None,
         )?);
+        success.push(KvOp::DeletePrefix {
+            prefix: network::cluster_endpoint_prefix(&member.node_id),
+        });
         for endpoint in &member.endpoints {
             success.push(KvOp::put_serde(
                 network::cluster_endpoint_key(&member.node_id, endpoint),
@@ -1774,6 +1779,7 @@ pub(crate) fn sync_cluster_state_to_kv(
 ) -> Result<KvSnapshot, CliError> {
     let mut keyed_state = state.clone();
     assign_local_node_public_keys(paths, &mut keyed_state)?;
+    network::cleanup_cluster_iroh_endpoints(&mut keyed_state);
     let mut commit_state = keyed_state.clone();
     commit_cluster_kv_txn_with_quorum(
         paths,
@@ -2000,7 +2006,9 @@ pub(crate) fn cluster_state_sync_txn(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvTxn, CliError> {
-    let new_config = network::ClusterRaftConfigRecord::from(state);
+    let mut state = state.clone();
+    network::cleanup_cluster_iroh_endpoints(&mut state);
+    let new_config = network::ClusterRaftConfigRecord::from(&state);
     let current_config_entry = read_cluster_kv_store(paths)?
         .get(&network::cluster_raft_config_key())
         .cloned();
@@ -2020,7 +2028,7 @@ pub(crate) fn cluster_state_sync_txn(
     let mut success = vec![
         KvOp::put_serde(
             network::cluster_identity_key(),
-            &network::ClusterIdentityRecord::from(state),
+            &network::ClusterIdentityRecord::from(&state),
             None,
         )?,
         KvOp::put_serde(network::cluster_raft_config_key(), &new_config, None)?,
@@ -2036,6 +2044,9 @@ pub(crate) fn cluster_state_sync_txn(
             &network::ClusterCapabilityPolicyRecord::from(member),
             None,
         )?);
+        success.push(KvOp::DeletePrefix {
+            prefix: network::cluster_endpoint_prefix(&member.node_id),
+        });
         for endpoint in &member.endpoints {
             success.push(KvOp::put_serde(
                 network::cluster_endpoint_key(&member.node_id, endpoint),
@@ -2222,6 +2233,7 @@ impl ClusterNetworkMaintenance {
 
         let mut state = read_cluster_state_without_kv(&cluster_paths)?;
         let state_before_maintenance = state.clone();
+        network::cleanup_cluster_iroh_endpoints(&mut state);
         let shadow_options = current_shadow_daemon_options(data_dir);
         ensure_daemon_cluster_members(
             &mut state,
@@ -3882,6 +3894,7 @@ pub(crate) fn advertise_daemon_iroh_endpoint(
         .find(|member| member.node_id == endpoint.node_id)
     {
         network::upsert_member_endpoint(member, endpoint);
+        network::cleanup_member_iroh_endpoints(member);
         state.updated_at = OffsetDateTime::now_utc();
         network::write_cluster_state(&cluster_paths, &state)?;
         sync_cluster_state_to_kv(&cluster_paths, &state)?;

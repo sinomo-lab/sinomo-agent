@@ -11,20 +11,21 @@ use super::{
     build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
     cluster_doctor_findings, cluster_has_local_quorum, cluster_init_with_paths,
     cluster_invite_publish_targets, cluster_invite_with_paths, cluster_join_with_paths,
-    cluster_peer_members, cluster_raft_known_leader_id, cluster_sync_targets,
-    daemon_advertised_endpoints_for_state, daemon_lan_endpoint, daemon_package_version,
-    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
-    encode_cluster_join_invite, ensure_rollout_layout, handle_daemon_cluster_join,
-    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
-    handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
-    handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
-    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    main_daemon_capabilities, models_default_with_data_dir, normalize_model_provider,
-    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    cluster_peer_members, cluster_raft_known_leader_id, cluster_state_sync_txn,
+    cluster_sync_targets, daemon_advertised_endpoints_for_state, daemon_lan_endpoint,
+    daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
+    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
+    handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
+    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn,
+    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
+    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
+    handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
+    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, is_terminal_status, main_daemon_capabilities,
+    models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_models_list_options, parse_propose_options, parse_provider_command,
     parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
     read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
@@ -324,6 +325,60 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].transport, ClusterTransportKind::LanTcp);
     assert_eq!(targets[0].address, "10.14.1.11:21353");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-endpoint-key-cleanup-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id = ClusterId::new("cluster_endpoint_key_cleanup").expect("cluster");
+    let node_id = NodeId::new("node_endpoint_key_cleanup").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "endpoint cleanup",
+        node_id.clone(),
+        "endpoint cleanup node",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+    state.members[0].endpoints.push(ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::new("endpoint_cleanup_current").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "10.14.1.11:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 20,
+        last_observed_latency_ms: None,
+    });
+
+    let txn = cluster_state_sync_txn(&paths, &state).expect("cluster state sync txn");
+    let endpoint_prefix = format!("/cluster/endpoints/{node_id}/");
+    let delete_prefix_index = txn
+        .success
+        .iter()
+        .position(|op| matches!(op, KvOp::DeletePrefix { prefix } if prefix == &endpoint_prefix));
+    let first_endpoint_put_index = txn
+        .success
+        .iter()
+        .position(|op| matches!(op, KvOp::Put { key, .. } if key.starts_with(&endpoint_prefix)));
+
+    assert!(delete_prefix_index.is_some());
+    assert!(
+        delete_prefix_index < first_endpoint_put_index,
+        "endpoint prefix must be deleted before canonical endpoints are put"
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 
