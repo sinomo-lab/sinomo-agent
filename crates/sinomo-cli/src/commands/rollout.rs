@@ -566,15 +566,15 @@ pub(crate) fn rollout_source_head(repo: &Path) -> Result<String, CliError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .output()
         .map_err(|source| CliError::Io {
-            path: format!("git -C {} rev-parse --short HEAD", repo.display()),
+            path: format!("git -C {} rev-parse HEAD", repo.display()),
             detail: source.to_string(),
         })?;
     if !output.status.success() {
         return Err(CliError::Process {
-            command: format!("git -C {} rev-parse --short HEAD", repo.display()),
+            command: format!("git -C {} rev-parse HEAD", repo.display()),
             status: output.status.code().unwrap_or(-1),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
