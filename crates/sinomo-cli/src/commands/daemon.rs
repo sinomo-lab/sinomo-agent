@@ -1371,10 +1371,23 @@ fn put_dfs_control_record<T: Serialize>(
     key: String,
     value: &T,
 ) -> Result<(), CliError> {
-    network::append_cluster_raft_command(
+    let mut state = read_cluster_state_without_kv(paths)?;
+    if &state.local_node_id != node_id {
+        return Err(CliError::ClusterReadOnly {
+            detail: format!(
+                "local cluster state belongs to {}, not {node_id}",
+                state.local_node_id
+            ),
+        });
+    }
+    commit_cluster_kv_txn_with_quorum(
         paths,
-        node_id,
-        KvCommand::Op(KvOp::put_serde(key, value, None)?),
+        &mut state,
+        KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::put_serde(key, value, None)?],
+            failure: Vec::new(),
+        },
     )?;
     Ok(())
 }

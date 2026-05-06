@@ -384,8 +384,13 @@ pub fn apply_cluster_raft_append(
             && (append.prev_log_index != snapshot.last_included_index
                 || append.prev_log_term == snapshot.last_included_term);
         let snapshot_is_newer = snapshot.last_included_index > node.applied_index();
+        let snapshot_kv_is_newer = snapshot.kv.revision > node.store().snapshot().revision;
         let append_term_is_current = append.term >= node.hard_state().current_term;
-        if append_term_is_current && snapshot_is_newer && snapshot_matches_append {
+        if append_term_is_current
+            && snapshot_is_newer
+            && snapshot_kv_is_newer
+            && snapshot_matches_append
+        {
             node.restore_snapshot(snapshot)?;
         }
     }

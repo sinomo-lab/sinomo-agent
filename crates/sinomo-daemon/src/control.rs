@@ -3,7 +3,7 @@ use crate::{
     create_cluster_invite_challenge_proof,
 };
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::time::Duration;
 
 pub const DAEMON_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,7 +25,10 @@ where
     if let Some(payload) = command.strip_prefix("INVITE_HELLO ") {
         let proof = match create_cluster_invite_challenge_proof(paths, payload.trim()) {
             Ok(proof) => proof,
-            Err(_error) => return Ok(false),
+            Err(_error) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Ok(false);
+            }
         };
         let body = sinomo_network::encode_object_text_payload(&proof).map_err(DaemonError::from)?;
         stream
@@ -44,6 +47,7 @@ where
     let authenticated = match authenticate_daemon_command(paths, &command) {
         Ok(authenticated) => authenticated,
         Err(_error) => {
+            let _ = stream.shutdown(Shutdown::Both);
             return Ok(false);
         }
     };

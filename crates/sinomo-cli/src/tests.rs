@@ -19,17 +19,18 @@ use super::{
     handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
     handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
     install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
-    is_terminal_status, main_daemon_capabilities, models_default_with_data_dir,
-    normalize_model_provider, parse_cli_command, parse_cluster_command,
-    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
-    parse_install_options, parse_model_default_options, parse_models_list_options,
-    parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
-    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
-    read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
-    run_cui_with_handler_io_and_daemon, run_evolve_command, send_daemon_command_raw,
-    sign_cluster_join_invite, sign_daemon_command_from_data_dir, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, uninstall_with_layout, write_json,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, is_terminal_status, main_daemon_capabilities,
+    models_default_with_data_dir, normalize_model_provider, parse_cli_command,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
+    parse_models_list_options, parse_propose_options, parse_provider_command,
+    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
+    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
+    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
+    send_daemon_command_raw, sign_cluster_join_invite, sign_daemon_command_from_data_dir,
+    stage_rollout_main_activation, uninstall_with_layout, write_json,
 };
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -314,7 +315,7 @@ fn cluster_peer_members_tolerates_unreachable_join_introducers() {
         OffsetDateTime::now_utc(),
     ));
     write_json(&paths.state, &state).expect("write joined state");
-    sync_cluster_state_to_kv(&paths, &state).expect("sync kv");
+    super::network::sync_cluster_state_to_kv(&paths, &state).expect("sync kv");
     std::fs::write(&paths.kv_snapshot, "{\"revision\":1}trailing").expect("corrupt kv");
 
     let members = cluster_peer_members(&paths).expect("peer members");
@@ -1063,6 +1064,50 @@ fn join_registration_keeps_loopback_when_it_is_the_only_invite_channel() {
 }
 
 #[test]
+fn explicit_invite_introducer_uses_known_member_endpoint_identity() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-explicit-introducer-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_explicit_intro").expect("cluster")),
+            node_id: Some(NodeId::new("node_host").expect("node")),
+            name: "explicit introducer cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let mut state = read_cluster_state(&paths).expect("cluster state");
+    let now = OffsetDateTime::now_utc();
+    let remote_node = NodeId::new("node_known_intro").expect("node");
+    let mut remote = ClusterMemberRecord::local_non_voting(
+        state.cluster_id.clone(),
+        remote_node.clone(),
+        "known introducer",
+        "known-public-key",
+        now,
+    );
+    remote.endpoints.push(invite_introducer_endpoint(
+        &remote_node,
+        "10.14.1.11:21353".to_string(),
+    ));
+    state.members.push(remote);
+
+    let endpoint = invite_introducer_endpoint_from_state(&state, "10.14.1.11:21353".to_string());
+    let channels = invite_communication_channels(&state, &[endpoint]);
+
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].endpoint.node_id, remote_node);
+    assert_eq!(channels[0].node_public_key, "known-public-key");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_join_uses_structured_invite_cluster_identity() {
     let host_root = std::env::temp_dir().join(format!(
         "sinomo-cli-cluster-host-{}",
@@ -1177,7 +1222,7 @@ fn introducer_records_joined_members_and_returns_peer_view() {
         &offline_invite,
     )
     .expect("active offline invite");
-    super::sync_cluster_invitation_to_kv(&host_paths, &offline_invite)
+    super::network::sync_cluster_invitation_to_kv(&host_paths, &offline_invite)
         .expect("active offline invite kv");
     let offline_uri = encode_cluster_join_invite(&offline_invite).expect("offline invite");
     cluster_join_with_paths(
@@ -1306,7 +1351,7 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
     peer.endpoints = vec![daemon_lan_endpoint(&peer_node_id, peer_address, 0)];
     state.members.push(peer);
     write_json(&paths.state, &state).expect("write cluster state");
-    sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+    super::network::sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
 
     let txn = KvTxn {
         compares: Vec::new(),
@@ -1418,7 +1463,7 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+    super::network::sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
     let bad_auth = authenticated_test_command(
         "CLUSTER_RAFT_APPEND",
         super::DaemonSignerAuthority::Voter,
@@ -1478,7 +1523,7 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+    super::network::sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
     let stale_snapshot = read_cluster_kv_snapshot(&paths).expect("stale snapshot");
     super::network::append_cluster_raft_command_with_response(
         &paths,
@@ -1518,7 +1563,7 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
         },
     )
     .expect("stale append response");
-    assert!(response.success);
+    assert!(!response.success);
     assert!(
         read_cluster_kv_snapshot(&paths)
             .expect("snapshot after stale append")
@@ -1676,7 +1721,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         host_state.local_node_id.as_str(),
         host_identity.public_key.clone(),
     );
-    sync_cluster_state_to_kv(&host_paths, &host_state).expect("host kv");
+    super::network::sync_cluster_state_to_kv(&host_paths, &host_state).expect("host kv");
     let request = build_cluster_raft_append_request(&host_paths, &host_state).expect("raft append");
     let peer_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),

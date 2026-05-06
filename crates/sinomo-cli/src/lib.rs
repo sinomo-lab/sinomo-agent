@@ -67,7 +67,7 @@ use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
 use sinomo_runtime::kv::{
     KvCommand, KvEntry, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesRequest,
-    RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
+    RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot, cluster_member_key,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{
@@ -76,7 +76,6 @@ use sinomo_runtime::network::{
     ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
     ClusterPaths, ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
     ClusterRaftVoteResponse, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoverySocket,
-    sync_cluster_invitation_to_kv,
 };
 use sinomo_runtime::node::{
     NodeIdentity, daemon_lan_endpoint_id, daemon_loopback_endpoint_id,
