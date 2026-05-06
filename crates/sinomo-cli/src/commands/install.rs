@@ -124,7 +124,6 @@ pub(crate) fn install_with_layout(
     install_current_binary(&layout.shadow_binary)?;
     install_managed_source_repo(layout)?;
     write_boot_entries(layout, &options)?;
-    remove_legacy_boot_entries(layout)?;
     activate_boot_entries(layout);
     #[cfg(not(test))]
     configure_user_bin_access(layout)?;
@@ -214,7 +213,6 @@ pub(crate) fn uninstall_with_layout(
     deactivate_boot_entries(layout);
     remove_boot_entry(&layout.main_boot_entry)?;
     remove_boot_entry(&layout.shadow_boot_entry)?;
-    remove_legacy_boot_entries(layout)?;
     println!("removed boot entry: {}", layout.main_boot_entry.display());
     println!("removed boot entry: {}", layout.shadow_boot_entry.display());
     println!("data directory retained at: {}", layout.data_dir.display());
@@ -227,9 +225,6 @@ pub(crate) fn install_layout_exists(layout: &InstallLayout) -> bool {
         || layout.main_boot_entry.exists()
         || layout.shadow_boot_entry.exists()
         || SelfRolloutPaths::new(&layout.data_dir).source_repo.exists()
-        || legacy_boot_entry_paths(layout)
-            .iter()
-            .any(|path| path.exists())
 }
 
 pub(crate) fn install_current_binary(destination: &Path) -> Result<(), CliError> {
@@ -510,32 +505,6 @@ pub(crate) fn remove_boot_entry(path: &Path) -> Result<(), CliError> {
             path: path.display().to_string(),
             detail: source.to_string(),
         }),
-    }
-}
-
-pub(crate) fn remove_legacy_boot_entries(layout: &InstallLayout) -> Result<(), CliError> {
-    for path in legacy_boot_entry_paths(layout) {
-        remove_boot_entry(&path)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn legacy_boot_entry_paths(layout: &InstallLayout) -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        vec![
-            layout
-                .boot_dir
-                .join(format!("{INSTALL_MAIN_BOOT_NAME}.cmd")),
-            layout
-                .boot_dir
-                .join(format!("{INSTALL_SHADOW_BOOT_NAME}.cmd")),
-        ]
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = layout;
-        Vec::new()
     }
 }
 

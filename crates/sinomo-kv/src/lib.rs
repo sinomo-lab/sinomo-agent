@@ -7,10 +7,10 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
-use serde::de::{self, DeserializeOwned, SeqAccess, Visitor};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sinomo_core::{ClusterMemberRecord, NodeId};
-use sinomo_object::{LengthMode, MAGIC, serde_ext as sinomo_object_serde};
+use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -29,12 +29,7 @@ pub fn encode_kv_value<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, KvEr
 }
 
 pub fn decode_kv_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, KvError> {
-    if bytes.starts_with(MAGIC) {
-        return sinomo_object_serde::from_bytes(bytes).map_err(|source| KvError::Serialization {
-            detail: source.to_string(),
-        });
-    }
-    serde_json::from_slice(bytes).map_err(|source| KvError::Serialization {
+    sinomo_object_serde::from_bytes(bytes).map_err(|source| KvError::Serialization {
         detail: source.to_string(),
     })
 }
@@ -247,7 +242,6 @@ pub struct KvSnapshot {
 
 mod base64_bytes {
     use super::*;
-    use std::fmt;
 
     pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -260,42 +254,10 @@ mod base64_bytes {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(BytesVisitor)
-    }
-
-    struct BytesVisitor;
-
-    impl<'de> Visitor<'de> for BytesVisitor {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a base64url string or a legacy byte array")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            URL_SAFE_NO_PAD.decode(value).map_err(E::custom)
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            self.visit_str(&value)
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-            while let Some(byte) = seq.next_element::<u8>()? {
-                bytes.push(byte);
-            }
-            Ok(bytes)
-        }
+        let value = String::deserialize(deserializer)?;
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1151,19 +1113,6 @@ impl InProcessRaftKvCluster {
             })
     }
 
-    pub fn txn_response_legacy(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        self.txn_response(txn)
-    }
-
-    pub fn legacy_log_entry(index: u64, term: u64, command: KvCommand) -> KvLogEntry {
-        KvLogEntry {
-            index,
-            term,
-            command,
-            revision: KvRevision::ZERO,
-        }
-    }
-
     pub fn put(&mut self, key: impl Into<String>, value: Vec<u8>) -> Result<KvRevision, KvError> {
         self.apply_as_leader(KvCommand::Op(KvOp::Put {
             key: key.into(),
@@ -1805,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_values_use_sinomo_object_and_decode_legacy_json() {
+    fn serde_values_use_sinomo_object() {
         let mut store = InProcessKvStore::new();
         let record = TestRecord {
             name: "alpha".to_string(),
@@ -1816,25 +1765,11 @@ mod tests {
             .put_serde("/typed/object", &record, None)
             .expect("put object value");
         let object_entry = store.get("/typed/object").expect("object entry");
-        assert!(object_entry.value.starts_with(MAGIC));
+        assert!(object_entry.value.starts_with(sinomo_object::MAGIC));
         assert_eq!(
             store
                 .get_serde::<TestRecord>("/typed/object")
                 .expect("decode object"),
-            Some(record.clone())
-        );
-
-        store
-            .put(
-                "/typed/legacy-json",
-                serde_json::to_vec(&record).expect("legacy json"),
-                None,
-            )
-            .expect("put legacy json");
-        assert_eq!(
-            store
-                .get_serde::<TestRecord>("/typed/legacy-json")
-                .expect("decode legacy json"),
             Some(record)
         );
     }

@@ -1359,7 +1359,6 @@ pub(crate) fn ensure_default_distributed_dfs(
         content_service_key(&state.local_node_id),
         &DfsNodeAdvertisement::content(state.local_node_id.clone(), endpoint),
     )?;
-    delete_legacy_dfs_control_records(&cluster_paths, &state.local_node_id)?;
     Ok(())
 }
 
@@ -1373,20 +1372,6 @@ fn put_dfs_control_record<T: Serialize>(
         paths,
         node_id,
         KvCommand::Op(KvOp::put_serde(key, value, None)?),
-    )?;
-    Ok(())
-}
-
-fn delete_legacy_dfs_control_records(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<(), CliError> {
-    network::append_cluster_raft_command(
-        paths,
-        node_id,
-        KvCommand::Op(KvOp::DeletePrefix {
-            prefix: "/dfs-control/".to_string(),
-        }),
     )?;
     Ok(())
 }

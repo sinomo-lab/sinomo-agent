@@ -133,16 +133,11 @@ pub struct ClusterJoinInvite {
     pub trust_domain: TrustDomain,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_member_roles: Vec<ClusterMemberRole>,
-    #[serde(default = "legacy_unsigned_invite_issuer_node_id")]
     pub issuer_node_id: NodeId,
     #[serde(default)]
     pub issuer_public_key: String,
     #[serde(default)]
     pub signature: String,
-}
-
-fn legacy_unsigned_invite_issuer_node_id() -> NodeId {
-    NodeId::new("node_legacy_unsigned_invite").expect("static legacy node id")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

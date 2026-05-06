@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
     BackgroundSchedulerPaths, BackgroundSchedulingPlan, BackgroundSchedulingRequest,
     CampaignBundlePaths, CampaignProposalRequest, CandidateWorkspace, ClusterLongHorizonWorkload,
-    ClusterLongHorizonWorkloadStatus, EvolutionCampaign, EvolutionCampaignStatus, EvolutionConfig,
+    ClusterLongHorizonWorkloadStatus, EvolutionCampaign, EvolutionCampaignStatus,
     EvolutionFailureClass, EvolutionOrchestrator, EvolutionPaths, EvolutionReport,
     EvolutionRequest, GitWorkspaceAdapter, LanguageModelMutationBridge, LocalCandidateBundleStore,
     MutationModel, MutationModelError, ReserveFloor, ResourceClassDefinition,
@@ -19,7 +19,7 @@ use sinomo_evolution::{
     read_background_tick_campaigns, read_campaign, read_config, read_stored_job, safe_file_stem,
     write_background_scheduling_plan, write_bundle_manifest, write_campaign_bundle,
     write_campaign_iteration_dry_run, write_campaign_schedule_dry_run,
-    write_campaign_stage_evaluation, write_config, write_report_record, write_stored_job,
+    write_campaign_stage_evaluation, write_report_record, write_stored_job,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -184,9 +184,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
             Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
         }
         Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
-        Some((command, rest)) if matches!(command.as_str(), "models" | "model") => Ok(
-            CliCommand::Models(parse_models_command(rest, ModelDefaultRepoMode::Reject)?),
-        ),
+        Some((command, rest)) if matches!(command.as_str(), "models" | "model") => {
+            Ok(CliCommand::Models(parse_models_command(rest)?))
+        }
         Some((command, rest)) if command == "providers" => {
             Ok(CliCommand::Providers(parse_provider_command(rest)?))
         }

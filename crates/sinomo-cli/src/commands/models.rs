@@ -4,7 +4,6 @@ use super::*;
 pub(crate) struct ModelDefaultOptions {
     pub(crate) provider: String,
     pub(crate) model: String,
-    pub(crate) repo: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -14,21 +13,12 @@ pub(crate) enum ModelsCliCommand {
     Default(ModelDefaultOptions),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelDefaultRepoMode {
-    Allow,
-    Reject,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelListOptions {
     pub(crate) provider: Option<String>,
 }
 
-pub(crate) fn parse_models_command(
-    args: &[String],
-    repo_mode: ModelDefaultRepoMode,
-) -> Result<ModelsCliCommand, CliError> {
+pub(crate) fn parse_models_command(args: &[String]) -> Result<ModelsCliCommand, CliError> {
     match args.split_first() {
         None => Ok(ModelsCliCommand::Help),
         Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
@@ -38,7 +28,7 @@ pub(crate) fn parse_models_command(
             Ok(ModelsCliCommand::List(parse_models_list_options(rest)?))
         }
         Some((command, rest)) if command == "default" => Ok(ModelsCliCommand::Default(
-            parse_model_default_options(rest, repo_mode)?,
+            parse_model_default_options(rest)?,
         )),
         _ => Err(CliError::Usage),
     }
@@ -56,7 +46,6 @@ pub(crate) fn parse_models_list_options(args: &[String]) -> Result<ModelListOpti
 
 pub(crate) fn parse_model_default_options(
     args: &[String],
-    repo_mode: ModelDefaultRepoMode,
 ) -> Result<ModelDefaultOptions, CliError> {
     let provider = flag_value(args, "--provider").ok_or(CliError::Usage)?;
     let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
@@ -64,24 +53,14 @@ pub(crate) fn parse_model_default_options(
     })?;
     let model = flag_value(args, "--model").ok_or(CliError::Usage)?;
     let model = normalize_model_id_for_provider(&provider, &model);
-    let repo = match (repo_mode, flag_value(args, "--repo")) {
-        (ModelDefaultRepoMode::Allow, repo) => repo.map(PathBuf::from),
-        (ModelDefaultRepoMode::Reject, None) => None,
-        (ModelDefaultRepoMode::Reject, Some(_)) => return Err(CliError::Usage),
-    };
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--provider" | "--model" => index += 2,
-            "--repo" if repo_mode == ModelDefaultRepoMode::Allow => index += 2,
             _ => return Err(CliError::Usage),
         }
     }
-    Ok(ModelDefaultOptions {
-        provider,
-        model,
-        repo,
-    })
+    Ok(ModelDefaultOptions { provider, model })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,17 +119,10 @@ pub(crate) struct CurrentDefaultModel {
 pub(crate) fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let model_paths = ModelPaths::new(&data_dir);
-    let evolution_paths = EvolutionPaths::new(&data_dir);
     let model_config = read_model_config(&model_paths).ok();
-    let evolution_config = read_config(&evolution_paths).ok();
     let provider = model_config
         .as_ref()
         .and_then(|config| config.default_provider.clone())
-        .or_else(|| {
-            evolution_config
-                .as_ref()
-                .and_then(|config| config.default_provider.clone())
-        })
         .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
     let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
         detail: format!("unknown provider `{provider}`"),
@@ -158,11 +130,6 @@ pub(crate) fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
     let configured_model = model_config
         .as_ref()
         .and_then(|config| config.default_model.clone())
-        .or_else(|| {
-            evolution_config
-                .as_ref()
-                .and_then(|config| config.default_model.clone())
-        })
         .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
     let model = effective_model_name(&provider, &configured_model);
     Ok(CurrentDefaultModel {
@@ -261,27 +228,6 @@ pub(crate) fn models_default_with_data_dir(
         default_model: Some(options.model),
     };
     write_json(&model_paths.config, &config)?;
-
-    if let Some(repo) = options.repo {
-        let evolution_paths = EvolutionPaths::new(data_dir);
-        evolution_paths.ensure()?;
-        let existing = read_config(&evolution_paths).ok();
-        let config = EvolutionConfig {
-            repo: repo.display().to_string(),
-            default_provider: config.default_provider.clone(),
-            default_model: config.default_model.clone(),
-        };
-        let config = if let Some(existing) = existing {
-            EvolutionConfig {
-                repo: config.repo,
-                default_provider: config.default_provider.or(existing.default_provider),
-                default_model: config.default_model.or(existing.default_model),
-            }
-        } else {
-            config
-        };
-        write_config(&evolution_paths, &config)?;
-    }
 
     println!(
         "default provider: {}",

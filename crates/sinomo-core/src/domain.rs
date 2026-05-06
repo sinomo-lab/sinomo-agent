@@ -656,7 +656,6 @@ pub enum EvolutionJobStatus {
     MutationFinished,
     Verified,
     AwaitingApproval,
-    #[serde(alias = "human-kept")]
     Approved,
     Revised,
     Restored,
@@ -672,7 +671,6 @@ pub enum EvolutionJobStatus {
     Shadowed,
     Canary,
     Promoted,
-    #[serde(alias = "human-rejected")]
     Rejected,
     BuildFailed,
     EvalFailed,
@@ -1003,16 +1001,5 @@ mod tests {
             CandidateDecisionOutcome::Restored.resulting_status(),
             EvolutionJobStatus::Restored
         );
-    }
-
-    #[test]
-    fn legacy_human_decision_statuses_deserialize_to_approval_states() {
-        let approved: EvolutionJobStatus =
-            serde_json::from_str("\"human-kept\"").expect("approved alias");
-        let rejected: EvolutionJobStatus =
-            serde_json::from_str("\"human-rejected\"").expect("rejected alias");
-
-        assert_eq!(approved, EvolutionJobStatus::Approved);
-        assert_eq!(rejected, EvolutionJobStatus::Rejected);
     }
 }

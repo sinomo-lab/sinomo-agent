@@ -59,9 +59,9 @@ pub(crate) fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, 
             Ok(EvolveCliCommand::Cleanup(rest.to_vec()))
         }
         Some((command, rest)) if command == "job" => Ok(EvolveCliCommand::Job(rest.to_vec())),
-        Some((command, rest)) if command == "models" => Ok(EvolveCliCommand::Models(
-            parse_models_command(rest, ModelDefaultRepoMode::Allow)?,
-        )),
+        Some((command, rest)) if command == "models" => {
+            Ok(EvolveCliCommand::Models(parse_models_command(rest)?))
+        }
         _ => Err(CliError::Usage),
     }
 }
@@ -1065,13 +1065,7 @@ pub(crate) fn resolve_job_from_args(
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     if let Some(job_id) = job_flag(args)? {
-        let job_path = paths.job_path(&job_id);
-        let record_path = if job_path.exists() {
-            job_path
-        } else {
-            paths.legacy_job_path(&job_id)
-        };
-        let record = read_stored_job(&record_path)?;
+        let record = read_stored_job(&paths.job_path(&job_id))?;
         return Ok((paths, record));
     }
 
@@ -1646,13 +1640,7 @@ pub(crate) fn evolve_evaluate(args: &[String]) -> Result<(), CliError> {
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let campaign = read_campaign(&paths, &options.campaign_id)?;
-    let job_path = paths.job_path(&options.job_id);
-    let record_path = if job_path.exists() {
-        job_path
-    } else {
-        paths.legacy_job_path(&options.job_id)
-    };
-    let record = read_stored_job(&record_path)?;
+    let record = read_stored_job(&paths.job_path(&options.job_id))?;
     let report = evolution_report_from_record(record)?;
     let update = evaluate_campaign_stage(StageEvaluationRequest {
         campaign,
@@ -1795,13 +1783,7 @@ pub(crate) fn evolve_status(args: &[String]) -> Result<(), CliError> {
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     if let Some(job_id) = job_flag(args)? {
-        let job_path = paths.job_path(&job_id);
-        let record_path = if job_path.exists() {
-            job_path
-        } else {
-            paths.legacy_job_path(&job_id)
-        };
-        let record = read_stored_job(&record_path)?;
+        let record = read_stored_job(&paths.job_path(&job_id))?;
         print_job_status(&record);
         return Ok(());
     }
@@ -1929,14 +1911,6 @@ pub(crate) fn evolve_cleanup(args: &[String]) -> Result<(), CliError> {
             path: job_dir.display().to_string(),
             detail: source.to_string(),
         })?;
-    } else {
-        let legacy_record = paths.legacy_job_path(&record.job.job_id);
-        if legacy_record.exists() {
-            fs::remove_file(&legacy_record).map_err(|source| CliError::Io {
-                path: legacy_record.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
     }
     let bundle_path = PathBuf::from(&record.bundle.bundle_path);
     if bundle_path.exists() && bundle_path != job_dir {

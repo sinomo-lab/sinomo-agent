@@ -85,10 +85,6 @@ impl EvolutionPaths {
     pub fn job_path(&self, job_id: &EvolutionJobId) -> PathBuf {
         self.job_dir(job_id).join("record.json")
     }
-
-    pub fn legacy_job_path(&self, job_id: &EvolutionJobId) -> PathBuf {
-        self.jobs.join(format!("{job_id}.json"))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

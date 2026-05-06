@@ -5,15 +5,15 @@ use super::{
     DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
     DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions,
     InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand,
-    ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    SelfRolloutPaths, UninstallOptions, authenticate_daemon_command,
-    build_cluster_raft_append_request, cli_command_requires_cluster_state, cluster_init_with_paths,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
-    cluster_raft_known_leader_id, cluster_sync_targets, daemon_lan_endpoint,
-    daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
-    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
-    handle_daemon_cluster_join, handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
+    InteractionSurfaceKind, ModelBackedInteractionHandler, ModelsCliCommand, ProviderCliCommand,
+    ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
+    UninstallOptions, authenticate_daemon_command, build_cluster_raft_append_request,
+    cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_sync_targets, daemon_lan_endpoint, daemon_package_version,
+    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
+    encode_cluster_join_invite, ensure_rollout_layout, handle_daemon_cluster_join,
+    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
     handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
     handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
     handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
@@ -225,55 +225,6 @@ fn install_parser_accepts_custom_daemon_ports() {
         parse_uninstall_options(&["--no-stop".to_string()]).expect("uninstall options"),
         UninstallOptions { stop: false }
     );
-}
-
-#[test]
-fn read_cluster_state_accepts_legacy_unsigned_join_invite() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-legacy-cluster-state-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    std::fs::write(
-        &paths.state,
-        r#"{
-  "cluster_id": "cluster_legacy",
-  "cluster_name": "legacy",
-  "local_node_id": "node_legacy",
-  "local_node_display_name": "legacy node",
-  "bootstrap": {
-    "joined": {
-      "invite": {
-        "invite_id": "invite_legacy",
-        "cluster_id": "cluster_legacy",
-        "cluster_name": "legacy",
-        "introducers": [],
-        "token_id": "token_legacy",
-        "expires_at": "2026-05-05T08:52:04Z",
-        "trust_domain": "trust.local",
-        "allowed_member_roles": ["learner"],
-        "signature": "local-bootstrap-signature-pending"
-      }
-    }
-  },
-  "term": 1,
-  "kv_revision": 0,
-  "members": [],
-  "initialized_at": "2026-05-04T08:16:46Z",
-  "updated_at": "2026-05-04T11:45:01Z"
-}"#,
-    )
-    .expect("write legacy state");
-
-    let state = read_cluster_state(&paths).expect("legacy cluster state");
-    assert_eq!(state.cluster_id.as_str(), "cluster_legacy");
-    assert!(matches!(state.bootstrap, ClusterBootstrap::Joined { .. }));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -2907,57 +2858,30 @@ fn usage_parser_accepts_provider_and_json() {
 
 #[test]
 fn model_default_parser_accepts_provider_model() {
-    let options = parse_model_default_options(
-        &[
-            "--provider".to_string(),
-            "openai-api".to_string(),
-            "--model".to_string(),
-            "gpt-5.5".to_string(),
-        ],
-        ModelDefaultRepoMode::Reject,
-    )
+    let options = parse_model_default_options(&[
+        "--provider".to_string(),
+        "openai-api".to_string(),
+        "--model".to_string(),
+        "gpt-5.5".to_string(),
+    ])
     .expect("options");
 
     assert_eq!(options.provider, "openai");
     assert_eq!(options.model, "gpt-5.5");
-    assert_eq!(options.repo, None);
 }
 
 #[test]
 fn model_default_parser_normalizes_nvidia_provider_qualified_model() {
-    let options = parse_model_default_options(
-        &[
-            "--provider".to_string(),
-            "nvidia".to_string(),
-            "--model".to_string(),
-            "nvidia/nvidia/nemotron-3-super-120b-a12b".to_string(),
-        ],
-        ModelDefaultRepoMode::Reject,
-    )
+    let options = parse_model_default_options(&[
+        "--provider".to_string(),
+        "nvidia".to_string(),
+        "--model".to_string(),
+        "nvidia/nvidia/nemotron-3-super-120b-a12b".to_string(),
+    ])
     .expect("options");
 
     assert_eq!(options.provider, "nvidia");
     assert_eq!(options.model, "nvidia/nemotron-3-super-120b-a12b");
-}
-
-#[test]
-fn evolve_model_default_parser_accepts_repo_for_compatibility() {
-    let options = parse_model_default_options(
-        &[
-            "--provider".to_string(),
-            "openai-api".to_string(),
-            "--model".to_string(),
-            "gpt-5.5".to_string(),
-            "--repo".to_string(),
-            "/repo".to_string(),
-        ],
-        ModelDefaultRepoMode::Allow,
-    )
-    .expect("options");
-
-    assert_eq!(options.provider, "openai");
-    assert_eq!(options.model, "gpt-5.5");
-    assert_eq!(options.repo.as_deref(), Some(std::path::Path::new("/repo")));
 }
 
 #[test]
@@ -2975,7 +2899,6 @@ fn models_default_writes_global_model_config() {
         super::ModelDefaultOptions {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
-            repo: None,
         },
         &data_dir,
     )
@@ -2994,15 +2917,12 @@ fn models_default_writes_global_model_config() {
 
 #[test]
 fn model_default_parser_requires_known_provider() {
-    let error = parse_model_default_options(
-        &[
-            "--provider".to_string(),
-            "unknown".to_string(),
-            "--model".to_string(),
-            "model".to_string(),
-        ],
-        ModelDefaultRepoMode::Reject,
-    )
+    let error = parse_model_default_options(&[
+        "--provider".to_string(),
+        "unknown".to_string(),
+        "--model".to_string(),
+        "model".to_string(),
+    ])
     .expect_err("unknown provider rejected");
 
     assert!(matches!(error, CliError::Parse { .. }));
@@ -3059,11 +2979,5 @@ fn evolution_paths_store_record_inside_job_folder() {
             .join("jobs")
             .join("evojob_layout")
             .join("record.json")
-    );
-    assert_eq!(
-        paths.legacy_job_path(&job_id),
-        root.join("evolution")
-            .join("jobs")
-            .join("evojob_layout.json")
     );
 }
