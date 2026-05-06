@@ -801,6 +801,90 @@ fn iroh_kv_exchange_round_trips_endpoint_records() {
 }
 
 #[test]
+fn iroh_endpoint_record_uses_stable_id_for_public_key() {
+    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+    let node_id = NodeId::new("node_mobile").expect("node");
+    let first = IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        endpoint_public_key: "iroh_public_key".to_string(),
+        direct_addresses: vec!["203.0.113.10:21356".to_string()],
+        relay_url: None,
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 50,
+    }
+    .endpoint();
+    let second = IrohEndpointRecord {
+        cluster_id,
+        node_id,
+        endpoint_public_key: "iroh_public_key".to_string(),
+        direct_addresses: vec!["203.0.113.11:21356".to_string()],
+        relay_url: None,
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 51,
+    }
+    .endpoint();
+
+    assert_eq!(first.endpoint_id, second.endpoint_id);
+    assert_ne!(first.address, second.address);
+}
+
+#[test]
+fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
+    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
+    let node_id = NodeId::new("node_mobile").expect("node");
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        node_id.clone(),
+        "mobile",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+    member.endpoints.push(ClusterEndpointRecord {
+        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_legacy_iroh")
+            .expect("legacy endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key?direct=203.0.113.9:21356".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 40,
+        last_observed_latency_ms: None,
+    });
+    let first = IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        endpoint_public_key: "iroh_public_key".to_string(),
+        direct_addresses: vec!["203.0.113.10:21356".to_string()],
+        relay_url: None,
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 50,
+    }
+    .endpoint();
+    let second = IrohEndpointRecord {
+        cluster_id,
+        node_id,
+        endpoint_public_key: "iroh_public_key".to_string(),
+        direct_addresses: vec!["203.0.113.11:21356".to_string()],
+        relay_url: None,
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 51,
+    }
+    .endpoint();
+
+    assert!(upsert_member_endpoint(&mut member, first));
+    assert!(upsert_member_endpoint(&mut member, second));
+
+    let iroh: Vec<_> = member
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.transport == ClusterTransportKind::Iroh)
+        .collect();
+    assert_eq!(iroh.len(), 1);
+    assert!(iroh[0].address.contains("203.0.113.11:21356"));
+}
+
+#[test]
 fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() {
     let node_id = NodeId::new("node_mobile").expect("node");
     let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {

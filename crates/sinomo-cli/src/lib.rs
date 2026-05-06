@@ -98,7 +98,7 @@ use sinomo_runtime::rollout::{
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
-use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
