@@ -6,6 +6,7 @@ pub(crate) enum ClusterCliCommand {
     Init(ClusterInitOptions),
     Invite(ClusterInviteOptions),
     Join(ClusterJoinOptions),
+    Role(ClusterRoleOptions),
     Status,
     Health,
     Doctor,
@@ -45,6 +46,12 @@ pub(crate) struct ClusterInviteOptions {
     pub(crate) output: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterRoleOptions {
+    pub(crate) node_id: NodeId,
+    pub(crate) role: ClusterMemberRole,
+}
+
 impl Default for ClusterInviteOptions {
     fn default() -> Self {
         Self {
@@ -69,6 +76,9 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         )),
         Some((command, rest)) if command == "join" => {
             Ok(ClusterCliCommand::Join(parse_cluster_join_options(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "role" | "set-role" | "promote") => {
+            Ok(ClusterCliCommand::Role(parse_cluster_role_options(rest)?))
         }
         Some((command, [])) if command == "status" => Ok(ClusterCliCommand::Status),
         Some((command, [])) if matches!(command.as_str(), "health" | "nodes") => {
@@ -213,6 +223,31 @@ pub(crate) fn parse_cluster_join_options(args: &[String]) -> Result<ClusterJoinO
     Ok(options)
 }
 
+pub(crate) fn parse_cluster_role_options(args: &[String]) -> Result<ClusterRoleOptions, CliError> {
+    let [node_id, role] = args else {
+        return Err(CliError::Usage);
+    };
+    Ok(ClusterRoleOptions {
+        node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
+            detail: format!("invalid node id `{node_id}`: {source}"),
+        })?,
+        role: parse_cluster_member_role(role)?,
+    })
+}
+
+pub(crate) fn parse_cluster_member_role(role: &str) -> Result<ClusterMemberRole, CliError> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "voter" => Ok(ClusterMemberRole::Voter),
+        "learner" => Ok(ClusterMemberRole::Learner),
+        "non-voting" | "non_voting" | "nonvoting" => Ok(ClusterMemberRole::NonVoting),
+        _ => Err(CliError::Parse {
+            detail: format!(
+                "invalid cluster member role `{role}`; expected voter, learner, or non-voting"
+            ),
+        }),
+    }
+}
+
 pub(crate) fn parse_cluster_id(cluster_id: &str) -> Result<ClusterId, CliError> {
     ClusterId::new(cluster_id.to_string()).map_err(|source| CliError::Parse {
         detail: format!("invalid cluster id `{cluster_id}`: {source}"),
@@ -248,6 +283,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Init(options) => cluster_init(options),
         ClusterCliCommand::Invite(options) => cluster_invite(options),
         ClusterCliCommand::Join(options) => cluster_join(options),
+        ClusterCliCommand::Role(options) => cluster_role(options),
         ClusterCliCommand::Status => cluster_status(),
         ClusterCliCommand::Health => cluster_health(),
         ClusterCliCommand::Doctor => cluster_doctor(),
@@ -1225,27 +1261,57 @@ pub(crate) fn extract_invite_from_join_command(raw: &str) -> &str {
 }
 
 pub(crate) fn encode_cluster_join_invite(invite: &ClusterJoinInvite) -> Result<String, CliError> {
-    let bytes = serde_json::to_vec(invite).map_err(|source| CliError::Json {
-        path: "cluster invite".to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(format!(
-        "{SINOMO_JOIN_URI_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(bytes)
-    ))
+    let mut params = Vec::new();
+    push_invite_param(&mut params, "invite_id", invite.invite_id.as_str());
+    push_invite_param(&mut params, "cluster_id", invite.cluster_id.as_str());
+    if let Some(cluster_name) = invite.cluster_name.as_deref() {
+        push_invite_param(&mut params, "cluster_name", cluster_name);
+    }
+    push_invite_param(
+        &mut params,
+        "cluster_public_key",
+        &invite.cluster_public_key,
+    );
+    push_invite_param(&mut params, "invitation_secret", &invite.invitation_secret);
+    push_invite_param(&mut params, "token_id", &invite.token_id);
+    push_invite_param(
+        &mut params,
+        "expires_at",
+        &invite
+            .expires_at
+            .format(&Rfc3339)
+            .map_err(|source| CliError::Parse {
+                detail: format!("invalid invite expiry timestamp: {source}"),
+            })?,
+    );
+    push_invite_param(&mut params, "trust_domain", invite.trust_domain.as_str());
+    for role in &invite.allowed_member_roles {
+        push_invite_param(&mut params, "role", &query_enum(role)?);
+    }
+    push_invite_param(
+        &mut params,
+        "issuer_node_id",
+        invite.issuer_node_id.as_str(),
+    );
+    push_invite_param(&mut params, "issuer_public_key", &invite.issuer_public_key);
+    for channel in &invite.communication_channels {
+        push_invite_param_raw(&mut params, "channel", &encode_invite_channel(channel)?);
+    }
+    for endpoint in &invite.introducers {
+        push_invite_param_raw(
+            &mut params,
+            "introducer",
+            &encode_invite_endpoint(endpoint)?,
+        );
+    }
+    push_invite_param(&mut params, "signature", &invite.signature);
+
+    Ok(format!("{SINOMO_JOIN_URI_PREFIX}?{}", params.join("&")))
 }
 
 pub(crate) fn decode_cluster_join_invite(raw: &str) -> Result<ClusterJoinInvite, CliError> {
     if let Some(payload) = raw.strip_prefix(SINOMO_JOIN_URI_PREFIX) {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(payload)
-            .map_err(|source| CliError::Parse {
-                detail: format!("invalid cluster invite encoding: {source}"),
-            })?;
-        serde_json::from_slice(&bytes).map_err(|source| CliError::Json {
-            path: "cluster invite".to_string(),
-            detail: source.to_string(),
-        })
+        decode_cluster_join_invite_uri(payload)
     } else if raw.trim_start().starts_with('{') {
         serde_json::from_str(raw).map_err(|source| CliError::Json {
             path: "cluster invite".to_string(),
@@ -1258,6 +1324,279 @@ pub(crate) fn decode_cluster_join_invite(raw: &str) -> Result<ClusterJoinInvite,
                     .to_string(),
         })
     }
+}
+
+fn push_invite_param(params: &mut Vec<String>, key: &str, value: &str) {
+    params.push(format!("{key}={}", percent_encode_invite_value(value)));
+}
+
+fn push_invite_param_raw(params: &mut Vec<String>, key: &str, value: &str) {
+    params.push(format!("{key}={value}"));
+}
+
+fn decode_cluster_join_invite_uri(payload: &str) -> Result<ClusterJoinInvite, CliError> {
+    let params = parse_invite_query(payload.strip_prefix('?').unwrap_or(payload))?;
+    let invite_id =
+        sinomo_runtime::core::ClusterInviteId::new(&required_invite_param(&params, "invite_id")?)
+            .map_err(|source| CliError::Parse {
+            detail: format!("invalid invite_id: {source}"),
+        })?;
+    let cluster_id =
+        ClusterId::new(&required_invite_param(&params, "cluster_id")?).map_err(|source| {
+            CliError::Parse {
+                detail: format!("invalid cluster_id: {source}"),
+            }
+        })?;
+    let cluster_name =
+        optional_invite_param(&params, "cluster_name")?.filter(|value| !value.is_empty());
+    let expires_at =
+        OffsetDateTime::parse(&required_invite_param(&params, "expires_at")?, &Rfc3339).map_err(
+            |source| CliError::Parse {
+                detail: format!("invalid invite expires_at: {source}"),
+            },
+        )?;
+    let trust_domain =
+        TrustDomain::new(&required_invite_param(&params, "trust_domain")?).map_err(|source| {
+            CliError::Parse {
+                detail: format!("invalid trust_domain: {source}"),
+            }
+        })?;
+    let allowed_member_roles = params
+        .iter()
+        .filter(|(key, _)| key == "role")
+        .map(|(_, value)| {
+            percent_decode_invite_value(value)
+                .and_then(|value| parse_query_enum::<ClusterMemberRole>(&value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let issuer_node_id =
+        NodeId::new(&required_invite_param(&params, "issuer_node_id")?).map_err(|source| {
+            CliError::Parse {
+                detail: format!("invalid issuer_node_id: {source}"),
+            }
+        })?;
+    let communication_channels = params
+        .iter()
+        .filter(|(key, _)| key == "channel")
+        .map(|(_, value)| decode_invite_channel(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let introducers = params
+        .iter()
+        .filter(|(key, _)| key == "introducer")
+        .map(|(_, value)| decode_invite_endpoint(value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ClusterJoinInvite {
+        invite_id,
+        cluster_id,
+        cluster_name,
+        cluster_public_key: required_invite_param(&params, "cluster_public_key")?,
+        invitation_secret: required_invite_param(&params, "invitation_secret")?,
+        communication_channels,
+        introducers,
+        token_id: required_invite_param(&params, "token_id")?,
+        expires_at,
+        trust_domain,
+        allowed_member_roles,
+        issuer_node_id,
+        issuer_public_key: required_invite_param(&params, "issuer_public_key")?,
+        signature: required_invite_param(&params, "signature")?,
+    })
+}
+
+fn required_invite_param(params: &[(String, String)], key: &str) -> Result<String, CliError> {
+    params
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| percent_decode_invite_value(value))
+        .transpose()?
+        .ok_or_else(|| CliError::Parse {
+            detail: format!("cluster invite is missing `{key}`"),
+        })
+}
+
+fn optional_invite_param(
+    params: &[(String, String)],
+    key: &str,
+) -> Result<Option<String>, CliError> {
+    params
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| percent_decode_invite_value(value))
+        .transpose()
+}
+
+fn parse_invite_query(payload: &str) -> Result<Vec<(String, String)>, CliError> {
+    if payload.trim().is_empty() {
+        return Err(CliError::Parse {
+            detail: "cluster invite URI has an empty query".to_string(),
+        });
+    }
+    payload
+        .split('&')
+        .map(|part| {
+            let (key, value) = part.split_once('=').ok_or_else(|| CliError::Parse {
+                detail: format!("cluster invite query parameter `{part}` has no value"),
+            })?;
+            Ok((percent_decode_invite_value(key)?, value.to_string()))
+        })
+        .collect()
+}
+
+fn encode_invite_channel(channel: &ClusterInvitationChannel) -> Result<String, CliError> {
+    let mut parts = endpoint_query_parts(&channel.endpoint)?;
+    parts.push(channel.node_public_key.clone());
+    Ok(join_invite_parts(&parts))
+}
+
+fn decode_invite_channel(value: &str) -> Result<ClusterInvitationChannel, CliError> {
+    let parts = split_invite_parts(value)?;
+    if parts.len() != 9 {
+        return Err(CliError::Parse {
+            detail: format!(
+                "cluster invite channel expected 9 fields, found {}",
+                parts.len()
+            ),
+        });
+    }
+    Ok(ClusterInvitationChannel {
+        endpoint: decode_invite_endpoint_parts(&parts[..8])?,
+        node_public_key: parts[8].clone(),
+    })
+}
+
+fn encode_invite_endpoint(endpoint: &ClusterEndpointRecord) -> Result<String, CliError> {
+    Ok(join_invite_parts(&endpoint_query_parts(endpoint)?))
+}
+
+fn decode_invite_endpoint(value: &str) -> Result<ClusterEndpointRecord, CliError> {
+    let parts = split_invite_parts(value)?;
+    if parts.len() != 8 {
+        return Err(CliError::Parse {
+            detail: format!(
+                "cluster invite endpoint expected 8 fields, found {}",
+                parts.len()
+            ),
+        });
+    }
+    decode_invite_endpoint_parts(&parts)
+}
+
+fn endpoint_query_parts(endpoint: &ClusterEndpointRecord) -> Result<Vec<String>, CliError> {
+    Ok(vec![
+        endpoint.endpoint_id.as_str().to_string(),
+        endpoint.node_id.as_str().to_string(),
+        query_enum(&endpoint.transport)?,
+        endpoint.address.clone(),
+        query_enum(&endpoint.source)?,
+        query_enum(&endpoint.privacy)?,
+        endpoint.priority.to_string(),
+        endpoint
+            .last_observed_latency_ms
+            .map(|latency| latency.to_string())
+            .unwrap_or_default(),
+    ])
+}
+
+fn decode_invite_endpoint_parts(parts: &[String]) -> Result<ClusterEndpointRecord, CliError> {
+    let priority = parts[6].parse::<u16>().map_err(|source| CliError::Parse {
+        detail: format!("invalid invite endpoint priority `{}`: {source}", parts[6]),
+    })?;
+    let last_observed_latency_ms = if parts[7].is_empty() {
+        None
+    } else {
+        Some(parts[7].parse::<u32>().map_err(|source| CliError::Parse {
+            detail: format!("invalid invite endpoint latency `{}`: {source}", parts[7]),
+        })?)
+    };
+    Ok(ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::new(&parts[0]).map_err(|source| CliError::Parse {
+            detail: format!("invalid invite endpoint_id `{}`: {source}", parts[0]),
+        })?,
+        node_id: NodeId::new(&parts[1]).map_err(|source| CliError::Parse {
+            detail: format!("invalid invite endpoint node_id `{}`: {source}", parts[1]),
+        })?,
+        transport: parse_query_enum(&parts[2])?,
+        address: parts[3].clone(),
+        source: parse_query_enum(&parts[4])?,
+        privacy: parse_query_enum(&parts[5])?,
+        priority,
+        last_observed_latency_ms,
+    })
+}
+
+fn query_enum<T: Serialize>(value: &T) -> Result<String, CliError> {
+    serde_json::to_string(value)
+        .map(|value| value.trim_matches('"').to_string())
+        .map_err(|source| CliError::Json {
+            path: "cluster invite enum".to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn parse_query_enum<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, CliError> {
+    serde_json::from_str(&format!("\"{value}\"")).map_err(|source| CliError::Parse {
+        detail: format!("invalid cluster invite enum `{value}`: {source}"),
+    })
+}
+
+fn join_invite_parts(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| percent_encode_invite_value(part))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn split_invite_parts(value: &str) -> Result<Vec<String>, CliError> {
+    value
+        .split(',')
+        .map(percent_decode_invite_value)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn percent_encode_invite_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b':' | b'@') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn percent_decode_invite_value(value: &str) -> Result<String, CliError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(CliError::Parse {
+                    detail: format!("invalid percent escape in cluster invite value `{value}`"),
+                });
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|source| {
+                CliError::Parse {
+                    detail: format!("invalid percent escape in cluster invite value: {source}"),
+                }
+            })?;
+            decoded.push(
+                u8::from_str_radix(hex, 16).map_err(|source| CliError::Parse {
+                    detail: format!("invalid percent escape `%{hex}`: {source}"),
+                })?,
+            );
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|source| CliError::Parse {
+        detail: format!("cluster invite value is not valid UTF-8: {source}"),
+    })
 }
 
 pub(crate) fn cluster_status() -> Result<(), CliError> {
@@ -1652,6 +1991,57 @@ pub(crate) fn cluster_peers() -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    let mut state = read_cluster_state(&paths)?;
+    let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == options.node_id)
+    else {
+        return Err(CliError::Parse {
+            detail: format!("cluster member `{}` was not found", options.node_id),
+        });
+    };
+    let previous_role = member.role.clone();
+    if previous_role == options.role {
+        println!(
+            "cluster member {} already has role {}",
+            options.node_id,
+            format_member_role(&options.role)
+        );
+        return Ok(());
+    }
+
+    apply_cluster_member_role(member, options.role.clone(), OffsetDateTime::now_utc());
+    state.updated_at = OffsetDateTime::now_utc();
+    sync_cluster_state_to_kv(&paths, &state)?;
+    network::write_cluster_state(&paths, &state)?;
+    println!(
+        "cluster member {} role changed: {} -> {}",
+        options.node_id,
+        format_member_role(&previous_role),
+        format_member_role(&options.role)
+    );
+    Ok(())
+}
+
+pub(crate) fn apply_cluster_member_role(
+    member: &mut ClusterMemberRecord,
+    role: ClusterMemberRole,
+    timestamp: OffsetDateTime,
+) {
+    member.role = role.clone();
+    member.state = match role {
+        ClusterMemberRole::Voter => ClusterMemberState::Active,
+        ClusterMemberRole::Learner => ClusterMemberState::Learner,
+        ClusterMemberRole::NonVoting => ClusterMemberState::NonVoting,
+    };
+    member.capabilities = main_daemon_capabilities(&role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.updated_at = timestamp;
 }
 
 pub(crate) fn cluster_peer_members(
