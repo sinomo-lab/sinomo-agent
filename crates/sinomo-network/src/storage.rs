@@ -321,6 +321,7 @@ pub fn open_cluster_raft_kv_node(
             kv: snapshot,
         })?;
     }
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
     Ok(node)
 }
 
@@ -430,12 +431,19 @@ pub fn compact_cluster_raft_node_if_needed(
 ) -> Result<(), NetworkError> {
     const MAX_UNCOMPACTED_LOG_ENTRIES: usize = 1024;
     const MAX_WAL_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
-    let wal_path = cluster_raft_wal_paths(paths, node.node_id()).wal;
-    let wal_bytes = fs::metadata(&wal_path)
+    let wal_paths = cluster_raft_wal_paths(paths, node.node_id());
+    let wal_bytes = fs::metadata(&wal_paths.wal)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    if node.log().len() > MAX_UNCOMPACTED_LOG_ENTRIES || wal_bytes > MAX_WAL_BYTES {
+    let snapshot_bytes = fs::metadata(&wal_paths.snapshot)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if node.log().len() > MAX_UNCOMPACTED_LOG_ENTRIES
+        || wal_bytes > MAX_WAL_BYTES
+        || snapshot_bytes > MAX_SNAPSHOT_BYTES
+    {
         node.save_snapshot()?;
     }
     Ok(())
