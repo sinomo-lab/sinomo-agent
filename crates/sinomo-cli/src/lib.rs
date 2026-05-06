@@ -252,6 +252,7 @@ const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_millis(500);
+const DAEMON_CLUSTER_PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const DAEMON_CLUSTER_RAFT_INTERVAL: Duration = Duration::from_secs(2);
 const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(5);

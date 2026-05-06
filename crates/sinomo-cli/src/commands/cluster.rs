@@ -1430,6 +1430,7 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub(crate) connectivity: std::collections::BTreeMap<String, ClusterConnectivityProbeState>,
     pub(crate) environment_id: Option<String>,
     pub(crate) tick: u64,
+    pub(crate) last_publish: Instant,
     pub(crate) last_discovery: Instant,
     pub(crate) last_sync: Instant,
     pub(crate) last_probe: Instant,
@@ -1448,6 +1449,7 @@ impl ClusterNetworkMaintenance {
             connectivity: std::collections::BTreeMap::new(),
             environment_id: None,
             tick: 0,
+            last_publish: Instant::now() - DAEMON_CLUSTER_PUBLISH_INTERVAL,
             last_discovery: Instant::now() - DAEMON_CLUSTER_DISCOVERY_INTERVAL,
             last_sync: Instant::now() - DAEMON_CLUSTER_RAFT_INTERVAL,
             last_probe: Instant::now() - DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL,
@@ -1479,43 +1481,58 @@ impl ClusterNetworkMaintenance {
         );
         assign_local_node_public_keys(&cluster_paths, &mut state)?;
 
-        self.process_discovery(&mut state);
-        sync_cluster_state_to_kv(&cluster_paths, &state)?;
-        let local_network_info = build_local_cluster_network_info(
-            &state,
-            &state.local_node_id,
-            OffsetDateTime::now_utc(),
-        );
-        if self
-            .environment_id
-            .as_ref()
-            .is_some_and(|known| known != &local_network_info.environment_id)
-        {
-            self.connectivity.clear();
-        }
-        self.environment_id = Some(local_network_info.environment_id.clone());
-        let mut snapshot =
-            network::sync_cluster_network_info_to_kv(&cluster_paths, local_network_info)?;
-        if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(paths)? {
-            snapshot = status_snapshot;
-        }
-        let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
-        if matches!(
-            probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
-            DaemonProbeStatus::Running(_)
-        ) {
-            if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(&shadow_paths)? {
-                snapshot = status_snapshot;
+        let discovered = self.process_discovery(&mut state);
+        let now = Instant::now();
+        let publish_due = now.duration_since(self.last_publish) >= DAEMON_CLUSTER_PUBLISH_INTERVAL;
+        let probe_due =
+            now.duration_since(self.last_probe) >= DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL;
+        let sync_due = now.duration_since(self.last_sync) >= DAEMON_CLUSTER_RAFT_INTERVAL;
+        let mut snapshot = if publish_due || probe_due || sync_due {
+            Some(read_cluster_kv_snapshot(&cluster_paths)?)
+        } else {
+            None
+        };
+
+        if publish_due {
+            self.last_publish = now;
+            sync_cluster_state_to_kv(&cluster_paths, &state)?;
+            let local_network_info = build_local_cluster_network_info(
+                &state,
+                &state.local_node_id,
+                OffsetDateTime::now_utc(),
+            );
+            if self
+                .environment_id
+                .as_ref()
+                .is_some_and(|known| known != &local_network_info.environment_id)
+            {
+                self.connectivity.clear();
+            }
+            self.environment_id = Some(local_network_info.environment_id.clone());
+            snapshot = Some(network::sync_cluster_network_info_to_kv(
+                &cluster_paths,
+                local_network_info,
+            )?);
+            if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(paths)? {
+                snapshot = Some(status_snapshot);
+            }
+            let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+            if matches!(
+                probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
+                DaemonProbeStatus::Running(_)
+            ) {
+                if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(&shadow_paths)? {
+                    snapshot = Some(status_snapshot);
+                }
             }
         }
 
-        let now = Instant::now();
         if now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL {
             self.last_discovery = now;
             self.announce(&state);
         }
 
-        if now.duration_since(self.last_probe) >= DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL {
+        if probe_due {
             self.last_probe = now;
             let records = self.probe_connectivity(&state);
             let _ = network::sync_cluster_connectivity_records_to_kv(
@@ -1523,27 +1540,37 @@ impl ClusterNetworkMaintenance {
                 &state.local_node_id,
                 records,
             )?;
-            snapshot =
-                network::expire_cluster_network_records(&cluster_paths, OffsetDateTime::now_utc())?;
+            snapshot = Some(network::expire_cluster_network_records(
+                &cluster_paths,
+                OffsetDateTime::now_utc(),
+            )?);
         }
 
-        if now.duration_since(self.last_sync) >= DAEMON_CLUSTER_RAFT_INTERVAL {
+        if sync_due {
             self.last_sync = now;
-            sync_cluster_with_reachable_peers(&cluster_paths, &mut state, &mut snapshot)?;
+            let snapshot = snapshot
+                .as_mut()
+                .expect("snapshot is loaded when sync is due");
+            sync_cluster_with_reachable_peers(&cluster_paths, &mut state, snapshot)?;
         }
 
-        network::write_cluster_state(&cluster_paths, &state)?;
-        write_cluster_kv_snapshot(&cluster_paths, &snapshot)?;
+        if discovered || publish_due || probe_due || sync_due {
+            network::write_cluster_state(&cluster_paths, &state)?;
+        }
+        if let Some(snapshot) = snapshot.as_ref() {
+            write_cluster_kv_snapshot(&cluster_paths, snapshot)?;
+        }
         Ok(())
     }
 
-    fn process_discovery(&mut self, state: &mut ClusterBootstrapState) {
+    fn process_discovery(&mut self, state: &mut ClusterBootstrapState) -> bool {
         let Some(discovery) = &self.discovery else {
-            return;
+            return false;
         };
         let Ok(advertisements) = discovery.drain() else {
-            return;
+            return false;
         };
+        let mut changed = false;
         for advertisement in advertisements {
             if advertisement.cluster_id != state.cluster_id
                 || advertisement.node_id == state.local_node_id
@@ -1558,10 +1585,12 @@ impl ClusterNetworkMaintenance {
                     .find(|member| member.node_id == record.endpoint.node_id)
                 {
                     network::upsert_member_endpoint(member, record.endpoint);
+                    changed = true;
                 }
             }
         }
         self.discovery_cache.expire_after_tick(self.tick);
+        changed
     }
 
     fn announce(&self, state: &ClusterBootstrapState) {

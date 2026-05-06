@@ -705,7 +705,7 @@ pub(crate) fn run_daemon_with_paths(
             }
         }
 
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(100));
     }
     Ok(())
 }
