@@ -43,7 +43,9 @@ An uninitialized node is an orphan. Orphan nodes must not run distributed operat
 
 `sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves the node into pending learner state until the cluster control plane accepts it.
 
-`sinomo cluster invite` creates a portable `sinomo-join://v1/...` invite. When the main daemon is running on a wildcard bind address such as `0.0.0.0`, invite generation tries to add the host's LAN address before local loopback endpoints. If the command warns that only local-only introducers were found, or if the machine has multiple interfaces, the initialized machine should include an address reachable from the remote host:
+`sinomo cluster invite` creates a portable `sinomo-join://v1/...` invite. The URI is intentionally small because invites are short-lived. It carries only the cluster's current public key, the invitation ID, the invitation secret, and communication channels the invited node can use to reach the cluster. Full invite metadata, expiry, allowed roles, issuer identity, and policy stay in the cluster KV under the invitation ID and are verified by the contacted introducer during join.
+
+When the main daemon is running on a wildcard bind address such as `0.0.0.0`, invite generation tries to add the host's LAN address before local loopback endpoints. If the command warns that only local-only introducers were found, or if the machine has multiple interfaces, the initialized machine should include an address reachable from the remote host:
 
 ```text
 sinomo cluster invite --introducer 192.168.1.10:21353 --output join.txt
@@ -133,17 +135,12 @@ The first node is both control-plane voter and data-plane participant. Additiona
 
 Invite payload fields:
 
-- `cluster_id`
-- optional `cluster_name`
-- introducer endpoints
-- join token ID
-- token expiry
-- allowed trust domain
-- allowed node roles
-- optional relay or signaling endpoints
-- issuer node ID
-- issuer public key
-- Ed25519 signature from an active voter or cluster authority over the full invite payload
+- `public_key`: the cluster's current public key for invite challenge verification.
+- `invite_id`: the invitation ID the invited node uses when contacting an introducer.
+- `secret`: the short-lived secret presented to prove possession of the invite.
+- repeated `channel`: communication channels containing introducer node ID, transport, address, and public key.
+
+The persisted invitation record is larger than the URI. It contains the cluster identity, expiry, allowed roles, issuer identity, signature, and any other policy needed by introducers to validate and register the join.
 
 Join tokens are one-time or short-lived. A leaked token should not grant ongoing authority after the token expires or after a successful use.
 
@@ -441,7 +438,7 @@ Phase 0, local cluster state:
 - Add `sinomo cluster` CLI. Implemented in `crates/sinomo-cli`.
 - Persist local cluster state. Implemented as `$SINOMO_DATA_DIR/cluster/state.json`.
 - Add orphan guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
-- Require signed join material. Implemented by requiring `sinomo cluster join` inputs to be signed `sinomo-join://v1` payloads, invite JSON, or files containing one of those forms.
+- Require short-lived join material. Implemented by storing signed invitation records in cluster KV while the portable `sinomo-join://v1` URI carries only the public key, invite ID, secret, and communication channels needed to reach an introducer.
 
 Phase 1, contracts:
 

@@ -898,6 +898,7 @@ pub(crate) fn default_invite_introducers(
         push_unique_introducer(&mut introducers, endpoint);
     }
     sort_default_invite_introducers(&mut introducers);
+    compact_default_invite_introducers(&mut introducers);
     introducers
 }
 
@@ -971,6 +972,38 @@ pub(crate) fn sort_default_invite_introducers(introducers: &mut [ClusterEndpoint
             endpoint.address.clone(),
         )
     });
+}
+
+pub(crate) fn compact_default_invite_introducers(introducers: &mut Vec<ClusterEndpointRecord>) {
+    let remote_direct = introducers
+        .iter()
+        .filter(|endpoint| {
+            is_remote_usable_invite_endpoint(endpoint)
+                && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
+        })
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !remote_direct.is_empty() {
+        *introducers = remote_direct;
+        return;
+    }
+
+    let remote_iroh = introducers
+        .iter()
+        .filter(|endpoint| {
+            is_remote_usable_invite_endpoint(endpoint)
+                && matches!(endpoint.transport, ClusterTransportKind::Iroh)
+        })
+        .take(1)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !remote_iroh.is_empty() {
+        *introducers = remote_iroh;
+        return;
+    }
+
+    introducers.truncate(1);
 }
 
 pub(crate) fn is_remote_usable_invite_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
@@ -1052,8 +1085,10 @@ pub(crate) fn cluster_join_with_paths(
     let local_node_id = options.node_id.unwrap_or_else(NodeId::generate);
     let timestamp = OffsetDateTime::now_utc();
     let invite = parse_cluster_join_invite_argument(&options.invite)?;
-    verify_cluster_join_invite_signature(&invite)?;
-    if invite.expires_at <= timestamp {
+    if invite_has_embedded_signature(&invite) {
+        verify_cluster_join_invite_signature(&invite)?;
+    }
+    if invite.expires_at != OffsetDateTime::UNIX_EPOCH && invite.expires_at <= timestamp {
         return Err(CliError::Parse {
             detail: format!(
                 "cluster invite expired at {}",
@@ -1062,6 +1097,7 @@ pub(crate) fn cluster_join_with_paths(
         });
     }
     if let Some(cluster_id) = &options.cluster_id
+        && invite_has_embedded_cluster_identity(&invite)
         && cluster_id != &invite.cluster_id
     {
         return Err(CliError::Parse {
@@ -1071,7 +1107,10 @@ pub(crate) fn cluster_join_with_paths(
             ),
         });
     }
-    let cluster_id = invite.cluster_id.clone();
+    let cluster_id = options
+        .cluster_id
+        .clone()
+        .unwrap_or_else(|| invite.cluster_id.clone());
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "cluster paths have no data directory parent".to_string(),
@@ -1107,8 +1146,10 @@ pub(crate) fn cluster_join_retry_with_paths(
 ) -> Result<(), CliError> {
     let timestamp = OffsetDateTime::now_utc();
     let invite = parse_cluster_join_invite_argument(&options.invite)?;
-    verify_cluster_join_invite_signature(&invite)?;
-    if invite.cluster_id != state.cluster_id {
+    if invite_has_embedded_signature(&invite) {
+        verify_cluster_join_invite_signature(&invite)?;
+    }
+    if invite_has_embedded_cluster_identity(&invite) && invite.cluster_id != state.cluster_id {
         return Err(CliError::Parse {
             detail: format!(
                 "join retry invite cluster `{}` does not match local cluster `{}`",
@@ -1134,7 +1175,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
     invite: &ClusterJoinInvite,
     paths: Option<&ClusterPaths>,
 ) -> Result<(), CliError> {
-    if invite.introducers.is_empty() {
+    if invite.communication_channels.is_empty() && invite.introducers.is_empty() {
         return Ok(());
     }
     let request = ClusterJoinRegistrationRequest {
@@ -1319,49 +1360,12 @@ pub(crate) fn extract_invite_from_join_command(raw: &str) -> &str {
 
 pub(crate) fn encode_cluster_join_invite(invite: &ClusterJoinInvite) -> Result<String, CliError> {
     let mut params = Vec::new();
+    push_invite_param(&mut params, "public_key", &invite.cluster_public_key);
     push_invite_param(&mut params, "invite_id", invite.invite_id.as_str());
-    push_invite_param(&mut params, "cluster_id", invite.cluster_id.as_str());
-    if let Some(cluster_name) = invite.cluster_name.as_deref() {
-        push_invite_param(&mut params, "cluster_name", cluster_name);
-    }
-    push_invite_param(
-        &mut params,
-        "cluster_public_key",
-        &invite.cluster_public_key,
-    );
-    push_invite_param(&mut params, "invitation_secret", &invite.invitation_secret);
-    push_invite_param(&mut params, "token_id", &invite.token_id);
-    push_invite_param(
-        &mut params,
-        "expires_at",
-        &invite
-            .expires_at
-            .format(&Rfc3339)
-            .map_err(|source| CliError::Parse {
-                detail: format!("invalid invite expiry timestamp: {source}"),
-            })?,
-    );
-    push_invite_param(&mut params, "trust_domain", invite.trust_domain.as_str());
-    for role in &invite.allowed_member_roles {
-        push_invite_param(&mut params, "role", &query_enum(role)?);
-    }
-    push_invite_param(
-        &mut params,
-        "issuer_node_id",
-        invite.issuer_node_id.as_str(),
-    );
-    push_invite_param(&mut params, "issuer_public_key", &invite.issuer_public_key);
+    push_invite_param(&mut params, "secret", &invite.invitation_secret);
     for channel in &invite.communication_channels {
         push_invite_param_raw(&mut params, "channel", &encode_invite_channel(channel)?);
     }
-    for endpoint in &invite.introducers {
-        push_invite_param_raw(
-            &mut params,
-            "introducer",
-            &encode_invite_endpoint(endpoint)?,
-        );
-    }
-    push_invite_param(&mut params, "signature", &invite.signature);
 
     Ok(format!("{SINOMO_JOIN_URI_PREFIX}?{}", params.join("&")))
 }
@@ -1398,26 +1402,30 @@ fn decode_cluster_join_invite_uri(payload: &str) -> Result<ClusterJoinInvite, Cl
             .map_err(|source| CliError::Parse {
             detail: format!("invalid invite_id: {source}"),
         })?;
-    let cluster_id =
-        ClusterId::new(&required_invite_param(&params, "cluster_id")?).map_err(|source| {
-            CliError::Parse {
-                detail: format!("invalid cluster_id: {source}"),
-            }
-        })?;
+    let cluster_id = ClusterId::new(
+        &optional_invite_param(&params, "cluster_id")?
+            .unwrap_or_else(|| pending_invite_cluster_id().to_string()),
+    )
+    .map_err(|source| CliError::Parse {
+        detail: format!("invalid cluster_id: {source}"),
+    })?;
     let cluster_name =
         optional_invite_param(&params, "cluster_name")?.filter(|value| !value.is_empty());
-    let expires_at =
-        OffsetDateTime::parse(&required_invite_param(&params, "expires_at")?, &Rfc3339).map_err(
-            |source| CliError::Parse {
+    let expires_at = optional_invite_param(&params, "expires_at")?
+        .map(|value| {
+            OffsetDateTime::parse(&value, &Rfc3339).map_err(|source| CliError::Parse {
                 detail: format!("invalid invite expires_at: {source}"),
-            },
-        )?;
-    let trust_domain =
-        TrustDomain::new(&required_invite_param(&params, "trust_domain")?).map_err(|source| {
-            CliError::Parse {
-                detail: format!("invalid trust_domain: {source}"),
-            }
-        })?;
+            })
+        })
+        .transpose()?
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let trust_domain = TrustDomain::new(
+        &optional_invite_param(&params, "trust_domain")?
+            .unwrap_or_else(|| "trust.local".to_string()),
+    )
+    .map_err(|source| CliError::Parse {
+        detail: format!("invalid trust_domain: {source}"),
+    })?;
     let allowed_member_roles = params
         .iter()
         .filter(|(key, _)| key == "role")
@@ -1426,12 +1434,13 @@ fn decode_cluster_join_invite_uri(payload: &str) -> Result<ClusterJoinInvite, Cl
                 .and_then(|value| parse_query_enum::<ClusterMemberRole>(&value))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let issuer_node_id =
-        NodeId::new(&required_invite_param(&params, "issuer_node_id")?).map_err(|source| {
-            CliError::Parse {
-                detail: format!("invalid issuer_node_id: {source}"),
-            }
-        })?;
+    let issuer_node_id = NodeId::new(
+        &optional_invite_param(&params, "issuer_node_id")?
+            .unwrap_or_else(|| "node_pending_invite".to_string()),
+    )
+    .map_err(|source| CliError::Parse {
+        detail: format!("invalid issuer_node_id: {source}"),
+    })?;
     let communication_channels = params
         .iter()
         .filter(|(key, _)| key == "channel")
@@ -1447,17 +1456,20 @@ fn decode_cluster_join_invite_uri(payload: &str) -> Result<ClusterJoinInvite, Cl
         invite_id,
         cluster_id,
         cluster_name,
-        cluster_public_key: required_invite_param(&params, "cluster_public_key")?,
-        invitation_secret: required_invite_param(&params, "invitation_secret")?,
+        cluster_public_key: required_invite_param_any(
+            &params,
+            &["public_key", "cluster_public_key"],
+        )?,
+        invitation_secret: required_invite_param_any(&params, &["secret", "invitation_secret"])?,
         communication_channels,
         introducers,
-        token_id: required_invite_param(&params, "token_id")?,
+        token_id: optional_invite_param(&params, "token_id")?.unwrap_or_default(),
         expires_at,
         trust_domain,
         allowed_member_roles,
         issuer_node_id,
-        issuer_public_key: required_invite_param(&params, "issuer_public_key")?,
-        signature: required_invite_param(&params, "signature")?,
+        issuer_public_key: optional_invite_param(&params, "issuer_public_key")?.unwrap_or_default(),
+        signature: optional_invite_param(&params, "signature")?.unwrap_or_default(),
     })
 }
 
@@ -1470,6 +1482,32 @@ fn required_invite_param(params: &[(String, String)], key: &str) -> Result<Strin
         .ok_or_else(|| CliError::Parse {
             detail: format!("cluster invite is missing `{key}`"),
         })
+}
+
+fn required_invite_param_any(
+    params: &[(String, String)],
+    keys: &[&str],
+) -> Result<String, CliError> {
+    for key in keys {
+        if let Some(value) = optional_invite_param(params, key)? {
+            return Ok(value);
+        }
+    }
+    Err(CliError::Parse {
+        detail: format!("cluster invite is missing `{}`", keys.join("` or `")),
+    })
+}
+
+fn pending_invite_cluster_id() -> &'static str {
+    "cluster_pending_join"
+}
+
+fn invite_has_embedded_cluster_identity(invite: &ClusterJoinInvite) -> bool {
+    invite.cluster_id.as_str() != pending_invite_cluster_id()
+}
+
+fn invite_has_embedded_signature(invite: &ClusterJoinInvite) -> bool {
+    !invite.signature.trim().is_empty()
 }
 
 fn optional_invite_param(
@@ -1501,17 +1539,38 @@ fn parse_invite_query(payload: &str) -> Result<Vec<(String, String)>, CliError> 
 }
 
 fn encode_invite_channel(channel: &ClusterInvitationChannel) -> Result<String, CliError> {
-    let mut parts = endpoint_query_parts(&channel.endpoint)?;
-    parts.push(channel.node_public_key.clone());
-    Ok(join_invite_parts(&parts))
+    Ok(join_invite_parts(&[
+        channel.endpoint.node_id.as_str().to_string(),
+        query_enum(&channel.endpoint.transport)?,
+        channel.endpoint.address.clone(),
+        channel.node_public_key.clone(),
+    ]))
 }
 
 fn decode_invite_channel(value: &str) -> Result<ClusterInvitationChannel, CliError> {
     let parts = split_invite_parts(value)?;
+    if parts.len() == 4 {
+        let node_id = NodeId::new(&parts[0]).map_err(|source| CliError::Parse {
+            detail: format!("invalid invite channel node_id `{}`: {source}", parts[0]),
+        })?;
+        return Ok(ClusterInvitationChannel {
+            endpoint: ClusterEndpointRecord {
+                endpoint_id: ClusterEndpointId::generate(),
+                node_id,
+                transport: parse_query_enum(&parts[1])?,
+                address: parts[2].clone(),
+                source: ClusterEndpointSource::Static,
+                privacy: ClusterEndpointPrivacy::InternetDirect,
+                priority: 0,
+                last_observed_latency_ms: None,
+            },
+            node_public_key: parts[3].clone(),
+        });
+    }
     if parts.len() != 9 {
         return Err(CliError::Parse {
             detail: format!(
-                "cluster invite channel expected 9 fields, found {}",
+                "cluster invite channel expected 4 fields, found {}",
                 parts.len()
             ),
         });
@@ -1520,10 +1579,6 @@ fn decode_invite_channel(value: &str) -> Result<ClusterInvitationChannel, CliErr
         endpoint: decode_invite_endpoint_parts(&parts[..8])?,
         node_public_key: parts[8].clone(),
     })
-}
-
-fn encode_invite_endpoint(endpoint: &ClusterEndpointRecord) -> Result<String, CliError> {
-    Ok(join_invite_parts(&endpoint_query_parts(endpoint)?))
 }
 
 fn decode_invite_endpoint(value: &str) -> Result<ClusterEndpointRecord, CliError> {
@@ -1537,22 +1592,6 @@ fn decode_invite_endpoint(value: &str) -> Result<ClusterEndpointRecord, CliError
         });
     }
     decode_invite_endpoint_parts(&parts)
-}
-
-fn endpoint_query_parts(endpoint: &ClusterEndpointRecord) -> Result<Vec<String>, CliError> {
-    Ok(vec![
-        endpoint.endpoint_id.as_str().to_string(),
-        endpoint.node_id.as_str().to_string(),
-        query_enum(&endpoint.transport)?,
-        endpoint.address.clone(),
-        query_enum(&endpoint.source)?,
-        query_enum(&endpoint.privacy)?,
-        endpoint.priority.to_string(),
-        endpoint
-            .last_observed_latency_ms
-            .map(|latency| latency.to_string())
-            .unwrap_or_default(),
-    ])
 }
 
 fn decode_invite_endpoint_parts(parts: &[String]) -> Result<ClusterEndpointRecord, CliError> {

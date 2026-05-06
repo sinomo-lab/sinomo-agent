@@ -208,7 +208,8 @@ pub fn verify_cluster_invite_challenge_proof(
 ) -> Result<(), DaemonError> {
     if proof.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL
         || proof.invite_id != invite.invite_id
-        || proof.cluster_id != invite.cluster_id
+        || (proof.cluster_id != invite.cluster_id
+            && invite.cluster_id.as_str() != "cluster_pending_join")
         || proof.challenge != expected_challenge
     {
         return Err(DaemonError::AuthDenied);
@@ -426,38 +427,36 @@ fn authorize_cluster_join_signer(
         .iter()
         .find(|member| member.node_public_key == public_key)
         .ok_or(DaemonError::AuthDenied)?;
-    if !request
-        .invite
-        .allowed_member_roles
-        .contains(&requested_member.role)
-    {
-        return Err(DaemonError::AuthDenied);
-    }
-
-    verify_cluster_join_invite_signature(&request.invite)?;
-    if request.invite.expires_at <= OffsetDateTime::now_utc() {
-        return Err(DaemonError::AuthExpired);
-    }
-
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let state = sinomo_network::read_cluster_state(&cluster_paths)?;
-    if request.invite.cluster_id != state.cluster_id {
+
+    let persisted_invite = read_active_cluster_invite(&cluster_paths, &request.invite.invite_id)?;
+    if !persisted_invite
+        .allowed_member_roles
+        .contains(&requested_member.role)
+    {
+        return Err(DaemonError::AuthDenied);
+    }
+    verify_cluster_join_invite_signature(&persisted_invite)?;
+    if persisted_invite.expires_at <= OffsetDateTime::now_utc() {
+        return Err(DaemonError::AuthExpired);
+    }
+    if persisted_invite.cluster_id != state.cluster_id {
         return Err(DaemonError::AuthDenied);
     }
     if !state.members.iter().any(|member| {
-        member.node_id == request.invite.issuer_node_id
-            && member.node_public_key == request.invite.issuer_public_key
+        member.node_id == persisted_invite.issuer_node_id
+            && member.node_public_key == persisted_invite.issuer_public_key
             && member.state.is_authorized()
     }) {
         return Err(DaemonError::AuthDenied);
     }
 
-    let persisted_invite = read_active_cluster_invite(&cluster_paths, &request.invite.invite_id)?;
-    if persisted_invite != request.invite {
+    if request.invite.cluster_public_key != persisted_invite.cluster_public_key {
         return Err(DaemonError::AuthDenied);
     }
     if request.invitation_secret.trim().is_empty()

@@ -1648,7 +1648,7 @@ pub(crate) fn handle_daemon_cluster_join(
                     }
                 })
             })?;
-    if persisted_invite != request.invite
+    if request.invite.cluster_public_key != persisted_invite.cluster_public_key
         || request.invitation_secret.trim().is_empty()
         || request.invitation_secret != persisted_invite.invitation_secret
     {
@@ -1659,7 +1659,7 @@ pub(crate) fn handle_daemon_cluster_join(
             kv_snapshot: None,
         });
     }
-    if let Err(error) = verify_cluster_join_invite_signature(&request.invite) {
+    if let Err(error) = verify_cluster_join_invite_signature(&persisted_invite) {
         return Ok(ClusterJoinRegistrationResponse {
             accepted: false,
             detail: format!("invite signature rejected: {error}"),
@@ -1668,15 +1668,15 @@ pub(crate) fn handle_daemon_cluster_join(
         });
     }
     if !state.members.iter().any(|member| {
-        member.node_id == request.invite.issuer_node_id
-            && member.node_public_key == request.invite.issuer_public_key
+        member.node_id == persisted_invite.issuer_node_id
+            && member.node_public_key == persisted_invite.issuer_public_key
             && member.state.is_authorized()
     }) {
         return Ok(ClusterJoinRegistrationResponse {
             accepted: false,
             detail: format!(
                 "invite issuer {} is not an authorized cluster member",
-                request.invite.issuer_node_id
+                persisted_invite.issuer_node_id
             ),
             state,
             kv_snapshot: None,
@@ -1703,25 +1703,23 @@ pub(crate) fn handle_daemon_cluster_join(
             OffsetDateTime::now_utc(),
         );
     }
-    if request.invite.cluster_id != state.cluster_id {
+    if persisted_invite.cluster_id != state.cluster_id {
         return Ok(ClusterJoinRegistrationResponse {
             accepted: false,
             detail: format!(
                 "invite cluster `{}` does not match introducer cluster `{}`",
-                request.invite.cluster_id, state.cluster_id
+                persisted_invite.cluster_id, state.cluster_id
             ),
             state,
             kv_snapshot: None,
         });
     }
-    if request.invite.expires_at != OffsetDateTime::UNIX_EPOCH
-        && request.invite.expires_at <= OffsetDateTime::now_utc()
-    {
+    if persisted_invite.expires_at <= OffsetDateTime::now_utc() {
         return Ok(ClusterJoinRegistrationResponse {
             accepted: false,
             detail: format!(
                 "invite expired at {}",
-                format_rfc3339(request.invite.expires_at)
+                format_rfc3339(persisted_invite.expires_at)
             ),
             state,
             kv_snapshot: None,
@@ -1730,7 +1728,7 @@ pub(crate) fn handle_daemon_cluster_join(
     if request
         .members
         .iter()
-        .any(|member| !request.invite.allowed_member_roles.contains(&member.role))
+        .any(|member| !persisted_invite.allowed_member_roles.contains(&member.role))
     {
         return Ok(ClusterJoinRegistrationResponse {
             accepted: false,

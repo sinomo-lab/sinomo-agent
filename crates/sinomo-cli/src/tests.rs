@@ -1300,7 +1300,7 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
     );
 
     let mut tampered = request;
-    tampered.invite.token_id.push_str("_tampered");
+    tampered.invite.cluster_public_key.push_str("_tampered");
     let tampered_payload = sinomo_runtime::network::encode_object_text_payload(&tampered)
         .expect("tampered join request");
     let tampered_signed = sign_daemon_command_from_data_dir(
@@ -1391,7 +1391,7 @@ fn cluster_join_records_pending_learner_state() {
     cluster_join_with_paths(
         ClusterJoinOptions {
             invite: signed_test_invite_uri(&root, "cluster_joined", "node_host"),
-            cluster_id: None,
+            cluster_id: Some(ClusterId::new("cluster_joined").expect("cluster")),
             node_id: Some(NodeId::new("node_joiner").expect("node")),
             name: "joiner".to_string(),
         },
@@ -1454,19 +1454,22 @@ fn cluster_invite_generates_portable_join_payload() {
     assert!(
         rendered
             .uri
-            .starts_with(&format!("{}?invite_id=", super::SINOMO_JOIN_URI_PREFIX))
+            .starts_with(&format!("{}?public_key=", super::SINOMO_JOIN_URI_PREFIX))
     );
-    assert!(rendered.uri.contains("&cluster_id=cluster_invite"));
-    assert!(rendered.uri.contains("&cluster_name=invite%20cluster"));
+    assert!(rendered.uri.contains("&invite_id="));
+    assert!(rendered.uri.contains("&secret="));
     assert!(rendered.uri.contains("&channel="));
-    assert!(rendered.uri.contains("&introducer="));
     assert!(rendered.uri.contains("192.168.1.10:21353"));
+    assert!(!rendered.uri.contains("&cluster_id="));
+    assert!(!rendered.uri.contains("&cluster_name="));
+    assert!(!rendered.uri.contains("&introducer="));
+    assert!(!rendered.uri.contains("&signature="));
     assert!(!rendered.uri.contains("%7B"));
     assert_eq!(
         parsed.cluster_id,
-        ClusterId::new("cluster_invite").expect("cluster")
+        ClusterId::new("cluster_pending_join").expect("cluster")
     );
-    assert_eq!(parsed.cluster_name.as_deref(), Some("invite cluster"));
+    assert_eq!(parsed.cluster_name, None);
     assert!(!parsed.cluster_public_key.trim().is_empty());
     assert!(!parsed.invitation_secret.trim().is_empty());
     assert_eq!(parsed.communication_channels.len(), 1);
@@ -1478,13 +1481,17 @@ fn cluster_invite_generates_portable_join_payload() {
         parsed.communication_channels[0].node_public_key,
         parsed.cluster_public_key
     );
-    assert_eq!(parsed.introducers.len(), 1);
-    assert_eq!(parsed.introducers[0].address, "192.168.1.10:21353");
-    assert_eq!(
+    assert!(parsed.introducers.is_empty());
+    let persisted_invite =
         super::network::read_cluster_invitation_from_kv(&paths, &parsed.invite_id)
-            .expect("published invite"),
-        parsed
+            .expect("published invite");
+    assert_eq!(persisted_invite, rendered.invite);
+    assert_eq!(parsed.invite_id, persisted_invite.invite_id);
+    assert_eq!(
+        parsed.cluster_public_key,
+        persisted_invite.cluster_public_key
     );
+    assert_eq!(parsed.invitation_secret, persisted_invite.invitation_secret);
     let invite_state_entry = super::network::read_cluster_kv_store(&paths)
         .expect("cluster kv store")
         .get(&super::network::cluster_invitation_state_key(
@@ -1501,9 +1508,22 @@ fn cluster_invite_generates_portable_join_payload() {
         rendered.join_command
     );
     assert!(rendered.join_command.starts_with("sinomo cluster join "));
+    let parsed_from_command =
+        parse_cluster_join_invite_argument(&rendered.join_command).expect("parse join command");
+    assert_eq!(parsed_from_command.invite_id, parsed.invite_id);
     assert_eq!(
-        parse_cluster_join_invite_argument(&rendered.join_command).expect("parse join command"),
-        parsed
+        parsed_from_command.cluster_public_key,
+        parsed.cluster_public_key
+    );
+    assert_eq!(
+        parsed_from_command.invitation_secret,
+        parsed.invitation_secret
+    );
+    assert_eq!(
+        parsed_from_command.communication_channels[0]
+            .endpoint
+            .address,
+        parsed.communication_channels[0].endpoint.address
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -1675,7 +1695,7 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
     cluster_join_with_paths(
         ClusterJoinOptions {
             invite: offline_uri,
-            cluster_id: None,
+            cluster_id: Some(ClusterId::new("cluster_remote").expect("cluster")),
             node_id: Some(NodeId::new("node_remote").expect("node")),
             name: "remote".to_string(),
         },
@@ -1688,7 +1708,7 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
         state.cluster_id,
         ClusterId::new("cluster_remote").expect("cluster")
     );
-    assert_eq!(state.cluster_name, "remote cluster");
+    assert_eq!(state.cluster_name, "remote");
     assert!(state.members.iter().any(|member| {
         member.node_id == NodeId::new("node_remote").expect("node")
             && member.role == ClusterMemberRole::Learner
@@ -1752,7 +1772,7 @@ fn introducer_records_joined_members_and_returns_peer_view() {
     cluster_join_with_paths(
         ClusterJoinOptions {
             invite: offline_uri,
-            cluster_id: None,
+            cluster_id: Some(ClusterId::new("cluster_register").expect("cluster")),
             node_id: Some(NodeId::new("node_remote").expect("node")),
             name: "remote".to_string(),
         },
@@ -2399,7 +2419,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     cluster_join_with_paths(
         ClusterJoinOptions {
             invite: encode_cluster_join_invite(&invite).expect("invite uri"),
-            cluster_id: None,
+            cluster_id: Some(cluster_id.clone()),
             node_id: Some(NodeId::new("node_peer").expect("node")),
             name: "peer".to_string(),
         },
