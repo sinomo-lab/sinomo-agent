@@ -719,8 +719,7 @@ pub(crate) fn print_existing_install_rollout_hint(layout: &InstallLayout) {
         println!("managed source status unavailable: git was not found");
     }
     println!(
-        "roll out this installed binary to the cluster with: sinomo rollout cluster --binary \"{}\"",
-        layout.binary.display()
+        "roll out the managed source to the cluster with: sinomo rollout cluster --remote-build"
     );
 }
 
