@@ -781,10 +781,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
     cluster: Option<&DaemonClusterStatus>,
     label: &str,
 ) {
-    if env::var("SINOMO_ENABLE_IROH")
-        .ok()
-        .is_none_or(|value| value != "1")
-    {
+    if env::var("SINOMO_ENABLE_IROH").ok().as_deref() == Some("0") {
         return;
     }
     let Some(cluster) = cluster.cloned() else {
