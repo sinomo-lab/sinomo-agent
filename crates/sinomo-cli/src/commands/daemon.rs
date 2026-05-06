@@ -233,7 +233,9 @@ pub(crate) fn run_shadow_daemon_with_paths(
     let mut supervised_main: Option<Child> = None;
     let mut main_restart_suppressed = false;
     let mut pending_rollout: Option<ShadowMainRolloutMonitor> = None;
-    let mut last_main_probe = Instant::now() - Duration::from_secs(2);
+    let main_probe_interval = Duration::from_secs(10);
+    let shadow_idle_interval = Duration::from_secs(1);
+    let mut last_main_probe = Instant::now() - main_probe_interval;
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
     loop {
         let now = Instant::now();
@@ -264,7 +266,7 @@ pub(crate) fn run_shadow_daemon_with_paths(
             }
         }
 
-        if now.duration_since(last_main_probe) >= Duration::from_secs(2) {
+        if now.duration_since(last_main_probe) >= main_probe_interval {
             main_probe_status = probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT);
             last_main_probe = now;
         }
@@ -432,7 +434,7 @@ pub(crate) fn run_shadow_daemon_with_paths(
             }
         }
 
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(shadow_idle_interval);
     }
     Ok(())
 }
