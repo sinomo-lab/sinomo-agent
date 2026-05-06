@@ -1309,7 +1309,7 @@ pub(crate) fn send_cluster_join_registration_over_iroh(
     let proof_response = network::send_daemon_command_to_cluster_endpoint(
         endpoint,
         &format!("INVITE_HELLO {challenge_payload}"),
-        DAEMON_JOIN_TIMEOUT,
+        IROH_DAEMON_JOIN_TIMEOUT,
     )?;
     let proof_payload = proof_response
         .trim()
@@ -1318,8 +1318,11 @@ pub(crate) fn send_cluster_join_registration_over_iroh(
     let proof: ClusterInviteChallengeProof = network::decode_object_text_payload(proof_payload)?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
     let signed = sign_daemon_command_for_local_node(&format!("CLUSTER_JOIN {payload}"))?;
-    let response =
-        network::send_daemon_command_to_cluster_endpoint(endpoint, &signed, DAEMON_JOIN_TIMEOUT)?;
+    let response = network::send_daemon_command_to_cluster_endpoint(
+        endpoint,
+        &signed,
+        IROH_DAEMON_JOIN_TIMEOUT,
+    )?;
     network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 

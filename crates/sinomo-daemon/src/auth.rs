@@ -222,10 +222,11 @@ pub fn verify_cluster_invite_challenge_proof(
     if skew > DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS {
         return Err(DaemonError::AuthExpired);
     }
-    if !invite.communication_channels.iter().any(|channel| {
-        channel.endpoint.node_id.as_str() == proof.responder_node_id
-            && channel.node_public_key == proof.responder_public_key
-    }) {
+    if !invite
+        .communication_channels
+        .iter()
+        .any(|channel| channel.node_public_key == proof.responder_public_key)
+    {
         return Err(DaemonError::AuthDenied);
     }
     let public_key = URL_SAFE_NO_PAD
