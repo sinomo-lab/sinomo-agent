@@ -465,10 +465,7 @@ pub(crate) fn publish_cluster_invitation_via_voter(
         invite: invite.clone(),
     };
     let mut failures = Vec::new();
-    for endpoint in cluster_sync_targets_with_connectivity(paths, state)
-        .into_iter()
-        .filter(|endpoint| cluster_raft_node_is_voter(state, &endpoint.node_id))
-    {
+    for endpoint in cluster_invite_publish_targets(paths, state) {
         match send_cluster_invite_publish(&endpoint, &request) {
             Ok(response) if response.accepted => {
                 if let Some(snapshot) = response.kv_snapshot {
@@ -496,6 +493,43 @@ pub(crate) fn publish_cluster_invitation_via_voter(
             }
         ),
     })
+}
+
+pub(crate) fn cluster_invite_publish_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut targets = Vec::new();
+    for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
+        if !cluster_raft_node_is_voter(state, &endpoint.node_id) {
+            continue;
+        }
+        let key = cluster_invite_publish_target_key(&endpoint);
+        if seen.insert(key) {
+            targets.push(endpoint);
+        }
+    }
+    targets
+}
+
+pub(crate) fn cluster_invite_publish_target_key(endpoint: &ClusterEndpointRecord) -> String {
+    let address = if endpoint.transport == ClusterTransportKind::Iroh {
+        endpoint
+            .address
+            .strip_prefix("iroh://")
+            .unwrap_or(endpoint.address.as_str())
+            .split('?')
+            .next()
+            .unwrap_or(endpoint.address.as_str())
+            .to_string()
+    } else {
+        endpoint.address.clone()
+    };
+    format!(
+        "{}\t{:?}\t{}",
+        endpoint.node_id, endpoint.transport, address
+    )
 }
 
 pub(crate) fn publish_local_members_via_voter(
@@ -2937,7 +2971,7 @@ pub(crate) fn send_cluster_invite_publish(
     let response = send_daemon_command_to_endpoint(
         endpoint,
         &format!("CLUSTER_INVITE_PUBLISH {payload}"),
-        DAEMON_JOIN_TIMEOUT,
+        CLUSTER_HEALTH_PROBE_TIMEOUT,
     )?;
     network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }

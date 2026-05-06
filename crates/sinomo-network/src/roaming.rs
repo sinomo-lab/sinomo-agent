@@ -626,6 +626,7 @@ pub fn send_iroh_daemon_command_raw(
     command: &str,
     timeout: Duration,
 ) -> Result<String, NetworkError> {
+    let timeout = timeout.max(IROH_DAEMON_ONLINE_TIMEOUT);
     let record = iroh_endpoint_record_from_address(
         address,
         &ClusterId::new("cluster_iroh_dial_placeholder").expect("static cluster id"),
@@ -638,16 +639,9 @@ pub fn send_iroh_daemon_command_raw(
             operation: "start iroh client runtime".to_string(),
             detail: source.to_string(),
         })?;
-    let response = runtime.block_on(async move {
-        tokio::time::timeout(timeout, send_iroh_daemon_command_raw_async(record, command)).await
-    });
-    match response {
-        Ok(result) => result,
-        Err(_) => Err(NetworkError::Io {
-            operation: "send iroh daemon command".to_string(),
-            detail: format!("timed out after {}s", timeout.as_secs()),
-        }),
-    }
+    let response = runtime.block_on(send_iroh_daemon_command_raw_async(record, command, timeout));
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    response
 }
 
 #[cfg(not(feature = "iroh-transport"))]
@@ -666,50 +660,127 @@ pub fn send_iroh_daemon_command_raw(
 async fn send_iroh_daemon_command_raw_async(
     record: IrohEndpointRecord,
     command: &str,
+    timeout: Duration,
 ) -> Result<String, NetworkError> {
     let remote_addr = iroh_endpoint_addr_from_record(&record)?;
-    let endpoint = iroh::Endpoint::bind(iroh::endpoint::presets::N0)
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "bind iroh client endpoint".to_string(),
-            detail: source.to_string(),
-        })?;
-    let connection = endpoint
-        .connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes())
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "connect iroh endpoint".to_string(),
-            detail: source.to_string(),
-        })?;
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "open iroh daemon stream".to_string(),
-            detail: source.to_string(),
-        })?;
-    send.write_all(format!("{command}\n").as_bytes())
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "write iroh daemon command".to_string(),
-            detail: source.to_string(),
-        })?;
+    let started = std::time::Instant::now();
+    let remaining = || {
+        timeout
+            .checked_sub(started.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(1))
+    };
+    let endpoint = match tokio::time::timeout(
+        remaining(),
+        iroh::Endpoint::bind(iroh::endpoint::presets::N0),
+    )
+    .await
+    {
+        Ok(Ok(endpoint)) => endpoint,
+        Ok(Err(source)) => {
+            return Err(NetworkError::Io {
+                operation: "bind iroh client endpoint".to_string(),
+                detail: source.to_string(),
+            });
+        }
+        Err(_) => return Err(iroh_daemon_command_timeout_error(timeout)),
+    };
+    let connection = match tokio::time::timeout(
+        remaining(),
+        endpoint.connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(source)) => {
+            close_iroh_endpoint(&endpoint).await;
+            return Err(NetworkError::Io {
+                operation: "connect iroh endpoint".to_string(),
+                detail: source.to_string(),
+            });
+        }
+        Err(_) => {
+            close_iroh_endpoint(&endpoint).await;
+            return Err(iroh_daemon_command_timeout_error(timeout));
+        }
+    };
+    let (mut send, mut recv) = match tokio::time::timeout(remaining(), connection.open_bi()).await {
+        Ok(Ok(streams)) => streams,
+        Ok(Err(source)) => {
+            connection.close(0_u8.into(), b"open stream failed");
+            close_iroh_endpoint(&endpoint).await;
+            return Err(NetworkError::Io {
+                operation: "open iroh daemon stream".to_string(),
+                detail: source.to_string(),
+            });
+        }
+        Err(_) => {
+            connection.close(0_u8.into(), b"open stream timed out");
+            close_iroh_endpoint(&endpoint).await;
+            return Err(iroh_daemon_command_timeout_error(timeout));
+        }
+    };
+    match tokio::time::timeout(
+        remaining(),
+        send.write_all(format!("{command}\n").as_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(source)) => {
+            connection.close(0_u8.into(), b"write failed");
+            close_iroh_endpoint(&endpoint).await;
+            return Err(NetworkError::Io {
+                operation: "write iroh daemon command".to_string(),
+                detail: source.to_string(),
+            });
+        }
+        Err(_) => {
+            connection.close(0_u8.into(), b"write timed out");
+            close_iroh_endpoint(&endpoint).await;
+            return Err(iroh_daemon_command_timeout_error(timeout));
+        }
+    }
     send.finish().map_err(|source| NetworkError::Io {
         operation: "finish iroh daemon command".to_string(),
         detail: source.to_string(),
     })?;
-    let response = recv
-        .read_to_end(IROH_DAEMON_COMMAND_MAX_BYTES)
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "read iroh daemon response".to_string(),
-            detail: source.to_string(),
-        })?;
+    let response =
+        match tokio::time::timeout(remaining(), recv.read_to_end(IROH_DAEMON_COMMAND_MAX_BYTES))
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(source)) => {
+                connection.close(0_u8.into(), b"read failed");
+                close_iroh_endpoint(&endpoint).await;
+                return Err(NetworkError::Io {
+                    operation: "read iroh daemon response".to_string(),
+                    detail: source.to_string(),
+                });
+            }
+            Err(_) => {
+                connection.close(0_u8.into(), b"read timed out");
+                close_iroh_endpoint(&endpoint).await;
+                return Err(iroh_daemon_command_timeout_error(timeout));
+            }
+        };
     connection.close(0_u8.into(), b"done");
-    endpoint.close().await;
+    close_iroh_endpoint(&endpoint).await;
     String::from_utf8(response).map_err(|source| NetworkError::Serialization {
         detail: source.to_string(),
     })
+}
+
+#[cfg(feature = "iroh-transport")]
+fn iroh_daemon_command_timeout_error(timeout: Duration) -> NetworkError {
+    NetworkError::Io {
+        operation: "send iroh daemon command".to_string(),
+        detail: format!("timed out after {}ms", timeout.as_millis()),
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
+async fn close_iroh_endpoint(endpoint: &iroh::Endpoint) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), endpoint.close()).await;
 }
 
 #[cfg(feature = "iroh-transport")]
