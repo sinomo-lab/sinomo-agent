@@ -282,7 +282,7 @@ fn merge_bundle_head_into_managed(
             stderr: String::from_utf8_lossy(&fetch.stderr).trim().to_string(),
         });
     }
-    run_git(&paths.source_repo, &["merge", "--no-edit", "FETCH_HEAD"])?;
+    update_managed_repo_to_fetched_head(&paths.source_repo)?;
     remove_all_git_remotes(&paths.source_repo)
 }
 
@@ -301,7 +301,36 @@ fn merge_repo_head(
     let remove_result = run_git(destination_repo, &["remote", "remove", remote_name]);
     fetch_result?;
     remove_result?;
-    run_git(destination_repo, &["merge", "--no-edit", "FETCH_HEAD"]).map(|_| ())
+    update_managed_repo_to_fetched_head(destination_repo)
+}
+
+fn update_managed_repo_to_fetched_head(repo: &Path) -> Result<(), RolloutError> {
+    if run_git(repo, &["merge", "--ff-only", "FETCH_HEAD"]).is_ok() {
+        return Ok(());
+    }
+
+    ensure_clean_git_worktree(repo)?;
+    let current = git_one_line(repo, &["rev-parse", "HEAD"])?;
+    if !current.is_empty() {
+        run_git(
+            repo,
+            &["branch", "-f", "sinomo-managed-source-backup", &current],
+        )?;
+    }
+    run_git(repo, &["reset", "--hard", "FETCH_HEAD"]).map(|_| ())
+}
+
+fn ensure_clean_git_worktree(repo: &Path) -> Result<(), RolloutError> {
+    let status = run_git(repo, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(RolloutError::Process {
+            command: format!("git -C {} status --porcelain", repo.display()),
+            status: 1,
+            stderr: "managed source worktree has local changes; refusing to overwrite".to_string(),
+        })
+    }
 }
 
 fn remove_all_git_remotes(repo: &Path) -> Result<(), RolloutError> {
@@ -463,6 +492,52 @@ mod tests {
 
         assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
         assert!(!status.has_external_remotes);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn deploy_managed_source_bundle_replaces_diverged_clean_managed_repo() {
+        let root = unique_temp("sinomo-rollout-source-bundle-diverged");
+        let external = root.join("external");
+        let data = root.join("data");
+        let bundle = root.join("source.bundle");
+        fs::create_dir_all(&external).expect("external dir");
+        run_git_for_test(&external, &["init"]);
+        run_git_for_test(&external, &["config", "user.email", "test@example.invalid"]);
+        run_git_for_test(&external, &["config", "user.name", "Sinomo Test"]);
+        fs::write(external.join("Cargo.toml"), "[workspace]\n").expect("cargo");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "initial"]);
+
+        let paths = SelfRolloutPaths::new(&data);
+        deploy_managed_source_repo(&paths, &external).expect("initial deploy");
+        fs::write(paths.source_repo.join("local.txt"), "managed-only\n").expect("local file");
+        run_git_for_test(&paths.source_repo, &["add", "-A"]);
+        run_git_for_test(&paths.source_repo, &["commit", "-m", "managed-only"]);
+        let diverged_head =
+            git_one_line(&paths.source_repo, &["rev-parse", "HEAD"]).expect("diverged head");
+
+        fs::write(
+            external.join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\n",
+        )
+        .expect("cargo update");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "second"]);
+        let expected_head = git_one_line(&external, &["rev-parse", "HEAD"]).expect("expected head");
+
+        create_source_repo_bundle(&external, &bundle).expect("source bundle");
+        deploy_managed_source_bundle(&paths, &bundle).expect("bundle deploy");
+        let status = managed_source_status(&paths).expect("status");
+        let backup = git_one_line(
+            &paths.source_repo,
+            &["rev-parse", "sinomo-managed-source-backup"],
+        )
+        .expect("backup");
+
+        assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
+        assert_eq!(backup, diverged_head);
+        assert!(!paths.source_repo.join("local.txt").exists());
         fs::remove_dir_all(root).ok();
     }
 
