@@ -7,30 +7,30 @@ use super::{
     InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
     InteractionSurfaceKind, ModelBackedInteractionHandler, ModelsCliCommand, ProviderCliCommand,
     ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
-    UninstallOptions, authenticate_daemon_command, build_cluster_raft_append_request,
-    cli_command_requires_cluster_state, cluster_has_local_quorum, cluster_init_with_paths,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
-    cluster_raft_known_leader_id, cluster_sync_targets, daemon_lan_endpoint,
-    daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
-    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
-    handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
-    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn,
-    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
-    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
-    handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
-    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
-    invite_communication_channels, invite_introducer_endpoint,
-    invite_introducer_endpoint_from_state, is_terminal_status, main_daemon_capabilities,
-    models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
+    UninstallOptions, authenticate_daemon_command,
+    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
+    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_sync_targets, daemon_lan_endpoint, daemon_package_version,
+    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
+    encode_cluster_join_invite, ensure_rollout_layout, handle_daemon_cluster_join,
+    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
+    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
+    handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
+    handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
+    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
+    invite_channels_for_join_registration, invite_communication_channels,
+    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
+    main_daemon_capabilities, models_default_with_data_dir, normalize_model_provider,
+    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_models_list_options, parse_propose_options, parse_provider_command,
     parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
     read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
     read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
     run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
     send_daemon_command_raw, sign_cluster_join_invite, sign_daemon_command_from_data_dir,
-    stage_rollout_main_activation, uninstall_with_layout, write_json,
+    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout, write_json,
 };
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
@@ -305,7 +305,7 @@ fn cluster_peer_members_preserves_pending_local_member() {
         OffsetDateTime::now_utc(),
     ));
     write_json(&paths.state, &state).expect("write joined state");
-    super::network::sync_cluster_state_to_kv(&paths, &state).expect("sync kv");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync kv");
     std::fs::write(&paths.kv_snapshot, "{\"revision\":1}trailing").expect("corrupt kv");
 
     let members = cluster_peer_members(&paths).expect("peer members");
@@ -662,6 +662,56 @@ fn cluster_init_persists_local_cluster_state() {
         cluster_raft_known_leader_id(&paths, &state).expect("reelected leader"),
         Some(NodeId::new("node_local").expect("node"))
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-unsafe-voter-config-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_unsafe_config").expect("cluster")),
+            node_id: Some(NodeId::new("node_config_host").expect("node")),
+            name: "unsafe config cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let state = read_cluster_state(&paths).expect("cluster state");
+
+    let mut removed_voter_state = state.clone();
+    removed_voter_state.members.clear();
+    let removed_error =
+        sync_cluster_state_to_kv(&paths, &removed_voter_state).expect_err("reject voter removal");
+    assert!(matches!(removed_error, CliError::ClusterReadOnly { .. }));
+
+    let mut direct_voter_state = state.clone();
+    let peer_id = NodeId::new("node_direct_voter").expect("peer");
+    let mut direct_voter = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        peer_id.clone(),
+        "direct voter",
+        "pk_direct_voter",
+        OffsetDateTime::now_utc(),
+    );
+    direct_voter.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    direct_voter.allowed_capabilities = direct_voter.capabilities.clone();
+    direct_voter.endpoints = vec![daemon_lan_endpoint(
+        &peer_id,
+        "127.0.0.1:32153".to_string(),
+        0,
+    )];
+    direct_voter_state.members.push(direct_voter);
+    let added_error =
+        sync_cluster_state_to_kv(&paths, &direct_voter_state).expect_err("reject direct voter add");
+    assert!(matches!(added_error, CliError::ClusterReadOnly { .. }));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -1230,6 +1280,34 @@ fn introducer_records_joined_members_and_returns_peer_view() {
     )
     .expect("cluster join local");
     let remote_state = read_cluster_state(&join_paths).expect("remote state");
+    let mut malicious_members = remote_state.members.clone();
+    for member in &mut malicious_members {
+        if member.node_id == NodeId::new("node_remote").expect("node") {
+            member.role = ClusterMemberRole::Voter;
+            member.state = ClusterMemberState::Pending;
+        }
+    }
+    let malicious_request = ClusterJoinRegistrationRequest {
+        invitation_secret: offline_invite.invitation_secret.clone(),
+        invite: offline_invite.clone(),
+        members: malicious_members,
+    };
+    let malicious_payload = sinomo_runtime::network::encode_object_text_payload(&malicious_request)
+        .expect("malicious request object");
+    let malicious_response = handle_daemon_cluster_join(
+        &DaemonPaths::with_root(host_root.join("daemon")),
+        &malicious_payload,
+    )
+    .expect("malicious introducer join");
+    assert!(!malicious_response.accepted);
+    assert!(
+        !read_cluster_state(&host_paths)
+            .expect("host state after rejected join")
+            .members
+            .iter()
+            .any(|member| member.node_id == NodeId::new("node_remote").expect("node"))
+    );
+
     let request = ClusterJoinRegistrationRequest {
         invitation_secret: offline_invite.invitation_secret.clone(),
         invite: offline_invite,
@@ -1341,7 +1419,8 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
     peer.endpoints = vec![daemon_lan_endpoint(&peer_node_id, peer_address, 0)];
     state.members.push(peer);
     write_json(&paths.state, &state).expect("write cluster state");
-    super::network::sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        .expect("sync state to kv");
 
     let txn = KvTxn {
         compares: Vec::new(),
@@ -1453,7 +1532,8 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    super::network::sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        .expect("sync state to kv");
     let bad_auth = authenticated_test_command(
         "CLUSTER_RAFT_APPEND",
         super::DaemonSignerAuthority::Voter,
@@ -1461,7 +1541,8 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
         "pk_other",
     );
 
-    let append_request = build_cluster_raft_append_request(&paths, &state).expect("append request");
+    let append_request = build_cluster_raft_append_request_from_next_index(&paths, &state, 1)
+        .expect("append request");
     let append_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(root.join("daemon")),
         &sinomo_runtime::network::encode_object_text_payload(&append_request)
@@ -1471,15 +1552,22 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
     .expect("append response");
     assert!(!append_response.accepted);
 
-    let node =
-        super::network::open_cluster_raft_kv_node(&paths, &state.local_node_id).expect("raft node");
+    let (vote_term, last_log_index, last_log_term) = {
+        let node = super::network::open_cluster_raft_kv_node(&paths, &state.local_node_id)
+            .expect("raft node");
+        (
+            node.hard_state().current_term.saturating_add(1),
+            node.last_log_index(),
+            node.last_log_term(),
+        )
+    };
     let vote_request = sinomo_runtime::network::ClusterRaftVoteRequest {
         state: state.clone(),
         vote: sinomo_runtime::kv::RaftRequestVoteRequest {
-            term: node.hard_state().current_term.saturating_add(1),
+            term: vote_term,
             candidate_id: state.local_node_id.clone(),
-            last_log_index: node.last_log_index(),
-            last_log_term: node.last_log_term(),
+            last_log_index,
+            last_log_term,
         },
     };
     let vote_response = handle_daemon_cluster_raft_vote(
@@ -1490,6 +1578,68 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
     )
     .expect("vote response");
     assert!(!vote_response.accepted);
+
+    let remote_node_id = NodeId::new("node_forged_voter").expect("remote node");
+    let mut forged_state = state.clone();
+    let mut forged_member = forged_state.members[0].clone();
+    forged_member.node_id = remote_node_id.clone();
+    forged_member.display_name = "forged voter".to_string();
+    forged_member.role = ClusterMemberRole::Voter;
+    forged_member.state = ClusterMemberState::Voter;
+    forged_member.node_public_key = "pk_forged_voter".to_string();
+    forged_member.endpoints.clear();
+    forged_state.members.push(forged_member);
+    let forged_auth = authenticated_test_command(
+        "CLUSTER_RAFT_APPEND",
+        super::DaemonSignerAuthority::Voter,
+        remote_node_id.as_str(),
+        "pk_forged_voter",
+    );
+    let forged_append = sinomo_runtime::network::ClusterRaftAppendRequest {
+        state: forged_state.clone(),
+        snapshot: None,
+        append: sinomo_runtime::kv::RaftAppendEntriesRequest {
+            term: 1,
+            leader_id: remote_node_id.clone(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        },
+    };
+    let forged_append_response = handle_daemon_cluster_raft_append(
+        &DaemonPaths::with_root(root.join("daemon")),
+        &sinomo_runtime::network::encode_object_text_payload(&forged_append)
+            .expect("forged append request"),
+        &forged_auth,
+    )
+    .expect("forged append response");
+    assert!(!forged_append_response.accepted);
+    assert!(
+        !read_cluster_state(&paths)
+            .expect("state after forged append")
+            .members
+            .iter()
+            .any(|member| member.node_id == remote_node_id)
+    );
+
+    let forged_vote = sinomo_runtime::network::ClusterRaftVoteRequest {
+        state: forged_state,
+        vote: sinomo_runtime::kv::RaftRequestVoteRequest {
+            term: 2,
+            candidate_id: remote_node_id.clone(),
+            last_log_index: 0,
+            last_log_term: 0,
+        },
+    };
+    let forged_vote_response = handle_daemon_cluster_raft_vote(
+        &DaemonPaths::with_root(root.join("daemon")),
+        &sinomo_runtime::network::encode_object_text_payload(&forged_vote)
+            .expect("forged vote request"),
+        &forged_auth,
+    )
+    .expect("forged vote response");
+    assert!(!forged_vote_response.accepted);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -1513,7 +1663,8 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    super::network::sync_cluster_state_to_kv(&paths, &state).expect("sync state to kv");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        .expect("sync state to kv");
     let stale_snapshot = read_cluster_kv_snapshot(&paths).expect("stale snapshot");
     super::network::append_cluster_raft_command_with_response(
         &paths,
@@ -1533,21 +1684,27 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
             .any(|entry| entry.key == "/config/current")
     );
 
-    let node =
-        super::network::open_cluster_raft_kv_node(&paths, &state.local_node_id).expect("raft node");
+    let (stale_snapshot_term, current_term) = {
+        let node = super::network::open_cluster_raft_kv_node(&paths, &state.local_node_id)
+            .expect("raft node");
+        (
+            node.term_at(stale_snapshot.revision.0).unwrap_or(1),
+            node.hard_state().current_term,
+        )
+    };
     let response = super::network::apply_cluster_raft_append(
         &paths,
         &state.local_node_id,
         Some(sinomo_runtime::kv::RaftSnapshot {
             last_included_index: stale_snapshot.revision.0,
-            last_included_term: node.term_at(stale_snapshot.revision.0).unwrap_or(1),
+            last_included_term: stale_snapshot_term,
             kv: stale_snapshot.clone(),
         }),
         sinomo_runtime::kv::RaftAppendEntriesRequest {
-            term: node.hard_state().current_term,
+            term: current_term,
             leader_id: state.local_node_id.clone(),
             prev_log_index: stale_snapshot.revision.0,
-            prev_log_term: node.term_at(stale_snapshot.revision.0).unwrap_or(1),
+            prev_log_term: stale_snapshot_term,
             entries: Vec::new(),
             leader_commit: stale_snapshot.revision.0,
         },
@@ -1560,6 +1717,72 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
             .entries
             .iter()
             .any(|entry| entry.key == "/config/current" && entry.value == b"current")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn raft_append_request_can_target_follower_next_index() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-targeted-append-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::new("cluster_targeted_append").expect("cluster")),
+            node_id: Some(NodeId::new("node_targeted_append").expect("node")),
+            name: "targeted append cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let state = read_cluster_state(&paths).expect("cluster state");
+    super::network::append_cluster_raft_command_with_response(
+        &paths,
+        &state.local_node_id,
+        sinomo_runtime::kv::KvCommand::Op(KvOp::Put {
+            key: "/config/targeted/a".to_string(),
+            value: b"a".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("first raft write");
+    super::network::append_cluster_raft_command_with_response(
+        &paths,
+        &state.local_node_id,
+        sinomo_runtime::kv::KvCommand::Op(KvOp::Put {
+            key: "/config/targeted/b".to_string(),
+            value: b"b".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("second raft write");
+
+    let full =
+        build_cluster_raft_append_request_from_next_index(&paths, &state, 1).expect("full append");
+    let tail =
+        build_cluster_raft_append_request_from_next_index(&paths, &state, 2).expect("tail append");
+    let heartbeat = build_cluster_raft_append_request_from_next_index(
+        &paths,
+        &state,
+        tail.append.entries.last().expect("tail entry").index + 1,
+    )
+    .expect("heartbeat append");
+
+    assert!(full.append.entries.len() >= 2);
+    assert_eq!(tail.append.prev_log_index, 1);
+    assert_eq!(
+        tail.append.entries.first().expect("first tail entry").index,
+        2
+    );
+    assert!(heartbeat.append.entries.is_empty());
+    assert_eq!(
+        heartbeat.append.prev_log_index,
+        full.append.entries.last().expect("last entry").index
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -1711,8 +1934,10 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         host_state.local_node_id.as_str(),
         host_identity.public_key.clone(),
     );
-    super::network::sync_cluster_state_to_kv(&host_paths, &host_state).expect("host kv");
-    let request = build_cluster_raft_append_request(&host_paths, &host_state).expect("raft append");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&host_paths, &host_state)
+        .expect("host kv");
+    let request = build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
+        .expect("raft append");
     let peer_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
         &sinomo_runtime::network::encode_object_text_payload(&request)
@@ -1744,7 +1969,8 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     )
     .expect("host latency txn");
     let current_request =
-        build_cluster_raft_append_request(&host_paths, &host_state).expect("current raft append");
+        build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
+            .expect("current raft append");
     let current_response = handle_daemon_cluster_raft_append(
         &DaemonPaths::with_root(peer_root.join("daemon")),
         &sinomo_runtime::network::encode_object_text_payload(&current_request)
@@ -1801,7 +2027,8 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     )
     .expect("host watch txn");
     let watch_append =
-        build_cluster_raft_append_request(&host_paths, &host_state).expect("watch raft append");
+        build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
+            .expect("watch raft append");
     assert!(
         handle_daemon_cluster_raft_append(
             &DaemonPaths::with_root(peer_root.join("daemon")),

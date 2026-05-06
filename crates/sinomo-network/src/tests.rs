@@ -9,6 +9,7 @@ use sinomo_core::{
     PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
 };
 use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
+use sinomo_kv::KvEventKind;
 
 #[test]
 fn cluster_storage_syncs_members_and_node_status_to_kv() {
@@ -59,7 +60,7 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         cluster_id
     );
 
-    sync_cluster_state_to_kv(&paths, &state).expect("sync members");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
     let members = read_cluster_members_from_kv(&paths).expect("members");
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].node_id, node_id);
@@ -176,7 +177,7 @@ fn cluster_network_records_publish_overwrite_and_expire() {
     }];
     state.members.push(member_b.clone());
     write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_kv(&paths, &state).expect("sync state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
     sync_cluster_network_info_to_kv(
         &paths,
@@ -247,6 +248,43 @@ fn cluster_network_records_publish_overwrite_and_expire() {
             .is_empty()
     );
 
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_is_bounded() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let events = (0..(MAX_CLUSTER_KV_WATCH_EVENTS + 10))
+        .map(|index| KvEvent {
+            revision: KvRevision(index as u64 + 1),
+            key: format!("/watch/{index}"),
+            kind: KvEventKind::Put {
+                value: index.to_string().into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+
+    let retained = cluster_kv_watch_events(&paths).expect("read watch events");
+    assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
+    assert_eq!(
+        retained.first().expect("first retained").revision,
+        KvRevision(11)
+    );
+    assert_eq!(
+        retained.last().expect("last retained").revision,
+        KvRevision(MAX_CLUSTER_KV_WATCH_EVENTS as u64 + 10)
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

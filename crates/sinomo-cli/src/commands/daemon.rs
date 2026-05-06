@@ -1611,9 +1611,23 @@ pub(crate) fn handle_daemon_cluster_join(
             kv_snapshot: None,
         });
     }
+    if request
+        .members
+        .iter()
+        .any(|member| !request.invite.allowed_member_roles.contains(&member.role))
+    {
+        return Ok(ClusterJoinRegistrationResponse {
+            accepted: false,
+            detail: "join request includes a member role not allowed by the invite".to_string(),
+            state,
+            kv_snapshot: None,
+        });
+    }
+
     let timestamp = OffsetDateTime::now_utc();
+    let mut accepted_state = state.clone();
     for mut member in request.members {
-        member.cluster_id = state.cluster_id.clone();
+        member.cluster_id = accepted_state.cluster_id.clone();
         if matches!(member.state, ClusterMemberState::Pending) {
             member.state = match member.role {
                 ClusterMemberRole::Learner => ClusterMemberState::Learner,
@@ -1622,16 +1636,16 @@ pub(crate) fn handle_daemon_cluster_join(
             };
         }
         member.updated_at = timestamp;
-        upsert_member_record(&mut state, member);
+        upsert_member_record(&mut accepted_state, member);
     }
-    state.kv_revision = state.kv_revision.saturating_add(1);
-    state.updated_at = timestamp;
-    network::write_cluster_state(&cluster_paths, &state)?;
-    let snapshot = sync_cluster_state_to_kv(&cluster_paths, &state)?;
+    accepted_state.kv_revision = accepted_state.kv_revision.saturating_add(1);
+    accepted_state.updated_at = timestamp;
+    let snapshot = sync_cluster_state_to_kv(&cluster_paths, &accepted_state)?;
+    network::write_cluster_state(&cluster_paths, &accepted_state)?;
     Ok(ClusterJoinRegistrationResponse {
         accepted: true,
         detail: "join registered".to_string(),
-        state,
+        state: accepted_state,
         kv_snapshot: Some(snapshot),
     })
 }

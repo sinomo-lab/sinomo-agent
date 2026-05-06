@@ -19,6 +19,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const KV_OBJECT_VERSION_ID: u16 = 1;
+const MAX_RETAINED_EVENTS: usize = 4096;
 
 pub fn encode_kv_value<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, KvError> {
     sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32).map_err(|source| {
@@ -332,6 +333,7 @@ pub struct RaftRequestVoteResponse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvWalPaths {
     pub root: PathBuf,
+    pub lock: PathBuf,
     pub hard_state: PathBuf,
     pub wal: PathBuf,
     pub snapshot: PathBuf,
@@ -341,6 +343,7 @@ impl KvWalPaths {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {
+            lock: root.join("node.lock"),
             hard_state: root.join("hard-state.json"),
             wal: root.join("wal.jsonl"),
             snapshot: root.join("snapshot.json"),
@@ -444,15 +447,18 @@ impl InProcessKvStore {
     pub fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
         let succeeded = txn.compares.iter().all(|compare| self.compare(compare));
         let ops = if succeeded { txn.success } else { txn.failure };
+        self.validate_ops(&ops)?;
+        let mut staged = self.clone();
         let mut responses = Vec::with_capacity(ops.len());
-        let mut revision = self.revision;
+        let mut revision = staged.revision;
 
         for op in ops {
-            let response = self.apply_op(op)?;
-            revision = self.revision;
+            let response = staged.apply_op(op)?;
+            revision = staged.revision;
             responses.push(response);
         }
 
+        *self = staged;
         Ok(KvTxnResponse {
             succeeded,
             revision,
@@ -652,6 +658,14 @@ impl InProcessKvStore {
         }
     }
 
+    fn validate_ops(&self, ops: &[KvOp]) -> Result<(), KvError> {
+        let mut staged = self.clone();
+        for op in ops {
+            staged.apply_op(op.clone())?;
+        }
+        Ok(())
+    }
+
     fn apply_put(
         &mut self,
         key: String,
@@ -765,6 +779,17 @@ impl InProcessKvStore {
             }
         }
         self.events.push(event);
+        self.trim_event_history();
+    }
+
+    fn trim_event_history(&mut self) {
+        let excess = self.events.len().saturating_sub(MAX_RETAINED_EVENTS);
+        if excess == 0 {
+            return;
+        }
+        let compacted = self.events[excess - 1].revision;
+        self.events.drain(..excess);
+        self.compacted_revision = self.compacted_revision.max(compacted);
     }
 }
 
@@ -1369,16 +1394,22 @@ struct RaftCommitOutcome {
     txn_response: Option<KvTxnResponse>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DurableRaftKvNode {
     node_id: NodeId,
     paths: KvWalPaths,
+    _lock: File,
     node: ReplicatedKvNode,
 }
 
 impl DurableRaftKvNode {
     pub fn open(node_id: NodeId, paths: KvWalPaths) -> Result<Self, KvError> {
         paths.ensure()?;
+        let lock = open_node_lock(&paths)?;
+        lock.lock_exclusive().map_err(|source| KvError::Io {
+            path: paths.lock.display().to_string(),
+            detail: source.to_string(),
+        })?;
         let snapshot = read_optional_json::<RaftSnapshot>(&paths.snapshot)?;
         let hard_state: RaftHardState = read_optional_json(&paths.hard_state)?.unwrap_or_default();
         let mut node = if let Some(snapshot) = snapshot {
@@ -1421,6 +1452,7 @@ impl DurableRaftKvNode {
         Ok(Self {
             node_id,
             paths,
+            _lock: lock,
             node,
         })
     }
@@ -1473,8 +1505,8 @@ impl DurableRaftKvNode {
         let response = self.node.handle_append_entries(request)?;
         if response.success {
             append_wal_entries(&self.paths.wal, &entries)?;
-            self.persist_hard_state()?;
         }
+        self.persist_hard_state()?;
         Ok(response)
     }
 
@@ -1694,10 +1726,59 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> 
     let content = serde_json::to_string_pretty(value).map_err(|source| KvError::Serialization {
         detail: source.to_string(),
     })?;
-    fs::write(path, format!("{content}\n")).map_err(|source| KvError::Io {
-        path: path.display().to_string(),
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("json");
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .map_err(|source| KvError::Io {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        file.write_all(content.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(|source| KvError::Io {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        file.sync_all().map_err(|source| KvError::Io {
+            path: temp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    fs::rename(&temp_path, path).map_err(|source| KvError::Io {
+        path: format!("{} -> {}", temp_path.display(), path.display()),
         detail: source.to_string(),
-    })
+    })?;
+    sync_directory(parent)
+}
+
+fn open_node_lock(paths: &KvWalPaths) -> Result<File, KvError> {
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&paths.lock)
+        .map_err(|source| KvError::Io {
+            path: paths.lock.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn sync_directory(path: &Path) -> Result<(), KvError> {
+    File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|source| KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
 }
 
 pub fn cluster_member_key(node_id: &NodeId) -> String {
@@ -1807,6 +1888,46 @@ mod tests {
     }
 
     #[test]
+    fn txn_error_does_not_partially_apply_ops() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+
+        let error = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::Put {
+                        key: "/config/b".to_string(),
+                        value: b"bad-lease".to_vec(),
+                        lease_id: Some(LeaseId(99)),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect_err("unknown lease aborts txn");
+
+        assert_eq!(
+            error,
+            KvError::UnknownLease {
+                lease_id: LeaseId(99)
+            }
+        );
+        assert_eq!(store.revision(), KvRevision(1));
+        assert_eq!(
+            store.get("/config/a").expect("existing value").value,
+            b"old"
+        );
+        assert!(store.get("/config/b").is_none());
+    }
+
+    #[test]
     fn watch_prefix_receives_backlog_and_future_events() {
         let mut store = InProcessKvStore::new();
         store
@@ -1827,6 +1948,33 @@ mod tests {
         let future = store.drain_watch(watch_id).expect("future");
         assert_eq!(future.len(), 1);
         assert_eq!(future[0].key, "/services/b");
+    }
+
+    #[test]
+    fn event_history_is_bounded_and_advances_compacted_revision() {
+        let mut store = InProcessKvStore::new();
+        for index in 0..(MAX_RETAINED_EVENTS + 10) {
+            store
+                .put(
+                    format!("/events/{index}"),
+                    index.to_string().into_bytes(),
+                    None,
+                )
+                .expect("put event");
+        }
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), MAX_RETAINED_EVENTS);
+        assert_eq!(snapshot.compacted_revision, KvRevision(10));
+        assert_eq!(
+            snapshot.events.first().expect("first retained").revision,
+            KvRevision(11)
+        );
+        assert!(matches!(
+            store.watch_prefix("/events/", KvRevision(10)),
+            Err(KvError::Compacted { .. })
+        ));
+        assert!(store.watch_prefix("/events/", KvRevision(11)).is_ok());
     }
 
     #[test]
@@ -2280,6 +2428,58 @@ mod tests {
                 .expect("committed value")
                 .value,
             b"survives"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_persists_higher_term_from_rejected_append() {
+        let root = temp_raft_root("sinomo-kv-rejected-append-term");
+        let follower_id = NodeId::new("node_rejected_append_follower").expect("node");
+        let leader_id = NodeId::new("node_rejected_append_leader").expect("node");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut follower =
+                DurableRaftKvNode::open(follower_id.clone(), paths.clone()).expect("open follower");
+            let entry = follower
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/config/local".to_string(),
+                        value: b"local".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append local");
+            follower.commit_to(entry.index).expect("commit local");
+
+            let response = follower
+                .append_entries(RaftAppendEntriesRequest {
+                    term: 2,
+                    leader_id: leader_id.clone(),
+                    prev_log_index: 99,
+                    prev_log_term: 2,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                })
+                .expect("rejected append response");
+
+            assert!(!response.success);
+            assert_eq!(follower.hard_state().current_term, 2);
+            assert_eq!(follower.hard_state().leader_id.as_ref(), Some(&leader_id));
+        }
+
+        let reopened =
+            DurableRaftKvNode::open(follower_id, paths.clone()).expect("reopen follower");
+        assert_eq!(reopened.hard_state().current_term, 2);
+        assert_eq!(reopened.hard_state().leader_id.as_ref(), Some(&leader_id));
+        assert_eq!(
+            reopened
+                .store()
+                .get("/config/local")
+                .expect("committed local value")
+                .value,
+            b"local"
         );
         std::fs::remove_dir_all(root).ok();
     }

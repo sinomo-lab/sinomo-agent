@@ -1,6 +1,8 @@
 use crate::error::NetworkError;
 use crate::prelude::*;
 
+pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterPaths {
     pub root: PathBuf,
@@ -554,37 +556,43 @@ pub fn append_cluster_kv_watch_events(
     }
     let mut existing = cluster_kv_watch_events(paths)?;
     let mut stored = 0;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.kv_watch_events)
-        .map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_watch_events.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    for event in incoming {
-        if existing.iter().any(|candidate| {
-            candidate.revision == event.revision
-                && candidate.key == event.key
-                && candidate.kind == event.kind
-        }) {
-            continue;
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&paths.kv_watch_events)
+            .map_err(|source| NetworkError::StorageIo {
+                path: paths.kv_watch_events.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        for event in incoming {
+            if existing.iter().any(|candidate| {
+                candidate.revision == event.revision
+                    && candidate.key == event.key
+                    && candidate.kind == event.kind
+            }) {
+                continue;
+            }
+            serde_json::to_writer(&mut file, event).map_err(|source| NetworkError::Json {
+                path: paths.kv_watch_events.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            writeln!(file).map_err(|source| NetworkError::StorageIo {
+                path: paths.kv_watch_events.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            existing.push(event.clone());
+            stored += 1;
         }
-        serde_json::to_writer(&mut file, event).map_err(|source| NetworkError::Json {
+        file.sync_data().map_err(|source| NetworkError::StorageIo {
             path: paths.kv_watch_events.display().to_string(),
             detail: source.to_string(),
         })?;
-        writeln!(file).map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_watch_events.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        existing.push(event.clone());
-        stored += 1;
     }
-    file.sync_data().map_err(|source| NetworkError::StorageIo {
-        path: paths.kv_watch_events.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    if existing.len() > MAX_CLUSTER_KV_WATCH_EVENTS {
+        let retained = existing.split_off(existing.len() - MAX_CLUSTER_KV_WATCH_EVENTS);
+        write_cluster_kv_watch_events(paths, &retained)?;
+    }
     Ok(stored)
 }
 
@@ -614,6 +622,55 @@ pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, Net
         );
     }
     Ok(events)
+}
+
+fn write_cluster_kv_watch_events(
+    paths: &ClusterPaths,
+    events: &[KvEvent],
+) -> Result<(), NetworkError> {
+    let parent = paths
+        .kv_watch_events
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
+        path: parent.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let temp_path = parent.join(format!(".watch-events.jsonl.tmp-{}", std::process::id()));
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .map_err(|source| NetworkError::StorageIo {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        for event in events {
+            serde_json::to_writer(&mut file, event).map_err(|source| NetworkError::Json {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            writeln!(file).map_err(|source| NetworkError::StorageIo {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        file.sync_all().map_err(|source| NetworkError::StorageIo {
+            path: temp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    fs::rename(&temp_path, &paths.kv_watch_events).map_err(|source| NetworkError::StorageIo {
+        path: format!(
+            "{} -> {}",
+            temp_path.display(),
+            paths.kv_watch_events.display()
+        ),
+        detail: source.to_string(),
+    })?;
+    sync_directory(parent)
 }
 
 fn cluster_kv_watch_path(paths: &ClusterPaths, watch_id: WatchId) -> PathBuf {
@@ -803,7 +860,13 @@ pub fn read_cluster_connectivity_graph_from_kv(
     Ok(records)
 }
 
-pub fn sync_cluster_state_to_kv(
+/// Mirrors a cluster state into the local durable Raft store without proving
+/// replication to a quorum.
+///
+/// Runtime cluster-control writes should go through the CLI quorum wrapper.
+/// This helper remains public for bootstrapping, recovery tooling, and tests
+/// that need to seed a local store deliberately.
+pub fn sync_cluster_state_to_local_raft_unchecked(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, NetworkError> {
@@ -1271,8 +1334,45 @@ pub(crate) fn write_json_file<T: Serialize>(path: &PathBuf, value: &T) -> Result
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
-    fs::write(path, format!("{content}\n")).map_err(|source| NetworkError::StorageIo {
-        path: path.display().to_string(),
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("json");
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .map_err(|source| NetworkError::StorageIo {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        file.write_all(content.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(|source| NetworkError::StorageIo {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        file.sync_all().map_err(|source| NetworkError::StorageIo {
+            path: temp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    fs::rename(&temp_path, path).map_err(|source| NetworkError::StorageIo {
+        path: format!("{} -> {}", temp_path.display(), path.display()),
         detail: source.to_string(),
-    })
+    })?;
+    sync_directory(parent)
+}
+
+fn sync_directory(path: &std::path::Path) -> Result<(), NetworkError> {
+    fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|source| NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
 }
