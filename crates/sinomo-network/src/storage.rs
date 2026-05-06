@@ -641,7 +641,7 @@ fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkErro
     Ok(WatchId(max_id.saturating_add(1).max(1)))
 }
 
-fn read_cluster_state_without_kv(
+pub fn read_cluster_state_without_kv(
     paths: &ClusterPaths,
 ) -> Result<ClusterBootstrapState, NetworkError> {
     if !paths.state.exists() {

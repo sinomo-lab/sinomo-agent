@@ -1330,14 +1330,29 @@ pub(crate) fn cluster_leave() -> Result<(), CliError> {
 
 pub(crate) fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, CliError> {
     let mut state = network::read_cluster_state(paths)?;
+    prepare_local_cluster_state(paths, &mut state)?;
+    Ok(state)
+}
+
+pub(crate) fn read_cluster_state_without_kv(
+    paths: &ClusterPaths,
+) -> Result<ClusterBootstrapState, CliError> {
+    let mut state = network::read_cluster_state_without_kv(paths)?;
+    prepare_local_cluster_state(paths, &mut state)?;
+    Ok(state)
+}
+
+fn prepare_local_cluster_state(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+) -> Result<(), CliError> {
     ensure_daemon_cluster_members(
-        &mut state,
+        state,
         &DaemonRunOptions::default(),
         &DaemonRunOptions::shadow_default(),
         OffsetDateTime::now_utc(),
     );
-    assign_local_node_public_keys(paths, &mut state)?;
-    Ok(state)
+    assign_local_node_public_keys(paths, state)
 }
 
 pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Result<(), CliError> {
@@ -1471,7 +1486,7 @@ impl ClusterNetworkMaintenance {
             return Ok(());
         }
 
-        let mut state = read_cluster_state(&cluster_paths)?;
+        let mut state = read_cluster_state_without_kv(&cluster_paths)?;
         let shadow_options = current_shadow_daemon_options(data_dir);
         ensure_daemon_cluster_members(
             &mut state,
