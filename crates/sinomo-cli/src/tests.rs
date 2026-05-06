@@ -30,7 +30,7 @@ use super::{
     parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
     parse_install_options, parse_model_default_options, parse_models_list_options,
     parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
+    parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
     run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
@@ -360,6 +360,38 @@ fn default_invite_compaction_keeps_iroh_fallback() {
     assert_eq!(endpoints[0].address, "10.14.1.11:21353");
     assert_eq!(endpoints[1].address, "10.14.1.12:21353");
     assert_eq!(endpoints[2].transport, ClusterTransportKind::Iroh);
+}
+
+#[test]
+fn invite_introducers_keep_fresh_iroh_endpoint_for_same_key() {
+    let node_id = NodeId::new("node_invite_iroh_fresh").expect("node");
+    let fresh = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::new("endpoint_invite_iroh_fresh").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://same_key?direct=10.14.1.11:53138&relay=https://relay.example/".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let stale = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::new("endpoint_invite_iroh_stale").expect("endpoint"),
+        node_id,
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://same_key?direct=10.14.1.11:33372&relay=https://relay.example/".to_string(),
+        source: ClusterEndpointSource::KvMembership,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let mut endpoints = Vec::new();
+
+    push_unique_introducer(&mut endpoints, fresh);
+    push_unique_introducer(&mut endpoints, stale);
+
+    assert_eq!(endpoints.len(), 1);
+    assert!(endpoints[0].address.contains("53138"));
 }
 
 #[test]

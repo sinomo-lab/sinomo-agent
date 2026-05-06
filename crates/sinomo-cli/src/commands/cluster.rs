@@ -956,6 +956,13 @@ pub(crate) fn push_unique_introducer(
     introducers: &mut Vec<ClusterEndpointRecord>,
     endpoint: ClusterEndpointRecord,
 ) {
+    if let Some(public_key) = network::iroh_endpoint_public_key(&endpoint)
+        && introducers.iter().any(|candidate| {
+            network::iroh_endpoint_public_key(candidate).as_deref() == Some(&public_key)
+        })
+    {
+        return;
+    }
     if !introducers
         .iter()
         .any(|candidate| candidate.address == endpoint.address)
