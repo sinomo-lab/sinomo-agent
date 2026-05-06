@@ -3484,6 +3484,14 @@ pub(crate) fn handle_daemon_cluster_member_publish(
             });
         }
     }
+    if cluster_member_publish_matches_kv(&cluster_paths, &request.members)? {
+        return Ok(ClusterMemberPublishResponse {
+            accepted: true,
+            detail: "member endpoints already current".to_string(),
+            state,
+            kv_snapshot: Some(read_cluster_kv_snapshot(&cluster_paths)?),
+        });
+    }
     let mut commit_state = state.clone();
     match commit_cluster_kv_txn_with_quorum(
         &cluster_paths,
@@ -3505,6 +3513,45 @@ pub(crate) fn handle_daemon_cluster_member_publish(
     }
 }
 
+fn cluster_member_publish_matches_kv(
+    paths: &ClusterPaths,
+    members: &[ClusterMemberRecord],
+) -> Result<bool, CliError> {
+    let store = network::read_cluster_kv_snapshot_store(paths)?;
+    for member in members {
+        let mut member = member.clone();
+        network::cleanup_member_iroh_endpoints(&mut member);
+        member
+            .endpoints
+            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+
+        let Some(entry) = store.get(&cluster_member_key(&member.node_id)) else {
+            return Ok(false);
+        };
+        let Ok(mut existing) = entry.decode::<ClusterMemberRecord>() else {
+            return Ok(false);
+        };
+        network::cleanup_member_iroh_endpoints(&mut existing);
+        existing
+            .endpoints
+            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        if !cluster_member_stable_eq(&existing, &member) {
+            return Ok(false);
+        }
+
+        let mut existing_endpoints = store
+            .range_prefix(&network::cluster_endpoint_prefix(&member.node_id))
+            .into_iter()
+            .filter_map(|entry| entry.decode::<ClusterEndpointRecord>().ok())
+            .collect::<Vec<_>>();
+        existing_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        if existing_endpoints != member.endpoints {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonClusterProcess {
     Main,
@@ -3523,10 +3570,14 @@ pub(crate) fn ensure_daemon_cluster_members(
     main_options: &DaemonRunOptions,
     shadow_options: &DaemonRunOptions,
     timestamp: OffsetDateTime,
-) {
-    ensure_main_daemon_cluster_member(state, main_options, timestamp);
-    ensure_shadow_daemon_cluster_member(state, shadow_options, timestamp);
-    state.updated_at = timestamp;
+) -> bool {
+    let main_changed = ensure_main_daemon_cluster_member(state, main_options, timestamp);
+    let shadow_changed = ensure_shadow_daemon_cluster_member(state, shadow_options, timestamp);
+    let changed = main_changed || shadow_changed;
+    if changed {
+        state.updated_at = timestamp;
+    }
+    changed
 }
 
 pub(crate) fn local_daemon_cluster_options()
@@ -3559,7 +3610,7 @@ pub(crate) fn ensure_main_daemon_cluster_member(
     state: &mut ClusterBootstrapState,
     options: &DaemonRunOptions,
     timestamp: OffsetDateTime,
-) {
+) -> bool {
     let local_node_id = state.local_node_id.clone();
     let existing = state
         .members
@@ -3595,14 +3646,14 @@ pub(crate) fn ensure_main_daemon_cluster_member(
             &discover_peer_route_ip_candidates(state),
         ),
         timestamp,
-    );
+    )
 }
 
 pub(crate) fn ensure_shadow_daemon_cluster_member(
     state: &mut ClusterBootstrapState,
     options: &DaemonRunOptions,
     timestamp: OffsetDateTime,
-) {
+) -> bool {
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
     let existing_shadow_state = state
         .members
@@ -3649,7 +3700,7 @@ pub(crate) fn ensure_shadow_daemon_cluster_member(
             &discover_peer_route_ip_candidates(state),
         ),
         timestamp,
-    );
+    )
 }
 
 pub(crate) fn existing_member_public_key(
@@ -3670,31 +3721,46 @@ pub(crate) fn upsert_daemon_member(
     capabilities: Vec<CapabilityName>,
     endpoints: Vec<ClusterEndpointRecord>,
     timestamp: OffsetDateTime,
-) {
+) -> bool {
     if let Some(member) = state
         .members
         .iter_mut()
         .find(|member| member.node_id == replacement.node_id)
     {
-        member.display_name = replacement.display_name;
-        member.role = replacement.role;
-        member.state = replacement.state;
-        member.node_public_key = replacement.node_public_key;
-        member.capabilities = capabilities.clone();
-        member.allowed_capabilities = capabilities;
+        let mut next_endpoints = member.endpoints.clone();
         for endpoint in endpoints {
-            member
-                .endpoints
-                .retain(|candidate| candidate.endpoint_id != endpoint.endpoint_id);
-            member.endpoints.push(endpoint);
+            next_endpoints.retain(|candidate| candidate.endpoint_id != endpoint.endpoint_id);
+            next_endpoints.push(endpoint);
         }
-        member.updated_at = timestamp;
+        next_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        let changed = member.display_name != replacement.display_name
+            || member.role != replacement.role
+            || member.state != replacement.state
+            || member.node_public_key != replacement.node_public_key
+            || member.capabilities != capabilities
+            || member.allowed_capabilities != capabilities
+            || member.endpoints != next_endpoints;
+        if changed {
+            member.display_name = replacement.display_name;
+            member.role = replacement.role;
+            member.state = replacement.state;
+            member.node_public_key = replacement.node_public_key;
+            member.capabilities = capabilities.clone();
+            member.allowed_capabilities = capabilities;
+            member.endpoints = next_endpoints;
+            member.updated_at = timestamp;
+        }
+        changed
     } else {
         let mut member = replacement;
         member.capabilities = capabilities.clone();
         member.allowed_capabilities = capabilities;
         member.endpoints = endpoints;
+        member
+            .endpoints
+            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
         state.members.push(member);
+        true
     }
 }
 
