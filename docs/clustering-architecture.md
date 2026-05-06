@@ -61,7 +61,7 @@ The remote machine can run the command from the file directly, append `--name <r
 sinomo cluster join join.txt --name <remote-name>
 ```
 
-On join, the remote node builds local pending bootstrap state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining node's main and shadow daemon members, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If the invite contains introducers but none are reachable, join fails with an actionable connectivity error instead of silently recording an isolated pending state. `sinomo cluster peers` on a joined node retries introducer reconciliation before printing the local member view. `sinomo cluster health` combines the KV member view, daemon-published node heartbeats, and live endpoint probes to report online/offline state, daemon version, platform, last-seen time, and rollout state for main and shadow daemon nodes.
+On join, the remote node builds local pending cluster state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining node's main and shadow daemon members, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If the invite contains introducers but none are reachable, join fails with an actionable connectivity error instead of silently recording an isolated pending state. `sinomo cluster health` combines the KV member view, daemon-published node heartbeats, and live endpoint probes to report online/offline state, daemon version, platform, last-seen time, and rollout state for main and shadow daemon nodes.
 
 Initial local state lives at:
 
@@ -69,7 +69,7 @@ Initial local state lives at:
 $SINOMO_DATA_DIR/cluster/state.json
 ```
 
-The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core`. It is only a bootstrap artifact. Once the cluster service is implemented, durable membership and config state come from the replicated KV log. The file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
+The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core` for the local cluster identity, local node identity, current Raft term/revision, and current member records. It records the current cluster status through member role/state data instead of storing how the node reached that status. Durable membership and config state come from the replicated KV log; the file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
 
 Each local installation has two daemon process nodes in the cluster metadata:
 
@@ -85,7 +85,7 @@ Cluster identity:
 - `cluster_id`: stable cluster identifier, prefixed with `cluster_`.
 - `cluster_name`: operator-friendly display name.
 - `cluster_epoch`: monotonic epoch incremented only by explicit destructive re-bootstrap or disaster recovery.
-- `created_at`: bootstrap timestamp.
+- `created_at`: cluster creation timestamp.
 
 Node identity:
 
@@ -114,7 +114,7 @@ Daemon and shadow daemon membership is process-scoped rather than machine-scoped
 3. Creates a cluster root key or uses a future operator-provided key.
 4. Creates the first member as an active voter.
 5. Creates an initial KV log entry containing cluster metadata, member metadata, and schema versions.
-6. Writes local bootstrap state under `$SINOMO_DATA_DIR/cluster/state.json`.
+6. Writes local cluster state under `$SINOMO_DATA_DIR/cluster/state.json`.
 
 The first node is both control-plane voter and data-plane participant. Additional nodes join as learners first.
 
@@ -124,7 +124,7 @@ The first node is both control-plane voter and data-plane participant. Additiona
 
 1. Parses the invite payload.
 2. Generates or accepts a local `node_id`.
-3. Stores pending bootstrap state locally.
+3. Stores pending cluster state locally.
 4. Contacts one or more introducers from the invite.
 5. Presents a join request containing node identity, public key, capabilities, and requested role.
 6. Waits for an existing voter to commit a pending member record.
@@ -153,7 +153,7 @@ The orphan guard is a hard runtime boundary.
 
 Allowed while orphaned:
 
-- create or inspect local bootstrap state
+- create or inspect local cluster state
 - print help
 
 Blocked while orphaned:
@@ -166,7 +166,7 @@ Blocked while orphaned:
 - self-evolution rollout that targets more than local dry-run artifacts
 - accepting inbound peer messages
 
-Implementation rule: code paths that depend on cluster authority call a small `require_cluster_state` guard before doing work. The guard first checks local bootstrap state, then asks the cluster service for an active member view once the daemon exists.
+Implementation rule: code paths that depend on cluster authority call a small `require_cluster_state` guard before doing work. The guard first checks local cluster state, then asks the cluster service for an active member view once the daemon exists.
 
 ## Membership Model
 
@@ -204,7 +204,7 @@ Transport preference:
 
 Discovery mechanisms:
 
-- Static endpoints from local bootstrap state and KV membership records.
+- Static endpoints from local cluster state and KV membership records.
 - mDNS/DNS-SD for LAN candidates.
 - UDP hole-punch candidates where available.
 - Iroh endpoint records published through the KV under `/iroh/endpoints/<cluster>/<node>`.
@@ -423,7 +423,7 @@ Roaming:
 
 Node restart:
 
-- Node reloads local bootstrap state.
+- Node reloads local cluster state.
 - Reconnects to voters.
 - Catches up WAL or snapshot.
 - Reinstates leases and service presence after local health checks.
@@ -436,20 +436,20 @@ Disaster recovery:
 
 ## Implementation Plan
 
-Phase 0, local bootstrap:
+Phase 0, local cluster state:
 
 - Add `sinomo cluster` CLI. Implemented in `crates/sinomo-cli`.
 - Persist local cluster state. Implemented as `$SINOMO_DATA_DIR/cluster/state.json`.
 - Add orphan guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
-- Require signed bootstrap. Implemented by requiring `sinomo cluster join` inputs to be signed `sinomo-join://v1` payloads, invite JSON, or files containing one of those forms.
+- Require signed join material. Implemented by requiring `sinomo cluster join` inputs to be signed `sinomo-join://v1` payloads, invite JSON, or files containing one of those forms.
 
 Phase 1, contracts:
 
 - Add cluster identity, membership, endpoint, invite, and certificate structs. Implemented in `crates/sinomo-core/src/cluster.rs`.
 - Extend `sinomo-network` transport kinds for QUIC, iroh, and WebRTC candidate metadata. Implemented through `TransportKind`, `NodeEndpoint::from_cluster_endpoint`, and `PeerEndpointCandidate`.
 - Add cluster-aware peer registry records. Implemented through `PeerRegistry` cluster member and endpoint candidate indexes.
-- Represent the local main daemon and shadow daemon as separate cluster members. Implemented in `crates/sinomo-cli`: cluster bootstrap writes the main daemon as the local voter/learner and the derived shadow daemon as a non-voting communication-capable member.
-- Use real bootstrap identity material. Implemented by generating the local Ed25519 identity before bootstrap state creation, storing explicit member public keys in every member record, signing invites with the issuer node identity, and verifying invite signatures before local join or introducer acceptance.
+- Represent the local main daemon and shadow daemon as separate cluster members. Implemented in `crates/sinomo-cli`: cluster state writes the main daemon as the local voter/learner and the derived shadow daemon as a non-voting communication-capable member.
+- Use real cluster identity material. Implemented by generating the local Ed25519 identity before cluster state creation, storing explicit member public keys in every member record, signing invites with the issuer node identity, and verifying invite signatures before local join or introducer acceptance.
 
 Phase 2, KV core:
 
@@ -481,6 +481,6 @@ Phase 5, DFS integration:
 
 Phase 6, operations:
 
-- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local bootstrap invites, and `cluster status` / `cluster health` / `cluster peers` read the daemon-backed KV membership and node-status view when available. Approval, revocation, promotion, doctor, and explicit KV inspection remain future work.
+- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local signed invites, and `cluster status` / `cluster health` / `cluster peers` read the daemon-backed KV membership and node-status view when available. Approval, revocation, promotion, doctor, and explicit KV inspection remain future work.
 - Add snapshot export/import.
 - Add metrics and event traces for elections, watches, membership changes, and replication lag.

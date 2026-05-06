@@ -36,10 +36,10 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
 use sinomo_runtime::core::{
-    CapabilityName, ClusterBootstrap, ClusterBootstrapState, ClusterEndpointPrivacy,
-    ClusterEndpointRecord, ClusterId, ClusterInviteId, ClusterJoinInvite, ClusterMemberRecord,
-    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterTransportKind,
-    EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
+    CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
+    ClusterId, ClusterInviteId, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
+    ClusterMemberState, ClusterNodeAvailability, ClusterTransportKind, EvolutionJobId, NodeId,
+    SessionId, TrustDomain, TrustRing,
 };
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
 use sinomo_runtime::kv::{KvCompare, KvOp, KvRevision, KvTxn};
@@ -270,7 +270,7 @@ fn cluster_sync_targets_skip_remote_local_only_endpoints() {
 }
 
 #[test]
-fn cluster_peer_members_tolerates_unreachable_join_introducers() {
+fn cluster_peer_members_preserves_pending_local_member() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-cluster-peers-offline-introducer-{}",
         SystemTime::now()
@@ -289,22 +289,12 @@ fn cluster_peer_members_tolerates_unreachable_join_introducers() {
         &paths,
     )
     .expect("cluster init");
-    let rendered = cluster_invite_with_paths(
-        ClusterInviteOptions {
-            ttl_seconds: 120,
-            introducers: vec!["127.0.0.1:1".to_string()],
-            output: None,
-        },
-        &paths,
-    )
-    .expect("cluster invite");
     let mut state = ClusterBootstrapState::pending_join(
         ClusterId::new("cluster_peers_offline").expect("cluster"),
         "offline peers".to_string(),
         NodeId::new("node_peers_joined").expect("node"),
         "joined peer".to_string(),
         "joined-public-key".to_string(),
-        rendered.invite,
         OffsetDateTime::now_utc(),
     );
     state.members.push(ClusterMemberRecord::local_voter(
@@ -598,7 +588,7 @@ fn cluster_parser_accepts_init_and_join_options() {
 }
 
 #[test]
-fn cluster_init_persists_local_bootstrap_state() {
+fn cluster_init_persists_local_cluster_state() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-cluster-init-{}",
         SystemTime::now()
@@ -1169,7 +1159,11 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
         ClusterId::new("cluster_remote").expect("cluster")
     );
     assert_eq!(state.cluster_name, "remote cluster");
-    assert!(matches!(state.bootstrap, ClusterBootstrap::Joined { .. }));
+    assert!(state.members.iter().any(|member| {
+        member.node_id == NodeId::new("node_remote").expect("node")
+            && member.role == ClusterMemberRole::Learner
+            && member.state == ClusterMemberState::Pending
+    }));
     std::fs::remove_dir_all(host_root).ok();
     std::fs::remove_dir_all(join_root).ok();
 }
@@ -1236,13 +1230,9 @@ fn introducer_records_joined_members_and_returns_peer_view() {
     )
     .expect("cluster join local");
     let remote_state = read_cluster_state(&join_paths).expect("remote state");
-    let invite = match &remote_state.bootstrap {
-        ClusterBootstrap::Joined { invite } => invite.clone(),
-        ClusterBootstrap::InitializedLocally => panic!("expected joined state"),
-    };
     let request = ClusterJoinRegistrationRequest {
-        invitation_secret: invite.invitation_secret.clone(),
-        invite,
+        invitation_secret: offline_invite.invitation_secret.clone(),
+        invite: offline_invite,
         members: remote_state.members,
     };
     let payload =

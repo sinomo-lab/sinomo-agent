@@ -65,7 +65,7 @@ pub(super) fn print_cluster_help() {
         "      Record intent to join an existing cluster from a signed sinomo-join URI or invite file."
     );
     println!("  sinomo cluster status");
-    println!("      Show local cluster bootstrap state and node health counts.");
+    println!("      Show local cluster status and node health counts.");
     println!("  sinomo cluster health");
     println!(
         "      Report node online/offline state, daemon version, platform, and rollout status."
@@ -73,7 +73,7 @@ pub(super) fn print_cluster_help() {
     println!("  sinomo cluster peers");
     println!("      List known peers. Fails while the node is orphaned.");
     println!("  sinomo cluster leave");
-    println!("      Remove local cluster bootstrap state.");
+    println!("      Remove local cluster state.");
 }
 
 pub(super) fn print_install_help() {

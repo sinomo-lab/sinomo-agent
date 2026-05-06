@@ -29,7 +29,6 @@ pub struct ClusterBootstrapState {
     pub cluster_name: String,
     pub local_node_id: NodeId,
     pub local_node_display_name: String,
-    pub bootstrap: ClusterBootstrap,
     pub term: u64,
     pub kv_revision: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -57,7 +56,6 @@ impl ClusterBootstrapState {
             cluster_name: cluster_name.clone(),
             local_node_id: local_node_id.clone(),
             local_node_display_name: local_node_display_name.clone(),
-            bootstrap: ClusterBootstrap::InitializedLocally,
             term: 1,
             kv_revision: 1,
             members: vec![ClusterMemberRecord::local_voter(
@@ -78,7 +76,6 @@ impl ClusterBootstrapState {
         local_node_id: NodeId,
         local_node_display_name: impl Into<String>,
         local_node_public_key: impl Into<String>,
-        invite: ClusterJoinInvite,
         timestamp: OffsetDateTime,
     ) -> Self {
         let cluster_name = cluster_name.into();
@@ -89,7 +86,6 @@ impl ClusterBootstrapState {
             cluster_name: cluster_name.clone(),
             local_node_id: local_node_id.clone(),
             local_node_display_name: local_node_display_name.clone(),
-            bootstrap: ClusterBootstrap::Joined { invite },
             term: 0,
             kv_revision: 0,
             members: vec![ClusterMemberRecord::pending_learner(
@@ -103,13 +99,6 @@ impl ClusterBootstrapState {
             updated_at: timestamp,
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ClusterBootstrap {
-    InitializedLocally,
-    Joined { invite: ClusterJoinInvite },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -442,7 +431,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_state_serializes_single_node_cluster() {
+    fn cluster_state_serializes_single_node_cluster() {
         let timestamp = OffsetDateTime::parse(
             "2026-05-02T12:00:00Z",
             &time::format_description::well_known::Rfc3339,
@@ -460,7 +449,7 @@ mod tests {
         let json = serde_json::to_value(&state).expect("serialize");
 
         assert_eq!(json["cluster_id"], "cluster_home");
-        assert_eq!(json["bootstrap"], "initialized-locally");
+        assert!(json.get("bootstrap").is_none());
         assert_eq!(json["members"][0]["role"], "voter");
         assert_eq!(json["members"][0]["state"], "active");
     }

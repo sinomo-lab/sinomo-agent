@@ -768,7 +768,7 @@ pub(crate) fn cluster_join_with_paths(
     paths.ensure()?;
     if paths.state.exists() {
         let existing = read_cluster_state(paths)?;
-        if matches!(existing.bootstrap, ClusterBootstrap::Joined { .. }) {
+        if cluster_state_needs_join_registration(&existing) {
             return cluster_join_retry_with_paths(options, paths, existing);
         }
         return Err(CliError::Parse {
@@ -816,13 +816,12 @@ pub(crate) fn cluster_join_with_paths(
         local_node_id.clone(),
         options.name,
         main_identity.public_key.clone(),
-        invite,
         timestamp,
     );
     let (main_options, shadow_options) = local_daemon_cluster_options()?;
     ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
     assign_local_node_public_keys(paths, &mut state)?;
-    reconcile_cluster_join_with_introducers(&mut state, Some(paths))?;
+    reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
     write_json(&paths.state, &state)?;
     println!("cluster join recorded: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
@@ -847,11 +846,10 @@ pub(crate) fn cluster_join_retry_with_paths(
             ),
         });
     }
-    state.bootstrap = ClusterBootstrap::Joined { invite };
     let (main_options, shadow_options) = local_daemon_cluster_options()?;
     ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
     assign_local_node_public_keys(paths, &mut state)?;
-    reconcile_cluster_join_with_introducers(&mut state, Some(paths))?;
+    reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
     state.updated_at = timestamp;
     write_json(&paths.state, &state)?;
     println!("cluster join reconciled: {}", state.cluster_id);
@@ -863,18 +861,15 @@ pub(crate) fn cluster_join_retry_with_paths(
 
 pub(crate) fn reconcile_cluster_join_with_introducers(
     state: &mut ClusterBootstrapState,
+    invite: &ClusterJoinInvite,
     paths: Option<&ClusterPaths>,
 ) -> Result<(), CliError> {
-    let invite = match &state.bootstrap {
-        ClusterBootstrap::Joined { invite } => invite.clone(),
-        ClusterBootstrap::InitializedLocally => return Ok(()),
-    };
     if invite.introducers.is_empty() {
         return Ok(());
     }
     let request = ClusterJoinRegistrationRequest {
         invitation_secret: invite.invitation_secret.clone(),
-        invite,
+        invite: invite.clone(),
         members: state.members.clone(),
     };
     let mut failures = Vec::new();
@@ -950,12 +945,10 @@ pub(crate) fn merge_cluster_join_registration(
     local: &mut ClusterBootstrapState,
     accepted: ClusterBootstrapState,
 ) {
-    let bootstrap = local.bootstrap.clone();
     let local_node_id = local.local_node_id.clone();
     let local_node_display_name = local.local_node_display_name.clone();
     let initialized_at = local.initialized_at;
     *local = accepted;
-    local.bootstrap = bootstrap;
     local.local_node_id = local_node_id;
     local.local_node_display_name = local_node_display_name;
     local.initialized_at = initialized_at;
@@ -1101,7 +1094,7 @@ pub(crate) fn cluster_status() -> Result<(), CliError> {
             println!("cluster: {}", state.cluster_id);
             println!("name: {}", state.cluster_name);
             println!("local node: {}", state.local_node_id);
-            println!("bootstrap: {}", cluster_bootstrap_label(&state.bootstrap));
+            println!("status: {}", cluster_status_label(&paths, &state));
             println!("term: {}", state.term);
             println!("kv revision: {}", kv_revision);
             println!("kv snapshot: {}", paths.kv_snapshot.display());
@@ -1376,19 +1369,7 @@ pub(crate) fn cluster_peer_members(
 ) -> Result<Vec<ClusterMemberRecord>, CliError> {
     refresh_cluster_kv_from_local_daemon(paths)?;
     let mut state = read_cluster_state(paths)?;
-    if matches!(state.bootstrap, ClusterBootstrap::Joined { .. }) {
-        let needs_join_registration = state
-            .members
-            .iter()
-            .find(|member| member.node_id == state.local_node_id)
-            .map_or(true, |member| !member.state.is_authorized());
-        if needs_join_registration {
-            if let Err(error) = reconcile_cluster_join_with_introducers(&mut state, Some(paths)) {
-                eprintln!(
-                    "warning: could not refresh cluster membership from introducers: {error}"
-                );
-            }
-        }
+    if cluster_state_needs_join_registration(&state) {
         let (main_options, shadow_options) = local_daemon_cluster_options()?;
         ensure_daemon_cluster_members(
             &mut state,
@@ -2163,6 +2144,29 @@ pub(crate) fn cluster_has_local_quorum(
     cluster_reachable_voter_count(paths, state) >= cluster_raft_quorum_size(state)
 }
 
+pub(crate) fn cluster_status_label(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> &'static str {
+    if cluster_state_needs_join_registration(state) {
+        "pending-join"
+    } else if cluster_has_local_quorum(paths, state) {
+        "healthy"
+    } else {
+        "read-only"
+    }
+}
+
+pub(crate) fn cluster_state_needs_join_registration(state: &ClusterBootstrapState) -> bool {
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .is_none_or(|member| {
+            matches!(member.role, ClusterMemberRole::Learner) && !member.state.is_authorized()
+        })
+}
+
 pub(crate) fn cluster_reachable_voter_count(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -2763,21 +2767,17 @@ pub(crate) fn ensure_main_daemon_cluster_member(
     options: &DaemonRunOptions,
     timestamp: OffsetDateTime,
 ) {
-    let role = match &state.bootstrap {
-        ClusterBootstrap::InitializedLocally => ClusterMemberRole::Voter,
-        ClusterBootstrap::Joined { .. } => ClusterMemberRole::Learner,
-    };
-    let member_state = match &state.bootstrap {
-        ClusterBootstrap::InitializedLocally => ClusterMemberState::Active,
-        ClusterBootstrap::Joined { .. } => state
-            .members
-            .iter()
-            .find(|member| member.node_id == state.local_node_id)
-            .map(|member| member.state.clone())
-            .filter(|state| *state != ClusterMemberState::Pending)
-            .unwrap_or(ClusterMemberState::Pending),
-    };
     let local_node_id = state.local_node_id.clone();
+    let existing = state
+        .members
+        .iter()
+        .find(|member| member.node_id == local_node_id);
+    let role = existing
+        .map(|member| member.role.clone())
+        .unwrap_or(ClusterMemberRole::Learner);
+    let member_state = existing
+        .map(|member| member.state.clone())
+        .unwrap_or(ClusterMemberState::Pending);
     let node_public_key = existing_member_public_key(state, &local_node_id).unwrap_or_default();
     let mut member = ClusterMemberRecord::local_voter(
         state.cluster_id.clone(),
@@ -2811,21 +2811,27 @@ pub(crate) fn ensure_shadow_daemon_cluster_member(
         .map(|member| member.state.clone())
         .filter(|state| *state != ClusterMemberState::Pending);
     let node_public_key = existing_member_public_key(state, &shadow_node_id).unwrap_or_default();
-    let mut member = match &state.bootstrap {
-        ClusterBootstrap::InitializedLocally => ClusterMemberRecord::local_non_voting(
+    let main_authorized = state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .is_some_and(|member| member.state.is_authorized());
+    let mut member = if main_authorized {
+        ClusterMemberRecord::local_non_voting(
             state.cluster_id.clone(),
             shadow_node_id.clone(),
             format!("{} shadow", state.local_node_display_name),
             node_public_key,
             timestamp,
-        ),
-        ClusterBootstrap::Joined { .. } => ClusterMemberRecord::pending_non_voting(
+        )
+    } else {
+        ClusterMemberRecord::pending_non_voting(
             state.cluster_id.clone(),
             shadow_node_id.clone(),
             format!("{} shadow", state.local_node_display_name),
             node_public_key,
             timestamp,
-        ),
+        )
     };
     if let Some(existing_state) = existing_shadow_state {
         member.state = existing_state;
@@ -3224,13 +3230,6 @@ pub(crate) fn format_member_state(state: &ClusterMemberState) -> &'static str {
         ClusterMemberState::Suspect => "suspect",
         ClusterMemberState::Offline => "offline",
         ClusterMemberState::Removed => "removed",
-    }
-}
-
-pub(crate) fn cluster_bootstrap_label(bootstrap: &ClusterBootstrap) -> &'static str {
-    match bootstrap {
-        ClusterBootstrap::InitializedLocally => "initialized-locally",
-        ClusterBootstrap::Joined { .. } => "joined",
     }
 }
 
