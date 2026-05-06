@@ -391,6 +391,44 @@ pub(crate) fn run_shadow_daemon_with_paths(
             })? {
                 if let Some(pending) = pending_rollout.take() {
                     let observation = main_exit_observation_from_status(status);
+                    if observation.exit_code == Some(0)
+                        && observation.signal.is_none()
+                        && matches!(
+                            probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT),
+                            DaemonProbeStatus::Running(_)
+                        )
+                    {
+                        // With a responsive shadow accept loop, try_wait() can observe the
+                        // candidate process' clean handoff exit before the periodic health
+                        // branch above consumes the same rollout. If the main daemon is now
+                        // probeable, continue the normal shadow-finalization path instead of
+                        // recording a false main rollout failure.
+                        stage_pending_shadow_rollout(
+                            &rollout_paths,
+                            &pending,
+                            &options.host,
+                            options.port,
+                        )?;
+                        let main_address = daemon_connect_address(
+                            &pending.main_options.host,
+                            pending.main_options.port,
+                        );
+                        thread::spawn(move || {
+                            let _ = send_daemon_command(
+                                &main_address,
+                                "FINALIZE_SHADOW_ROLLOUT",
+                                DAEMON_ROLLOUT_TIMEOUT,
+                            );
+                        });
+                        let _ = fs::remove_file(rollout_main_activation_path(&rollout_paths));
+                        main_binary = pending.activation.main_binary.clone();
+                        main_options = pending.main_options;
+                        main_probe_status = probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT);
+                        last_main_probe = Instant::now();
+                        supervised_main = None;
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
                     let detail = format!(
                         "candidate main exited before health check: exit_code={:?} signal={:?}",
                         observation.exit_code, observation.signal
