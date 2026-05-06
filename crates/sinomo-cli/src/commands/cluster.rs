@@ -1791,9 +1791,9 @@ pub(crate) fn sync_cluster_state_to_kv(
 pub(crate) fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
-) -> Result<KvSnapshot, CliError> {
+) -> Result<Option<KvSnapshot>, CliError> {
     if stored_cluster_node_status_matches(paths, &status)? {
-        return read_cluster_kv_snapshot(paths);
+        return Ok(None);
     }
     let mut state = read_cluster_state_without_kv(paths)?;
     let mut success = vec![KvOp::put_serde(
@@ -1817,14 +1817,15 @@ pub(crate) fn sync_cluster_node_status_to_kv(
             failure: Vec::new(),
         },
     )
+    .map(Some)
 }
 
 pub(crate) fn sync_cluster_network_info_to_kv(
     paths: &ClusterPaths,
     info: network::ClusterNetworkInfoRecord,
-) -> Result<KvSnapshot, CliError> {
+) -> Result<Option<KvSnapshot>, CliError> {
     if stored_cluster_network_info_matches(paths, &info)? {
-        return read_cluster_kv_snapshot(paths);
+        return Ok(None);
     }
     let mut state = read_cluster_state_without_kv(paths)?;
     commit_cluster_kv_txn_with_quorum(
@@ -1840,15 +1841,16 @@ pub(crate) fn sync_cluster_network_info_to_kv(
             failure: Vec::new(),
         },
     )
+    .map(Some)
 }
 
 pub(crate) fn sync_cluster_connectivity_records_to_kv(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: Vec<network::ClusterConnectivityRecord>,
-) -> Result<KvSnapshot, CliError> {
+) -> Result<Option<KvSnapshot>, CliError> {
     if stored_cluster_connectivity_records_match(paths, source_node_id, &records)? {
-        return read_cluster_kv_snapshot(paths);
+        return Ok(None);
     }
     let mut state = read_cluster_state_without_kv(paths)?;
     let mut success = vec![KvOp::DeletePrefix {
@@ -1871,12 +1873,13 @@ pub(crate) fn sync_cluster_connectivity_records_to_kv(
             failure: Vec::new(),
         },
     )
+    .map(Some)
 }
 
 pub(crate) fn expire_cluster_network_records_in_kv(
     paths: &ClusterPaths,
     now: OffsetDateTime,
-) -> Result<KvSnapshot, CliError> {
+) -> Result<Option<KvSnapshot>, CliError> {
     let store = network::read_cluster_kv_snapshot_store(paths)?;
     let mut success = Vec::new();
     for entry in store.range_prefix("/cluster/network/info/") {
@@ -1896,7 +1899,7 @@ pub(crate) fn expire_cluster_network_records_in_kv(
         }
     }
     if success.is_empty() {
-        return read_cluster_kv_snapshot(paths);
+        return Ok(None);
     }
     let mut state = read_cluster_state_without_kv(paths)?;
     commit_cluster_kv_txn_with_quorum(
@@ -1908,6 +1911,7 @@ pub(crate) fn expire_cluster_network_records_in_kv(
             failure: Vec::new(),
         },
     )
+    .map(Some)
 }
 
 fn stored_cluster_node_status_matches(
@@ -1999,7 +2003,6 @@ fn cluster_connectivity_stable_eq(
         && left.transport == right.transport
         && left.address == right.address
         && left.state == right.state
-        && left.consecutive_failures == right.consecutive_failures
 }
 
 pub(crate) fn cluster_state_sync_txn(
@@ -2222,6 +2225,17 @@ impl ClusterNetworkMaintenance {
         options: &DaemonRunOptions,
     ) -> Result<(), CliError> {
         self.tick = self.tick.saturating_add(1);
+        let now = Instant::now();
+        let publish_due = now.duration_since(self.last_publish) >= DAEMON_CLUSTER_PUBLISH_INTERVAL;
+        let probe_due =
+            now.duration_since(self.last_probe) >= DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL;
+        let sync_due = now.duration_since(self.last_sync) >= DAEMON_CLUSTER_RAFT_INTERVAL;
+        let discovery_due =
+            now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL;
+        if !(publish_due || probe_due || sync_due || discovery_due) {
+            return Ok(());
+        }
+
         let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
             path: paths.root.display().to_string(),
             detail: "daemon paths have no data directory parent".to_string(),
@@ -2233,23 +2247,26 @@ impl ClusterNetworkMaintenance {
 
         let mut state = read_cluster_state_without_kv(&cluster_paths)?;
         let state_before_maintenance = state.clone();
-        network::cleanup_cluster_iroh_endpoints(&mut state);
-        let shadow_options = current_shadow_daemon_options(data_dir);
-        ensure_daemon_cluster_members(
-            &mut state,
-            options,
-            &shadow_options,
-            OffsetDateTime::now_utc(),
-        );
-        assign_local_node_public_keys(&cluster_paths, &mut state)?;
-
-        let discovered = self.process_discovery(&mut state);
-        let now = Instant::now();
-        let publish_due = now.duration_since(self.last_publish) >= DAEMON_CLUSTER_PUBLISH_INTERVAL;
-        let probe_due =
-            now.duration_since(self.last_probe) >= DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL;
-        let sync_due = now.duration_since(self.last_sync) >= DAEMON_CLUSTER_RAFT_INTERVAL;
+        let mut discovered = false;
         let mut snapshot = None;
+
+        if discovery_due {
+            self.last_discovery = now;
+            discovered = self.process_discovery(&mut state);
+            self.announce(&state);
+        }
+
+        if publish_due || probe_due || sync_due {
+            network::cleanup_cluster_iroh_endpoints(&mut state);
+            let shadow_options = current_shadow_daemon_options(data_dir);
+            ensure_daemon_cluster_members(
+                &mut state,
+                options,
+                &shadow_options,
+                OffsetDateTime::now_utc(),
+            );
+            assign_local_node_public_keys(&cluster_paths, &mut state)?;
+        }
 
         if publish_due {
             self.last_publish = now;
@@ -2270,10 +2287,11 @@ impl ClusterNetworkMaintenance {
                     self.connectivity.clear();
                 }
                 self.environment_id = Some(local_network_info.environment_id.clone());
-                snapshot = Some(sync_cluster_network_info_to_kv(
-                    &cluster_paths,
-                    local_network_info,
-                )?);
+                if let Some(network_snapshot) =
+                    sync_cluster_network_info_to_kv(&cluster_paths, local_network_info)?
+                {
+                    snapshot = Some(network_snapshot);
+                }
                 if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(paths)? {
                     snapshot = Some(status_snapshot);
                 }
@@ -2294,11 +2312,6 @@ impl ClusterNetworkMaintenance {
             }
         }
 
-        if now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL {
-            self.last_discovery = now;
-            self.announce(&state);
-        }
-
         if probe_due {
             self.last_probe = now;
             if cluster_has_local_quorum(&cluster_paths, &state) {
@@ -2308,10 +2321,11 @@ impl ClusterNetworkMaintenance {
                     &state.local_node_id,
                     records,
                 )?;
-                snapshot = Some(expire_cluster_network_records_in_kv(
-                    &cluster_paths,
-                    OffsetDateTime::now_utc(),
-                )?);
+                if let Some(expire_snapshot) =
+                    expire_cluster_network_records_in_kv(&cluster_paths, OffsetDateTime::now_utc())?
+                {
+                    snapshot = Some(expire_snapshot);
+                }
             }
         }
 
@@ -2428,22 +2442,24 @@ impl ClusterNetworkMaintenance {
                     )
                 }
                 _ => {
-                    let failures = previous
+                    let observed_failures = previous
                         .as_ref()
                         .map(|record| record.consecutive_failures.saturating_add(1))
                         .unwrap_or(1);
                     let retained_success = previous.as_ref().and_then(|record| {
-                        if failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
+                        if observed_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
                             record.last_success_at.clone()
                         } else {
                             None
                         }
                     });
-                    let state_label = if failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
+                    let state_label = if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+                    {
                         network::ClusterConnectivityState::Unreachable
                     } else {
                         network::ClusterConnectivityState::Degraded
                     };
+                    let failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
                     cluster_connectivity_record(
                         state,
                         &endpoint,
@@ -4007,7 +4023,7 @@ pub(crate) fn refresh_daemon_node_status_in_kv(
         read_cluster_rollout_status(&rollout_paths)?,
         OffsetDateTime::now_utc(),
     );
-    sync_cluster_node_status_to_kv(&cluster_paths, record).map(Some)
+    sync_cluster_node_status_to_kv(&cluster_paths, record)
 }
 
 pub(crate) fn ensure_daemon_status_cluster(

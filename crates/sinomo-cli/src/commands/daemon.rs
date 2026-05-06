@@ -240,11 +240,9 @@ pub(crate) fn run_shadow_daemon_with_paths(
     let mut main_restart_suppressed = false;
     let mut pending_rollout: Option<ShadowMainRolloutMonitor> = None;
     let main_probe_interval = Duration::from_secs(10);
-    // Keep the nonblocking shadow accept loop responsive to status probes from
-    // the main daemon cluster-maintenance thread. A one-second idle sleep makes
-    // every probe wait behind the supervisor loop and can keep maintenance ticks
-    // in a near-continuous probe/sleep cycle.
-    let shadow_idle_interval = Duration::from_millis(20);
+    // Keep the nonblocking shadow accept loop responsive to status probes while
+    // avoiding a high-frequency idle poll when the cluster is quiet.
+    let shadow_idle_interval = Duration::from_millis(100);
     let mut last_main_probe = Instant::now() - main_probe_interval;
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
     loop {
