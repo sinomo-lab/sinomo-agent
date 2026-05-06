@@ -20,6 +20,10 @@ pub struct ClusterRolloutBuildRequest {
     pub source: String,
     #[serde(default)]
     pub remote_repo: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bundle_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_head: Option<String>,
     pub host: String,
     pub port: u16,
     pub shadow_port: u16,
@@ -32,4 +36,6 @@ pub struct ClusterRolloutBinaryResponse {
     pub detail: String,
     pub main_binary: PathBuf,
     pub shadow_binary: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_head: Option<String>,
 }

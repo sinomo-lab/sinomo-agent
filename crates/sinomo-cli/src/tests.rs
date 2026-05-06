@@ -12,10 +12,10 @@ use super::{
     cluster_doctor_findings, cluster_has_local_quorum, cluster_init_with_paths,
     cluster_invite_publish_targets, cluster_invite_with_paths, cluster_join_with_paths,
     cluster_peer_members, cluster_raft_known_leader_id, cluster_state_sync_txn,
-    cluster_sync_targets, daemon_advertised_endpoints_for_state, daemon_lan_endpoint,
-    daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
-    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
-    handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
+    cluster_sync_targets, create_source_repo_bundle, daemon_advertised_endpoints_for_state,
+    daemon_lan_endpoint, daemon_package_version, daemon_status_matches_options,
+    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
+    ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
     handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn,
     handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
     handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
@@ -23,9 +23,9 @@ use super::{
     install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
     invite_communication_channels, invite_introducer_endpoint,
     invite_introducer_endpoint_from_state, is_terminal_status, main_daemon_capabilities,
-    models_default_with_data_dir, normalize_model_provider, parse_cli_command,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
+    managed_source_status, models_default_with_data_dir, normalize_model_provider,
+    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_models_list_options, parse_propose_options, parse_provider_command,
     parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
     read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
@@ -34,6 +34,7 @@ use super::{
     send_daemon_command_raw, sign_cluster_join_invite, sign_daemon_command_from_data_dir,
     stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout, write_json,
 };
+use base64::Engine;
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
@@ -49,6 +50,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use std::io::{BufRead, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -2424,6 +2426,8 @@ fn daemon_rollout_build_rejects_missing_remote_repo() {
     let request = ClusterRolloutBuildRequest {
         source: "test".to_string(),
         remote_repo: None,
+        source_bundle_base64: None,
+        source_head: None,
         host: "127.0.0.1".to_string(),
         port: 21_353,
         shadow_port: 21_354,
@@ -2441,6 +2445,101 @@ fn daemon_rollout_build_rejects_missing_remote_repo() {
             .detail
             .contains("remote source repo is not initialized")
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn daemon_rollout_build_imports_source_bundle_before_building() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-build-bundle-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let source_repo = root.join("source");
+    let bundle = root.join("source.bundle");
+    std::fs::create_dir_all(&source_repo).expect("source repo dir");
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .current_dir(&source_repo)
+            .status()
+            .expect("git init")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["config", "user.email", "test@example.invalid"])
+            .current_dir(&source_repo)
+            .status()
+            .expect("git config email")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["config", "user.name", "Sinomo Test"])
+            .current_dir(&source_repo)
+            .status()
+            .expect("git config name")
+            .success()
+    );
+    std::fs::write(source_repo.join("README.md"), "bundle source\n").expect("readme");
+    assert!(
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&source_repo)
+            .status()
+            .expect("git add")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["commit", "-m", "bundle-source"])
+            .current_dir(&source_repo)
+            .status()
+            .expect("git commit")
+            .success()
+    );
+    let expected_head = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(&source_repo)
+        .output()
+        .expect("git rev-parse");
+    assert!(expected_head.status.success());
+    let expected_head = String::from_utf8_lossy(&expected_head.stdout)
+        .trim()
+        .to_string();
+
+    create_source_repo_bundle(&source_repo, &bundle).expect("source bundle");
+    let request = ClusterRolloutBuildRequest {
+        source: "test".to_string(),
+        remote_repo: None,
+        source_bundle_base64: Some(
+            super::URL_SAFE_NO_PAD.encode(std::fs::read(&bundle).expect("bundle bytes")),
+        ),
+        source_head: Some(expected_head.clone()),
+        host: "127.0.0.1".to_string(),
+        port: 21_353,
+        shadow_port: 21_354,
+        requested_at: "now".to_string(),
+    };
+    let payload =
+        sinomo_runtime::network::encode_object_text_payload(&request).expect("request object");
+    let response =
+        handle_daemon_rollout_build(&DaemonPaths::with_root(root.join("daemon")), &payload)
+            .expect("build response");
+    let rollout_paths = SelfRolloutPaths::new(&root);
+    let source_status = managed_source_status(&rollout_paths).expect("managed source status");
+
+    assert_eq!(response.status, "rejected");
+    assert!(
+        response
+            .detail
+            .contains("remote source repo is not initialized")
+    );
+    assert_eq!(source_status.head.as_deref(), Some(expected_head.as_str()));
+    assert!(!source_status.has_external_remotes);
     std::fs::remove_dir_all(root).ok();
 }
 

@@ -86,14 +86,15 @@ use sinomo_runtime::rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
     MainExitKind, MainExitObservation, PendingShadowRolloutContext, RolloutError,
     RolloutFailureDiagnostics, RolloutMainActivation, SelfRolloutPaths,
-    activate_staged_rollout_binary, classify_main_exit, deploy_managed_source_repo,
-    discover_current_git_repo, ensure_rollout_layout, managed_source_status,
-    read_pending_shadow_rollout, read_rollout_main_activation, record_activation_failure,
-    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
-    record_shadow_rollout_finalized, remove_shadow_finalize, restore_rollout_binary_from_backup,
-    rollout_main_activation_path, rollout_shadow_finalize_path, rollout_staged_main_binary,
-    rollout_staged_shadow_binary, stage_pending_shadow_rollout, stage_rollout_bytes,
-    stage_rollout_file, sync_external_repo_from_managed, write_main_activation,
+    activate_staged_rollout_binary, classify_main_exit, create_source_repo_bundle,
+    deploy_managed_source_bundle, deploy_managed_source_repo, discover_current_git_repo,
+    ensure_rollout_layout, managed_source_status, read_pending_shadow_rollout,
+    read_rollout_main_activation, record_activation_failure, record_main_activation_staged,
+    record_main_rollout_failure_with_diagnostics, record_shadow_rollout_finalized,
+    remove_shadow_finalize, restore_rollout_binary_from_backup, rollout_main_activation_path,
+    rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
+    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
+    sync_external_repo_from_managed, write_main_activation,
 };
 use std::env;
 use std::fs::{self, File};

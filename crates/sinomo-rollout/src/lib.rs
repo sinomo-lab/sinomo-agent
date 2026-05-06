@@ -24,8 +24,9 @@ pub use protocol::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
 };
 pub use source::{
-    ManagedSourceStatus, deploy_managed_source_repo, discover_current_git_repo,
-    managed_source_status, remove_dir_if_exists, sync_external_repo_from_managed,
+    ManagedSourceStatus, create_source_repo_bundle, deploy_managed_source_bundle,
+    deploy_managed_source_repo, discover_current_git_repo, managed_source_status,
+    remove_dir_if_exists, sync_external_repo_from_managed,
 };
 pub use state::{
     PendingShadowRollout, PendingShadowRolloutContext, RolloutFailureDiagnostics,

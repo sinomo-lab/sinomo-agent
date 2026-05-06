@@ -1265,6 +1265,7 @@ pub(crate) fn handle_daemon_connection(
                         detail: error.to_string(),
                         main_binary: PathBuf::new(),
                         shadow_binary: PathBuf::new(),
+                        source_head: None,
                     },
                 };
                 let body = network::encode_object_text_payload(&response)?;
@@ -1293,6 +1294,7 @@ pub(crate) fn handle_daemon_connection(
                         detail: error.to_string(),
                         main_binary: PathBuf::new(),
                         shadow_binary: PathBuf::new(),
+                        source_head: None,
                     },
                 };
                 let body = network::encode_object_text_payload(&response)?;
@@ -1768,6 +1770,7 @@ pub(crate) fn handle_daemon_rollout_binary(
             ),
             main_binary: PathBuf::new(),
             shadow_binary: PathBuf::new(),
+            source_head: None,
         });
     }
     let rollout_paths = SelfRolloutPaths::new(data_dir);
@@ -1814,6 +1817,7 @@ pub(crate) fn handle_daemon_rollout_binary(
         ),
         main_binary,
         shadow_binary,
+        source_head: None,
     })
 }
 
@@ -2013,7 +2017,46 @@ pub(crate) fn handle_daemon_rollout_build(
     })?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
-    let repo = rollout_remote_repo_path(&rollout_paths, request.remote_repo.as_deref());
+    let repo = if let Some(bundle_base64) = request.source_bundle_base64.as_deref() {
+        let bundle_bytes = URL_SAFE_NO_PAD
+            .decode(bundle_base64.as_bytes())
+            .map_err(|source| CliError::Parse {
+                detail: format!("invalid rollout source bundle encoding: {source}"),
+            })?;
+        let bundle_path = rollout_paths
+            .root
+            .join("staged")
+            .join(format!("source-{}.bundle", rollout_artifact_suffix()));
+        if let Some(parent) = bundle_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| CliError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        fs::write(&bundle_path, bundle_bytes).map_err(|source| CliError::Io {
+            path: bundle_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        deploy_managed_source_bundle(&rollout_paths, &bundle_path)?;
+        if let Some(expected_head) = request.source_head.as_deref() {
+            let status = managed_source_status(&rollout_paths)?;
+            if status.head.as_deref() != Some(expected_head) {
+                return Ok(ClusterRolloutBinaryResponse {
+                    status: "rejected".to_string(),
+                    detail: format!(
+                        "source bundle imported but managed source head is {}, expected {expected_head}",
+                        status.head.unwrap_or_else(|| "unknown".to_string())
+                    ),
+                    main_binary: PathBuf::new(),
+                    shadow_binary: PathBuf::new(),
+                    source_head: None,
+                });
+            }
+        }
+        rollout_paths.source_repo.clone()
+    } else {
+        rollout_remote_repo_path(&rollout_paths, request.remote_repo.as_deref())
+    };
     if !repo.join("Cargo.toml").exists() {
         return Ok(ClusterRolloutBinaryResponse {
             status: "rejected".to_string(),
@@ -2023,6 +2066,7 @@ pub(crate) fn handle_daemon_rollout_build(
             ),
             main_binary: PathBuf::new(),
             shadow_binary: PathBuf::new(),
+            source_head: None,
         });
     }
 
@@ -2034,6 +2078,7 @@ pub(crate) fn handle_daemon_rollout_build(
                 detail: format!("remote build failed: {error}"),
                 main_binary: PathBuf::new(),
                 shadow_binary: PathBuf::new(),
+                source_head: None,
             });
         }
     };
@@ -2091,6 +2136,7 @@ pub(crate) fn handle_daemon_rollout_build(
         ),
         main_binary,
         shadow_binary,
+        source_head: managed_source_status(&rollout_paths)?.head,
     })
 }
 

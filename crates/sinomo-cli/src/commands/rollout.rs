@@ -442,12 +442,15 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
     let build_request = ClusterRolloutBuildRequest {
         source: source.clone(),
         remote_repo: options.remote_repo.clone(),
+        source_bundle_base64: None,
+        source_head: None,
         host: options.host.clone(),
         port: options.port,
         shadow_port: options.shadow_port,
         requested_at: requested_at.clone(),
     };
     let mut binary_request: Option<ClusterRolloutBinaryRequest> = None;
+    let mut source_bundle: Option<(String, String)> = None;
 
     for target in targets {
         let target_status = match read_rollout_target_status(&target) {
@@ -463,9 +466,31 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                 && options.binary.is_none()
                 && platform_match != Some(true));
         if use_remote_build {
-            match send_daemon_rollout_build(&target, &build_request) {
+            let mut request = build_request.clone();
+            if request.remote_repo.is_none() {
+                if source_bundle.is_none() {
+                    source_bundle = Some(rollout_source_bundle_base64(&options)?);
+                }
+                if let Some((bundle, head)) = source_bundle.as_ref() {
+                    request.source_bundle_base64 = Some(bundle.clone());
+                    request.source_head = Some(head.clone());
+                }
+            }
+            match send_daemon_rollout_build(&target, &request) {
                 Ok(response) => {
-                    println!("{target}: {}", response.status);
+                    let source_head_mismatch = response.status == "accepted"
+                        && request.source_head.is_some()
+                        && response.source_head != request.source_head;
+                    if source_head_mismatch {
+                        println!("{target}: rejected");
+                        println!(
+                            "  remote build did not acknowledge requested source head {}; target reported {}",
+                            request.source_head.as_deref().unwrap_or("unknown"),
+                            response.source_head.as_deref().unwrap_or("unknown")
+                        );
+                    } else {
+                        println!("{target}: {}", response.status);
+                    }
                     if !response.detail.is_empty() {
                         println!("  {}", response.detail);
                     }
@@ -511,6 +536,50 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn rollout_source_bundle_base64(
+    options: &RolloutOptions,
+) -> Result<(String, String), CliError> {
+    let repo = options
+        .repo
+        .clone()
+        .unwrap_or(env::current_dir().map_err(|source| CliError::Io {
+            path: ".".to_string(),
+            detail: source.to_string(),
+        })?);
+    let paths = rollout_paths_from_defaults()?;
+    ensure_rollout_layout(&paths)?;
+    let bundle = paths
+        .root
+        .join("staged")
+        .join(format!("source-{}.bundle", rollout_artifact_suffix()));
+    create_source_repo_bundle(&repo, &bundle)?;
+    let bytes = fs::read(&bundle).map_err(|source| CliError::Io {
+        path: bundle.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok((URL_SAFE_NO_PAD.encode(bytes), rollout_source_head(&repo)?))
+}
+
+pub(crate) fn rollout_source_head(repo: &Path) -> Result<String, CliError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .map_err(|source| CliError::Io {
+            path: format!("git -C {} rev-parse --short HEAD", repo.display()),
+            detail: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Process {
+            command: format!("git -C {} rev-parse --short HEAD", repo.display()),
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub(crate) fn rollout_prepare_dev_binary(options: &RolloutOptions) -> Result<PathBuf, CliError> {
