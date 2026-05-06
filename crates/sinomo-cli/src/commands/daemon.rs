@@ -220,14 +220,20 @@ pub(crate) fn run_shadow_daemon_with_paths(
     );
 
     let status_paths = shadow_paths.clone();
-    thread::spawn(move || {
-        loop {
-            if let Err(error) = refresh_daemon_node_status_in_kv(&status_paths) {
-                eprintln!("sinomo shadow daemon cluster status tick failed: {error}");
+    thread::Builder::new()
+        .name("sinomo-shadow-status".to_string())
+        .spawn(move || {
+            loop {
+                thread::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL);
+                if let Err(error) = refresh_daemon_node_status_in_kv(&status_paths) {
+                    eprintln!("sinomo shadow daemon cluster status tick failed: {error}");
+                }
             }
-            thread::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL);
-        }
-    });
+        })
+        .map_err(|source| CliError::Io {
+            path: "spawn shadow status thread".to_string(),
+            detail: source.to_string(),
+        })?;
 
     let mut main_binary = main_binary;
     let mut supervised_main: Option<Child> = None;
@@ -653,36 +659,52 @@ pub(crate) fn run_daemon_with_paths(
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
     if label == "daemon" {
         ensure_default_local_dfs_expose(&paths)?;
-        if let Err(error) = ensure_default_distributed_dfs(&paths, &options) {
-            eprintln!("sinomo {label} distributed DFS bootstrap failed: {error}");
-        }
     }
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
         detail: source.to_string(),
     })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|source| CliError::Network {
-            address: bind_address.clone(),
-            detail: source.to_string(),
-        })?;
     println!("sinomo {label} listening on {bind_address}");
     start_daemon_iroh_proxy_if_clustered(&paths, &options, cluster.as_ref(), label);
+
+    if label == "daemon" {
+        let bootstrap_paths = paths.clone();
+        let bootstrap_options = options.clone();
+        let bootstrap_label = label.to_string();
+        thread::Builder::new()
+            .name("sinomo-dfs-bootstrap".to_string())
+            .spawn(move || {
+                if let Err(error) =
+                    ensure_default_distributed_dfs(&bootstrap_paths, &bootstrap_options, false)
+                {
+                    eprintln!("sinomo {bootstrap_label} distributed DFS bootstrap failed: {error}");
+                }
+            })
+            .map_err(|source| CliError::Io {
+                path: "spawn distributed DFS bootstrap thread".to_string(),
+                detail: source.to_string(),
+            })?;
+    }
 
     let maintenance_paths = paths.clone();
     let maintenance_options = options.clone();
     let maintenance_label = label.to_string();
-    thread::spawn(move || {
-        let mut cluster_network = ClusterNetworkMaintenance::new();
-        loop {
-            if let Err(error) = cluster_network.tick(&maintenance_paths, &maintenance_options) {
-                eprintln!("sinomo {maintenance_label} cluster network tick failed: {error}");
+    thread::Builder::new()
+        .name(format!("sinomo-{label}-cluster"))
+        .spawn(move || {
+            let mut cluster_network = ClusterNetworkMaintenance::new();
+            loop {
+                if let Err(error) = cluster_network.tick(&maintenance_paths, &maintenance_options) {
+                    eprintln!("sinomo {maintenance_label} cluster network tick failed: {error}");
+                }
+                thread::sleep(DAEMON_CLUSTER_TICK_INTERVAL);
             }
-            thread::sleep(DAEMON_CLUSTER_TICK_INTERVAL);
-        }
-    });
+        })
+        .map_err(|source| CliError::Io {
+            path: "spawn cluster maintenance thread".to_string(),
+            detail: source.to_string(),
+        })?;
     loop {
         match listener.accept() {
             Ok((mut stream, _address)) => {
@@ -702,7 +724,6 @@ pub(crate) fn run_daemon_with_paths(
                     Err(error) => eprintln!("sinomo {label} client error: {error}"),
                 }
             }
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
             Err(source) => {
                 return Err(CliError::Network {
                     address: bind_address.clone(),
@@ -710,8 +731,6 @@ pub(crate) fn run_daemon_with_paths(
                 });
             }
         }
-
-        thread::sleep(Duration::from_millis(100));
     }
     Ok(())
 }
@@ -722,31 +741,45 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
     cluster: Option<&DaemonClusterStatus>,
     label: &str,
 ) {
-    let Some(cluster) = cluster else {
+    if env::var("SINOMO_ENABLE_IROH")
+        .ok()
+        .is_none_or(|value| value != "1")
+    {
         return;
-    };
-    let Some(data_dir) = paths.root.parent() else {
-        eprintln!("sinomo {label} iroh proxy disabled: daemon paths have no data directory parent");
-        return;
-    };
-    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let daemon_address = daemon_connect_address(&options.host, options.port);
-    match network::start_iroh_daemon_proxy(
-        cluster_paths,
-        cluster.cluster_id.clone(),
-        cluster.node_id.clone(),
-        daemon_address,
-    ) {
-        Ok(record) => {
-            let endpoint = record.endpoint();
-            if let Err(error) = advertise_daemon_iroh_endpoint(paths, record) {
-                eprintln!("sinomo {label} iroh endpoint advertisement failed: {error}");
-            } else {
-                println!("sinomo {label} iroh endpoint: {}", endpoint.address);
-            }
-        }
-        Err(error) => eprintln!("sinomo {label} iroh proxy disabled: {error}"),
     }
+    let Some(cluster) = cluster.cloned() else {
+        return;
+    };
+    let paths = paths.clone();
+    let options = options.clone();
+    let label = label.to_string();
+    let thread_name = format!("sinomo-{label}-iroh");
+    let _ = thread::Builder::new().name(thread_name).spawn(move || {
+        let Some(data_dir) = paths.root.parent() else {
+            eprintln!(
+                "sinomo {label} iroh proxy disabled: daemon paths have no data directory parent"
+            );
+            return;
+        };
+        let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+        let daemon_address = daemon_connect_address(&options.host, options.port);
+        match network::start_iroh_daemon_proxy(
+            cluster_paths,
+            cluster.cluster_id.clone(),
+            cluster.node_id.clone(),
+            daemon_address,
+        ) {
+            Ok(record) => {
+                let endpoint = record.endpoint();
+                if let Err(error) = advertise_daemon_iroh_endpoint(&paths, record) {
+                    eprintln!("sinomo {label} iroh endpoint advertisement failed: {error}");
+                } else {
+                    println!("sinomo {label} iroh endpoint: {}", endpoint.address);
+                }
+            }
+            Err(error) => eprintln!("sinomo {label} iroh proxy disabled: {error}"),
+        }
+    });
 }
 
 pub(crate) fn start_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
@@ -1299,6 +1332,7 @@ pub(crate) fn handle_daemon_dfs_expose_config(paths: &DaemonPaths) -> Result<Str
 pub(crate) fn ensure_default_distributed_dfs(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
+    publish_cluster_control: bool,
 ) -> Result<(), CliError> {
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
@@ -1310,7 +1344,7 @@ pub(crate) fn ensure_default_distributed_dfs(
     if !cluster_paths.state.exists() {
         return Ok(());
     }
-    let state = read_cluster_state(&cluster_paths)?;
+    let state = read_cluster_state_without_kv(&cluster_paths)?;
     let file_system = distributed_sifs(state.local_node_id.clone());
     let mut backend = LocalJsonMetadataBackend::new(
         DfsMetadataShardId::new("root"),
@@ -1336,6 +1370,9 @@ pub(crate) fn ensure_default_distributed_dfs(
                 visible: true,
             })?;
         }
+    }
+    if !publish_cluster_control {
+        return Ok(());
     }
     if !cluster_has_local_quorum(&cluster_paths, &state) {
         return Ok(());
@@ -1389,6 +1426,18 @@ fn put_dfs_control_record<T: Serialize>(
     key: String,
     value: &T,
 ) -> Result<(), CliError> {
+    let op = KvOp::put_serde(key.clone(), value, None)?;
+    if read_cluster_kv_store(paths)?
+        .get(&key)
+        .is_some_and(|entry| match &op {
+            KvOp::Put {
+                value, lease_id, ..
+            } => entry.value == *value && entry.lease_id == *lease_id,
+            _ => false,
+        })
+    {
+        return Ok(());
+    }
     let mut state = read_cluster_state_without_kv(paths)?;
     if &state.local_node_id != node_id {
         return Err(CliError::ClusterReadOnly {
@@ -1403,7 +1452,7 @@ fn put_dfs_control_record<T: Serialize>(
         &mut state,
         KvTxn {
             compares: Vec::new(),
-            success: vec![KvOp::put_serde(key, value, None)?],
+            success: vec![op],
             failure: Vec::new(),
         },
     )?;

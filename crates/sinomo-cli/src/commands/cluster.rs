@@ -1844,16 +1844,17 @@ pub(crate) struct ClusterConnectivityProbeState {
 
 impl ClusterNetworkMaintenance {
     pub(crate) fn new() -> Self {
+        let now = Instant::now();
         Self {
             discovery: MdnsDiscoverySocket::bind_default().ok(),
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
             environment_id: None,
             tick: 0,
-            last_publish: Instant::now() - DAEMON_CLUSTER_PUBLISH_INTERVAL,
-            last_discovery: Instant::now() - DAEMON_CLUSTER_DISCOVERY_INTERVAL,
-            last_sync: Instant::now() - DAEMON_CLUSTER_RAFT_INTERVAL,
-            last_probe: Instant::now() - DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL,
+            last_publish: now,
+            last_discovery: now,
+            last_sync: now,
+            last_probe: now,
         }
     }
 
@@ -2330,9 +2331,13 @@ pub(crate) fn cluster_reachable_voter_count(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> usize {
+    let quorum_size = cluster_raft_quorum_size(state);
     let mut voters = std::collections::BTreeSet::new();
     if cluster_raft_local_is_voter(state) {
         voters.insert(state.local_node_id.clone());
+        if voters.len() >= quorum_size {
+            return voters.len();
+        }
     }
     for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
         if !cluster_raft_node_is_voter(state, &endpoint.node_id) {
@@ -2340,6 +2345,9 @@ pub(crate) fn cluster_reachable_voter_count(
         }
         if send_daemon_command_to_endpoint(&endpoint, "STATUS", DAEMON_JOIN_TIMEOUT).is_ok() {
             voters.insert(endpoint.node_id);
+            if voters.len() >= quorum_size {
+                break;
+            }
         }
     }
     voters.len()
@@ -3352,7 +3360,7 @@ pub(crate) fn refresh_daemon_node_status_in_kv(
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let rollout_paths = SelfRolloutPaths::new(data_dir);
-    let state = read_cluster_state(&cluster_paths)?;
+    let state = read_cluster_state_without_kv(&cluster_paths)?;
     if !cluster_has_local_quorum(&cluster_paths, &state) {
         return Ok(None);
     }
