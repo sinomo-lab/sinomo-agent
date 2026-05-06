@@ -263,6 +263,14 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::JoinCandidate
             )
         }
+        command if command.starts_with("CLUSTER_INVITE_PUBLISH ") => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         command
             if command.starts_with("CLUSTER_RAFT_APPEND ")
                 || command.starts_with("CLUSTER_RAFT_VOTE ") =>

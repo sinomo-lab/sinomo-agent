@@ -364,6 +364,19 @@ pub(crate) struct RenderedClusterInvite {
     pub(crate) output_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ClusterInvitePublishRequest {
+    pub(crate) invite: ClusterJoinInvite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ClusterInvitePublishResponse {
+    pub(crate) accepted: bool,
+    pub(crate) detail: String,
+    pub(crate) state: ClusterBootstrapState,
+    pub(crate) kv_snapshot: Option<KvSnapshot>,
+}
+
 pub(crate) fn cluster_invite_with_paths(
     options: ClusterInviteOptions,
     paths: &ClusterPaths,
@@ -389,7 +402,7 @@ pub(crate) fn cluster_invite_with_paths(
     let join_command = cluster_join_command(&uri);
     let persisted_path = paths.invite_path(&invite.invite_id);
     write_json(&persisted_path, &invite)?;
-    publish_cluster_invitation_to_quorum(paths, &state, &invite)?;
+    publish_cluster_invitation(paths, &state, &invite)?;
     if let Some(output) = &options.output {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent).map_err(|source| CliError::Io {
@@ -408,6 +421,62 @@ pub(crate) fn cluster_invite_with_paths(
         join_command,
         persisted_path,
         output_path: options.output,
+    })
+}
+
+pub(crate) fn publish_cluster_invitation(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    invite: &ClusterJoinInvite,
+) -> Result<(), CliError> {
+    match publish_cluster_invitation_to_quorum(paths, state, invite) {
+        Ok(()) => Ok(()),
+        Err(CliError::ClusterReadOnly { .. }) if !cluster_raft_local_is_voter(state) => {
+            publish_cluster_invitation_via_voter(paths, state, invite)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn publish_cluster_invitation_via_voter(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    invite: &ClusterJoinInvite,
+) -> Result<(), CliError> {
+    let request = ClusterInvitePublishRequest {
+        invite: invite.clone(),
+    };
+    let mut failures = Vec::new();
+    for endpoint in cluster_sync_targets_with_connectivity(paths, state)
+        .into_iter()
+        .filter(|endpoint| cluster_raft_node_is_voter(state, &endpoint.node_id))
+    {
+        match send_cluster_invite_publish(&endpoint, &request) {
+            Ok(response) if response.accepted => {
+                if let Some(snapshot) = response.kv_snapshot {
+                    write_cluster_kv_snapshot(paths, &snapshot)?;
+                }
+                return Ok(());
+            }
+            Ok(response) => failures.push(format!(
+                "{} ({:?}) rejected invite publish: {}",
+                endpoint.address, endpoint.transport, response.detail
+            )),
+            Err(error) => failures.push(format!(
+                "{} ({:?}) failed: {}",
+                endpoint.address, endpoint.transport, error
+            )),
+        }
+    }
+    Err(CliError::ClusterReadOnly {
+        detail: format!(
+            "local node is not a voter and no reachable voter accepted invite publication{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
     })
 }
 
@@ -2629,6 +2698,19 @@ pub(crate) fn send_cluster_raft_vote(
     network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
+pub(crate) fn send_cluster_invite_publish(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterInvitePublishRequest,
+) -> Result<ClusterInvitePublishResponse, CliError> {
+    let payload = network::encode_object_text_payload(request)?;
+    let response = send_daemon_command_to_endpoint(
+        endpoint,
+        &format!("CLUSTER_INVITE_PUBLISH {payload}"),
+        DAEMON_JOIN_TIMEOUT,
+    )?;
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+}
+
 pub(crate) fn send_cluster_kv_watch_events(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterKvWatchEventsRequest,
@@ -2855,6 +2937,89 @@ pub(crate) fn handle_daemon_cluster_kv_watch_events(
         detail: "cluster kv watch events stored".to_string(),
         stored_events,
     })
+}
+
+pub(crate) fn handle_daemon_cluster_invite_publish(
+    paths: &DaemonPaths,
+    payload: &str,
+    authenticated: &AuthenticatedDaemonCommand,
+) -> Result<ClusterInvitePublishResponse, CliError> {
+    let request: ClusterInvitePublishRequest = network::decode_object_text_payload(payload)?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state = read_cluster_state(&cluster_paths)?;
+    if request.invite.cluster_id != state.cluster_id {
+        return Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: format!(
+                "invite cluster `{}` does not match local cluster `{}`",
+                request.invite.cluster_id, state.cluster_id
+            ),
+            state,
+            kv_snapshot: None,
+        });
+    }
+    if request.invite.expires_at <= OffsetDateTime::now_utc() {
+        return Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: format!(
+                "invite expired at {}",
+                format_rfc3339(request.invite.expires_at)
+            ),
+            state,
+            kv_snapshot: None,
+        });
+    }
+    if let Err(error) = verify_cluster_join_invite_signature(&request.invite) {
+        return Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: format!("invite signature rejected: {error}"),
+            state,
+            kv_snapshot: None,
+        });
+    }
+    if !state.members.iter().any(|member| {
+        member.node_id == request.invite.issuer_node_id
+            && member.node_public_key == request.invite.issuer_public_key
+            && member.state.is_authorized()
+    }) {
+        return Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: format!(
+                "invite issuer {} is not an authorized cluster member",
+                request.invite.issuer_node_id
+            ),
+            state,
+            kv_snapshot: None,
+        });
+    }
+    if authenticated.signer_node_id != request.invite.issuer_node_id.as_str()
+        || authenticated.signer_public_key != request.invite.issuer_public_key
+    {
+        return Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: "invite publisher does not match invite issuer".to_string(),
+            state,
+            kv_snapshot: None,
+        });
+    }
+    match publish_cluster_invitation_to_quorum(&cluster_paths, &state, &request.invite) {
+        Ok(()) => Ok(ClusterInvitePublishResponse {
+            accepted: true,
+            detail: "invite published".to_string(),
+            state: read_cluster_state(&cluster_paths).unwrap_or(state),
+            kv_snapshot: read_cluster_kv_snapshot(&cluster_paths).ok(),
+        }),
+        Err(error) => Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: error.to_string(),
+            state,
+            kv_snapshot: None,
+        }),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

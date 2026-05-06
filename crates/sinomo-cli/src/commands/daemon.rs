@@ -1052,6 +1052,22 @@ pub(crate) fn handle_daemon_connection(
                     })?;
                 Ok(false)
             }
+            command if command.starts_with("CLUSTER_INVITE_PUBLISH ") => {
+                let payload = command
+                    .strip_prefix("CLUSTER_INVITE_PUBLISH ")
+                    .unwrap_or_default()
+                    .trim();
+                let response =
+                    handle_daemon_cluster_invite_publish(paths, payload, &authenticated)?;
+                let body = network::encode_object_text_payload(&response)?;
+                stream
+                    .write_all(body.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
             "CLUSTER_KV_SNAPSHOT" => {
                 let snapshot = handle_daemon_cluster_kv_snapshot(paths)?;
                 let body =
