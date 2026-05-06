@@ -263,7 +263,10 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::JoinCandidate
             )
         }
-        command if command.starts_with("CLUSTER_INVITE_PUBLISH ") => {
+        command
+            if command.starts_with("CLUSTER_INVITE_PUBLISH ")
+                || command.starts_with("CLUSTER_MEMBER_PUBLISH ") =>
+        {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local

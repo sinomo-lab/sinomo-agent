@@ -382,6 +382,19 @@ pub(crate) struct ClusterInvitePublishResponse {
     pub(crate) kv_snapshot: Option<KvSnapshot>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ClusterMemberPublishRequest {
+    pub(crate) members: Vec<ClusterMemberRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ClusterMemberPublishResponse {
+    pub(crate) accepted: bool,
+    pub(crate) detail: String,
+    pub(crate) state: ClusterBootstrapState,
+    pub(crate) kv_snapshot: Option<KvSnapshot>,
+}
+
 pub(crate) fn cluster_invite_with_paths(
     options: ClusterInviteOptions,
     paths: &ClusterPaths,
@@ -485,6 +498,54 @@ pub(crate) fn publish_cluster_invitation_via_voter(
     })
 }
 
+pub(crate) fn publish_local_members_via_voter(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<(), CliError> {
+    let members: Vec<_> = state
+        .members
+        .iter()
+        .filter(|member| cluster_member_is_local_process(state, member))
+        .cloned()
+        .collect();
+    if members.is_empty() {
+        return Ok(());
+    }
+    let request = ClusterMemberPublishRequest { members };
+    let mut failures = Vec::new();
+    for endpoint in cluster_sync_targets_with_connectivity(paths, state)
+        .into_iter()
+        .filter(|endpoint| cluster_raft_node_is_voter(state, &endpoint.node_id))
+    {
+        match send_cluster_member_publish(&endpoint, &request) {
+            Ok(response) if response.accepted => {
+                if let Some(snapshot) = response.kv_snapshot {
+                    write_cluster_kv_snapshot(paths, &snapshot)?;
+                }
+                return Ok(());
+            }
+            Ok(response) => failures.push(format!(
+                "{} ({:?}) rejected member publish: {}",
+                endpoint.address, endpoint.transport, response.detail
+            )),
+            Err(error) => failures.push(format!(
+                "{} ({:?}) failed: {}",
+                endpoint.address, endpoint.transport, error
+            )),
+        }
+    }
+    Err(CliError::ClusterReadOnly {
+        detail: format!(
+            "local node is not a voter and no reachable voter accepted member publication{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    })
+}
+
 pub(crate) fn publish_cluster_invitation_to_quorum(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -520,6 +581,36 @@ pub(crate) fn publish_cluster_invitation_to_quorum(
         },
     )?;
     Ok(())
+}
+
+pub(crate) fn cluster_member_publish_txn(
+    members: &[ClusterMemberRecord],
+) -> Result<KvTxn, CliError> {
+    let mut success = Vec::new();
+    for member in members {
+        success.push(KvOp::put_serde(
+            cluster_member_key(&member.node_id),
+            member,
+            None,
+        )?);
+        success.push(KvOp::put_serde(
+            network::cluster_capability_policy_key(&member.node_id),
+            &network::ClusterCapabilityPolicyRecord::from(member),
+            None,
+        )?);
+        for endpoint in &member.endpoints {
+            success.push(KvOp::put_serde(
+                network::cluster_endpoint_key(&member.node_id, endpoint),
+                endpoint,
+                None,
+            )?);
+        }
+    }
+    Ok(KvTxn {
+        compares: Vec::new(),
+        success,
+        failure: Vec::new(),
+    })
 }
 
 pub(crate) fn cluster_join_command(uri: &str) -> String {
@@ -2057,6 +2148,10 @@ impl ClusterNetworkMaintenance {
                         snapshot = Some(status_snapshot);
                     }
                 }
+            } else if !cluster_raft_local_is_voter(&state) {
+                if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
+                    eprintln!("sinomo daemon cluster member publish via voter failed: {error}");
+                }
             }
         }
 
@@ -2847,6 +2942,19 @@ pub(crate) fn send_cluster_invite_publish(
     network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
 
+pub(crate) fn send_cluster_member_publish(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterMemberPublishRequest,
+) -> Result<ClusterMemberPublishResponse, CliError> {
+    let payload = network::encode_object_text_payload(request)?;
+    let response = send_daemon_command_to_endpoint(
+        endpoint,
+        &format!("CLUSTER_MEMBER_PUBLISH {payload}"),
+        DAEMON_JOIN_TIMEOUT,
+    )?;
+    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+}
+
 pub(crate) fn send_cluster_kv_watch_events(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterKvWatchEventsRequest,
@@ -3150,6 +3258,91 @@ pub(crate) fn handle_daemon_cluster_invite_publish(
             kv_snapshot: read_cluster_kv_snapshot(&cluster_paths).ok(),
         }),
         Err(error) => Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: error.to_string(),
+            state,
+            kv_snapshot: None,
+        }),
+    }
+}
+
+pub(crate) fn handle_daemon_cluster_member_publish(
+    paths: &DaemonPaths,
+    payload: &str,
+    authenticated: &AuthenticatedDaemonCommand,
+) -> Result<ClusterMemberPublishResponse, CliError> {
+    let request: ClusterMemberPublishRequest = network::decode_object_text_payload(payload)?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state = read_cluster_state(&cluster_paths)?;
+    if request.members.is_empty() {
+        return Ok(ClusterMemberPublishResponse {
+            accepted: false,
+            detail: "member publish request was empty".to_string(),
+            state,
+            kv_snapshot: None,
+        });
+    }
+    for member in &request.members {
+        if member.cluster_id != state.cluster_id {
+            return Ok(ClusterMemberPublishResponse {
+                accepted: false,
+                detail: format!(
+                    "member {} cluster `{}` does not match local cluster `{}`",
+                    member.node_id, member.cluster_id, state.cluster_id
+                ),
+                state,
+                kv_snapshot: None,
+            });
+        }
+        if member.node_id.as_str() != authenticated.signer_node_id
+            && !member
+                .node_id
+                .as_str()
+                .starts_with(&format!("{}-", authenticated.signer_node_id))
+        {
+            return Ok(ClusterMemberPublishResponse {
+                accepted: false,
+                detail: format!(
+                    "member publisher {} cannot publish member {}",
+                    authenticated.signer_node_id, member.node_id
+                ),
+                state,
+                kv_snapshot: None,
+            });
+        }
+        if !state.members.iter().any(|existing| {
+            existing.node_id == member.node_id
+                && existing.node_public_key == member.node_public_key
+                && existing.state.is_authorized()
+        }) {
+            return Ok(ClusterMemberPublishResponse {
+                accepted: false,
+                detail: format!(
+                    "member {} is not an authorized cluster member with the published public key",
+                    member.node_id
+                ),
+                state,
+                kv_snapshot: None,
+            });
+        }
+    }
+    let mut commit_state = state.clone();
+    match commit_cluster_kv_txn_with_quorum(
+        &cluster_paths,
+        &mut commit_state,
+        cluster_member_publish_txn(&request.members)?,
+    ) {
+        Ok(snapshot) => Ok(ClusterMemberPublishResponse {
+            accepted: true,
+            detail: "member endpoints published".to_string(),
+            state: read_cluster_state(&cluster_paths).unwrap_or(state),
+            kv_snapshot: Some(snapshot),
+        }),
+        Err(error) => Ok(ClusterMemberPublishResponse {
             accepted: false,
             detail: error.to_string(),
             state,
