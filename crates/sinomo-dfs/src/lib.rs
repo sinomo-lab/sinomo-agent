@@ -2,20 +2,33 @@
 
 pub mod content_store;
 pub mod control_plane;
+pub mod discovery;
 pub mod distributed;
+pub mod local_owned;
 pub mod metadata_backend;
+pub mod namespace;
 pub mod operator;
+pub mod posix;
 
 pub use content_store::{ContentManifest, ContentStoreError, LocalContentStore};
 pub use control_plane::{
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, SharedDfsControlPlaneKvClient,
+    DfsMetadataShardConfig, SharedDfsControlPlaneKvClient, file_system_config_key,
+    metadata_shard_key,
+};
+pub use discovery::{
+    DfsClusterView, DfsNodeAdvertisement, content_service_key, content_services_prefix,
+    metadata_service_key, metadata_services_prefix,
 };
 pub use distributed::{
     DfsDistributedError, DfsReplicaCandidate, DfsReplicaPlacementPlan, DfsReplicaPlacementRequest,
     DfsReplicaReceiptState, DfsReplicationPolicy, DfsWriteIntentState,
     DistributedEventualCoordinator, DistributedRepairJob, DistributedReplicaReceipt,
     DistributedWriteIntent, plan_replicas,
+};
+pub use local_owned::{
+    DfsExposeConfig, DfsExposeEntry, DfsExposeFileInfo, DfsExposeStore, DfsExposeStoreError,
+    DfsExposedDirectory, LocalOwnedDfsError,
 };
 pub use metadata_backend::{
     DfsConflictRecord, DfsConflictStatus, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId,
@@ -24,11 +37,17 @@ pub use metadata_backend::{
     DfsPathRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
     LocalJsonMetadataBackend, MetadataBackendError,
 };
+pub use namespace::{
+    SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,
+    directory_object, distributed_sifs, distributed_sifs_bootstrap_objects, sifs_node_files_path,
+    sifs_node_path,
+};
 pub use operator::{
     DfsAgentFileSystemSummary, DfsAgentObjectState, DfsAgentObjectSummary,
     DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
     DfsOperatorStatus, DfsPinMode, DfsPinRecord, DfsPinStoreError, LocalDfsPinStore,
 };
+pub use posix::{DfsDirEntry, DfsPosixError, DfsStat, DfsWriteOptions};
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
@@ -231,6 +250,8 @@ pub struct DfsStageBlobCommand {
     pub version: DfsVersion,
     pub content_hash: String,
     pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_metadata: Option<DfsObjectMetadata>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -252,6 +273,8 @@ pub struct DfsCommitVersionCommand {
     pub object_id: DfsObjectId,
     pub version: DfsVersion,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_metadata: Option<DfsObjectMetadata>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -274,6 +297,8 @@ pub struct DfsRepairReplicaCommand {
     pub version: DfsVersion,
     pub content_hash: String,
     pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_metadata: Option<DfsObjectMetadata>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1518,6 +1543,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         version: request.target_version.clone(),
                         content_hash: manifest.content_hash.clone(),
                         bytes: bytes.clone(),
+                        object_metadata: Some(object.clone()),
                     }),
                 )?;
             }
@@ -1602,6 +1628,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     version: pending.version.clone(),
                     content_hash: pending.content_hash.clone(),
                     bytes: pending.bytes.clone(),
+                    object_metadata: self.metadata.object(&pending.object_id).cloned(),
                 }),
             )?;
 
@@ -2007,6 +2034,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsStageBlobCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.ensure_replica_object_metadata(command.object_metadata.as_ref())?;
         let result = match self.store_command_bytes(
             &command.object_id,
             &command.version,
@@ -2118,6 +2146,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsCommitVersionCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.ensure_replica_object_metadata(command.object_metadata.as_ref())?;
         let result = match self
             .commit_local_metadata(&command.object_id, &command.version, &command.content_hash)
             .and_then(|object| {
@@ -2169,6 +2198,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsRepairReplicaCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.ensure_replica_object_metadata(command.object_metadata.as_ref())?;
         let result = match self.store_command_bytes(
             &command.object_id,
             &command.version,
@@ -2317,6 +2347,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .filter(|node_id| *node_id != &self.node_id)
             .cloned()
             .collect();
+        let committed_metadata = self.metadata.object(&pending.object_id).cloned();
         for replica_node_id in commit_targets {
             let request_id = self.next_request_id();
             self.send_dfs_message(
@@ -2328,6 +2359,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: pending.object_id.clone(),
                     version: pending.version.clone(),
                     content_hash: pending.content_hash.clone(),
+                    object_metadata: committed_metadata.clone(),
                 }),
             )?;
         }
@@ -2359,6 +2391,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     version: pending.version.clone(),
                     content_hash: pending.content_hash.clone(),
                     bytes: pending.bytes.clone(),
+                    object_metadata: committed_metadata.clone(),
                 }),
             )?;
             if !sent {
@@ -2595,6 +2628,31 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 expected: expected_hash.to_string(),
                 actual: manifest.content_hash,
             });
+        }
+        Ok(())
+    }
+
+    fn ensure_replica_object_metadata(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+    ) -> Result<(), DfsError> {
+        let Some(object) = object else {
+            return Ok(());
+        };
+        if !self
+            .metadata
+            .filesystems
+            .contains_key(&object.file_system_id)
+        {
+            self.add_file_system(DfsFileSystem {
+                file_system_id: object.file_system_id.clone(),
+                display_name: object.file_system_id.to_string(),
+                owner_node_id: object.owner_node_id.clone(),
+                subtree_policies: Vec::new(),
+            })?;
+        }
+        if self.metadata.object(&object.object_id).is_none() {
+            self.add_object_metadata(object.clone())?;
         }
         Ok(())
     }

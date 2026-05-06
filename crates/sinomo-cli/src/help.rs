@@ -165,6 +165,13 @@ pub(super) fn print_dfs_help() {
     println!(
         "  sinomo dfs pin remove --path <path> [--filesystem <file_system_id>] [--node <node_id>] [--pin-root <path>] [--json]"
     );
+    println!("  sinomo dfs expose init [--config <path>] [--json]");
+    println!("      Ensure the default local SIFS exposure exists.");
+    println!("  sinomo dfs expose list [--config <path>] [--json]");
+    println!(
+        "  sinomo dfs expose add --source <path> --dfs-path <path> [--id <id>] [--filesystem <file_system_id>] [--node <node_id>] [--read-only] [--follow-symlinks] [--config <path>] [--json]"
+    );
+    println!("  sinomo dfs expose remove --id <id> [--config <path>] [--json]");
 }
 
 pub(super) fn print_models_help() {

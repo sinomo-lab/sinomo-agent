@@ -4,10 +4,11 @@ use sinomo_core::{
 use sinomo_dfs::{
     DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsConflictStatus, DfsControlPlaneStore,
     DfsFileSystem, DfsMetadataMutation, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsObjectKind, DfsObjectMetadata, DfsOwnerHandoffOutcome,
-    DfsReplicationPolicy, DfsWriteIntentState, DfsWriteIntentStatus, LocalJsonMetadataBackend,
-    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
-    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient,
+    DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectKind, DfsObjectMetadata,
+    DfsOwnerHandoffOutcome, DfsReplicationPolicy, DfsWriteIntentState, DfsWriteIntentStatus,
+    LocalJsonMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
+    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    SharedDfsControlPlaneKvClient,
 };
 use sinomo_kv::InProcessRaftKvCluster;
 use sinomo_network::InProcessNetwork;
@@ -226,9 +227,197 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
             file_system_id
         );
         let leader_store = kv.store(kv.leader_id()).expect("leader store");
-        assert!(leader_store.range_prefix("/dfs/").is_empty());
-        assert_eq!(leader_store.range_prefix("/dfs-control/").len(), 1);
+        let dfs_keys: Vec<_> = leader_store
+            .range_prefix("/dfs/")
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect();
+        assert_eq!(dfs_keys, vec!["/dfs/filesystems/sifs/config"]);
     });
+
+    cleanup(&root);
+}
+
+#[test]
+fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadata_not_kv() {
+    let owner = NodeId::new("node_owner").expect("node");
+    let replica = NodeId::new("node_replica").expect("node");
+    let root = temp_root("distributed_sifs_bootstrap");
+    let network = InProcessNetwork::new();
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![owner.clone(), replica.clone()])
+            .expect("control-plane kv cluster"),
+    );
+    let backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("content")).expect("content store"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(backend);
+
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .advertise_metadata_service(&DfsNodeAdvertisement::metadata(
+                owner.clone(),
+                "loopback://metadata",
+            ))
+            .expect("metadata advertisement");
+        control
+            .advertise_content_service(&DfsNodeAdvertisement::content(
+                owner.clone(),
+                "loopback://content",
+            ))
+            .expect("content advertisement");
+        let leader = kv.store(kv.leader_id()).expect("leader store");
+        let dfs_keys: Vec<_> = leader
+            .range_prefix("/dfs/")
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect();
+        assert!(dfs_keys.len() >= 3);
+        assert!(dfs_keys.iter().all(|key| {
+            key.starts_with("/dfs/filesystems/")
+                || key.starts_with("/dfs/services/metadata/")
+                || key.starts_with("/dfs/services/content/")
+        }));
+    });
+
+    assert_eq!(
+        dfs.posix_stat("/users").expect("users stat").kind,
+        DfsObjectKind::Directory
+    );
+    assert_eq!(
+        dfs.posix_stat("/services").expect("services stat").kind,
+        DfsObjectKind::Directory
+    );
+    assert_eq!(
+        dfs.posix_stat("/sinomo").expect("sinomo stat").kind,
+        DfsObjectKind::Directory
+    );
+    assert_eq!(
+        dfs.posix_stat("/sinomo/nodes").expect("nodes stat").kind,
+        DfsObjectKind::Directory
+    );
+    let node_files = dfs
+        .posix_stat("/sinomo/nodes/node_owner/files")
+        .expect("node files stat");
+    assert_eq!(node_files.kind, DfsObjectKind::Directory);
+    assert_eq!(node_files.policy, DfsObjectPolicy::LocalOwned);
+
+    cleanup(&root);
+}
+
+#[test]
+fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
+    let owner = NodeId::new("node_owner").expect("node");
+    let replica = NodeId::new("node_replica").expect("node");
+    let root = temp_root("posix_service_workflow");
+    let network = InProcessNetwork::new();
+    let owner_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(owner_backend);
+    let replica_backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("replica"),
+        root.join("replica-meta"),
+    )
+    .expect("replica metadata");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_metadata_backend(replica_backend);
+
+    owner_dfs
+        .bootstrap_distributed_sifs()
+        .expect("owner bootstrap");
+    replica_dfs
+        .bootstrap_distributed_sifs()
+        .expect("replica bootstrap");
+    owner_dfs
+        .posix_mkdir_all("/services/web")
+        .expect("mkdir service");
+    let stat = owner_dfs
+        .posix_write_file(
+            "/services/web/index.html",
+            b"<h1>Sinomo</h1>",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone(), replica.clone()]),
+        )
+        .expect("write service file");
+    assert_eq!(stat.size_bytes, Some(15));
+    assert_eq!(
+        owner_dfs
+            .posix_read_file("/services/web/index.html")
+            .expect("read service file"),
+        b"<h1>Sinomo</h1>"
+    );
+
+    let repairs = replica_dfs.process_incoming().expect("replica repair");
+    assert!(repairs.iter().any(|event| {
+        matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { object_id, .. } if object_id == &stat.object_id)
+    }));
+    let listing = owner_dfs
+        .posix_list_dir("/services/web")
+        .expect("list service dir");
+    assert_eq!(listing.len(), 1);
+    assert_eq!(listing[0].name, "index.html");
+    owner_dfs
+        .posix_rename("/services/web/index.html", "/services/web/current.html")
+        .expect("rename service file");
+    assert_eq!(
+        owner_dfs
+            .posix_read_file("/services/web/current.html")
+            .expect("read renamed service file"),
+        b"<h1>Sinomo</h1>"
+    );
+    assert!(
+        owner_dfs
+            .posix_stat("/services/web/index.html")
+            .expect_err("old path hidden after rename")
+            .to_string()
+            .contains("not found")
+    );
+    owner_dfs
+        .posix_write_file(
+            "/services/web/next.html",
+            b"<h1>Next</h1>",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("write replacement candidate");
+    owner_dfs
+        .posix_rename("/services/web/next.html", "/services/web/current.html")
+        .expect("atomic replace service file");
+    assert_eq!(
+        owner_dfs
+            .posix_read_file("/services/web/current.html")
+            .expect("read replaced service file"),
+        b"<h1>Next</h1>"
+    );
+    owner_dfs
+        .posix_unlink("/services/web/current.html")
+        .expect("unlink service file");
+    assert!(
+        owner_dfs
+            .posix_stat("/services/web/current.html")
+            .expect_err("stat after unlink")
+            .to_string()
+            .contains("not found")
+    );
+    assert!(
+        owner_dfs
+            .posix_list_dir("/services/web")
+            .expect("list after unlink")
+            .is_empty()
+    );
 
     cleanup(&root);
 }

@@ -571,6 +571,7 @@ pub(crate) fn stop_daemon_before_install(
     label: &str,
     reason: &str,
 ) -> Result<(), CliError> {
+    let mut next_shutdown_nudge = Instant::now();
     match probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT) {
         DaemonProbeStatus::Running(status) => {
             match send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT) {
@@ -582,7 +583,10 @@ pub(crate) fn stop_daemon_before_install(
                     ) {
                         return Ok(());
                     }
-                    return Err(error.into());
+                    println!(
+                        "sinomo {label} shutdown request failed during {reason}; will retry: {error}"
+                    );
+                    next_shutdown_nudge = Instant::now() + Duration::from_secs(1);
                 }
             }
         }
@@ -592,22 +596,70 @@ pub(crate) fn stop_daemon_before_install(
         DaemonProbeStatus::NotRunning => return Ok(()),
     }
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
-        if matches!(
-            probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT),
-            DaemonProbeStatus::NotRunning
-        ) {
-            println!("sinomo {label} stopped");
-            return Ok(());
+        match probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT) {
+            DaemonProbeStatus::NotRunning => {
+                println!("sinomo {label} stopped");
+                return Ok(());
+            }
+            DaemonProbeStatus::Running(status) if Instant::now() >= next_shutdown_nudge => {
+                let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+                next_shutdown_nudge = Instant::now() + Duration::from_secs(1);
+            }
+            DaemonProbeStatus::Running(_) | DaemonProbeStatus::Locked { .. } => {}
         }
         thread::sleep(Duration::from_millis(100));
+    }
+
+    if terminate_daemon_from_status_file(paths, label, reason)? {
+        return Ok(());
     }
 
     Err(CliError::Network {
         address: paths.status.display().to_string(),
         detail: format!("{label} did not stop before {reason}"),
     })
+}
+
+pub(crate) fn terminate_daemon_from_status_file(
+    paths: &DaemonPaths,
+    label: &str,
+    reason: &str,
+) -> Result<bool, CliError> {
+    let Ok(status) = read_daemon_status(paths) else {
+        return Ok(false);
+    };
+    println!(
+        "sinomo {label} did not answer shutdown for {reason}; sending SIGTERM to pid {}",
+        status.pid
+    );
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGTERM: i32 = 15;
+        let result = unsafe { kill(status.pid as i32, SIGTERM) };
+        if result == -1 {
+            return Err(CliError::Io {
+                path: format!("pid {}", status.pid),
+                detail: std::io::Error::last_os_error().to_string(),
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if matches!(
+                probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT),
+                DaemonProbeStatus::NotRunning
+            ) {
+                println!("sinomo {label} stopped");
+                return Ok(true);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn start_installed_sinomo_daemon(
@@ -634,7 +686,7 @@ pub(crate) fn start_installed_sinomo_daemon(
             detail: source.to_string(),
         })?;
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         if let DaemonProbeStatus::Running(status) = probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT)
         {

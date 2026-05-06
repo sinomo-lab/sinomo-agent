@@ -764,7 +764,7 @@ pub(crate) fn wait_for_main_daemon_health(
 ) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let paths = DaemonPaths::new(&data_dir);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         if let DaemonProbeStatus::Running(status) =
             probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
@@ -794,7 +794,7 @@ pub(crate) fn wait_for_local_shadow_rollout_completion(
     let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
     let shadow_paths = DaemonPaths::for_shadow(data_dir);
     let main_paths = DaemonPaths::new(data_dir);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut next_restart_nudge = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let pending_main = rollout_main_activation_path(&rollout_paths).exists();

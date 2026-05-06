@@ -13,14 +13,14 @@ use sinomo_kv::{
 };
 use std::sync::{Arc, Mutex};
 
-const DFS_CONTROL_PREFIX: &str = "/dfs-control";
+const DFS_KV_PREFIX: &str = "/dfs";
 
 pub fn file_system_config_key(file_system_id: &DfsFileSystemId) -> String {
-    format!("{DFS_CONTROL_PREFIX}/filesystems/{file_system_id}/config")
+    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/config")
 }
 
 pub fn metadata_shards_prefix(file_system_id: &DfsFileSystemId) -> String {
-    format!("{DFS_CONTROL_PREFIX}/filesystems/{file_system_id}/metadata-shards")
+    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/metadata-shards")
 }
 
 pub fn metadata_shard_key(file_system_id: &DfsFileSystemId, shard_id: &str) -> String {
@@ -78,6 +78,7 @@ pub enum DfsMetadataShardAssignment {
 
 pub trait DfsControlPlaneKvClient: std::fmt::Debug {
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError>;
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError>;
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError>;
 }
@@ -113,6 +114,15 @@ where
             .get(key)
     }
 
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".to_string(),
+            })?
+            .range_prefix(prefix)
+    }
+
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
         self.inner
             .lock()
@@ -142,6 +152,15 @@ impl DfsControlPlaneKvClient for InProcessRaftKvCluster {
         Ok(leader.get(key).cloned())
     }
 
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        let leader = self
+            .store(self.leader_id())
+            .ok_or_else(|| KvError::UnknownNode {
+                node_id: self.leader_id().clone(),
+            })?;
+        Ok(leader.range_prefix(prefix))
+    }
+
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
         InProcessRaftKvCluster::put(self, key, value)
     }
@@ -152,7 +171,7 @@ impl DfsControlPlaneKvClient for InProcessRaftKvCluster {
 }
 
 pub struct DfsControlPlaneStore<'a> {
-    kv: &'a mut dyn DfsControlPlaneKvClient,
+    pub(crate) kv: &'a mut dyn DfsControlPlaneKvClient,
 }
 
 impl<'a> DfsControlPlaneStore<'a> {
@@ -278,11 +297,11 @@ mod tests {
 
         assert_eq!(
             file_system_config_key(&file_system_id),
-            "/dfs-control/filesystems/sifs/config"
+            "/dfs/filesystems/sifs/config"
         );
         assert_eq!(
             metadata_shard_key(&file_system_id, "root/frag"),
-            "/dfs-control/filesystems/sifs/metadata-shards/root_frag"
+            "/dfs/filesystems/sifs/metadata-shards/root_frag"
         );
     }
 

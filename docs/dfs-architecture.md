@@ -4,9 +4,11 @@
 
 Sinomo DFS is a local-first distributed object and metadata layer for agent
 artifacts, evidence bundles, task staging, and cross-device handoff. It exposes
-a default virtual filesystem named `sifs` (Sinomo File System), but it does not
-own higher-level layout concepts such as evolution workspaces. Layout is built
-above DFS by applying policies to SIFS subtrees.
+a default virtual filesystem named `sifs` (Sinomo File System). SIFS is the root
+filesystem for the cluster and many cluster operations depend on it. From
+`sinomo-dfs`'s perspective, SIFS is not a special storage engine; it is the
+default filesystem with predefined subtree policies. See [SIFS](sifs.md) for the
+cluster filesystem layout.
 
 The design borrows the useful shape of Ceph:
 
@@ -505,13 +507,36 @@ operating implementation transfers bounded whole blobs in protocol messages for
 staging and repair. Large payloads should move to chunked/ranged streams after
 the minimal service path is stable.
 
+## SIFS Cluster Root
+
+SIFS is the cluster root filesystem. It is the default DFS namespace exposed to
+operators, agents, cluster services, and rollout/self-evolution workflows.
+Higher-level concepts such as evolution workspaces are layered onto SIFS paths;
+DFS itself records object identity, path metadata, versions, locations,
+receipts, conflicts, and inherited subtree policy.
+
+The initial SIFS layout is mixed-architecture:
+
+```text
+/
+/sinomo
+/sinomo/nodes
+/sinomo/nodes/<node_id>
+/sinomo/nodes/<node_id>/files
+/users
+/services
+```
+
+`/sinomo/nodes/<node_id>/files` is a local-owned subtree where a node exposes
+its local `$SINOMO_DATA_DIR/files` directory. `/users` and `/services` are true
+distributed DFS subtrees for cluster-shared user and service state.
+
 ## Metadata Model
 
-SIFS is the default DFS namespace. It is not a project or evolution workspace;
-it is the low-level virtual filesystem used by the Sinomo cluster itself.
-Agents and higher-level services can map their own directory layouts onto SIFS,
-but DFS metadata only records object identity, paths, versions, locations,
-receipts, conflicts, and inherited subtree policy.
+SIFS is the default DFS namespace and cluster root filesystem. Agents and
+higher-level services can map their own directory layouts onto SIFS, but DFS
+metadata only records object identity, paths, versions, locations, receipts,
+conflicts, and inherited subtree policy.
 
 Object identity is stable across path moves:
 
@@ -567,11 +592,11 @@ Use slash-delimited `sinomo-kv` keys and JSON values only for compact
 configuration:
 
 ```text
-/dfs-control/filesystems/<file_system_id>/config
-/dfs-control/filesystems/<file_system_id>/metadata-shards/<shard_id>
-/dfs-control/policies/<policy_id>
-/dfs-control/services/metadata/<node_id>
-/dfs-control/services/content/<node_id>
+/dfs/filesystems/<file_system_id>/config
+/dfs/filesystems/<file_system_id>/metadata-shards/<shard_id>
+/dfs/policies/<policy_id>
+/dfs/services/metadata/<node_id>
+/dfs/services/content/<node_id>
 ```
 
 Important rule: this keyspace must not contain per-path, per-object,

@@ -2405,7 +2405,6 @@ pub(crate) fn register_daemon_cluster_node(
         OffsetDateTime::now_utc(),
     );
     write_json(&paths.state, &state)?;
-    sync_cluster_state_to_kv(&paths, &state)?;
     daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
         detail: "daemon cluster member could not be registered".to_string(),
     })

@@ -57,13 +57,16 @@ use sinomo_runtime::daemon::{
     daemon_package_version, send_daemon_command_raw, sign_daemon_command_from_data_dir,
 };
 use sinomo_runtime::dfs::{
-    DfsMetadataShardId, DfsOperatorInspector, DfsPinMode, DfsPinRecord, LocalDfsPinStore,
-    LocalJsonMetadataBackend,
+    DfsExposeEntry, DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend,
+    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement,
+    DfsOperatorInspector, DfsPinMode, DfsPinRecord, LocalDfsPinStore, LocalJsonMetadataBackend,
+    content_service_key, distributed_sifs, distributed_sifs_bootstrap_objects,
+    file_system_config_key, metadata_service_key, metadata_shard_key,
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
 use sinomo_runtime::kv::{
-    KvCommand, KvEntry, KvError, KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesRequest,
+    KvCommand, KvEntry, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesRequest,
     RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
 };
 use sinomo_runtime::local::SinomoDataDir;

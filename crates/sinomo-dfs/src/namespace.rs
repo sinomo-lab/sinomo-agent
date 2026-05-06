@@ -1,0 +1,174 @@
+//! Distributed SIFS namespace bootstrap helpers.
+
+use crate::{
+    DfsFileSystem, DfsObjectKind, DfsObjectMetadata, DfsSubtreePolicy, sifs_file_system_id,
+};
+use sinomo_core::{DfsObjectId, DfsObjectPolicy, DfsVersion, NodeId};
+
+pub const SIFS_ROOT_PATH: &str = "/";
+pub const SIFS_SINOMO_PATH: &str = "/sinomo";
+pub const SIFS_NODES_PATH: &str = "/sinomo/nodes";
+pub const SIFS_USERS_PATH: &str = "/users";
+pub const SIFS_SERVICES_PATH: &str = "/services";
+
+pub fn distributed_sifs(owner_node_id: NodeId) -> DfsFileSystem {
+    let node_files_path = sifs_node_files_path(&owner_node_id);
+    DfsFileSystem {
+        file_system_id: sifs_file_system_id(),
+        display_name: "sifs".to_string(),
+        owner_node_id,
+        subtree_policies: vec![
+            DfsSubtreePolicy {
+                path_prefix: node_files_path,
+                policy: DfsObjectPolicy::LocalOwned,
+            },
+            DfsSubtreePolicy {
+                path_prefix: SIFS_USERS_PATH.to_string(),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsSubtreePolicy {
+                path_prefix: SIFS_SERVICES_PATH.to_string(),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ],
+    }
+}
+
+pub fn distributed_sifs_bootstrap_objects(owner_node_id: NodeId) -> Vec<DfsObjectMetadata> {
+    let node_path = sifs_node_path(&owner_node_id);
+    let node_files_path = sifs_node_files_path(&owner_node_id);
+    [
+        SIFS_ROOT_PATH.to_string(),
+        SIFS_SINOMO_PATH.to_string(),
+        SIFS_NODES_PATH.to_string(),
+        node_path,
+        node_files_path,
+        SIFS_USERS_PATH.to_string(),
+        SIFS_SERVICES_PATH.to_string(),
+    ]
+    .into_iter()
+    .map(|path| {
+        let policy = if path == sifs_node_files_path(&owner_node_id) {
+            DfsObjectPolicy::LocalOwned
+        } else {
+            DfsObjectPolicy::ReplicatedEventual
+        };
+        directory_object_with_policy(&path, owner_node_id.clone(), policy)
+    })
+    .collect()
+}
+
+pub fn directory_object(path: &str, owner_node_id: NodeId) -> DfsObjectMetadata {
+    directory_object_with_policy(path, owner_node_id, DfsObjectPolicy::ReplicatedEventual)
+}
+
+pub fn directory_object_with_policy(
+    path: &str,
+    owner_node_id: NodeId,
+    policy: DfsObjectPolicy,
+) -> DfsObjectMetadata {
+    DfsObjectMetadata {
+        object_id: object_id_for_path(path),
+        file_system_id: sifs_file_system_id(),
+        path: normalize_sifs_path(path),
+        kind: DfsObjectKind::Directory,
+        owner_node_id: owner_node_id.clone(),
+        current_locations: vec![owner_node_id],
+        content_hash: None,
+        version: initial_version(),
+        policy,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    }
+}
+
+pub fn sifs_node_path(node_id: &NodeId) -> String {
+    format!("{SIFS_NODES_PATH}/{node_id}")
+}
+
+pub fn sifs_node_files_path(node_id: &NodeId) -> String {
+    format!("{}/files", sifs_node_path(node_id))
+}
+
+pub fn object_id_for_path(path: &str) -> DfsObjectId {
+    let normalized = normalize_sifs_path(path);
+    let hash = blake3::hash(normalized.as_bytes()).to_hex().to_string();
+    DfsObjectId::new(format!("obj_sifs_{}", &hash[..32])).expect("valid deterministic object id")
+}
+
+pub fn normalize_sifs_path(path: &str) -> String {
+    let replaced = path.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in replaced.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+pub fn metadata_path(path: &str) -> String {
+    normalize_sifs_path(path).trim_matches('/').to_string()
+}
+
+pub fn initial_version() -> DfsVersion {
+    DfsVersion::new("version_1").expect("valid initial version")
+}
+
+pub fn next_version(version: &DfsVersion) -> DfsVersion {
+    let suffix = version.as_str().trim_start_matches(DfsVersion::PREFIX);
+    if let Ok(number) = suffix.parse::<u64>() {
+        return DfsVersion::new(format!("version_{}", number.saturating_add(1)))
+            .expect("valid incremented version");
+    }
+    DfsVersion::generate()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distributed_sifs_bootstrap_exposes_users_and_services() {
+        let node = NodeId::new("node_alpha").expect("node");
+        let filesystem = distributed_sifs(node.clone());
+        let objects = distributed_sifs_bootstrap_objects(node);
+
+        assert_eq!(filesystem.file_system_id.as_str(), "sifs");
+        assert!(
+            filesystem
+                .subtree_policies
+                .iter()
+                .any(|policy| policy.path_prefix == SIFS_USERS_PATH)
+        );
+        assert!(filesystem.subtree_policies.iter().any(|policy| {
+            policy.path_prefix == "/sinomo/nodes/node_alpha/files"
+                && policy.policy == DfsObjectPolicy::LocalOwned
+        }));
+        assert!(objects.iter().any(|object| object.path == SIFS_SINOMO_PATH));
+        assert!(objects.iter().any(|object| object.path == SIFS_NODES_PATH));
+        assert!(
+            objects
+                .iter()
+                .any(|object| object.path == "/sinomo/nodes/node_alpha")
+        );
+        assert!(objects.iter().any(|object| {
+            object.path == "/sinomo/nodes/node_alpha/files"
+                && object.policy == DfsObjectPolicy::LocalOwned
+        }));
+        assert!(objects.iter().any(|object| object.path == SIFS_USERS_PATH));
+        assert!(
+            objects
+                .iter()
+                .any(|object| object.path == SIFS_SERVICES_PATH)
+        );
+    }
+}

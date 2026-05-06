@@ -204,9 +204,11 @@ The same event contract should work for local and distributed cases. Distributio
 
 ### Distributed Filesystem
 
-Sinomo should include a distributed filesystem component for agent workspaces, staging areas, generated artifacts, coding tasks, and handoff between nodes.
+Sinomo should include a distributed filesystem component for agent workspaces, staging areas, generated artifacts, coding tasks, and handoff between nodes. Its default exposed filesystem is SIFS, the cluster root filesystem described in [SIFS](sifs.md).
 
 The DFS should be local-first. A file object can live primarily on one node, be replicated to several nodes, or require distributed write confirmation. The policy is attached to the object, directory, workspace, or mount, not hardcoded by file type.
+
+SIFS is mixed-architecture: `/sinomo/nodes/<node_id>/files` exposes a node's local files as a `local-owned` subtree, while `/users` and `/services` are distributed DFS subtrees for cluster-shared user and service state.
 
 Core use cases:
 

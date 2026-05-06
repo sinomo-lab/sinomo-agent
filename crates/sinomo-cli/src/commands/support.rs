@@ -1,6 +1,24 @@
 use super::*;
 
 pub(crate) fn prepare_background_command(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        unsafe extern "C" {
+            fn setsid() -> i32;
+        }
+
+        unsafe {
+            command.pre_exec(|| {
+                if setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

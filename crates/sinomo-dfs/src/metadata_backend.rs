@@ -589,7 +589,13 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         if normalize_path(&path_record.path) != normalize_path(path) {
             return Ok(None);
         }
-        self.get_object(&path_record.object_id)
+        let Some(object) = self.get_object(&path_record.object_id)? else {
+            return Ok(None);
+        };
+        if normalize_path(&object.path) != normalize_path(path) {
+            return Ok(None);
+        }
+        Ok(Some(object))
     }
 
     fn objects_for_file_system(

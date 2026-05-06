@@ -2,18 +2,18 @@ use super::{
     CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
     ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRolloutBuildRequest,
     DaemonCliCommand, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
-    DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsFilterOptions, DfsPinCliCommand,
-    EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions, InteractionModel,
-    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand, ProviderCliCommand,
-    ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
-    UninstallOptions, authenticate_daemon_command, build_cluster_raft_append_request,
-    cli_command_requires_cluster_state, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_sync_targets, daemon_lan_endpoint, daemon_package_version,
-    daemon_status_matches_options, decode_cluster_join_invite, elect_cluster_raft_leader,
-    encode_cluster_join_invite, ensure_rollout_layout, handle_daemon_cluster_join,
-    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
+    DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
+    DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions,
+    InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, ModelBackedInteractionHandler, ModelDefaultRepoMode, ModelsCliCommand,
+    ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
+    SelfRolloutPaths, UninstallOptions, authenticate_daemon_command,
+    build_cluster_raft_append_request, cli_command_requires_cluster_state, cluster_init_with_paths,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
+    cluster_raft_known_leader_id, cluster_sync_targets, daemon_lan_endpoint,
+    daemon_package_version, daemon_status_matches_options, decode_cluster_join_invite,
+    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
+    handle_daemon_cluster_join, handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
     handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
     handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
     handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
@@ -565,6 +565,25 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         DfsCliCommand::Pin(DfsPinCliCommand::Add(options))
             if options.mode == sinomo_runtime::dfs::DfsPinMode::Metadata
                 && options.path == "src/lib.rs"
+    ));
+    assert!(matches!(
+        parse_dfs_command(&[
+            "expose".to_string(),
+            "add".to_string(),
+            "--source".to_string(),
+            "/tmp/shared".to_string(),
+            "--dfs-path".to_string(),
+            "/sinomo/nodes/node_alpha/files/shared".to_string(),
+            "--node".to_string(),
+            "node_alpha".to_string(),
+            "--read-only".to_string(),
+        ])
+        .expect("dfs expose add"),
+        DfsCliCommand::Expose(DfsExposeCliCommand::Add(options))
+            if options.source == PathBuf::from("/tmp/shared")
+                && options.dfs_path == "/sinomo/nodes/node_alpha/files/shared"
+                && options.node_id == Some(NodeId::new("node_alpha").expect("node"))
+                && !options.writable
     ));
 }
 

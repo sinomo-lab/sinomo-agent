@@ -41,6 +41,14 @@ impl SinomoDataDir {
         self.root.join("dfs")
     }
 
+    pub fn files_dir(&self) -> PathBuf {
+        self.root.join("files")
+    }
+
+    pub fn dfs_expose_config_file(&self) -> PathBuf {
+        self.configs_dir().join("dfs-expose.json")
+    }
+
     pub fn providers_dir(&self) -> PathBuf {
         self.root.join("providers")
     }
@@ -58,6 +66,7 @@ impl SinomoDataDir {
             self.root(),
             self.configs_dir(),
             self.dfs_dir(),
+            self.files_dir(),
             self.providers_dir(),
         ] {
             fs::create_dir_all(&path).map_err(|source| LocalDataError::CreateDir {

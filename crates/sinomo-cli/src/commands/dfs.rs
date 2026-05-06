@@ -15,6 +15,7 @@ pub(crate) enum DfsCliCommand {
     Conflicts(DfsFilterOptions),
     Repair(DfsFilterOptions),
     Pin(DfsPinCliCommand),
+    Expose(DfsExposeCliCommand),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
@@ -64,6 +65,38 @@ pub(crate) struct DfsPinRemoveOptions {
     pub(crate) json: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum DfsExposeCliCommand {
+    Init(DfsExposeCommonOptions),
+    List(DfsExposeCommonOptions),
+    Add(DfsExposeAddOptions),
+    Remove(DfsExposeRemoveOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub(crate) struct DfsExposeCommonOptions {
+    pub(crate) config: Option<PathBuf>,
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsExposeAddOptions {
+    pub(crate) common: DfsExposeCommonOptions,
+    pub(crate) id: Option<String>,
+    pub(crate) source: PathBuf,
+    pub(crate) dfs_path: String,
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) node_id: Option<NodeId>,
+    pub(crate) writable: bool,
+    pub(crate) follow_symlinks: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsExposeRemoveOptions {
+    pub(crate) common: DfsExposeCommonOptions,
+    pub(crate) id: String,
+}
+
 pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
     match args.split_first() {
         None => Ok(DfsCliCommand::Help),
@@ -95,6 +128,9 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
         }
         Some((command, rest)) if command == "pin" => {
             Ok(DfsCliCommand::Pin(parse_dfs_pin_command(rest)?))
+        }
+        Some((command, rest)) if command == "expose" => {
+            Ok(DfsCliCommand::Expose(parse_dfs_expose_command(rest)?))
         }
         _ => Err(CliError::Usage),
     }
@@ -300,6 +336,132 @@ pub(crate) fn parse_dfs_pin_remove_options(
     })
 }
 
+pub(crate) fn parse_dfs_expose_command(args: &[String]) -> Result<DfsExposeCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "init" => {
+            Ok(DfsExposeCliCommand::Init(parse_dfs_expose_common(rest)?))
+        }
+        Some((command, rest)) if command == "list" => {
+            Ok(DfsExposeCliCommand::List(parse_dfs_expose_common(rest)?))
+        }
+        Some((command, rest)) if command == "add" => {
+            Ok(DfsExposeCliCommand::Add(parse_dfs_expose_add(rest)?))
+        }
+        Some((command, rest)) if command == "remove" => {
+            Ok(DfsExposeCliCommand::Remove(parse_dfs_expose_remove(rest)?))
+        }
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_dfs_expose_common(args: &[String]) -> Result<DfsExposeCommonOptions, CliError> {
+    let mut options = DfsExposeCommonOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                options.config = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
+            }
+            "--json" => options.json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+pub(crate) fn parse_dfs_expose_add(args: &[String]) -> Result<DfsExposeAddOptions, CliError> {
+    let mut common = DfsExposeCommonOptions::default();
+    let mut id = None;
+    let mut source = None;
+    let mut dfs_path = None;
+    let mut file_system_id = None;
+    let mut node_id = None;
+    let mut writable = true;
+    let mut follow_symlinks = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                common.config = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
+            }
+            "--id" => {
+                index += 1;
+                id = Some(non_empty_string(
+                    args.get(index).ok_or(CliError::Usage)?,
+                    "id",
+                )?);
+            }
+            "--source" => {
+                index += 1;
+                source = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
+            }
+            "--dfs-path" | "--path" => {
+                index += 1;
+                dfs_path = Some(non_empty_string(
+                    args.get(index).ok_or(CliError::Usage)?,
+                    "dfs path",
+                )?);
+            }
+            "--filesystem" | "--fs" => {
+                index += 1;
+                file_system_id = Some(parse_dfs_file_system_id(
+                    args.get(index).ok_or(CliError::Usage)?,
+                )?);
+            }
+            "--node" => {
+                index += 1;
+                node_id = Some(parse_node_id(args.get(index).ok_or(CliError::Usage)?)?);
+            }
+            "--read-only" => writable = false,
+            "--follow-symlinks" => follow_symlinks = true,
+            "--json" => common.json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(DfsExposeAddOptions {
+        common,
+        id,
+        source: source.ok_or(CliError::Usage)?,
+        dfs_path: dfs_path.ok_or(CliError::Usage)?,
+        file_system_id: file_system_id.unwrap_or_else(default_dfs_file_system_id),
+        node_id,
+        writable,
+        follow_symlinks,
+    })
+}
+
+pub(crate) fn parse_dfs_expose_remove(args: &[String]) -> Result<DfsExposeRemoveOptions, CliError> {
+    let mut common = DfsExposeCommonOptions::default();
+    let mut id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                common.config = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
+            }
+            "--id" => {
+                index += 1;
+                id = Some(non_empty_string(
+                    args.get(index).ok_or(CliError::Usage)?,
+                    "id",
+                )?);
+            }
+            "--json" => common.json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(DfsExposeRemoveOptions {
+        common,
+        id: id.ok_or(CliError::Usage)?,
+    })
+}
+
 pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError> {
     match command {
         DfsCliCommand::Help => {
@@ -439,6 +601,118 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
+        DfsCliCommand::Expose(command) => run_dfs_expose_command(command),
+    }
+}
+
+pub(crate) fn run_dfs_expose_command(command: DfsExposeCliCommand) -> Result<(), CliError> {
+    match command {
+        DfsExposeCliCommand::Init(options) => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            data_dir.ensure_root_layout()?;
+            let node_id = default_dfs_node_id();
+            let store = DfsExposeStore::new(dfs_expose_config_path(options.config, &data_dir));
+            let config = store.ensure_default(&data_dir.root(), node_id)?;
+            if options.json {
+                print_json("<dfs-expose-config>", &config)?;
+            } else {
+                println!("DFS expose config: {}", store.path().display());
+                for entry in config.entries {
+                    println!(
+                        "{} {} -> {} owner={} writable={}",
+                        entry.file_system_id,
+                        entry.source_path.display(),
+                        entry.dfs_path,
+                        entry.owner_node_id,
+                        entry.writable
+                    );
+                }
+            }
+            Ok(())
+        }
+        DfsExposeCliCommand::List(options) => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            data_dir.ensure_root_layout()?;
+            let store = DfsExposeStore::new(dfs_expose_config_path(options.config, &data_dir));
+            let config = store.load()?;
+            if options.json {
+                print_json("<dfs-expose-config>", &config)?;
+            } else if config.entries.is_empty() {
+                println!("No DFS exposed directories.");
+            } else {
+                for entry in config.entries {
+                    println!(
+                        "{} {} -> {} owner={} writable={} symlinks={}",
+                        entry.id,
+                        entry.source_path.display(),
+                        entry.dfs_path,
+                        entry.owner_node_id,
+                        entry.writable,
+                        entry.follow_symlinks
+                    );
+                }
+            }
+            Ok(())
+        }
+        DfsExposeCliCommand::Add(options) => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            data_dir.ensure_root_layout()?;
+            let store = DfsExposeStore::new(dfs_expose_config_path(
+                options.common.config.clone(),
+                &data_dir,
+            ));
+            let mut config = store.load()?;
+            let node_id = options.node_id.unwrap_or_else(default_dfs_node_id);
+            let id = options.id.unwrap_or_else(|| {
+                format!(
+                    "expose-{}-{}",
+                    node_id,
+                    options.dfs_path.trim_matches('/').replace('/', "-")
+                )
+            });
+            config.entries.retain(|entry| entry.id != id);
+            config.entries.push(DfsExposeEntry {
+                id,
+                file_system_id: options.file_system_id,
+                dfs_path: options.dfs_path,
+                source_path: options.source,
+                owner_node_id: node_id,
+                writable: options.writable,
+                follow_symlinks: options.follow_symlinks,
+                created_at: OffsetDateTime::now_utc(),
+            });
+            store.save(&config)?;
+            if options.common.json {
+                print_json("<dfs-expose-config>", &config)?;
+            } else {
+                println!("DFS expose config updated: {}", store.path().display());
+            }
+            Ok(())
+        }
+        DfsExposeCliCommand::Remove(options) => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            data_dir.ensure_root_layout()?;
+            let store = DfsExposeStore::new(dfs_expose_config_path(
+                options.common.config.clone(),
+                &data_dir,
+            ));
+            let mut config = store.load()?;
+            let before = config.entries.len();
+            config.entries.retain(|entry| entry.id != options.id);
+            let removed = before != config.entries.len();
+            store.save(&config)?;
+            if options.common.json {
+                print_json(
+                    "<dfs-expose-remove>",
+                    &serde_json::json!({ "id": options.id, "removed": removed }),
+                )?;
+            } else if removed {
+                println!("removed DFS exposure");
+            } else {
+                println!("no matching DFS exposure");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -548,6 +822,13 @@ pub(crate) fn dfs_pin_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliErro
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     Ok(data_dir.dfs_dir().join("pins"))
+}
+
+pub(crate) fn dfs_expose_config_path(
+    explicit: Option<PathBuf>,
+    data_dir: &SinomoDataDir,
+) -> PathBuf {
+    explicit.unwrap_or_else(|| data_dir.dfs_expose_config_file())
 }
 
 pub(crate) fn parse_dfs_file_system_id(value: &str) -> Result<DfsFileSystemId, CliError> {

@@ -213,14 +213,33 @@ pub(crate) fn run_shadow_daemon_with_paths(
         })?;
     println!("sinomo shadow daemon listening on {bind_address}");
 
+    let status_paths = shadow_paths.clone();
+    thread::spawn(move || {
+        loop {
+            if let Err(error) = refresh_daemon_node_status_in_kv(&status_paths) {
+                eprintln!("sinomo shadow daemon cluster status tick failed: {error}");
+            }
+            thread::sleep(DAEMON_CLUSTER_RAFT_INTERVAL);
+        }
+    });
+
     let mut main_binary = main_binary;
     let mut supervised_main: Option<Child> = None;
     let mut main_restart_suppressed = false;
     let mut pending_rollout: Option<ShadowMainRolloutMonitor> = None;
-    let mut next_status_tick = Instant::now();
     loop {
         match listener.accept() {
             Ok((mut stream, _address)) => {
+                if let Err(source) = stream.set_nonblocking(false) {
+                    eprintln!(
+                        "sinomo shadow daemon client error: {}",
+                        CliError::Network {
+                            address: "shadow daemon client".to_string(),
+                            detail: source.to_string(),
+                        }
+                    );
+                    continue;
+                }
                 match handle_daemon_connection(&mut stream, &shadow_paths) {
                     Ok(true) => break,
                     Ok(false) => {}
@@ -403,11 +422,6 @@ pub(crate) fn run_shadow_daemon_with_paths(
                     main_restart_suppressed = true;
                 }
             }
-        }
-
-        if Instant::now() >= next_status_tick {
-            let _ = refresh_daemon_node_status_in_kv(&shadow_paths);
-            next_status_tick = Instant::now() + DAEMON_CLUSTER_RAFT_INTERVAL;
         }
 
         thread::sleep(Duration::from_millis(200));
@@ -625,6 +639,12 @@ pub(crate) fn run_daemon_with_paths(
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
     let _lock = DaemonLock::acquire(&paths, &options, cluster)?;
+    if label == "daemon" {
+        ensure_default_local_dfs_expose(&paths)?;
+        if let Err(error) = ensure_default_distributed_dfs(&paths, &options) {
+            eprintln!("sinomo {label} distributed DFS bootstrap failed: {error}");
+        }
+    }
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind_address).map_err(|source| CliError::Network {
         address: bind_address.clone(),
@@ -761,7 +781,7 @@ pub(crate) fn start_daemon_with_paths_with_env(
             detail: source.to_string(),
         })?;
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         if let DaemonProbeStatus::Running(status) =
             probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
@@ -953,6 +973,16 @@ pub(crate) fn handle_daemon_connection(
             }
             "ROLLOUT_DIAGNOSTICS" => {
                 let response = handle_daemon_rollout_diagnostics(paths)?;
+                stream
+                    .write_all(response.as_bytes())
+                    .map_err(|source| CliError::Network {
+                        address: "daemon client".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                Ok(false)
+            }
+            "DFS_EXPOSE_CONFIG" => {
+                let response = handle_daemon_dfs_expose_config(paths)?;
                 stream
                     .write_all(response.as_bytes())
                     .map_err(|source| CliError::Network {
@@ -1195,6 +1225,158 @@ pub(crate) fn handle_daemon_connection(
             _ => Ok(false),
         }
     })
+}
+
+pub(crate) fn ensure_default_local_dfs_expose(paths: &DaemonPaths) -> Result<(), CliError> {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon root has no data directory parent".to_string(),
+    })?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    let node_id = cluster_paths_from_defaults()
+        .and_then(|cluster_paths| read_cluster_state(&cluster_paths).map_err(CliError::from))
+        .map(|state| state.local_node_id)
+        .unwrap_or_else(|_| NodeId::new("node_local").expect("valid fallback node id"));
+    DfsExposeStore::new(data_dir.dfs_expose_config_file())
+        .ensure_default(&data_dir.root(), node_id)?;
+    Ok(())
+}
+
+pub(crate) fn handle_daemon_dfs_expose_config(paths: &DaemonPaths) -> Result<String, CliError> {
+    ensure_default_local_dfs_expose(paths)?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon root has no data directory parent".to_string(),
+    })?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    let config_path = data_dir.dfs_expose_config_file();
+    let config = DfsExposeStore::new(&config_path).load()?;
+    serde_json::to_string_pretty(&config).map_err(|source| CliError::Json {
+        path: config_path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub(crate) fn ensure_default_distributed_dfs(
+    paths: &DaemonPaths,
+    options: &DaemonRunOptions,
+) -> Result<(), CliError> {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon root has no data directory parent".to_string(),
+    })?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(());
+    }
+    let state = read_cluster_state(&cluster_paths)?;
+    let file_system = distributed_sifs(state.local_node_id.clone());
+    let mut backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        data_dir.dfs_dir().join("metadata").join("root"),
+    )?;
+    if backend.get_file_system(&file_system.file_system_id)? != Some(file_system.clone()) {
+        backend.put_file_system(&file_system)?;
+    }
+    for object in distributed_sifs_bootstrap_objects(state.local_node_id.clone()) {
+        if backend
+            .get_object_by_path(&object.file_system_id, object.path.trim_matches('/'))?
+            .is_none()
+        {
+            backend.put_object(&object)?;
+            backend.put_version(&sinomo_runtime::dfs::DfsObjectVersionRecord {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                content_hash: object.content_hash.clone(),
+                locations: object.current_locations.clone(),
+                created_by_event_id: object.created_by_event_id.clone(),
+                created_at: OffsetDateTime::now_utc(),
+                visible: true,
+            })?;
+        }
+    }
+
+    put_dfs_control_record(
+        &cluster_paths,
+        &state.local_node_id,
+        file_system_config_key(&file_system.file_system_id),
+        &DfsFileSystemConfig::from(&file_system),
+    )?;
+    put_dfs_control_record(
+        &cluster_paths,
+        &state.local_node_id,
+        metadata_shard_key(&file_system.file_system_id, "root"),
+        &DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: state.local_node_id.clone(),
+            replica_node_ids: state
+                .members
+                .iter()
+                .filter(|member| member.node_id != state.local_node_id)
+                .take(2)
+                .map(|member| member.node_id.clone())
+                .collect(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+        },
+    )?;
+    let endpoint = format!("loopback://{}:{}", options.host, options.port);
+    put_dfs_control_record(
+        &cluster_paths,
+        &state.local_node_id,
+        metadata_service_key(&state.local_node_id),
+        &DfsNodeAdvertisement::metadata(state.local_node_id.clone(), endpoint.clone()),
+    )?;
+    put_dfs_control_record(
+        &cluster_paths,
+        &state.local_node_id,
+        content_service_key(&state.local_node_id),
+        &DfsNodeAdvertisement::content(state.local_node_id.clone(), endpoint),
+    )?;
+    delete_legacy_dfs_control_records(&cluster_paths, &state.local_node_id)?;
+    Ok(())
+}
+
+fn put_dfs_control_record<T: Serialize>(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    key: String,
+    value: &T,
+) -> Result<(), CliError> {
+    let value = serde_json::to_vec(value).map_err(|source| CliError::Json {
+        path: key.clone(),
+        detail: source.to_string(),
+    })?;
+    network::append_cluster_raft_command(
+        paths,
+        node_id,
+        KvCommand::Op(KvOp::Put {
+            key,
+            value,
+            lease_id: None,
+        }),
+    )?;
+    Ok(())
+}
+
+fn delete_legacy_dfs_control_records(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<(), CliError> {
+    network::append_cluster_raft_command(
+        paths,
+        node_id,
+        KvCommand::Op(KvOp::DeletePrefix {
+            prefix: "/dfs-control/".to_string(),
+        }),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn handle_daemon_cluster_kv_snapshot(

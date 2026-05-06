@@ -36,6 +36,7 @@ pub enum CliError {
     EventStore(sinomo_runtime::events::EventStoreError),
     DfsMetadata(sinomo_runtime::dfs::MetadataBackendError),
     DfsPin(sinomo_runtime::dfs::DfsPinStoreError),
+    DfsExpose(sinomo_runtime::dfs::DfsExposeStoreError),
     Kv(KvError),
     LanguageModel(LanguageModelError),
     Evolution(sinomo_evolution::EvolutionError),
@@ -88,6 +89,12 @@ impl From<sinomo_runtime::dfs::MetadataBackendError> for CliError {
 impl From<sinomo_runtime::dfs::DfsPinStoreError> for CliError {
     fn from(error: sinomo_runtime::dfs::DfsPinStoreError) -> Self {
         Self::DfsPin(error)
+    }
+}
+
+impl From<sinomo_runtime::dfs::DfsExposeStoreError> for CliError {
+    fn from(error: sinomo_runtime::dfs::DfsExposeStoreError) -> Self {
+        Self::DfsExpose(error)
     }
 }
 
@@ -233,6 +240,7 @@ impl std::fmt::Display for CliError {
             Self::EventStore(error) => write!(formatter, "{error}"),
             Self::DfsMetadata(error) => write!(formatter, "{error}"),
             Self::DfsPin(error) => write!(formatter, "{error}"),
+            Self::DfsExpose(error) => write!(formatter, "{error}"),
             Self::Kv(error) => write!(formatter, "{error}"),
             Self::LanguageModel(error) => write!(formatter, "{error}"),
             Self::Evolution(error) => write!(formatter, "{error}"),
