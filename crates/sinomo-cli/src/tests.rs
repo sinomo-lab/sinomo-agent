@@ -31,8 +31,9 @@ use super::{
     read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
     read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
     run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-    send_daemon_command_raw, sign_cluster_join_invite, sign_daemon_command_from_data_dir,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout, write_json,
+    run_shadow_daemon_with_paths, send_daemon_command_raw, sign_cluster_join_invite,
+    sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
+    uninstall_with_layout, write_json,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -52,7 +53,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 
 fn authenticated_test_command(
@@ -2753,6 +2754,77 @@ fn daemon_accepted_stream_is_reset_to_blocking_for_delayed_client_input() {
 
     assert!(!should_shutdown);
     assert!(response.is_empty());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn shadow_daemon_status_probe_does_not_wait_for_idle_sleep() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-shadow-status-latency-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("data dir");
+    let port_listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let port = port_listener.local_addr().expect("local addr").port();
+    drop(port_listener);
+    let address = format!("127.0.0.1:{port}");
+    let shadow_paths = DaemonPaths::for_shadow(&data_dir);
+    let main_paths = DaemonPaths::new(&data_dir);
+    let rollout_paths = SelfRolloutPaths::new(&root);
+    let shadow_options = DaemonRunOptions {
+        host: "127.0.0.1".to_string(),
+        port,
+    };
+    let daemon = thread::spawn({
+        let shadow_options = shadow_options.clone();
+        let root = root.clone();
+        move || {
+            run_shadow_daemon_with_paths(
+                shadow_options,
+                shadow_paths,
+                main_paths,
+                rollout_paths,
+                DaemonRunOptions::default(),
+                root.join("missing-main-binary"),
+                None,
+            )
+        }
+    });
+
+    for _ in 0..50 {
+        let signed = sign_daemon_command_from_data_dir(&data_dir, "STATUS").expect("sign status");
+        if send_daemon_command_raw(&address, &signed, Duration::from_millis(250)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut durations = Vec::new();
+    for _ in 0..3 {
+        let signed = sign_daemon_command_from_data_dir(&data_dir, "STATUS").expect("sign status");
+        let started = Instant::now();
+        send_daemon_command_raw(&address, &signed, Duration::from_secs(2))
+            .expect("status response");
+        durations.push(started.elapsed());
+    }
+
+    let signed = sign_daemon_command_from_data_dir(&data_dir, "SHUTDOWN").expect("sign shutdown");
+    let _ = send_daemon_command_raw(&address, &signed, Duration::from_secs(2));
+    daemon
+        .join()
+        .expect("shadow daemon")
+        .expect("shadow result");
+
+    assert!(
+        durations
+            .iter()
+            .all(|duration| *duration < Duration::from_millis(250)),
+        "shadow daemon status probes waited for the idle sleep: {durations:?}"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
