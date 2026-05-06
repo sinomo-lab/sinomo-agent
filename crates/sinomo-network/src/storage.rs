@@ -413,7 +413,6 @@ pub fn append_cluster_raft_command_uncommitted(
     let term = node.hard_state().current_term.max(1);
     let entry = node.append_local_command(term, command)?;
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
-    mirror_cluster_raft_snapshot(paths, &node)?;
     Ok(entry)
 }
 

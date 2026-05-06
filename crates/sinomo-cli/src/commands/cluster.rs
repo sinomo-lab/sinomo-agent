@@ -1453,8 +1453,14 @@ pub(crate) fn cluster_member_is_local_process(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> bool {
-    member.node_id == state.local_node_id
-        || member.node_id == shadow_daemon_node_id(&state.local_node_id)
+    cluster_node_is_local_process(state, &member.node_id)
+}
+
+pub(crate) fn cluster_node_is_local_process(
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+) -> bool {
+    *node_id == state.local_node_id || *node_id == shadow_daemon_node_id(&state.local_node_id)
 }
 
 pub(crate) fn unknown_cluster_node_status(
@@ -1878,6 +1884,7 @@ pub(crate) fn sync_cluster_connectivity_records_to_kv(
 
 pub(crate) fn expire_cluster_network_records_in_kv(
     paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
     now: OffsetDateTime,
 ) -> Result<Option<KvSnapshot>, CliError> {
     let store = network::read_cluster_kv_snapshot_store(paths)?;
@@ -1886,6 +1893,9 @@ pub(crate) fn expire_cluster_network_records_in_kv(
         let Ok(record) = entry.decode::<network::ClusterNetworkInfoRecord>() else {
             continue;
         };
+        if cluster_node_is_local_process(state, &record.node_id) {
+            continue;
+        }
         if record.expires_at <= now {
             success.push(KvOp::Delete { key: entry.key });
         }
@@ -1894,6 +1904,9 @@ pub(crate) fn expire_cluster_network_records_in_kv(
         let Ok(record) = entry.decode::<network::ClusterConnectivityRecord>() else {
             continue;
         };
+        if record.source_node_id == state.local_node_id {
+            continue;
+        }
         if record.expires_at <= now {
             success.push(KvOp::Delete { key: entry.key });
         }
@@ -1976,7 +1989,7 @@ fn stored_cluster_connectivity_records_match(
     source_node_id: &NodeId,
     records: &[network::ClusterConnectivityRecord],
 ) -> Result<bool, CliError> {
-    let store = read_cluster_kv_store(paths)?;
+    let store = network::read_cluster_kv_snapshot_store(paths)?;
     let mut existing = store
         .range_prefix(&network::cluster_connectivity_source_prefix(source_node_id))
         .into_iter()
@@ -2245,7 +2258,6 @@ impl ClusterNetworkMaintenance {
         let mut state = read_cluster_state_without_kv(&cluster_paths)?;
         let state_before_maintenance = state.clone();
         let mut discovered = false;
-        let mut snapshot = None;
 
         if discovery_due {
             self.last_discovery = now;
@@ -2284,23 +2296,14 @@ impl ClusterNetworkMaintenance {
                     self.connectivity.clear();
                 }
                 self.environment_id = Some(local_network_info.environment_id.clone());
-                if let Some(network_snapshot) =
-                    sync_cluster_network_info_to_kv(&cluster_paths, local_network_info)?
-                {
-                    snapshot = Some(network_snapshot);
-                }
-                if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(paths)? {
-                    snapshot = Some(status_snapshot);
-                }
+                let _ = sync_cluster_network_info_to_kv(&cluster_paths, local_network_info)?;
+                let _ = refresh_daemon_node_status_in_kv(paths)?;
                 let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
                 if matches!(
                     probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
                     DaemonProbeStatus::Running(_)
                 ) {
-                    if let Some(status_snapshot) = refresh_daemon_node_status_in_kv(&shadow_paths)?
-                    {
-                        snapshot = Some(status_snapshot);
-                    }
+                    let _ = refresh_daemon_node_status_in_kv(&shadow_paths)?;
                 }
             } else if !cluster_raft_local_is_voter(&state) {
                 if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
@@ -2318,19 +2321,16 @@ impl ClusterNetworkMaintenance {
                     &state.local_node_id,
                     records,
                 )?;
-                if let Some(expire_snapshot) =
-                    expire_cluster_network_records_in_kv(&cluster_paths, OffsetDateTime::now_utc())?
-                {
-                    snapshot = Some(expire_snapshot);
-                }
+                let _ = expire_cluster_network_records_in_kv(
+                    &cluster_paths,
+                    &state,
+                    OffsetDateTime::now_utc(),
+                )?;
             }
         }
 
         if discovered || !cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state) {
             network::write_cluster_state(&cluster_paths, &state)?;
-        }
-        if let Some(snapshot) = snapshot.as_ref() {
-            write_cluster_kv_snapshot(&cluster_paths, snapshot)?;
         }
         Ok(())
     }

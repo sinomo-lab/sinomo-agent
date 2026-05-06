@@ -9,7 +9,51 @@ use sinomo_core::{
     PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
 };
 use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
-use sinomo_kv::{InProcessKvStore, KvEventKind};
+use sinomo_kv::{InProcessKvStore, KvCommand, KvEventKind, KvOp};
+
+#[test]
+fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-uncommitted-raft-snapshot-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::new("node_uncommitted_snapshot").expect("node");
+
+    append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/committed".to_string(),
+            value: b"committed".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed snapshot");
+    std::fs::write(&paths.kv_snapshot, b"sentinel snapshot").expect("sentinel snapshot");
+
+    append_cluster_raft_command_uncommitted(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/uncommitted".to_string(),
+            value: b"uncommitted".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("append uncommitted");
+
+    assert_eq!(
+        std::fs::read(&paths.kv_snapshot).expect("read snapshot"),
+        b"sentinel snapshot"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
 
 #[test]
 fn cluster_storage_syncs_members_and_node_status_to_kv() {

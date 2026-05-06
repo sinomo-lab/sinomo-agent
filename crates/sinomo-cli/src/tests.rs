@@ -15,23 +15,24 @@ use super::{
     cluster_sync_targets, create_source_repo_bundle, daemon_advertised_endpoints_for_state,
     daemon_lan_endpoint, daemon_package_version, daemon_status_matches_options,
     decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
-    ensure_rollout_layout, handle_daemon_cluster_join, handle_daemon_cluster_kv_range_prefix,
-    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn,
-    handle_daemon_cluster_kv_watch_drain, handle_daemon_cluster_kv_watch_events,
-    handle_daemon_cluster_kv_watch_prefix, handle_daemon_cluster_raft_append,
-    handle_daemon_cluster_raft_vote, handle_daemon_connection, handle_daemon_rollout_build,
-    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
-    invite_communication_channels, invite_introducer_endpoint,
-    invite_introducer_endpoint_from_state, is_terminal_status, main_daemon_capabilities,
-    managed_source_status, models_default_with_data_dir, normalize_model_provider,
-    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_models_list_options, parse_propose_options, parse_provider_command,
-    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
-    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
-    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-    run_shadow_daemon_with_paths, send_daemon_command_raw, sign_cluster_join_invite,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv, handle_daemon_cluster_join,
+    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
+    handle_daemon_cluster_kv_txn, handle_daemon_cluster_kv_watch_drain,
+    handle_daemon_cluster_kv_watch_events, handle_daemon_cluster_kv_watch_prefix,
+    handle_daemon_cluster_raft_append, handle_daemon_cluster_raft_vote, handle_daemon_connection,
+    handle_daemon_rollout_build, install_should_update_binary, install_with_layout,
+    invite_channels_for_join_registration, invite_communication_channels,
+    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
+    main_daemon_capabilities, managed_source_status, models_default_with_data_dir,
+    normalize_model_provider, parse_cli_command, parse_cluster_command,
+    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
+    parse_install_options, parse_model_default_options, parse_models_list_options,
+    parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
+    parse_uninstall_options, parse_usage_options, read_cluster_kv_snapshot,
+    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
+    read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
+    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
+    send_daemon_command_raw, shadow_daemon_node_id, sign_cluster_join_invite,
     sign_daemon_command_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
     uninstall_with_layout, write_json,
 };
@@ -46,7 +47,7 @@ use sinomo_runtime::core::{
     ClusterTransportKind, EvolutionJobId, NodeId, SessionId, TrustDomain, TrustRing,
 };
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
-use sinomo_runtime::kv::{KvCompare, KvOp, KvRevision, KvTxn};
+use sinomo_runtime::kv::{InProcessKvStore, KvCompare, KvOp, KvRevision, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
 use std::io::{BufRead, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -382,6 +383,95 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
         "endpoint prefix must be deleted before canonical endpoints are put"
     );
 
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_network_expiration_keeps_local_owned_records() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-local-network-expiration-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id = ClusterId::new("cluster_local_network_expiration").expect("cluster");
+    let node_id = NodeId::new("node_local_network_expiration").expect("node");
+    let remote_node_id = NodeId::new("node_remote_network_expiration").expect("node");
+    let now = OffsetDateTime::now_utc();
+    let expired = now - time::Duration::seconds(10);
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "local network expiration",
+        node_id.clone(),
+        "local",
+        "local-public-key",
+        now,
+    );
+    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("cluster state");
+
+    let mut store = InProcessKvStore::new();
+    for node_id in [&node_id, &shadow_daemon_node_id(&node_id)] {
+        let info = sinomo_runtime::network::ClusterNetworkInfoRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_id.clone(),
+            environment_id: "env_local".to_string(),
+            observed_addresses: vec!["10.14.1.11:21353".to_string()],
+            endpoints: Vec::new(),
+            observed_at: expired,
+            expires_at: expired,
+        };
+        store
+            .put_serde(
+                sinomo_runtime::network::cluster_network_info_key(node_id),
+                &info,
+                None,
+            )
+            .expect("local network info");
+    }
+    let connectivity = sinomo_runtime::network::ClusterConnectivityRecord {
+        cluster_id: cluster_id.clone(),
+        source_node_id: node_id.clone(),
+        target_node_id: remote_node_id.clone(),
+        endpoint_id: ClusterEndpointId::new("endpoint_remote").expect("endpoint"),
+        transport: ClusterTransportKind::LanTcp,
+        address: "10.14.1.12:21353".to_string(),
+        state: sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+        latency_ms: None,
+        consecutive_failures: 3,
+        last_success_at: None,
+        last_failure_at: Some("2026-05-06T00:00:00Z".to_string()),
+        observed_at: expired,
+        expires_at: expired,
+    };
+    store
+        .put_serde(
+            sinomo_runtime::network::cluster_connectivity_key(
+                &connectivity.source_node_id,
+                &connectivity.target_node_id,
+                &connectivity.endpoint_id,
+            ),
+            &connectivity,
+            None,
+        )
+        .expect("local connectivity");
+    sinomo_runtime::network::write_cluster_kv_snapshot(&paths, &store.snapshot())
+        .expect("cluster kv snapshot");
+
+    let snapshot =
+        expire_cluster_network_records_in_kv(&paths, &state, now).expect("expire local records");
+
+    assert!(snapshot.is_none());
+    assert!(
+        !sinomo_runtime::network::cluster_raft_wal_paths(&paths, &node_id)
+            .wal
+            .exists(),
+        "skipping local expiration must not append a raft delete transaction"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
