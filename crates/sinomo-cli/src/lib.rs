@@ -246,7 +246,6 @@ const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_CLUSTER_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
-const DAEMON_CLUSTER_RAFT_INTERVAL: Duration = Duration::from_secs(30);
 const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 180;
 const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 180;

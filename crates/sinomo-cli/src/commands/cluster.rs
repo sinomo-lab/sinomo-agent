@@ -2194,7 +2194,6 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub(crate) tick: u64,
     pub(crate) last_publish: Instant,
     pub(crate) last_discovery: Instant,
-    pub(crate) last_sync: Instant,
     pub(crate) last_probe: Instant,
 }
 
@@ -2214,7 +2213,6 @@ impl ClusterNetworkMaintenance {
             tick: 0,
             last_publish: now,
             last_discovery: now,
-            last_sync: now,
             last_probe: now,
         }
     }
@@ -2229,10 +2227,9 @@ impl ClusterNetworkMaintenance {
         let publish_due = now.duration_since(self.last_publish) >= DAEMON_CLUSTER_PUBLISH_INTERVAL;
         let probe_due =
             now.duration_since(self.last_probe) >= DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL;
-        let sync_due = now.duration_since(self.last_sync) >= DAEMON_CLUSTER_RAFT_INTERVAL;
         let discovery_due =
             now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL;
-        if !(publish_due || probe_due || sync_due || discovery_due) {
+        if !(publish_due || probe_due || discovery_due) {
             return Ok(());
         }
 
@@ -2256,7 +2253,7 @@ impl ClusterNetworkMaintenance {
             self.announce(&state);
         }
 
-        if publish_due || probe_due || sync_due {
+        if publish_due || probe_due {
             network::cleanup_cluster_iroh_endpoints(&mut state);
             let shadow_options = current_shadow_daemon_options(data_dir);
             ensure_daemon_cluster_members(
@@ -2326,13 +2323,6 @@ impl ClusterNetworkMaintenance {
                 {
                     snapshot = Some(expire_snapshot);
                 }
-            }
-        }
-
-        if sync_due {
-            self.last_sync = now;
-            if let Some(snapshot) = snapshot.as_mut() {
-                sync_cluster_with_reachable_peers(&cluster_paths, &mut state, snapshot)?;
             }
         }
 
