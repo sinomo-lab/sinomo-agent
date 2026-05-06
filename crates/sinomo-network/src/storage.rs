@@ -320,6 +320,15 @@ pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, N
     Ok(InProcessKvStore::new())
 }
 
+pub fn read_cluster_kv_snapshot_store(
+    paths: &ClusterPaths,
+) -> Result<InProcessKvStore, NetworkError> {
+    if paths.kv_snapshot.exists() {
+        return read_cluster_kv_snapshot(paths).map(InProcessKvStore::restore);
+    }
+    Ok(InProcessKvStore::new())
+}
+
 fn quarantine_unreadable_cluster_raft_view(paths: &ClusterPaths, node_id: &NodeId) {
     let wal_paths = cluster_raft_wal_paths(paths, node_id);
     if !wal_paths.root.exists() {
@@ -770,7 +779,7 @@ pub fn read_cluster_members_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_store(paths)?;
+    let store = read_cluster_kv_snapshot_store(paths)?;
     let mut members: Vec<ClusterMemberRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/members/") {
         members.push(entry.decode()?);
@@ -804,7 +813,7 @@ pub fn read_cluster_endpoints_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_store(paths)?;
+    let store = read_cluster_kv_snapshot_store(paths)?;
     let mut endpoints = read_cluster_endpoints_from_store(&store)?
         .into_values()
         .flatten()
@@ -855,7 +864,7 @@ pub fn read_cluster_node_statuses_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_store(paths)?;
+    let store = read_cluster_kv_snapshot_store(paths)?;
     let mut statuses: Vec<ClusterNodeStatusRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/node-status/") {
         statuses.push(entry.decode()?);
@@ -870,7 +879,7 @@ pub fn read_cluster_network_info_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_store(paths)?;
+    let store = read_cluster_kv_snapshot_store(paths)?;
     let mut records: Vec<ClusterNetworkInfoRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/network/info/") {
         records.push(entry.decode()?);
@@ -885,7 +894,7 @@ pub fn read_cluster_connectivity_graph_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_store(paths)?;
+    let store = read_cluster_kv_snapshot_store(paths)?;
     let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/network/connectivity/") {
         records.push(entry.decode()?);
@@ -1404,6 +1413,10 @@ pub(crate) fn write_json_file<T: Serialize>(path: &PathBuf, value: &T) -> Result
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    let desired = format!("{content}\n");
+    if fs::read_to_string(path).is_ok_and(|existing| existing == desired) {
+        return Ok(());
+    }
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let file_name = path
         .file_name()
@@ -1420,8 +1433,7 @@ pub(crate) fn write_json_file<T: Serialize>(path: &PathBuf, value: &T) -> Result
                 path: temp_path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        file.write_all(content.as_bytes())
-            .and_then(|()| file.write_all(b"\n"))
+        file.write_all(desired.as_bytes())
             .map_err(|source| NetworkError::StorageIo {
                 path: temp_path.display().to_string(),
                 detail: source.to_string(),

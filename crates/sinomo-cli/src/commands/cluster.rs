@@ -404,7 +404,10 @@ pub(crate) fn cluster_invite_with_paths(
         path: paths.invites.display().to_string(),
         detail: source.to_string(),
     })?;
-    let state = read_cluster_state(paths)?;
+    let state = read_cluster_state_without_kv(paths)?;
+    if !cluster_raft_local_is_voter(&state) {
+        return Err(cluster_invite_requires_voter_error(paths, &state));
+    }
     let now = OffsetDateTime::now_utc();
     let invite = build_cluster_invite(&state, &options, paths, now)?;
     if invite
@@ -459,77 +462,47 @@ pub(crate) fn publish_cluster_invitation(
 pub(crate) fn publish_cluster_invitation_via_voter(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    invite: &ClusterJoinInvite,
+    _invite: &ClusterJoinInvite,
 ) -> Result<(), CliError> {
-    let request = ClusterInvitePublishRequest {
-        invite: invite.clone(),
-    };
-    let mut failures = Vec::new();
-    for endpoint in cluster_invite_publish_targets(paths, state) {
-        match send_cluster_invite_publish(&endpoint, &request) {
-            Ok(response) if response.accepted => {
-                if let Some(snapshot) = response.kv_snapshot {
-                    write_cluster_kv_snapshot(paths, &snapshot)?;
-                }
-                return Ok(());
-            }
-            Ok(response) => failures.push(format!(
-                "{} ({:?}) rejected invite publish: {}",
-                endpoint.address, endpoint.transport, response.detail
-            )),
-            Err(error) => failures.push(format!(
-                "{} ({:?}) failed: {}",
-                endpoint.address, endpoint.transport, error
-            )),
-        }
-    }
-    Err(CliError::ClusterReadOnly {
+    Err(cluster_invite_requires_voter_error(paths, state))
+}
+
+fn cluster_invite_requires_voter_error(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> CliError {
+    let targets = cluster_invite_publish_targets(paths, state);
+    CliError::ClusterReadOnly {
         detail: format!(
-            "local node is not a voter and no reachable voter accepted invite publication{}",
-            if failures.is_empty() {
+            "local node is not a voter; create the invite on a voter node or restore voter connectivity{}",
+            if targets.is_empty() {
                 String::new()
             } else {
-                format!(": {}", failures.join("; "))
+                format!(
+                    " (best known voter target: {} via {:?})",
+                    targets[0].address, targets[0].transport
+                )
             }
         ),
-    })
+    }
 }
 
 pub(crate) fn cluster_invite_publish_targets(
-    paths: &ClusterPaths,
+    _paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen_nodes = std::collections::BTreeSet::new();
     let mut targets = Vec::new();
-    for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
+    for endpoint in cluster_sync_targets(state) {
         if !cluster_raft_node_is_voter(state, &endpoint.node_id) {
             continue;
         }
-        let key = cluster_invite_publish_target_key(&endpoint);
-        if seen.insert(key) {
-            targets.push(endpoint);
+        if !seen_nodes.insert(endpoint.node_id.clone()) {
+            continue;
         }
+        targets.push(endpoint);
     }
     targets
-}
-
-pub(crate) fn cluster_invite_publish_target_key(endpoint: &ClusterEndpointRecord) -> String {
-    let address = if endpoint.transport == ClusterTransportKind::Iroh {
-        endpoint
-            .address
-            .strip_prefix("iroh://")
-            .unwrap_or(endpoint.address.as_str())
-            .split('?')
-            .next()
-            .unwrap_or(endpoint.address.as_str())
-            .to_string()
-    } else {
-        endpoint.address.clone()
-    };
-    format!(
-        "{}\t{:?}\t{}",
-        endpoint.node_id, endpoint.transport, address
-    )
 }
 
 pub(crate) fn publish_local_members_via_voter(
@@ -1284,33 +1257,16 @@ pub(crate) fn decode_cluster_join_invite(raw: &str) -> Result<ClusterJoinInvite,
 
 pub(crate) fn cluster_status() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    refresh_cluster_kv_from_local_daemon(&paths)?;
-    match read_cluster_state(&paths) {
+    match read_cluster_state_without_kv(&paths) {
         Ok(state) => {
-            let kv_revision = read_cluster_kv_snapshot(&paths)
-                .map(|snapshot| snapshot.revision.0)
-                .unwrap_or(state.kv_revision);
             println!("cluster: {}", state.cluster_id);
             println!("name: {}", state.cluster_name);
             println!("local node: {}", state.local_node_id);
-            println!("status: {}", cluster_status_label(&paths, &state));
+            println!("status: {}", cluster_status_summary_label(&state));
             println!("term: {}", state.term);
-            println!("kv revision: {}", kv_revision);
+            println!("kv revision: {}", state.kv_revision);
             println!("kv snapshot: {}", paths.kv_snapshot.display());
             println!("members: {}", state.members.len());
-            let health = cluster_health_rows(&paths, &state)?;
-            let online = health
-                .iter()
-                .filter(|row| row.availability == ClusterNodeAvailability::Online)
-                .count();
-            let offline = health
-                .iter()
-                .filter(|row| row.availability == ClusterNodeAvailability::Offline)
-                .count();
-            if !health.is_empty() {
-                println!("online nodes: {online}");
-                println!("offline nodes: {offline}");
-            }
             println!("state: {}", paths.state.display());
             Ok(())
         }
@@ -1786,6 +1742,9 @@ pub(crate) fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), CliError> {
+    if network::read_cluster_kv_snapshot(paths).is_ok_and(|existing| existing == *snapshot) {
+        return Ok(());
+    }
     network::write_cluster_kv_snapshot(paths, snapshot).map_err(Into::into)
 }
 
@@ -1826,6 +1785,9 @@ pub(crate) fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
 ) -> Result<KvSnapshot, CliError> {
+    if stored_cluster_node_status_matches(paths, &status)? {
+        return read_cluster_kv_snapshot(paths);
+    }
     let mut state = read_cluster_state_without_kv(paths)?;
     let mut success = vec![KvOp::put_serde(
         network::cluster_node_status_key(&status.node_id),
@@ -1854,6 +1816,9 @@ pub(crate) fn sync_cluster_network_info_to_kv(
     paths: &ClusterPaths,
     info: network::ClusterNetworkInfoRecord,
 ) -> Result<KvSnapshot, CliError> {
+    if stored_cluster_network_info_matches(paths, &info)? {
+        return read_cluster_kv_snapshot(paths);
+    }
     let mut state = read_cluster_state_without_kv(paths)?;
     commit_cluster_kv_txn_with_quorum(
         paths,
@@ -1875,6 +1840,9 @@ pub(crate) fn sync_cluster_connectivity_records_to_kv(
     source_node_id: &NodeId,
     records: Vec<network::ClusterConnectivityRecord>,
 ) -> Result<KvSnapshot, CliError> {
+    if stored_cluster_connectivity_records_match(paths, source_node_id, &records)? {
+        return read_cluster_kv_snapshot(paths);
+    }
     let mut state = read_cluster_state_without_kv(paths)?;
     let mut success = vec![KvOp::DeletePrefix {
         prefix: network::cluster_connectivity_source_prefix(source_node_id),
@@ -1902,7 +1870,7 @@ pub(crate) fn expire_cluster_network_records_in_kv(
     paths: &ClusterPaths,
     now: OffsetDateTime,
 ) -> Result<KvSnapshot, CliError> {
-    let store = read_cluster_kv_store(paths)?;
+    let store = network::read_cluster_kv_snapshot_store(paths)?;
     let mut success = Vec::new();
     for entry in store.range_prefix("/cluster/network/info/") {
         let Ok(record) = entry.decode::<network::ClusterNetworkInfoRecord>() else {
@@ -1933,6 +1901,98 @@ pub(crate) fn expire_cluster_network_records_in_kv(
             failure: Vec::new(),
         },
     )
+}
+
+fn stored_cluster_node_status_matches(
+    paths: &ClusterPaths,
+    status: &ClusterNodeStatusRecord,
+) -> Result<bool, CliError> {
+    let store = network::read_cluster_kv_snapshot_store(paths)?;
+    let Some(entry) = store.get(&network::cluster_node_status_key(&status.node_id)) else {
+        return Ok(false);
+    };
+    let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
+        return Ok(false);
+    };
+    Ok(cluster_node_status_stable_eq(&existing, status))
+}
+
+fn cluster_node_status_stable_eq(
+    left: &ClusterNodeStatusRecord,
+    right: &ClusterNodeStatusRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.node_id == right.node_id
+        && left.process == right.process
+        && left.availability == right.availability
+        && left.daemon_version == right.daemon_version
+        && left.target_os == right.target_os
+        && left.target_arch == right.target_arch
+        && left.address == right.address
+        && left.bind_address == right.bind_address
+        && left.executable == right.executable
+        && left.rollout == right.rollout
+        && left.daemon_started_at == right.daemon_started_at
+}
+
+fn stored_cluster_network_info_matches(
+    paths: &ClusterPaths,
+    info: &network::ClusterNetworkInfoRecord,
+) -> Result<bool, CliError> {
+    let store = network::read_cluster_kv_snapshot_store(paths)?;
+    let Some(entry) = store.get(&network::cluster_network_info_key(&info.node_id)) else {
+        return Ok(false);
+    };
+    let Ok(existing) = entry.decode::<network::ClusterNetworkInfoRecord>() else {
+        return Ok(false);
+    };
+    Ok(cluster_network_info_stable_eq(&existing, info))
+}
+
+fn cluster_network_info_stable_eq(
+    left: &network::ClusterNetworkInfoRecord,
+    right: &network::ClusterNetworkInfoRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.node_id == right.node_id
+        && left.environment_id == right.environment_id
+        && left.observed_addresses == right.observed_addresses
+        && left.endpoints == right.endpoints
+}
+
+fn stored_cluster_connectivity_records_match(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[network::ClusterConnectivityRecord],
+) -> Result<bool, CliError> {
+    let store = read_cluster_kv_store(paths)?;
+    let mut existing = store
+        .range_prefix(&network::cluster_connectivity_source_prefix(source_node_id))
+        .into_iter()
+        .filter_map(|entry| entry.decode::<network::ClusterConnectivityRecord>().ok())
+        .collect::<Vec<_>>();
+    let mut incoming = records.to_vec();
+    existing.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+    incoming.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+    Ok(existing.len() == incoming.len()
+        && existing
+            .iter()
+            .zip(incoming.iter())
+            .all(|(left, right)| cluster_connectivity_stable_eq(left, right)))
+}
+
+fn cluster_connectivity_stable_eq(
+    left: &network::ClusterConnectivityRecord,
+    right: &network::ClusterConnectivityRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.source_node_id == right.source_node_id
+        && left.target_node_id == right.target_node_id
+        && left.endpoint_id == right.endpoint_id
+        && left.transport == right.transport
+        && left.address == right.address
+        && left.state == right.state
+        && left.consecutive_failures == right.consecutive_failures
 }
 
 pub(crate) fn cluster_state_sync_txn(
@@ -2078,6 +2138,39 @@ pub(crate) fn assign_local_node_public_keys(
     Ok(())
 }
 
+fn cluster_bootstrap_state_stable_eq(
+    left: &ClusterBootstrapState,
+    right: &ClusterBootstrapState,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.cluster_name == right.cluster_name
+        && left.local_node_id == right.local_node_id
+        && left.local_node_display_name == right.local_node_display_name
+        && left.term == right.term
+        && left.initialized_at == right.initialized_at
+        && left.members.len() == right.members.len()
+        && left
+            .members
+            .iter()
+            .zip(right.members.iter())
+            .all(|(left, right)| cluster_member_stable_eq(left, right))
+}
+
+fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMemberRecord) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.node_id == right.node_id
+        && left.display_name == right.display_name
+        && left.role == right.role
+        && left.state == right.state
+        && left.trust_domain == right.trust_domain
+        && left.node_public_key == right.node_public_key
+        && left.certificate_id == right.certificate_id
+        && left.capabilities == right.capabilities
+        && left.allowed_capabilities == right.allowed_capabilities
+        && left.endpoints == right.endpoints
+        && left.joined_at == right.joined_at
+}
+
 pub(crate) struct ClusterNetworkMaintenance {
     pub(crate) discovery: Option<MdnsDiscoverySocket>,
     pub(crate) discovery_cache: MdnsDiscoveryCache,
@@ -2127,6 +2220,7 @@ impl ClusterNetworkMaintenance {
         }
 
         let mut state = read_cluster_state_without_kv(&cluster_paths)?;
+        let state_before_maintenance = state.clone();
         let shadow_options = current_shadow_daemon_options(data_dir);
         ensure_daemon_cluster_members(
             &mut state,
@@ -2142,16 +2236,14 @@ impl ClusterNetworkMaintenance {
         let probe_due =
             now.duration_since(self.last_probe) >= DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL;
         let sync_due = now.duration_since(self.last_sync) >= DAEMON_CLUSTER_RAFT_INTERVAL;
-        let mut snapshot = if publish_due || probe_due || sync_due {
-            Some(read_cluster_kv_snapshot(&cluster_paths)?)
-        } else {
-            None
-        };
+        let mut snapshot = None;
 
         if publish_due {
             self.last_publish = now;
             if cluster_has_local_quorum(&cluster_paths, &state) {
-                sync_cluster_state_to_kv(&cluster_paths, &state)?;
+                if !cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state) {
+                    let _ = sync_cluster_state_to_kv(&cluster_paths, &state)?;
+                }
                 let local_network_info = build_local_cluster_network_info(
                     &state,
                     &state.local_node_id,
@@ -2212,13 +2304,12 @@ impl ClusterNetworkMaintenance {
 
         if sync_due {
             self.last_sync = now;
-            let snapshot = snapshot
-                .as_mut()
-                .expect("snapshot is loaded when sync is due");
-            sync_cluster_with_reachable_peers(&cluster_paths, &mut state, snapshot)?;
+            if let Some(snapshot) = snapshot.as_mut() {
+                sync_cluster_with_reachable_peers(&cluster_paths, &mut state, snapshot)?;
+            }
         }
 
-        if discovered || publish_due || probe_due || sync_due {
+        if discovered || !cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state) {
             network::write_cluster_state(&cluster_paths, &state)?;
         }
         if let Some(snapshot) = snapshot.as_ref() {
@@ -2561,14 +2652,11 @@ pub(crate) fn cluster_has_local_quorum(
     cluster_reachable_voter_count(paths, state) >= cluster_raft_quorum_size(state)
 }
 
-pub(crate) fn cluster_status_label(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> &'static str {
+pub(crate) fn cluster_status_summary_label(state: &ClusterBootstrapState) -> &'static str {
     if cluster_state_needs_join_registration(state) {
         "pending-join"
-    } else if cluster_has_local_quorum(paths, state) {
-        "healthy"
+    } else if cluster_raft_local_is_voter(state) {
+        "voter"
     } else {
         "read-only"
     }
@@ -2959,19 +3047,6 @@ pub(crate) fn send_cluster_raft_vote(
         endpoint,
         &format!("CLUSTER_RAFT_VOTE {payload}"),
         DAEMON_JOIN_TIMEOUT,
-    )?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
-}
-
-pub(crate) fn send_cluster_invite_publish(
-    endpoint: &ClusterEndpointRecord,
-    request: &ClusterInvitePublishRequest,
-) -> Result<ClusterInvitePublishResponse, CliError> {
-    let payload = network::encode_object_text_payload(request)?;
-    let response = send_daemon_command_to_endpoint(
-        endpoint,
-        &format!("CLUSTER_INVITE_PUBLISH {payload}"),
-        CLUSTER_HEALTH_PROBE_TIMEOUT,
     )?;
     network::decode_object_text_payload(response.trim()).map_err(Into::into)
 }
