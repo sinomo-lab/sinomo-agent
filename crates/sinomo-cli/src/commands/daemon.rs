@@ -225,7 +225,7 @@ pub(crate) fn run_shadow_daemon_with_paths(
             if let Err(error) = refresh_daemon_node_status_in_kv(&status_paths) {
                 eprintln!("sinomo shadow daemon cluster status tick failed: {error}");
             }
-            thread::sleep(DAEMON_CLUSTER_RAFT_INTERVAL);
+            thread::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL);
         }
     });
 

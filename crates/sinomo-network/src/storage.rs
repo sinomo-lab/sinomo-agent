@@ -321,7 +321,6 @@ pub fn open_cluster_raft_kv_node(
             kv: snapshot,
         })?;
     }
-    mirror_cluster_raft_snapshot(paths, &node)?;
     Ok(node)
 }
 
@@ -343,6 +342,7 @@ pub fn append_cluster_raft_command_with_response(
     let entry = node.append_local_command(term, command)?;
     node.commit_to(entry.index)?;
     let txn_response = node.txn_response_at(entry.index).cloned();
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
     mirror_cluster_raft_snapshot(paths, &node).map(|snapshot| (snapshot, txn_response))
 }
 
@@ -354,6 +354,7 @@ pub fn append_cluster_raft_command_uncommitted(
     let mut node = open_cluster_raft_kv_node(paths, node_id)?;
     let term = node.hard_state().current_term.max(1);
     let entry = node.append_local_command(term, command)?;
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
     mirror_cluster_raft_snapshot(paths, &node)?;
     Ok(entry)
 }
@@ -366,6 +367,7 @@ pub fn commit_cluster_raft_index(
     let mut node = open_cluster_raft_kv_node(paths, node_id)?;
     node.commit_to(commit_index)?;
     let txn_response = node.txn_response_at(commit_index).cloned();
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
     mirror_cluster_raft_snapshot(paths, &node).map(|snapshot| (snapshot, txn_response))
 }
 
@@ -387,6 +389,7 @@ pub fn apply_cluster_raft_append(
         }
     }
     let response = node.append_entries(append)?;
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
     mirror_cluster_raft_snapshot(paths, &node)?;
     Ok(response)
 }
@@ -407,6 +410,7 @@ pub fn set_cluster_raft_leader(
 ) -> Result<KvSnapshot, NetworkError> {
     let mut node = open_cluster_raft_kv_node(paths, node_id)?;
     node.become_leader(term)?;
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
     mirror_cluster_raft_snapshot(paths, &node)
 }
 
@@ -416,7 +420,25 @@ pub fn clear_cluster_raft_leader(
 ) -> Result<KvSnapshot, NetworkError> {
     let mut node = open_cluster_raft_kv_node(paths, node_id)?;
     node.clear_known_leader()?;
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
     mirror_cluster_raft_snapshot(paths, &node)
+}
+
+pub fn compact_cluster_raft_node_if_needed(
+    paths: &ClusterPaths,
+    node: &mut DurableRaftKvNode,
+) -> Result<(), NetworkError> {
+    const MAX_UNCOMPACTED_LOG_ENTRIES: usize = 1024;
+    const MAX_WAL_BYTES: u64 = 4 * 1024 * 1024;
+
+    let wal_path = cluster_raft_wal_paths(paths, node.node_id()).wal;
+    let wal_bytes = fs::metadata(&wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if node.log().len() > MAX_UNCOMPACTED_LOG_ENTRIES || wal_bytes > MAX_WAL_BYTES {
+        node.save_snapshot()?;
+    }
+    Ok(())
 }
 
 pub fn mirror_cluster_raft_snapshot(
