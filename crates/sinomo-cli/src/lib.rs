@@ -71,8 +71,8 @@ use sinomo_runtime::dfs::{
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
 use sinomo_runtime::kv::{
-    KvCommand, KvEntry, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesRequest,
-    RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot, cluster_member_key,
+    KvCommand, KvEntry, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftRequestVoteRequest,
+    RaftRequestVoteResponse, cluster_member_key,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{

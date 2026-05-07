@@ -2646,45 +2646,8 @@ pub(crate) fn build_cluster_raft_append_request_from_next_index(
     state: &ClusterBootstrapState,
     next_index: u64,
 ) -> Result<ClusterRaftAppendRequest, CliError> {
-    let node = network::open_cluster_raft_kv_node(paths, &state.local_node_id)?;
-    let prev_log_index = next_index.saturating_sub(1).min(node.last_log_index());
-    let include_snapshot = node.log().is_empty()
-        || (node.snapshot_index() > 0 && prev_log_index <= node.snapshot_index());
-    let (snapshot, prev_log_index, entries) = if include_snapshot {
-        let snapshot = RaftSnapshot {
-            last_included_index: node.applied_index(),
-            last_included_term: node.term_at(node.applied_index()).unwrap_or(1),
-            kv: node.store().snapshot(),
-        };
-        let entries = node
-            .log()
-            .iter()
-            .filter(|entry| entry.index > snapshot.last_included_index)
-            .cloned()
-            .collect::<Vec<_>>();
-        (Some(snapshot), node.applied_index(), entries)
-    } else {
-        let entries = node
-            .log()
-            .iter()
-            .filter(|entry| entry.index >= next_index)
-            .cloned()
-            .collect::<Vec<_>>();
-        (None, prev_log_index, entries)
-    };
-    let prev_log_term = node.term_at(prev_log_index).unwrap_or(0);
-    Ok(ClusterRaftAppendRequest {
-        state: state.clone(),
-        snapshot,
-        append: RaftAppendEntriesRequest {
-            term: node.hard_state().current_term,
-            leader_id: state.local_node_id.clone(),
-            prev_log_index,
-            prev_log_term,
-            entries,
-            leader_commit: node.hard_state().commit_index,
-        },
-    })
+    network::build_cluster_raft_append_request_from_next_index(paths, state, next_index)
+        .map_err(Into::into)
 }
 
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 8;
@@ -2732,55 +2695,17 @@ pub(crate) fn cluster_sync_targets_with_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints = cluster_sync_targets(state);
-    let graph = network::read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
-    endpoints.sort_by_key(|endpoint| {
-        let score = graph
-            .iter()
-            .find(|record| {
-                record.source_node_id == state.local_node_id
-                    && record.target_node_id == endpoint.node_id
-                    && record.endpoint_id == endpoint.endpoint_id
-            })
-            .map(|record| match record.state {
-                network::ClusterConnectivityState::Healthy => 0,
-                network::ClusterConnectivityState::Degraded => 1,
-                network::ClusterConnectivityState::Unreachable => 3,
-            })
-            .unwrap_or(2);
-        (
-            cluster_daemon_command_transport_rank(endpoint),
-            score,
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
-    endpoints
+    network::cluster_sync_targets_with_connectivity(paths, state)
 }
 
 pub(crate) fn prefer_bounded_daemon_command_targets(
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints: Vec<_> = endpoints.into_iter().collect();
-    let mut nodes_with_bounded_transport = std::collections::BTreeSet::new();
-    for endpoint in &endpoints {
-        if cluster_daemon_command_transport_rank(endpoint) == 0 {
-            nodes_with_bounded_transport.insert(endpoint.node_id.clone());
-        }
-    }
-    endpoints.retain(|endpoint| {
-        cluster_daemon_command_transport_rank(endpoint) == 0
-            || !nodes_with_bounded_transport.contains(&endpoint.node_id)
-    });
-    endpoints
+    network::prefer_bounded_daemon_command_targets(endpoints)
 }
 
 pub(crate) fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -> u8 {
-    match endpoint.transport {
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => 0,
-        ClusterTransportKind::Iroh => 1,
-        _ => 2,
-    }
+    network::cluster_daemon_command_transport_rank(endpoint)
 }
 
 pub(crate) fn send_daemon_rpc_to_endpoint(
