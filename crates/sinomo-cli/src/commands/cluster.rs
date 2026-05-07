@@ -3450,43 +3450,15 @@ pub(crate) fn daemon_advertised_endpoints_from_ips(
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints = vec![daemon_loopback_endpoint(node_id, options, priority)];
-    let mut lan_addresses = Vec::new();
-    if matches!(options.host.as_str(), "0.0.0.0" | "::") {
-        for ip in lan_ips.iter().chain(route_ips.iter()).copied() {
-            if network::is_invitable_ip(ip) {
-                push_unique_address(
-                    &mut lan_addresses,
-                    network::format_ip_port(ip, options.port),
-                );
-            }
-        }
-    } else if options
-        .host
-        .parse::<IpAddr>()
-        .is_ok_and(network::is_invitable_ip)
-        || !is_loopback_connect_address(&daemon_connect_address(&options.host, options.port))
-    {
-        push_unique_address(
-            &mut lan_addresses,
-            format!("{}:{}", options.host, options.port),
-        );
-    }
-
-    for address in lan_addresses {
-        endpoints.push(daemon_lan_endpoint(
-            node_id,
-            address,
-            priority.saturating_add(20),
-        ));
-    }
-    endpoints
-}
-
-pub(crate) fn push_unique_address(addresses: &mut Vec<String>, address: String) {
-    if !addresses.iter().any(|candidate| candidate == &address) {
-        addresses.push(address);
-    }
+    network::daemon_advertised_endpoints_from_addresses(
+        node_id,
+        daemon_connect_address(&options.host, options.port),
+        &options.host,
+        options.port,
+        priority,
+        lan_ips,
+        route_ips,
+    )
 }
 
 pub(crate) fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Vec<SocketAddr> {
@@ -3519,40 +3491,6 @@ pub(crate) fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Ve
 
 pub(crate) fn discover_peer_route_ip_candidates(state: &ClusterBootstrapState) -> Vec<IpAddr> {
     network::discover_local_ip_candidates_for_targets(advertised_peer_route_targets(state))
-}
-
-pub(crate) fn daemon_loopback_endpoint(
-    node_id: &NodeId,
-    options: &DaemonRunOptions,
-    priority: u16,
-) -> ClusterEndpointRecord {
-    ClusterEndpointRecord {
-        endpoint_id: daemon_loopback_endpoint_id(node_id),
-        node_id: node_id.clone(),
-        transport: ClusterTransportKind::Loopback,
-        address: daemon_connect_address(&options.host, options.port),
-        source: ClusterEndpointSource::Static,
-        privacy: ClusterEndpointPrivacy::LocalOnly,
-        priority,
-        last_observed_latency_ms: None,
-    }
-}
-
-pub(crate) fn daemon_lan_endpoint(
-    node_id: &NodeId,
-    address: String,
-    priority: u16,
-) -> ClusterEndpointRecord {
-    ClusterEndpointRecord {
-        endpoint_id: daemon_lan_endpoint_id(node_id, &address),
-        node_id: node_id.clone(),
-        transport: ClusterTransportKind::LanTcp,
-        address,
-        source: ClusterEndpointSource::Observed,
-        privacy: ClusterEndpointPrivacy::Lan,
-        priority,
-        last_observed_latency_ms: None,
-    }
 }
 
 pub(crate) fn daemon_cluster_status(

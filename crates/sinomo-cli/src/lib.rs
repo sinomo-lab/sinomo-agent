@@ -38,13 +38,13 @@ use sinomo_lm::{
 };
 use sinomo_runtime::core::{
     CandidateDecision, CandidateDecisionOutcome, CapabilityName, ClusterBootstrapState,
-    ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterId,
-    ClusterInvitationChannel, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
-    ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole, ClusterNodeRolloutStatus,
-    ClusterNodeStatusRecord, ClusterTransportKind, Confidence, DfsFileSystemId, DfsObjectId,
-    EvaluationGate, EvaluationOutcome, EventEnvelope, EventId, EventKind, EvolutionJobId,
-    EvolutionJobStatus, LatencyClass, MutationPacket, NodeId, PrivacyClass, RoutingMetadata,
-    RoutingScope, Salience, SessionId, Source, TrustDomain, TrustRing, VerificationCommand,
+    ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterId, ClusterInvitationChannel,
+    ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
+    ClusterNodeAvailability, ClusterNodeRole, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
+    ClusterTransportKind, Confidence, DfsFileSystemId, DfsObjectId, EvaluationGate,
+    EvaluationOutcome, EventEnvelope, EventId, EventKind, EvolutionJobId, EvolutionJobStatus,
+    LatencyClass, MutationPacket, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
+    SessionId, Source, TrustDomain, TrustRing, VerificationCommand,
 };
 use sinomo_runtime::daemon::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
@@ -83,8 +83,7 @@ use sinomo_runtime::network::{
     ClusterRaftVoteResponse, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoverySocket,
 };
 use sinomo_runtime::node::{
-    NodeIdentity, daemon_lan_endpoint_id, daemon_loopback_endpoint_id,
-    load_or_create_main_node_identity, load_or_create_shadow_node_identity,
+    NodeIdentity, load_or_create_main_node_identity, load_or_create_shadow_node_identity,
     main_daemon_capabilities, shadow_daemon_capabilities, shadow_daemon_node_id,
 };
 use sinomo_runtime::rollout::{

@@ -14,9 +14,9 @@ use super::{
     cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
     cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
     cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
-    create_source_repo_bundle, daemon_advertised_endpoints_for_state, daemon_lan_endpoint,
-    daemon_package_version, decode_cluster_join_invite, elect_cluster_raft_leader,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    create_source_repo_bundle, daemon_advertised_endpoints_for_state, daemon_package_version,
+    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv,
     handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
     handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
     handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
@@ -53,6 +53,7 @@ use sinomo_runtime::daemon::daemon_status_matches_options;
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
 use sinomo_runtime::kv::{InProcessKvStore, KvCompare, KvOp, KvRevision, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::daemon_lan_endpoint;
 use std::io::{BufRead, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

@@ -1,6 +1,7 @@
 use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
+use crate::{format_ip_port, is_invitable_ip, is_loopback_connect_address};
 use sinomo_kv::cluster_member_key;
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
@@ -1279,6 +1280,83 @@ pub fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => 0,
         ClusterTransportKind::Iroh => 1,
         _ => 2,
+    }
+}
+
+pub fn daemon_advertised_endpoints_from_addresses(
+    node_id: &NodeId,
+    loopback_address: String,
+    host: &str,
+    port: u16,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints = vec![daemon_loopback_endpoint(
+        node_id,
+        loopback_address,
+        priority,
+    )];
+    let mut lan_addresses = Vec::new();
+    if matches!(host, "0.0.0.0" | "::") {
+        for ip in lan_ips.iter().chain(route_ips.iter()).copied() {
+            if is_invitable_ip(ip) {
+                push_unique_address(&mut lan_addresses, format_ip_port(ip, port));
+            }
+        }
+    } else if host.parse::<IpAddr>().is_ok_and(is_invitable_ip)
+        || !is_loopback_connect_address(&format!("{host}:{port}"))
+    {
+        push_unique_address(&mut lan_addresses, format!("{host}:{port}"));
+    }
+
+    for address in lan_addresses {
+        endpoints.push(daemon_lan_endpoint(
+            node_id,
+            address,
+            priority.saturating_add(20),
+        ));
+    }
+    endpoints
+}
+
+pub fn daemon_loopback_endpoint(
+    node_id: &NodeId,
+    address: String,
+    priority: u16,
+) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: daemon_loopback_endpoint_id(node_id),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Loopback,
+        address,
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::LocalOnly,
+        priority,
+        last_observed_latency_ms: None,
+    }
+}
+
+pub fn daemon_lan_endpoint(
+    node_id: &NodeId,
+    address: String,
+    priority: u16,
+) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: daemon_lan_endpoint_id(node_id, &address),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address,
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority,
+        last_observed_latency_ms: None,
+    }
+}
+
+fn push_unique_address(addresses: &mut Vec<String>, address: String) {
+    if !addresses.iter().any(|candidate| candidate == &address) {
+        addresses.push(address);
     }
 }
 
