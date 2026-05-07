@@ -2746,7 +2746,7 @@ pub(crate) fn handle_daemon_cluster_member_publish_request(
             });
         }
     }
-    if cluster_member_publish_matches_kv(&cluster_paths, &request.members)? {
+    if network::cluster_member_publish_matches_kv(&cluster_paths, &request.members)? {
         return Ok(ClusterMemberPublishResponse {
             accepted: true,
             detail: "member endpoints already current".to_string(),
@@ -2773,45 +2773,6 @@ pub(crate) fn handle_daemon_cluster_member_publish_request(
             kv_snapshot: None,
         }),
     }
-}
-
-fn cluster_member_publish_matches_kv(
-    paths: &ClusterPaths,
-    members: &[ClusterMemberRecord],
-) -> Result<bool, CliError> {
-    let store = network::read_cluster_kv_snapshot_store(paths)?;
-    for member in members {
-        let mut member = member.clone();
-        network::cleanup_member_iroh_endpoints(&mut member);
-        member
-            .endpoints
-            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
-
-        let Some(entry) = store.get(&cluster_member_key(&member.node_id)) else {
-            return Ok(false);
-        };
-        let Ok(mut existing) = entry.decode::<ClusterMemberRecord>() else {
-            return Ok(false);
-        };
-        network::cleanup_member_iroh_endpoints(&mut existing);
-        existing
-            .endpoints
-            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
-        if !network::cluster_member_stable_eq(&existing, &member) {
-            return Ok(false);
-        }
-
-        let mut existing_endpoints = store
-            .range_prefix(&network::cluster_endpoint_prefix(&member.node_id))
-            .into_iter()
-            .filter_map(|entry| entry.decode::<ClusterEndpointRecord>().ok())
-            .collect::<Vec<_>>();
-        existing_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
-        if existing_endpoints != member.endpoints {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 pub(crate) fn ensure_daemon_cluster_members(

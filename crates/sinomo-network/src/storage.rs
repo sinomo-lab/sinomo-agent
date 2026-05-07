@@ -1872,6 +1872,45 @@ pub fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMembe
         && left.joined_at == right.joined_at
 }
 
+pub fn cluster_member_publish_matches_kv(
+    paths: &ClusterPaths,
+    members: &[ClusterMemberRecord],
+) -> Result<bool, NetworkError> {
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    for member in members {
+        let mut member = member.clone();
+        cleanup_member_iroh_endpoints(&mut member);
+        member
+            .endpoints
+            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+
+        let Some(entry) = store.get(&cluster_member_key(&member.node_id)) else {
+            return Ok(false);
+        };
+        let Ok(mut existing) = entry.decode::<ClusterMemberRecord>() else {
+            return Ok(false);
+        };
+        cleanup_member_iroh_endpoints(&mut existing);
+        existing
+            .endpoints
+            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        if !cluster_member_stable_eq(&existing, &member) {
+            return Ok(false);
+        }
+
+        let mut existing_endpoints = store
+            .range_prefix(&cluster_endpoint_prefix(&member.node_id))
+            .into_iter()
+            .filter_map(|entry| entry.decode::<ClusterEndpointRecord>().ok())
+            .collect::<Vec<_>>();
+        existing_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        if existing_endpoints != member.endpoints {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub fn expire_cluster_network_records(
     paths: &ClusterPaths,
     now: OffsetDateTime,
