@@ -799,11 +799,8 @@ pub(crate) fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliEr
 pub(crate) fn open_dfs_metadata_backend(
     options: &DfsCommonOptions,
 ) -> Result<LocalJsonMetadataBackend, CliError> {
-    LocalJsonMetadataBackend::new(
-        DfsMetadataShardId::new("root"),
-        dfs_metadata_root(options.metadata_root.clone())?,
-    )
-    .map_err(CliError::from)
+    open_root_local_metadata_backend(dfs_metadata_root(options.metadata_root.clone())?)
+        .map_err(CliError::from)
 }
 
 pub(crate) fn dfs_metadata_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliError> {
@@ -812,7 +809,7 @@ pub(crate) fn dfs_metadata_root(explicit: Option<PathBuf>) -> Result<PathBuf, Cl
     }
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
-    Ok(data_dir.dfs_dir().join("metadata").join("root"))
+    Ok(default_dfs_metadata_root(&data_dir))
 }
 
 pub(crate) fn dfs_pin_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliError> {
@@ -821,14 +818,7 @@ pub(crate) fn dfs_pin_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliErro
     }
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
-    Ok(data_dir.dfs_dir().join("pins"))
-}
-
-pub(crate) fn dfs_expose_config_path(
-    explicit: Option<PathBuf>,
-    data_dir: &SinomoDataDir,
-) -> PathBuf {
-    explicit.unwrap_or_else(|| data_dir.dfs_expose_config_file())
+    Ok(default_dfs_pin_root(&data_dir))
 }
 
 pub(crate) fn parse_dfs_file_system_id(value: &str) -> Result<DfsFileSystemId, CliError> {

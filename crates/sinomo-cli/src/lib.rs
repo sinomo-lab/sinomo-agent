@@ -23,14 +23,18 @@ use sinomo_evolution::{
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
-    CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig,
-    CodexCliProvider, CodexConfig, CodexProvider, CodexToolRegistry, DefaultCodexContextManager,
-    DefaultCodexPromptBuilder, GeminiConfig, GeminiProvider, GitHubCopilotCliConfig,
+    CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig, CodexCliProvider,
+    CodexProvider, CurrentDefaultModel, GeminiConfig, GeminiProvider, GitHubCopilotCliConfig,
     GitHubCopilotCliProvider, GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError,
     LanguageModelMessage, LanguageModelProvider, LanguageModelProviderUsage, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, NvidiaConfig,
-    NvidiaProvider, OpenAiConfig, OpenAiProvider, OpenAiResponsesCodexClient,
-    OpenAiResponsesCodexConfig, PROVIDER_DEFAULT_MODEL, normalize_nvidia_model_id,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, ModelConfig, ModelPaths,
+    NvidiaConfig, NvidiaProvider, OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL,
+    anthropic_provider, codex_provider_for_model,
+    current_default_model as resolve_current_default_model, default_model_provider_ids,
+    gemini_provider, github_copilot_provider, load_model_config, model_or_default,
+    normalize_model_id_for_provider, normalize_model_provider, nvidia_provider, openai_provider,
+    provider_available_model_ids, provider_usage, save_model_config,
+    subscription_usage_provider_ids,
 };
 use sinomo_runtime::core::{
     CandidateDecision, CandidateDecisionOutcome, CapabilityName, ClusterBootstrapState,
@@ -60,8 +64,9 @@ use sinomo_runtime::dfs::{
     DfsExposeEntry, DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend,
     DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement,
     DfsOperatorInspector, DfsPinMode, DfsPinRecord, LocalDfsPinStore, LocalJsonMetadataBackend,
-    content_service_key, distributed_sifs, distributed_sifs_bootstrap_objects,
-    file_system_config_key, metadata_service_key, metadata_shard_key,
+    content_service_key, default_dfs_metadata_root, default_dfs_pin_root, dfs_expose_config_path,
+    distributed_sifs, distributed_sifs_bootstrap_objects, file_system_config_key,
+    metadata_service_key, metadata_shard_key, open_root_local_metadata_backend,
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayDirection, ReplayQuery};
@@ -89,15 +94,15 @@ use sinomo_runtime::rollout::{
     RolloutFailureDiagnostics, RolloutMainActivation, SelfRolloutPaths,
     activate_staged_rollout_binary, classify_main_exit, create_source_repo_bundle,
     deploy_managed_source_bundle, deploy_managed_source_repo, discover_current_git_repo,
-    ensure_rollout_layout, managed_source_status, read_pending_shadow_rollout,
-    read_rollout_main_activation, read_rollout_main_exit, read_rollout_status,
-    record_activation_failure, record_main_activation_staged,
+    ensure_rollout_layout, install_binary_atomically, managed_source_status,
+    read_pending_shadow_rollout, read_rollout_main_activation, read_rollout_main_exit,
+    read_rollout_status, record_activation_failure, record_main_activation_staged,
     record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
     record_shadow_rollout_finalized, remove_shadow_finalize, restore_rollout_binary_from_backup,
     rollout_main_activation_path, rollout_main_exit_path, rollout_shadow_finalize_path,
-    rollout_staged_main_binary, rollout_staged_shadow_binary, stage_pending_shadow_rollout,
-    stage_rollout_bytes, stage_rollout_file, sync_external_repo_from_managed,
-    write_main_activation, write_rollout_status,
+    rollout_staged_main_binary, rollout_staged_shadow_binary, same_path_if_exists,
+    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
+    sync_external_repo_from_managed, write_main_activation, write_rollout_status,
 };
 use std::env;
 use std::fs::{self, File};
@@ -243,7 +248,6 @@ const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
-const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -256,7 +260,8 @@ const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 180;
 const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 const ROLLOUT_DIAGNOSTIC_TAIL_BYTES: usize = 8 * 1024;
-const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
+#[cfg(test)]
+const SINOMO_JOIN_URI_PREFIX: &str = network::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
 const INSTALL_MAIN_BOOT_NAME: &str = "Sinomo Daemon";

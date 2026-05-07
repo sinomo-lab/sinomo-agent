@@ -56,11 +56,13 @@ use sinomo_core::{
     RoutingMetadata, RoutingScope, Salience, Source,
 };
 use sinomo_kv::KvError;
+use sinomo_local::SinomoDataDir;
 use sinomo_network::{
     MeshMessage, MeshMessageBody, MeshMessageId, NetworkError, NetworkFrame, NetworkFrameId,
     NetworkTransport, ProtocolMessage,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -69,6 +71,28 @@ pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
 
 pub fn sifs_file_system_id() -> DfsFileSystemId {
     DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).expect("valid sifs filesystem id")
+}
+
+pub fn default_dfs_metadata_root(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir.dfs_dir().join("metadata").join("root")
+}
+
+pub fn default_dfs_pin_root(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir.dfs_dir().join("pins")
+}
+
+pub fn default_dfs_expose_config_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir.dfs_expose_config_file()
+}
+
+pub fn dfs_expose_config_path(explicit: Option<PathBuf>, data_dir: &SinomoDataDir) -> PathBuf {
+    explicit.unwrap_or_else(|| default_dfs_expose_config_path(data_dir))
+}
+
+pub fn open_root_local_metadata_backend(
+    root: impl Into<PathBuf>,
+) -> Result<LocalJsonMetadataBackend, MetadataBackendError> {
+    LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.into())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

@@ -1,6 +1,7 @@
 //! Peer registry, mesh contracts, and cluster networking primitives.
 
 mod error;
+mod invite;
 mod lan;
 mod object;
 mod peer;
@@ -9,6 +10,7 @@ mod rpc;
 mod storage;
 
 pub use error::*;
+pub use invite::*;
 pub use lan::*;
 pub use object::*;
 pub use peer::*;
@@ -21,9 +23,10 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_core::{
         CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointId,
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterId,
-        ClusterInviteId, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
-        ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, EventId, LatencyClass,
-        NodeId, RoutingScope, SessionId,
+        ClusterInvitationChannel, ClusterInviteId, ClusterJoinInvite, ClusterMemberRecord,
+        ClusterMemberRole, ClusterMemberState, ClusterNodeRole, ClusterNodeStatusRecord,
+        ClusterTransportKind, EventEnvelope, EventId, LatencyClass, NodeId, RoutingScope,
+        SessionId, TrustDomain,
     };
     pub(crate) use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
     pub(crate) use sinomo_kv::{
@@ -33,7 +36,9 @@ pub(crate) mod prelude {
         RaftRequestVoteResponse, RaftSnapshot, WatchId,
     };
     pub(crate) use sinomo_local::SinomoDataDir;
-    pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
+    pub(crate) use sinomo_node::{
+        NodeAvailability, NodeHealth, NodeProfile, main_daemon_capabilities,
+    };
     pub(crate) use std::cell::RefCell;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
     pub(crate) use std::fs;

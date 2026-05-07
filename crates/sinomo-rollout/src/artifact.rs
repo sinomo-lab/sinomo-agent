@@ -32,6 +32,48 @@ pub fn stage_rollout_file(source: &Path, destination: &Path) -> Result<(), Rollo
     set_executable(destination)
 }
 
+pub fn install_binary_atomically(source: &Path, destination: &Path) -> Result<(), RolloutError> {
+    if !source.exists() {
+        return Err(RolloutError::MissingArtifact {
+            artifact: source.display().to_string(),
+        });
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let next = destination.with_extension("next");
+    fs::copy(source, &next).map_err(|error| RolloutError::Io {
+        path: format!("{} -> {}", source.display(), next.display()),
+        detail: error.to_string(),
+    })?;
+    if destination.exists() {
+        let previous = destination.with_extension("previous");
+        let _ = fs::remove_file(&previous);
+        fs::rename(destination, &previous).map_err(|source| RolloutError::Io {
+            path: format!("{} -> {}", destination.display(), previous.display()),
+            detail: source.to_string(),
+        })?;
+    }
+    fs::rename(&next, destination).map_err(|source| RolloutError::Io {
+        path: format!("{} -> {}", next.display(), destination.display()),
+        detail: source.to_string(),
+    })?;
+    Ok(())
+}
+
+pub fn same_path_if_exists(left: &Path, right: &Path) -> bool {
+    let Ok(left) = fs::canonicalize(left) else {
+        return false;
+    };
+    let Ok(right) = fs::canonicalize(right) else {
+        return false;
+    };
+    left == right
+}
+
 pub fn activate_staged_rollout_binary(
     staged: &Path,
     destination: &Path,

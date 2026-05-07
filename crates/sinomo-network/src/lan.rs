@@ -95,6 +95,13 @@ pub fn is_invitable_ip(ip: IpAddr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
 }
 
+pub fn format_ip_port(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}:{port}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MdnsDiscoveryCache {
     records: BTreeMap<String, MdnsDiscoveryRecord>,

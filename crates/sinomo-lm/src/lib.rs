@@ -38,7 +38,11 @@ pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_n
 pub use openai::{OpenAiConfig, OpenAiProvider};
 
 use serde::{Deserialize, Serialize};
+use sinomo_runtime::local::SinomoDataDir;
+use std::env;
+use std::fs;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -146,6 +150,352 @@ pub struct LanguageModelCreditUsage {
 
 pub trait LanguageModelUsageProvider {
     fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModelConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelPaths {
+    pub config: PathBuf,
+}
+
+impl ModelPaths {
+    pub fn new(data_dir: &SinomoDataDir) -> Self {
+        Self {
+            config: data_dir.configs_dir().join("models.json"),
+        }
+    }
+
+    pub fn ensure(&self) -> Result<(), LanguageModelError> {
+        let Some(parent) = self.config.parent() else {
+            return Ok(());
+        };
+        fs::create_dir_all(parent).map_err(|source| LanguageModelError::ConfigStore {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentDefaultModel {
+    pub provider: String,
+    pub configured_model: String,
+    pub model: String,
+    pub config_path: PathBuf,
+}
+
+pub fn load_model_config(paths: &ModelPaths) -> Result<ModelConfig, LanguageModelError> {
+    let content =
+        fs::read_to_string(&paths.config).map_err(|source| LanguageModelError::ConfigStore {
+            path: paths.config.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    serde_json::from_str(&content).map_err(|source| LanguageModelError::RequestSerialization {
+        detail: format!(
+            "failed to parse model config at {}: {source}",
+            paths.config.display()
+        ),
+    })
+}
+
+pub fn save_model_config(path: &Path, value: &ModelConfig) -> Result<(), LanguageModelError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| LanguageModelError::ConfigStore {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let content = serde_json::to_string_pretty(value).map_err(|source| {
+        LanguageModelError::RequestSerialization {
+            detail: source.to_string(),
+        }
+    })?;
+    fs::write(path, content).map_err(|source| LanguageModelError::ConfigStore {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub fn current_default_model(
+    data_dir: &SinomoDataDir,
+) -> Result<CurrentDefaultModel, LanguageModelError> {
+    let model_paths = ModelPaths::new(data_dir);
+    let model_config = load_model_config(&model_paths).ok();
+    let provider = model_config
+        .as_ref()
+        .and_then(|config| config.default_provider.clone())
+        .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
+    let provider = normalize_model_provider(&provider).ok_or_else(|| {
+        LanguageModelError::ProviderInvocationFailed {
+            provider: provider.clone(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: format!("unknown provider `{provider}`"),
+        }
+    })?;
+    let configured_model = model_config
+        .as_ref()
+        .and_then(|config| config.default_model.clone())
+        .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
+    let model = effective_model_name(&provider, &configured_model);
+    Ok(CurrentDefaultModel {
+        provider,
+        configured_model,
+        model,
+        config_path: model_paths.config,
+    })
+}
+
+pub fn effective_model_name(provider: &str, configured_model: &str) -> String {
+    if configured_model != PROVIDER_DEFAULT_MODEL {
+        return normalize_model_id_for_provider(provider, configured_model);
+    }
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => GitHubCopilotConfig::default().default_model,
+        GitHubCopilotCliProvider::PROVIDER_ID => GitHubCopilotCliConfig::default().model,
+        CodexCliProvider::PROVIDER_ID => CODEX_CLI_DEFAULT_MODEL.to_string(),
+        CODEX_PROVIDER_ID => CODEX_DEFAULT_MODEL.to_string(),
+        ClaudeCodeProvider::PROVIDER_ID => CLAUDE_CODE_DEFAULT_MODEL.to_string(),
+        AnthropicProvider::PROVIDER_ID => AnthropicConfig::default().default_model,
+        OpenAiProvider::PROVIDER_ID => OpenAiConfig::default().default_model,
+        GeminiProvider::PROVIDER_ID => GeminiConfig::default().default_model,
+        NvidiaProvider::PROVIDER_ID => NvidiaConfig::default().default_model,
+        _ => configured_model.to_string(),
+    }
+}
+
+pub fn normalize_model_id_for_provider(provider: &str, model: &str) -> String {
+    match provider {
+        NvidiaProvider::PROVIDER_ID => normalize_nvidia_model_id(model),
+        _ => model.to_string(),
+    }
+}
+
+pub fn default_model_provider_ids() -> &'static [&'static str] {
+    &[
+        GitHubCopilotProvider::PROVIDER_ID,
+        GitHubCopilotCliProvider::PROVIDER_ID,
+        CodexCliProvider::PROVIDER_ID,
+        CODEX_PROVIDER_ID,
+        ClaudeCodeProvider::PROVIDER_ID,
+        AnthropicProvider::PROVIDER_ID,
+        OpenAiProvider::PROVIDER_ID,
+        GeminiProvider::PROVIDER_ID,
+        NvidiaProvider::PROVIDER_ID,
+    ]
+}
+
+pub fn normalize_model_provider(provider: &str) -> Option<String> {
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => Some(GitHubCopilotProvider::PROVIDER_ID.to_string()),
+        GitHubCopilotCliProvider::PROVIDER_ID => {
+            Some(GitHubCopilotCliProvider::PROVIDER_ID.to_string())
+        }
+        CodexCliProvider::PROVIDER_ID => Some(CodexCliProvider::PROVIDER_ID.to_string()),
+        CODEX_PROVIDER_ID => Some(CODEX_PROVIDER_ID.to_string()),
+        ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
+            Some(ClaudeCodeProvider::PROVIDER_ID.to_string())
+        }
+        AnthropicProvider::PROVIDER_ID | "claude" => {
+            Some(AnthropicProvider::PROVIDER_ID.to_string())
+        }
+        OpenAiProvider::PROVIDER_ID | "openai-api" => Some(OpenAiProvider::PROVIDER_ID.to_string()),
+        GeminiProvider::PROVIDER_ID | "google-gemini" => {
+            Some(GeminiProvider::PROVIDER_ID.to_string())
+        }
+        NvidiaProvider::PROVIDER_ID | "nvidia-nim" => Some(NvidiaProvider::PROVIDER_ID.to_string()),
+        _ => None,
+    }
+}
+
+pub fn subscription_usage_provider_ids() -> &'static [&'static str] {
+    &[CODEX_PROVIDER_ID, GitHubCopilotProvider::PROVIDER_ID]
+}
+
+pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, LanguageModelError> {
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let (provider, _) = github_copilot_provider()?;
+            provider.list_models()
+        }
+        GitHubCopilotCliProvider::PROVIDER_ID
+        | CodexCliProvider::PROVIDER_ID
+        | ClaudeCodeProvider::PROVIDER_ID => Err(LanguageModelError::ProviderInvocationFailed {
+            provider: provider.to_string(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: format!("provider `{provider}` does not use Sinomo-managed authentication"),
+        }),
+        CODEX_PROVIDER_ID => codex_provider_for_model(PROVIDER_DEFAULT_MODEL).list_models(),
+        AnthropicProvider::PROVIDER_ID => {
+            let (provider, _) = anthropic_provider()?;
+            provider.api_key()?;
+            Ok(vec![AnthropicConfig::default().default_model])
+        }
+        OpenAiProvider::PROVIDER_ID => {
+            let (provider, _) = openai_provider()?;
+            provider.api_key()?;
+            Ok(vec![OpenAiConfig::default().default_model])
+        }
+        GeminiProvider::PROVIDER_ID => {
+            let (provider, _) = gemini_provider()?;
+            provider.api_key()?;
+            Ok(vec![GeminiConfig::default().default_model])
+        }
+        NvidiaProvider::PROVIDER_ID => {
+            let (provider, _) = nvidia_provider()?;
+            provider.list_models()
+        }
+        _ => Err(LanguageModelError::ProviderInvocationFailed {
+            provider: provider.to_string(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: format!("unknown provider `{provider}`"),
+        }),
+    }
+}
+
+pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+    match provider {
+        CODEX_PROVIDER_ID => codex_provider_for_model(PROVIDER_DEFAULT_MODEL).usage(),
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let (provider, _) = github_copilot_provider()?;
+            provider.usage()
+        }
+        _ => Err(LanguageModelError::ProviderInvocationFailed {
+            provider: provider.to_string(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: format!("provider `{provider}` does not expose subscription usage"),
+        }),
+    }
+}
+
+pub fn model_or_default(model: &str, default_model: String) -> String {
+    if model == PROVIDER_DEFAULT_MODEL {
+        default_model
+    } else {
+        model.to_string()
+    }
+}
+
+pub fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), LanguageModelError> {
+    let data_dir =
+        SinomoDataDir::from_env_or_home().map_err(|source| LanguageModelError::ConfigStore {
+            path: "<data-dir>".to_string(),
+            detail: source.to_string(),
+        })?;
+    data_dir
+        .ensure_provider_dir(GitHubCopilotProvider::PROVIDER_ID)
+        .map_err(|source| LanguageModelError::ConfigStore {
+            path: data_dir
+                .provider_dir(GitHubCopilotProvider::PROVIDER_ID)
+                .display()
+                .to_string(),
+            detail: source.to_string(),
+        })?;
+    let credentials_path = data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
+    let client_id = env::var("SINOMO_COPILOT_CLIENT_ID")
+        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id);
+    let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
+        client_id,
+        token_store_path: Some(credentials_path.clone()),
+        ..GitHubCopilotConfig::default()
+    });
+    Ok((provider, credentials_path))
+}
+
+pub fn anthropic_provider() -> Result<(AnthropicProvider, PathBuf), LanguageModelError> {
+    let data_dir = provider_data_dir(AnthropicProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(AnthropicProvider::PROVIDER_ID);
+    let provider = AnthropicProvider::new(AnthropicConfig {
+        api_base_url: env::var("SINOMO_ANTHROPIC_API_BASE_URL")
+            .or_else(|_| env::var("SINOMO_CLAUDE_API_BASE_URL"))
+            .unwrap_or_else(|_| AnthropicConfig::default().api_base_url),
+        default_model: AnthropicConfig::default().default_model,
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
+pub fn openai_provider() -> Result<(OpenAiProvider, PathBuf), LanguageModelError> {
+    let data_dir = provider_data_dir(OpenAiProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
+    let provider = OpenAiProvider::new(OpenAiConfig {
+        api_base_url: env::var("SINOMO_OPENAI_API_BASE_URL")
+            .unwrap_or_else(|_| OpenAiConfig::default().api_base_url),
+        default_model: OpenAiConfig::default().default_model,
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
+pub fn gemini_provider() -> Result<(GeminiProvider, PathBuf), LanguageModelError> {
+    let data_dir = provider_data_dir(GeminiProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
+    let provider = GeminiProvider::new(GeminiConfig {
+        api_base_url: env::var("SINOMO_GEMINI_API_BASE_URL")
+            .unwrap_or_else(|_| GeminiConfig::default().api_base_url),
+        default_model: GeminiConfig::default().default_model,
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
+pub fn nvidia_provider() -> Result<(NvidiaProvider, PathBuf), LanguageModelError> {
+    let data_dir = provider_data_dir(NvidiaProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
+    let provider = NvidiaProvider::new(NvidiaConfig {
+        api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
+            .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
+        default_model: NvidiaConfig::default().default_model,
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
+pub fn codex_provider_for_model(model: &str) -> CodexProvider {
+    let default_model = model_or_default(model, CODEX_DEFAULT_MODEL.to_string());
+    let config_default = OpenAiResponsesCodexConfig::default();
+    let client_config = OpenAiResponsesCodexConfig {
+        api_base_url: env::var("SINOMO_CODEX_API_BASE_URL")
+            .unwrap_or_else(|_| config_default.api_base_url.clone()),
+        auth_issuer: env::var("SINOMO_CODEX_AUTH_ISSUER")
+            .unwrap_or_else(|_| config_default.auth_issuer.clone()),
+        client_id: env::var("SINOMO_CODEX_CLIENT_ID")
+            .unwrap_or_else(|_| config_default.client_id.clone()),
+        client_version: config_default.client_version,
+        default_model: default_model.clone(),
+        credentials_path: config_default.credentials_path,
+    };
+    CodexProvider::new(
+        CodexConfig {
+            default_model,
+            ..CodexConfig::default()
+        },
+        OpenAiResponsesCodexClient::new(client_config),
+        CodexToolRegistry::new(),
+        DefaultCodexPromptBuilder::default(),
+        DefaultCodexContextManager::default(),
+    )
+}
+
+fn provider_data_dir(provider: &str) -> Result<SinomoDataDir, LanguageModelError> {
+    let data_dir =
+        SinomoDataDir::from_env_or_home().map_err(|source| LanguageModelError::ConfigStore {
+            path: "<data-dir>".to_string(),
+            detail: source.to_string(),
+        })?;
+    data_dir
+        .ensure_provider_dir(provider)
+        .map_err(|source| LanguageModelError::ConfigStore {
+            path: data_dir.provider_dir(provider).display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(data_dir)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -354,6 +704,8 @@ pub enum LanguageModelError {
     UnsupportedToken { provider: String, detail: String },
     #[error("token store error at {path}: {detail}")]
     TokenStore { path: String, detail: String },
+    #[error("model config store error at {path}: {detail}")]
+    ConfigStore { path: String, detail: String },
     #[error("failed to spawn provider {provider} command {program}: {detail}")]
     ProviderSpawnFailed {
         provider: String,

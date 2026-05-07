@@ -108,54 +108,9 @@ pub(crate) fn parse_usage_options(args: &[String]) -> Result<UsageOptions, CliEr
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CurrentDefaultModel {
-    pub(crate) provider: String,
-    pub(crate) configured_model: String,
-    pub(crate) model: String,
-    pub(crate) config_path: PathBuf,
-}
-
 pub(crate) fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    let model_paths = ModelPaths::new(&data_dir);
-    let model_config = read_model_config(&model_paths).ok();
-    let provider = model_config
-        .as_ref()
-        .and_then(|config| config.default_provider.clone())
-        .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
-    let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
-        detail: format!("unknown provider `{provider}`"),
-    })?;
-    let configured_model = model_config
-        .as_ref()
-        .and_then(|config| config.default_model.clone())
-        .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
-    let model = effective_model_name(&provider, &configured_model);
-    Ok(CurrentDefaultModel {
-        provider,
-        configured_model,
-        model,
-        config_path: model_paths.config,
-    })
-}
-
-pub(crate) fn effective_model_name(provider: &str, configured_model: &str) -> String {
-    if configured_model != PROVIDER_DEFAULT_MODEL {
-        return normalize_model_id_for_provider(provider, configured_model);
-    }
-    match provider {
-        GitHubCopilotProvider::PROVIDER_ID => GitHubCopilotConfig::default().default_model,
-        GitHubCopilotCliProvider::PROVIDER_ID => GitHubCopilotCliConfig::default().model,
-        CodexCliProvider::PROVIDER_ID => CODEX_CLI_DEFAULT_MODEL.to_string(),
-        CODEX_PROVIDER_ID => CODEX_DEFAULT_MODEL.to_string(),
-        ClaudeCodeProvider::PROVIDER_ID => CLAUDE_CODE_DEFAULT_MODEL.to_string(),
-        AnthropicProvider::PROVIDER_ID => AnthropicConfig::default().default_model,
-        OpenAiProvider::PROVIDER_ID => OpenAiConfig::default().default_model,
-        GeminiProvider::PROVIDER_ID => GeminiConfig::default().default_model,
-        NvidiaProvider::PROVIDER_ID => NvidiaConfig::default().default_model,
-        _ => configured_model.to_string(),
-    }
+    resolve_current_default_model(&data_dir).map_err(CliError::LanguageModel)
 }
 
 pub(crate) fn run_models_command(command: ModelsCliCommand) -> Result<(), CliError> {
@@ -227,7 +182,7 @@ pub(crate) fn models_default_with_data_dir(
         default_provider: Some(options.provider),
         default_model: Some(options.model),
     };
-    write_json(&model_paths.config, &config)?;
+    save_model_config(&model_paths.config, &config)?;
 
     println!(
         "default provider: {}",
@@ -239,90 +194,6 @@ pub(crate) fn models_default_with_data_dir(
     );
     println!("config: {}", model_paths.config.display());
     Ok(())
-}
-
-pub(crate) fn normalize_model_id_for_provider(provider: &str, model: &str) -> String {
-    match provider {
-        NvidiaProvider::PROVIDER_ID => normalize_nvidia_model_id(model),
-        _ => model.to_string(),
-    }
-}
-
-pub(crate) fn default_model_provider_ids() -> &'static [&'static str] {
-    &[
-        GitHubCopilotProvider::PROVIDER_ID,
-        GitHubCopilotCliProvider::PROVIDER_ID,
-        CodexCliProvider::PROVIDER_ID,
-        CODEX_PROVIDER_ID,
-        ClaudeCodeProvider::PROVIDER_ID,
-        AnthropicProvider::PROVIDER_ID,
-        OpenAiProvider::PROVIDER_ID,
-        GeminiProvider::PROVIDER_ID,
-        NvidiaProvider::PROVIDER_ID,
-    ]
-}
-
-pub(crate) fn normalize_model_provider(provider: &str) -> Option<String> {
-    match provider {
-        GitHubCopilotProvider::PROVIDER_ID => Some(GitHubCopilotProvider::PROVIDER_ID.to_string()),
-        GitHubCopilotCliProvider::PROVIDER_ID => {
-            Some(GitHubCopilotCliProvider::PROVIDER_ID.to_string())
-        }
-        CodexCliProvider::PROVIDER_ID => Some(CodexCliProvider::PROVIDER_ID.to_string()),
-        CODEX_PROVIDER_ID => Some(CODEX_PROVIDER_ID.to_string()),
-        ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
-            Some(ClaudeCodeProvider::PROVIDER_ID.to_string())
-        }
-        AnthropicProvider::PROVIDER_ID | "claude" => {
-            Some(AnthropicProvider::PROVIDER_ID.to_string())
-        }
-        OpenAiProvider::PROVIDER_ID | "openai-api" => Some(OpenAiProvider::PROVIDER_ID.to_string()),
-        GeminiProvider::PROVIDER_ID | "google-gemini" => {
-            Some(GeminiProvider::PROVIDER_ID.to_string())
-        }
-        NvidiaProvider::PROVIDER_ID | "nvidia-nim" => Some(NvidiaProvider::PROVIDER_ID.to_string()),
-        _ => None,
-    }
-}
-
-pub(crate) fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, CliError> {
-    match provider {
-        GitHubCopilotProvider::PROVIDER_ID => {
-            let (provider, _) = github_copilot_provider()?;
-            provider.list_models().map_err(CliError::LanguageModel)
-        }
-        GitHubCopilotCliProvider::PROVIDER_ID
-        | CodexCliProvider::PROVIDER_ID
-        | ClaudeCodeProvider::PROVIDER_ID => Err(CliError::Parse {
-            detail: format!("provider `{provider}` does not use Sinomo-managed authentication"),
-        }),
-        CODEX_PROVIDER_ID => {
-            let (provider, _) = codex_provider()?;
-            provider.list_models().map_err(CliError::LanguageModel)
-        }
-        AnthropicProvider::PROVIDER_ID => {
-            let (provider, _) = anthropic_provider()?;
-            provider.api_key()?;
-            Ok(vec![AnthropicConfig::default().default_model])
-        }
-        OpenAiProvider::PROVIDER_ID => {
-            let (provider, _) = openai_provider()?;
-            provider.api_key()?;
-            Ok(vec![OpenAiConfig::default().default_model])
-        }
-        GeminiProvider::PROVIDER_ID => {
-            let (provider, _) = gemini_provider()?;
-            provider.api_key()?;
-            Ok(vec![GeminiConfig::default().default_model])
-        }
-        NvidiaProvider::PROVIDER_ID => {
-            let (provider, _) = nvidia_provider()?;
-            provider.list_models().map_err(CliError::LanguageModel)
-        }
-        _ => Err(CliError::Parse {
-            detail: format!("unknown provider `{provider}`"),
-        }),
-    }
 }
 
 pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {
@@ -347,7 +218,7 @@ pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {
 
     let mut snapshots = Vec::new();
     for provider in providers {
-        match provider_usage(&provider) {
+        match provider_usage(&provider).map_err(CliError::LanguageModel) {
             Ok(snapshot) => snapshots.push(snapshot),
             Err(error) if explicit_provider => return Err(error),
             Err(_) => {}
@@ -396,26 +267,6 @@ pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {
         print_provider_usage(snapshot);
     }
     Ok(())
-}
-
-pub(crate) fn subscription_usage_provider_ids() -> &'static [&'static str] {
-    &[CODEX_PROVIDER_ID, GitHubCopilotProvider::PROVIDER_ID]
-}
-
-pub(crate) fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, CliError> {
-    match provider {
-        CODEX_PROVIDER_ID => {
-            let (provider, _) = codex_provider()?;
-            provider.usage().map_err(CliError::LanguageModel)
-        }
-        GitHubCopilotProvider::PROVIDER_ID => {
-            let (provider, _) = github_copilot_provider()?;
-            provider.usage().map_err(CliError::LanguageModel)
-        }
-        _ => Err(CliError::Parse {
-            detail: format!("provider `{provider}` does not expose subscription usage"),
-        }),
-    }
 }
 
 pub(crate) fn print_provider_usage(snapshot: &LanguageModelProviderUsage) {

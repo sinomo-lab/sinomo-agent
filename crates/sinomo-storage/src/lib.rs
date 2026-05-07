@@ -491,6 +491,25 @@ pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
     Ok(layout)
 }
 
+pub fn verify_sinomo_data_dir(
+    data_dir: impl AsRef<Path>,
+) -> Result<StorageVerificationReport, StorageContractError> {
+    sinomo_data_dir_layout()?.verify_data_dir(data_dir)
+}
+
+pub fn ensure_sinomo_data_dir_is_registered(
+    data_dir: impl AsRef<Path>,
+) -> Result<(), StorageContractError> {
+    let report = verify_sinomo_data_dir(data_dir)?;
+    if report.is_complete() {
+        Ok(())
+    } else {
+        Err(StorageContractError::UnregisteredPaths {
+            paths: report.unregistered,
+        })
+    }
+}
+
 fn register_object(
     layout: &mut StorageLayout,
     module: &'static str,
@@ -572,6 +591,8 @@ pub enum StorageContractError {
     InvalidRelativePath { path: String },
     #[error("storage path is registered more than once: {relative_path}")]
     DuplicatePath { relative_path: String },
+    #[error("unregistered files in sinomo data directory: {}", paths.join(", "))]
+    UnregisteredPaths { paths: Vec<String> },
     #[error("storage verifier I/O error at {path}: {detail}")]
     Io { path: String, detail: String },
 }

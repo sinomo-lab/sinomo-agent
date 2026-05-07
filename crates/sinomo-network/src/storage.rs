@@ -234,6 +234,168 @@ pub struct ClusterConnectivityRecord {
     pub expires_at: OffsetDateTime,
 }
 
+pub fn build_cluster_network_info_record(
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+    observed_at: OffsetDateTime,
+    ttl_seconds: i64,
+) -> ClusterNetworkInfoRecord {
+    let endpoints = state
+        .members
+        .iter()
+        .find(|member| member.node_id == *node_id)
+        .map(|member| member.endpoints.clone())
+        .unwrap_or_default();
+    let observed_addresses = cluster_network_observed_addresses(&endpoints);
+    ClusterNetworkInfoRecord {
+        cluster_id: state.cluster_id.clone(),
+        node_id: node_id.clone(),
+        environment_id: cluster_network_environment_id(&observed_addresses),
+        observed_addresses,
+        endpoints,
+        observed_at,
+        expires_at: observed_at + time::Duration::seconds(ttl_seconds),
+    }
+}
+
+pub fn cluster_network_observed_addresses(endpoints: &[ClusterEndpointRecord]) -> Vec<String> {
+    let mut observed_addresses = endpoints
+        .iter()
+        .filter(|endpoint| {
+            matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp
+                    | ClusterTransportKind::LanQuic
+                    | ClusterTransportKind::Iroh
+                    | ClusterTransportKind::WebRtc
+                    | ClusterTransportKind::TurnRelay
+                    | ClusterTransportKind::HttpsRelay
+            )
+        })
+        .map(|endpoint| endpoint.address.clone())
+        .collect::<Vec<_>>();
+    observed_addresses.sort();
+    observed_addresses.dedup();
+    observed_addresses
+}
+
+pub fn cluster_network_environment_id(values: &[String]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for value in values {
+        for byte in value.as_bytes().iter().chain(std::iter::once(&0)) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("env_{hash:016x}")
+}
+
+pub fn cluster_connectivity_probe_key(
+    source_node_id: &NodeId,
+    endpoint: &ClusterEndpointRecord,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        source_node_id, endpoint.node_id, endpoint.endpoint_id
+    )
+}
+
+pub fn cluster_connectivity_record(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    connectivity_state: ClusterConnectivityState,
+    latency_ms: Option<u64>,
+    consecutive_failures: u16,
+    last_success_at: Option<String>,
+    last_failure_at: Option<String>,
+    observed_at: OffsetDateTime,
+    ttl_seconds: i64,
+) -> ClusterConnectivityRecord {
+    let expires_in = if matches!(connectivity_state, ClusterConnectivityState::Healthy) {
+        ttl_seconds
+    } else {
+        ttl_seconds / 2
+    };
+    ClusterConnectivityRecord {
+        cluster_id: state.cluster_id.clone(),
+        source_node_id: state.local_node_id.clone(),
+        target_node_id: endpoint.node_id.clone(),
+        endpoint_id: endpoint.endpoint_id.clone(),
+        transport: endpoint.transport.clone(),
+        address: endpoint.address.clone(),
+        state: connectivity_state,
+        latency_ms,
+        consecutive_failures,
+        last_success_at,
+        last_failure_at,
+        observed_at,
+        expires_at: observed_at + time::Duration::seconds(expires_in),
+    }
+}
+
+pub fn apply_cluster_node_role(
+    member: &mut ClusterMemberRecord,
+    role: ClusterNodeRole,
+    timestamp: OffsetDateTime,
+) {
+    member.node_role = role;
+    member.updated_at = timestamp;
+}
+
+pub fn apply_cluster_raft_role(
+    member: &mut ClusterMemberRecord,
+    role: ClusterMemberRole,
+    timestamp: OffsetDateTime,
+) {
+    member.role = role.clone();
+    member.state = cluster_raft_state_for_role(&role);
+    member.capabilities = main_daemon_capabilities(&role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.updated_at = timestamp;
+}
+
+pub fn cluster_raft_state_for_role(role: &ClusterMemberRole) -> ClusterMemberState {
+    match role {
+        ClusterMemberRole::Voter => ClusterMemberState::Voter,
+        ClusterMemberRole::Learner => ClusterMemberState::Learner,
+        ClusterMemberRole::NonVoting => ClusterMemberState::NonVoting,
+    }
+}
+
+pub fn cluster_raft_local_is_voter(state: &ClusterBootstrapState) -> bool {
+    cluster_raft_node_is_voter(state, &state.local_node_id)
+}
+
+pub fn cluster_raft_node_is_voter(state: &ClusterBootstrapState, node_id: &NodeId) -> bool {
+    state.members.iter().any(|member| {
+        member.node_id == *node_id
+            && member.cluster_id == state.cluster_id
+            && member.state.is_authorized()
+            && cluster_member_has_raft_vote(member)
+            && member
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == "daemon.main.run")
+    })
+}
+
+pub fn cluster_member_has_raft_vote(member: &ClusterMemberRecord) -> bool {
+    matches!(member.state, ClusterMemberState::Voter)
+        || (matches!(member.state, ClusterMemberState::Active)
+            && matches!(member.role, ClusterMemberRole::Voter))
+}
+
+pub fn cluster_raft_quorum_size(state: &ClusterBootstrapState) -> usize {
+    let voters = state
+        .members
+        .iter()
+        .filter(|member| cluster_raft_node_is_voter(state, &member.node_id))
+        .map(|member| member.node_id.clone())
+        .collect::<BTreeSet<_>>()
+        .len();
+    voters / 2 + 1
+}
+
 pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, NetworkError> {
     if !paths.state.exists() {
         return Err(NetworkError::ClusterOrphan);

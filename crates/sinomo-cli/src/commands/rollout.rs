@@ -802,38 +802,6 @@ pub(crate) fn ensure_source_repo(
     Ok(deploy_managed_source_repo(paths, &source)?)
 }
 
-pub(crate) fn install_binary_atomically(source: &Path, destination: &Path) -> Result<(), CliError> {
-    if !source.exists() {
-        return Err(CliError::MissingArtifact {
-            artifact: source.display().to_string(),
-        });
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let next = destination.with_extension("next");
-    fs::copy(source, &next).map_err(|error| CliError::Io {
-        path: format!("{} -> {}", source.display(), next.display()),
-        detail: error.to_string(),
-    })?;
-    if destination.exists() {
-        let previous = destination.with_extension("previous");
-        let _ = fs::remove_file(&previous);
-        fs::rename(destination, &previous).map_err(|source| CliError::Io {
-            path: format!("{} -> {}", destination.display(), previous.display()),
-            detail: source.to_string(),
-        })?;
-    }
-    fs::rename(&next, destination).map_err(|source| CliError::Io {
-        path: format!("{} -> {}", next.display(), destination.display()),
-        detail: source.to_string(),
-    })?;
-    Ok(())
-}
-
 pub(crate) fn wait_for_main_daemon_health(
     options: &RolloutOptions,
     previous_pid: Option<u32>,

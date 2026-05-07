@@ -36,8 +36,7 @@ use super::{
     run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
     send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
     sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
-    uninstall_with_layout, verify_data_dir_storage_contracts, write_daemon_status,
-    write_rollout_status,
+    uninstall_with_layout, write_daemon_status, write_rollout_status,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -1045,8 +1044,8 @@ fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
     assert!(main_entry.contains("21400"));
     assert!(shadow_entry.contains("21401"));
 
-    let storage_report =
-        verify_data_dir_storage_contracts(&layout.data_dir).expect("storage verifier");
+    let storage_report = sinomo_runtime::storage::verify_sinomo_data_dir(&layout.data_dir)
+        .expect("storage verifier");
     assert!(
         storage_report.is_complete(),
         "unregistered data-dir files: {:?}",

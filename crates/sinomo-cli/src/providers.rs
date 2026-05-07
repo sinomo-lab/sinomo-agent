@@ -299,47 +299,6 @@ pub fn test_nvidia() -> Result<(), CliError> {
     Ok(())
 }
 
-pub(super) fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_provider_dir(GitHubCopilotProvider::PROVIDER_ID)?;
-    let credentials_path = data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
-    let client_id = env::var("SINOMO_COPILOT_CLIENT_ID")
-        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id);
-    let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
-        client_id,
-        token_store_path: Some(credentials_path.clone()),
-        ..GitHubCopilotConfig::default()
-    });
-    Ok((provider, credentials_path))
-}
-
-pub(super) fn anthropic_provider() -> Result<(AnthropicProvider, PathBuf), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_provider_dir(AnthropicProvider::PROVIDER_ID)?;
-    let credentials_path = data_dir.provider_credentials_file(AnthropicProvider::PROVIDER_ID);
-    let provider = AnthropicProvider::new(AnthropicConfig {
-        api_base_url: env::var("SINOMO_ANTHROPIC_API_BASE_URL")
-            .or_else(|_| env::var("SINOMO_CLAUDE_API_BASE_URL"))
-            .unwrap_or_else(|_| AnthropicConfig::default().api_base_url),
-        default_model: AnthropicConfig::default().default_model,
-        credentials_path: Some(credentials_path.clone()),
-    });
-    Ok((provider, credentials_path))
-}
-
-pub(super) fn openai_provider() -> Result<(OpenAiProvider, PathBuf), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_provider_dir(OpenAiProvider::PROVIDER_ID)?;
-    let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
-    let provider = OpenAiProvider::new(OpenAiConfig {
-        api_base_url: env::var("SINOMO_OPENAI_API_BASE_URL")
-            .unwrap_or_else(|_| OpenAiConfig::default().api_base_url),
-        default_model: OpenAiConfig::default().default_model,
-        credentials_path: Some(credentials_path.clone()),
-    });
-    Ok((provider, credentials_path))
-}
-
 pub(super) fn codex_provider() -> Result<(CodexProvider, PathBuf), CliError> {
     let provider = codex_provider_for_model(PROVIDER_DEFAULT_MODEL);
     let auth_path = provider
@@ -348,32 +307,6 @@ pub(super) fn codex_provider() -> Result<(CodexProvider, PathBuf), CliError> {
             detail: "could not resolve Sinomo Codex credentials path; set SINOMO_DATA_DIR or SINOMO_CODEX_CREDENTIALS_FILE".to_string(),
         })?;
     Ok((provider, auth_path))
-}
-
-pub(super) fn gemini_provider() -> Result<(GeminiProvider, PathBuf), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_provider_dir(GeminiProvider::PROVIDER_ID)?;
-    let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
-    let provider = GeminiProvider::new(GeminiConfig {
-        api_base_url: env::var("SINOMO_GEMINI_API_BASE_URL")
-            .unwrap_or_else(|_| GeminiConfig::default().api_base_url),
-        default_model: GeminiConfig::default().default_model,
-        credentials_path: Some(credentials_path.clone()),
-    });
-    Ok((provider, credentials_path))
-}
-
-pub(super) fn nvidia_provider() -> Result<(NvidiaProvider, PathBuf), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_provider_dir(NvidiaProvider::PROVIDER_ID)?;
-    let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
-    let provider = NvidiaProvider::new(NvidiaConfig {
-        api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
-            .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
-        default_model: NvidiaConfig::default().default_model,
-        credentials_path: Some(credentials_path.clone()),
-    });
-    Ok((provider, credentials_path))
 }
 
 fn api_key_from_env_or_prompt(

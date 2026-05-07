@@ -85,27 +85,10 @@ pub(crate) fn parse_port(label: &str, value: &str) -> Result<u16, CliError> {
     })
 }
 
-pub(crate) fn verify_data_dir_storage_contracts(
-    data_dir: impl AsRef<Path>,
-) -> Result<sinomo_runtime::storage::StorageVerificationReport, CliError> {
-    let layout = sinomo_runtime::storage::sinomo_data_dir_layout()?;
-    Ok(layout.verify_data_dir(data_dir)?)
-}
-
 pub(crate) fn ensure_data_dir_storage_contracts(
     data_dir: impl AsRef<Path>,
 ) -> Result<(), CliError> {
-    let report = verify_data_dir_storage_contracts(data_dir)?;
-    if report.is_complete() {
-        Ok(())
-    } else {
-        Err(CliError::Parse {
-            detail: format!(
-                "unregistered files in sinomo data directory: {}",
-                report.unregistered.join(", ")
-            ),
-        })
-    }
+    Ok(sinomo_runtime::storage::ensure_sinomo_data_dir_is_registered(data_dir)?)
 }
 
 pub(crate) fn install(options: InstallOptions) -> Result<(), CliError> {
@@ -256,7 +239,7 @@ pub(crate) fn install_current_binary(destination: &Path) -> Result<(), CliError>
     if same_path_if_exists(&current, destination) {
         return Ok(());
     }
-    install_binary_atomically(&current, destination)
+    Ok(install_binary_atomically(&current, destination)?)
 }
 
 pub(crate) fn install_should_update_binary(destination: &Path) -> Result<bool, CliError> {
@@ -329,16 +312,6 @@ pub(crate) fn current_executable_path() -> Result<PathBuf, CliError> {
         path: "current executable".to_string(),
         detail: source.to_string(),
     })
-}
-
-pub(crate) fn same_path_if_exists(left: &Path, right: &Path) -> bool {
-    let Ok(left) = fs::canonicalize(left) else {
-        return false;
-    };
-    let Ok(right) = fs::canonicalize(right) else {
-        return false;
-    };
-    left == right
 }
 
 pub(crate) fn default_boot_dir(data_dir: &SinomoDataDir) -> Result<PathBuf, CliError> {

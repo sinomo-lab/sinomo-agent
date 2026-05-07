@@ -3158,6 +3158,7 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-kv",
+ "sinomo-local",
  "sinomo-network",
  "sinomo-object",
  "thiserror",

@@ -1023,40 +1023,6 @@ impl MutationModel for CliMutationModel {
     }
 }
 
-pub(crate) fn model_or_default(model: &str, default_model: String) -> String {
-    if model == PROVIDER_DEFAULT_MODEL {
-        default_model
-    } else {
-        model.to_string()
-    }
-}
-
-pub(crate) fn codex_provider_for_model(model: &str) -> CodexProvider {
-    let default_model = model_or_default(model, CODEX_DEFAULT_MODEL.to_string());
-    let config_default = OpenAiResponsesCodexConfig::default();
-    let client_config = OpenAiResponsesCodexConfig {
-        api_base_url: env::var("SINOMO_CODEX_API_BASE_URL")
-            .unwrap_or_else(|_| config_default.api_base_url.clone()),
-        auth_issuer: env::var("SINOMO_CODEX_AUTH_ISSUER")
-            .unwrap_or_else(|_| config_default.auth_issuer.clone()),
-        client_id: env::var("SINOMO_CODEX_CLIENT_ID")
-            .unwrap_or_else(|_| config_default.client_id.clone()),
-        client_version: config_default.client_version,
-        default_model: default_model.clone(),
-        credentials_path: config_default.credentials_path,
-    };
-    CodexProvider::new(
-        CodexConfig {
-            default_model,
-            ..CodexConfig::default()
-        },
-        OpenAiResponsesCodexClient::new(client_config),
-        CodexToolRegistry::new(),
-        DefaultCodexPromptBuilder::default(),
-        DefaultCodexContextManager::default(),
-    )
-}
-
 pub(crate) fn resolve_job_from_args(
     args: &[String],
     waiting_only: bool,
@@ -1100,17 +1066,6 @@ pub(crate) fn ensure_awaiting_approval(record: &StoredEvolutionJob) -> Result<()
         job_id: record.job.job_id.to_string(),
         status: job_status_label(&record.job.status).to_string(),
         expected: "awaiting-approval".to_string(),
-    })
-}
-
-pub(crate) fn read_model_config(paths: &ModelPaths) -> Result<ModelConfig, CliError> {
-    let content = fs::read_to_string(&paths.config).map_err(|source| CliError::Io {
-        path: paths.config.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content).map_err(|source| CliError::Json {
-        path: paths.config.display().to_string(),
-        detail: source.to_string(),
     })
 }
 
@@ -1404,37 +1359,6 @@ pub(crate) fn println_iteration_dry_run(
     );
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(crate) struct ModelConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) default_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) default_model: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ModelPaths {
-    pub(crate) config: PathBuf,
-}
-
-impl ModelPaths {
-    pub(crate) fn new(data_dir: &SinomoDataDir) -> Self {
-        Self {
-            config: data_dir.configs_dir().join("models.json"),
-        }
-    }
-
-    pub(crate) fn ensure(&self) -> Result<(), CliError> {
-        let Some(parent) = self.config.parent() else {
-            return Ok(());
-        };
-        fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
     run_evolve_cli_command(parse_evolve_command(args)?)
@@ -1469,7 +1393,7 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let config = read_config(&paths).ok();
-    let model_config = read_model_config(&ModelPaths::new(&data_dir)).ok();
+    let model_config = load_model_config(&ModelPaths::new(&data_dir)).ok();
     let repo = if let Some(repo) = options
         .repo
         .clone()

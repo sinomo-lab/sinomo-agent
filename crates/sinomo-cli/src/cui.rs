@@ -393,7 +393,7 @@ impl CliConversationModel {
         let paths = EvolutionPaths::new(&data_dir);
         paths.ensure()?;
         let evolution_config = read_config(&paths).ok();
-        let model_config = read_model_config(&ModelPaths::new(&data_dir)).ok();
+        let model_config = load_model_config(&ModelPaths::new(&data_dir)).ok();
         let provider = model_config
             .as_ref()
             .and_then(|config| config.default_provider.clone())

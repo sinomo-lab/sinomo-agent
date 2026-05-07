@@ -19,6 +19,7 @@ thiserror.workspace = true
 time.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-kv = { path = "../sinomo-kv" }
+sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 
