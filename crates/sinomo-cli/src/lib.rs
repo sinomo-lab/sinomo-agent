@@ -46,21 +46,21 @@ use sinomo_runtime::core::{
 };
 use sinomo_runtime::daemon::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DaemonClusterProcess,
-    DaemonClusterStatus, DaemonLock, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
-    DaemonSignerAuthority, DaemonStatus, cluster_node_status_from_daemon_status,
-    cluster_node_status_is_stale, daemon_bind_address, daemon_cluster_options_from_status,
-    daemon_cluster_process_from_paths, daemon_connect_address, daemon_options_from_status,
-    daemon_rpc_command, handle_authenticated_daemon_connection,
+    DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonLock, DaemonPaths,
+    DaemonProbeStatus, DaemonRunOptions, DaemonSignerAuthority, DaemonStatus,
+    cluster_node_status_from_daemon_status, cluster_node_status_is_stale, daemon_bind_address,
+    daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
+    daemon_cluster_registration, daemon_cluster_status, daemon_connect_address,
+    daemon_options_from_status, daemon_rpc_command, handle_authenticated_daemon_connection,
     invite_introducers_from_daemon_status, probe_daemon_status, read_daemon_status,
     send_daemon_rpc, sign_daemon_rpc_request_for_local_node, unknown_cluster_node_status,
     verify_cluster_invite_challenge_proof, write_daemon_rpc_response_frame, write_daemon_status,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
-    DaemonError, SignedDaemonCommand, authenticate_daemon_control_request,
-    authorize_authenticated_daemon_command, daemon_package_version,
-    sign_daemon_rpc_request_from_data_dir,
+    DAEMON_MAIN_CLUSTER_ROLE, DaemonError, SignedDaemonCommand,
+    authenticate_daemon_control_request, authorize_authenticated_daemon_command,
+    daemon_package_version, sign_daemon_rpc_request_from_data_dir,
 };
 use sinomo_runtime::dfs::{
     DfsExposeEntry, DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend,

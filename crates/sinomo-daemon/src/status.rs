@@ -51,6 +51,13 @@ pub enum DaemonClusterProcess {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonClusterRegistration {
+    pub process: DaemonClusterProcess,
+    pub main_options: DaemonRunOptions,
+    pub shadow_options: DaemonRunOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonProbeStatus {
     Running(DaemonStatus),
     Locked { status: Option<DaemonStatus> },
@@ -64,6 +71,42 @@ pub struct DaemonClusterStatus {
     pub process: String,
     pub member_role: ClusterMemberRole,
     pub member_state: ClusterMemberState,
+}
+
+pub fn daemon_cluster_registration(
+    process: DaemonClusterProcess,
+    main_options: DaemonRunOptions,
+    shadow_options: DaemonRunOptions,
+) -> DaemonClusterRegistration {
+    DaemonClusterRegistration {
+        process,
+        main_options,
+        shadow_options,
+    }
+}
+
+pub fn daemon_cluster_status(
+    state: &ClusterBootstrapState,
+    process: DaemonClusterProcess,
+) -> Option<DaemonClusterStatus> {
+    let node_id = match process {
+        DaemonClusterProcess::Main => state.local_node_id.clone(),
+        DaemonClusterProcess::Shadow => sinomo_node::shadow_daemon_node_id(&state.local_node_id),
+    };
+    let member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == node_id)?;
+    Some(DaemonClusterStatus {
+        cluster_id: state.cluster_id.clone(),
+        node_id,
+        process: match process {
+            DaemonClusterProcess::Main => DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            DaemonClusterProcess::Shadow => DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+        },
+        member_role: member.role.clone(),
+        member_state: member.state.clone(),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

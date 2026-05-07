@@ -2964,13 +2964,6 @@ fn cluster_member_publish_matches_kv(
     Ok(true)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DaemonClusterRegistration {
-    pub(crate) process: DaemonClusterProcess,
-    pub(crate) main_options: DaemonRunOptions,
-    pub(crate) shadow_options: DaemonRunOptions,
-}
-
 pub(crate) fn ensure_daemon_cluster_members(
     state: &mut ClusterBootstrapState,
     main_options: &DaemonRunOptions,
@@ -3054,30 +3047,6 @@ pub(crate) fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Ve
 
 pub(crate) fn discover_peer_route_ip_candidates(state: &ClusterBootstrapState) -> Vec<IpAddr> {
     network::discover_peer_route_ip_candidates(state)
-}
-
-pub(crate) fn daemon_cluster_status(
-    state: &ClusterBootstrapState,
-    process: DaemonClusterProcess,
-) -> Option<DaemonClusterStatus> {
-    let node_id = match process {
-        DaemonClusterProcess::Main => state.local_node_id.clone(),
-        DaemonClusterProcess::Shadow => shadow_daemon_node_id(&state.local_node_id),
-    };
-    let member = state
-        .members
-        .iter()
-        .find(|member| member.node_id == node_id)?;
-    Some(DaemonClusterStatus {
-        cluster_id: state.cluster_id.clone(),
-        node_id,
-        process: match process {
-            DaemonClusterProcess::Main => DAEMON_MAIN_CLUSTER_ROLE.to_string(),
-            DaemonClusterProcess::Shadow => DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
-        },
-        member_role: member.role.clone(),
-        member_state: member.state.clone(),
-    })
 }
 
 pub(crate) fn register_daemon_cluster_node(
@@ -3202,18 +3171,6 @@ pub(crate) fn read_cluster_rollout_status(
     paths: &SelfRolloutPaths,
 ) -> Result<Option<ClusterNodeRolloutStatus>, CliError> {
     read_rollout_status(paths).map_err(Into::into)
-}
-
-pub(crate) fn daemon_cluster_registration(
-    process: DaemonClusterProcess,
-    main_options: DaemonRunOptions,
-    shadow_options: DaemonRunOptions,
-) -> DaemonClusterRegistration {
-    DaemonClusterRegistration {
-        process,
-        main_options,
-        shadow_options,
-    }
 }
 
 pub(crate) fn format_member_role(role: &ClusterMemberRole) -> &'static str {

@@ -21,9 +21,10 @@ pub use error::DaemonError;
 pub use paths::{DaemonPaths, daemon_paths_from_data_dir, shadow_daemon_paths_from_data_dir};
 pub use status::{
     CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE,
-    DaemonClusterProcess, DaemonClusterStatus, DaemonLock, DaemonProbeStatus, DaemonRunOptions,
-    DaemonStatus, cluster_node_status_from_daemon_status, cluster_node_status_is_stale,
-    daemon_bind_address, daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
+    DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonLock,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, cluster_node_status_from_daemon_status,
+    cluster_node_status_is_stale, daemon_bind_address, daemon_cluster_options_from_status,
+    daemon_cluster_process_from_paths, daemon_cluster_registration, daemon_cluster_status,
     daemon_connect_address, daemon_options_from_status, daemon_package_version,
     daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
     daemon_status_matches_probe, invite_introducers_from_daemon_status, probe_daemon_status,
