@@ -540,6 +540,16 @@ pub fn cluster_state_needs_join_registration(state: &ClusterBootstrapState) -> b
         })
 }
 
+pub fn cluster_status_summary_label(state: &ClusterBootstrapState) -> &'static str {
+    if cluster_state_needs_join_registration(state) {
+        "pending-join"
+    } else if cluster_raft_local_is_voter(state) {
+        "voter"
+    } else {
+        "read-only"
+    }
+}
+
 pub fn cluster_raft_node_is_voter(state: &ClusterBootstrapState, node_id: &NodeId) -> bool {
     state.members.iter().any(|member| {
         member.node_id == *node_id
