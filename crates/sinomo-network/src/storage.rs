@@ -540,6 +540,19 @@ pub fn cluster_state_needs_join_registration(state: &ClusterBootstrapState) -> b
         })
 }
 
+pub fn merge_cluster_join_registration(
+    local: &mut ClusterBootstrapState,
+    accepted: ClusterBootstrapState,
+) {
+    let local_node_id = local.local_node_id.clone();
+    let local_node_display_name = local.local_node_display_name.clone();
+    let initialized_at = local.initialized_at;
+    *local = accepted;
+    local.local_node_id = local_node_id;
+    local.local_node_display_name = local_node_display_name;
+    local.initialized_at = initialized_at;
+}
+
 pub fn cluster_status_summary_label(state: &ClusterBootstrapState) -> &'static str {
     if cluster_state_needs_join_registration(state) {
         "pending-join"

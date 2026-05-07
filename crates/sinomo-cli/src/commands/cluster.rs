@@ -957,7 +957,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
                     {
                         write_cluster_kv_snapshot(paths, &snapshot)?;
                     }
-                    merge_cluster_join_registration(state, response.state);
+                    network::merge_cluster_join_registration(state, response.state);
                     println!("introducer accepted join: {}", channel.endpoint.address);
                     return Ok(());
                 }
@@ -992,19 +992,6 @@ pub(crate) fn send_cluster_join_registration_to_channel(
         ClusterTransportKind::Iroh => send_cluster_join_registration_over_iroh(endpoint, request),
         _ => send_cluster_join_registration(&endpoint.address, request),
     }
-}
-
-pub(crate) fn merge_cluster_join_registration(
-    local: &mut ClusterBootstrapState,
-    accepted: ClusterBootstrapState,
-) {
-    let local_node_id = local.local_node_id.clone();
-    let local_node_display_name = local.local_node_display_name.clone();
-    let initialized_at = local.initialized_at;
-    *local = accepted;
-    local.local_node_id = local_node_id;
-    local.local_node_display_name = local_node_display_name;
-    local.initialized_at = initialized_at;
 }
 
 pub(crate) fn send_cluster_join_registration(
