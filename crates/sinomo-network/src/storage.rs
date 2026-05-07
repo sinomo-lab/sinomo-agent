@@ -1440,6 +1440,22 @@ pub fn cluster_sync_targets_with_connectivity(
     endpoints
 }
 
+pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints = cluster_sync_targets(state)
+        .into_iter()
+        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
+        .collect::<Vec<_>>();
+    endpoints.sort_by_key(|endpoint| {
+        (
+            endpoint.node_id.clone(),
+            endpoint.priority,
+            format!("{:?}", endpoint.transport),
+            endpoint.address.clone(),
+        )
+    });
+    endpoints
+}
+
 pub fn prefer_bounded_daemon_command_targets(
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> Vec<ClusterEndpointRecord> {

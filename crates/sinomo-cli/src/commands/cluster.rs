@@ -4,12 +4,13 @@ use super::*;
 pub(crate) use network::invite_introducer_endpoint;
 pub(crate) use network::{
     apply_cluster_node_role, apply_cluster_raft_role, cluster_member_has_raft_vote,
-    cluster_member_is_local_process, cluster_raft_local_is_voter, cluster_raft_node_is_voter,
-    cluster_raft_quorum_size, cluster_raft_state_for_role, cluster_state_needs_join_registration,
-    cluster_status_summary_label, compact_default_invite_introducers,
-    invite_communication_channels, invite_introducer_endpoint_from_state,
-    is_loopback_connect_address, is_remote_usable_invite_endpoint,
-    live_cluster_member_probe_possible, push_unique_introducer, sort_default_invite_introducers,
+    cluster_member_is_local_process, cluster_network_probe_targets, cluster_raft_local_is_voter,
+    cluster_raft_node_is_voter, cluster_raft_quorum_size, cluster_raft_state_for_role,
+    cluster_state_needs_join_registration, cluster_status_summary_label,
+    compact_default_invite_introducers, invite_communication_channels,
+    invite_introducer_endpoint_from_state, is_loopback_connect_address,
+    is_remote_usable_invite_endpoint, live_cluster_member_probe_possible, push_unique_introducer,
+    sort_default_invite_introducers,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1909,10 +1910,11 @@ impl ClusterNetworkMaintenance {
                 if !network::cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state) {
                     let _ = sync_cluster_state_to_kv(&cluster_paths, &state)?;
                 }
-                let local_network_info = build_local_cluster_network_info(
+                let local_network_info = network::build_cluster_network_info_record(
                     &state,
                     &state.local_node_id,
                     OffsetDateTime::now_utc(),
+                    CLUSTER_NETWORK_INFO_TTL_SECONDS,
                 );
                 if self
                     .environment_id
@@ -2102,37 +2104,6 @@ impl ClusterNetworkMaintenance {
             .map(|state| state.record.clone())
             .collect()
     }
-}
-
-pub(crate) fn build_local_cluster_network_info(
-    state: &ClusterBootstrapState,
-    node_id: &NodeId,
-    now: OffsetDateTime,
-) -> network::ClusterNetworkInfoRecord {
-    network::build_cluster_network_info_record(
-        state,
-        node_id,
-        now,
-        CLUSTER_NETWORK_INFO_TTL_SECONDS,
-    )
-}
-
-pub(crate) fn cluster_network_probe_targets(
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints = cluster_sync_targets(state)
-        .into_iter()
-        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-        .collect::<Vec<_>>();
-    endpoints.sort_by_key(|endpoint| {
-        (
-            endpoint.node_id.clone(),
-            endpoint.priority,
-            format!("{:?}", endpoint.transport),
-            endpoint.address.clone(),
-        )
-    });
-    endpoints
 }
 
 pub(crate) fn cluster_status_matches(
@@ -3066,7 +3037,12 @@ pub(crate) fn refresh_daemon_node_status_in_kv(
     }
     let _ = sync_cluster_network_info_to_kv(
         &cluster_paths,
-        build_local_cluster_network_info(&state, &cluster.node_id, OffsetDateTime::now_utc()),
+        network::build_cluster_network_info_record(
+            &state,
+            &cluster.node_id,
+            OffsetDateTime::now_utc(),
+            CLUSTER_NETWORK_INFO_TTL_SECONDS,
+        ),
     );
     let record = cluster_node_status_from_daemon_status(
         &status,
