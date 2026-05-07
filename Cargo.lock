@@ -3281,6 +3281,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "iroh",
+ "ring",
  "serde",
  "serde_json",
  "sinomo-core",

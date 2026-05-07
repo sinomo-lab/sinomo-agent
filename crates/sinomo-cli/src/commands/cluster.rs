@@ -722,30 +722,13 @@ pub(crate) fn sign_cluster_join_invite(
     invite: &ClusterJoinInvite,
     identity: &NodeIdentity,
 ) -> Result<String, CliError> {
-    let key_pair = identity.key_pair()?;
-    let payload = network::cluster_invite_signing_payload(invite)?;
-    Ok(URL_SAFE_NO_PAD.encode(key_pair.sign(payload.as_bytes()).as_ref()))
+    network::sign_cluster_join_invite(invite, identity).map_err(Into::into)
 }
 
 pub(crate) fn verify_cluster_join_invite_signature(
     invite: &ClusterJoinInvite,
 ) -> Result<(), CliError> {
-    if invite.signature.trim().is_empty()
-        || invite.issuer_public_key.trim().is_empty()
-        || invite.issuer_node_id.as_str().trim().is_empty()
-    {
-        return Err(CliError::AuthDenied);
-    }
-    let public_key = URL_SAFE_NO_PAD
-        .decode(invite.issuer_public_key.as_bytes())
-        .map_err(|_| CliError::AuthDenied)?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(invite.signature.as_bytes())
-        .map_err(|_| CliError::AuthDenied)?;
-    let payload = network::cluster_invite_signing_payload(invite)?;
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(payload.as_bytes(), &signature)
-        .map_err(|_| CliError::AuthDenied)
+    network::verify_cluster_join_invite_signature(invite).map_err(Into::into)
 }
 
 pub(crate) fn build_cluster_invite(

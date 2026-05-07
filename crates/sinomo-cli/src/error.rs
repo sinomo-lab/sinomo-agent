@@ -123,6 +123,7 @@ impl From<KvError> for CliError {
 impl From<network::NetworkError> for CliError {
     fn from(error: network::NetworkError) -> Self {
         match error {
+            network::NetworkError::AuthDenied => Self::AuthDenied,
             network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
             network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },

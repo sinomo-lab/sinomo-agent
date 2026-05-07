@@ -3,6 +3,8 @@ use crate::prelude::*;
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum NetworkError {
+    #[error("network authorization was denied")]
+    AuthDenied,
     #[error("cluster has not been initialized; run `sinomo cluster init` or `sinomo cluster join`")]
     ClusterOrphan,
     #[error("unknown node: {node_id}")]

@@ -1,6 +1,9 @@
 use crate::error::NetworkError;
 use crate::iroh_endpoint_public_key;
 use crate::prelude::*;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ring::signature::{ED25519, UnparsedPublicKey};
+use sinomo_node::NodeIdentity;
 use time::format_description::well_known::Rfc3339;
 
 pub const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
@@ -77,6 +80,40 @@ pub fn cluster_invite_signing_payload(invite: &ClusterJoinInvite) -> Result<Stri
         invite.issuer_node_id,
         invite.issuer_public_key
     ))
+}
+
+pub fn sign_cluster_join_invite(
+    invite: &ClusterJoinInvite,
+    identity: &NodeIdentity,
+) -> Result<String, NetworkError> {
+    let key_pair = identity
+        .key_pair()
+        .map_err(|source| NetworkError::Serialization {
+            detail: source.to_string(),
+        })?;
+    let payload = cluster_invite_signing_payload(invite)?;
+    Ok(URL_SAFE_NO_PAD.encode(key_pair.sign(payload.as_bytes()).as_ref()))
+}
+
+pub fn verify_cluster_join_invite_signature(
+    invite: &ClusterJoinInvite,
+) -> Result<(), NetworkError> {
+    if invite.signature.trim().is_empty()
+        || invite.issuer_public_key.trim().is_empty()
+        || invite.issuer_node_id.as_str().trim().is_empty()
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let public_key = URL_SAFE_NO_PAD
+        .decode(invite.issuer_public_key.as_bytes())
+        .map_err(|_| NetworkError::AuthDenied)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(invite.signature.as_bytes())
+        .map_err(|_| NetworkError::AuthDenied)?;
+    let payload = cluster_invite_signing_payload(invite)?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| NetworkError::AuthDenied)
 }
 
 pub fn invite_has_embedded_cluster_identity(invite: &ClusterJoinInvite) -> bool {
