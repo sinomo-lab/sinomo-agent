@@ -775,12 +775,7 @@ pub(crate) fn build_cluster_invite(
 }
 
 pub(crate) fn random_url_secret(byte_len: usize) -> Result<String, CliError> {
-    let rng = SystemRandom::new();
-    let mut bytes = vec![0_u8; byte_len];
-    rng.fill(&mut bytes).map_err(|_| CliError::Parse {
-        detail: "failed to generate secure random invitation secret".to_string(),
-    })?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
+    network::random_url_secret(byte_len).map_err(Into::into)
 }
 
 pub(crate) fn default_invite_introducers(

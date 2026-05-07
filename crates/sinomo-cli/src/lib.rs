@@ -1,7 +1,6 @@
 //! Shared Sinomo command-line handlers.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sinomo_evolution::{
     BackgroundSchedulerPaths, BackgroundSchedulingPlan, BackgroundSchedulingRequest,

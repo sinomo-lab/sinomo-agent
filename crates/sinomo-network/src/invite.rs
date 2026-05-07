@@ -2,6 +2,7 @@ use crate::error::NetworkError;
 use crate::iroh_endpoint_public_key;
 use crate::prelude::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use sinomo_node::NodeIdentity;
 use time::format_description::well_known::Rfc3339;
@@ -114,6 +115,16 @@ pub fn verify_cluster_join_invite_signature(
     UnparsedPublicKey::new(&ED25519, public_key)
         .verify(payload.as_bytes(), &signature)
         .map_err(|_| NetworkError::AuthDenied)
+}
+
+pub fn random_url_secret(byte_len: usize) -> Result<String, NetworkError> {
+    let rng = SystemRandom::new();
+    let mut bytes = vec![0_u8; byte_len];
+    rng.fill(&mut bytes)
+        .map_err(|_| NetworkError::Serialization {
+            detail: "failed to generate secure random URL secret".to_string(),
+        })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 pub fn invite_has_embedded_cluster_identity(invite: &ClusterJoinInvite) -> bool {
