@@ -1892,7 +1892,7 @@ impl ClusterNetworkMaintenance {
 
         if publish_due || probe_due {
             network::cleanup_cluster_iroh_endpoints(&mut state);
-            let shadow_options = current_shadow_daemon_options(data_dir);
+            let shadow_options = current_shadow_daemon_options(data_dir, DAEMON_PROBE_TIMEOUT);
             ensure_daemon_cluster_members(
                 &mut state,
                 options,
@@ -2142,21 +2142,6 @@ pub(crate) fn cluster_status_matches(
     status.cluster.as_ref().is_some_and(|cluster| {
         cluster.cluster_id == state.cluster_id && cluster.node_id == endpoint.node_id
     })
-}
-
-pub(crate) fn current_shadow_daemon_options(data_dir: &Path) -> DaemonRunOptions {
-    match probe_daemon_status(
-        &DaemonPaths::with_root(data_dir.join("shadow-daemon")),
-        DAEMON_PROBE_TIMEOUT,
-    ) {
-        DaemonProbeStatus::Running(status)
-        | DaemonProbeStatus::Locked {
-            status: Some(status),
-        } => daemon_options_from_status(&status),
-        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
-            DaemonRunOptions::shadow_default()
-        }
-    }
 }
 
 pub(crate) fn cluster_has_local_quorum(

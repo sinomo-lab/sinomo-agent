@@ -109,6 +109,21 @@ pub fn daemon_cluster_status(
     })
 }
 
+pub fn current_shadow_daemon_options(data_dir: &Path, timeout: Duration) -> DaemonRunOptions {
+    match probe_daemon_status(
+        &DaemonPaths::with_root(data_dir.join("shadow-daemon")),
+        timeout,
+    ) {
+        DaemonProbeStatus::Running(status)
+        | DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => daemon_options_from_status(&status),
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+            DaemonRunOptions::shadow_default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub pid: u32,
