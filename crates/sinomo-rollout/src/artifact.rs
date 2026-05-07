@@ -64,6 +64,44 @@ pub fn install_binary_atomically(source: &Path, destination: &Path) -> Result<()
     Ok(())
 }
 
+pub fn current_executable_path() -> Result<PathBuf, RolloutError> {
+    std::env::current_exe().map_err(|source| RolloutError::Io {
+        path: "current executable".to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub fn install_current_executable(destination: &Path) -> Result<(), RolloutError> {
+    let current = current_executable_path()?;
+    if same_path_if_exists(&current, destination) {
+        return Ok(());
+    }
+    install_binary_atomically(&current, destination)
+}
+
+pub fn binary_should_update(source: &Path, destination: &Path) -> Result<bool, RolloutError> {
+    if !destination.exists() {
+        return Ok(false);
+    }
+    if same_path_if_exists(source, destination) {
+        return Ok(false);
+    }
+    let source_bytes = fs::read(source).map_err(|error| RolloutError::Io {
+        path: source.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    let destination_bytes = fs::read(destination).map_err(|error| RolloutError::Io {
+        path: destination.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    Ok(source_bytes != destination_bytes)
+}
+
+pub fn current_executable_should_update(destination: &Path) -> Result<bool, RolloutError> {
+    let current = current_executable_path()?;
+    binary_should_update(&current, destination)
+}
+
 pub fn same_path_if_exists(left: &Path, right: &Path) -> bool {
     let Ok(left) = fs::canonicalize(left) else {
         return false;

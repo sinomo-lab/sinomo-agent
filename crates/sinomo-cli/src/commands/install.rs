@@ -235,30 +235,11 @@ pub(crate) fn install_layout_exists(layout: &InstallLayout) -> bool {
 }
 
 pub(crate) fn install_current_binary(destination: &Path) -> Result<(), CliError> {
-    let current = current_executable_path()?;
-    if same_path_if_exists(&current, destination) {
-        return Ok(());
-    }
-    Ok(install_binary_atomically(&current, destination)?)
+    Ok(install_current_executable(destination)?)
 }
 
 pub(crate) fn install_should_update_binary(destination: &Path) -> Result<bool, CliError> {
-    if !destination.exists() {
-        return Ok(false);
-    }
-    let current = current_executable_path()?;
-    if same_path_if_exists(&current, destination) {
-        return Ok(false);
-    }
-    let current_bytes = fs::read(&current).map_err(|source| CliError::Io {
-        path: current.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let destination_bytes = fs::read(destination).map_err(|source| CliError::Io {
-        path: destination.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(current_bytes != destination_bytes)
+    Ok(current_executable_should_update(destination)?)
 }
 
 pub(crate) fn install_managed_source_repo(layout: &InstallLayout) -> Result<(), CliError> {
@@ -305,13 +286,6 @@ pub(crate) fn daemon_probe_status_needs_install_restart(
 
 pub(crate) fn daemon_status_matches_options(status: &DaemonStatus, host: &str, port: u16) -> bool {
     status.host == host && status.port == port
-}
-
-pub(crate) fn current_executable_path() -> Result<PathBuf, CliError> {
-    env::current_exe().map_err(|source| CliError::Io {
-        path: "current executable".to_string(),
-        detail: source.to_string(),
-    })
 }
 
 pub(crate) fn default_boot_dir(data_dir: &SinomoDataDir) -> Result<PathBuf, CliError> {
