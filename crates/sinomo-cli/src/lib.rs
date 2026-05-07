@@ -51,10 +51,10 @@ use sinomo_runtime::daemon::{
     cluster_node_status_from_daemon_status, cluster_node_status_is_stale,
     current_shadow_daemon_options, daemon_bind_address, daemon_cluster_options_from_status,
     daemon_cluster_process_from_paths, daemon_cluster_registration, daemon_cluster_status,
-    daemon_connect_address, daemon_options_from_status, daemon_rpc_command,
-    handle_authenticated_daemon_connection, invite_introducers_from_daemon_status,
-    probe_daemon_status, read_daemon_status, send_daemon_rpc,
-    sign_daemon_rpc_request_for_local_node, unknown_cluster_node_status,
+    daemon_cluster_status_matches, daemon_connect_address, daemon_options_from_status,
+    daemon_rpc_command, handle_authenticated_daemon_connection,
+    invite_introducers_from_daemon_status, probe_daemon_status, read_daemon_status,
+    send_daemon_rpc, sign_daemon_rpc_request_for_local_node, unknown_cluster_node_status,
     verify_cluster_invite_challenge_proof, write_daemon_rpc_response_frame, write_daemon_status,
 };
 #[cfg(test)]

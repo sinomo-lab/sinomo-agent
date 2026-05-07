@@ -2048,7 +2048,7 @@ impl ClusterNetworkMaintenance {
                 .get(&key)
                 .map(|state| state.record.clone());
             let record = match result {
-                Ok(status) if cluster_status_matches(state, &endpoint, &status) => {
+                Ok(status) if daemon_cluster_status_matches(state, &endpoint, &status) => {
                     network::cluster_connectivity_record(
                         state,
                         &endpoint,
@@ -2104,16 +2104,6 @@ impl ClusterNetworkMaintenance {
             .map(|state| state.record.clone())
             .collect()
     }
-}
-
-pub(crate) fn cluster_status_matches(
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    status: &DaemonStatus,
-) -> bool {
-    status.cluster.as_ref().is_some_and(|cluster| {
-        cluster.cluster_id == state.cluster_id && cluster.node_id == endpoint.node_id
-    })
 }
 
 pub(crate) fn cluster_has_local_quorum(

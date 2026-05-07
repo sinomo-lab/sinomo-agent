@@ -2,9 +2,9 @@ use crate::{DaemonError, DaemonPaths, send_daemon_rpc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterId, ClusterMemberRecord,
-    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRolloutStatus,
-    ClusterNodeStatusRecord, NodeId,
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterId,
+    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
+    ClusterNodeRolloutStatus, ClusterNodeStatusRecord, NodeId,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -122,6 +122,16 @@ pub fn current_shadow_daemon_options(data_dir: &Path, timeout: Duration) -> Daem
             DaemonRunOptions::shadow_default()
         }
     }
+}
+
+pub fn daemon_cluster_status_matches(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    status: &DaemonStatus,
+) -> bool {
+    status.cluster.as_ref().is_some_and(|cluster| {
+        cluster.cluster_id == state.cluster_id && cluster.node_id == endpoint.node_id
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
