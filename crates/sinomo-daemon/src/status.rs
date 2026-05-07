@@ -2,8 +2,9 @@ use crate::{DaemonError, DaemonPaths, send_daemon_rpc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ClusterId, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
-    ClusterNodeRolloutStatus, ClusterNodeStatusRecord, NodeId,
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterId, ClusterMemberRecord,
+    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRolloutStatus,
+    ClusterNodeStatusRecord, NodeId,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -15,6 +16,9 @@ use time::format_description::well_known::Rfc3339;
 pub const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
 pub const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 pub const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
+pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
+pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
+pub const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonRunOptions {
@@ -199,6 +203,47 @@ pub fn cluster_node_status_from_daemon_status(
         daemon_started_at: Some(status.started_at.clone()),
         observed_at,
     }
+}
+
+pub fn unknown_cluster_node_status(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    observed_at: OffsetDateTime,
+) -> ClusterNodeStatusRecord {
+    ClusterNodeStatusRecord {
+        cluster_id: state.cluster_id.clone(),
+        node_id: member.node_id.clone(),
+        process: member
+            .capabilities
+            .iter()
+            .find_map(|capability| match capability.as_str() {
+                "daemon.main.run" => Some(DAEMON_MAIN_CLUSTER_ROLE.to_string()),
+                "daemon.shadow.supervise" => Some(DAEMON_SHADOW_CLUSTER_ROLE.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "unknown".to_string()),
+        availability: ClusterNodeAvailability::Unknown,
+        daemon_version: "unknown".to_string(),
+        target_os: None,
+        target_arch: None,
+        pid: None,
+        address: member
+            .endpoints
+            .iter()
+            .find(|endpoint| !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
+            .or_else(|| member.endpoints.first())
+            .map(|endpoint| endpoint.address.clone()),
+        bind_address: None,
+        executable: None,
+        rollout: None,
+        daemon_started_at: None,
+        observed_at,
+    }
+}
+
+pub fn cluster_node_status_is_stale(status: &ClusterNodeStatusRecord) -> bool {
+    (OffsetDateTime::now_utc() - status.observed_at).whole_seconds()
+        > CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS
 }
 
 pub fn invite_introducers_from_daemon_status(

@@ -46,14 +46,15 @@ use sinomo_runtime::core::{
 };
 use sinomo_runtime::daemon::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
-    DaemonClusterProcess, DaemonClusterStatus, DaemonLock, DaemonPaths, DaemonProbeStatus,
-    DaemonRunOptions, DaemonSignerAuthority, DaemonStatus, cluster_node_status_from_daemon_status,
-    daemon_bind_address, daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
-    daemon_connect_address, daemon_options_from_status, daemon_rpc_command,
-    handle_authenticated_daemon_connection, invite_introducers_from_daemon_status,
-    probe_daemon_status, read_daemon_status, send_daemon_rpc,
-    sign_daemon_rpc_request_for_local_node, verify_cluster_invite_challenge_proof,
-    write_daemon_rpc_response_frame, write_daemon_status,
+    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DaemonClusterProcess,
+    DaemonClusterStatus, DaemonLock, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
+    DaemonSignerAuthority, DaemonStatus, cluster_node_status_from_daemon_status,
+    cluster_node_status_is_stale, daemon_bind_address, daemon_cluster_options_from_status,
+    daemon_cluster_process_from_paths, daemon_connect_address, daemon_options_from_status,
+    daemon_rpc_command, handle_authenticated_daemon_connection,
+    invite_introducers_from_daemon_status, probe_daemon_status, read_daemon_status,
+    send_daemon_rpc, sign_daemon_rpc_request_for_local_node, unknown_cluster_node_status,
+    verify_cluster_invite_challenge_proof, write_daemon_rpc_response_frame, write_daemon_status,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
@@ -245,8 +246,6 @@ const SHADOW_MAIN_HOST_ENV: &str = "SINOMO_SHADOW_MAIN_HOST";
 const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
 const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
 const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
-const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
-const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -258,7 +257,6 @@ const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 180;
 const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 180;
 const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
-const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 const ROLLOUT_DIAGNOSTIC_TAIL_BYTES: usize = 8 * 1024;
 #[cfg(test)]
 const SINOMO_JOIN_URI_PREFIX: &str = network::SINOMO_JOIN_URI_PREFIX;

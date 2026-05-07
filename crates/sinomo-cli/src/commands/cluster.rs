@@ -1345,47 +1345,6 @@ pub(crate) fn cluster_member_is_local_process(
     network::cluster_member_is_local_process(state, member)
 }
 
-pub(crate) fn unknown_cluster_node_status(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    observed_at: OffsetDateTime,
-) -> ClusterNodeStatusRecord {
-    ClusterNodeStatusRecord {
-        cluster_id: state.cluster_id.clone(),
-        node_id: member.node_id.clone(),
-        process: member
-            .capabilities
-            .iter()
-            .find_map(|capability| match capability.as_str() {
-                "daemon.main.run" => Some(DAEMON_MAIN_CLUSTER_ROLE.to_string()),
-                "daemon.shadow.supervise" => Some(DAEMON_SHADOW_CLUSTER_ROLE.to_string()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_string()),
-        availability: ClusterNodeAvailability::Unknown,
-        daemon_version: "unknown".to_string(),
-        target_os: None,
-        target_arch: None,
-        pid: None,
-        address: member
-            .endpoints
-            .iter()
-            .find(|endpoint| !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
-            .or_else(|| member.endpoints.first())
-            .map(|endpoint| endpoint.address.clone()),
-        bind_address: None,
-        executable: None,
-        rollout: None,
-        daemon_started_at: None,
-        observed_at,
-    }
-}
-
-pub(crate) fn cluster_node_status_is_stale(status: &ClusterNodeStatusRecord) -> bool {
-    (OffsetDateTime::now_utc() - status.observed_at).whole_seconds()
-        > CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS
-}
-
 pub(crate) fn format_node_availability(availability: &ClusterNodeAvailability) -> &'static str {
     match availability {
         ClusterNodeAvailability::Online => "online",
