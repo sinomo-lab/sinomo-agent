@@ -1445,6 +1445,17 @@ pub fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -
     }
 }
 
+pub fn cluster_member_is_local_process(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> bool {
+    cluster_node_is_local_process(state, &member.node_id)
+}
+
+pub fn cluster_node_is_local_process(state: &ClusterBootstrapState, node_id: &NodeId) -> bool {
+    *node_id == state.local_node_id || *node_id == shadow_daemon_node_id(&state.local_node_id)
+}
+
 pub fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Vec<SocketAddr> {
     let mut targets = Vec::new();
     for member in &state.members {
@@ -1713,6 +1724,38 @@ pub fn cluster_connectivity_sync_ops(
             continue;
         }
         ops.push(KvOp::put_serde(key, record, None)?);
+    }
+    Ok(ops)
+}
+
+pub fn expire_cluster_network_record_ops(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    now: OffsetDateTime,
+) -> Result<Vec<KvOp>, NetworkError> {
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    let mut ops = Vec::new();
+    for entry in store.range_prefix("/cluster/network/info/") {
+        let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
+            continue;
+        };
+        if cluster_node_is_local_process(state, &record.node_id) {
+            continue;
+        }
+        if record.expires_at <= now {
+            ops.push(KvOp::Delete { key: entry.key });
+        }
+    }
+    for entry in store.range_prefix("/cluster/network/connectivity/") {
+        let Ok(record) = entry.decode::<ClusterConnectivityRecord>() else {
+            continue;
+        };
+        if record.source_node_id == state.local_node_id {
+            continue;
+        }
+        if record.expires_at <= now {
+            ops.push(KvOp::Delete { key: entry.key });
+        }
     }
     Ok(ops)
 }

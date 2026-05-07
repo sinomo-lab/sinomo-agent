@@ -1342,14 +1342,7 @@ pub(crate) fn cluster_member_is_local_process(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> bool {
-    cluster_node_is_local_process(state, &member.node_id)
-}
-
-pub(crate) fn cluster_node_is_local_process(
-    state: &ClusterBootstrapState,
-    node_id: &NodeId,
-) -> bool {
-    *node_id == state.local_node_id || *node_id == shadow_daemon_node_id(&state.local_node_id)
+    network::cluster_member_is_local_process(state, member)
 }
 
 pub(crate) fn unknown_cluster_node_status(
@@ -1849,30 +1842,7 @@ pub(crate) fn expire_cluster_network_records_in_kv(
     state: &ClusterBootstrapState,
     now: OffsetDateTime,
 ) -> Result<Option<KvSnapshot>, CliError> {
-    let store = network::read_cluster_kv_snapshot_store(paths)?;
-    let mut success = Vec::new();
-    for entry in store.range_prefix("/cluster/network/info/") {
-        let Ok(record) = entry.decode::<network::ClusterNetworkInfoRecord>() else {
-            continue;
-        };
-        if cluster_node_is_local_process(state, &record.node_id) {
-            continue;
-        }
-        if record.expires_at <= now {
-            success.push(KvOp::Delete { key: entry.key });
-        }
-    }
-    for entry in store.range_prefix("/cluster/network/connectivity/") {
-        let Ok(record) = entry.decode::<network::ClusterConnectivityRecord>() else {
-            continue;
-        };
-        if record.source_node_id == state.local_node_id {
-            continue;
-        }
-        if record.expires_at <= now {
-            success.push(KvOp::Delete { key: entry.key });
-        }
-    }
+    let success = network::expire_cluster_network_record_ops(paths, state, now)?;
     if success.is_empty() {
         return Ok(None);
     }
