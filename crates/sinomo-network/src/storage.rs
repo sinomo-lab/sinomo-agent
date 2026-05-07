@@ -1579,6 +1579,65 @@ pub fn sync_cluster_connectivity_records_to_kv(
     )
 }
 
+pub fn cluster_connectivity_sync_ops(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<Vec<KvOp>, NetworkError> {
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    let mut existing = BTreeMap::new();
+    for entry in store.range_prefix(&cluster_connectivity_source_prefix(source_node_id)) {
+        match entry.decode::<ClusterConnectivityRecord>() {
+            Ok(record) => {
+                existing.insert(entry.key, record);
+            }
+            Err(_) => {
+                existing.remove(&entry.key);
+            }
+        }
+    }
+
+    let mut incoming = BTreeMap::new();
+    for record in records {
+        let key = cluster_connectivity_key(
+            &record.source_node_id,
+            &record.target_node_id,
+            &record.endpoint_id,
+        );
+        incoming.insert(key, record);
+    }
+
+    let mut ops = Vec::new();
+    for key in existing.keys() {
+        if !incoming.contains_key(key) {
+            ops.push(KvOp::Delete { key: key.clone() });
+        }
+    }
+    for (key, record) in incoming {
+        if existing
+            .get(&key)
+            .is_some_and(|existing| cluster_connectivity_stable_eq(existing, record))
+        {
+            continue;
+        }
+        ops.push(KvOp::put_serde(key, record, None)?);
+    }
+    Ok(ops)
+}
+
+fn cluster_connectivity_stable_eq(
+    left: &ClusterConnectivityRecord,
+    right: &ClusterConnectivityRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.source_node_id == right.source_node_id
+        && left.target_node_id == right.target_node_id
+        && left.endpoint_id == right.endpoint_id
+        && left.transport == right.transport
+        && left.address == right.address
+        && left.state == right.state
+}
+
 pub fn expire_cluster_network_records(
     paths: &ClusterPaths,
     now: OffsetDateTime,

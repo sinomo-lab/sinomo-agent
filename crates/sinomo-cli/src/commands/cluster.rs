@@ -1880,45 +1880,7 @@ pub(crate) fn cluster_connectivity_sync_ops(
     source_node_id: &NodeId,
     records: &[network::ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, CliError> {
-    let store = network::read_cluster_kv_snapshot_store(paths)?;
-    let mut existing = std::collections::BTreeMap::new();
-    for entry in store.range_prefix(&network::cluster_connectivity_source_prefix(source_node_id)) {
-        match entry.decode::<network::ClusterConnectivityRecord>() {
-            Ok(record) => {
-                existing.insert(entry.key, record);
-            }
-            Err(_) => {
-                existing.remove(&entry.key);
-            }
-        }
-    }
-
-    let mut incoming = std::collections::BTreeMap::new();
-    for record in records {
-        let key = network::cluster_connectivity_key(
-            &record.source_node_id,
-            &record.target_node_id,
-            &record.endpoint_id,
-        );
-        incoming.insert(key, record);
-    }
-
-    let mut ops = Vec::new();
-    for key in existing.keys() {
-        if !incoming.contains_key(key) {
-            ops.push(KvOp::Delete { key: key.clone() });
-        }
-    }
-    for (key, record) in incoming {
-        if existing
-            .get(&key)
-            .is_some_and(|existing| cluster_connectivity_stable_eq(existing, record))
-        {
-            continue;
-        }
-        ops.push(KvOp::put_serde(key, record, None)?);
-    }
-    Ok(ops)
+    network::cluster_connectivity_sync_ops(paths, source_node_id, records).map_err(Into::into)
 }
 
 pub(crate) fn expire_cluster_network_records_in_kv(
@@ -2021,19 +1983,6 @@ fn cluster_network_info_stable_eq(
         && left.environment_id == right.environment_id
         && left.observed_addresses == right.observed_addresses
         && left.endpoints == right.endpoints
-}
-
-fn cluster_connectivity_stable_eq(
-    left: &network::ClusterConnectivityRecord,
-    right: &network::ClusterConnectivityRecord,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.source_node_id == right.source_node_id
-        && left.target_node_id == right.target_node_id
-        && left.endpoint_id == right.endpoint_id
-        && left.transport == right.transport
-        && left.address == right.address
-        && left.state == right.state
 }
 
 pub(crate) fn cluster_state_sync_txn(
