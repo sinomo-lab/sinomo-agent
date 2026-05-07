@@ -5,10 +5,11 @@ pub(crate) use network::invite_introducer_endpoint;
 pub(crate) use network::{
     apply_cluster_node_role, apply_cluster_raft_role, cluster_member_has_raft_vote,
     cluster_member_is_local_process, cluster_raft_local_is_voter, cluster_raft_node_is_voter,
-    cluster_raft_quorum_size, cluster_raft_state_for_role, compact_default_invite_introducers,
-    invite_communication_channels, invite_introducer_endpoint_from_state,
-    is_loopback_connect_address, is_remote_usable_invite_endpoint,
-    live_cluster_member_probe_possible, push_unique_introducer, sort_default_invite_introducers,
+    cluster_raft_quorum_size, cluster_raft_state_for_role, cluster_state_needs_join_registration,
+    compact_default_invite_introducers, invite_communication_channels,
+    invite_introducer_endpoint_from_state, is_loopback_connect_address,
+    is_remote_usable_invite_endpoint, live_cluster_member_probe_possible, push_unique_introducer,
+    sort_default_invite_introducers,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2159,16 +2160,6 @@ pub(crate) fn cluster_status_summary_label(state: &ClusterBootstrapState) -> &'s
     } else {
         "read-only"
     }
-}
-
-pub(crate) fn cluster_state_needs_join_registration(state: &ClusterBootstrapState) -> bool {
-    state
-        .members
-        .iter()
-        .find(|member| member.node_id == state.local_node_id)
-        .is_none_or(|member| {
-            matches!(member.role, ClusterMemberRole::Learner) && !member.state.is_authorized()
-        })
 }
 
 pub(crate) fn cluster_reachable_voter_count(

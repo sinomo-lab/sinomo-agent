@@ -530,6 +530,16 @@ pub fn cluster_raft_local_is_voter(state: &ClusterBootstrapState) -> bool {
     cluster_raft_node_is_voter(state, &state.local_node_id)
 }
 
+pub fn cluster_state_needs_join_registration(state: &ClusterBootstrapState) -> bool {
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .is_none_or(|member| {
+            matches!(member.role, ClusterMemberRole::Learner) && !member.state.is_authorized()
+        })
+}
+
 pub fn cluster_raft_node_is_voter(state: &ClusterBootstrapState, node_id: &NodeId) -> bool {
     state.members.iter().any(|member| {
         member.node_id == *node_id
