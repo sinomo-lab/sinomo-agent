@@ -25,18 +25,18 @@ use super::{
     handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
     invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    main_daemon_capabilities, managed_source_status, models_default_with_data_dir,
-    normalize_model_provider, parse_cli_command, parse_cluster_command,
-    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
-    parse_install_options, parse_model_default_options, parse_models_list_options,
-    parse_propose_options, parse_provider_command, parse_rollout_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
-    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
-    read_cluster_state, refresh_daemon_node_status_in_kv, run_cui_with_handler_io,
-    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
-    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
-    sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
-    uninstall_with_layout, write_daemon_status, write_rollout_status,
+    managed_source_status, models_default_with_data_dir, normalize_model_provider,
+    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    parse_models_list_options, parse_propose_options, parse_provider_command,
+    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
+    push_unique_introducer, read_cluster_kv_snapshot, read_cluster_members_from_kv,
+    read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
+    refresh_daemon_node_status_in_kv, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
+    run_evolve_command, run_shadow_daemon_with_paths, send_cluster_join_registration_over_iroh,
+    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
+    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout,
+    write_daemon_status, write_rollout_status,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -54,6 +54,7 @@ use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
 use sinomo_runtime::kv::{InProcessKvStore, KvCompare, KvOp, KvRevision, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::daemon_lan_endpoint;
+use sinomo_runtime::node::main_daemon_capabilities;
 use std::io::{BufRead, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

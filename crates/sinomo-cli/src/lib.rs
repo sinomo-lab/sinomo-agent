@@ -37,14 +37,14 @@ use sinomo_lm::{
     subscription_usage_provider_ids,
 };
 use sinomo_runtime::core::{
-    CandidateDecision, CandidateDecisionOutcome, CapabilityName, ClusterBootstrapState,
-    ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterId, ClusterInvitationChannel,
-    ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
-    ClusterNodeAvailability, ClusterNodeRole, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
-    ClusterTransportKind, Confidence, DfsFileSystemId, DfsObjectId, EvaluationGate,
-    EvaluationOutcome, EventEnvelope, EventId, EventKind, EvolutionJobId, EvolutionJobStatus,
-    LatencyClass, MutationPacket, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
-    SessionId, Source, TrustDomain, TrustRing, VerificationCommand,
+    CandidateDecision, CandidateDecisionOutcome, ClusterBootstrapState, ClusterEndpointPrivacy,
+    ClusterEndpointRecord, ClusterId, ClusterInvitationChannel, ClusterJoinInvite,
+    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
+    ClusterNodeRole, ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind,
+    Confidence, DfsFileSystemId, DfsObjectId, EvaluationGate, EvaluationOutcome, EventEnvelope,
+    EventId, EventKind, EvolutionJobId, EvolutionJobStatus, LatencyClass, MutationPacket, NodeId,
+    PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source, TrustDomain,
+    TrustRing, VerificationCommand,
 };
 use sinomo_runtime::daemon::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
@@ -84,7 +84,7 @@ use sinomo_runtime::network::{
 };
 use sinomo_runtime::node::{
     NodeIdentity, load_or_create_main_node_identity, load_or_create_shadow_node_identity,
-    main_daemon_capabilities, shadow_daemon_capabilities, shadow_daemon_node_id,
+    shadow_daemon_node_id,
 };
 use sinomo_runtime::rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,

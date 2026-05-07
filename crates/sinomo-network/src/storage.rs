@@ -364,6 +364,165 @@ pub fn cluster_raft_state_for_role(role: &ClusterMemberRole) -> ClusterMemberSta
     }
 }
 
+pub fn ensure_daemon_cluster_members(
+    state: &mut ClusterBootstrapState,
+    main_endpoints: Vec<ClusterEndpointRecord>,
+    shadow_endpoints: Vec<ClusterEndpointRecord>,
+    timestamp: OffsetDateTime,
+) -> bool {
+    let main_changed = ensure_main_daemon_cluster_member(state, main_endpoints, timestamp);
+    let shadow_changed = ensure_shadow_daemon_cluster_member(state, shadow_endpoints, timestamp);
+    let changed = main_changed || shadow_changed;
+    if changed {
+        state.updated_at = timestamp;
+    }
+    changed
+}
+
+pub fn ensure_main_daemon_cluster_member(
+    state: &mut ClusterBootstrapState,
+    endpoints: Vec<ClusterEndpointRecord>,
+    timestamp: OffsetDateTime,
+) -> bool {
+    let local_node_id = state.local_node_id.clone();
+    let existing = state
+        .members
+        .iter()
+        .find(|member| member.node_id == local_node_id);
+    let role = existing
+        .map(|member| member.role.clone())
+        .unwrap_or(ClusterMemberRole::Learner);
+    let node_role = existing
+        .map(|member| member.node_role.clone())
+        .unwrap_or_default();
+    let member_state = existing
+        .map(|member| member.state.clone())
+        .unwrap_or(ClusterMemberState::Pending);
+    let node_public_key = existing_member_public_key(state, &local_node_id).unwrap_or_default();
+    let mut member = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        local_node_id,
+        state.local_node_display_name.clone(),
+        node_public_key,
+        timestamp,
+    );
+    let capabilities = main_daemon_capabilities(&role);
+    member.node_role = node_role;
+    member.role = role;
+    member.state = member_state;
+    upsert_daemon_member(state, member, capabilities, endpoints, timestamp)
+}
+
+pub fn ensure_shadow_daemon_cluster_member(
+    state: &mut ClusterBootstrapState,
+    endpoints: Vec<ClusterEndpointRecord>,
+    timestamp: OffsetDateTime,
+) -> bool {
+    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+    let existing_shadow_state = state
+        .members
+        .iter()
+        .find(|member| member.node_id == shadow_node_id)
+        .map(|member| member.state.clone())
+        .filter(|state| *state != ClusterMemberState::Pending);
+    let node_public_key = existing_member_public_key(state, &shadow_node_id).unwrap_or_default();
+    let main_authorized = state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .is_some_and(|member| member.state.is_authorized());
+    let mut member = if main_authorized {
+        ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            shadow_node_id,
+            format!("{} shadow", state.local_node_display_name),
+            node_public_key,
+            timestamp,
+        )
+    } else {
+        ClusterMemberRecord::pending_non_voting(
+            state.cluster_id.clone(),
+            shadow_node_id,
+            format!("{} shadow", state.local_node_display_name),
+            node_public_key,
+            timestamp,
+        )
+    };
+    if let Some(existing_state) = existing_shadow_state {
+        member.state = existing_state;
+    }
+    upsert_daemon_member(
+        state,
+        member,
+        shadow_daemon_capabilities(),
+        endpoints,
+        timestamp,
+    )
+}
+
+pub fn existing_member_public_key(
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+) -> Option<String> {
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == *node_id)
+        .map(|member| member.node_public_key.clone())
+        .filter(|key| !key.trim().is_empty())
+}
+
+pub fn upsert_daemon_member(
+    state: &mut ClusterBootstrapState,
+    replacement: ClusterMemberRecord,
+    capabilities: Vec<CapabilityName>,
+    endpoints: Vec<ClusterEndpointRecord>,
+    timestamp: OffsetDateTime,
+) -> bool {
+    if let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == replacement.node_id)
+    {
+        let mut next_endpoints = member.endpoints.clone();
+        for endpoint in endpoints {
+            next_endpoints.retain(|candidate| candidate.endpoint_id != endpoint.endpoint_id);
+            next_endpoints.push(endpoint);
+        }
+        next_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        let changed = member.display_name != replacement.display_name
+            || member.node_role != replacement.node_role
+            || member.role != replacement.role
+            || member.state != replacement.state
+            || member.node_public_key != replacement.node_public_key
+            || member.capabilities != capabilities
+            || member.allowed_capabilities != capabilities
+            || member.endpoints != next_endpoints;
+        if changed {
+            member.display_name = replacement.display_name;
+            member.node_role = replacement.node_role;
+            member.role = replacement.role;
+            member.state = replacement.state;
+            member.node_public_key = replacement.node_public_key;
+            member.capabilities = capabilities.clone();
+            member.allowed_capabilities = capabilities;
+            member.endpoints = next_endpoints;
+            member.updated_at = timestamp;
+        }
+        changed
+    } else {
+        let mut member = replacement;
+        member.capabilities = capabilities.clone();
+        member.allowed_capabilities = capabilities;
+        member.endpoints = endpoints;
+        member
+            .endpoints
+            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        state.members.push(member);
+        true
+    }
+}
+
 pub fn cluster_raft_local_is_voter(state: &ClusterBootstrapState) -> bool {
     cluster_raft_node_is_voter(state, &state.local_node_id)
 }
