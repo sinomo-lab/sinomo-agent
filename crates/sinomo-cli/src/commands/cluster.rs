@@ -1762,7 +1762,7 @@ pub(crate) fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
 ) -> Result<Option<KvSnapshot>, CliError> {
-    if stored_cluster_node_status_matches(paths, &status)? {
+    if network::stored_cluster_node_status_matches(paths, &status)? {
         return Ok(None);
     }
     let mut state = read_cluster_state_without_kv(paths)?;
@@ -1794,7 +1794,7 @@ pub(crate) fn sync_cluster_network_info_to_kv(
     paths: &ClusterPaths,
     info: network::ClusterNetworkInfoRecord,
 ) -> Result<Option<KvSnapshot>, CliError> {
-    if stored_cluster_network_info_matches(paths, &info)? {
+    if network::stored_cluster_network_info_matches(paths, &info)? {
         return Ok(None);
     }
     let mut state = read_cluster_state_without_kv(paths)?;
@@ -1889,63 +1889,6 @@ pub(crate) fn expire_cluster_network_records_in_kv(
     .map(Some)
 }
 
-fn stored_cluster_node_status_matches(
-    paths: &ClusterPaths,
-    status: &ClusterNodeStatusRecord,
-) -> Result<bool, CliError> {
-    let store = network::read_cluster_kv_snapshot_store(paths)?;
-    let Some(entry) = store.get(&network::cluster_node_status_key(&status.node_id)) else {
-        return Ok(false);
-    };
-    let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
-        return Ok(false);
-    };
-    Ok(cluster_node_status_stable_eq(&existing, status))
-}
-
-fn cluster_node_status_stable_eq(
-    left: &ClusterNodeStatusRecord,
-    right: &ClusterNodeStatusRecord,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.node_id == right.node_id
-        && left.process == right.process
-        && left.availability == right.availability
-        && left.daemon_version == right.daemon_version
-        && left.target_os == right.target_os
-        && left.target_arch == right.target_arch
-        && left.address == right.address
-        && left.bind_address == right.bind_address
-        && left.executable == right.executable
-        && left.rollout == right.rollout
-        && left.daemon_started_at == right.daemon_started_at
-}
-
-fn stored_cluster_network_info_matches(
-    paths: &ClusterPaths,
-    info: &network::ClusterNetworkInfoRecord,
-) -> Result<bool, CliError> {
-    let store = network::read_cluster_kv_snapshot_store(paths)?;
-    let Some(entry) = store.get(&network::cluster_network_info_key(&info.node_id)) else {
-        return Ok(false);
-    };
-    let Ok(existing) = entry.decode::<network::ClusterNetworkInfoRecord>() else {
-        return Ok(false);
-    };
-    Ok(cluster_network_info_stable_eq(&existing, info))
-}
-
-fn cluster_network_info_stable_eq(
-    left: &network::ClusterNetworkInfoRecord,
-    right: &network::ClusterNetworkInfoRecord,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.node_id == right.node_id
-        && left.environment_id == right.environment_id
-        && left.observed_addresses == right.observed_addresses
-        && left.endpoints == right.endpoints
-}
-
 pub(crate) fn cluster_state_sync_txn(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -1972,40 +1915,6 @@ pub(crate) fn assign_local_node_public_keys(
         }
     }
     Ok(())
-}
-
-fn cluster_bootstrap_state_stable_eq(
-    left: &ClusterBootstrapState,
-    right: &ClusterBootstrapState,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.cluster_name == right.cluster_name
-        && left.local_node_id == right.local_node_id
-        && left.local_node_display_name == right.local_node_display_name
-        && left.term == right.term
-        && left.initialized_at == right.initialized_at
-        && left.members.len() == right.members.len()
-        && left
-            .members
-            .iter()
-            .zip(right.members.iter())
-            .all(|(left, right)| cluster_member_stable_eq(left, right))
-}
-
-fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMemberRecord) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.node_id == right.node_id
-        && left.display_name == right.display_name
-        && left.node_role == right.node_role
-        && left.role == right.role
-        && left.state == right.state
-        && left.trust_domain == right.trust_domain
-        && left.node_public_key == right.node_public_key
-        && left.certificate_id == right.certificate_id
-        && left.capabilities == right.capabilities
-        && left.allowed_capabilities == right.allowed_capabilities
-        && left.endpoints == right.endpoints
-        && left.joined_at == right.joined_at
 }
 
 pub(crate) struct ClusterNetworkMaintenance {
@@ -2089,7 +1998,7 @@ impl ClusterNetworkMaintenance {
         if publish_due {
             self.last_publish = now;
             if cluster_has_local_quorum(&cluster_paths, &state) {
-                if !cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state) {
+                if !network::cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state) {
                     let _ = sync_cluster_state_to_kv(&cluster_paths, &state)?;
                 }
                 let local_network_info = build_local_cluster_network_info(
@@ -2138,7 +2047,9 @@ impl ClusterNetworkMaintenance {
             }
         }
 
-        if discovered || !cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state) {
+        if discovered
+            || !network::cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state)
+        {
             network::write_cluster_state(&cluster_paths, &state)?;
         }
         Ok(())
@@ -3107,7 +3018,7 @@ fn cluster_member_publish_matches_kv(
         existing
             .endpoints
             .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
-        if !cluster_member_stable_eq(&existing, &member) {
+        if !network::cluster_member_stable_eq(&existing, &member) {
             return Ok(false);
         }
 

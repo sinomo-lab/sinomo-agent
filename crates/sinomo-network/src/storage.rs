@@ -1614,6 +1614,63 @@ pub fn sync_cluster_connectivity_records_to_kv(
     )
 }
 
+pub fn stored_cluster_node_status_matches(
+    paths: &ClusterPaths,
+    status: &ClusterNodeStatusRecord,
+) -> Result<bool, NetworkError> {
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    let Some(entry) = store.get(&cluster_node_status_key(&status.node_id)) else {
+        return Ok(false);
+    };
+    let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
+        return Ok(false);
+    };
+    Ok(cluster_node_status_stable_eq(&existing, status))
+}
+
+pub fn cluster_node_status_stable_eq(
+    left: &ClusterNodeStatusRecord,
+    right: &ClusterNodeStatusRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.node_id == right.node_id
+        && left.process == right.process
+        && left.availability == right.availability
+        && left.daemon_version == right.daemon_version
+        && left.target_os == right.target_os
+        && left.target_arch == right.target_arch
+        && left.address == right.address
+        && left.bind_address == right.bind_address
+        && left.executable == right.executable
+        && left.rollout == right.rollout
+        && left.daemon_started_at == right.daemon_started_at
+}
+
+pub fn stored_cluster_network_info_matches(
+    paths: &ClusterPaths,
+    info: &ClusterNetworkInfoRecord,
+) -> Result<bool, NetworkError> {
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    let Some(entry) = store.get(&cluster_network_info_key(&info.node_id)) else {
+        return Ok(false);
+    };
+    let Ok(existing) = entry.decode::<ClusterNetworkInfoRecord>() else {
+        return Ok(false);
+    };
+    Ok(cluster_network_info_stable_eq(&existing, info))
+}
+
+pub fn cluster_network_info_stable_eq(
+    left: &ClusterNetworkInfoRecord,
+    right: &ClusterNetworkInfoRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.node_id == right.node_id
+        && left.environment_id == right.environment_id
+        && left.observed_addresses == right.observed_addresses
+        && left.endpoints == right.endpoints
+}
+
 pub fn cluster_connectivity_sync_ops(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -1671,6 +1728,40 @@ fn cluster_connectivity_stable_eq(
         && left.transport == right.transport
         && left.address == right.address
         && left.state == right.state
+}
+
+pub fn cluster_bootstrap_state_stable_eq(
+    left: &ClusterBootstrapState,
+    right: &ClusterBootstrapState,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.cluster_name == right.cluster_name
+        && left.local_node_id == right.local_node_id
+        && left.local_node_display_name == right.local_node_display_name
+        && left.term == right.term
+        && left.initialized_at == right.initialized_at
+        && left.members.len() == right.members.len()
+        && left
+            .members
+            .iter()
+            .zip(right.members.iter())
+            .all(|(left, right)| cluster_member_stable_eq(left, right))
+}
+
+pub fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMemberRecord) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.node_id == right.node_id
+        && left.display_name == right.display_name
+        && left.node_role == right.node_role
+        && left.role == right.role
+        && left.state == right.state
+        && left.trust_domain == right.trust_domain
+        && left.node_public_key == right.node_public_key
+        && left.certificate_id == right.certificate_id
+        && left.capabilities == right.capabilities
+        && left.allowed_capabilities == right.allowed_capabilities
+        && left.endpoints == right.endpoints
+        && left.joined_at == right.joined_at
 }
 
 pub fn expire_cluster_network_records(
