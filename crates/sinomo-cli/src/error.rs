@@ -126,6 +126,7 @@ impl From<network::NetworkError> for CliError {
             network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
             network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
+            network::NetworkError::ClusterReadOnly { detail } => Self::ClusterReadOnly { detail },
             network::NetworkError::Kv(error) => Self::Kv(error),
             network::NetworkError::Io { operation, detail } => Self::Network {
                 address: operation,

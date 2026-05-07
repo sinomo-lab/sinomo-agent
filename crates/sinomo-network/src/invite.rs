@@ -1,4 +1,5 @@
 use crate::error::NetworkError;
+use crate::iroh_endpoint_public_key;
 use crate::prelude::*;
 use time::format_description::well_known::Rfc3339;
 
@@ -84,6 +85,136 @@ pub fn invite_has_embedded_cluster_identity(invite: &ClusterJoinInvite) -> bool 
 
 pub fn invite_has_embedded_signature(invite: &ClusterJoinInvite) -> bool {
     !invite.signature.trim().is_empty()
+}
+
+pub fn invite_communication_channels(
+    state: &ClusterBootstrapState,
+    endpoints: &[ClusterEndpointRecord],
+) -> Vec<ClusterInvitationChannel> {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let member = state.members.iter().find(|member| {
+                member.node_id == endpoint.node_id && member.state.is_authorized()
+            })?;
+            Some(ClusterInvitationChannel {
+                endpoint: endpoint.clone(),
+                node_public_key: member.node_public_key.clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn push_unique_introducer(
+    introducers: &mut Vec<ClusterEndpointRecord>,
+    endpoint: ClusterEndpointRecord,
+) {
+    if let Some(public_key) = iroh_endpoint_public_key(&endpoint)
+        && introducers
+            .iter()
+            .any(|candidate| iroh_endpoint_public_key(candidate).as_deref() == Some(&public_key))
+    {
+        return;
+    }
+    if !introducers
+        .iter()
+        .any(|candidate| candidate.address == endpoint.address)
+    {
+        introducers.push(endpoint);
+    }
+}
+
+pub fn sort_default_invite_introducers(introducers: &mut [ClusterEndpointRecord]) {
+    introducers.sort_by_key(|endpoint| {
+        (
+            !is_remote_usable_invite_endpoint(endpoint),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+}
+
+pub fn compact_default_invite_introducers(introducers: &mut Vec<ClusterEndpointRecord>) {
+    let remote_direct = introducers
+        .iter()
+        .filter(|endpoint| {
+            is_remote_usable_invite_endpoint(endpoint)
+                && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
+        })
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remote_iroh = introducers
+        .iter()
+        .find(|endpoint| {
+            is_remote_usable_invite_endpoint(endpoint)
+                && matches!(endpoint.transport, ClusterTransportKind::Iroh)
+        })
+        .cloned();
+    if !remote_direct.is_empty() {
+        *introducers = remote_direct;
+        if let Some(iroh) = remote_iroh {
+            push_unique_introducer(introducers, iroh);
+        }
+        return;
+    }
+
+    if let Some(iroh) = remote_iroh {
+        *introducers = vec![iroh];
+        return;
+    }
+
+    introducers.truncate(1);
+}
+
+pub fn is_remote_usable_invite_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
+    !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
+        && !is_loopback_connect_address(&endpoint.address)
+}
+
+pub fn is_loopback_connect_address(address: &str) -> bool {
+    address.starts_with("127.")
+        || address.starts_with("localhost:")
+        || address.starts_with("[::1]:")
+        || address.starts_with("::1:")
+}
+
+pub fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterEndpointRecord {
+    let is_loopback = is_loopback_connect_address(&address);
+    ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::generate(),
+        node_id: node_id.clone(),
+        transport: if is_loopback {
+            ClusterTransportKind::Loopback
+        } else {
+            ClusterTransportKind::LanTcp
+        },
+        address,
+        source: ClusterEndpointSource::Static,
+        privacy: if is_loopback {
+            ClusterEndpointPrivacy::LocalOnly
+        } else {
+            ClusterEndpointPrivacy::Lan
+        },
+        priority: if is_loopback { 100 } else { 20 },
+        last_observed_latency_ms: None,
+    }
+}
+
+pub fn invite_introducer_endpoint_from_state(
+    state: &ClusterBootstrapState,
+    address: String,
+) -> ClusterEndpointRecord {
+    if let Some(endpoint) = state
+        .members
+        .iter()
+        .filter(|member| member.state.is_authorized())
+        .flat_map(|member| member.endpoints.iter())
+        .find(|endpoint| endpoint.address == address)
+    {
+        return endpoint.clone();
+    }
+    invite_introducer_endpoint(&state.local_node_id, address)
 }
 
 fn push_invite_param(params: &mut Vec<String>, key: &str, value: &str) {

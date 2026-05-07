@@ -38,6 +38,8 @@ pub enum NetworkError {
         expected: ClusterId,
         actual: ClusterId,
     },
+    #[error("cluster is read-only: {detail}")]
+    ClusterReadOnly { detail: String },
     #[error(
         "certificate node {certificate_node_id} does not match material node {material_node_id}"
     )]

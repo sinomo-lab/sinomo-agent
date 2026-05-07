@@ -3,7 +3,9 @@ use super::*;
 pub(crate) use network::{
     apply_cluster_node_role, apply_cluster_raft_role, cluster_member_has_raft_vote,
     cluster_raft_local_is_voter, cluster_raft_node_is_voter, cluster_raft_quorum_size,
-    cluster_raft_state_for_role,
+    cluster_raft_state_for_role, compact_default_invite_introducers, invite_communication_channels,
+    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_loopback_connect_address,
+    is_remote_usable_invite_endpoint, push_unique_introducer, sort_default_invite_introducers,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -798,24 +800,6 @@ pub(crate) fn random_url_secret(byte_len: usize) -> Result<String, CliError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-pub(crate) fn invite_communication_channels(
-    state: &ClusterBootstrapState,
-    endpoints: &[ClusterEndpointRecord],
-) -> Vec<ClusterInvitationChannel> {
-    endpoints
-        .iter()
-        .filter_map(|endpoint| {
-            let member = state.members.iter().find(|member| {
-                member.node_id == endpoint.node_id && member.state.is_authorized()
-            })?;
-            Some(ClusterInvitationChannel {
-                endpoint: endpoint.clone(),
-                node_public_key: member.node_public_key.clone(),
-            })
-        })
-        .collect()
-}
-
 pub(crate) fn default_invite_introducers(
     state: &ClusterBootstrapState,
     paths: &ClusterPaths,
@@ -871,121 +855,6 @@ pub(crate) fn invite_introducers_from_daemon_status(
     } else {
         vec![invite_introducer_endpoint(node_id, status.address.clone())]
     }
-}
-
-pub(crate) fn push_unique_introducer(
-    introducers: &mut Vec<ClusterEndpointRecord>,
-    endpoint: ClusterEndpointRecord,
-) {
-    if let Some(public_key) = network::iroh_endpoint_public_key(&endpoint)
-        && introducers.iter().any(|candidate| {
-            network::iroh_endpoint_public_key(candidate).as_deref() == Some(&public_key)
-        })
-    {
-        return;
-    }
-    if !introducers
-        .iter()
-        .any(|candidate| candidate.address == endpoint.address)
-    {
-        introducers.push(endpoint);
-    }
-}
-
-pub(crate) fn sort_default_invite_introducers(introducers: &mut [ClusterEndpointRecord]) {
-    introducers.sort_by_key(|endpoint| {
-        (
-            !is_remote_usable_invite_endpoint(endpoint),
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
-}
-
-pub(crate) fn compact_default_invite_introducers(introducers: &mut Vec<ClusterEndpointRecord>) {
-    let remote_direct = introducers
-        .iter()
-        .filter(|endpoint| {
-            is_remote_usable_invite_endpoint(endpoint)
-                && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
-        })
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>();
-    let remote_iroh = introducers
-        .iter()
-        .find(|endpoint| {
-            is_remote_usable_invite_endpoint(endpoint)
-                && matches!(endpoint.transport, ClusterTransportKind::Iroh)
-        })
-        .cloned();
-    if !remote_direct.is_empty() {
-        *introducers = remote_direct;
-        if let Some(iroh) = remote_iroh {
-            push_unique_introducer(introducers, iroh);
-        }
-        return;
-    }
-
-    if let Some(iroh) = remote_iroh {
-        *introducers = vec![iroh];
-        return;
-    }
-
-    introducers.truncate(1);
-}
-
-pub(crate) fn is_remote_usable_invite_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
-    !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
-        && !is_loopback_connect_address(&endpoint.address)
-}
-
-pub(crate) fn is_loopback_connect_address(address: &str) -> bool {
-    address.starts_with("127.")
-        || address.starts_with("localhost:")
-        || address.starts_with("[::1]:")
-        || address.starts_with("::1:")
-}
-
-pub(crate) fn invite_introducer_endpoint(
-    node_id: &NodeId,
-    address: String,
-) -> ClusterEndpointRecord {
-    let is_loopback = is_loopback_connect_address(&address);
-    ClusterEndpointRecord {
-        endpoint_id: ClusterEndpointId::generate(),
-        node_id: node_id.clone(),
-        transport: if is_loopback {
-            ClusterTransportKind::Loopback
-        } else {
-            ClusterTransportKind::LanTcp
-        },
-        address,
-        source: ClusterEndpointSource::Static,
-        privacy: if is_loopback {
-            ClusterEndpointPrivacy::LocalOnly
-        } else {
-            ClusterEndpointPrivacy::Lan
-        },
-        priority: if is_loopback { 100 } else { 20 },
-        last_observed_latency_ms: None,
-    }
-}
-
-pub(crate) fn invite_introducer_endpoint_from_state(
-    state: &ClusterBootstrapState,
-    address: String,
-) -> ClusterEndpointRecord {
-    if let Some(endpoint) = state
-        .members
-        .iter()
-        .filter(|member| member.state.is_authorized())
-        .flat_map(|member| member.endpoints.iter())
-        .find(|endpoint| endpoint.address == address)
-    {
-        return endpoint.clone();
-    }
-    invite_introducer_endpoint(&state.local_node_id, address)
 }
 
 pub(crate) fn cluster_join(options: ClusterJoinOptions) -> Result<(), CliError> {
@@ -2171,127 +2040,7 @@ pub(crate) fn cluster_state_sync_txn(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvTxn, CliError> {
-    let mut state = state.clone();
-    network::cleanup_cluster_iroh_endpoints(&mut state);
-    let new_config = network::ClusterRaftConfigRecord::from(&state);
-    let current_config_entry = read_cluster_kv_store(paths)?
-        .get(&network::cluster_raft_config_key())
-        .cloned();
-    let mut compares = Vec::new();
-    if let Some(current_config_entry) = current_config_entry {
-        let current_config: network::ClusterRaftConfigRecord = current_config_entry.decode()?;
-        validate_raft_config_transition(&current_config, &new_config)?;
-        compares.push(KvCompare::ValueEquals {
-            key: network::cluster_raft_config_key(),
-            value: current_config_entry.value,
-        });
-    } else {
-        compares.push(KvCompare::Missing {
-            key: network::cluster_raft_config_key(),
-        });
-    }
-    let mut success = vec![
-        KvOp::put_serde(
-            network::cluster_identity_key(),
-            &network::ClusterIdentityRecord::from(&state),
-            None,
-        )?,
-        KvOp::put_serde(network::cluster_raft_config_key(), &new_config, None)?,
-    ];
-    for member in &state.members {
-        success.push(KvOp::put_serde(
-            cluster_member_key(&member.node_id),
-            member,
-            None,
-        )?);
-        success.push(KvOp::put_serde(
-            network::cluster_capability_policy_key(&member.node_id),
-            &network::ClusterCapabilityPolicyRecord::from(member),
-            None,
-        )?);
-        success.push(KvOp::DeletePrefix {
-            prefix: network::cluster_endpoint_prefix(&member.node_id),
-        });
-        for endpoint in &member.endpoints {
-            success.push(KvOp::put_serde(
-                network::cluster_endpoint_key(&member.node_id, endpoint),
-                endpoint,
-                None,
-            )?);
-        }
-    }
-    Ok(KvTxn {
-        compares,
-        success,
-        failure: Vec::new(),
-    })
-}
-
-pub(crate) fn validate_raft_config_transition(
-    current: &network::ClusterRaftConfigRecord,
-    next: &network::ClusterRaftConfigRecord,
-) -> Result<(), CliError> {
-    if current.cluster_id != next.cluster_id {
-        return Err(CliError::ClusterReadOnly {
-            detail: format!(
-                "cluster raft config cluster id changed from `{}` to `{}`",
-                current.cluster_id, next.cluster_id
-            ),
-        });
-    }
-    let current_voters = current
-        .voters
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let next_voters = next
-        .voters
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let removed_voters = current_voters
-        .difference(&next_voters)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !removed_voters.is_empty() {
-        return Err(CliError::ClusterReadOnly {
-            detail: format!(
-                "raft voter removal requires a safe reconfiguration protocol; refusing to remove {}",
-                removed_voters
-                    .iter()
-                    .map(NodeId::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        });
-    }
-    let added_voters = next_voters
-        .difference(&current_voters)
-        .cloned()
-        .collect::<Vec<_>>();
-    if added_voters.len() > 1 {
-        return Err(CliError::ClusterReadOnly {
-            detail: format!(
-                "raft voter expansion is limited to one voter per committed config change; requested {} additions",
-                added_voters.len()
-            ),
-        });
-    }
-    if let Some(added_voter) = added_voters.first() {
-        let current_learners = current
-            .learners
-            .iter()
-            .chain(current.non_voting.iter())
-            .collect::<std::collections::BTreeSet<_>>();
-        if !current_learners.contains(added_voter) {
-            return Err(CliError::ClusterReadOnly {
-                detail: format!(
-                    "raft voter `{added_voter}` must already be a committed learner or non-voting member before promotion"
-                ),
-            });
-        }
-    }
-    Ok(())
+    network::cluster_state_sync_txn(paths, state).map_err(Into::into)
 }
 
 pub(crate) fn assign_local_node_public_keys(

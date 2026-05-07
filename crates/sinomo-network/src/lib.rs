@@ -30,8 +30,8 @@ pub(crate) mod prelude {
     };
     pub(crate) use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
     pub(crate) use sinomo_kv::{
-        DurableRaftKvNode, InProcessKvStore, KvCommand, KvEntry, KvError, KvEvent, KvLogEntry,
-        KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvWalPaths, LeaseId,
+        DurableRaftKvNode, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent,
+        KvLogEntry, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvWalPaths, LeaseId,
         RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
         RaftRequestVoteResponse, RaftSnapshot, WatchId,
     };

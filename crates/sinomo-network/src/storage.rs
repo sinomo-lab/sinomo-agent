@@ -1,6 +1,7 @@
 use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
+use sinomo_kv::cluster_member_key;
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
 
@@ -1059,6 +1060,125 @@ pub fn sync_cluster_state_to_local_raft_unchecked(
         }
     }
     Ok(snapshot)
+}
+
+pub fn cluster_state_sync_txn(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<KvTxn, NetworkError> {
+    let mut state = state.clone();
+    cleanup_cluster_iroh_endpoints(&mut state);
+    let new_config = ClusterRaftConfigRecord::from(&state);
+    let current_config_entry = read_cluster_kv_store(paths)?
+        .get(&cluster_raft_config_key())
+        .cloned();
+    let mut compares = Vec::new();
+    if let Some(current_config_entry) = current_config_entry {
+        let current_config: ClusterRaftConfigRecord = current_config_entry.decode()?;
+        validate_raft_config_transition(&current_config, &new_config)?;
+        compares.push(KvCompare::ValueEquals {
+            key: cluster_raft_config_key(),
+            value: current_config_entry.value,
+        });
+    } else {
+        compares.push(KvCompare::Missing {
+            key: cluster_raft_config_key(),
+        });
+    }
+    let mut success = vec![
+        KvOp::put_serde(
+            cluster_identity_key(),
+            &ClusterIdentityRecord::from(&state),
+            None,
+        )?,
+        KvOp::put_serde(cluster_raft_config_key(), &new_config, None)?,
+    ];
+    for member in &state.members {
+        success.push(KvOp::put_serde(
+            cluster_member_key(&member.node_id),
+            member,
+            None,
+        )?);
+        success.push(KvOp::put_serde(
+            cluster_capability_policy_key(&member.node_id),
+            &ClusterCapabilityPolicyRecord::from(member),
+            None,
+        )?);
+        success.push(KvOp::DeletePrefix {
+            prefix: cluster_endpoint_prefix(&member.node_id),
+        });
+        for endpoint in &member.endpoints {
+            success.push(KvOp::put_serde(
+                cluster_endpoint_key(&member.node_id, endpoint),
+                endpoint,
+                None,
+            )?);
+        }
+    }
+    Ok(KvTxn {
+        compares,
+        success,
+        failure: Vec::new(),
+    })
+}
+
+pub fn validate_raft_config_transition(
+    current: &ClusterRaftConfigRecord,
+    next: &ClusterRaftConfigRecord,
+) -> Result<(), NetworkError> {
+    if current.cluster_id != next.cluster_id {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "cluster raft config cluster id changed from `{}` to `{}`",
+                current.cluster_id, next.cluster_id
+            ),
+        });
+    }
+    let current_voters = current.voters.iter().cloned().collect::<BTreeSet<_>>();
+    let next_voters = next.voters.iter().cloned().collect::<BTreeSet<_>>();
+    let removed_voters = current_voters
+        .difference(&next_voters)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !removed_voters.is_empty() {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "raft voter removal requires a safe reconfiguration protocol; refusing to remove {}",
+                removed_voters
+                    .iter()
+                    .map(NodeId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    let added_voters = next_voters
+        .difference(&current_voters)
+        .cloned()
+        .collect::<Vec<_>>();
+    if added_voters.len() > 1 {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "raft voter expansion is limited to one voter per committed config change; requested {} additions",
+                added_voters.len()
+            ),
+        });
+    }
+    if let Some(added_voter) = added_voters.first() {
+        let current_learners = current
+            .learners
+            .iter()
+            .chain(current.non_voting.iter())
+            .collect::<BTreeSet<_>>();
+        if !current_learners.contains(added_voter) {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "raft voter `{added_voter}` must already be a committed learner or non-voting member before promotion"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn sync_cluster_node_status_to_kv(
