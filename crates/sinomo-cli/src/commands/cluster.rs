@@ -7,10 +7,10 @@ pub(crate) use network::{
     cluster_member_is_local_process, cluster_network_probe_targets, cluster_raft_local_is_voter,
     cluster_raft_node_is_voter, cluster_raft_quorum_size, cluster_raft_state_for_role,
     cluster_state_needs_join_registration, cluster_status_summary_label,
-    compact_default_invite_introducers, invite_communication_channels,
-    invite_introducer_endpoint_from_state, is_loopback_connect_address,
-    is_remote_usable_invite_endpoint, live_cluster_member_probe_possible, push_unique_introducer,
-    sort_default_invite_introducers,
+    compact_default_invite_introducers, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint_from_state,
+    is_loopback_connect_address, is_remote_usable_invite_endpoint,
+    live_cluster_member_probe_possible, push_unique_introducer, sort_default_invite_introducers,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -982,28 +982,6 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         });
     }
     Ok(())
-}
-
-pub(crate) fn invite_channels_for_join_registration(
-    invite: &ClusterJoinInvite,
-) -> Vec<ClusterInvitationChannel> {
-    let channels = invite_channels(invite);
-    if channels
-        .iter()
-        .any(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
-    {
-        channels
-            .into_iter()
-            .filter(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
-            .collect()
-    } else {
-        channels
-    }
-}
-
-pub(crate) fn is_remote_join_registration_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
-    matches!(endpoint.transport, ClusterTransportKind::Iroh)
-        || is_remote_usable_invite_endpoint(endpoint)
 }
 
 pub(crate) fn send_cluster_join_registration_to_channel(
@@ -3112,19 +3090,4 @@ pub(crate) fn format_member_state(state: &ClusterMemberState) -> &'static str {
         ClusterMemberState::Offline => "offline",
         ClusterMemberState::Removed => "removed",
     }
-}
-
-pub(crate) fn invite_channels(invite: &ClusterJoinInvite) -> Vec<ClusterInvitationChannel> {
-    if !invite.communication_channels.is_empty() {
-        return invite.communication_channels.clone();
-    }
-    invite
-        .introducers
-        .iter()
-        .cloned()
-        .map(|endpoint| ClusterInvitationChannel {
-            endpoint,
-            node_public_key: invite.issuer_public_key.clone(),
-        })
-        .collect()
 }

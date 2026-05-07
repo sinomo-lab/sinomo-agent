@@ -153,6 +153,43 @@ pub fn invite_communication_channels(
         .collect()
 }
 
+pub fn invite_channels(invite: &ClusterJoinInvite) -> Vec<ClusterInvitationChannel> {
+    if !invite.communication_channels.is_empty() {
+        return invite.communication_channels.clone();
+    }
+    invite
+        .introducers
+        .iter()
+        .cloned()
+        .map(|endpoint| ClusterInvitationChannel {
+            endpoint,
+            node_public_key: invite.issuer_public_key.clone(),
+        })
+        .collect()
+}
+
+pub fn invite_channels_for_join_registration(
+    invite: &ClusterJoinInvite,
+) -> Vec<ClusterInvitationChannel> {
+    let channels = invite_channels(invite);
+    if channels
+        .iter()
+        .any(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
+    {
+        channels
+            .into_iter()
+            .filter(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
+            .collect()
+    } else {
+        channels
+    }
+}
+
+pub fn is_remote_join_registration_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
+    matches!(endpoint.transport, ClusterTransportKind::Iroh)
+        || is_remote_usable_invite_endpoint(endpoint)
+}
+
 pub fn push_unique_introducer(
     introducers: &mut Vec<ClusterEndpointRecord>,
     endpoint: ClusterEndpointRecord,
