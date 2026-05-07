@@ -46,7 +46,7 @@ use sinomo_runtime::core::{
 use sinomo_runtime::daemon::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
     DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonLock, DaemonPaths,
-    DaemonProbeStatus, DaemonRunOptions, DaemonSignerAuthority, DaemonStatus,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, authenticated_signer_matches_cluster_node,
     cluster_node_status_from_daemon_status, cluster_node_status_is_stale,
     current_shadow_daemon_options, daemon_bind_address, daemon_cluster_options_from_status,
     daemon_cluster_process_from_paths, daemon_cluster_registration, daemon_cluster_status,
@@ -58,7 +58,7 @@ use sinomo_runtime::daemon::{
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
-    DAEMON_MAIN_CLUSTER_ROLE, DaemonError, SignedDaemonCommand,
+    DAEMON_MAIN_CLUSTER_ROLE, DaemonError, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
     daemon_package_version, sign_daemon_rpc_request_from_data_dir,
 };

@@ -2563,26 +2563,6 @@ pub(crate) fn handle_daemon_cluster_raft_vote_request(
     })
 }
 
-pub(crate) fn authenticated_signer_matches_cluster_node(
-    state: &ClusterBootstrapState,
-    authenticated: &AuthenticatedDaemonCommand,
-    node_id: &NodeId,
-) -> bool {
-    if !matches!(
-        authenticated.signer,
-        DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
-    ) {
-        return false;
-    }
-    state.members.iter().any(|member| {
-        member.node_id == *node_id
-            && member.cluster_id == state.cluster_id
-            && member.state.is_authorized()
-            && member.node_id.as_str() == authenticated.signer_node_id
-            && member.node_public_key == authenticated.signer_public_key
-    })
-}
-
 pub(crate) fn handle_daemon_cluster_kv_watch_events_request(
     paths: &DaemonPaths,
     request: ClusterKvWatchEventsRequest,

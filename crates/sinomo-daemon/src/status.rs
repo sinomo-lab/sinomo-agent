@@ -1,4 +1,6 @@
-use crate::{DaemonError, DaemonPaths, send_daemon_rpc};
+use crate::{
+    AuthenticatedDaemonCommand, DaemonError, DaemonPaths, DaemonSignerAuthority, send_daemon_rpc,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
@@ -131,6 +133,26 @@ pub fn daemon_cluster_status_matches(
 ) -> bool {
     status.cluster.as_ref().is_some_and(|cluster| {
         cluster.cluster_id == state.cluster_id && cluster.node_id == endpoint.node_id
+    })
+}
+
+pub fn authenticated_signer_matches_cluster_node(
+    state: &ClusterBootstrapState,
+    authenticated: &AuthenticatedDaemonCommand,
+    node_id: &NodeId,
+) -> bool {
+    if !matches!(
+        authenticated.signer,
+        DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
+    ) {
+        return false;
+    }
+    state.members.iter().any(|member| {
+        member.node_id == *node_id
+            && member.cluster_id == state.cluster_id
+            && member.state.is_authorized()
+            && member.node_id.as_str() == authenticated.signer_node_id
+            && member.node_public_key == authenticated.signer_public_key
     })
 }
 
