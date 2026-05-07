@@ -1,7 +1,10 @@
 use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
-use crate::{format_ip_port, is_invitable_ip, is_loopback_connect_address};
+use crate::{
+    discover_local_ip_candidates_for_targets, format_ip_port, is_invitable_ip,
+    is_loopback_connect_address,
+};
 use sinomo_kv::cluster_member_key;
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
@@ -1440,6 +1443,38 @@ pub fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -
         ClusterTransportKind::Iroh => 1,
         _ => 2,
     }
+}
+
+pub fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Vec<SocketAddr> {
+    let mut targets = Vec::new();
+    for member in &state.members {
+        if member.node_id == state.local_node_id || !member.state.is_authorized() {
+            continue;
+        }
+        for endpoint in &member.endpoints {
+            if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly {
+                continue;
+            }
+            if !matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+            ) {
+                continue;
+            }
+            let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
+                continue;
+            };
+            if is_invitable_ip(address.ip()) && !targets.contains(&address) {
+                targets.push(address);
+            }
+        }
+    }
+    targets.sort();
+    targets
+}
+
+pub fn discover_peer_route_ip_candidates(state: &ClusterBootstrapState) -> Vec<IpAddr> {
+    discover_local_ip_candidates_for_targets(advertised_peer_route_targets(state))
 }
 
 pub fn daemon_advertised_endpoints_from_addresses(

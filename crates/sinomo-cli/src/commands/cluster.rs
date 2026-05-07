@@ -3209,35 +3209,11 @@ pub(crate) fn daemon_advertised_endpoints_from_ips(
 }
 
 pub(crate) fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Vec<SocketAddr> {
-    let mut targets = Vec::new();
-    for member in &state.members {
-        if member.node_id == state.local_node_id || !member.state.is_authorized() {
-            continue;
-        }
-        for endpoint in &member.endpoints {
-            if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly {
-                continue;
-            }
-            if !matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-            ) {
-                continue;
-            }
-            let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
-                continue;
-            };
-            if network::is_invitable_ip(address.ip()) && !targets.contains(&address) {
-                targets.push(address);
-            }
-        }
-    }
-    targets.sort();
-    targets
+    network::advertised_peer_route_targets(state)
 }
 
 pub(crate) fn discover_peer_route_ip_candidates(state: &ClusterBootstrapState) -> Vec<IpAddr> {
-    network::discover_local_ip_candidates_for_targets(advertised_peer_route_targets(state))
+    network::discover_peer_route_ip_candidates(state)
 }
 
 pub(crate) fn daemon_cluster_status(
