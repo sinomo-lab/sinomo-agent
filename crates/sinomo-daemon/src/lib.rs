@@ -20,8 +20,10 @@ pub use control::{
 pub use error::DaemonError;
 pub use paths::{DaemonPaths, daemon_paths_from_data_dir, shadow_daemon_paths_from_data_dir};
 pub use status::{
-    DaemonClusterStatus, DaemonLock, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    daemon_bind_address, daemon_connect_address, daemon_package_version,
+    DaemonClusterProcess, DaemonClusterStatus, DaemonLock, DaemonProbeStatus, DaemonRunOptions,
+    DaemonStatus, cluster_node_status_from_daemon_status, daemon_bind_address,
+    daemon_cluster_options_from_status, daemon_cluster_process_from_paths, daemon_connect_address,
+    daemon_options_from_status, daemon_package_version,
     daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
     daemon_status_matches_probe, probe_daemon_status, read_daemon_status, write_daemon_status,
 };

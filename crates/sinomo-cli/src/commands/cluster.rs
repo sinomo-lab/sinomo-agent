@@ -3163,12 +3163,6 @@ fn cluster_member_publish_matches_kv(
     Ok(true)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DaemonClusterProcess {
-    Main,
-    Shadow,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DaemonClusterRegistration {
     pub(crate) process: DaemonClusterProcess,
@@ -3222,13 +3216,6 @@ pub(crate) fn local_daemon_cluster_options()
             }
         };
     Ok((main, shadow))
-}
-
-pub(crate) fn daemon_options_from_status(status: &DaemonStatus) -> DaemonRunOptions {
-    DaemonRunOptions {
-        host: status.host.clone(),
-        port: status.port,
-    }
 }
 
 pub(crate) fn daemon_advertised_endpoints_for_state(
@@ -3432,69 +3419,6 @@ pub(crate) fn ensure_daemon_status_cluster(
         write_daemon_status(paths, status)?;
     }
     Ok(())
-}
-
-pub(crate) fn daemon_cluster_process_from_paths(
-    data_dir: &Path,
-    paths: &DaemonPaths,
-) -> DaemonClusterProcess {
-    if paths.root == data_dir.join("shadow-daemon") {
-        DaemonClusterProcess::Shadow
-    } else {
-        DaemonClusterProcess::Main
-    }
-}
-
-pub(crate) fn daemon_cluster_options_from_status(
-    data_dir: &Path,
-    paths: &DaemonPaths,
-    status: &DaemonStatus,
-    process: DaemonClusterProcess,
-) -> (DaemonRunOptions, DaemonRunOptions) {
-    let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
-    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
-    let main_options = if process == DaemonClusterProcess::Main {
-        daemon_options_from_status(status)
-    } else {
-        read_daemon_status(&main_paths)
-            .map(|status| daemon_options_from_status(&status))
-            .unwrap_or_else(|_| DaemonRunOptions::default())
-    };
-    let shadow_options = if paths.root == shadow_paths.root {
-        daemon_options_from_status(status)
-    } else {
-        read_daemon_status(&shadow_paths)
-            .map(|status| daemon_options_from_status(&status))
-            .unwrap_or_else(|_| DaemonRunOptions::shadow_default())
-    };
-    (main_options, shadow_options)
-}
-
-pub(crate) fn cluster_node_status_from_daemon_status(
-    status: &DaemonStatus,
-    cluster: &DaemonClusterStatus,
-    rollout: Option<ClusterNodeRolloutStatus>,
-    observed_at: OffsetDateTime,
-) -> ClusterNodeStatusRecord {
-    ClusterNodeStatusRecord {
-        cluster_id: cluster.cluster_id.clone(),
-        node_id: cluster.node_id.clone(),
-        process: cluster.process.clone(),
-        availability: ClusterNodeAvailability::Online,
-        daemon_version: status.version.clone(),
-        target_os: status.target_os.clone(),
-        target_arch: status.target_arch.clone(),
-        pid: Some(status.pid),
-        address: Some(status.address.clone()),
-        bind_address: Some(daemon_bind_address(status)),
-        executable: status
-            .executable
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        rollout: rollout.or_else(|| status.rollout.clone()),
-        daemon_started_at: Some(status.started_at.clone()),
-        observed_at,
-    }
 }
 
 pub(crate) fn read_cluster_rollout_status(
