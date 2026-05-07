@@ -4,10 +4,11 @@ use super::*;
 pub(crate) use network::invite_introducer_endpoint;
 pub(crate) use network::{
     apply_cluster_node_role, apply_cluster_raft_role, cluster_member_has_raft_vote,
-    cluster_raft_local_is_voter, cluster_raft_node_is_voter, cluster_raft_quorum_size,
-    cluster_raft_state_for_role, compact_default_invite_introducers, invite_communication_channels,
-    invite_introducer_endpoint_from_state, is_loopback_connect_address,
-    is_remote_usable_invite_endpoint, push_unique_introducer, sort_default_invite_introducers,
+    cluster_member_is_local_process, cluster_raft_local_is_voter, cluster_raft_node_is_voter,
+    cluster_raft_quorum_size, cluster_raft_state_for_role, compact_default_invite_introducers,
+    invite_communication_channels, invite_introducer_endpoint_from_state,
+    is_loopback_connect_address, is_remote_usable_invite_endpoint,
+    live_cluster_member_probe_possible, push_unique_introducer, sort_default_invite_introducers,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1268,7 +1269,7 @@ pub(crate) fn cluster_health_rows(
                 && !cluster_node_status_is_stale(&status))
         {
             ClusterNodeAvailability::Online
-        } else if live_probe_possible(state, member) {
+        } else if live_cluster_member_probe_possible(state, member) {
             ClusterNodeAvailability::Offline
         } else {
             ClusterNodeAvailability::Unknown
@@ -1320,29 +1321,6 @@ pub(crate) fn probe_member_daemon_status(
         ));
     }
     None
-}
-
-pub(crate) fn live_probe_possible(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-) -> bool {
-    let is_local_process = cluster_member_is_local_process(state, member);
-    member.endpoints.iter().any(|endpoint| {
-        (is_local_process || !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
-            && matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp
-                    | ClusterTransportKind::Loopback
-                    | ClusterTransportKind::Iroh
-            )
-    })
-}
-
-pub(crate) fn cluster_member_is_local_process(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-) -> bool {
-    network::cluster_member_is_local_process(state, member)
 }
 
 pub(crate) fn format_node_availability(availability: &ClusterNodeAvailability) -> &'static str {

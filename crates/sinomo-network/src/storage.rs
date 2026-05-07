@@ -1452,6 +1452,22 @@ pub fn cluster_member_is_local_process(
     cluster_node_is_local_process(state, &member.node_id)
 }
 
+pub fn live_cluster_member_probe_possible(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> bool {
+    let is_local_process = cluster_member_is_local_process(state, member);
+    member.endpoints.iter().any(|endpoint| {
+        (is_local_process || endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
+            && matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp
+                    | ClusterTransportKind::Loopback
+                    | ClusterTransportKind::Iroh
+            )
+    })
+}
+
 pub fn cluster_node_is_local_process(state: &ClusterBootstrapState, node_id: &NodeId) -> bool {
     *node_id == state.local_node_id || *node_id == shadow_daemon_node_id(&state.local_node_id)
 }
