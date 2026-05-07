@@ -201,6 +201,31 @@ pub fn cluster_node_status_from_daemon_status(
     }
 }
 
+pub fn invite_introducers_from_daemon_status(
+    node_id: &NodeId,
+    status: &DaemonStatus,
+) -> Vec<sinomo_core::ClusterEndpointRecord> {
+    if matches!(status.host.as_str(), "0.0.0.0" | "::") {
+        let mut endpoints = Vec::new();
+        for ip in sinomo_network::discover_default_lan_ip_candidates() {
+            endpoints.push(sinomo_network::invite_introducer_endpoint(
+                node_id,
+                sinomo_network::format_ip_port(ip, status.port),
+            ));
+        }
+        endpoints.push(sinomo_network::invite_introducer_endpoint(
+            node_id,
+            status.address.clone(),
+        ));
+        endpoints
+    } else {
+        vec![sinomo_network::invite_introducer_endpoint(
+            node_id,
+            status.address.clone(),
+        )]
+    }
+}
+
 pub fn daemon_probe_status_needs_restart_for_options(
     status: DaemonProbeStatus,
     host: &str,

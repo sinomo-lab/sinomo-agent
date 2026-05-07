@@ -50,8 +50,9 @@ use sinomo_runtime::daemon::{
     DaemonRunOptions, DaemonSignerAuthority, DaemonStatus, cluster_node_status_from_daemon_status,
     daemon_bind_address, daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
     daemon_connect_address, daemon_options_from_status, daemon_rpc_command,
-    handle_authenticated_daemon_connection, probe_daemon_status, read_daemon_status,
-    send_daemon_rpc, sign_daemon_rpc_request_for_local_node, verify_cluster_invite_challenge_proof,
+    handle_authenticated_daemon_connection, invite_introducers_from_daemon_status,
+    probe_daemon_status, read_daemon_status, send_daemon_rpc,
+    sign_daemon_rpc_request_for_local_node, verify_cluster_invite_challenge_proof,
     write_daemon_rpc_response_frame, write_daemon_status,
 };
 #[cfg(test)]

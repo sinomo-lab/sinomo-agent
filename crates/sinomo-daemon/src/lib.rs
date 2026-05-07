@@ -25,5 +25,6 @@ pub use status::{
     daemon_cluster_options_from_status, daemon_cluster_process_from_paths, daemon_connect_address,
     daemon_options_from_status, daemon_package_version,
     daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
-    daemon_status_matches_probe, probe_daemon_status, read_daemon_status, write_daemon_status,
+    daemon_status_matches_probe, invite_introducers_from_daemon_status, probe_daemon_status,
+    read_daemon_status, write_daemon_status,
 };

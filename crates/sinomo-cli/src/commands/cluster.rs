@@ -1,10 +1,12 @@
 use super::*;
 
+#[cfg(test)]
+pub(crate) use network::invite_introducer_endpoint;
 pub(crate) use network::{
     apply_cluster_node_role, apply_cluster_raft_role, cluster_member_has_raft_vote,
     cluster_raft_local_is_voter, cluster_raft_node_is_voter, cluster_raft_quorum_size,
     cluster_raft_state_for_role, compact_default_invite_introducers, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_loopback_connect_address,
+    invite_introducer_endpoint_from_state, is_loopback_connect_address,
     is_remote_usable_invite_endpoint, push_unique_introducer, sort_default_invite_introducers,
 };
 
@@ -814,25 +816,6 @@ pub(crate) fn default_invite_introducers(
     sort_default_invite_introducers(&mut introducers);
     compact_default_invite_introducers(&mut introducers);
     introducers
-}
-
-pub(crate) fn invite_introducers_from_daemon_status(
-    node_id: &NodeId,
-    status: &DaemonStatus,
-) -> Vec<ClusterEndpointRecord> {
-    if matches!(status.host.as_str(), "0.0.0.0" | "::") {
-        let mut endpoints = Vec::new();
-        for ip in network::discover_default_lan_ip_candidates() {
-            endpoints.push(invite_introducer_endpoint(
-                node_id,
-                network::format_ip_port(ip, status.port),
-            ));
-        }
-        endpoints.push(invite_introducer_endpoint(node_id, status.address.clone()));
-        endpoints
-    } else {
-        vec![invite_introducer_endpoint(node_id, status.address.clone())]
-    }
 }
 
 pub(crate) fn cluster_join(options: ClusterJoinOptions) -> Result<(), CliError> {
