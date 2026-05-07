@@ -22,5 +22,6 @@ pub use paths::{DaemonPaths, daemon_paths_from_data_dir, shadow_daemon_paths_fro
 pub use status::{
     DaemonClusterStatus, DaemonLock, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     daemon_bind_address, daemon_connect_address, daemon_package_version,
+    daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
     daemon_status_matches_probe, probe_daemon_status, read_daemon_status, write_daemon_status,
 };

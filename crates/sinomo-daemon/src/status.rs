@@ -120,6 +120,24 @@ pub fn daemon_bind_address(status: &DaemonStatus) -> String {
     format!("{}:{}", status.host, status.port)
 }
 
+pub fn daemon_status_matches_options(status: &DaemonStatus, host: &str, port: u16) -> bool {
+    status.host == host && status.port == port
+}
+
+pub fn daemon_probe_status_needs_restart_for_options(
+    status: DaemonProbeStatus,
+    host: &str,
+    port: u16,
+) -> bool {
+    match status {
+        DaemonProbeStatus::Running(status)
+        | DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => !daemon_status_matches_options(&status, host, port),
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => false,
+    }
+}
+
 #[derive(Debug)]
 pub struct DaemonLock {
     file: File,

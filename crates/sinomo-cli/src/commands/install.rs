@@ -275,17 +275,7 @@ pub(crate) fn daemon_probe_status_needs_install_restart(
     host: &str,
     port: u16,
 ) -> bool {
-    match status {
-        DaemonProbeStatus::Running(status)
-        | DaemonProbeStatus::Locked {
-            status: Some(status),
-        } => !daemon_status_matches_options(&status, host, port),
-        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => false,
-    }
-}
-
-pub(crate) fn daemon_status_matches_options(status: &DaemonStatus, host: &str, port: u16) -> bool {
-    status.host == host && status.port == port
+    sinomo_runtime::daemon::daemon_probe_status_needs_restart_for_options(status, host, port)
 }
 
 pub(crate) fn default_boot_dir(data_dir: &SinomoDataDir) -> Result<PathBuf, CliError> {
