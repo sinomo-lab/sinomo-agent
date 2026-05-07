@@ -14,9 +14,9 @@ ring = "r1"
 [dependencies]
 base64 = "0.22"
 serde.workspace = true
-serde_json.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 thiserror.workspace = true
 time.workspace = true
 fs2.workspace = true
+tokio = { version = "1.44", features = ["rt"] }
 sinomo-core = { path = "../sinomo-core" }

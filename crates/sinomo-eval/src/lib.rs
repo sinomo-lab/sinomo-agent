@@ -785,10 +785,12 @@ mod tests {
 
     #[test]
     fn command_suite_produces_passing_scorecard_with_replay_fixture_count() {
-        let harness = LocalEvalHarness::new(NodeId::new("node_server").expect("node"));
+        let harness =
+            LocalEvalHarness::new(NodeId::from_legacy_named("node_server").expect("node"));
         let scorecard = harness
             .run(CommandEvaluationSuite {
-                candidate_artifact_id: ArtifactId::new("artifact_candidate").expect("artifact"),
+                candidate_artifact_id: ArtifactId::from_legacy_named("artifact_candidate")
+                    .expect("artifact"),
                 baseline_artifact_id: None,
                 specs: vec![CommandEvaluationSpec {
                     gate: EvaluationGate::ReplayTests,
@@ -799,7 +801,7 @@ mod tests {
                         name: "urgent alert replay".to_string(),
                         fixture_uri: "fixtures/replay/urgent-alert.jsonl".to_string(),
                         query: ReplayQuery::by_session(
-                            SessionId::new("sess_eval").expect("session"),
+                            SessionId::from_legacy_named("sess_eval").expect("session"),
                         ),
                     }],
                     log_excerpt: Some("ok".to_string()),

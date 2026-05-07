@@ -17,7 +17,8 @@ The default data directory is `~/.sinomo`. Important rollout paths are:
 - `~/.sinomo/bin/sinomo`: installed main binary.
 - `~/.sinomo/bin/sinomo-shadow`: installed shadow binary.
 - `~/.sinomo/rollout/build.log`: last build log.
-- `~/.sinomo/rollout/state.json`: last rollout state.
+- `~/.sinomo/rollout/state.sobj`: last rollout state as a binary Sinomo object.
+- `~/.sinomo/rollout/last-main-exit.sobj`: last supervised main process exit as a binary Sinomo object.
 - `~/.sinomo/rollout/logs/`: candidate stdout, stderr, and diagnostics.
 
 The managed source checkout is intentionally local. `sinomo install`, `sinomo rollout init-source`, and `sinomo rollout import-source` merge source into `~/.sinomo/source/sinomo` and remove external remotes, so a node can build later without depending on GitHub or another upstream service.
@@ -34,7 +35,7 @@ Cluster rollout is staged through the running main daemon:
 6. The shadow waits for main health checks to pass.
 7. The healthy main daemon finalizes the shadow binary update.
 
-If the candidate main cannot start or does not become healthy, the shadow records failure in `rollout/state.json`, restores the previous main binary, and keeps supervising. If the candidate shadow fails after main is healthy, the main daemon attempts to restart the previous shadow binary and records the recovery result.
+If the candidate main cannot start or does not become healthy, the shadow records failure in `rollout/state.sobj`, restores the previous main binary, and keeps supervising. If the candidate shadow fails after main is healthy, the main daemon attempts to restart the previous shadow binary and records the recovery result.
 
 ## Normal Source Rollout
 
@@ -164,10 +165,10 @@ sinomo rollout diagnostics --target 127.0.0.1:21353
 sinomo rollout diagnostics --target 192.168.1.154:21353
 ```
 
-Diagnostics include `rollout/state.json`, build logs, and candidate stdout/stderr tails. If a rollout fails, inspect:
+Diagnostics include the decoded rollout state, build logs, and candidate stdout/stderr tails. If a rollout fails, inspect:
 
 ```sh
-cat ~/.sinomo/rollout/state.json
+sinomo rollout diagnostics
 cat ~/.sinomo/rollout/build.log
 ls -lt ~/.sinomo/rollout/logs
 ```

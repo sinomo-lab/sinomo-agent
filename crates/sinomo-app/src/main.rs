@@ -71,12 +71,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_capability(NodeCapability::new(voice_capability.clone()))
         .with_capability(NodeCapability::new(api_capability.clone()))
         .with_service(HostedService::new(event_service_capability));
-    workstation.node_id = sinomo_runtime::core::NodeId::new("node_desktop")?;
+    workstation.node_id = sinomo_runtime::core::NodeId::from_legacy_named("node_desktop")?;
 
     let mut home_server = NodeProfile::local("home server")?
         .with_capability(NodeCapability::new(registry_capability))
         .with_capability(NodeCapability::new(module_loader_capability));
-    home_server.node_id = sinomo_runtime::core::NodeId::new("node_server")?;
+    home_server.node_id = sinomo_runtime::core::NodeId::from_legacy_named("node_server")?;
 
     let workspace_device = DeviceProfile::new(
         workstation.node_id.clone(),
@@ -130,8 +130,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     sync_registry.upsert_session(sync_state);
 
-    let workspace_id = WorkspaceId::new("workspace_evolution_trigger")?;
-    let candidate_object_id = DfsObjectId::new("obj_trigger_candidate")?;
+    let workspace_id = WorkspaceId::from_legacy_named("workspace_evolution_trigger")?;
+    let candidate_object_id = DfsObjectId::from_legacy_named("obj_trigger_candidate")?;
     let sifs_id = sifs_file_system_id();
     let mut dfs = DfsMetadataStore::new();
     dfs.add_file_system(DfsFileSystem {
@@ -151,13 +151,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         owner_node_id: workstation.node_id.clone(),
         current_locations: vec![workstation.node_id.clone()],
         content_hash: Some("sha256:phase2-candidate".to_string()),
-        version: DfsVersion::new("version_1")?,
+        version: DfsVersion::from_legacy_named("version_1")?,
         policy: DfsObjectPolicy::LocalOwned,
         created_by_event_id: None,
         last_modified_by_event_id: None,
     })?;
 
-    let module_id = ModuleId::new("module.trigger.silence_policy")?;
+    let module_id = ModuleId::from_legacy_named("module.trigger.silence_policy")?;
     let module_manifest = ModuleManifest::r3_wasm(module_id.clone(), "0.3.7", "sinomo-trigger");
     let candidate_artifact_id = ArtifactId::generate();
     let planner = EvolutionPlanner::new(workstation.node_id.clone());
@@ -402,7 +402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DfsWriteRequest {
             file_system_id: sifs_id,
             object_id: candidate_object_id,
-            target_version: DfsVersion::new("version_2")?,
+            target_version: DfsVersion::from_legacy_named("version_2")?,
             requesting_node_id: home_server.node_id.clone(),
         },
         &home_server.node_id,
@@ -423,7 +423,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target_ring: TrustRing::R3SandboxedModule,
         content_hash: "sha256:phase2-candidate".to_string(),
         signature: Some("local-dev-signature".to_string()),
-        source_workspace: Some(WorkspaceId::new("workspace_evolution_trigger")?),
+        source_workspace: Some(WorkspaceId::from_legacy_named(
+            "workspace_evolution_trigger",
+        )?),
         source_revision: Some("git:phase2-smoke".to_string()),
         module_manifest,
         provenance: ArtifactProvenance {
@@ -463,7 +465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rollout_controller = RolloutController::new(workstation.node_id.clone());
     let rollout_state = rollout_controller.initial_state(
         rollout_plan.clone(),
-        ArtifactId::new("artifact_active_trigger").expect("artifact"),
+        ArtifactId::from_legacy_named("artifact_active_trigger").expect("artifact"),
     );
     let rollout_decision = rollout_controller.advance(
         rollout_state,

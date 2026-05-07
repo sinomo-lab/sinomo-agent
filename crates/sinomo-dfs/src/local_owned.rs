@@ -341,7 +341,7 @@ struct ResolvedExposePath<'a> {
 }
 
 fn sifs_id() -> DfsFileSystemId {
-    DfsFileSystemId::new(SIFS_FILE_SYSTEM_ID).expect("valid sifs id")
+    DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).expect("valid sifs id")
 }
 
 fn default_true() -> bool {
@@ -465,12 +465,18 @@ mod tests {
 
     #[test]
     fn default_config_exposes_data_files_under_node_sifs_path() {
-        let node_id = NodeId::new("node_alpha").expect("node id");
+        let node_id = NodeId::from_legacy_named("node_alpha").expect("node id");
         let config = DfsExposeConfig::default_for_node(Path::new("/tmp/sinomo"), node_id);
 
         assert_eq!(config.entries.len(), 1);
-        assert_eq!(config.entries[0].file_system_id.as_str(), "sifs");
-        assert_eq!(config.entries[0].dfs_path, "/sinomo/nodes/node_alpha/files");
+        assert_eq!(
+            config.entries[0].file_system_id,
+            crate::sifs_file_system_id()
+        );
+        assert_eq!(
+            config.entries[0].dfs_path,
+            format!("/sinomo/nodes/{}/files", config.entries[0].owner_node_id)
+        );
         assert_eq!(
             config.entries[0].source_path,
             PathBuf::from("/tmp/sinomo/files")
@@ -515,7 +521,7 @@ mod tests {
                 file_system_id: sifs_id(),
                 dfs_path: "/sinomo/nodes/node_alpha/files".to_string(),
                 source_path: root.join("files"),
-                owner_node_id: NodeId::new("node_alpha").expect("node id"),
+                owner_node_id: NodeId::from_legacy_named("node_alpha").expect("node id"),
                 writable: true,
                 follow_symlinks: false,
                 created_at: OffsetDateTime::now_utc(),

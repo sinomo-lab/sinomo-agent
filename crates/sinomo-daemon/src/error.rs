@@ -28,6 +28,9 @@ impl From<sinomo_node::NodeIdentityError> for DaemonError {
             sinomo_node::NodeIdentityError::Parse { detail } => Self::Parse { detail },
             sinomo_node::NodeIdentityError::Io { path, detail } => Self::Io { path, detail },
             sinomo_node::NodeIdentityError::Json { path, detail } => Self::Json { path, detail },
+            sinomo_node::NodeIdentityError::Object { path, detail } => Self::Parse {
+                detail: format!("node identity object error at {path}: {detail}"),
+            },
         }
     }
 }
@@ -38,6 +41,10 @@ impl From<sinomo_network::NetworkError> for DaemonError {
             sinomo_network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
             sinomo_network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             sinomo_network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
+            sinomo_network::NetworkError::Io { operation, detail } => Self::Network {
+                address: operation,
+                detail,
+            },
             other => Self::Parse {
                 detail: other.to_string(),
             },

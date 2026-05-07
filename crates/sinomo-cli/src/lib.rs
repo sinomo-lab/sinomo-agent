@@ -46,14 +46,15 @@ use sinomo_runtime::daemon::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
     DaemonClusterStatus, DaemonLock, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
     DaemonSignerAuthority, DaemonStatus, daemon_bind_address, daemon_connect_address,
-    handle_authenticated_daemon_connection, probe_daemon_status, read_daemon_status,
-    send_daemon_command, sign_daemon_command_for_local_node, verify_cluster_invite_challenge_proof,
-    write_daemon_status,
+    daemon_rpc_command, handle_authenticated_daemon_connection, probe_daemon_status,
+    read_daemon_status, send_daemon_rpc, sign_daemon_rpc_request_for_local_node,
+    verify_cluster_invite_challenge_proof, write_daemon_rpc_response_frame, write_daemon_status,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
-    DaemonError, authenticate_daemon_command, authorize_authenticated_daemon_command,
-    daemon_package_version, send_daemon_command_raw, sign_daemon_command_from_data_dir,
+    DaemonError, SignedDaemonCommand, authenticate_daemon_control_request,
+    authorize_authenticated_daemon_command, daemon_package_version,
+    sign_daemon_rpc_request_from_data_dir,
 };
 use sinomo_runtime::dfs::{
     DfsExposeEntry, DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend,
@@ -89,17 +90,19 @@ use sinomo_runtime::rollout::{
     activate_staged_rollout_binary, classify_main_exit, create_source_repo_bundle,
     deploy_managed_source_bundle, deploy_managed_source_repo, discover_current_git_repo,
     ensure_rollout_layout, managed_source_status, read_pending_shadow_rollout,
-    read_rollout_main_activation, record_activation_failure, record_main_activation_staged,
-    record_main_rollout_failure_with_diagnostics, record_shadow_rollout_finalized,
-    remove_shadow_finalize, restore_rollout_binary_from_backup, rollout_main_activation_path,
-    rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
-    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
-    sync_external_repo_from_managed, write_main_activation,
+    read_rollout_main_activation, read_rollout_main_exit, read_rollout_status,
+    record_activation_failure, record_main_activation_staged,
+    record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
+    record_shadow_rollout_finalized, remove_shadow_finalize, restore_rollout_binary_from_backup,
+    rollout_main_activation_path, rollout_main_exit_path, rollout_shadow_finalize_path,
+    rollout_staged_main_binary, rollout_staged_shadow_binary, stage_pending_shadow_rollout,
+    stage_rollout_bytes, stage_rollout_file, sync_external_repo_from_managed,
+    write_main_activation, write_rollout_status,
 };
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};

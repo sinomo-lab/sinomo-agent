@@ -85,6 +85,29 @@ pub(crate) fn parse_port(label: &str, value: &str) -> Result<u16, CliError> {
     })
 }
 
+pub(crate) fn verify_data_dir_storage_contracts(
+    data_dir: impl AsRef<Path>,
+) -> Result<sinomo_runtime::storage::StorageVerificationReport, CliError> {
+    let layout = sinomo_runtime::storage::sinomo_data_dir_layout()?;
+    Ok(layout.verify_data_dir(data_dir)?)
+}
+
+pub(crate) fn ensure_data_dir_storage_contracts(
+    data_dir: impl AsRef<Path>,
+) -> Result<(), CliError> {
+    let report = verify_data_dir_storage_contracts(data_dir)?;
+    if report.is_complete() {
+        Ok(())
+    } else {
+        Err(CliError::Parse {
+            detail: format!(
+                "unregistered files in sinomo data directory: {}",
+                report.unregistered.join(", ")
+            ),
+        })
+    }
+}
+
 pub(crate) fn install(options: InstallOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
@@ -127,6 +150,7 @@ pub(crate) fn install_with_layout(
     activate_boot_entries(layout);
     #[cfg(not(test))]
     configure_user_bin_access(layout)?;
+    ensure_data_dir_storage_contracts(&layout.data_dir)?;
     println!("installed binary: {}", layout.binary.display());
     println!(
         "installed shadow binary: {}",
@@ -822,7 +846,7 @@ pub(crate) fn stop_daemon_before_install(
     let mut next_shutdown_nudge = Instant::now();
     match probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT) {
         DaemonProbeStatus::Running(status) => {
-            match send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT) {
+            match send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT) {
                 Ok(_) => println!("sinomo {label} stop requested for {reason}"),
                 Err(error) => {
                     if matches!(
@@ -852,7 +876,7 @@ pub(crate) fn stop_daemon_before_install(
                 return Ok(());
             }
             DaemonProbeStatus::Running(status) if Instant::now() >= next_shutdown_nudge => {
-                let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+                let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
                 next_shutdown_nudge = Instant::now() + Duration::from_secs(1);
             }
             DaemonProbeStatus::Running(_) | DaemonProbeStatus::Locked { .. } => {}
@@ -971,7 +995,7 @@ pub(crate) fn start_installed_sinomo_daemon(
 pub(crate) fn stop_daemon_if_running(paths: &DaemonPaths, label: &str) -> Result<(), CliError> {
     match probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT) {
         DaemonProbeStatus::Running(status) => {
-            let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT)?;
+            let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT)?;
             println!("sinomo {label} stop requested");
             Ok(())
         }

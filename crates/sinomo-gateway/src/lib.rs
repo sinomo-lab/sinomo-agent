@@ -151,8 +151,9 @@ mod tests {
 
     #[test]
     fn synthetic_audio_chunk_carries_node_and_device_provenance() {
-        let device = DeviceProfile::mock_microphone(NodeId::new("node_mobile").expect("node"));
-        let session = SessionId::new("sess_ingest").expect("session");
+        let device =
+            DeviceProfile::mock_microphone(NodeId::from_legacy_named("node_mobile").expect("node"));
+        let session = SessionId::from_legacy_named("sess_ingest").expect("session");
         let mut adapter =
             SyntheticInputAdapter::audio_transcript(&device, session, "hello").expect("adapter");
 

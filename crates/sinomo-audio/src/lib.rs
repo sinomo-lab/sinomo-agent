@@ -95,8 +95,9 @@ mod tests {
 
     #[test]
     fn audio_worker_emits_vad_and_transcript_events() {
-        let device = DeviceProfile::mock_microphone(NodeId::new("node_mobile").expect("node"));
-        let session = SessionId::new("sess_audio").expect("session");
+        let device =
+            DeviceProfile::mock_microphone(NodeId::from_legacy_named("node_mobile").expect("node"));
+        let session = SessionId::from_legacy_named("sess_audio").expect("session");
         let mut adapter =
             SyntheticInputAdapter::audio_transcript(&device, session, "check the alert")
                 .expect("adapter");

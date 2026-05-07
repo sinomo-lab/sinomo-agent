@@ -242,8 +242,14 @@ pub(crate) fn rollout_diagnostics(options: RolloutOptions) -> Result<(), CliErro
     };
     for target in targets {
         println!("== {target} ==");
-        let signed = sign_daemon_command_for_local_node("ROLLOUT_DIAGNOSTICS")?;
-        match network::send_daemon_command_raw(&target, &signed, CLUSTER_HEALTH_PROBE_TIMEOUT) {
+        let request = network::ObjectRpcRequest::encode_body(
+            network::ROLLOUT_DIAGNOSTICS_ROUTE,
+            network::ROLLOUT_RPC_CATEGORY,
+            &(),
+        )?;
+        match send_daemon_rpc(&target, &request, CLUSTER_HEALTH_PROBE_TIMEOUT)
+            .and_then(|response| response.decode_body::<String>().map_err(Into::into))
+        {
             Ok(response) => print!("{response}"),
             Err(error) => println!("failed: {error}"),
         }
@@ -350,7 +356,7 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         },
     )?;
     if let Some(status) = previous_main_status.as_ref() {
-        let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+        let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
     }
     wait_for_main_daemon_health(
         &options,
@@ -711,12 +717,13 @@ pub(crate) fn unique_rollout_targets(targets: Vec<String>) -> Vec<String> {
 }
 
 pub(crate) fn read_rollout_target_status(address: &str) -> Result<DaemonStatus, CliError> {
-    let signed = sign_daemon_command_for_local_node("STATUS")?;
-    let response = network::send_daemon_command_raw(address, &signed, DAEMON_JOIN_TIMEOUT)?;
-    serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-        path: format!("daemon status from {address}"),
-        detail: source.to_string(),
-    })
+    let request = network::ObjectRpcRequest::encode_body(
+        network::DAEMON_STATUS_ROUTE,
+        network::DAEMON_RPC_CATEGORY,
+        &(),
+    )?;
+    let response = send_daemon_rpc(address, &request, DAEMON_JOIN_TIMEOUT)?;
+    response.decode_body().map_err(CliError::from)
 }
 
 pub(crate) fn rollout_target_platform_matches_local(status: &DaemonStatus) -> Option<bool> {
@@ -759,20 +766,26 @@ pub(crate) fn send_daemon_rollout_binary(
     address: &str,
     request: &ClusterRolloutBinaryRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    let payload = network::encode_object_text_payload(request)?;
-    let signed = sign_daemon_command_for_local_node(&format!("ROLLOUT_BINARY {payload}"))?;
-    let response = network::send_daemon_command_raw(address, &signed, DAEMON_ROLLOUT_TIMEOUT)?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+    let request = network::ObjectRpcRequest::encode_body(
+        network::ROLLOUT_BINARY_ROUTE,
+        network::ROLLOUT_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc(address, &request, DAEMON_ROLLOUT_TIMEOUT)?;
+    response.decode_body().map_err(CliError::from)
 }
 
 pub(crate) fn send_daemon_rollout_build(
     address: &str,
     request: &ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    let payload = network::encode_object_text_payload(request)?;
-    let signed = sign_daemon_command_for_local_node(&format!("ROLLOUT_BUILD {payload}"))?;
-    let response = network::send_daemon_command_raw(address, &signed, DAEMON_ROLLOUT_TIMEOUT)?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+    let request = network::ObjectRpcRequest::encode_body(
+        network::ROLLOUT_BUILD_ROUTE,
+        network::ROLLOUT_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc(address, &request, DAEMON_ROLLOUT_TIMEOUT)?;
+    response.decode_body().map_err(CliError::from)
 }
 
 pub(crate) fn ensure_source_repo(
@@ -875,7 +888,7 @@ pub(crate) fn wait_for_local_shadow_rollout_completion(
             if let DaemonProbeStatus::Running(status) =
                 probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT)
             {
-                let _ = send_daemon_command(&status.address, "SHUTDOWN", DAEMON_PROBE_TIMEOUT);
+                let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
             }
             next_restart_nudge = Instant::now() + Duration::from_secs(2);
         }

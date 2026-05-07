@@ -114,8 +114,8 @@ mod tests {
 
     #[test]
     fn session_membership_merges_by_node() {
-        let session_id = SessionId::new("sess_sync").expect("session");
-        let node_id = NodeId::new("node_desktop").expect("node");
+        let session_id = SessionId::from_legacy_named("sess_sync").expect("session");
+        let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
         let mut state = SessionSyncState::new(session_id, SyncPolicy::Session);
         state.add_participant(SessionParticipant {
             node_id: node_id.clone(),

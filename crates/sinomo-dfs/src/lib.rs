@@ -68,7 +68,7 @@ pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
 
 pub fn sifs_file_system_id() -> DfsFileSystemId {
-    DfsFileSystemId::new(SIFS_FILE_SYSTEM_ID).expect("valid sifs filesystem id")
+    DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).expect("valid sifs filesystem id")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1282,11 +1282,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 return Ok(NetworkedDfsReadOutcome::Found {
                     data: DfsReadData {
                         object_id: object.object_id.clone(),
-                        version: DfsVersion::new(manifest.version.clone()).map_err(|error| {
-                            DfsError::ContentStore {
+                        version: DfsVersion::deserialize_migrating_legacy(manifest.version.clone())
+                            .map_err(|error| DfsError::ContentStore {
                                 message: error.to_string(),
-                            }
-                        })?,
+                            })?,
                         content_hash: Some(manifest.content_hash.clone()),
                         bytes,
                     },
@@ -1789,10 +1788,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let mut has_current_manifest = false;
 
         for manifest in manifests {
-            let manifest_version = DfsVersion::new(manifest.version.clone()).map_err(|error| {
-                DfsError::ContentStore {
-                    message: error.to_string(),
-                }
+            let manifest_version = DfsVersion::deserialize_migrating_legacy(
+                manifest.version.clone(),
+            )
+            .map_err(|error| DfsError::ContentStore {
+                message: error.to_string(),
             })?;
             if manifest_version == object.version {
                 if object
@@ -2916,7 +2916,7 @@ mod tests {
 
     fn file_system(owner: NodeId) -> DfsFileSystem {
         DfsFileSystem {
-            file_system_id: DfsFileSystemId::new("sifs").expect("filesystem"),
+            file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
             display_name: "repo".to_string(),
             owner_node_id: owner,
             subtree_policies: Vec::new(),
@@ -2925,14 +2925,14 @@ mod tests {
 
     fn file_metadata(owner: NodeId) -> DfsObjectMetadata {
         DfsObjectMetadata {
-            object_id: DfsObjectId::new("obj_file").expect("object"),
-            file_system_id: DfsFileSystemId::new("sifs").expect("filesystem"),
+            object_id: DfsObjectId::from_legacy_named("obj_file").expect("object"),
+            file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
             path: "src/lib.rs".to_string(),
             kind: DfsObjectKind::File,
             owner_node_id: owner.clone(),
             current_locations: vec![owner],
             content_hash: None,
-            version: DfsVersion::new("version_1").expect("version"),
+            version: DfsVersion::from_legacy_named("version_1").expect("version"),
             policy: DfsObjectPolicy::LocalOwned,
             created_by_event_id: None,
             last_modified_by_event_id: None,
@@ -2941,10 +2941,10 @@ mod tests {
 
     #[test]
     fn local_owned_write_routes_to_owner() {
-        let owner = NodeId::new("node_desktop").expect("node");
-        let remote = NodeId::new("node_mobile").expect("node");
-        let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-        let object_id = DfsObjectId::new("obj_file").expect("object");
+        let owner = NodeId::from_legacy_named("node_desktop").expect("node");
+        let remote = NodeId::from_legacy_named("node_mobile").expect("node");
+        let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+        let object_id = DfsObjectId::from_legacy_named("obj_file").expect("object");
         let mut store = DfsMetadataStore::new();
         store.add_file_system(file_system(owner.clone()));
         store
@@ -2956,7 +2956,7 @@ mod tests {
                 owner_node_id: owner.clone(),
                 current_locations: vec![owner.clone()],
                 content_hash: None,
-                version: DfsVersion::new("version_1").expect("version"),
+                version: DfsVersion::from_legacy_named("version_1").expect("version"),
                 policy: DfsObjectPolicy::LocalOwned,
                 created_by_event_id: None,
                 last_modified_by_event_id: None,
@@ -2966,9 +2966,9 @@ mod tests {
         let route = store
             .route_write(
                 DfsWriteRequest {
-                    file_system_id: DfsFileSystemId::new("sifs").expect("filesystem"),
+                    file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
                     object_id,
-                    target_version: DfsVersion::new("version_2").expect("version"),
+                    target_version: DfsVersion::from_legacy_named("version_2").expect("version"),
                     requesting_node_id: remote.clone(),
                 },
                 &remote,
@@ -2985,8 +2985,8 @@ mod tests {
 
     #[test]
     fn local_owned_read_is_routed_to_owner_node() {
-        let owner = NodeId::new("node_desktop").expect("node");
-        let remote = NodeId::new("node_mobile").expect("node");
+        let owner = NodeId::from_legacy_named("node_desktop").expect("node");
+        let remote = NodeId::from_legacy_named("node_mobile").expect("node");
         let network = InProcessNetwork::new();
         let mut owner_dfs = LocalOwnedDfsService::new(network.add_node(owner.clone()));
         let mut remote_dfs = LocalOwnedDfsService::new(network.add_node(remote.clone()));
@@ -3038,8 +3038,8 @@ mod tests {
 
     #[test]
     fn local_owned_write_is_routed_to_owner_node_and_committed() {
-        let owner = NodeId::new("node_desktop").expect("node");
-        let remote = NodeId::new("node_mobile").expect("node");
+        let owner = NodeId::from_legacy_named("node_desktop").expect("node");
+        let remote = NodeId::from_legacy_named("node_mobile").expect("node");
         let network = InProcessNetwork::new();
         let mut owner_dfs = LocalOwnedDfsService::new(network.add_node(owner.clone()));
         let mut remote_dfs = LocalOwnedDfsService::new(network.add_node(remote.clone()));
@@ -3056,7 +3056,7 @@ mod tests {
             .add_object_metadata(metadata)
             .expect("replicate metadata");
 
-        let target_version = DfsVersion::new("version_2").expect("version");
+        let target_version = DfsVersion::from_legacy_named("version_2").expect("version");
         let write = remote_dfs
             .write_object(
                 DfsWriteRequest {
@@ -3124,19 +3124,24 @@ mod tests {
 
     #[test]
     fn dfs_policy_violation_event_is_structured_for_supervision() {
-        let owner = NodeId::new("node_desktop").expect("node");
-        let remote = NodeId::new("node_mobile").expect("node");
+        let owner = NodeId::from_legacy_named("node_desktop").expect("node");
+        let remote = NodeId::from_legacy_named("node_mobile").expect("node");
         let event = DfsPolicyViolation {
             requesting_node_id: remote,
             executing_node_id: owner.clone(),
-            file_system_id: Some(DfsFileSystemId::new("sifs").expect("filesystem")),
-            object_id: Some(DfsObjectId::new("obj_file").expect("object")),
+            file_system_id: Some(DfsFileSystemId::from_legacy_named("sifs").expect("filesystem")),
+            object_id: Some(DfsObjectId::from_legacy_named("obj_file").expect("object")),
             reason: "write attempted against non-owner".to_string(),
         }
         .event();
 
         assert_eq!(event.kind.as_str(), "dfs.policy.violation");
         assert_eq!(event.target_node_id, Some(owner));
-        assert_eq!(event.payload["file_system_id"], "sifs");
+        assert_eq!(
+            event.payload["file_system_id"],
+            DfsFileSystemId::from_legacy_named("sifs")
+                .expect("filesystem")
+                .as_str()
+        );
     }
 }

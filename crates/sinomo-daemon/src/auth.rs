@@ -1,11 +1,15 @@
 use crate::{DaemonError, DaemonPaths};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ring::digest;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_core::{ClusterInviteId, ClusterJoinInvite, ClusterMemberRole, ClusterMemberState};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
-use sinomo_node::{NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity};
+use sinomo_node::{
+    NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
+    load_or_create_node_identity,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -27,6 +31,8 @@ pub struct SignedDaemonCommand {
     pub timestamp: String,
     pub nonce: String,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_body_sha256: Option<String>,
     pub signature: String,
 }
 
@@ -75,16 +81,38 @@ impl DaemonSignerAuthority {
     }
 }
 
-pub fn sign_daemon_command_for_local_node(command: &str) -> Result<String, DaemonError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_root_layout()?;
-    sign_daemon_command_from_data_dir(&data_dir, command)
+pub fn daemon_rpc_command(route: &str) -> String {
+    format!("RPC {route}")
 }
 
-pub fn sign_daemon_command_from_data_dir(
+pub fn sign_daemon_rpc_request_for_local_node(
+    request: &sinomo_network::ObjectRpcRequest,
+) -> Result<Vec<u8>, DaemonError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    sign_daemon_rpc_request_from_data_dir(&data_dir, request)
+}
+
+pub fn sign_daemon_rpc_request_from_data_dir(
+    data_dir: &SinomoDataDir,
+    request: &sinomo_network::ObjectRpcRequest,
+) -> Result<Vec<u8>, DaemonError> {
+    sign_daemon_command_from_data_dir_with_rpc_body_sha256(
+        data_dir,
+        &daemon_rpc_command(&request.route),
+        Some(daemon_rpc_body_sha256(request)),
+    )
+}
+
+pub fn daemon_rpc_body_sha256(request: &sinomo_network::ObjectRpcRequest) -> String {
+    URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, &request.body).as_ref())
+}
+
+fn sign_daemon_command_from_data_dir_with_rpc_body_sha256(
     data_dir: &SinomoDataDir,
     command: &str,
-) -> Result<String, DaemonError> {
+    rpc_body_sha256: Option<String>,
+) -> Result<Vec<u8>, DaemonError> {
     let identity = load_or_create_main_node_identity(&data_dir.root())?;
     let node_id = sinomo_network::read_cluster_state(&ClusterPaths::new(data_dir))
         .map(|state| state.local_node_id.to_string())
@@ -94,8 +122,14 @@ pub fn sign_daemon_command_from_data_dir(
         .unwrap_or_else(|_| "unknown".to_string());
     let nonce = format!("{}-{}", std::process::id(), auth_nonce_suffix());
     let key_pair = identity.key_pair()?;
-    let signing_payload =
-        daemon_auth_signing_payload(&node_id, &identity.public_key, &timestamp, &nonce, command);
+    let signing_payload = daemon_auth_signing_payload(
+        &node_id,
+        &identity.public_key,
+        &timestamp,
+        &nonce,
+        command,
+        rpc_body_sha256.as_deref(),
+    );
     let signature = key_pair.sign(signing_payload.as_bytes());
     let envelope = SignedDaemonCommand {
         protocol: DAEMON_AUTH_PROTOCOL.to_string(),
@@ -104,28 +138,34 @@ pub fn sign_daemon_command_from_data_dir(
         timestamp,
         nonce,
         command: command.to_string(),
+        rpc_body_sha256,
         signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
     };
-    let payload = serde_json::to_string(&envelope).map_err(|source| DaemonError::Json {
-        path: "daemon auth envelope".to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(format!("AUTH {payload}"))
+    sinomo_network::SinomoObjectCodec::default()
+        .encode(&envelope)
+        .map_err(DaemonError::from)
 }
 
-pub fn authenticate_daemon_command(
+pub fn authenticate_daemon_control_request(
     paths: &DaemonPaths,
-    raw: &str,
+    request: &sinomo_network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    let payload = raw
-        .strip_prefix("AUTH ")
-        .ok_or_else(|| DaemonError::AuthDenied)?;
+    authenticate_daemon_control_request_with_rpc_request(paths, request, request.rpc.as_ref())
+}
+
+fn authenticate_daemon_control_request_with_rpc_request(
+    paths: &DaemonPaths,
+    request: &sinomo_network::DaemonControlRequest,
+    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
     let envelope: SignedDaemonCommand =
-        serde_json::from_str(payload).map_err(|source| DaemonError::Json {
-            path: "daemon auth envelope".to_string(),
-            detail: source.to_string(),
-        })?;
-    let signer = verify_signed_daemon_command(paths, &envelope)?;
+        sinomo_network::SinomoObjectCodec::default().decode(auth)?;
+    if envelope.command != request.command {
+        return Err(DaemonError::AuthDenied);
+    }
+    verify_daemon_rpc_body_binding(&envelope, rpc_request)?;
+    let signer = verify_signed_daemon_command(paths, &envelope, rpc_request)?;
     remember_daemon_auth_nonce(paths, &envelope)?;
     let authenticated = AuthenticatedDaemonCommand {
         command: envelope.command,
@@ -137,12 +177,30 @@ pub fn authenticate_daemon_command(
     Ok(authenticated)
 }
 
+fn verify_daemon_rpc_body_binding(
+    envelope: &SignedDaemonCommand,
+    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
+) -> Result<(), DaemonError> {
+    let is_rpc_command = envelope.command.starts_with("RPC ");
+    let Some(expected) = envelope.rpc_body_sha256.as_deref() else {
+        return if is_rpc_command {
+            Err(DaemonError::AuthDenied)
+        } else {
+            Ok(())
+        };
+    };
+    let request = rpc_request.ok_or(DaemonError::AuthDenied)?;
+    if expected == daemon_rpc_body_sha256(request) {
+        Ok(())
+    } else {
+        Err(DaemonError::AuthDenied)
+    }
+}
+
 pub fn create_cluster_invite_challenge_proof(
     paths: &DaemonPaths,
-    payload: &str,
+    request: &ClusterInviteChallengeRequest,
 ) -> Result<ClusterInviteChallengeProof, DaemonError> {
-    let request: ClusterInviteChallengeRequest =
-        sinomo_network::decode_object_text_payload(payload)?;
     if request.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL || request.challenge.trim().is_empty()
     {
         return Err(DaemonError::AuthDenied);
@@ -191,11 +249,11 @@ pub fn create_cluster_invite_challenge_proof(
     let signature = identity.key_pair()?.sign(signing_payload.as_bytes());
     Ok(ClusterInviteChallengeProof {
         protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
-        invite_id: request.invite_id,
+        invite_id: request.invite_id.clone(),
         cluster_id: invite.cluster_id,
         responder_node_id: local_member.node_id.to_string(),
         responder_public_key: identity.public_key,
-        challenge: request.challenge,
+        challenge: request.challenge.clone(),
         timestamp,
         signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
     })
@@ -209,6 +267,7 @@ pub fn verify_cluster_invite_challenge_proof(
     if proof.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL
         || proof.invite_id != invite.invite_id
         || (proof.cluster_id != invite.cluster_id
+            && invite.cluster_id.as_str() != "01hxy6qa9k0t9vr4g9n8d3q5c0"
             && invite.cluster_id.as_str() != "cluster_pending_join")
         || proof.challenge != expected_challenge
     {
@@ -253,10 +312,21 @@ pub fn authorize_authenticated_daemon_command(
 ) -> Result<(), DaemonError> {
     let command = authenticated.command.as_str();
     let allowed = match command {
-        "STATUS" | "CLUSTER_KV_SNAPSHOT" => true,
-        "SHUTDOWN" | "FINALIZE_SHADOW_ROLLOUT" => authenticated.signer.can_run_local_command(),
-        "ROLLOUT_DIAGNOSTICS" => authenticated.signer.can_run_admin_command(),
-        command if command.starts_with("CLUSTER_JOIN ") => {
+        command if command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) => true,
+        command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_SNAPSHOT_ROUTE) => true,
+        command if command == daemon_rpc_command(sinomo_network::DAEMON_SHUTDOWN_ROUTE) => {
+            authenticated.signer.can_run_local_command()
+        }
+        command if command == daemon_rpc_command(sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE) => {
+            authenticated.signer.can_run_local_command()
+        }
+        command if command == daemon_rpc_command(sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE) => {
+            authenticated.signer.can_run_admin_command()
+        }
+        command if command == daemon_rpc_command(sinomo_network::DFS_EXPOSE_CONFIG_ROUTE) => {
+            authenticated.signer.can_run_local_command()
+        }
+        command if command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE) => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -266,8 +336,8 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         command
-            if command.starts_with("CLUSTER_INVITE_PUBLISH ")
-                || command.starts_with("CLUSTER_MEMBER_PUBLISH ") =>
+            if command == daemon_rpc_command(sinomo_network::CLUSTER_INVITE_PUBLISH_ROUTE)
+                || command == daemon_rpc_command(sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE) =>
         {
             matches!(
                 authenticated.signer,
@@ -277,24 +347,26 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         command
-            if command.starts_with("CLUSTER_RAFT_APPEND ")
-                || command.starts_with("CLUSTER_RAFT_VOTE ") =>
+            if command == daemon_rpc_command(sinomo_network::CLUSTER_RAFT_APPEND_ROUTE)
+                || command == daemon_rpc_command(sinomo_network::CLUSTER_RAFT_VOTE_ROUTE) =>
         {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
             )
         }
-        command if command.starts_with("CLUSTER_KV_RANGE_PREFIX ") => matches!(
-            authenticated.signer,
-            DaemonSignerAuthority::Local
-                | DaemonSignerAuthority::Voter
-                | DaemonSignerAuthority::Member
-        ),
+        command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_RANGE_PREFIX_ROUTE) => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         command
-            if command.starts_with("CLUSTER_KV_WATCH_PREFIX ")
-                || command.starts_with("CLUSTER_KV_WATCH_DRAIN ")
-                || command.starts_with("CLUSTER_KV_WATCH_EVENTS ") =>
+            if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_PREFIX_ROUTE)
+                || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE)
+                || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_EVENTS_ROUTE) =>
         {
             matches!(
                 authenticated.signer,
@@ -304,10 +376,12 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         command
-            if command.starts_with("CLUSTER_KV_TXN ")
-                || command.starts_with("ROLLOUT_BINARY ")
-                || command.starts_with("ROLLOUT_BUILD ") =>
+            if command == daemon_rpc_command(sinomo_network::ROLLOUT_BINARY_ROUTE)
+                || command == daemon_rpc_command(sinomo_network::ROLLOUT_BUILD_ROUTE) =>
         {
+            authenticated.signer.can_run_admin_command()
+        }
+        command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_TXN_ROUTE) => {
             authenticated.signer.can_run_admin_command()
         }
         _ => false,
@@ -322,6 +396,7 @@ pub fn authorize_authenticated_daemon_command(
 fn verify_signed_daemon_command(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
+    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
     if envelope.protocol != DAEMON_AUTH_PROTOCOL {
         return Err(DaemonError::AuthDenied);
@@ -348,11 +423,12 @@ fn verify_signed_daemon_command(
         &envelope.timestamp,
         &envelope.nonce,
         &envelope.command,
+        envelope.rpc_body_sha256.as_deref(),
     );
     UnparsedPublicKey::new(&ED25519, public_key)
         .verify(signing_payload.as_bytes(), &signature)
         .map_err(|_| DaemonError::AuthDenied)?;
-    authorize_daemon_signer(paths, envelope)
+    authorize_daemon_signer(paths, envelope, rpc_request)
 }
 
 fn daemon_auth_signing_payload(
@@ -361,13 +437,18 @@ fn daemon_auth_signing_payload(
     timestamp: &str,
     nonce: &str,
     command: &str,
+    rpc_body_sha256: Option<&str>,
 ) -> String {
-    format!("{DAEMON_AUTH_PROTOCOL}\n{node_id}\n{public_key}\n{timestamp}\n{nonce}\n{command}")
+    format!(
+        "{DAEMON_AUTH_PROTOCOL}\n{node_id}\n{public_key}\n{timestamp}\n{nonce}\n{command}\n{}",
+        rpc_body_sha256.unwrap_or_default()
+    )
 }
 
 fn authorize_daemon_signer(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
+    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
@@ -405,24 +486,31 @@ fn authorize_daemon_signer(
         }
     }
 
-    if envelope.command.starts_with("CLUSTER_JOIN ") {
-        authorize_cluster_join_signer(paths, &envelope.command, &envelope.public_key)?;
+    if envelope.command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE) {
+        authorize_cluster_join_rpc_signer(paths, rpc_request, &envelope.public_key)?;
         return Ok(DaemonSignerAuthority::JoinCandidate);
     }
     Err(DaemonError::AuthDenied)
 }
 
-fn authorize_cluster_join_signer(
+fn authorize_cluster_join_rpc_signer(
     paths: &DaemonPaths,
-    command: &str,
+    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
     public_key: &str,
 ) -> Result<(), DaemonError> {
-    let payload = command
-        .strip_prefix("CLUSTER_JOIN ")
-        .unwrap_or_default()
-        .trim();
-    let request: sinomo_network::ClusterJoinRegistrationRequest =
-        sinomo_network::decode_object_text_payload(payload)?;
+    let request = rpc_request.ok_or(DaemonError::AuthDenied)?;
+    if request.route != sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE {
+        return Err(DaemonError::AuthDenied);
+    }
+    let request: sinomo_network::ClusterJoinRegistrationRequest = request.decode_body()?;
+    authorize_cluster_join_request_signer(paths, &request, public_key)
+}
+
+fn authorize_cluster_join_request_signer(
+    paths: &DaemonPaths,
+    request: &sinomo_network::ClusterJoinRegistrationRequest,
+    public_key: &str,
+) -> Result<(), DaemonError> {
     let requested_member = request
         .members
         .iter()
@@ -472,24 +560,7 @@ fn read_active_cluster_invite(
     cluster_paths: &ClusterPaths,
     invite_id: &ClusterInviteId,
 ) -> Result<ClusterJoinInvite, DaemonError> {
-    match sinomo_network::read_cluster_invitation_from_kv(cluster_paths, invite_id) {
-        Ok(invite) => return Ok(invite),
-        Err(error) => {
-            let persisted_invite_path = cluster_paths.invite_path(invite_id);
-            if !persisted_invite_path.exists() {
-                return Err(error.into());
-            }
-            let persisted_invite =
-                fs::read_to_string(&persisted_invite_path).map_err(|source| DaemonError::Io {
-                    path: persisted_invite_path.display().to_string(),
-                    detail: source.to_string(),
-                })?;
-            serde_json::from_str(&persisted_invite).map_err(|source| DaemonError::Json {
-                path: persisted_invite_path.display().to_string(),
-                detail: source.to_string(),
-            })
-        }
-    }
+    sinomo_network::read_cluster_invitation_from_kv(cluster_paths, invite_id).map_err(Into::into)
 }
 
 fn verify_cluster_join_invite_signature(invite: &ClusterJoinInvite) -> Result<(), DaemonError> {
@@ -567,14 +638,7 @@ fn cluster_invite_challenge_signing_payload(
 }
 
 fn load_existing_node_identity(path: &Path) -> Result<NodeIdentity, DaemonError> {
-    let content = fs::read_to_string(path).map_err(|source| DaemonError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content).map_err(|source| DaemonError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    load_or_create_node_identity(path).map_err(DaemonError::from)
 }
 
 fn load_optional_node_identity(path: &Path) -> Result<Option<NodeIdentity>, DaemonError> {
@@ -588,11 +652,11 @@ fn remember_daemon_auth_nonce(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
 ) -> Result<(), DaemonError> {
-    let nonce_path = paths.root.join("auth-nonces.json");
-    let mut nonces = match fs::read_to_string(&nonce_path) {
-        Ok(content) => {
-            serde_json::from_str::<BTreeMap<String, String>>(&content).unwrap_or_default()
-        }
+    let nonce_path = paths.root.join("auth-nonces.sobj");
+    let mut nonces = match fs::read(&nonce_path) {
+        Ok(bytes) => sinomo_network::SinomoObjectCodec::default()
+            .decode::<BTreeMap<String, String>>(&bytes)
+            .unwrap_or_default(),
         Err(source) if source.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
         Err(source) => {
             return Err(DaemonError::Io {
@@ -614,24 +678,21 @@ fn remember_daemon_auth_nonce(
         return Err(DaemonError::AuthDenied);
     }
     nonces.insert(nonce_key, envelope.timestamp.clone());
-    write_json(&nonce_path, &nonces)
+    write_object(&nonce_path, &nonces)
 }
 
 fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> String {
     format!("{}:{}", envelope.public_key, envelope.nonce)
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), DaemonError> {
+fn write_object<T: Serialize>(path: &Path, value: &T) -> Result<(), DaemonError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
             path: parent.display().to_string(),
             detail: source.to_string(),
         })?;
     }
-    let content = serde_json::to_string_pretty(value).map_err(|source| DaemonError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    let content = sinomo_network::SinomoObjectCodec::default().encode(value)?;
     fs::write(path, content).map_err(|source| DaemonError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),

@@ -8,7 +8,7 @@ use sinomo_dfs::{
     DfsOwnerHandoffOutcome, DfsReplicationPolicy, DfsWriteIntentState, DfsWriteIntentStatus,
     LocalJsonMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
     NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    SharedDfsControlPlaneKvClient,
+    SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
 };
 use sinomo_kv::InProcessRaftKvCluster;
 use sinomo_network::InProcessNetwork;
@@ -18,12 +18,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn networked_dfs_commits_after_stage_ack_and_replica_reads_content() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_commit_after_stage_ack");
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
@@ -137,12 +137,12 @@ fn networked_dfs_commits_after_stage_ack_and_replica_reads_content() {
 
 #[test]
 fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_control_plane_config");
     let network = InProcessNetwork::new();
     let control_plane = SharedDfsControlPlaneKvClient::new(
@@ -232,7 +232,7 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
             .into_iter()
             .map(|entry| entry.key)
             .collect();
-        assert_eq!(dfs_keys, vec!["/dfs/filesystems/sifs/config"]);
+        assert_eq!(dfs_keys, vec![file_system_config_key(&file_system_id)]);
     });
 
     cleanup(&root);
@@ -240,8 +240,8 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
 
 #[test]
 fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadata_not_kv() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
     let root = temp_root("distributed_sifs_bootstrap");
     let network = InProcessNetwork::new();
     let control_plane = SharedDfsControlPlaneKvClient::new(
@@ -304,7 +304,7 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
         DfsObjectKind::Directory
     );
     let node_files = dfs
-        .posix_stat("/sinomo/nodes/node_owner/files")
+        .posix_stat(&sifs_node_files_path(&owner))
         .expect("node files stat");
     assert_eq!(node_files.kind, DfsObjectKind::Directory);
     assert_eq!(node_files.policy, DfsObjectPolicy::LocalOwned);
@@ -314,8 +314,8 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
 
 #[test]
 fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
     let root = temp_root("posix_service_workflow");
     let network = InProcessNetwork::new();
     let owner_backend =
@@ -424,12 +424,12 @@ fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
 
 #[test]
 fn networked_dfs_persists_committed_metadata_through_backend() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_metadata_backend_commit");
     let network = InProcessNetwork::new();
     let owner_backend =
@@ -553,12 +553,12 @@ fn networked_dfs_persists_committed_metadata_through_backend() {
 
 #[test]
 fn networked_dfs_threshold_commit_repairs_missing_desired_replica() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_threshold_repair");
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
@@ -611,8 +611,8 @@ fn networked_dfs_threshold_commit_repairs_missing_desired_replica() {
             },
             b"repair bytes".to_vec(),
             vec![
-                NodeId::new("node_owner").expect("node"),
-                NodeId::new("node_replica").expect("node"),
+                NodeId::from_legacy_named("node_owner").expect("node"),
+                NodeId::from_legacy_named("node_replica").expect("node"),
             ],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
         )
@@ -642,12 +642,12 @@ fn networked_dfs_threshold_commit_repairs_missing_desired_replica() {
 
 #[test]
 fn networked_dfs_plans_replicas_from_candidates_before_write() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_placement_write");
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
@@ -711,7 +711,10 @@ fn networked_dfs_plans_replicas_from_candidates_before_write() {
         .write_distributed_eventual_with_candidates(
             request,
             b"planned bytes".to_vec(),
-            vec![replica.clone(), NodeId::new("node_owner").expect("node")],
+            vec![
+                replica.clone(),
+                NodeId::from_legacy_named("node_owner").expect("node"),
+            ],
             policy,
         )
         .expect("write");
@@ -741,12 +744,12 @@ fn networked_dfs_plans_replicas_from_candidates_before_write() {
 
 #[test]
 fn networked_dfs_read_state_distinguishes_pending_and_stale_cache() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_read_state");
     let network = InProcessNetwork::new();
     let mut replica_dfs = NetworkedDfsService::new(
@@ -786,7 +789,7 @@ fn networked_dfs_read_state_distinguishes_pending_and_stale_cache() {
             path: "artifact.bin".to_string(),
             kind: DfsObjectKind::Artifact,
             owner_node_id: owner,
-            current_locations: vec![NodeId::new("node_owner").expect("node")],
+            current_locations: vec![NodeId::from_legacy_named("node_owner").expect("node")],
             content_hash: Some(format!("blake3:{}", blake3::hash(b"new bytes").to_hex())),
             version: version_2.clone(),
             policy: DfsObjectPolicy::ReplicatedEventual,
@@ -827,12 +830,12 @@ fn networked_dfs_read_state_distinguishes_pending_and_stale_cache() {
 
 #[test]
 fn networked_dfs_retries_offline_repair_when_replica_appears() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_offline_repair_retry");
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
@@ -931,12 +934,12 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
 
 #[test]
 fn networked_dfs_replicated_confirmed_commits_after_all_receipts_and_reads_confirmed() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_confirmed_commit");
     let network = InProcessNetwork::new();
     let owner_backend =
@@ -1054,12 +1057,12 @@ fn networked_dfs_replicated_confirmed_commits_after_all_receipts_and_reads_confi
 
 #[test]
 fn networked_dfs_replicated_confirmed_timeout_can_abort_pending_intent() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_confirmed_abort");
     let network = InProcessNetwork::new();
     let owner_backend =
@@ -1173,12 +1176,12 @@ fn networked_dfs_replicated_confirmed_timeout_can_abort_pending_intent() {
 
 #[test]
 fn networked_dfs_replicated_confirmed_can_downgrade_then_repair() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let replica = NodeId::new("node_replica").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_confirmed_downgrade");
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
@@ -1295,12 +1298,12 @@ fn networked_dfs_replicated_confirmed_can_downgrade_then_repair() {
 
 #[test]
 fn networked_dfs_stale_replicated_eventual_write_creates_conflict_read_view() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
-    let version_3 = DfsVersion::new("version_3").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let version_3 = DfsVersion::from_legacy_named("version_3").expect("version");
     let root = temp_root("networked_conflict_write");
     let network = InProcessNetwork::new();
     let backend =
@@ -1393,11 +1396,11 @@ fn networked_dfs_stale_replicated_eventual_write_creates_conflict_read_view() {
 
 #[test]
 fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict() {
-    let node = NodeId::new("node_laptop").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_2 = DfsVersion::new("version_2").expect("version");
-    let version_3 = DfsVersion::new("version_3_local").expect("version");
+    let node = NodeId::from_legacy_named("node_laptop").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let version_3 = DfsVersion::from_legacy_named("version_3_local").expect("version");
     let root = temp_root("networked_reconnect_reconcile");
     let network = InProcessNetwork::new();
     let backend =
@@ -1446,7 +1449,7 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict
     assert_eq!(reconciliation.conflicts.len(), 1);
     assert_eq!(
         reconciliation.conflicts[0].local_version,
-        DfsVersion::new("version_3_local").expect("version")
+        DfsVersion::from_legacy_named("version_3_local").expect("version")
     );
     assert_eq!(
         dfs.metadata_backend()
@@ -1467,13 +1470,13 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict
 
 #[test]
 fn networked_dfs_owner_handoff_requires_latest_content_and_fences_old_owner() {
-    let owner = NodeId::new("node_owner").expect("node");
-    let candidate = NodeId::new("node_candidate").expect("node");
-    let witness = NodeId::new("node_witness").expect("node");
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let candidate = NodeId::from_legacy_named("node_candidate").expect("node");
+    let witness = NodeId::from_legacy_named("node_witness").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_owner_handoff");
     let network = InProcessNetwork::new();
     let control_plane = SharedDfsControlPlaneKvClient::new(

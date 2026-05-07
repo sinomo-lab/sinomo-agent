@@ -130,10 +130,10 @@ mod tests {
 
     #[test]
     fn api_exposes_replay_and_supervision_snapshot() {
-        let node = NodeId::new("node_desktop").expect("node");
+        let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let mut store = InMemoryEventStore::new();
         let event = EventEnvelope::new(
-            EventId::new("evt_blocked").expect("event"),
+            EventId::from_legacy_named("evt_blocked").expect("event"),
             OffsetDateTime::now_utc(),
             node.clone(),
             Source::new("actions.executor").expect("source"),

@@ -626,19 +626,19 @@ mod tests {
     use super::*;
 
     fn file_system_id() -> DfsFileSystemId {
-        DfsFileSystemId::new("sifs").expect("filesystem")
+        DfsFileSystemId::from_legacy_named("sifs").expect("filesystem")
     }
 
     fn object_id() -> DfsObjectId {
-        DfsObjectId::new("obj_file").expect("object")
+        DfsObjectId::from_legacy_named("obj_file").expect("object")
     }
 
     fn version(value: &str) -> DfsVersion {
-        DfsVersion::new(value).expect("version")
+        DfsVersion::from_legacy_named(value).expect("version")
     }
 
     fn node(value: &str) -> NodeId {
-        NodeId::new(value).expect("node")
+        NodeId::from_legacy_named(value).expect("node")
     }
 
     fn policy(min_commit_replicas: usize, desired_replicas: usize) -> DfsReplicationPolicy {

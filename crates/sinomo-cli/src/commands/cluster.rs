@@ -403,13 +403,7 @@ pub(crate) fn cluster_init_with_paths(
 
     let local_node_id = options.node_id.unwrap_or_else(NodeId::generate);
     let timestamp = OffsetDateTime::now_utc();
-    let cluster_id = options.cluster_id.unwrap_or_else(|| {
-        ClusterId::new(format!(
-            "cluster_{}",
-            local_node_id.as_str().trim_start_matches("node_")
-        ))
-        .expect("generated cluster id")
-    });
+    let cluster_id = options.cluster_id.unwrap_or_else(ClusterId::generate);
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "cluster paths have no data directory parent".to_string(),
@@ -430,7 +424,7 @@ pub(crate) fn cluster_init_with_paths(
         timestamp,
     );
     assign_local_node_public_keys(paths, &mut state)?;
-    write_json(&paths.state, &state)?;
+    network::write_cluster_state(paths, &state)?;
     network::set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
     sync_cluster_state_to_kv(paths, &state)?;
     println!("cluster initialized: {}", state.cluster_id);
@@ -446,7 +440,7 @@ pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliErr
     println!("join command: {}", rendered.join_command);
     println!("cluster: {}", rendered.invite.cluster_id);
     println!("expires: {}", format_rfc3339(rendered.invite.expires_at));
-    println!("saved: {}", rendered.persisted_path.display());
+    println!("saved: {}", rendered.persisted_key);
     if let Some(output) = rendered.output_path {
         println!("output: {}", output.display());
     }
@@ -458,7 +452,7 @@ pub(crate) struct RenderedClusterInvite {
     pub(crate) invite: ClusterJoinInvite,
     pub(crate) uri: String,
     pub(crate) join_command: String,
-    pub(crate) persisted_path: PathBuf,
+    pub(crate) persisted_key: String,
     pub(crate) output_path: Option<PathBuf>,
 }
 
@@ -493,10 +487,6 @@ pub(crate) fn cluster_invite_with_paths(
     paths: &ClusterPaths,
 ) -> Result<RenderedClusterInvite, CliError> {
     paths.ensure()?;
-    fs::create_dir_all(&paths.invites).map_err(|source| CliError::Io {
-        path: paths.invites.display().to_string(),
-        detail: source.to_string(),
-    })?;
     let state = read_cluster_state_without_kv(paths)?;
     if !cluster_raft_local_is_voter(&state) {
         return Err(cluster_invite_requires_voter_error(paths, &state));
@@ -514,8 +504,6 @@ pub(crate) fn cluster_invite_with_paths(
     }
     let uri = encode_cluster_join_invite(&invite)?;
     let join_command = cluster_join_command(&uri);
-    let persisted_path = paths.invite_path(&invite.invite_id);
-    write_json(&persisted_path, &invite)?;
     publish_cluster_invitation(paths, &state, &invite)?;
     if let Some(output) = &options.output {
         if let Some(parent) = output.parent() {
@@ -530,10 +518,10 @@ pub(crate) fn cluster_invite_with_paths(
         })?;
     }
     Ok(RenderedClusterInvite {
+        persisted_key: network::cluster_invitation_key(&invite.invite_id),
         invite,
         uri,
         join_command,
-        persisted_path,
         output_path: options.output,
     })
 }
@@ -922,27 +910,11 @@ pub(crate) fn invite_introducers_from_daemon_status(
 }
 
 pub(crate) fn discover_lan_ip_candidates() -> Vec<IpAddr> {
-    let mut candidates = Vec::new();
-    for target in ["8.8.8.8:80", "1.1.1.1:80", "192.0.2.1:80"] {
-        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-            continue;
-        };
-        if socket.connect(target).is_err() {
-            continue;
-        }
-        let Ok(address) = socket.local_addr() else {
-            continue;
-        };
-        let ip = address.ip();
-        if is_invitable_ip(ip) && !candidates.contains(&ip) {
-            candidates.push(ip);
-        }
-    }
-    candidates
+    network::discover_default_lan_ip_candidates()
 }
 
 pub(crate) fn is_invitable_ip(ip: IpAddr) -> bool {
-    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+    network::is_invitable_ip(ip)
 }
 
 pub(crate) fn format_ip_port(ip: IpAddr, port: u16) -> String {
@@ -1139,7 +1111,7 @@ pub(crate) fn cluster_join_with_paths(
     ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
     assign_local_node_public_keys(paths, &mut state)?;
     reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
-    write_json(&paths.state, &state)?;
+    network::write_cluster_state(paths, &state)?;
     println!("cluster join recorded: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     println!("invite: {}", options.invite);
@@ -1170,7 +1142,7 @@ pub(crate) fn cluster_join_retry_with_paths(
     assign_local_node_public_keys(paths, &mut state)?;
     reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
     state.updated_at = timestamp;
-    write_json(&paths.state, &state)?;
+    network::write_cluster_state(paths, &state)?;
     println!("cluster join reconciled: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     println!("invite: {}", options.invite);
@@ -1277,60 +1249,80 @@ pub(crate) fn send_cluster_join_registration(
     address: &str,
     request: &ClusterJoinRegistrationRequest,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    let payload = network::encode_object_text_payload(request)?;
     let challenge = random_url_secret(32)?;
     let challenge_request = ClusterInviteChallengeRequest {
         protocol: "sinomo.cluster-invite-challenge.v1".to_string(),
         invite_id: request.invite.invite_id.clone(),
         challenge: challenge.clone(),
     };
-    let challenge_payload = network::encode_object_text_payload(&challenge_request)?;
-    let signed = sign_daemon_command_for_local_node(&format!("CLUSTER_JOIN {payload}"))?;
-    let (proof_line, response) = network::send_daemon_command_pair_raw(
+    let challenge_rpc = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_JOIN_CHALLENGE_ROUTE,
+        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        &challenge_request,
+    )?;
+    let proof_response = network::send_daemon_rpc_raw(
         address,
-        &format!("INVITE_HELLO {challenge_payload}"),
-        &signed,
+        &daemon_rpc_command(network::CLUSTER_JOIN_CHALLENGE_ROUTE),
+        None,
+        &challenge_rpc,
         DAEMON_JOIN_TIMEOUT,
     )?;
-    let proof_payload = proof_line
-        .trim()
-        .strip_prefix("INVITE_PROOF ")
-        .ok_or_else(|| CliError::AuthDenied)?;
-    let proof: ClusterInviteChallengeProof = network::decode_object_text_payload(proof_payload)?;
+    let proof: ClusterInviteChallengeProof = proof_response.decode_body()?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+    let register_rpc = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_JOIN_REGISTER_ROUTE,
+        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        request,
+    )?;
+    let signed = sign_daemon_rpc_request_for_local_node(&register_rpc)?;
+    let response = network::send_daemon_rpc_raw(
+        address,
+        &daemon_rpc_command(network::CLUSTER_JOIN_REGISTER_ROUTE),
+        Some(&signed),
+        &register_rpc,
+        DAEMON_JOIN_TIMEOUT,
+    )?;
+    response.decode_body().map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_join_registration_over_iroh(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterJoinRegistrationRequest,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    let payload = network::encode_object_text_payload(request)?;
     let challenge = random_url_secret(32)?;
     let challenge_request = ClusterInviteChallengeRequest {
         protocol: "sinomo.cluster-invite-challenge.v1".to_string(),
         invite_id: request.invite.invite_id.clone(),
         challenge: challenge.clone(),
     };
-    let challenge_payload = network::encode_object_text_payload(&challenge_request)?;
-    let proof_response = network::send_daemon_command_to_cluster_endpoint(
+    let challenge_rpc = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_JOIN_CHALLENGE_ROUTE,
+        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        &challenge_request,
+    )?;
+    let proof_response = network::send_daemon_rpc_to_cluster_endpoint(
         endpoint,
-        &format!("INVITE_HELLO {challenge_payload}"),
+        &daemon_rpc_command(network::CLUSTER_JOIN_CHALLENGE_ROUTE),
+        None,
+        &challenge_rpc,
         IROH_DAEMON_JOIN_TIMEOUT,
     )?;
-    let proof_payload = proof_response
-        .trim()
-        .strip_prefix("INVITE_PROOF ")
-        .ok_or_else(|| CliError::AuthDenied)?;
-    let proof: ClusterInviteChallengeProof = network::decode_object_text_payload(proof_payload)?;
+    let proof: ClusterInviteChallengeProof = proof_response.decode_body()?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
-    let signed = sign_daemon_command_for_local_node(&format!("CLUSTER_JOIN {payload}"))?;
-    let response = network::send_daemon_command_to_cluster_endpoint(
+    let register_rpc = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_JOIN_REGISTER_ROUTE,
+        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        request,
+    )?;
+    let signed = sign_daemon_rpc_request_for_local_node(&register_rpc)?;
+    let response = network::send_daemon_rpc_to_cluster_endpoint(
         endpoint,
-        &signed,
+        &daemon_rpc_command(network::CLUSTER_JOIN_REGISTER_ROUTE),
+        Some(&signed),
+        &register_rpc,
         IROH_DAEMON_JOIN_TIMEOUT,
     )?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+    response.decode_body().map_err(Into::into)
 }
 
 pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
@@ -1408,12 +1400,13 @@ fn push_invite_param_raw(params: &mut Vec<String>, key: &str, value: &str) {
 
 fn decode_cluster_join_invite_uri(payload: &str) -> Result<ClusterJoinInvite, CliError> {
     let params = parse_invite_query(payload.strip_prefix('?').unwrap_or(payload))?;
-    let invite_id =
-        sinomo_runtime::core::ClusterInviteId::new(&required_invite_param(&params, "invite_id")?)
-            .map_err(|source| CliError::Parse {
-            detail: format!("invalid invite_id: {source}"),
-        })?;
-    let cluster_id = ClusterId::new(
+    let invite_id = sinomo_runtime::core::ClusterInviteId::deserialize_migrating_legacy(
+        &required_invite_param(&params, "invite_id")?,
+    )
+    .map_err(|source| CliError::Parse {
+        detail: format!("invalid invite_id: {source}"),
+    })?;
+    let cluster_id = ClusterId::deserialize_migrating_legacy(
         &optional_invite_param(&params, "cluster_id")?
             .unwrap_or_else(|| pending_invite_cluster_id().to_string()),
     )
@@ -1445,13 +1438,13 @@ fn decode_cluster_join_invite_uri(payload: &str) -> Result<ClusterJoinInvite, Cl
                 .and_then(|value| parse_query_enum::<ClusterMemberRole>(&value))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let issuer_node_id = NodeId::new(
-        &optional_invite_param(&params, "issuer_node_id")?
-            .unwrap_or_else(|| "node_pending_invite".to_string()),
-    )
-    .map_err(|source| CliError::Parse {
-        detail: format!("invalid issuer_node_id: {source}"),
-    })?;
+    let issuer_node_id = if let Some(value) = optional_invite_param(&params, "issuer_node_id")? {
+        NodeId::deserialize_migrating_legacy(&value).map_err(|source| CliError::Parse {
+            detail: format!("invalid issuer_node_id: {source}"),
+        })?
+    } else {
+        pending_invite_node_id()
+    };
     let communication_channels = params
         .iter()
         .filter(|(key, _)| key == "channel")
@@ -1510,7 +1503,11 @@ fn required_invite_param_any(
 }
 
 fn pending_invite_cluster_id() -> &'static str {
-    "cluster_pending_join"
+    "01hxy6qa9k0t9vr4g9n8d3q5c0"
+}
+
+fn pending_invite_node_id() -> NodeId {
+    NodeId::from_legacy_named("node_pending_invite").expect("static pending invite node id")
 }
 
 fn invite_has_embedded_cluster_identity(invite: &ClusterJoinInvite) -> bool {
@@ -1563,7 +1560,8 @@ fn decode_invite_channel(value: &str) -> Result<ClusterInvitationChannel, CliErr
         return Ok(ClusterInvitationChannel {
             endpoint: ClusterEndpointRecord {
                 endpoint_id: ClusterEndpointId::generate(),
-                node_id: NodeId::new("node_invite_channel").expect("static invite channel node id"),
+                node_id: NodeId::from_legacy_named("node_invite_channel")
+                    .expect("static invite channel node id"),
                 transport: parse_query_enum(&parts[0])?,
                 address: parts[1].clone(),
                 source: ClusterEndpointSource::Static,
@@ -1872,12 +1870,8 @@ pub(crate) fn probe_member_daemon_status(
         if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
             continue;
         }
-        let Ok(response) =
-            send_daemon_command_to_endpoint(&endpoint, "STATUS", CLUSTER_HEALTH_PROBE_TIMEOUT)
+        let Ok(status) = fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
         else {
-            continue;
-        };
-        let Ok(status) = serde_json::from_str::<DaemonStatus>(response.trim()) else {
             continue;
         };
         let Some(cluster) = status.cluster.as_ref() else {
@@ -2236,7 +2230,7 @@ pub(crate) fn cluster_peer_members(
             &shadow_options,
             OffsetDateTime::now_utc(),
         );
-        write_json(&paths.state, &state)?;
+        network::write_cluster_state(paths, &state)?;
     }
     Ok(state.members)
 }
@@ -2291,19 +2285,17 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
     let Some(status) = default_main_daemon_status()? else {
         return Ok(());
     };
-    let Ok(response) =
-        send_daemon_command(&status.address, "CLUSTER_KV_SNAPSHOT", DAEMON_PROBE_TIMEOUT)
-    else {
+    let Ok(request) = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_KV_SNAPSHOT_ROUTE,
+        network::CLUSTER_KV_RPC_CATEGORY,
+        &(),
+    ) else {
         return Ok(());
     };
-    if response.trim().is_empty() {
+    let Ok(response) = send_daemon_rpc(&status.address, &request, DAEMON_PROBE_TIMEOUT) else {
         return Ok(());
-    }
-    let snapshot: KvSnapshot =
-        serde_json::from_str(response.trim()).map_err(|source| CliError::Json {
-            path: "cluster kv snapshot response".to_string(),
-            detail: source.to_string(),
-        })?;
+    };
+    let snapshot: KvSnapshot = response.decode_body()?;
     write_cluster_kv_snapshot(paths, &snapshot)
 }
 
@@ -2996,15 +2988,14 @@ impl ClusterNetworkMaintenance {
             let key = cluster_connectivity_probe_key(&state.local_node_id, &endpoint);
             active_keys.insert(key.clone());
             let started = Instant::now();
-            let result =
-                send_daemon_command_to_endpoint(&endpoint, "STATUS", CLUSTER_HEALTH_PROBE_TIMEOUT);
+            let result = fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT);
             let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let previous = self
                 .connectivity
                 .get(&key)
                 .map(|state| state.record.clone());
             let record = match result {
-                Ok(response) if cluster_status_response_matches(state, &endpoint, &response) => {
+                Ok(status) if cluster_status_matches(state, &endpoint, &status) => {
                     cluster_connectivity_record(
                         state,
                         &endpoint,
@@ -3139,14 +3130,11 @@ pub(crate) fn cluster_connectivity_probe_key(
     )
 }
 
-pub(crate) fn cluster_status_response_matches(
+pub(crate) fn cluster_status_matches(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
-    response: &str,
+    status: &DaemonStatus,
 ) -> bool {
-    let Ok(status) = serde_json::from_str::<DaemonStatus>(response.trim()) else {
-        return false;
-    };
     status.cluster.as_ref().is_some_and(|cluster| {
         cluster.cluster_id == state.cluster_id && cluster.node_id == endpoint.node_id
     })
@@ -3247,7 +3235,7 @@ pub(crate) fn cluster_reachable_voter_count(
         if !cluster_raft_node_is_voter(state, &endpoint.node_id) {
             continue;
         }
-        if send_daemon_command_to_endpoint(&endpoint, "STATUS", DAEMON_JOIN_TIMEOUT).is_ok() {
+        if fetch_daemon_status_from_endpoint(&endpoint, DAEMON_JOIN_TIMEOUT).is_ok() {
             voters.insert(endpoint.node_id);
             if voters.len() >= quorum_size {
                 break;
@@ -3588,52 +3576,72 @@ pub(crate) fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRe
     }
 }
 
-pub(crate) fn send_daemon_command_to_endpoint(
+pub(crate) fn send_daemon_rpc_to_endpoint(
     endpoint: &ClusterEndpointRecord,
-    command: &str,
+    request: &network::ObjectRpcRequest,
     timeout: Duration,
-) -> Result<String, CliError> {
-    let signed = sign_daemon_command_for_local_node(command)?;
-    network::send_daemon_command_to_cluster_endpoint(endpoint, &signed, timeout).map_err(Into::into)
+) -> Result<network::ObjectRpcResponse, CliError> {
+    let signed = sign_daemon_rpc_request_for_local_node(request)?;
+    network::send_daemon_rpc_to_cluster_endpoint(
+        endpoint,
+        &daemon_rpc_command(&request.route),
+        Some(&signed),
+        request,
+        timeout,
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) fn fetch_daemon_status_from_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<DaemonStatus, CliError> {
+    let request = network::ObjectRpcRequest::encode_body(
+        network::DAEMON_STATUS_ROUTE,
+        network::DAEMON_RPC_CATEGORY,
+        &(),
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &request, timeout)?;
+    response.decode_body().map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_raft_append(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterRaftAppendRequest,
 ) -> Result<ClusterRaftAppendResponse, CliError> {
-    let payload = network::encode_object_text_payload(request)?;
-    let response = send_daemon_command_to_endpoint(
-        endpoint,
-        &format!("CLUSTER_RAFT_APPEND {payload}"),
-        DAEMON_JOIN_TIMEOUT,
+    let rpc_request = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_RAFT_APPEND_ROUTE,
+        network::CLUSTER_RAFT_RPC_CATEGORY,
+        request,
     )?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, DAEMON_JOIN_TIMEOUT)?;
+    response.decode_body().map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_raft_vote(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterRaftVoteRequest,
 ) -> Result<ClusterRaftVoteResponse, CliError> {
-    let payload = network::encode_object_text_payload(request)?;
-    let response = send_daemon_command_to_endpoint(
-        endpoint,
-        &format!("CLUSTER_RAFT_VOTE {payload}"),
-        DAEMON_JOIN_TIMEOUT,
+    let rpc_request = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_RAFT_VOTE_ROUTE,
+        network::CLUSTER_RAFT_RPC_CATEGORY,
+        request,
     )?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, DAEMON_JOIN_TIMEOUT)?;
+    response.decode_body().map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_member_publish(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterMemberPublishRequest,
 ) -> Result<ClusterMemberPublishResponse, CliError> {
-    let payload = network::encode_object_text_payload(request)?;
-    let response = send_daemon_command_to_endpoint(
-        endpoint,
-        &format!("CLUSTER_MEMBER_PUBLISH {payload}"),
-        DAEMON_JOIN_TIMEOUT,
+    let rpc_request = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_MEMBER_PUBLISH_ROUTE,
+        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        request,
     )?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, DAEMON_JOIN_TIMEOUT)?;
+    response.decode_body().map_err(Into::into)
 }
 
 pub(crate) fn send_cluster_kv_watch_events(
@@ -3647,21 +3655,20 @@ pub(crate) fn send_cluster_kv_watch_events(
             stored_events: 0,
         });
     }
-    let payload = network::encode_object_text_payload(request)?;
-    let response = send_daemon_command_to_endpoint(
-        endpoint,
-        &format!("CLUSTER_KV_WATCH_EVENTS {payload}"),
-        DAEMON_JOIN_TIMEOUT,
+    let rpc_request = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_KV_WATCH_EVENTS_ROUTE,
+        network::CLUSTER_KV_RPC_CATEGORY,
+        request,
     )?;
-    network::decode_object_text_payload(response.trim()).map_err(Into::into)
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, DAEMON_JOIN_TIMEOUT)?;
+    response.decode_body().map_err(Into::into)
 }
 
-pub(crate) fn handle_daemon_cluster_raft_append(
+pub(crate) fn handle_daemon_cluster_raft_append_request(
     paths: &DaemonPaths,
-    payload: &str,
+    request: ClusterRaftAppendRequest,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<ClusterRaftAppendResponse, CliError> {
-    let request: ClusterRaftAppendRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -3735,12 +3742,11 @@ pub(crate) fn handle_daemon_cluster_raft_append(
     })
 }
 
-pub(crate) fn handle_daemon_cluster_raft_vote(
+pub(crate) fn handle_daemon_cluster_raft_vote_request(
     paths: &DaemonPaths,
-    payload: &str,
+    request: ClusterRaftVoteRequest,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<ClusterRaftVoteResponse, CliError> {
-    let request: ClusterRaftVoteRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -3825,11 +3831,10 @@ pub(crate) fn authenticated_signer_matches_cluster_node(
     })
 }
 
-pub(crate) fn handle_daemon_cluster_kv_watch_events(
+pub(crate) fn handle_daemon_cluster_kv_watch_events_request(
     paths: &DaemonPaths,
-    payload: &str,
+    request: ClusterKvWatchEventsRequest,
 ) -> Result<ClusterKvWatchEventsResponse, CliError> {
-    let request: ClusterKvWatchEventsRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -3864,12 +3869,11 @@ pub(crate) fn handle_daemon_cluster_kv_watch_events(
     })
 }
 
-pub(crate) fn handle_daemon_cluster_invite_publish(
+pub(crate) fn handle_daemon_cluster_invite_publish_request(
     paths: &DaemonPaths,
-    payload: &str,
+    request: ClusterInvitePublishRequest,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<ClusterInvitePublishResponse, CliError> {
-    let request: ClusterInvitePublishRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -3947,12 +3951,11 @@ pub(crate) fn handle_daemon_cluster_invite_publish(
     }
 }
 
-pub(crate) fn handle_daemon_cluster_member_publish(
+pub(crate) fn handle_daemon_cluster_member_publish_request(
     paths: &DaemonPaths,
-    payload: &str,
+    request: ClusterMemberPublishRequest,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<ClusterMemberPublishResponse, CliError> {
-    let request: ClusterMemberPublishRequest = network::decode_object_text_payload(payload)?;
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -4377,28 +4380,7 @@ pub(crate) fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Ve
 }
 
 pub(crate) fn discover_peer_route_ip_candidates(state: &ClusterBootstrapState) -> Vec<IpAddr> {
-    let mut candidates = Vec::new();
-    for target in advertised_peer_route_targets(state) {
-        let bind = if target.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let Ok(socket) = UdpSocket::bind(bind) else {
-            continue;
-        };
-        if socket.connect(target).is_err() {
-            continue;
-        }
-        let Ok(address) = socket.local_addr() else {
-            continue;
-        };
-        let ip = address.ip();
-        if is_invitable_ip(ip) && !candidates.contains(&ip) {
-            candidates.push(ip);
-        }
-    }
-    candidates
+    network::discover_local_ip_candidates_for_targets(advertised_peer_route_targets(state))
 }
 
 pub(crate) fn daemon_loopback_endpoint(
@@ -4470,7 +4452,7 @@ pub(crate) fn register_daemon_cluster_node(
         &registration.shadow_options,
         OffsetDateTime::now_utc(),
     );
-    write_json(&paths.state, &state)?;
+    network::write_cluster_state(&paths, &state)?;
     daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
         detail: "daemon cluster member could not be registered".to_string(),
     })
@@ -4643,45 +4625,7 @@ pub(crate) fn cluster_node_status_from_daemon_status(
 pub(crate) fn read_cluster_rollout_status(
     paths: &SelfRolloutPaths,
 ) -> Result<Option<ClusterNodeRolloutStatus>, CliError> {
-    if !paths.state.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&paths.state).map_err(|source| CliError::Io {
-        path: paths.state.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let value: serde_json::Value =
-        serde_json::from_str(&content).map_err(|source| CliError::Json {
-            path: paths.state.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    let Some(status) = json_string_field(&value, "status") else {
-        return Ok(None);
-    };
-    Ok(Some(ClusterNodeRolloutStatus {
-        status,
-        mode: json_string_field(&value, "mode"),
-        detail: json_string_field(&value, "detail"),
-        source: json_string_field(&value, "source")
-            .or_else(|| json_string_field(&value, "source_repo")),
-        requested_at: json_string_field(&value, "requested_at"),
-        staged_at: json_string_field(&value, "staged_at"),
-        updated_at: json_string_field(&value, "updated_at"),
-        failed_at: json_string_field(&value, "failed_at"),
-        diagnostics: json_string_field(&value, "diagnostics"),
-        stdout_log: json_string_field(&value, "stdout_log"),
-        stderr_log: json_string_field(&value, "stderr_log"),
-        stdout_tail: json_string_field(&value, "stdout_tail"),
-        stderr_tail: json_string_field(&value, "stderr_tail"),
-    }))
-}
-
-pub(crate) fn json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
-    value.get(key).and_then(|field| match field {
-        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
-        serde_json::Value::Null => None,
-        other => Some(other.to_string()),
-    })
+    read_rollout_status(paths).map_err(Into::into)
 }
 
 pub(crate) fn daemon_cluster_registration(

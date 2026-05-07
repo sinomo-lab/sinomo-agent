@@ -183,15 +183,15 @@ mod tests {
 
     #[test]
     fn speech_output_completes_on_local_speaker() {
-        let node = NodeId::new("node_desktop").expect("node");
+        let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let speaker = DeviceProfile::new(node.clone(), "speaker", DeviceKind::Speaker)
             .with_permission(DevicePermission::EmitOutput);
         let request = SpeechOutputRequest {
-            request_id: TaskId::new("task_voice").expect("task"),
+            request_id: TaskId::from_legacy_named("task_voice").expect("task"),
             origin_node_id: node.clone(),
             target_node_id: node.clone(),
             target_device_id: speaker.device_id.clone(),
-            session_id: Some(SessionId::new("sess_voice").expect("session")),
+            session_id: Some(SessionId::from_legacy_named("sess_voice").expect("session")),
             text: "I see the alert.".to_string(),
             allow_barge_in: true,
         };
@@ -208,8 +208,8 @@ mod tests {
 
     #[test]
     fn barge_in_interrupts_active_session_output() {
-        let node = NodeId::new("node_desktop").expect("node");
-        let session = SessionId::new("sess_voice").expect("session");
+        let node = NodeId::from_legacy_named("node_desktop").expect("node");
+        let session = SessionId::from_legacy_named("sess_voice").expect("session");
         let speaker = DeviceProfile::new(
             node.clone(),
             "speaker",
@@ -217,7 +217,7 @@ mod tests {
         )
         .with_permission(DevicePermission::EmitOutput);
         let request = SpeechOutputRequest {
-            request_id: TaskId::new("task_voice").expect("task"),
+            request_id: TaskId::from_legacy_named("task_voice").expect("task"),
             origin_node_id: node.clone(),
             target_node_id: node.clone(),
             target_device_id: speaker.device_id.clone(),

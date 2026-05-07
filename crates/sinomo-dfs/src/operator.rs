@@ -7,6 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::{DfsFileSystemId, DfsObjectId, DfsVersion, NodeId};
+use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
@@ -362,7 +363,7 @@ impl LocalDfsPinStore {
     }
 
     pub fn put_pin(&self, record: &DfsPinRecord) -> Result<(), DfsPinStoreError> {
-        write_json_atomic(&self.pin_path(record), record)
+        write_object_atomic(&self.pin_path(record), record)
     }
 
     pub fn remove_pin(
@@ -398,10 +399,10 @@ impl LocalDfsPinStore {
         let mut records = Vec::new();
         for entry in read_dir(&self.root)? {
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
                 continue;
             }
-            let record: DfsPinRecord = read_json(&path)?;
+            let record: DfsPinRecord = read_object(&path)?;
             if file_system_id.is_none_or(|expected| &record.file_system_id == expected) {
                 records.push(record);
             }
@@ -417,7 +418,7 @@ impl LocalDfsPinStore {
 
     fn pin_path(&self, record: &DfsPinRecord) -> PathBuf {
         self.root.join(format!(
-            "{}-{}-{}.json",
+            "{}-{}-{}.sobj",
             key_segment(&record.file_system_id),
             path_hash(&record.path),
             key_segment(&record.pinned_by_node_id)
@@ -430,7 +431,7 @@ pub enum DfsPinStoreError {
     #[error("io error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("pin serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
+    Serde(String),
 }
 
 fn agent_state_for(
@@ -476,7 +477,7 @@ fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>, DfsPinStoreError> {
     Ok(entries)
 }
 
-fn read_json<T>(path: &Path) -> Result<T, DfsPinStoreError>
+fn read_object<T>(path: &Path) -> Result<T, DfsPinStoreError>
 where
     T: DeserializeOwned,
 {
@@ -484,10 +485,11 @@ where
         path: path.to_owned(),
         source,
     })?;
-    Ok(serde_json::from_slice(&bytes)?)
+    sinomo_object_serde::from_bytes(&bytes)
+        .map_err(|source| DfsPinStoreError::Serde(source.to_string()))
 }
 
-fn write_json_atomic<T>(path: &Path, value: &T) -> Result<(), DfsPinStoreError>
+fn write_object_atomic<T>(path: &Path, value: &T) -> Result<(), DfsPinStoreError>
 where
     T: Serialize,
 {
@@ -498,11 +500,11 @@ where
         })?;
     }
     let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, serde_json::to_vec_pretty(value)?).map_err(|source| {
-        DfsPinStoreError::Io {
-            path: tmp_path.clone(),
-            source,
-        }
+    let bytes = sinomo_object_serde::to_bytes(value, 1, LengthMode::U32)
+        .map_err(|source| DfsPinStoreError::Serde(source.to_string()))?;
+    fs::write(&tmp_path, bytes).map_err(|source| DfsPinStoreError::Io {
+        path: tmp_path.clone(),
+        source,
     })?;
     fs::rename(&tmp_path, path).map_err(|source| DfsPinStoreError::Io {
         path: path.to_owned(),
@@ -583,7 +585,7 @@ mod tests {
                     object_id: object_id(),
                     committed_version: version("version_2"),
                     owner_node_id: node("node_owner"),
-                    event_id: EventId::new("evt_commit").expect("event"),
+                    event_id: EventId::from_legacy_named("evt_commit").expect("event"),
                 },
                 replica_node_id: node("node_owner"),
                 content_hash: Some("blake3:new".to_string()),
@@ -673,19 +675,19 @@ mod tests {
     }
 
     fn file_system_id() -> DfsFileSystemId {
-        DfsFileSystemId::new("sifs").expect("filesystem")
+        DfsFileSystemId::from_legacy_named("sifs").expect("filesystem")
     }
 
     fn object_id() -> DfsObjectId {
-        DfsObjectId::new("obj_artifact").expect("object")
+        DfsObjectId::from_legacy_named("obj_artifact").expect("object")
     }
 
     fn version(value: &str) -> DfsVersion {
-        DfsVersion::new(value).expect("version")
+        DfsVersion::from_legacy_named(value).expect("version")
     }
 
     fn node(value: &str) -> NodeId {
-        NodeId::new(value).expect("node")
+        NodeId::from_legacy_named(value).expect("node")
     }
 
     fn temp_root(name: &str) -> PathBuf {

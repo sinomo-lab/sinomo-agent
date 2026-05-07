@@ -68,7 +68,7 @@ On join, the remote node builds local pending cluster state and then contacts th
 Initial local state lives at:
 
 ```text
-$SINOMO_DATA_DIR/cluster/state.json
+$SINOMO_DATA_DIR/cluster/state.sobj
 ```
 
 The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core` for the local cluster identity, local node identity, current Raft term/revision, and current member records. It records the current cluster status through member records, keeping the documented node role separate from Raft membership state. Durable membership and config state come from the replicated KV log; the file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
@@ -116,7 +116,7 @@ Daemon and shadow daemon membership is process-scoped rather than machine-scoped
 3. Creates a cluster root key or uses a future operator-provided key.
 4. Creates the first member as an active voter.
 5. Creates an initial KV log entry containing cluster metadata, member metadata, and schema versions.
-6. Writes local cluster state under `$SINOMO_DATA_DIR/cluster/state.json`.
+6. Writes local cluster state under `$SINOMO_DATA_DIR/cluster/state.sobj`.
 
 The first node is both control-plane voter and data-plane participant. Additional nodes join as learners first.
 
@@ -436,7 +436,7 @@ Disaster recovery:
 Phase 0, local cluster state:
 
 - Add `sinomo cluster` CLI. Implemented in `crates/sinomo-cli`.
-- Persist local cluster state. Implemented as `$SINOMO_DATA_DIR/cluster/state.json`.
+- Persist local cluster state. Implemented as `$SINOMO_DATA_DIR/cluster/state.sobj`.
 - Add orphan guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
 - Require short-lived join material. Implemented by storing signed invitation records in cluster KV while the portable `sinomo-join://v1` URI carries only the public key, invite ID, secret, and communication channels needed to reach an introducer.
 
@@ -454,7 +454,7 @@ Phase 2, KV core:
 - Add WAL, snapshots, revisions, compare-and-swap transactions, and watches. Implemented as `DurableRaftKvNode`, `KvWalPaths`, `RaftHardState`, `KvLogEntry`, `RaftSnapshot`, `KvRevision`, `KvTxn`, and prefix watches; durable nodes replay JSONL WAL entries, persist hard state, save and restore snapshots, preserve watchable event history across snapshot restore, and compact WAL after snapshots.
 - Store membership and service registry records in the KV. Implemented for cluster identity under `/cluster/config/identity`, Raft role config under `/cluster/raft/config`, membership records under `/cluster/members/<node_id>`, split endpoint records under `/cluster/endpoints/<node_id>/<endpoint_id>`, capability policy under `/cluster/policy/capabilities/<node_id>`, invitations and invite state under `/cluster/invitations/...`, rollout desired/node state under `/cluster/rollout/...`, and runtime health records under `/cluster/node-status/<node_id>`; service registry records use the same generic keyspace and lease primitives.
 - Generate node identity key pairs and publish public keys in KV membership records. Implemented with node-local Ed25519 identity files under `$SINOMO_DATA_DIR/identity/`; the main daemon and shadow daemon have distinct public keys, and local CLI control messages are signed from the local main identity.
-- Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned `CLUSTER_KV_SNAPSHOT`, `CLUSTER_KV_TXN`, and `CLUSTER_KV_RANGE_PREFIX` control messages backed by a per-node durable Raft WAL under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/`; `$SINOMO_DATA_DIR/cluster/kv-snapshot.json` stores the current local snapshot. Cluster init, daemon registration, and join registration persist member records into the KV, daemon maintenance publishes version/health/rollout node-status records, and join responses carry the current snapshot to the joining node.
+- Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned object RPC routes backed by a per-node durable Raft WAL under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/`; `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj` stores the current local snapshot. Cluster init, daemon registration, and join registration persist member records into the KV, daemon maintenance publishes version/health/rollout node-status records, and join responses carry the current snapshot to the joining node.
 - Integrate the daemon's cluster KV transport with the durable Raft core. Implemented with authenticated `CLUSTER_RAFT_APPEND`, `CLUSTER_RAFT_VOTE`, and `CLUSTER_KV_WATCH_EVENTS` daemon messages. The periodic cluster path no longer exchanges and merges whole KV snapshots; the current durable Raft leader sends append-entries with optional Raft snapshot-install payloads to followers, and vote requests are handled against durable local hard state. Daemon maintenance checks leader reachability, starts a new election when the known leader is missing, persists the elected leader after quorum, steps down when it cannot observe quorum during replication, and fans out watch event history over the authenticated transport so local daemon-backed prefix watches can resume and drain committed changes.
 
 Phase 3, real local network:

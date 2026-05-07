@@ -8,6 +8,7 @@
 use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::{DfsFileSystemId, DfsObjectId, DfsVersion, DfsWriteReceipt, EventId, NodeId};
+use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -22,7 +23,7 @@ pub enum MetadataBackendError {
     #[error("io error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("metadata serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
+    Serde(String),
     #[error("filesystem not found: {file_system_id}")]
     UnknownFileSystem { file_system_id: DfsFileSystemId },
     #[error("object not found: {object_id}")]
@@ -400,7 +401,7 @@ impl LocalJsonMetadataBackend {
     fn file_system_path(&self, file_system_id: &DfsFileSystemId) -> PathBuf {
         self.records_root()
             .join("filesystems")
-            .join(format!("{}.json", key_segment(file_system_id)))
+            .join(format!("{}.sobj", key_segment(file_system_id)))
     }
 
     fn file_system_dir(&self) -> PathBuf {
@@ -411,7 +412,7 @@ impl LocalJsonMetadataBackend {
         self.records_root()
             .join("objects")
             .join(key_segment(object_id))
-            .join("object.json")
+            .join("object.sobj")
     }
 
     fn object_dir(&self) -> PathBuf {
@@ -422,20 +423,20 @@ impl LocalJsonMetadataBackend {
         self.records_root()
             .join("paths")
             .join(key_segment(file_system_id))
-            .join(format!("{}.json", path_hash(path)))
+            .join(format!("{}.sobj", path_hash(path)))
     }
 
     fn inode_path(&self, inode_id: &DfsInodeId) -> PathBuf {
         self.records_root()
             .join("inodes")
-            .join(format!("{}.json", key_segment(&inode_id.0)))
+            .join(format!("{}.sobj", key_segment(&inode_id.0)))
     }
 
     fn dirfrag_path(&self, dir_inode_id: &DfsInodeId, dirfrag_id: &DfsDirFragmentId) -> PathBuf {
         self.records_root()
             .join("dirfrags")
             .join(key_segment(&dir_inode_id.0))
-            .join(format!("{}.json", key_segment(&dirfrag_id.0)))
+            .join(format!("{}.sobj", key_segment(&dirfrag_id.0)))
     }
 
     fn dentry_path(&self, path_record: &DfsPathRecord) -> PathBuf {
@@ -444,7 +445,7 @@ impl LocalJsonMetadataBackend {
             .join(key_segment(&path_record.parent_inode_id.0))
             .join(key_segment(&path_record.dirfrag_id.0))
             .join(format!(
-                "{:016x}-{}.json",
+                "{:016x}-{}.sobj",
                 path_record.name_hash,
                 path_hash(&path_record.name)
             ))
@@ -454,7 +455,7 @@ impl LocalJsonMetadataBackend {
         self.records_root()
             .join("versions")
             .join(key_segment(object_id))
-            .join(format!("{}.json", key_segment(version)))
+            .join(format!("{}.sobj", key_segment(version)))
     }
 
     fn version_dir(&self, object_id: &DfsObjectId) -> PathBuf {
@@ -473,7 +474,7 @@ impl LocalJsonMetadataBackend {
             .join("receipts")
             .join(key_segment(object_id))
             .join(key_segment(version))
-            .join(format!("{}.json", key_segment(replica_node_id)))
+            .join(format!("{}.sobj", key_segment(replica_node_id)))
     }
 
     fn receipt_dir(&self, object_id: &DfsObjectId, version: &DfsVersion) -> PathBuf {
@@ -487,7 +488,7 @@ impl LocalJsonMetadataBackend {
         self.records_root()
             .join("intents")
             .join(key_segment(object_id))
-            .join(format!("{}.json", key_segment(&intent_id)))
+            .join(format!("{}.sobj", key_segment(&intent_id)))
     }
 
     fn intent_dir(&self, object_id: &DfsObjectId) -> PathBuf {
@@ -508,13 +509,13 @@ impl LocalJsonMetadataBackend {
 
     fn conflict_path_by_id(&self, object_id: &DfsObjectId, conflict_id: &str) -> PathBuf {
         self.conflict_dir(object_id)
-            .join(format!("{}.json", key_segment(&conflict_id)))
+            .join(format!("{}.sobj", key_segment(&conflict_id)))
     }
 
     fn journal_path(&self, sequence: u64) -> PathBuf {
         self.root
             .join("journal")
-            .join(format!("{sequence:020}.json"))
+            .join(format!("{sequence:020}.sobj"))
     }
 }
 
@@ -607,7 +608,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             return Ok(objects);
         }
         for entry in read_dir(&self.object_dir())? {
-            let path = entry.path().join("object.json");
+            let path = entry.path().join("object.sobj");
             if !path.is_file() {
                 continue;
             }
@@ -805,7 +806,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         }
         for entry in read_dir(&journal_dir)? {
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
                 continue;
             }
             let journal_entry: DfsMetadataJournalEntry = read_json(&path)?;
@@ -972,7 +973,8 @@ fn read_json<T>(path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    Ok(serde_json::from_slice(&read_file(path)?)?)
+    sinomo_object_serde::from_bytes(&read_file(path)?)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))
 }
 
 fn read_json_optional<T>(path: &Path) -> Result<Option<T>>
@@ -995,7 +997,7 @@ where
     let mut records = Vec::new();
     for entry in read_dir(path)? {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("sobj") {
             records.push(read_json(&path)?);
         }
     }
@@ -1006,7 +1008,9 @@ fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,
 {
-    write_file_atomic(path, &serde_json::to_vec_pretty(value)?)
+    let bytes = sinomo_object_serde::to_bytes(value, 1, LengthMode::U32)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    write_file_atomic(path, &bytes)
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1031,19 +1035,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn node(value: &str) -> NodeId {
-        NodeId::new(value).expect("valid node id")
+        NodeId::from_legacy_named(value).expect("valid node id")
     }
 
     fn file_system_id() -> DfsFileSystemId {
-        DfsFileSystemId::new("sifs").expect("valid filesystem id")
+        DfsFileSystemId::from_legacy_named("sifs").expect("valid filesystem id")
     }
 
     fn object_id() -> DfsObjectId {
-        DfsObjectId::new("obj_readme").expect("valid object id")
+        DfsObjectId::from_legacy_named("obj_readme").expect("valid object id")
     }
 
     fn version(value: &str) -> DfsVersion {
-        DfsVersion::new(value).expect("valid version")
+        DfsVersion::from_legacy_named(value).expect("valid version")
     }
 
     fn file_system() -> DfsFileSystem {
@@ -1196,7 +1200,7 @@ mod tests {
                 object_id: committed.object_id.clone(),
                 committed_version: committed.version.clone(),
                 owner_node_id: node("node_owner"),
-                event_id: EventId::new("evt_commit").expect("event"),
+                event_id: EventId::from_legacy_named("evt_commit").expect("event"),
             },
             replica_node_id: node("node_replica"),
             content_hash: committed.content_hash.clone(),

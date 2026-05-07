@@ -101,6 +101,19 @@ impl From<sinomo_runtime::dfs::DfsExposeStoreError> for CliError {
     }
 }
 
+impl From<sinomo_runtime::storage::StorageContractError> for CliError {
+    fn from(error: sinomo_runtime::storage::StorageContractError) -> Self {
+        match error {
+            sinomo_runtime::storage::StorageContractError::Io { path, detail } => {
+                Self::Io { path, detail }
+            }
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
 impl From<KvError> for CliError {
     fn from(error: KvError) -> Self {
         Self::Kv(error)
@@ -156,6 +169,9 @@ impl From<sinomo_runtime::node::NodeIdentityError> for CliError {
             sinomo_runtime::node::NodeIdentityError::Json { path, detail } => {
                 Self::Json { path, detail }
             }
+            sinomo_runtime::node::NodeIdentityError::Object { path, detail } => Self::Parse {
+                detail: format!("node identity object error at {path}: {detail}"),
+            },
         }
     }
 }
@@ -190,6 +206,9 @@ impl From<RolloutError> for CliError {
         match error {
             RolloutError::Io { path, detail } => Self::Io { path, detail },
             RolloutError::Json { path, detail } => Self::Json { path, detail },
+            RolloutError::Object { path, detail } => Self::Parse {
+                detail: format!("sinomo object error at {path}: {detail}"),
+            },
             RolloutError::Process {
                 command,
                 status,

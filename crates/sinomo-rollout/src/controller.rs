@@ -210,11 +210,13 @@ mod tests {
 
     #[test]
     fn passed_shadow_scorecard_advances_r3_canary() {
-        let node = NodeId::new("node_desktop").expect("node");
+        let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let plan = RolloutPlan {
-            rollout_plan_id: RolloutPlanId::new("rollout_candidate").expect("rollout"),
-            artifact_id: ArtifactId::new("artifact_candidate").expect("artifact"),
-            module_id: ModuleId::new("module.trigger.silence_policy").expect("module"),
+            rollout_plan_id: RolloutPlanId::from_legacy_named("rollout_candidate")
+                .expect("rollout"),
+            artifact_id: ArtifactId::from_legacy_named("artifact_candidate").expect("artifact"),
+            module_id: ModuleId::from_legacy_named("module.trigger.silence_policy")
+                .expect("module"),
             target_ring: TrustRing::R3SandboxedModule,
             strategy: RolloutStrategy::Shadow,
             target_nodes: vec![node.clone()],
@@ -223,16 +225,18 @@ mod tests {
             rollback_policy: RollbackPolicy::default(),
         };
         let controller = RolloutController::new(node);
-        let state =
-            controller.initial_state(plan, ArtifactId::new("artifact_active").expect("artifact"));
+        let state = controller.initial_state(
+            plan,
+            ArtifactId::from_legacy_named("artifact_active").expect("artifact"),
+        );
         let decision = controller.advance(
             state,
             RolloutObservation {
                 scorecard: Some(EvaluationScorecard {
-                    scorecard_id: ScorecardId::new("score_candidate").expect("score"),
+                    scorecard_id: ScorecardId::from_legacy_named("score_candidate").expect("score"),
                     baseline_artifact_id: None,
                     candidate_artifact_id: Some(
-                        ArtifactId::new("artifact_candidate").expect("artifact"),
+                        ArtifactId::from_legacy_named("artifact_candidate").expect("artifact"),
                     ),
                     outcome: EvaluationOutcome::Passed,
                     gates: vec![EvaluationGateResult {

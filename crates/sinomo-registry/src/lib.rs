@@ -118,8 +118,9 @@ mod tests {
 
     #[test]
     fn registry_tracks_latest_approved_artifact_for_module() {
-        let module_id = ModuleId::new("module.trigger.silence_policy").expect("module");
-        let artifact_id = ArtifactId::new("artifact_candidate").expect("artifact");
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
         let artifact = ArtifactManifest {
             artifact_id: artifact_id.clone(),
             module_id: module_id.clone(),
@@ -144,7 +145,9 @@ mod tests {
         registry
             .register_candidate(CandidateRecord {
                 artifact: artifact.clone(),
-                source_job_id: Some(EvolutionJobId::new("evojob_candidate").expect("job")),
+                source_job_id: Some(
+                    EvolutionJobId::from_legacy_named("evojob_candidate").expect("job"),
+                ),
                 scorecard: None,
                 evidence_refs: vec!["sandbox://run/local".to_string()],
                 registered_at: OffsetDateTime::now_utc(),
@@ -154,7 +157,7 @@ mod tests {
             .register(RegistryEntry {
                 artifact,
                 policy_decision: PolicyDecision {
-                    decision_id: PolicyDecisionId::new("policy_ok").expect("policy"),
+                    decision_id: PolicyDecisionId::from_legacy_named("policy_ok").expect("policy"),
                     target_ring: TrustRing::R3SandboxedModule,
                     target_artifact_id: artifact_id.clone(),
                     action: PolicyAction::Allow,

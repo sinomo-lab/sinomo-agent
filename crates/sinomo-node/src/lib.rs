@@ -195,10 +195,11 @@ mod tests {
 
     #[test]
     fn daemon_node_helpers_are_stable() {
-        let main_node = NodeId::new("node_test_main").expect("node");
+        let main_node = NodeId::from_legacy_named("node_test_main").expect("node");
         let shadow_node = shadow_daemon_node_id(&main_node);
 
-        assert_eq!(shadow_node.as_str(), "node_test_main-shadow");
+        assert_eq!(shadow_node, shadow_daemon_node_id(&main_node));
+        assert_eq!(shadow_node.as_str().len(), 26);
         assert!(
             main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter)
                 .iter()
@@ -209,13 +210,11 @@ mod tests {
                 .iter()
                 .any(|capability| capability.as_str() == "daemon.shadow.supervise")
         );
-        assert_eq!(
-            daemon_loopback_endpoint_id(&main_node).as_str(),
-            "endpoint_test_main_daemon_loopback"
-        );
-        assert_eq!(
-            daemon_lan_endpoint_id(&main_node, "192.168.1.5:21353").as_str(),
-            "endpoint_test_main_daemon_lan_192.168.1.5_21353"
-        );
+        let loopback = daemon_loopback_endpoint_id(&main_node);
+        assert_eq!(loopback, daemon_loopback_endpoint_id(&main_node));
+        assert_eq!(loopback.as_str().len(), 26);
+        let lan = daemon_lan_endpoint_id(&main_node, "192.168.1.5:21353");
+        assert_eq!(lan, daemon_lan_endpoint_id(&main_node, "192.168.1.5:21353"));
+        assert_eq!(lan.as_str().len(), 26);
     }
 }

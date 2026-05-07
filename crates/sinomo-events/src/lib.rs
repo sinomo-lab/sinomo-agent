@@ -302,9 +302,9 @@ mod tests {
 
     fn fixture_event(id: &str, session_id: Option<&str>, kind: &str) -> EventEnvelope {
         let mut event = EventEnvelope::new(
-            EventId::new(id).expect("event id"),
+            EventId::from_legacy_named(id).expect("event id"),
             OffsetDateTime::from_unix_timestamp(1_776_809_414).expect("timestamp"),
-            NodeId::new("node_desktop").expect("node id"),
+            NodeId::from_legacy_named("node_desktop").expect("node id"),
             Source::new("test.fixture").expect("source"),
             EventKind::new(kind).expect("kind"),
             Salience::new(0.5).expect("salience"),
@@ -317,7 +317,8 @@ mod tests {
         );
 
         if let Some(session_id) = session_id {
-            event = event.with_session(SessionId::new(session_id).expect("session id"));
+            event =
+                event.with_session(SessionId::from_legacy_named(session_id).expect("session id"));
         }
 
         event
@@ -338,7 +339,7 @@ mod tests {
     fn validator_rejects_self_reference() {
         let mut event = fixture_event("evt_self_ref", None, "agent.trace.created");
         event.links = EventLinks {
-            caused_by: vec![EventId::new("evt_self_ref").expect("event id")],
+            caused_by: vec![EventId::from_legacy_named("evt_self_ref").expect("event id")],
             related_to: Vec::new(),
             supersedes: Vec::new(),
         };
@@ -390,7 +391,7 @@ mod tests {
 
         let session_events = store
             .replay(ReplayQuery::by_session(
-                SessionId::new("sess_main").expect("session id"),
+                SessionId::from_legacy_named("sess_main").expect("session id"),
             ))
             .expect("replay by session");
         assert_eq!(session_events.len(), 2);
@@ -404,6 +405,9 @@ mod tests {
             .replay(ReplayQuery::all().after(second.sequence))
             .expect("replay after cursor");
         assert_eq!(after_second.len(), 1);
-        assert_eq!(after_second[0].event.event_id.as_str(), "evt_three");
+        assert_eq!(
+            after_second[0].event.event_id,
+            EventId::from_legacy_named("evt_three").expect("event")
+        );
     }
 }

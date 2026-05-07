@@ -246,9 +246,9 @@ mod tests {
 
     fn event(id: &str, text: &str, salience: f32) -> EventEnvelope {
         EventEnvelope::new(
-            EventId::new(id).expect("event"),
+            EventId::from_legacy_named(id).expect("event"),
             time::OffsetDateTime::now_utc(),
-            NodeId::new("node_desktop").expect("node"),
+            NodeId::from_legacy_named("node_desktop").expect("node"),
             Source::new("test.agent").expect("source"),
             EventKind::new("speech.transcript.final").expect("kind"),
             Salience::new(salience).expect("salience"),
@@ -259,7 +259,7 @@ mod tests {
                 PrivacyClass::Derived,
             ),
         )
-        .with_session(SessionId::new("sess_agent").expect("session"))
+        .with_session(SessionId::from_legacy_named("sess_agent").expect("session"))
         .with_payload(serde_json::json!({ "text": text }))
     }
 
@@ -271,7 +271,10 @@ mod tests {
         store.append(event("evt_3", "three", 0.9)).expect("append");
 
         let context = BoundedContextBuilder::new(2)
-            .build(&store, SessionId::new("sess_agent").expect("session"))
+            .build(
+                &store,
+                SessionId::from_legacy_named("sess_agent").expect("session"),
+            )
             .expect("context");
 
         assert_eq!(context.events.len(), 2);
@@ -280,9 +283,9 @@ mod tests {
 
     #[test]
     fn agent_routes_alert_action_to_screen_owner() {
-        let node = NodeId::new("node_desktop").expect("node");
+        let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let screen = DeviceProfile {
-            device_id: DeviceId::new("device_screen").expect("device"),
+            device_id: DeviceId::from_legacy_named("device_screen").expect("device"),
             node_id: node.clone(),
             display_name: "screen".to_string(),
             kind: DeviceKind::Screen,
@@ -291,7 +294,7 @@ mod tests {
             state: DeviceState::available(),
         };
         let context = BoundedContext {
-            session_id: SessionId::new("sess_agent").expect("session"),
+            session_id: SessionId::from_legacy_named("sess_agent").expect("session"),
             events: vec![StoredEvent {
                 sequence: sinomo_runtime::events::EventSequence(1),
                 appended_at: time::OffsetDateTime::now_utc(),
@@ -300,7 +303,7 @@ mod tests {
             packet: ContextPacket::default(),
         };
         let decision = TriggerDecision {
-            trigger_event_id: EventId::new("evt_alert").expect("event"),
+            trigger_event_id: EventId::from_legacy_named("evt_alert").expect("event"),
             action: TriggerAction::Acknowledge,
             reason: "alert".to_string(),
         };

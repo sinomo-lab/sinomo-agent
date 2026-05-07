@@ -440,11 +440,11 @@ Recommended layout:
 ```text
 content/
   blobs/<hash-prefix>/<hash>
-  objects/<object_id>/<version>/manifest.json
+  objects/<object_id>/<version>/manifest.sobj
   staging/<intent_id>/
   gc/
 metadata-cache/
-  snapshot.json
+  snapshot.sobj
   watches/
 ```
 

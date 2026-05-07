@@ -264,11 +264,11 @@ mod tests {
     use super::*;
 
     fn node(value: &str) -> NodeId {
-        NodeId::new(value).expect("valid node id")
+        NodeId::from_legacy_named(value).expect("valid node id")
     }
 
     fn file_system_id() -> DfsFileSystemId {
-        DfsFileSystemId::new("sifs").expect("valid filesystem id")
+        DfsFileSystemId::from_legacy_named("sifs").expect("valid filesystem id")
     }
 
     #[test]
@@ -277,11 +277,11 @@ mod tests {
 
         assert_eq!(
             file_system_config_key(&file_system_id),
-            "/dfs/filesystems/sifs/config"
+            format!("/dfs/filesystems/{file_system_id}/config")
         );
         assert_eq!(
             metadata_shard_key(&file_system_id, "root/frag"),
-            "/dfs/filesystems/sifs/metadata-shards/root_frag"
+            format!("/dfs/filesystems/{file_system_id}/metadata-shards/root_frag")
         );
     }
 

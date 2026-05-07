@@ -859,7 +859,7 @@ mod tests {
     #[test]
     fn r3_module_manifest_serializes_capsule_shape() {
         let mut manifest = ModuleManifest::r3_wasm(
-            ModuleId::new("module.trigger.silence_policy").expect("module id"),
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module id"),
             "0.3.7",
             "sinomo-trigger",
         );
@@ -873,7 +873,8 @@ mod tests {
             .push(CapabilityName::new("trigger.evaluate").expect("capability"));
 
         let json = serde_json::to_value(&manifest).expect("serialize manifest");
-        assert_eq!(json["module_id"], "module.trigger.silence_policy");
+        assert_eq!(json["module_id"].as_str().expect("module id").len(), 26);
+        assert!(!json["module_id"].as_str().expect("module id").contains('.'));
         assert_eq!(json["target_ring"], "r3-sandboxed-module");
         assert_eq!(json["kind"], "wasm-component");
 
@@ -885,9 +886,11 @@ mod tests {
     #[test]
     fn policy_decision_captures_capability_diff_as_data() {
         let decision = PolicyDecision {
-            decision_id: PolicyDecisionId::new("policy_allow_trigger").expect("decision id"),
+            decision_id: PolicyDecisionId::from_legacy_named("policy_allow_trigger")
+                .expect("decision id"),
             target_ring: TrustRing::R3SandboxedModule,
-            target_artifact_id: ArtifactId::new("artifact_candidate").expect("artifact id"),
+            target_artifact_id: ArtifactId::from_legacy_named("artifact_candidate")
+                .expect("artifact id"),
             action: PolicyAction::RequireMoreEvidence,
             capability_diff: CapabilityDiff {
                 added_imports: vec![CapabilityName::new("event.read.session").expect("capability")],
@@ -905,7 +908,7 @@ mod tests {
     #[test]
     fn evolution_job_serializes_bootstrap_loop_contract() {
         let job = EvolutionJob {
-            job_id: EvolutionJobId::new("evojob_bootstrap").expect("job id"),
+            job_id: EvolutionJobId::from_legacy_named("evojob_bootstrap").expect("job id"),
             objective: "improve command evaluation scorecard details".to_string(),
             target_ring: TrustRing::R1TrustedRuntime,
             target_module_id: None,
@@ -938,7 +941,8 @@ mod tests {
 
         let json = serde_json::to_value(&job).expect("serialize job");
 
-        assert_eq!(json["job_id"], "evojob_bootstrap");
+        assert_eq!(json["job_id"].as_str().expect("job id").len(), 26);
+        assert!(!json["job_id"].as_str().expect("job id").contains('_'));
         assert_eq!(json["status"], "created");
         assert_eq!(
             json["edit_scope"]["intended_paths"][0],
@@ -953,7 +957,7 @@ mod tests {
     #[test]
     fn mutation_packet_carries_verification_and_recovery_contract() {
         let packet = MutationPacket {
-            job_id: EvolutionJobId::new("evojob_packet").expect("job id"),
+            job_id: EvolutionJobId::from_legacy_named("evojob_packet").expect("job id"),
             objective: "add bundle writer".to_string(),
             target_ring: TrustRing::R1TrustedRuntime,
             edit_scope: EditScope {

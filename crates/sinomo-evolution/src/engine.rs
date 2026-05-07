@@ -2263,12 +2263,7 @@ fn classify_objective(objective: &str) -> ObjectiveKind {
 }
 
 fn generated_id(prefix: &str) -> String {
-    format!(
-        "{prefix}_{}",
-        EventId::generate()
-            .as_str()
-            .trim_start_matches(EventId::PREFIX)
-    )
+    format!("{prefix}_{}", EventId::generate().as_str())
 }
 
 fn proposal_constraints(request: &CampaignProposalRequest) -> Vec<String> {
@@ -4244,7 +4239,9 @@ mod tests {
                 scope: EvolutionScope {
                     allowed_paths: plan.evolution_request.intended_paths.clone(),
                     forbidden_paths: Vec::new(),
-                    workspace_id: Some(WorkspaceId::new("workspace_campaign").expect("workspace")),
+                    workspace_id: Some(
+                        WorkspaceId::from_legacy_named("workspace_campaign").expect("workspace"),
+                    ),
                 },
                 status: EvolutionJobStatus::AwaitingApproval,
                 required_gates: vec![EvaluationGate::StaticChecks],
@@ -4688,7 +4685,9 @@ mod tests {
                 scope: EvolutionScope {
                     allowed_paths: plan.evolution_request.intended_paths.clone(),
                     forbidden_paths: Vec::new(),
-                    workspace_id: Some(WorkspaceId::new("workspace_campaign").expect("workspace")),
+                    workspace_id: Some(
+                        WorkspaceId::from_legacy_named("workspace_campaign").expect("workspace"),
+                    ),
                 },
                 status: EvolutionJobStatus::AwaitingApproval,
                 required_gates: vec![EvaluationGate::StaticChecks],
@@ -4732,13 +4731,14 @@ mod tests {
 
     #[test]
     fn r1_job_receives_continuity_gates_and_workspace_scope() {
-        let planner = EvolutionPlanner::new(NodeId::new("node_desktop").expect("node"));
+        let planner =
+            EvolutionPlanner::new(NodeId::from_legacy_named("node_desktop").expect("node"));
         let (job, workspace) = planner.scope_job(EvolutionOpportunity {
             observed_event_id: None,
             target_ring: TrustRing::R1TrustedRuntime,
             target_module_id: None,
             objective: "harden event store".to_string(),
-            workspace_id: WorkspaceId::new("workspace_runtime").expect("workspace"),
+            workspace_id: WorkspaceId::from_legacy_named("workspace_runtime").expect("workspace"),
             allowed_paths: vec!["crates/sinomo-events/**".to_string()],
             forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
             priority: 0.9,
@@ -4749,7 +4749,10 @@ mod tests {
                 .contains(&EvaluationGate::ContinuityChecks)
         );
         assert_eq!(job.scope.workspace_id, Some(workspace.workspace_id));
-        assert!(workspace.branch_name.starts_with("evolution/evojob_"));
+        assert_eq!(
+            workspace.branch_name,
+            format!("evolution/{}", job.job_id.as_str())
+        );
     }
 
     #[test]
@@ -4773,7 +4776,7 @@ mod tests {
     #[test]
     fn mutation_prompt_contains_objective_verification_and_recovery() {
         let packet = MutationPacket {
-            job_id: EvolutionJobId::new("evojob_prompt").expect("job"),
+            job_id: EvolutionJobId::from_legacy_named("evojob_prompt").expect("job"),
             objective: "improve bundle summaries".to_string(),
             target_ring: TrustRing::R1TrustedRuntime,
             edit_scope: EditScope {
@@ -5368,7 +5371,7 @@ mod tests {
         fs::write(root.join("tracked.txt"), "after\n").expect("modify tracked");
         let workspace = candidate_workspace(&root);
         let context = EvolutionToolEventContext::new(
-            NodeId::new("node_tool_test").expect("node"),
+            NodeId::from_legacy_named("node_tool_test").expect("node"),
             workspace.job_id.clone(),
         );
 
@@ -5735,7 +5738,7 @@ index 3b18e51..6320cd2 100644
 
     fn candidate_workspace(root: &Path) -> CandidateWorkspace {
         CandidateWorkspace {
-            job_id: EvolutionJobId::new("evojob_tools").expect("job"),
+            job_id: EvolutionJobId::from_legacy_named("evojob_tools").expect("job"),
             path: root.to_path_buf(),
             branch_name: "codex/evolve/tools".to_string(),
             source_revision: Some("test".to_string()),

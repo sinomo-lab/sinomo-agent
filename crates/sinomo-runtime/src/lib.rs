@@ -38,6 +38,7 @@ pub mod r1 {
     pub use sinomo_registry as registry;
     pub use sinomo_rollout as rollout;
     pub use sinomo_sandbox as sandbox;
+    pub use sinomo_storage as storage;
     pub use sinomo_supervision as supervision;
     pub use sinomo_sync as sync;
 }
@@ -45,5 +46,5 @@ pub mod r1 {
 pub use r0::core;
 pub use r1::{
     api, daemon, device, dfs, eval, events, kv, local, module, network, node, policy, registry,
-    rollout, sandbox, supervision, sync,
+    rollout, sandbox, storage, supervision, sync,
 };

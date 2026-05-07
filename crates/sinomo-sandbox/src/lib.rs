@@ -161,9 +161,10 @@ mod tests {
 
     #[test]
     fn sandbox_run_passes_when_scope_and_commands_pass() {
-        let workspace_id = WorkspaceId::new("workspace_candidate").expect("workspace");
+        let workspace_id =
+            WorkspaceId::from_legacy_named("workspace_candidate").expect("workspace");
         let job = EvolutionJob {
-            job_id: EvolutionJobId::new("evojob_candidate").expect("job"),
+            job_id: EvolutionJobId::from_legacy_named("evojob_candidate").expect("job"),
             objective: "improve trigger".to_string(),
             target_ring: TrustRing::R3SandboxedModule,
             target_module_id: None,
@@ -191,10 +192,11 @@ mod tests {
             rollback_policy: RollbackPolicy::default(),
         };
 
-        let result = SandboxHarness::new(NodeId::new("node_desktop").expect("node")).run(
-            SandboxRunRequest {
+        let result = SandboxHarness::new(NodeId::from_legacy_named("node_desktop").expect("node"))
+            .run(SandboxRunRequest {
                 job,
-                candidate_artifact_id: ArtifactId::new("artifact_candidate").expect("artifact"),
+                candidate_artifact_id: ArtifactId::from_legacy_named("artifact_candidate")
+                    .expect("artifact"),
                 workspace_snapshot: SandboxWorkspaceSnapshot {
                     workspace_id,
                     object_ids: Vec::new(),
@@ -207,8 +209,7 @@ mod tests {
                     expected_exit_code: 0,
                     observed_exit_code: 0,
                 }],
-            },
-        );
+            });
 
         assert_eq!(result.status, SandboxRunStatus::Passed);
     }

@@ -152,9 +152,10 @@ mod tests {
 
     #[test]
     fn r3_allowed_artifact_loads_in_shadow() {
-        let node_id = NodeId::new("node_desktop").expect("node");
-        let module_id = ModuleId::new("module.trigger.silence_policy").expect("module");
-        let artifact_id = ArtifactId::new("artifact_candidate").expect("artifact");
+        let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
         let artifact = ArtifactManifest {
             artifact_id: artifact_id.clone(),
             module_id: module_id.clone(),
@@ -178,7 +179,7 @@ mod tests {
             node_id: node_id.clone(),
             artifact,
             policy_decision: PolicyDecision {
-                decision_id: PolicyDecisionId::new("policy_ok").expect("policy"),
+                decision_id: PolicyDecisionId::from_legacy_named("policy_ok").expect("policy"),
                 target_ring: TrustRing::R3SandboxedModule,
                 target_artifact_id: artifact_id.clone(),
                 action: PolicyAction::Allow,
@@ -188,7 +189,7 @@ mod tests {
                 reason: "ok".to_string(),
             },
             rollout_plan: RolloutPlan {
-                rollout_plan_id: RolloutPlanId::new("rollout_ok").expect("rollout"),
+                rollout_plan_id: RolloutPlanId::from_legacy_named("rollout_ok").expect("rollout"),
                 artifact_id,
                 module_id,
                 target_ring: TrustRing::R3SandboxedModule,
@@ -208,18 +209,26 @@ mod tests {
 
     #[test]
     fn module_policy_violation_event_is_structured_for_audit() {
-        let node_id = NodeId::new("node_desktop").expect("node");
+        let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
         let event = ModulePolicyViolation {
             node_id: node_id.clone(),
-            module_id: ModuleId::new("module.trigger.silence_policy").expect("module"),
-            artifact_id: ArtifactId::new("artifact_candidate").expect("artifact"),
-            rollout_plan_id: Some(RolloutPlanId::new("rollout_candidate").expect("rollout")),
+            module_id: ModuleId::from_legacy_named("module.trigger.silence_policy")
+                .expect("module"),
+            artifact_id: ArtifactId::from_legacy_named("artifact_candidate").expect("artifact"),
+            rollout_plan_id: Some(
+                RolloutPlanId::from_legacy_named("rollout_candidate").expect("rollout"),
+            ),
             reason: "policy denied candidate load".to_string(),
         }
         .event();
 
         assert_eq!(event.kind.as_str(), "module.policy.violation");
         assert_eq!(event.target_node_id, Some(node_id));
-        assert_eq!(event.payload["artifact_id"], "artifact_candidate");
+        assert_eq!(
+            event.payload["artifact_id"],
+            ArtifactId::from_legacy_named("artifact_candidate")
+                .expect("artifact")
+                .as_str()
+        );
     }
 }

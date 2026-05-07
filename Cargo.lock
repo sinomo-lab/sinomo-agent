@@ -3159,6 +3159,7 @@ dependencies = [
  "sinomo-core",
  "sinomo-kv",
  "sinomo-network",
+ "sinomo-object",
  "thiserror",
  "time",
 ]
@@ -3224,11 +3225,11 @@ dependencies = [
  "base64",
  "fs2",
  "serde",
- "serde_json",
  "sinomo-core",
  "sinomo-object",
  "thiserror",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -3287,9 +3288,12 @@ dependencies = [
  "sinomo-local",
  "sinomo-node",
  "sinomo-object",
+ "sinomo-storage",
  "thiserror",
  "time",
  "tokio",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
@@ -3301,6 +3305,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-object",
  "thiserror",
  "time",
 ]
@@ -3339,6 +3344,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-object",
  "time",
 ]
 
@@ -3362,6 +3368,7 @@ dependencies = [
  "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
+ "sinomo-storage",
  "sinomo-supervision",
  "sinomo-sync",
 ]
@@ -3375,6 +3382,15 @@ dependencies = [
  "sinomo-core",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "sinomo-storage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sinomo-object",
+ "thiserror",
 ]
 
 [[package]]

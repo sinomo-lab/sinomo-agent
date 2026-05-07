@@ -22,7 +22,7 @@ impl DaemonPaths {
     pub fn with_root(root: PathBuf) -> Self {
         Self {
             lock: root.join("daemon.lock"),
-            status: root.join("status.json"),
+            status: root.join("status.sobj"),
             root,
         }
     }

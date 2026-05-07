@@ -1,7 +1,7 @@
 use crate::error::NetworkError;
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
-use crate::storage::{ClusterPaths, write_json_file};
+use crate::storage::{ClusterPaths, read_object_file, write_object_file};
 
 pub const WEBRTC_SIGNALING_PROTOCOL: &str = "sinomo.webrtc-signaling.v1";
 pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
@@ -238,18 +238,10 @@ impl IrohEndpointRecord {
 }
 
 pub fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in node_id
-        .as_str()
-        .as_bytes()
-        .iter()
-        .chain(std::iter::once(&0))
-        .chain(endpoint_public_key.as_bytes())
-    {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    ClusterEndpointId::new(format!("endpoint_iroh_{hash:016x}")).expect("stable iroh endpoint id")
+    ClusterEndpointId::derived(
+        "sinomo.iroh.endpoint",
+        format!("{}\0{endpoint_public_key}", node_id.as_str()),
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -361,13 +353,13 @@ impl IrohKvExchange {
 }
 
 pub fn iroh_endpoint_key_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
-    paths.iroh.join(format!("{}.secret.json", node_id.as_str()))
+    paths.iroh.join(format!("{}.secret.sobj", node_id.as_str()))
 }
 
 pub fn iroh_endpoint_record_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
     paths
         .iroh
-        .join(format!("{}.endpoint.json", node_id.as_str()))
+        .join(format!("{}.endpoint.sobj", node_id.as_str()))
 }
 
 #[cfg(feature = "iroh-transport")]
@@ -377,14 +369,7 @@ pub fn load_or_create_iroh_secret_key(
 ) -> Result<iroh::SecretKey, NetworkError> {
     let key_path = iroh_endpoint_key_path(paths, node_id);
     if key_path.exists() {
-        let content = fs::read_to_string(&key_path).map_err(|source| NetworkError::StorageIo {
-            path: key_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        return serde_json::from_str(&content).map_err(|source| NetworkError::Json {
-            path: key_path.display().to_string(),
-            detail: source.to_string(),
-        });
+        return read_object_file(&key_path);
     }
     if let Some(parent) = key_path.parent() {
         fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
@@ -393,14 +378,7 @@ pub fn load_or_create_iroh_secret_key(
         })?;
     }
     let key = iroh::SecretKey::generate();
-    let content = serde_json::to_string_pretty(&key).map_err(|source| NetworkError::Json {
-        path: key_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::write(&key_path, format!("{content}\n")).map_err(|source| NetworkError::StorageIo {
-        path: key_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    write_object_file(&key_path, &key)?;
     Ok(key)
 }
 
@@ -441,21 +419,14 @@ pub fn read_iroh_endpoint_record(
     node_id: &NodeId,
 ) -> Result<IrohEndpointRecord, NetworkError> {
     let path = iroh_endpoint_record_path(paths, node_id);
-    let content = fs::read_to_string(&path).map_err(|source| NetworkError::StorageIo {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content).map_err(|source| NetworkError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    read_object_file(&path)
 }
 
 pub fn write_iroh_endpoint_record(
     paths: &ClusterPaths,
     record: &IrohEndpointRecord,
 ) -> Result<(), NetworkError> {
-    write_json_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
+    write_object_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
 }
 
 #[cfg(feature = "iroh-transport")]
@@ -675,15 +646,17 @@ pub fn iroh_endpoint_record_from_address(
 }
 
 #[cfg(feature = "iroh-transport")]
-pub fn send_iroh_daemon_command_raw(
+pub fn send_iroh_daemon_rpc_raw(
     address: &str,
     command: &str,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
     timeout: Duration,
-) -> Result<String, NetworkError> {
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
     let record = iroh_endpoint_record_from_address(
         address,
-        &ClusterId::new("cluster_iroh_dial_placeholder").expect("static cluster id"),
-        &NodeId::new("node_iroh_dial_placeholder").expect("static node id"),
+        &ClusterId::from_legacy_named("cluster_iroh_dial_placeholder").expect("static cluster id"),
+        &NodeId::from_legacy_named("node_iroh_dial_placeholder").expect("static node id"),
     )?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -692,29 +665,54 @@ pub fn send_iroh_daemon_command_raw(
             operation: "start iroh client runtime".to_string(),
             detail: source.to_string(),
         })?;
-    let response = runtime.block_on(send_iroh_daemon_command_raw_async(record, command, timeout));
+    let response = runtime.block_on(send_iroh_daemon_rpc_raw_async(
+        record, command, auth, request, timeout,
+    ));
     runtime.shutdown_timeout(Duration::from_millis(250));
     response
 }
 
 #[cfg(not(feature = "iroh-transport"))]
-pub fn send_iroh_daemon_command_raw(
+pub fn send_iroh_daemon_rpc_raw(
     address: &str,
     _command: &str,
+    _auth: Option<&[u8]>,
+    _request: &crate::ObjectRpcRequest,
     _timeout: Duration,
-) -> Result<String, NetworkError> {
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
     Err(NetworkError::Io {
-        operation: "send iroh daemon command".to_string(),
+        operation: "send iroh daemon rpc".to_string(),
         detail: format!("cannot dial {address}; sinomo-network was built without iroh-transport"),
     })
 }
 
 #[cfg(feature = "iroh-transport")]
-async fn send_iroh_daemon_command_raw_async(
+async fn send_iroh_daemon_rpc_raw_async(
     record: IrohEndpointRecord,
     command: &str,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
     timeout: Duration,
-) -> Result<String, NetworkError> {
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    let control_request = match auth {
+        Some(auth) => {
+            crate::DaemonControlRequest::authenticated_rpc(command, request.clone(), auth.to_vec())
+        }
+        None => crate::DaemonControlRequest::rpc(command, request.clone()),
+    };
+    let response =
+        send_iroh_daemon_control_request_async(record, &control_request, timeout).await?;
+    response.rpc.ok_or_else(|| NetworkError::Serialization {
+        detail: "iroh daemon returned a non-rpc response".to_string(),
+    })
+}
+
+#[cfg(feature = "iroh-transport")]
+async fn send_iroh_daemon_control_request_async(
+    record: IrohEndpointRecord,
+    request: &crate::DaemonControlRequest,
+    timeout: Duration,
+) -> Result<crate::DaemonControlResponse, NetworkError> {
     let remote_addr = iroh_endpoint_addr_from_record(&record)?;
     let started = std::time::Instant::now();
     let remaining = || {
@@ -775,12 +773,9 @@ async fn send_iroh_daemon_command_raw_async(
             return Err(iroh_daemon_command_timeout_error(timeout));
         }
     };
-    match tokio::time::timeout(
-        remaining(),
-        send.write_all(format!("{command}\n").as_bytes()),
-    )
-    .await
-    {
+    let mut request_bytes = Vec::new();
+    crate::write_object_frame_blocking(&mut request_bytes, request)?;
+    match tokio::time::timeout(remaining(), send.write_all(&request_bytes)).await {
         Ok(Ok(())) => {}
         Ok(Err(source)) => {
             connection.close(0_u8.into(), b"write failed");
@@ -821,9 +816,10 @@ async fn send_iroh_daemon_command_raw_async(
         };
     connection.close(0_u8.into(), b"done");
     close_iroh_endpoint(&endpoint).await;
-    String::from_utf8(response).map_err(|source| NetworkError::Serialization {
-        detail: source.to_string(),
-    })
+    let mut response = std::io::Cursor::new(response);
+    let response: crate::DaemonControlResponse =
+        crate::read_object_frame_blocking(&mut response, IROH_DAEMON_COMMAND_MAX_BYTES)?;
+    Ok(response)
 }
 
 #[cfg(feature = "iroh-transport")]
@@ -870,114 +866,110 @@ fn iroh_endpoint_addr_from_record(
     Ok(addr)
 }
 
-pub fn send_daemon_command_to_cluster_endpoint(
+pub fn send_daemon_rpc_to_cluster_endpoint(
     endpoint: &ClusterEndpointRecord,
     command: &str,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
     timeout: Duration,
-) -> Result<String, NetworkError> {
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
     match endpoint.transport {
-        #[cfg(feature = "iroh-transport")]
         ClusterTransportKind::Iroh => {
-            send_iroh_daemon_command_raw(&endpoint.address, command, timeout)
+            send_iroh_daemon_rpc_raw(&endpoint.address, command, auth, request, timeout)
         }
-        #[cfg(not(feature = "iroh-transport"))]
-        ClusterTransportKind::Iroh => Err(NetworkError::Io {
-            operation: format!("send daemon command to {}", endpoint.address),
-            detail: "iroh transport feature is disabled".to_string(),
-        }),
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            send_daemon_command_raw(&endpoint.address, command, timeout)
+            send_daemon_rpc_raw(&endpoint.address, command, auth, request, timeout)
         }
         _ => Err(NetworkError::Io {
-            operation: format!("send daemon command to {}", endpoint.address),
-            detail: format!(
-                "unsupported daemon command transport {:?}",
-                endpoint.transport
-            ),
+            operation: format!("send daemon rpc to {}", endpoint.address),
+            detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
         }),
     }
 }
 
-pub fn send_daemon_command_raw(
+pub fn send_daemon_rpc_raw(
     address: &str,
     command: &str,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
     timeout: Duration,
-) -> Result<String, NetworkError> {
-    let response =
-        forward_daemon_control_payload(address, format!("{command}\n").as_bytes(), timeout)?;
-    String::from_utf8(response).map_err(|source| NetworkError::Serialization {
-        detail: source.to_string(),
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| NetworkError::Io {
+            operation: "start daemon control runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    let response = runtime.block_on(send_daemon_rpc_raw_async(
+        address, command, auth, request, timeout,
+    ));
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    response
+}
+
+pub async fn send_daemon_rpc_raw_async(
+    address: &str,
+    command: &str,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
+    timeout: Duration,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    let control_request = match auth {
+        Some(auth) => {
+            crate::DaemonControlRequest::authenticated_rpc(command, request.clone(), auth.to_vec())
+        }
+        None => crate::DaemonControlRequest::rpc(command, request.clone()),
+    };
+    let response = send_daemon_control_request_async(address, &control_request, timeout).await?;
+    response.rpc.ok_or_else(|| NetworkError::Serialization {
+        detail: format!("daemon control address {address} returned a non-rpc response"),
     })
 }
 
-pub fn send_daemon_command_pair_raw(
+async fn send_daemon_control_request_async(
     address: &str,
-    first_command: &str,
-    second_command: &str,
+    request: &crate::DaemonControlRequest,
     timeout: Duration,
-) -> Result<(String, String), NetworkError> {
-    let socket_address = address
-        .to_socket_addrs()
-        .map_err(|source| NetworkError::Io {
-            operation: format!("resolve daemon control address {address}"),
-            detail: source.to_string(),
+) -> Result<crate::DaemonControlResponse, NetworkError> {
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(address))
+        .await
+        .map_err(|_| NetworkError::Io {
+            operation: format!("connect daemon control address {address}"),
+            detail: format!("timed out after {}ms", timeout.as_millis()),
         })?
-        .next()
-        .ok_or_else(|| NetworkError::Io {
-            operation: format!("resolve daemon control address {address}"),
-            detail: "no socket addresses resolved".to_string(),
-        })?;
-    let mut stream = TcpStream::connect_timeout(&socket_address, timeout).map_err(|source| {
-        NetworkError::Io {
+        .map_err(|source| NetworkError::Io {
             operation: format!("connect daemon control address {address}"),
             detail: source.to_string(),
-        }
-    })?;
-    stream
-        .set_read_timeout(Some(timeout))
+        })?;
+    tokio::time::timeout(
+        timeout,
+        crate::write_object_frame_async(&mut stream, request),
+    )
+    .await
+    .map_err(|_| NetworkError::Io {
+        operation: format!("write daemon control address {address}"),
+        detail: format!("timed out after {}ms", timeout.as_millis()),
+    })??;
+    tokio::io::AsyncWriteExt::shutdown(&mut stream)
+        .await
         .map_err(|source| NetworkError::Io {
-            operation: format!("configure daemon control address {address}"),
+            operation: format!("finish daemon control address {address}"),
             detail: source.to_string(),
         })?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|source| NetworkError::Io {
-            operation: format!("configure daemon control address {address}"),
-            detail: source.to_string(),
-        })?;
-    stream
-        .write_all(format!("{first_command}\n").as_bytes())
-        .map_err(|source| NetworkError::Io {
-            operation: format!("write daemon control address {address}"),
-            detail: source.to_string(),
-        })?;
-    let mut first_response = String::new();
-    BufReader::new(stream.try_clone().map_err(|source| NetworkError::Io {
-        operation: format!("clone daemon control address {address}"),
-        detail: source.to_string(),
-    })?)
-    .read_line(&mut first_response)
-    .map_err(|source| NetworkError::Io {
+    let response: crate::DaemonControlResponse = tokio::time::timeout(
+        timeout,
+        crate::read_object_frame_async(&mut stream, IROH_DAEMON_COMMAND_MAX_BYTES),
+    )
+    .await
+    .map_err(|_| NetworkError::Io {
         operation: format!("read daemon control address {address}"),
-        detail: source.to_string(),
-    })?;
-    stream
-        .write_all(format!("{second_command}\n").as_bytes())
-        .map_err(|source| NetworkError::Io {
-            operation: format!("write daemon control address {address}"),
-            detail: source.to_string(),
-        })?;
-    let _ = stream.shutdown(Shutdown::Write);
-    let mut second_response = String::new();
-    stream
-        .read_to_string(&mut second_response)
-        .map_err(|source| NetworkError::Io {
-            operation: format!("read daemon control address {address}"),
-            detail: source.to_string(),
-        })?;
-    Ok((first_response, second_response))
+        detail: format!("timed out after {}ms", timeout.as_millis()),
+    })??;
+    Ok(response)
 }
 
+#[cfg(feature = "iroh-transport")]
 fn forward_daemon_control_payload(
     address: &str,
     payload: &[u8],
@@ -1020,12 +1012,10 @@ fn forward_daemon_control_payload(
         })?;
     let _ = stream.shutdown(Shutdown::Write);
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|source| NetworkError::Io {
-            operation: format!("read daemon control address {address}"),
-            detail: source.to_string(),
-        })?;
+    std::io::Read::read_to_end(&mut stream, &mut response).map_err(|source| NetworkError::Io {
+        operation: format!("read daemon control address {address}"),
+        detail: source.to_string(),
+    })?;
     Ok(response)
 }
 

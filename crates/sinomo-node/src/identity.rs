@@ -2,6 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
+use sinomo_object::{LengthMode, serde_ext};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +10,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+const NODE_IDENTITY_OBJECT_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeIdentityPaths {
@@ -20,8 +23,8 @@ impl NodeIdentityPaths {
     pub fn new(data_dir: &Path) -> Self {
         let root = data_dir.join("identity");
         Self {
-            main: root.join("main-ed25519.json"),
-            shadow: root.join("shadow-ed25519.json"),
+            main: root.join("main-ed25519.sobj"),
+            shadow: root.join("shadow-ed25519.sobj"),
         }
     }
 }
@@ -60,14 +63,7 @@ pub fn load_or_create_shadow_node_identity(
 
 pub fn load_or_create_node_identity(path: &Path) -> Result<NodeIdentity, NodeIdentityError> {
     if path.exists() {
-        let content = fs::read_to_string(path).map_err(|source| NodeIdentityError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        return serde_json::from_str(&content).map_err(|source| NodeIdentityError::Json {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        });
+        return read_object(path);
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| NodeIdentityError::Io {
@@ -91,7 +87,7 @@ pub fn load_or_create_node_identity(path: &Path) -> Result<NodeIdentity, NodeIde
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string()),
     };
-    write_json(path, &identity)?;
+    write_object(path, &identity)?;
     #[cfg(unix)]
     {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
@@ -104,15 +100,26 @@ pub fn load_or_create_node_identity(path: &Path) -> Result<NodeIdentity, NodeIde
     Ok(identity)
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), NodeIdentityError> {
+fn read_object<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, NodeIdentityError> {
+    let bytes = fs::read(path).map_err(|source| NodeIdentityError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_ext::from_bytes(&bytes).map_err(|source| NodeIdentityError::Object {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn write_object<T: Serialize>(path: &Path, value: &T) -> Result<(), NodeIdentityError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| NodeIdentityError::Io {
             path: parent.display().to_string(),
             detail: source.to_string(),
         })?;
     }
-    let content =
-        serde_json::to_string_pretty(value).map_err(|source| NodeIdentityError::Json {
+    let content = serde_ext::to_bytes(value, NODE_IDENTITY_OBJECT_VERSION, LengthMode::U32)
+        .map_err(|source| NodeIdentityError::Object {
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
@@ -130,4 +137,6 @@ pub enum NodeIdentityError {
     Io { path: String, detail: String },
     #[error("node identity JSON error at {path}: {detail}")]
     Json { path: String, detail: String },
+    #[error("node identity Sinomo object error at {path}: {detail}")]
+    Object { path: String, detail: String },
 }

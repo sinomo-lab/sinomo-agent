@@ -1,5 +1,8 @@
+use crate::process::{MainExitKind, MainExitObservation};
 use crate::{RolloutError, SelfRolloutPaths, executable_name};
 use serde::{Deserialize, Serialize};
+use sinomo_core::ClusterNodeRolloutStatus;
+use sinomo_object::{LengthMode, serde_ext};
 use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -55,6 +58,15 @@ pub struct RolloutFailureDiagnostics {
     pub stderr_tail: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RolloutMainExitRecord {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub requested_shutdown: bool,
+    pub kind: MainExitKind,
+    pub observed_at: String,
+}
+
 pub trait PendingShadowRolloutContext {
     fn activation(&self) -> &RolloutMainActivation;
     fn main_binary(&self) -> &Path;
@@ -64,11 +76,15 @@ pub trait PendingShadowRolloutContext {
 }
 
 pub fn rollout_main_activation_path(paths: &SelfRolloutPaths) -> PathBuf {
-    paths.root.join("pending-main-rollout.json")
+    paths.root.join("pending-main-rollout.sobj")
 }
 
 pub fn rollout_shadow_finalize_path(paths: &SelfRolloutPaths) -> PathBuf {
-    paths.root.join("pending-shadow-rollout.json")
+    paths.root.join("pending-shadow-rollout.sobj")
+}
+
+pub fn rollout_main_exit_path(paths: &SelfRolloutPaths) -> PathBuf {
+    paths.root.join("last-main-exit.sobj")
 }
 
 pub fn rollout_staging_dir(paths: &SelfRolloutPaths) -> PathBuf {
@@ -90,16 +106,7 @@ pub fn read_rollout_main_activation(
     if !path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(&path).map_err(|source| RolloutError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|source| RolloutError::Json {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
+    read_object(&path).map(Some)
 }
 
 pub fn read_pending_shadow_rollout(
@@ -109,16 +116,7 @@ pub fn read_pending_shadow_rollout(
     if !path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(&path).map_err(|source| RolloutError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|source| RolloutError::Json {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
+    read_object(&path).map(Some)
 }
 
 pub fn stage_pending_shadow_rollout(
@@ -142,32 +140,37 @@ pub fn stage_pending_shadow_rollout(
         main_healthy_at: format_now(),
         mode: activation.mode.clone(),
     };
-    write_json(&rollout_shadow_finalize_path(rollout_paths), &finalize)
+    write_object(&rollout_shadow_finalize_path(rollout_paths), &finalize)
 }
 
 pub fn write_main_activation(
     rollout_paths: &SelfRolloutPaths,
     activation: &RolloutMainActivation,
 ) -> Result<(), RolloutError> {
-    write_json(&rollout_main_activation_path(rollout_paths), activation)
+    write_object(&rollout_main_activation_path(rollout_paths), activation)
 }
 
 pub fn record_main_activation_staged(
     rollout_paths: &SelfRolloutPaths,
     activation: &RolloutMainActivation,
 ) -> Result<(), RolloutError> {
-    write_json(
-        &rollout_paths.state,
-        &serde_json::json!({
-            "source": activation.source,
-            "main_binary": activation.main_binary,
-            "shadow_binary": activation.shadow_binary,
-            "previous_main_binary": activation.previous_main_binary,
-            "requested_at": activation.requested_at,
-            "staged_at": format_now(),
-            "status": "main-staged",
-            "mode": activation.mode
-        }),
+    write_rollout_status(
+        rollout_paths,
+        &ClusterNodeRolloutStatus {
+            status: "main-staged".to_string(),
+            mode: Some(activation.mode.clone()),
+            detail: None,
+            source: Some(activation.source.clone()),
+            requested_at: Some(activation.requested_at.clone()),
+            staged_at: Some(format_now()),
+            updated_at: None,
+            failed_at: None,
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        },
     )
 }
 
@@ -177,19 +180,24 @@ pub fn record_activation_failure(
     previous_main_binary: &Path,
     detail: &str,
 ) -> Result<(), RolloutError> {
-    write_json(
-        &rollout_paths.state,
-        &serde_json::json!({
-            "source": activation.source,
-            "main_binary": activation.main_binary,
-            "shadow_binary": activation.shadow_binary,
-            "previous_main_binary": previous_main_binary,
-            "status": "failed",
-            "detail": detail,
-            "requested_at": activation.requested_at,
-            "failed_at": format_now(),
-            "mode": activation.mode
-        }),
+    let _ = previous_main_binary;
+    write_rollout_status(
+        rollout_paths,
+        &ClusterNodeRolloutStatus {
+            status: "failed".to_string(),
+            mode: Some(activation.mode.clone()),
+            detail: Some(detail.to_string()),
+            source: Some(activation.source.clone()),
+            requested_at: Some(activation.requested_at.clone()),
+            staged_at: None,
+            updated_at: None,
+            failed_at: Some(format_now()),
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        },
     )
 }
 
@@ -218,34 +226,29 @@ pub fn record_main_rollout_failure_with_diagnostics(
     detail: &str,
     diagnostics: Option<&RolloutFailureDiagnostics>,
 ) -> Result<(), RolloutError> {
-    let mut value = serde_json::json!({
-        "source": activation.source,
-        "main_binary": activation.main_binary,
-        "shadow_binary": activation.shadow_binary,
-        "previous_main_binary": previous_main_binary,
-        "previous_shadow_binary": previous_shadow_binary,
-        "status": "failed",
-        "detail": detail,
-        "requested_at": activation.requested_at,
-        "failed_at": format_now(),
-        "mode": activation.mode
-    });
-    if let Some(diagnostics) = diagnostics {
-        value["diagnostics"] = serde_json::json!(diagnostics.diagnostics_path);
-        if let Some(stdout_log) = &diagnostics.stdout_log {
-            value["stdout_log"] = serde_json::json!(stdout_log);
-        }
-        if let Some(stderr_log) = &diagnostics.stderr_log {
-            value["stderr_log"] = serde_json::json!(stderr_log);
-        }
-        if let Some(stdout_tail) = &diagnostics.stdout_tail {
-            value["stdout_tail"] = serde_json::json!(stdout_tail);
-        }
-        if let Some(stderr_tail) = &diagnostics.stderr_tail {
-            value["stderr_tail"] = serde_json::json!(stderr_tail);
-        }
-    }
-    write_json(&rollout_paths.state, &value)
+    let _ = (previous_main_binary, previous_shadow_binary);
+    write_rollout_status(
+        rollout_paths,
+        &ClusterNodeRolloutStatus {
+            status: "failed".to_string(),
+            mode: Some(activation.mode.clone()),
+            detail: Some(detail.to_string()),
+            source: Some(activation.source.clone()),
+            requested_at: Some(activation.requested_at.clone()),
+            staged_at: None,
+            updated_at: None,
+            failed_at: Some(format_now()),
+            diagnostics: diagnostics.map(|value| value.diagnostics_path.display().to_string()),
+            stdout_log: diagnostics
+                .and_then(|value| value.stdout_log.as_ref())
+                .map(|path| path.display().to_string()),
+            stderr_log: diagnostics
+                .and_then(|value| value.stderr_log.as_ref())
+                .map(|path| path.display().to_string()),
+            stdout_tail: diagnostics.and_then(|value| value.stdout_tail.clone()),
+            stderr_tail: diagnostics.and_then(|value| value.stderr_tail.clone()),
+        },
+    )
 }
 
 pub fn record_shadow_rollout_finalized(
@@ -254,21 +257,98 @@ pub fn record_shadow_rollout_finalized(
     status: &str,
     detail: &str,
 ) -> Result<(), RolloutError> {
-    write_json(
-        &rollout_paths.state,
-        &serde_json::json!({
-            "source": finalize.source,
-            "main_binary": finalize.main_binary,
-            "shadow_binary": finalize.shadow_binary,
-            "previous_shadow_binary": finalize.previous_shadow_binary,
-            "requested_at": finalize.requested_at,
-            "main_healthy_at": finalize.main_healthy_at,
-            "updated_at": format_now(),
-            "status": status,
-            "detail": detail,
-            "mode": finalize.mode
-        }),
+    write_rollout_status(
+        rollout_paths,
+        &ClusterNodeRolloutStatus {
+            status: status.to_string(),
+            mode: Some(finalize.mode.clone()),
+            detail: Some(detail.to_string()),
+            source: Some(finalize.source.clone()),
+            requested_at: Some(finalize.requested_at.clone()),
+            staged_at: None,
+            updated_at: Some(format_now()),
+            failed_at: None,
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        },
     )
+}
+
+pub fn read_rollout_status(
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<Option<ClusterNodeRolloutStatus>, RolloutError> {
+    if !rollout_paths.state.exists() {
+        return Ok(None);
+    }
+    read_object(&rollout_paths.state).map(Some)
+}
+
+pub fn write_rollout_status(
+    rollout_paths: &SelfRolloutPaths,
+    status: &ClusterNodeRolloutStatus,
+) -> Result<(), RolloutError> {
+    write_object(&rollout_paths.state, status)
+}
+
+pub fn read_rollout_main_exit(
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<Option<RolloutMainExitRecord>, RolloutError> {
+    let path = rollout_main_exit_path(rollout_paths);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_object(&path).map(Some)
+}
+
+pub fn record_rollout_main_exit(
+    rollout_paths: &SelfRolloutPaths,
+    observation: MainExitObservation,
+    kind: MainExitKind,
+) -> Result<(), RolloutError> {
+    write_object(
+        &rollout_main_exit_path(rollout_paths),
+        &RolloutMainExitRecord {
+            exit_code: observation.exit_code,
+            signal: observation.signal,
+            requested_shutdown: observation.requested_shutdown,
+            kind,
+            observed_at: format_now(),
+        },
+    )
+}
+
+pub fn write_object<T: Serialize>(path: &Path, value: &T) -> Result<(), RolloutError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let bytes =
+        serde_ext::to_bytes(value, ROLLOUT_OBJECT_VERSION, LengthMode::U32).map_err(|source| {
+            RolloutError::Object {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+    fs::write(path, bytes).map_err(|source| RolloutError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub fn read_object<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, RolloutError> {
+    let bytes = fs::read(path).map_err(|source| RolloutError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_ext::from_bytes(&bytes).map_err(|source| RolloutError::Object {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), RolloutError> {
@@ -309,3 +389,4 @@ fn format_now() -> String {
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string())
 }
+const ROLLOUT_OBJECT_VERSION: u16 = 1;

@@ -34,7 +34,7 @@ pub(super) fn run_cui_with_handler_io_and_daemon<
         .as_ref()
         .and_then(|status| status.cluster.as_ref())
         .map(|cluster| cluster.node_id.clone())
-        .unwrap_or_else(|| NodeId::new("node_cli").expect("valid node id"));
+        .unwrap_or_else(|| NodeId::from_legacy_named("node_cli").expect("valid node id"));
     let session = InteractionSession::new(
         SessionId::generate(),
         node_id,

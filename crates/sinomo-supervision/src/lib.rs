@@ -134,9 +134,9 @@ mod tests {
 
     #[test]
     fn index_collects_incident_and_workspace_views() {
-        let node = NodeId::new("node_desktop").expect("node");
+        let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let event = EventEnvelope::new(
-            EventId::new("evt_blocked").expect("event"),
+            EventId::from_legacy_named("evt_blocked").expect("event"),
             OffsetDateTime::now_utc(),
             node.clone(),
             Source::new("dfs.supervision").expect("source"),

@@ -20,5 +20,6 @@ time.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-network = { path = "../sinomo-network" }
+sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 
 [dev-dependencies]

@@ -26,5 +26,6 @@ sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
+sinomo-storage = { path = "../sinomo-storage" }
 sinomo-supervision = { path = "../sinomo-supervision" }
 sinomo-sync = { path = "../sinomo-sync" }

@@ -3,7 +3,7 @@ use sinomo_core::{
 };
 
 pub fn shadow_daemon_node_id(main_node_id: &NodeId) -> NodeId {
-    NodeId::new(format!("{}-shadow", main_node_id.as_str())).expect("derived shadow daemon node id")
+    NodeId::derived("sinomo.node.shadow", main_node_id.as_str())
 }
 
 pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName> {
@@ -27,16 +27,14 @@ pub fn shadow_daemon_capabilities() -> Vec<CapabilityName> {
 }
 
 pub fn daemon_loopback_endpoint_id(node_id: &NodeId) -> ClusterEndpointId {
-    let body = node_id.as_str().trim_start_matches(NodeId::PREFIX);
-    ClusterEndpointId::new(format!("endpoint_{body}_daemon_loopback"))
-        .expect("derived daemon endpoint id")
+    ClusterEndpointId::derived("sinomo.daemon.endpoint.loopback", node_id.as_str())
 }
 
 pub fn daemon_lan_endpoint_id(node_id: &NodeId, address: &str) -> ClusterEndpointId {
-    let node = node_id.as_str().trim_start_matches(NodeId::PREFIX);
-    let address = sanitize_endpoint_id_body(address);
-    ClusterEndpointId::new(format!("endpoint_{node}_daemon_lan_{address}"))
-        .expect("derived daemon lan endpoint id")
+    ClusterEndpointId::derived(
+        "sinomo.daemon.endpoint.lan",
+        format!("{}\0{address}", node_id.as_str()),
+    )
 }
 
 pub fn sanitize_endpoint_id_body(value: &str) -> String {

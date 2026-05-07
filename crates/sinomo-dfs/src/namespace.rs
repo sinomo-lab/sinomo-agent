@@ -92,8 +92,7 @@ pub fn sifs_node_files_path(node_id: &NodeId) -> String {
 
 pub fn object_id_for_path(path: &str) -> DfsObjectId {
     let normalized = normalize_sifs_path(path);
-    let hash = blake3::hash(normalized.as_bytes()).to_hex().to_string();
-    DfsObjectId::new(format!("obj_sifs_{}", &hash[..32])).expect("valid deterministic object id")
+    DfsObjectId::derived("sinomo.sifs.object.path", normalized.as_bytes())
 }
 
 pub fn normalize_sifs_path(path: &str) -> String {
@@ -120,13 +119,16 @@ pub fn metadata_path(path: &str) -> String {
 }
 
 pub fn initial_version() -> DfsVersion {
-    DfsVersion::new("version_1").expect("valid initial version")
+    DfsVersion::from_legacy_named("version_1").expect("valid initial version")
 }
 
 pub fn next_version(version: &DfsVersion) -> DfsVersion {
-    let suffix = version.as_str().trim_start_matches(DfsVersion::PREFIX);
+    let suffix = version
+        .as_str()
+        .strip_prefix("version_")
+        .unwrap_or(version.as_str());
     if let Ok(number) = suffix.parse::<u64>() {
-        return DfsVersion::new(format!("version_{}", number.saturating_add(1)))
+        return DfsVersion::from_legacy_named(format!("version_{}", number.saturating_add(1)))
             .expect("valid incremented version");
     }
     DfsVersion::generate()
@@ -138,11 +140,11 @@ mod tests {
 
     #[test]
     fn distributed_sifs_bootstrap_exposes_users_and_services() {
-        let node = NodeId::new("node_alpha").expect("node");
+        let node = NodeId::from_legacy_named("node_alpha").expect("node");
         let filesystem = distributed_sifs(node.clone());
         let objects = distributed_sifs_bootstrap_objects(node);
 
-        assert_eq!(filesystem.file_system_id.as_str(), "sifs");
+        assert_eq!(filesystem.file_system_id, sifs_file_system_id());
         assert!(
             filesystem
                 .subtree_policies
@@ -150,7 +152,7 @@ mod tests {
                 .any(|policy| policy.path_prefix == SIFS_USERS_PATH)
         );
         assert!(filesystem.subtree_policies.iter().any(|policy| {
-            policy.path_prefix == "/sinomo/nodes/node_alpha/files"
+            policy.path_prefix == sifs_node_files_path(&filesystem.owner_node_id)
                 && policy.policy == DfsObjectPolicy::LocalOwned
         }));
         assert!(objects.iter().any(|object| object.path == SIFS_SINOMO_PATH));
@@ -158,10 +160,10 @@ mod tests {
         assert!(
             objects
                 .iter()
-                .any(|object| object.path == "/sinomo/nodes/node_alpha")
+                .any(|object| object.path == sifs_node_path(&filesystem.owner_node_id))
         );
         assert!(objects.iter().any(|object| {
-            object.path == "/sinomo/nodes/node_alpha/files"
+            object.path == sifs_node_files_path(&filesystem.owner_node_id)
                 && object.policy == DfsObjectPolicy::LocalOwned
         }));
         assert!(objects.iter().any(|object| object.path == SIFS_USERS_PATH));

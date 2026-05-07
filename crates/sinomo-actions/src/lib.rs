@@ -266,14 +266,14 @@ mod tests {
 
     #[test]
     fn local_action_executes_when_kind_and_device_are_allowed() {
-        let node = NodeId::new("node_desktop").expect("node");
+        let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let device = DeviceProfile::new(node.clone(), "screen", DeviceKind::Screen)
             .with_capability(DeviceCapability::new(
                 sinomo_runtime::core::CapabilityName::new("action.desktop.inspect").expect("cap"),
             ))
             .with_permission(DevicePermission::ExecuteAction);
         let request = ActionRequest {
-            request_id: TaskId::new("task_action").expect("task"),
+            request_id: TaskId::from_legacy_named("task_action").expect("task"),
             origin_node_id: node.clone(),
             target_node_id: Some(node.clone()),
             target_device_id: Some(device.device_id.clone()),
@@ -292,13 +292,13 @@ mod tests {
 
     #[test]
     fn remote_target_is_blocked_by_local_authority() {
-        let local = NodeId::new("node_desktop").expect("node");
-        let remote = NodeId::new("node_mobile").expect("node");
+        let local = NodeId::from_legacy_named("node_desktop").expect("node");
+        let remote = NodeId::from_legacy_named("node_mobile").expect("node");
         let request = ActionRequest {
-            request_id: TaskId::new("task_remote").expect("task"),
+            request_id: TaskId::from_legacy_named("task_remote").expect("task"),
             origin_node_id: remote.clone(),
             target_node_id: Some(remote),
-            target_device_id: Some(DeviceId::new("device_remote").expect("device")),
+            target_device_id: Some(DeviceId::from_legacy_named("device_remote").expect("device")),
             kind: "ui.inspect.alert".to_string(),
             payload: serde_json::Value::Null,
         };

@@ -15,4 +15,5 @@ ring = "r1"
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
+sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-core = { path = "../sinomo-core" }

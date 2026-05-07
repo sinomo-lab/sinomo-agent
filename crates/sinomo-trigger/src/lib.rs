@@ -147,9 +147,9 @@ mod tests {
             sequence: EventSequence(1),
             appended_at: time::OffsetDateTime::now_utc(),
             event: EventEnvelope::new(
-                EventId::new("evt_trigger").expect("event"),
+                EventId::from_legacy_named("evt_trigger").expect("event"),
                 time::OffsetDateTime::now_utc(),
-                NodeId::new("node_desktop").expect("node"),
+                NodeId::from_legacy_named("node_desktop").expect("node"),
                 Source::new("test.trigger").expect("source"),
                 EventKind::new("speech.transcript.final").expect("kind"),
                 Salience::new(salience).expect("salience"),
@@ -160,7 +160,7 @@ mod tests {
                     PrivacyClass::Derived,
                 ),
             )
-            .with_session(SessionId::new("sess_trigger").expect("session"))
+            .with_session(SessionId::from_legacy_named("sess_trigger").expect("session"))
             .with_payload(payload),
         }
     }

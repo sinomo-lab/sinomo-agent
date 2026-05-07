@@ -70,9 +70,9 @@ mod tests {
 
     fn observation(id: &str, kind: &str) -> EventEnvelope {
         EventEnvelope::new(
-            EventId::new(id).expect("event"),
+            EventId::from_legacy_named(id).expect("event"),
             time::OffsetDateTime::now_utc(),
-            NodeId::new("node_desktop").expect("node"),
+            NodeId::from_legacy_named("node_desktop").expect("node"),
             Source::new("test.observation").expect("source"),
             EventKind::new(kind).expect("kind"),
             Salience::new(0.5).expect("salience"),
@@ -83,7 +83,7 @@ mod tests {
                 PrivacyClass::Derived,
             ),
         )
-        .with_session(SessionId::new("sess_fusion").expect("session"))
+        .with_session(SessionId::from_legacy_named("sess_fusion").expect("session"))
     }
 
     #[test]

@@ -9,12 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn distributed_eventual_commit_advances_metadata_then_repairs_missing_replica() {
-    let file_system_id = DfsFileSystemId::new("sifs").expect("filesystem");
-    let object_id = DfsObjectId::new("obj_artifact").expect("object");
-    let version_1 = DfsVersion::new("version_1").expect("version");
-    let version_2 = DfsVersion::new("version_2").expect("version");
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let root = temp_root("distributed_eventual_commit");
     let store_a = LocalContentStore::new(root.join("node-a")).expect("store a");
     let store_b = LocalContentStore::new(root.join("node-b")).expect("store b");

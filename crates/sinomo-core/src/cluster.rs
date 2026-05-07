@@ -458,9 +458,9 @@ mod tests {
         )
         .expect("timestamp");
         let state = ClusterBootstrapState::initialized_locally(
-            ClusterId::new("cluster_home").expect("cluster"),
+            ClusterId::from_legacy_named("cluster_home").expect("cluster"),
             "home",
-            NodeId::new("node_desktop").expect("node"),
+            NodeId::from_legacy_named("node_desktop").expect("node"),
             "desktop",
             "pk_desktop",
             timestamp,
@@ -468,7 +468,13 @@ mod tests {
 
         let json = serde_json::to_value(&state).expect("serialize");
 
-        assert_eq!(json["cluster_id"], "cluster_home");
+        assert_eq!(json["cluster_id"].as_str().expect("cluster id").len(), 26);
+        assert!(
+            !json["cluster_id"]
+                .as_str()
+                .expect("cluster id")
+                .contains('_')
+        );
         assert!(json.get("bootstrap").is_none());
         assert!(json["members"][0].get("node_role").is_none());
         assert_eq!(json["members"][0]["role"], "voter");
@@ -483,27 +489,27 @@ mod tests {
         )
         .expect("timestamp");
         let invite = ClusterJoinInvite {
-            invite_id: ClusterInviteId::new("invite_phone").expect("invite"),
-            cluster_id: ClusterId::new("cluster_home").expect("cluster"),
+            invite_id: ClusterInviteId::from_legacy_named("invite_phone").expect("invite"),
+            cluster_id: ClusterId::from_legacy_named("cluster_home").expect("cluster"),
             cluster_name: Some("home".to_string()),
             cluster_public_key: "pk_desktop".to_string(),
             invitation_secret: "secret_1".to_string(),
             communication_channels: vec![ClusterInvitationChannel {
                 endpoint: ClusterEndpointRecord::loopback(
-                    NodeId::new("node_desktop").expect("node"),
+                    NodeId::from_legacy_named("node_desktop").expect("node"),
                     "127.0.0.1:21353",
                 ),
                 node_public_key: "pk_desktop".to_string(),
             }],
             introducers: vec![ClusterEndpointRecord::loopback(
-                NodeId::new("node_desktop").expect("node"),
+                NodeId::from_legacy_named("node_desktop").expect("node"),
                 "127.0.0.1:21353",
             )],
             token_id: "token_1".to_string(),
             expires_at: timestamp,
             trust_domain: TrustDomain::new("trust.local").expect("trust"),
             allowed_member_roles: vec![ClusterMemberRole::Learner],
-            issuer_node_id: NodeId::new("node_desktop").expect("node"),
+            issuer_node_id: NodeId::from_legacy_named("node_desktop").expect("node"),
             issuer_public_key: "pk_desktop".to_string(),
             signature: "sig".to_string(),
         };

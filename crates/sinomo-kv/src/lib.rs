@@ -13,13 +13,15 @@ use sinomo_core::{ClusterMemberRecord, NodeId};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const KV_OBJECT_VERSION_ID: u16 = 1;
+pub const KV_WAL_OBJECT_VERSION_ID: u16 = 2;
 const MAX_RETAINED_EVENTS: usize = 4096;
+const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn encode_kv_value<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, KvError> {
     sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32).map_err(|source| {
@@ -344,9 +346,9 @@ impl KvWalPaths {
         let root = root.into();
         Self {
             lock: root.join("node.lock"),
-            hard_state: root.join("hard-state.json"),
-            wal: root.join("wal.jsonl"),
-            snapshot: root.join("snapshot.json"),
+            hard_state: root.join("hard-state.sobj"),
+            wal: root.join("wal.sobjlog"),
+            snapshot: root.join("snapshot.sobj"),
             root,
         }
     }
@@ -1410,8 +1412,9 @@ impl DurableRaftKvNode {
             path: paths.lock.display().to_string(),
             detail: source.to_string(),
         })?;
-        let snapshot = read_optional_json::<RaftSnapshot>(&paths.snapshot)?;
-        let hard_state: RaftHardState = read_optional_json(&paths.hard_state)?.unwrap_or_default();
+        let snapshot = read_optional_object::<RaftSnapshot>(&paths.snapshot)?;
+        let hard_state: RaftHardState =
+            read_optional_object(&paths.hard_state)?.unwrap_or_default();
         let mut node = if let Some(snapshot) = snapshot {
             let mut node = ReplicatedKvNode {
                 store: InProcessKvStore::new(),
@@ -1455,6 +1458,16 @@ impl DurableRaftKvNode {
             _lock: lock,
             node,
         })
+    }
+
+    pub async fn open_async(node_id: NodeId, paths: KvWalPaths) -> Result<Self, KvError> {
+        let error_path = paths.root.display().to_string();
+        tokio::task::spawn_blocking(move || Self::open(node_id, paths))
+            .await
+            .map_err(|source| KvError::Io {
+                path: error_path,
+                detail: source.to_string(),
+            })?
     }
 
     pub fn node_id(&self) -> &NodeId {
@@ -1564,7 +1577,7 @@ impl DurableRaftKvNode {
                 .unwrap_or(self.node.snapshot_term),
             kv: self.node.store.snapshot(),
         };
-        write_json_file(&self.paths.snapshot, &snapshot)?;
+        write_object_file(&self.paths.snapshot, &snapshot)?;
         self.node.install_snapshot(snapshot.clone());
         rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
         self.persist_hard_state()?;
@@ -1572,14 +1585,14 @@ impl DurableRaftKvNode {
     }
 
     pub fn restore_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
-        write_json_file(&self.paths.snapshot, &snapshot)?;
+        write_object_file(&self.paths.snapshot, &snapshot)?;
         self.node.install_snapshot(snapshot);
         rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
         self.persist_hard_state()
     }
 
     fn persist_hard_state(&self) -> Result<(), KvError> {
-        write_json_file(&self.paths.hard_state, &self.node.hard_state)
+        write_object_file(&self.paths.hard_state, &self.node.hard_state)
     }
 }
 
@@ -1593,7 +1606,7 @@ fn read_wal_entries(path: &Path) -> Result<WalRead, KvError> {
     if !path.exists() {
         return Ok(WalRead::default());
     }
-    let file = File::open(path).map_err(|source| KvError::Io {
+    let mut file = File::open(path).map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
@@ -1601,28 +1614,45 @@ fn read_wal_entries(path: &Path) -> Result<WalRead, KvError> {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|source| KvError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
     let mut entries = Vec::new();
     let mut truncated = false;
-    for (line_number, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|source| KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        if line.trim().is_empty() {
-            continue;
+    let mut offset = 0;
+    let mut record_number = 0;
+    while offset < bytes.len() {
+        record_number += 1;
+        if bytes.len().saturating_sub(offset) < 4 {
+            truncated = true;
+            break;
         }
-        match serde_json::from_str(&line) {
+        let len = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if len == 0 || len > MAX_WAL_RECORD_BYTES || bytes.len().saturating_sub(offset) < len {
+            truncated = true;
+            break;
+        }
+        match sinomo_object_serde::from_bytes(&bytes[offset..offset + len]) {
             Ok(entry) => entries.push(entry),
             Err(source) => {
                 eprintln!(
-                    "warning: truncating cluster kv WAL at unreadable record {} in {}: {source}",
-                    line_number + 1,
+                    "warning: truncating cluster kv WAL at unreadable binary record {} in {}: {source}",
+                    record_number,
                     path.display()
                 );
                 truncated = true;
                 break;
             }
         }
+        offset += len;
     }
     Ok(WalRead { entries, truncated })
 }
@@ -1651,18 +1681,28 @@ fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError
         detail: source.to_string(),
     })?;
     for entry in entries {
-        serde_json::to_writer(&mut file, entry).map_err(|source| KvError::Serialization {
-            detail: source.to_string(),
-        })?;
-        writeln!(file).map_err(|source| KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        write_wal_record(&mut file, entry, path)?;
     }
     file.sync_data().map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })
+}
+
+fn write_wal_record(file: &mut File, entry: &KvLogEntry, path: &Path) -> Result<(), KvError> {
+    let record = sinomo_object_serde::to_bytes(entry, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
+        .map_err(|source| KvError::Serialization {
+            detail: source.to_string(),
+        })?;
+    let record_len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
+        detail: format!("wal record for {} exceeds u32 length", path.display()),
+    })?;
+    file.write_all(&record_len.to_be_bytes())
+        .and_then(|()| file.write_all(&record))
+        .map_err(|source| KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
 }
 
 fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
@@ -1687,13 +1727,7 @@ fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvErro
         detail: source.to_string(),
     })?;
     for entry in entries {
-        serde_json::to_writer(&mut file, entry).map_err(|source| KvError::Serialization {
-            detail: source.to_string(),
-        })?;
-        writeln!(file).map_err(|source| KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        write_wal_record(&mut file, entry, path)?;
     }
     file.sync_data().map_err(|source| KvError::Io {
         path: path.display().to_string(),
@@ -1701,29 +1735,30 @@ fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvErro
     })
 }
 
-fn read_optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, KvError> {
+fn read_optional_object<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, KvError> {
     if !path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(path).map_err(|source| KvError::Io {
+    let bytes = fs::read(path).map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
-    serde_json::from_str(&content)
+    sinomo_object_serde::from_bytes(&bytes)
         .map(Some)
         .map_err(|source| KvError::Serialization {
             detail: format!("{}: {source}", path.display()),
         })
 }
 
-fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> {
+fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| KvError::Io {
             path: parent.display().to_string(),
             detail: source.to_string(),
         })?;
     }
-    let content = serde_json::to_string_pretty(value).map_err(|source| KvError::Serialization {
+    let content = sinomo_object_serde::to_bytes(value, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
+        .map_err(|source| KvError::Serialization {
         detail: source.to_string(),
     })?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1742,12 +1777,10 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> 
                 path: temp_path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        file.write_all(content.as_bytes())
-            .and_then(|()| file.write_all(b"\n"))
-            .map_err(|source| KvError::Io {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
+        file.write_all(&content).map_err(|source| KvError::Io {
+            path: temp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
         file.sync_all().map_err(|source| KvError::Io {
             path: temp_path.display().to_string(),
             detail: source.to_string(),
@@ -2034,9 +2067,9 @@ mod tests {
 
     #[test]
     fn raft_cluster_replicates_committed_writes_to_online_voters() {
-        let node_a = NodeId::new("node_a").expect("node");
-        let node_b = NodeId::new("node_b").expect("node");
-        let node_c = NodeId::new("node_c").expect("node");
+        let node_a = NodeId::from_legacy_named("node_a").expect("node");
+        let node_b = NodeId::from_legacy_named("node_b").expect("node");
+        let node_c = NodeId::from_legacy_named("node_c").expect("node");
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
@@ -2060,9 +2093,9 @@ mod tests {
 
     #[test]
     fn raft_cluster_rejects_writes_without_quorum() {
-        let node_a = NodeId::new("node_a").expect("node");
-        let node_b = NodeId::new("node_b").expect("node");
-        let node_c = NodeId::new("node_c").expect("node");
+        let node_a = NodeId::from_legacy_named("node_a").expect("node");
+        let node_b = NodeId::from_legacy_named("node_b").expect("node");
+        let node_c = NodeId::from_legacy_named("node_c").expect("node");
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
@@ -2078,9 +2111,9 @@ mod tests {
 
     #[test]
     fn cluster_member_records_are_stored_under_cluster_namespace() {
-        let node_id = NodeId::new("node_desktop").expect("node");
+        let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
         let member = ClusterMemberRecord::local_voter(
-            ClusterId::new("cluster_home").expect("cluster"),
+            ClusterId::from_legacy_named("cluster_home").expect("cluster"),
             node_id.clone(),
             "desktop",
             "pk_desktop",
@@ -2092,7 +2125,7 @@ mod tests {
             .put_cluster_member(member.clone())
             .expect("put member");
 
-        assert!(store.get("/cluster/members/node_desktop").is_some());
+        assert!(store.get(&cluster_member_key(&node_id)).is_some());
         assert_eq!(
             store
                 .read_cluster_member(&node_id)
@@ -2104,9 +2137,9 @@ mod tests {
 
     #[test]
     fn learner_can_catch_up_from_snapshot() {
-        let node_a = NodeId::new("node_a").expect("node");
-        let node_b = NodeId::new("node_b").expect("node");
-        let learner = NodeId::new("node_learner").expect("node");
+        let node_a = NodeId::from_legacy_named("node_a").expect("node");
+        let node_b = NodeId::from_legacy_named("node_b").expect("node");
+        let learner = NodeId::from_legacy_named("node_learner").expect("node");
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone()]).expect("cluster");
         cluster.put("/policy/a", b"allow".to_vec()).expect("put");
@@ -2129,9 +2162,9 @@ mod tests {
 
     #[test]
     fn raft_cluster_catches_up_partitioned_voter_from_committed_log() {
-        let node_a = NodeId::new("node_a").expect("node");
-        let node_b = NodeId::new("node_b").expect("node");
-        let node_c = NodeId::new("node_c").expect("node");
+        let node_a = NodeId::from_legacy_named("node_a").expect("node");
+        let node_b = NodeId::from_legacy_named("node_b").expect("node");
+        let node_c = NodeId::from_legacy_named("node_c").expect("node");
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
@@ -2168,9 +2201,9 @@ mod tests {
 
     #[test]
     fn raft_cluster_partition_blocks_isolated_leader_and_recovers_after_majority_leader_change() {
-        let node_a = NodeId::new("node_partition_a").expect("node");
-        let node_b = NodeId::new("node_partition_b").expect("node");
-        let node_c = NodeId::new("node_partition_c").expect("node");
+        let node_a = NodeId::from_legacy_named("node_partition_a").expect("node");
+        let node_b = NodeId::from_legacy_named("node_partition_b").expect("node");
+        let node_c = NodeId::from_legacy_named("node_partition_c").expect("node");
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
@@ -2221,9 +2254,9 @@ mod tests {
 
     #[test]
     fn raft_cluster_autonomous_election_replaces_lost_leader_with_majority_quorum() {
-        let node_a = NodeId::new("node_elect_a").expect("node");
-        let node_b = NodeId::new("node_elect_b").expect("node");
-        let node_c = NodeId::new("node_elect_c").expect("node");
+        let node_a = NodeId::from_legacy_named("node_elect_a").expect("node");
+        let node_b = NodeId::from_legacy_named("node_elect_b").expect("node");
+        let node_c = NodeId::from_legacy_named("node_elect_c").expect("node");
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
@@ -2273,9 +2306,9 @@ mod tests {
 
     #[test]
     fn raft_cluster_autonomous_election_fails_without_majority() {
-        let node_a = NodeId::new("node_elect_fail_a").expect("node");
-        let node_b = NodeId::new("node_elect_fail_b").expect("node");
-        let node_c = NodeId::new("node_elect_fail_c").expect("node");
+        let node_a = NodeId::from_legacy_named("node_elect_fail_a").expect("node");
+        let node_b = NodeId::from_legacy_named("node_elect_fail_b").expect("node");
+        let node_c = NodeId::from_legacy_named("node_elect_fail_c").expect("node");
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
@@ -2296,9 +2329,9 @@ mod tests {
 
     #[test]
     fn raft_votes_require_current_candidate_log() {
-        let voter = NodeId::new("node_voter").expect("node");
-        let stale = NodeId::new("node_stale").expect("node");
-        let current = NodeId::new("node_current").expect("node");
+        let voter = NodeId::from_legacy_named("node_voter").expect("node");
+        let stale = NodeId::from_legacy_named("node_stale").expect("node");
+        let current = NodeId::from_legacy_named("node_current").expect("node");
         let mut cluster = InProcessRaftKvCluster::new(vec![voter.clone()]).expect("cluster");
         cluster.put("/config/a", b"one".to_vec()).expect("put");
 
@@ -2332,7 +2365,7 @@ mod tests {
     #[test]
     fn durable_raft_node_replays_wal_and_snapshot() {
         let root = temp_raft_root("sinomo-kv-wal");
-        let node_id = NodeId::new("node_wal").expect("node");
+        let node_id = NodeId::from_legacy_named("node_wal").expect("node");
         let paths = KvWalPaths::new(&root);
         {
             let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
@@ -2372,9 +2405,26 @@ mod tests {
     }
 
     #[test]
+    fn durable_raft_node_opens_from_tokio_without_blocking_runtime() {
+        let root = temp_raft_root("sinomo-kv-async-open");
+        let node_id = NodeId::from_legacy_named("node_async_open").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+
+        let node = runtime
+            .block_on(DurableRaftKvNode::open_async(node_id.clone(), paths))
+            .expect("open async");
+
+        assert_eq!(node.node_id(), &node_id);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn durable_raft_power_loss_before_commit_does_not_apply_uncommitted_wal() {
         let root = temp_raft_root("sinomo-kv-powerloss-uncommitted");
-        let node_id = NodeId::new("node_powerloss_uncommitted").expect("node");
+        let node_id = NodeId::from_legacy_named("node_powerloss_uncommitted").expect("node");
         let paths = KvWalPaths::new(&root);
         {
             let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
@@ -2408,7 +2458,7 @@ mod tests {
     #[test]
     fn durable_raft_power_loss_after_commit_replays_committed_state() {
         let root = temp_raft_root("sinomo-kv-powerloss-committed");
-        let node_id = NodeId::new("node_powerloss_committed").expect("node");
+        let node_id = NodeId::from_legacy_named("node_powerloss_committed").expect("node");
         let paths = KvWalPaths::new(&root);
         {
             let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
@@ -2441,8 +2491,8 @@ mod tests {
     #[test]
     fn durable_raft_persists_higher_term_from_rejected_append() {
         let root = temp_raft_root("sinomo-kv-rejected-append-term");
-        let follower_id = NodeId::new("node_rejected_append_follower").expect("node");
-        let leader_id = NodeId::new("node_rejected_append_leader").expect("node");
+        let follower_id = NodeId::from_legacy_named("node_rejected_append_follower").expect("node");
+        let leader_id = NodeId::from_legacy_named("node_rejected_append_leader").expect("node");
         let paths = KvWalPaths::new(&root);
         {
             let mut follower =
@@ -2494,8 +2544,8 @@ mod tests {
     fn delayed_stale_append_entries_do_not_roll_back_committed_state() {
         let leader_root = temp_raft_root("sinomo-kv-latency-leader");
         let follower_root = temp_raft_root("sinomo-kv-latency-follower");
-        let leader_id = NodeId::new("node_latency_leader").expect("node");
-        let follower_id = NodeId::new("node_latency_follower").expect("node");
+        let leader_id = NodeId::from_legacy_named("node_latency_leader").expect("node");
+        let follower_id = NodeId::from_legacy_named("node_latency_follower").expect("node");
         let leader_paths = KvWalPaths::new(&leader_root);
         let follower_paths = KvWalPaths::new(&follower_root);
         let mut leader =
@@ -2603,7 +2653,7 @@ mod tests {
     #[test]
     fn durable_raft_node_recovers_by_truncating_corrupt_wal_tail() {
         let root = temp_raft_root("sinomo-kv-corrupt-wal");
-        let node_id = NodeId::new("node_corrupt_wal").expect("node id");
+        let node_id = NodeId::from_legacy_named("node_corrupt_wal").expect("node id");
         let paths = KvWalPaths::new(&root);
         let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
         let before_snapshot = node
@@ -2650,8 +2700,12 @@ mod tests {
                 .value,
             b"two"
         );
-        let rewritten = std::fs::read_to_string(&paths.wal).expect("rewritten wal");
-        assert!(!rewritten.contains("broken"));
+        let rewritten = std::fs::read(&paths.wal).expect("rewritten wal");
+        assert!(
+            !rewritten
+                .windows(b"broken".len())
+                .any(|window| window == b"broken")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

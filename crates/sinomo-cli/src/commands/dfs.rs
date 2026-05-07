@@ -838,7 +838,7 @@ pub(crate) fn parse_dfs_file_system_id(value: &str) -> Result<DfsFileSystemId, C
 }
 
 pub(crate) fn default_dfs_file_system_id() -> DfsFileSystemId {
-    DfsFileSystemId::new("sifs").expect("valid default DFS filesystem id")
+    DfsFileSystemId::from_legacy_named("sifs").expect("valid default DFS filesystem id")
 }
 
 pub(crate) fn parse_dfs_object_id(value: &str) -> Result<DfsObjectId, CliError> {
@@ -867,7 +867,9 @@ pub(crate) fn default_dfs_node_id() -> NodeId {
     cluster_paths_from_defaults()
         .and_then(|paths| read_cluster_state(&paths))
         .map(|state| state.local_node_id)
-        .unwrap_or_else(|_| NodeId::new("node_local").expect("valid fallback node id"))
+        .unwrap_or_else(|_| {
+            NodeId::from_legacy_named("node_local").expect("valid fallback node id")
+        })
 }
 
 pub(crate) fn non_empty_string(value: &str, field: &str) -> Result<String, CliError> {

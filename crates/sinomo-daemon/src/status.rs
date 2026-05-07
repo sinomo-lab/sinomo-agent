@@ -1,10 +1,11 @@
-use crate::{DaemonError, DaemonPaths, send_daemon_command};
+use crate::{DaemonError, DaemonPaths, send_daemon_rpc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
     ClusterId, ClusterMemberRole, ClusterMemberState, ClusterNodeRolloutStatus, NodeId,
 };
 use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -154,7 +155,20 @@ impl DaemonLock {
             path: paths.lock.display().to_string(),
             detail: source.to_string(),
         })?;
-        serde_json::to_writer_pretty(&file, &status).map_err(|source| DaemonError::Json {
+        (&file)
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| DaemonError::Io {
+                path: paths.lock.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        let status_bytes = sinomo_network::SinomoObjectCodec::default().encode(&status)?;
+        (&file)
+            .write_all(&status_bytes)
+            .map_err(|source| DaemonError::Io {
+                path: paths.lock.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        (&file).flush().map_err(|source| DaemonError::Io {
             path: paths.lock.display().to_string(),
             detail: source.to_string(),
         })?;
@@ -176,9 +190,15 @@ impl Drop for DaemonLock {
 pub fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProbeStatus {
     let status = read_daemon_status(paths).ok();
     if let Some(status) = &status {
-        if send_daemon_command(&status.address, "STATUS", timeout)
+        let request = sinomo_network::ObjectRpcRequest::encode_body(
+            sinomo_network::DAEMON_STATUS_ROUTE,
+            sinomo_network::DAEMON_RPC_CATEGORY,
+            &(),
+        );
+        if request
             .ok()
-            .and_then(|response| serde_json::from_str::<DaemonStatus>(&response).ok())
+            .and_then(|request| send_daemon_rpc(&status.address, &request, timeout).ok())
+            .and_then(|response| response.decode_body::<DaemonStatus>().ok())
             .is_some_and(|remote_status| daemon_status_matches_probe(status, &remote_status))
         {
             return DaemonProbeStatus::Running(status.clone());
@@ -219,22 +239,18 @@ pub fn daemon_status_matches_probe(expected: &DaemonStatus, actual: &DaemonStatu
 }
 
 pub fn read_daemon_status(paths: &DaemonPaths) -> Result<DaemonStatus, DaemonError> {
-    let content = fs::read_to_string(&paths.status).map_err(|source| DaemonError::Io {
+    let bytes = fs::read(&paths.status).map_err(|source| DaemonError::Io {
         path: paths.status.display().to_string(),
         detail: source.to_string(),
     })?;
-    serde_json::from_str(&content).map_err(|source| DaemonError::Json {
-        path: paths.status.display().to_string(),
-        detail: source.to_string(),
-    })
+    sinomo_network::SinomoObjectCodec::default()
+        .decode(&bytes)
+        .map_err(DaemonError::from)
 }
 
 pub fn write_daemon_status(paths: &DaemonPaths, status: &DaemonStatus) -> Result<(), DaemonError> {
-    let status_json = serde_json::to_vec_pretty(status).map_err(|source| DaemonError::Json {
-        path: paths.status.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::write(&paths.status, status_json).map_err(|source| DaemonError::Io {
+    let status_bytes = sinomo_network::SinomoObjectCodec::default().encode(status)?;
+    fs::write(&paths.status, status_bytes).map_err(|source| DaemonError::Io {
         path: paths.status.display().to_string(),
         detail: source.to_string(),
     })

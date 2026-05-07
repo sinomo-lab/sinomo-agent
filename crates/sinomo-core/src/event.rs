@@ -228,9 +228,9 @@ mod tests {
     #[test]
     fn event_json_matches_documented_shape() {
         let event = EventEnvelope::new(
-            EventId::new("evt_example").expect("event id"),
+            EventId::from_legacy_named("evt_example").expect("event id"),
             OffsetDateTime::from_unix_timestamp(1_776_809_414).expect("timestamp"),
-            NodeId::new("node_mobile_phone").expect("node id"),
+            NodeId::from_legacy_named("node_mobile_phone").expect("node id"),
             Source::new("audio.mic.frontdesk").expect("source"),
             EventKind::new("speech.transcript.final").expect("kind"),
             Salience::new(0.81).expect("salience"),
@@ -242,19 +242,23 @@ mod tests {
             )
             .with_hint(RoutingHint::new("target:desktop").expect("hint")),
         )
-        .with_session(SessionId::new("sess_example").expect("session"))
+        .with_session(SessionId::from_legacy_named("sess_example").expect("session"))
         .with_payload(serde_json::json!({
             "text": "Please check the alert and tell me if it is urgent"
         }));
 
         let json = serde_json::to_value(&event).expect("serialize event");
-        assert_eq!(json["event_id"], "evt_example");
+        assert_eq!(json["event_id"].as_str().expect("event id").len(), 26);
+        assert!(!json["event_id"].as_str().expect("event id").contains('_'));
         assert_eq!(json["kind"], "speech.transcript.final");
         assert_eq!(json["routing"]["scope"], "session");
         assert_eq!(json["routing"]["latency_class"], "interactive");
 
         let round_tripped: EventEnvelope = serde_json::from_value(json).expect("deserialize event");
-        assert_eq!(round_tripped.event_id.as_str(), "evt_example");
+        assert_eq!(
+            round_tripped.event_id,
+            EventId::from_legacy_named("evt_example").expect("event id")
+        );
     }
 
     #[test]

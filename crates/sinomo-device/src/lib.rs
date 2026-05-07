@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn device_profile_round_trips_json() {
-        let node_id = NodeId::new("node_desktop").expect("node id");
+        let node_id = NodeId::from_legacy_named("node_desktop").expect("node id");
         let capability_name = CapabilityName::new("input.audio.vad").expect("capability");
         let device = DeviceProfile::mock_microphone(node_id.clone())
             .with_capability(DeviceCapability::new(capability_name.clone()))
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn device_source_carries_provenance() {
-        let node_id = NodeId::new("node_desktop").expect("node id");
+        let node_id = NodeId::from_legacy_named("node_desktop").expect("node id");
         let device = DeviceProfile::mock_screen(node_id.clone());
         let source = device.source("screen.main");
 

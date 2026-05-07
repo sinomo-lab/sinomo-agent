@@ -257,9 +257,9 @@ mod tests {
             sequence: EventSequence(1),
             appended_at: OffsetDateTime::now_utc(),
             event: EventEnvelope::new(
-                EventId::new(id).expect("event"),
+                EventId::from_legacy_named(id).expect("event"),
                 OffsetDateTime::now_utc(),
-                NodeId::new("node_desktop").expect("node"),
+                NodeId::from_legacy_named("node_desktop").expect("node"),
                 Source::new("test.memory").expect("source"),
                 EventKind::new(kind).expect("kind"),
                 Salience::new(salience).expect("salience"),
@@ -270,7 +270,7 @@ mod tests {
                     PrivacyClass::Derived,
                 ),
             )
-            .with_session(SessionId::new("sess_memory").expect("session"))
+            .with_session(SessionId::from_legacy_named("sess_memory").expect("session"))
             .with_payload(serde_json::json!({ "text": "urgent alert" })),
         }
     }
@@ -283,7 +283,10 @@ mod tests {
         hot.ingest(stored("evt_3", "speech.transcript.final", 0.2));
 
         assert_eq!(hot.len(), 2);
-        assert_eq!(hot.recent()[0].event.event_id.as_str(), "evt_2");
+        assert_eq!(
+            hot.recent()[0].event.event_id,
+            EventId::from_legacy_named("evt_2").expect("event")
+        );
     }
 
     #[test]
@@ -294,7 +297,8 @@ mod tests {
         });
         manager.ingest(stored("evt_salient", "speech.transcript.final", 0.9));
 
-        let packet = manager.context_packet(&SessionId::new("sess_memory").expect("session"));
+        let packet =
+            manager.context_packet(&SessionId::from_legacy_named("sess_memory").expect("session"));
         assert_eq!(manager.warm().entries().len(), 1);
         assert_eq!(packet.salient_events.len(), 1);
         assert_eq!(packet.memory_records.len(), 1);

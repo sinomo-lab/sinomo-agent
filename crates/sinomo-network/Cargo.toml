@@ -13,7 +13,7 @@ ring = "r1"
 
 [features]
 default = []
-iroh-transport = ["dep:iroh", "dep:tokio"]
+iroh-transport = ["dep:iroh"]
 
 [dependencies]
 base64 = "0.22"
@@ -22,10 +22,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 iroh = { version = "0.98.2", optional = true }
-tokio = { version = "1.44", features = ["io-util", "net", "rt-multi-thread", "time"], optional = true }
+tokio = { version = "1.44", features = ["io-util", "net", "rt-multi-thread", "time"] }
+tower-layer = "0.3"
+tower-service = "0.3"
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
+sinomo-storage = { path = "../sinomo-storage" }

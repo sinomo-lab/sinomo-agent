@@ -80,8 +80,9 @@ mod tests {
 
     #[test]
     fn video_worker_emits_screen_observation() {
-        let device = DeviceProfile::mock_screen(NodeId::new("node_desktop").expect("node"));
-        let session = SessionId::new("sess_video").expect("session");
+        let device =
+            DeviceProfile::mock_screen(NodeId::from_legacy_named("node_desktop").expect("node"));
+        let session = SessionId::from_legacy_named("sess_video").expect("session");
         let mut adapter =
             SyntheticInputAdapter::screen_observation(&device, session, "alert dialog visible")
                 .expect("adapter");

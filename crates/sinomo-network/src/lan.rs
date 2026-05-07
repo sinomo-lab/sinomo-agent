@@ -56,6 +56,45 @@ impl LanQuicFrameCodec {
     }
 }
 
+pub fn discover_default_lan_ip_candidates() -> Vec<IpAddr> {
+    let targets = ["8.8.8.8:80", "1.1.1.1:80", "192.0.2.1:80"]
+        .into_iter()
+        .filter_map(|target| target.parse::<SocketAddr>().ok());
+    discover_local_ip_candidates_for_targets(targets)
+}
+
+pub fn discover_local_ip_candidates_for_targets<I>(targets: I) -> Vec<IpAddr>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let mut candidates = Vec::new();
+    for target in targets {
+        let bind = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let Ok(socket) = UdpSocket::bind(bind) else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+        let Ok(address) = socket.local_addr() else {
+            continue;
+        };
+        let ip = address.ip();
+        if is_invitable_ip(ip) && !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    candidates
+}
+
+pub fn is_invitable_ip(ip: IpAddr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MdnsDiscoveryCache {
     records: BTreeMap<String, MdnsDiscoveryRecord>,

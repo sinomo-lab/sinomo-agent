@@ -23,6 +23,8 @@ pub enum NetworkError {
     },
     #[error("unknown delivery: {delivery_id:?}")]
     UnknownDelivery { delivery_id: RouteDeliveryId },
+    #[error("unknown object rpc route: {route}")]
+    UnknownRoute { route: String },
     #[error(
         "delivery {delivery_id:?} acked by {acking_node_id}, expected {expected_target_node_id}"
     )]

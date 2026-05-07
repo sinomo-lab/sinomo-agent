@@ -22,7 +22,7 @@ impl SelfRolloutPaths {
             source_repo: data_dir_root.join("source").join("sinomo"),
             main_binary: bin.join(executable_name("sinomo")),
             shadow_binary: bin.join(executable_name("sinomo-shadow")),
-            state: root.join("state.json"),
+            state: root.join("state.sobj"),
             build_log: root.join("build.log"),
             root,
             bin,
@@ -103,7 +103,7 @@ mod tests {
             paths.shadow_binary,
             root.join("bin").join(executable_name("sinomo-shadow"))
         );
-        assert_eq!(paths.state, root.join("rollout").join("state.json"));
+        assert_eq!(paths.state, root.join("rollout").join("state.sobj"));
         assert_eq!(paths.build_log, root.join("rollout").join("build.log"));
     }
 

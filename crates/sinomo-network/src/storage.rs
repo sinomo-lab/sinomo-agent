@@ -1,4 +1,5 @@
 use crate::error::NetworkError;
+use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
@@ -7,7 +8,6 @@ pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
 pub struct ClusterPaths {
     pub root: PathBuf,
     pub state: PathBuf,
-    pub invites: PathBuf,
     pub iroh: PathBuf,
     pub kv_snapshot: PathBuf,
     pub kv_raft: PathBuf,
@@ -19,13 +19,12 @@ impl ClusterPaths {
     pub fn new(data_dir: &SinomoDataDir) -> Self {
         let root = data_dir.root().join("cluster");
         Self {
-            state: root.join("state.json"),
-            invites: root.join("invites"),
+            state: root.join("state.sobj"),
             iroh: root.join("iroh"),
-            kv_snapshot: root.join("kv-snapshot.json"),
+            kv_snapshot: root.join("kv-snapshot.sobj"),
             kv_raft: root.join("kv-raft"),
             kv_watches: root.join("watches"),
-            kv_watch_events: root.join("watch-events.jsonl"),
+            kv_watch_events: root.join("watch-events.sobj"),
             root,
         }
     }
@@ -35,10 +34,6 @@ impl ClusterPaths {
             path: self.root.display().to_string(),
             detail: source.to_string(),
         })
-    }
-
-    pub fn invite_path(&self, invite_id: &ClusterInviteId) -> PathBuf {
-        self.invites.join(format!("{}.json", invite_id.as_str()))
     }
 }
 
@@ -243,15 +238,7 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
     if !paths.state.exists() {
         return Err(NetworkError::ClusterOrphan);
     }
-    let content = fs::read_to_string(&paths.state).map_err(|source| NetworkError::StorageIo {
-        path: paths.state.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let mut state: ClusterBootstrapState =
-        serde_json::from_str(&content).map_err(|source| NetworkError::Json {
-            path: paths.state.display().to_string(),
-            detail: source.to_string(),
-        })?;
+    let mut state: ClusterBootstrapState = read_object_file(&paths.state)?;
     let kv_members = match read_cluster_members_from_kv(paths) {
         Ok(members) => members,
         Err(error) => {
@@ -272,26 +259,18 @@ pub fn write_cluster_state(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), NetworkError> {
-    write_json_file(&paths.state, state)
+    write_object_file(&paths.state, state)
 }
 
 pub fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, NetworkError> {
-    let content =
-        fs::read_to_string(&paths.kv_snapshot).map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_snapshot.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    serde_json::from_str(&content).map_err(|source| NetworkError::Json {
-        path: paths.kv_snapshot.display().to_string(),
-        detail: source.to_string(),
-    })
+    read_object_file(&paths.kv_snapshot)
 }
 
 pub fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), NetworkError> {
-    write_json_file(&paths.kv_snapshot, snapshot)
+    write_object_file(&paths.kv_snapshot, snapshot)
 }
 
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
@@ -370,6 +349,24 @@ pub fn open_cluster_raft_kv_node(
 ) -> Result<DurableRaftKvNode, NetworkError> {
     let wal_paths = cluster_raft_wal_paths(paths, node_id);
     let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths)?;
+    if node.hard_state().commit_index == 0 && paths.kv_snapshot.exists() {
+        let snapshot = read_cluster_kv_snapshot(paths)?;
+        node.restore_snapshot(RaftSnapshot {
+            last_included_index: snapshot.revision.0,
+            last_included_term: 1,
+            kv: snapshot,
+        })?;
+    }
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
+    Ok(node)
+}
+
+pub async fn open_cluster_raft_kv_node_async(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<DurableRaftKvNode, NetworkError> {
+    let wal_paths = cluster_raft_wal_paths(paths, node_id);
+    let mut node = DurableRaftKvNode::open_async(node_id.clone(), wal_paths).await?;
     if node.hard_state().commit_index == 0 && paths.kv_snapshot.exists() {
         let snapshot = read_cluster_kv_snapshot(paths)?;
         node.restore_snapshot(RaftSnapshot {
@@ -542,7 +539,7 @@ pub fn create_cluster_kv_watch(
         prefix: request.prefix,
         next_revision: request.start_revision,
     };
-    write_json_file(&cluster_kv_watch_path(paths, watch_id), &registration)?;
+    write_object_file(&cluster_kv_watch_path(paths, watch_id), &registration)?;
     Ok(registration)
 }
 
@@ -551,15 +548,7 @@ pub fn drain_cluster_kv_watch(
     request: ClusterKvWatchDrainRequest,
 ) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
     let watch_path = cluster_kv_watch_path(paths, request.watch_id);
-    let content = fs::read_to_string(&watch_path).map_err(|source| NetworkError::StorageIo {
-        path: watch_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let mut registration: ClusterKvWatchRegistration =
-        serde_json::from_str(&content).map_err(|source| NetworkError::Json {
-            path: watch_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+    let mut registration: ClusterKvWatchRegistration = read_object_file(&watch_path)?;
     let snapshot = read_cluster_kv_snapshot(paths)?;
     if registration.next_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
@@ -586,7 +575,7 @@ pub fn drain_cluster_kv_watch(
         .collect::<Vec<_>>();
     if let Some(last) = events.last() {
         registration.next_revision = KvRevision(last.revision.0.saturating_add(1));
-        write_json_file(&watch_path, &registration)?;
+        write_object_file(&watch_path, &registration)?;
     }
     Ok(ClusterKvWatchDrainResponse {
         watch_id: registration.watch_id,
@@ -610,42 +599,22 @@ pub fn append_cluster_kv_watch_events(
     }
     let mut existing = cluster_kv_watch_events(paths)?;
     let mut stored = 0;
-    {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&paths.kv_watch_events)
-            .map_err(|source| NetworkError::StorageIo {
-                path: paths.kv_watch_events.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        for event in incoming {
-            if existing.iter().any(|candidate| {
-                candidate.revision == event.revision
-                    && candidate.key == event.key
-                    && candidate.kind == event.kind
-            }) {
-                continue;
-            }
-            serde_json::to_writer(&mut file, event).map_err(|source| NetworkError::Json {
-                path: paths.kv_watch_events.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            writeln!(file).map_err(|source| NetworkError::StorageIo {
-                path: paths.kv_watch_events.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            existing.push(event.clone());
-            stored += 1;
+    for event in incoming {
+        if existing.iter().any(|candidate| {
+            candidate.revision == event.revision
+                && candidate.key == event.key
+                && candidate.kind == event.kind
+        }) {
+            continue;
         }
-        file.sync_data().map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_watch_events.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        existing.push(event.clone());
+        stored += 1;
     }
     if existing.len() > MAX_CLUSTER_KV_WATCH_EVENTS {
         let retained = existing.split_off(existing.len() - MAX_CLUSTER_KV_WATCH_EVENTS);
         write_cluster_kv_watch_events(paths, &retained)?;
+    } else if stored > 0 {
+        write_cluster_kv_watch_events(paths, &existing)?;
     }
     Ok(stored)
 }
@@ -654,28 +623,7 @@ pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, Net
     if !paths.kv_watch_events.exists() {
         return Ok(Vec::new());
     }
-    let file =
-        fs::File::open(&paths.kv_watch_events).map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_watch_events.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    let mut events = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line.map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_watch_events.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        events.push(
-            serde_json::from_str(&line).map_err(|source| NetworkError::Json {
-                path: paths.kv_watch_events.display().to_string(),
-                detail: source.to_string(),
-            })?,
-        );
-    }
-    Ok(events)
+    read_object_file(&paths.kv_watch_events)
 }
 
 fn write_cluster_kv_watch_events(
@@ -690,45 +638,11 @@ fn write_cluster_kv_watch_events(
         path: parent.display().to_string(),
         detail: source.to_string(),
     })?;
-    let temp_path = parent.join(format!(".watch-events.jsonl.tmp-{}", std::process::id()));
-    {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temp_path)
-            .map_err(|source| NetworkError::StorageIo {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        for event in events {
-            serde_json::to_writer(&mut file, event).map_err(|source| NetworkError::Json {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            writeln!(file).map_err(|source| NetworkError::StorageIo {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        file.sync_all().map_err(|source| NetworkError::StorageIo {
-            path: temp_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    fs::rename(&temp_path, &paths.kv_watch_events).map_err(|source| NetworkError::StorageIo {
-        path: format!(
-            "{} -> {}",
-            temp_path.display(),
-            paths.kv_watch_events.display()
-        ),
-        detail: source.to_string(),
-    })?;
-    sync_directory(parent)
+    write_object_file(&paths.kv_watch_events, &events)
 }
 
 fn cluster_kv_watch_path(paths: &ClusterPaths, watch_id: WatchId) -> PathBuf {
-    paths.kv_watches.join(format!("watch-{}.json", watch_id.0))
+    paths.kv_watches.join(format!("watch-{}.sobj", watch_id.0))
 }
 
 fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkError> {
@@ -747,7 +661,7 @@ fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkErro
             };
             if let Some(id) = name
                 .strip_prefix("watch-")
-                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|name| name.strip_suffix(".sobj"))
                 .and_then(|id| id.parse::<u64>().ok())
             {
                 max_id = max_id.max(id);
@@ -763,14 +677,7 @@ pub fn read_cluster_state_without_kv(
     if !paths.state.exists() {
         return Err(NetworkError::ClusterOrphan);
     }
-    let content = fs::read_to_string(&paths.state).map_err(|source| NetworkError::StorageIo {
-        path: paths.state.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content).map_err(|source| NetworkError::Json {
-        path: paths.state.display().to_string(),
-        detail: source.to_string(),
-    })
+    read_object_file(&paths.state)
 }
 
 pub fn read_cluster_members_from_kv(
@@ -1504,26 +1411,35 @@ pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpoin
     targets
 }
 
-pub(crate) fn write_json_file<T: Serialize>(path: &PathBuf, value: &T) -> Result<(), NetworkError> {
+pub(crate) fn read_object_file<T: serde::de::DeserializeOwned>(
+    path: &PathBuf,
+) -> Result<T, NetworkError> {
+    let bytes = fs::read(path).map_err(|source| NetworkError::StorageIo {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    SinomoObjectCodec::default().decode(&bytes)
+}
+
+pub(crate) fn write_object_file<T: Serialize>(
+    path: &PathBuf,
+    value: &T,
+) -> Result<(), NetworkError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
             path: parent.display().to_string(),
             detail: source.to_string(),
         })?;
     }
-    let content = serde_json::to_string_pretty(value).map_err(|source| NetworkError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let desired = format!("{content}\n");
-    if fs::read_to_string(path).is_ok_and(|existing| existing == desired) {
+    let desired = SinomoObjectCodec::default().encode(value)?;
+    if fs::read(path).is_ok_and(|existing| existing == desired) {
         return Ok(());
     }
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("json");
+        .unwrap_or("sobj");
     let temp_path = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
     {
         let mut file = fs::OpenOptions::new()
@@ -1535,7 +1451,7 @@ pub(crate) fn write_json_file<T: Serialize>(path: &PathBuf, value: &T) -> Result
                 path: temp_path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        file.write_all(desired.as_bytes())
+        file.write_all(&desired)
             .map_err(|source| NetworkError::StorageIo {
                 path: temp_path.display().to_string(),
                 detail: source.to_string(),

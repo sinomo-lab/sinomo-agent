@@ -9,11 +9,212 @@ use sinomo_core::{
     PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
 };
 use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
-use sinomo_kv::{InProcessKvStore, KvCommand, KvEventKind, KvOp};
+use sinomo_kv::{
+    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvEventKind, KvOp, KvRevision, KvSnapshot,
+    KvTxn, LeaseId, cluster_member_key,
+};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
+
+#[test]
+fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
+    use tower_service::Service;
+
+    let category = object_rpc_category!(
+        "cluster.kv",
+        "Cluster KV control routes",
+        [
+            route(
+                "/cluster/kv/increment",
+                "Increment a test counter",
+                u64 => u64,
+                observe("counter" => "sinomo_network_rpc_requests_total")
+            )
+        ]
+    );
+    let increment_route = category.routes[0].clone();
+    let mut router = ObjectRpcRouter::new()
+        .register_category_definition(category)
+        .register_route(increment_route, |request| async move {
+            let value: u64 = request.decode_body()?;
+            ObjectRpcResponse::encode_body(request.route, &(value + 1))
+        });
+
+    assert!(router.catalog().categories.contains_key("cluster.kv"));
+    assert!(
+        router
+            .catalog()
+            .routes
+            .contains_key("/cluster/kv/increment")
+    );
+    let descriptor = router
+        .catalog()
+        .routes
+        .get("/cluster/kv/increment")
+        .expect("route descriptor");
+    assert_eq!(descriptor.input_type, "u64");
+    assert_eq!(descriptor.output_type, "u64");
+
+    let request = ObjectRpcRequest::encode_body("/cluster/kv/increment", "cluster.kv", &41_u64)
+        .expect("request");
+    assert!(request.body.starts_with(sinomo_object::MAGIC));
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let response = runtime
+        .block_on(router.call(request))
+        .expect("route response");
+    assert!(response.body.starts_with(sinomo_object::MAGIC));
+    assert_eq!(response.decode_body::<u64>().expect("decode"), 42);
+}
+
+#[test]
+fn object_rpc_frame_transport_serves_binary_request_response() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let mut router = ObjectRpcRouter::new().register_route(
+            ObjectRouteDescriptor::for_types::<u64, u64>(
+                "/cluster/kv/increment",
+                "cluster.kv",
+                "Increment a test counter",
+            ),
+            |request| async move {
+                let value: u64 = request.decode_body()?;
+                ObjectRpcResponse::encode_body(request.route, &(value + 1))
+            },
+        );
+        let server_task = tokio::spawn(async move {
+            serve_object_rpc_frame_async(&mut server, &mut router, 4096)
+                .await
+                .expect("serve frame");
+        });
+        let request = ObjectRpcRequest::encode_body("/cluster/kv/increment", "cluster.kv", &41_u64)
+            .expect("request");
+        let response = call_object_rpc_frame_async(&mut client, &request, 4096)
+            .await
+            .expect("response");
+
+        server_task.await.expect("server task");
+        assert_eq!(response.decode_body::<u64>().expect("decode"), 42);
+    });
+}
+
+#[test]
+fn async_object_frame_helpers_round_trip_binary_payloads() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            write_object_frame_async(&mut client, &DaemonControlRequest::new("RPC /test/status"))
+                .await
+                .expect("write frame");
+        });
+        let request: DaemonControlRequest = read_object_frame_async(&mut server, 4096)
+            .await
+            .expect("read frame");
+        writer.await.expect("writer task");
+        assert_eq!(request.command, "RPC /test/status");
+    });
+}
+
+#[test]
+fn async_daemon_control_client_round_trips_object_frames() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request: DaemonControlRequest = read_object_frame_async(&mut stream, 4096)
+                .await
+                .expect("read request");
+            assert_eq!(request.command, "RPC /test/status");
+            assert_eq!(request.rpc.as_ref().expect("rpc").route, "/test/status");
+            let rpc_response = ObjectRpcResponse::encode_body("/test/status", &"OK".to_string())
+                .expect("rpc response");
+            write_object_frame_async(
+                &mut stream,
+                &DaemonControlResponse::rpc(String::new(), rpc_response),
+            )
+            .await
+            .expect("write response");
+        });
+        let request =
+            ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
+        let response = send_daemon_rpc_raw_async(
+            &address,
+            "RPC /test/status",
+            None,
+            &request,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("response");
+        server.await.expect("server");
+        assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
+    });
+}
+
+#[test]
+fn async_daemon_rpc_client_rejects_non_rpc_response() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request: DaemonControlRequest = read_object_frame_async(&mut stream, 4096)
+                .await
+                .expect("read request");
+            assert_eq!(request.command, "RPC /test/status");
+            write_object_frame_async(&mut stream, &DaemonControlResponse::new("OK"))
+                .await
+                .expect("write response");
+        });
+        let request =
+            ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
+        let error = send_daemon_rpc_raw_async(
+            &address,
+            "RPC /test/status",
+            None,
+            &request,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("non-rpc response");
+        server.await.expect("server");
+        assert!(error.to_string().contains("non-rpc response"));
+    });
+}
+
+#[test]
+fn lan_ip_filter_rejects_non_invitable_addresses() {
+    assert!(!is_invitable_ip("127.0.0.1".parse().expect("loopback")));
+    assert!(!is_invitable_ip("0.0.0.0".parse().expect("unspecified")));
+    assert!(!is_invitable_ip("224.0.0.1".parse().expect("multicast")));
+    assert!(is_invitable_ip("192.168.1.10".parse().expect("lan")));
+}
 
 #[cfg(feature = "iroh-transport")]
 #[test]
-fn iroh_daemon_proxy_round_trips_control_command() {
+fn iroh_daemon_proxy_round_trips_rpc_request() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind daemon fixture");
     let daemon_address = listener
         .local_addr()
@@ -21,11 +222,18 @@ fn iroh_daemon_proxy_round_trips_control_command() {
         .to_string();
     let fixture = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept daemon fixture");
-        let mut request = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut request)
-            .expect("read daemon fixture request");
-        assert_eq!(request.trim(), "PING");
-        std::io::Write::write_all(&mut stream, b"PONG\n").expect("write daemon fixture response");
+        let request: crate::DaemonControlRequest =
+            crate::read_object_frame_blocking(&mut stream, crate::IROH_DAEMON_COMMAND_MAX_BYTES)
+                .expect("read daemon fixture request");
+        assert_eq!(request.command, "RPC /test/ping");
+        assert_eq!(request.rpc.as_ref().expect("rpc").route, "/test/ping");
+        let rpc_response = crate::ObjectRpcResponse::encode_body("/test/ping", &"PONG".to_string())
+            .expect("rpc response");
+        crate::write_object_frame_blocking(
+            &mut stream,
+            &crate::DaemonControlResponse::rpc(String::new(), rpc_response),
+        )
+        .expect("write daemon fixture response");
     });
 
     let root = std::env::temp_dir().join(format!(
@@ -39,20 +247,23 @@ fn iroh_daemon_proxy_round_trips_control_command() {
     paths.ensure().expect("cluster paths");
     let record = start_iroh_daemon_proxy(
         paths.clone(),
-        ClusterId::new("cluster_iroh_proxy").expect("cluster"),
-        NodeId::new("node_iroh_proxy").expect("node"),
+        ClusterId::from_legacy_named("cluster_iroh_proxy").expect("cluster"),
+        NodeId::from_legacy_named("node_iroh_proxy").expect("node"),
         daemon_address,
     )
     .expect("start iroh proxy");
 
-    let response = send_daemon_command_to_cluster_endpoint(
+    let request = ObjectRpcRequest::encode_body("/test/ping", "test", &()).expect("rpc request");
+    let response = send_daemon_rpc_to_cluster_endpoint(
         &record.endpoint(),
-        "PING",
+        "RPC /test/ping",
+        None,
+        &request,
         std::time::Duration::from_secs(5),
     )
-    .expect("send iroh daemon command");
+    .expect("send iroh daemon rpc");
 
-    assert_eq!(response.trim(), "PONG");
+    assert_eq!(response.decode_body::<String>().expect("decode"), "PONG");
     fixture.join().expect("daemon fixture");
     std::fs::remove_dir_all(root).ok();
 }
@@ -99,7 +310,7 @@ fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    let node_id = NodeId::new("node_uncommitted_snapshot").expect("node");
+    let node_id = NodeId::from_legacy_named("node_uncommitted_snapshot").expect("node");
 
     append_cluster_raft_command(
         &paths,
@@ -145,8 +356,8 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     paths.ensure().expect("cluster paths");
 
     let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::new("cluster_network_storage").expect("cluster");
-    let node_id = NodeId::new("node_network_storage").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_network_storage").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_network_storage").expect("node");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "network storage",
@@ -163,8 +374,10 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
     member.allowed_capabilities = member.capabilities.clone();
     member.endpoints = vec![ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_network_storage_daemon_lan")
-            .expect("endpoint id"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named(
+            "endpoint_network_storage_daemon_lan",
+        )
+        .expect("endpoint id"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::LanTcp,
         address: "127.0.0.1:21353".to_string(),
@@ -253,6 +466,16 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
             .get(&cluster_rollout_node_key(&state.local_node_id))
             .is_some()
     );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let async_node = runtime
+        .block_on(open_cluster_raft_kv_node_async(
+            &paths,
+            &state.local_node_id,
+        ))
+        .expect("async open");
+    assert_eq!(async_node.node_id(), &state.local_node_id);
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -271,8 +494,8 @@ fn cluster_read_view_falls_back_to_snapshot_when_local_raft_state_is_corrupt() {
     paths.ensure().expect("cluster paths");
 
     let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::new("cluster_corrupt_read_view").expect("cluster");
-    let node_id = NodeId::new("node_corrupt_read_view").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_corrupt_read_view").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_corrupt_read_view").expect("node");
     let state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         "corrupt read view",
@@ -307,9 +530,9 @@ fn cluster_network_records_publish_overwrite_and_expire() {
     paths.ensure().expect("cluster paths");
 
     let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::new("cluster_network_graph").expect("cluster");
-    let node_a = NodeId::new("node_network_graph_a").expect("node a");
-    let node_b = NodeId::new("node_network_graph_b").expect("node b");
+    let cluster_id = ClusterId::from_legacy_named("cluster_network_graph").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_network_graph_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_network_graph_b").expect("node b");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "network graph",
@@ -321,7 +544,7 @@ fn cluster_network_records_publish_overwrite_and_expire() {
     let mut member_b =
         ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "node b", "pk-b", now);
     member_b.endpoints = vec![ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_network_graph_b")
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_network_graph_b")
             .expect("endpoint"),
         node_id: node_b.clone(),
         transport: ClusterTransportKind::LanTcp,
@@ -446,13 +669,13 @@ fn cluster_kv_watch_event_log_is_bounded() {
 
 fn node(id: &str) -> NodeProfile {
     let mut profile = NodeProfile::local(id).expect("profile");
-    profile.node_id = NodeId::new(id).expect("node id");
+    profile.node_id = NodeId::from_legacy_named(id).expect("node id");
     profile
 }
 
 fn fixture_event(id: &str, origin_node_id: NodeId) -> EventEnvelope {
     EventEnvelope::new(
-        EventId::new(id).expect("event"),
+        EventId::from_legacy_named(id).expect("event"),
         time::OffsetDateTime::now_utc(),
         origin_node_id,
         Source::new("test.network").expect("source"),
@@ -489,8 +712,8 @@ fn certificate(
 
 #[test]
 fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
-    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
-    let node_id = NodeId::new("node_desktop").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
     let timestamp = time::OffsetDateTime::now_utc();
     let mut member = ClusterMemberRecord::local_voter(
         cluster_id.clone(),
@@ -500,7 +723,8 @@ fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
         timestamp,
     );
     member.endpoints.push(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_lan").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_lan")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::LanQuic,
         address: "192.168.1.20:21353".to_string(),
@@ -510,7 +734,8 @@ fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
         last_observed_latency_ms: None,
     });
     member.endpoints.push(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_webrtc")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::WebRtc,
         address: "webrtc://candidate".to_string(),
@@ -538,9 +763,10 @@ fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
 
 #[test]
 fn node_endpoint_maps_cluster_roaming_transports() {
-    let node_id = NodeId::new("node_phone").expect("node");
+    let node_id = NodeId::from_legacy_named("node_phone").expect("node");
     let endpoint = ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_ice").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_ice")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::WebRtc,
         address: "webrtc://candidate".to_string(),
@@ -559,9 +785,10 @@ fn node_endpoint_maps_cluster_roaming_transports() {
 
 #[test]
 fn node_endpoint_maps_iroh_transport() {
-    let node_id = NodeId::new("node_phone").expect("node");
+    let node_id = NodeId::from_legacy_named("node_phone").expect("node");
     let endpoint = ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_iroh").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_iroh")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
         address: "iroh://iroh_pk".to_string(),
@@ -580,8 +807,8 @@ fn node_endpoint_maps_iroh_transport() {
 
 #[test]
 fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let event = fixture_event("evt_codec", node_a.clone());
     let frame = NetworkFrame {
         frame_id: NetworkFrameId(7),
@@ -645,19 +872,12 @@ fn protocol_and_stream_metadata_use_sinomo_object_payloads() {
             .expect("decode metadata"),
         payload
     );
-
-    let text = encode_object_text_payload(&payload).expect("text payload");
-    assert!(!text.contains(char::is_whitespace));
-    assert_eq!(
-        decode_object_text_payload::<FixtureProtocolPayload>(&text).expect("decode text"),
-        payload
-    );
 }
 
 #[test]
 fn mdns_discovery_cache_returns_lan_quic_candidates_and_expires_records() {
-    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
-    let node_id = NodeId::new("node_desktop").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
     let mut cache = MdnsDiscoveryCache::new();
     cache.upsert(MdnsDiscoveryRecord::lan_quic(
         cluster_id.clone(),
@@ -682,9 +902,9 @@ fn mdns_discovery_cache_returns_lan_quic_candidates_and_expires_records() {
 
 #[test]
 fn cluster_auth_verifier_establishes_mutual_session_for_authorized_members() {
-    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let now = time::OffsetDateTime::now_utc();
     let expires_at = now + time::Duration::hours(1);
     let member_a =
@@ -728,8 +948,8 @@ fn cluster_auth_verifier_establishes_mutual_session_for_authorized_members() {
 
 #[test]
 fn cluster_auth_verifier_rejects_expired_or_wrong_key_certificate() {
-    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
-    let node_a = NodeId::new("node_a").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let now = time::OffsetDateTime::now_utc();
     let member =
         ClusterMemberRecord::local_voter(cluster_id.clone(), node_a.clone(), "a", "pk_a", now);
@@ -765,9 +985,10 @@ fn cluster_auth_verifier_rejects_expired_or_wrong_key_certificate() {
 
 #[test]
 fn lan_connection_planner_prefers_lan_quic_over_relays() {
-    let node_id = NodeId::new("node_desktop").expect("node");
+    let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
     let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_relay").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_relay")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::TurnRelay,
         address: "turn://relay".to_string(),
@@ -777,7 +998,8 @@ fn lan_connection_planner_prefers_lan_quic_over_relays() {
         last_observed_latency_ms: None,
     });
     let lan = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_lan").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_lan")
+            .expect("endpoint"),
         node_id,
         transport: ClusterTransportKind::LanQuic,
         address: "192.168.1.20:21355".to_string(),
@@ -796,9 +1018,9 @@ fn lan_connection_planner_prefers_lan_quic_over_relays() {
 
 #[test]
 fn webrtc_kv_exchange_round_trips_offer_answer_and_ice_candidates() {
-    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let exchange_id = "exchange_1";
     let mut store = sinomo_kv::InProcessKvStore::new();
     store
@@ -873,8 +1095,8 @@ fn webrtc_kv_exchange_round_trips_offer_answer_and_ice_candidates() {
 
 #[test]
 fn iroh_kv_exchange_round_trips_endpoint_records() {
-    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
-    let node_id = NodeId::new("node_mobile").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let endpoint = IrohEndpointRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
@@ -922,8 +1144,8 @@ fn iroh_kv_exchange_round_trips_endpoint_records() {
 
 #[test]
 fn iroh_endpoint_record_uses_stable_id_for_public_key() {
-    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
-    let node_id = NodeId::new("node_mobile").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let first = IrohEndpointRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
@@ -951,8 +1173,8 @@ fn iroh_endpoint_record_uses_stable_id_for_public_key() {
 
 #[test]
 fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
-    let cluster_id = ClusterId::new("cluster_home").expect("cluster");
-    let node_id = NodeId::new("node_mobile").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let mut member = ClusterMemberRecord::local_voter(
         cluster_id.clone(),
         node_id.clone(),
@@ -961,7 +1183,7 @@ fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
         OffsetDateTime::now_utc(),
     );
     member.endpoints.push(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_legacy_iroh")
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh")
             .expect("legacy endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
@@ -1018,8 +1240,8 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
     paths.ensure().expect("cluster paths");
 
     let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::new("cluster_iroh_kv_cleanup").expect("cluster");
-    let node_id = NodeId::new("node_iroh_kv_cleanup").expect("node");
+    let cluster_id = ClusterId::from_legacy_named("cluster_iroh_kv_cleanup").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_iroh_kv_cleanup").expect("node");
     let mut member = ClusterMemberRecord::local_voter(
         cluster_id.clone(),
         node_id.clone(),
@@ -1028,7 +1250,7 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
         now,
     );
     member.endpoints.push(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_legacy_iroh_a")
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh_a")
             .expect("legacy endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
@@ -1049,7 +1271,7 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
     }
     .endpoint();
     let legacy_b = ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_legacy_iroh_b")
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh_b")
             .expect("legacy endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
@@ -1088,9 +1310,10 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
 
 #[test]
 fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() {
-    let node_id = NodeId::new("node_mobile").expect("node");
+    let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_webrtc")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::WebRtc,
         address: "webrtc://srflx".to_string(),
@@ -1101,7 +1324,8 @@ fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() 
     })
     .healthy(35);
     let turn = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_turn").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_turn")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::TurnRelay,
         address: "turn://relay".to_string(),
@@ -1132,9 +1356,10 @@ fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() 
 
 #[test]
 fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
-    let node_id = NodeId::new("node_mobile").expect("node");
+    let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let iroh = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_iroh").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_iroh")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
         address: "iroh://iroh_public_key?relay=https://relay.example".to_string(),
@@ -1144,7 +1369,8 @@ fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
         last_observed_latency_ms: None,
     });
     let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_webrtc").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_webrtc")
+            .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::WebRtc,
         address: "webrtc://srflx".to_string(),
@@ -1154,7 +1380,8 @@ fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
         last_observed_latency_ms: None,
     });
     let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::new("endpoint_turn").expect("endpoint"),
+        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_turn")
+            .expect("endpoint"),
         node_id,
         transport: ClusterTransportKind::TurnRelay,
         address: "turn://relay".to_string(),
@@ -1176,27 +1403,27 @@ fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
 
 #[test]
 fn routes_session_events_to_participants() {
-    let session_id = SessionId::new("sess_demo").expect("session");
+    let session_id = SessionId::from_legacy_named("sess_demo").expect("session");
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_mobile"));
     registry.register_node(node("node_desktop"));
     registry
         .join_session(
             session_id.clone(),
-            NodeId::new("node_mobile").expect("node"),
+            NodeId::from_legacy_named("node_mobile").expect("node"),
         )
         .expect("join mobile");
     registry
         .join_session(
             session_id.clone(),
-            NodeId::new("node_desktop").expect("node"),
+            NodeId::from_legacy_named("node_desktop").expect("node"),
         )
         .expect("join desktop");
 
     let event = EventEnvelope::new(
-        EventId::new("evt_route").expect("event"),
+        EventId::from_legacy_named("evt_route").expect("event"),
         time::OffsetDateTime::now_utc(),
-        NodeId::new("node_mobile").expect("node"),
+        NodeId::from_legacy_named("node_mobile").expect("node"),
         Source::new("test.route").expect("source"),
         EventKind::new("evolution.job.scoped").expect("kind"),
         Salience::new(0.8).expect("salience"),
@@ -1224,8 +1451,8 @@ fn routes_session_events_to_participants() {
 
 #[test]
 fn in_process_transport_delivers_typed_frames() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
     let mut transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
@@ -1258,8 +1485,8 @@ fn in_process_transport_delivers_typed_frames() {
 
 #[test]
 fn in_process_transport_rejects_unknown_targets() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_missing = NodeId::new("node_missing").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_missing = NodeId::from_legacy_named("node_missing").expect("node");
     let network = InProcessNetwork::new();
     let mut transport_a = network.add_node(node_a.clone());
     let event = fixture_event("evt_missing_target", node_a.clone());
@@ -1294,9 +1521,9 @@ fn in_process_transport_rejects_unknown_targets() {
 
 #[test]
 fn network_service_delivers_event_and_processes_ack() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
-    let session_id = SessionId::new("sess_network").expect("session");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_network").expect("session");
     let network = InProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
@@ -1354,8 +1581,8 @@ fn network_service_delivers_event_and_processes_ack() {
 
 #[test]
 fn delivery_ledger_suppresses_duplicate_event_targets() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut registry = PeerRegistry::new();
@@ -1378,8 +1605,8 @@ fn delivery_ledger_suppresses_duplicate_event_targets() {
 
 #[test]
 fn inbound_duplicate_event_is_acked_without_duplicate_append() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
@@ -1422,8 +1649,8 @@ fn inbound_duplicate_event_is_acked_without_duplicate_append() {
 
 #[test]
 fn retry_policy_marks_delivery_failed_after_max_attempts() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut registry = PeerRegistry::new();
@@ -1468,9 +1695,9 @@ fn retry_policy_marks_delivery_failed_after_max_attempts() {
 
 #[test]
 fn ack_rejects_wrong_target_node() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
-    let node_c = NodeId::new("node_c").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
+    let node_c = NodeId::from_legacy_named("node_c").expect("node");
     let mut ledger = DeliveryLedger::new(RetryPolicy::default());
     let event = fixture_event("evt_wrong_ack", node_a);
     let delivery = RouteDelivery {
@@ -1499,7 +1726,7 @@ fn ack_rejects_wrong_target_node() {
 
 #[test]
 fn heartbeat_marks_peer_healthy_and_updates_node_health() {
-    let node_a = NodeId::new("node_a").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
 
@@ -1522,8 +1749,8 @@ fn heartbeat_marks_peer_healthy_and_updates_node_health() {
 
 #[test]
 fn missed_heartbeats_degrade_then_mark_offline_without_removing_session() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let session_id = SessionId::new("sess_heartbeat").expect("session");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_heartbeat").expect("session");
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
     registry
@@ -1557,8 +1784,8 @@ fn missed_heartbeats_degrade_then_mark_offline_without_removing_session() {
 
 #[test]
 fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut registry = PeerRegistry::new();
@@ -1626,9 +1853,9 @@ fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
 
 #[test]
 fn session_routing_excludes_offline_participants() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
-    let session_id = SessionId::new("sess_offline_route").expect("session");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_offline_route").expect("session");
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
     registry.register_node(node("node_b"));
@@ -1661,8 +1888,8 @@ fn session_routing_excludes_offline_participants() {
 
 #[test]
 fn direct_target_offline_buffers_instead_of_sending() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
@@ -1701,9 +1928,9 @@ fn direct_target_offline_buffers_instead_of_sending() {
 
 #[test]
 fn trusted_network_routing_skips_offline_peers() {
-    let node_a = NodeId::new("node_a").expect("node");
-    let node_b = NodeId::new("node_b").expect("node");
-    let node_c = NodeId::new("node_c").expect("node");
+    let node_a = NodeId::from_legacy_named("node_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_b").expect("node");
+    let node_c = NodeId::from_legacy_named("node_c").expect("node");
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
     registry.register_node(node("node_b"));
@@ -1737,4 +1964,355 @@ fn trusted_network_routing_skips_offline_peers() {
         targets,
         BTreeSet::from([stored.event.origin_node_id, node_c])
     );
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum LocalhostKvRequest {
+    Apply { command: KvCommand },
+    Get { key: String },
+    Snapshot,
+    InstallSnapshot { snapshot: KvSnapshot },
+    Stop,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum LocalhostKvResponse {
+    Revision { revision: KvRevision },
+    Entry { entry: Option<KvEntry> },
+    Snapshot { snapshot: KvSnapshot },
+    Ok,
+    Error { message: String },
+}
+
+struct LocalhostKvNode {
+    address: String,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl LocalhostKvNode {
+    fn start() -> Self {
+        let listener = DaemonControlListener::bind("127.0.0.1:0").expect("bind localhost kv node");
+        let address = listener.local_addr_string().expect("local addr");
+        let store = Arc::new(Mutex::new(InProcessKvStore::new()));
+        let handle_store = Arc::clone(&store);
+        let handle = thread::spawn(move || {
+            loop {
+                let mut stream = listener
+                    .accept()
+                    .expect("accept localhost kv request")
+                    .expect("blocking listener accepted stream");
+                let request = read_localhost_kv_request(&mut stream);
+                let should_stop = matches!(request, Ok(LocalhostKvRequest::Stop));
+                let response = match request {
+                    Ok(request) => handle_localhost_kv_request(&handle_store, request),
+                    Err(error) => LocalhostKvResponse::Error {
+                        message: error.to_string(),
+                    },
+                };
+                write_object_frame_blocking(&mut stream, &response)
+                    .expect("write localhost kv response");
+                if should_stop {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            address,
+            handle: Some(handle),
+        }
+    }
+
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn stop(mut self) {
+        let _ = send_localhost_kv_request(self.address(), LocalhostKvRequest::Stop);
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("join localhost kv node");
+        }
+    }
+}
+
+fn read_localhost_kv_request(
+    stream: &mut DaemonControlStream,
+) -> Result<LocalhostKvRequest, NetworkError> {
+    read_object_frame_blocking(stream, IROH_DAEMON_COMMAND_MAX_BYTES)
+}
+
+fn handle_localhost_kv_request(
+    store: &Arc<Mutex<InProcessKvStore>>,
+    request: LocalhostKvRequest,
+) -> LocalhostKvResponse {
+    let mut store = store.lock().expect("lock kv store");
+    match request {
+        LocalhostKvRequest::Apply { command } => match store.apply_command(command) {
+            Ok(revision) => LocalhostKvResponse::Revision { revision },
+            Err(error) => LocalhostKvResponse::Error {
+                message: error.to_string(),
+            },
+        },
+        LocalhostKvRequest::Get { key } => LocalhostKvResponse::Entry {
+            entry: store.get(&key).cloned(),
+        },
+        LocalhostKvRequest::Snapshot => LocalhostKvResponse::Snapshot {
+            snapshot: store.snapshot(),
+        },
+        LocalhostKvRequest::InstallSnapshot { snapshot } => {
+            *store = InProcessKvStore::restore(snapshot);
+            LocalhostKvResponse::Ok
+        }
+        LocalhostKvRequest::Stop => LocalhostKvResponse::Ok,
+    }
+}
+
+fn send_localhost_kv_request(
+    address: &str,
+    request: LocalhostKvRequest,
+) -> Result<LocalhostKvResponse, String> {
+    let mut stream = DaemonControlStream::connect(address).map_err(|source| source.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|source| source.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|source| source.to_string())?;
+    write_object_frame_blocking(&mut stream, &request).map_err(|source| source.to_string())?;
+
+    let response: LocalhostKvResponse =
+        read_object_frame_blocking(&mut stream, IROH_DAEMON_COMMAND_MAX_BYTES)
+            .map_err(|source| source.to_string())?;
+    if let LocalhostKvResponse::Error { message } = &response {
+        return Err(message.clone());
+    }
+    Ok(response)
+}
+
+fn apply_to_localhost_kv(address: &str, command: KvCommand) -> KvRevision {
+    match send_localhost_kv_request(address, LocalhostKvRequest::Apply { command })
+        .expect("apply command over localhost")
+    {
+        LocalhostKvResponse::Revision { revision } => revision,
+        response => panic!("unexpected apply response: {response:?}"),
+    }
+}
+
+fn replicate_to_localhost_kv(addresses: &[String], command: KvCommand) -> Vec<KvRevision> {
+    addresses
+        .iter()
+        .map(|address| apply_to_localhost_kv(address, command.clone()))
+        .collect()
+}
+
+fn get_localhost_kv_entry(address: &str, key: &str) -> Option<KvEntry> {
+    match send_localhost_kv_request(
+        address,
+        LocalhostKvRequest::Get {
+            key: key.to_string(),
+        },
+    )
+    .expect("get entry over localhost")
+    {
+        LocalhostKvResponse::Entry { entry } => entry,
+        response => panic!("unexpected get response: {response:?}"),
+    }
+}
+
+fn localhost_kv_snapshot(address: &str) -> KvSnapshot {
+    match send_localhost_kv_request(address, LocalhostKvRequest::Snapshot)
+        .expect("snapshot over localhost")
+    {
+        LocalhostKvResponse::Snapshot { snapshot } => snapshot,
+        response => panic!("unexpected snapshot response: {response:?}"),
+    }
+}
+
+fn install_localhost_kv_snapshot(address: &str, snapshot: KvSnapshot) {
+    match send_localhost_kv_request(address, LocalhostKvRequest::InstallSnapshot { snapshot })
+        .expect("install snapshot over localhost")
+    {
+        LocalhostKvResponse::Ok => {}
+        response => panic!("unexpected install snapshot response: {response:?}"),
+    }
+}
+
+fn wait_for_localhost_kv_entry(address: &str, key: &str, expected: &[u8]) -> KvEntry {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(entry) = get_localhost_kv_entry(address, key) {
+            if entry.value == expected {
+                return entry;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "entry {key} did not converge on {address}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn localhost_kv_cluster_member(
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    display_name: &str,
+) -> ClusterMemberRecord {
+    ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id,
+        display_name,
+        format!("pk_{display_name}"),
+        time::OffsetDateTime::now_utc(),
+    )
+}
+
+fn start_three_localhost_kv_nodes() -> (Vec<LocalhostKvNode>, Vec<String>) {
+    let nodes = vec![
+        LocalhostKvNode::start(),
+        LocalhostKvNode::start(),
+        LocalhostKvNode::start(),
+    ];
+    let addresses = nodes
+        .iter()
+        .map(|node| node.address().to_string())
+        .collect();
+    (nodes, addresses)
+}
+
+fn stop_localhost_kv_nodes(nodes: Vec<LocalhostKvNode>) {
+    for node in nodes {
+        node.stop();
+    }
+}
+
+#[test]
+fn localhost_kv_cluster_replicates_membership_and_kv_operations_over_network_object_frames() {
+    let (nodes, addresses) = start_three_localhost_kv_nodes();
+    let cluster_id = ClusterId::from_legacy_named("cluster_localhost").expect("cluster");
+    let node_ids = [
+        NodeId::from_legacy_named("node_alpha").expect("node"),
+        NodeId::from_legacy_named("node_beta").expect("node"),
+        NodeId::from_legacy_named("node_gamma").expect("node"),
+    ];
+
+    for (node_id, display_name) in node_ids.iter().zip(["alpha", "beta", "gamma"]) {
+        let member = localhost_kv_cluster_member(cluster_id.clone(), node_id.clone(), display_name);
+        replicate_to_localhost_kv(&addresses, KvCommand::PutClusterMember(member));
+    }
+    replicate_to_localhost_kv(
+        &addresses,
+        KvCommand::Op(KvOp::LeaseGrant {
+            lease_id: LeaseId(1),
+            ttl_ticks: 10,
+        }),
+    );
+    replicate_to_localhost_kv(
+        &addresses,
+        KvCommand::Op(KvOp::Put {
+            key: "/services/kv/node_alpha".to_string(),
+            value: addresses[0].as_bytes().to_vec(),
+            lease_id: Some(LeaseId(1)),
+        }),
+    );
+    let revisions = replicate_to_localhost_kv(
+        &addresses,
+        KvCommand::Txn(KvTxn {
+            compares: vec![KvCompare::Missing {
+                key: "/config/epoch".to_string(),
+            }],
+            success: vec![KvOp::Put {
+                key: "/config/epoch".to_string(),
+                value: b"1".to_vec(),
+                lease_id: None,
+            }],
+            failure: vec![],
+        }),
+    );
+
+    assert_eq!(revisions, vec![KvRevision(5), KvRevision(5), KvRevision(5)]);
+    for address in &addresses {
+        for node_id in &node_ids {
+            assert!(
+                get_localhost_kv_entry(address, &cluster_member_key(node_id)).is_some(),
+                "missing member {node_id} on {address}"
+            );
+        }
+        assert_eq!(
+            get_localhost_kv_entry(address, "/config/epoch")
+                .expect("epoch")
+                .value,
+            b"1"
+        );
+        assert_eq!(
+            get_localhost_kv_entry(address, "/services/kv/node_alpha")
+                .expect("service")
+                .lease_id,
+            Some(LeaseId(1))
+        );
+    }
+
+    stop_localhost_kv_nodes(nodes);
+}
+
+#[test]
+fn localhost_kv_cluster_catches_up_delayed_node_from_snapshot_over_network_object_frames() {
+    let (nodes, addresses) = start_three_localhost_kv_nodes();
+    let first_two = addresses[..2].to_vec();
+
+    replicate_to_localhost_kv(
+        &first_two,
+        KvCommand::Op(KvOp::Put {
+            key: "/config/a".to_string(),
+            value: b"one".to_vec(),
+            lease_id: None,
+        }),
+    );
+    replicate_to_localhost_kv(
+        &first_two,
+        KvCommand::Op(KvOp::Put {
+            key: "/config/b".to_string(),
+            value: b"two".to_vec(),
+            lease_id: None,
+        }),
+    );
+
+    assert!(get_localhost_kv_entry(&addresses[2], "/config/b").is_none());
+    install_localhost_kv_snapshot(&addresses[2], localhost_kv_snapshot(&addresses[0]));
+    wait_for_localhost_kv_entry(&addresses[2], "/config/b", b"two");
+
+    replicate_to_localhost_kv(
+        &addresses,
+        KvCommand::Op(KvOp::Put {
+            key: "/config/c".to_string(),
+            value: b"three".to_vec(),
+            lease_id: None,
+        }),
+    );
+
+    let snapshots: Vec<KvSnapshot> = addresses
+        .iter()
+        .map(|address| localhost_kv_snapshot(address))
+        .collect();
+    assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot.revision == KvRevision(3))
+    );
+    for address in &addresses {
+        assert_eq!(
+            wait_for_localhost_kv_entry(address, "/config/a", b"one").value,
+            b"one"
+        );
+        assert_eq!(
+            wait_for_localhost_kv_entry(address, "/config/b", b"two").value,
+            b"two"
+        );
+        assert_eq!(
+            wait_for_localhost_kv_entry(address, "/config/c", b"three").value,
+            b"three"
+        );
+    }
+
+    stop_localhost_kv_nodes(nodes);
 }

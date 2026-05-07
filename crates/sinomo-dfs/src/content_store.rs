@@ -1,6 +1,7 @@
 //! Durable local content storage for DFS blobs.
 
 use serde::{Deserialize, Serialize};
+use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ pub enum ContentStoreError {
     #[error("io error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("manifest serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
+    Serde(String),
     #[error("invalid content hash: {0}")]
     InvalidHash(String),
     #[error("staged content not found for intent: {0}")]
@@ -86,7 +87,7 @@ impl LocalContentStore {
     pub fn read_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
         let path = self.manifest_path(object_id, version);
         let bytes = read_file(&path)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        decode_manifest(&bytes)
     }
 
     pub fn manifests_for_object(&self, object_id: &str) -> Result<Vec<ContentManifest>> {
@@ -97,9 +98,9 @@ impl LocalContentStore {
 
         let mut manifests: Vec<ContentManifest> = Vec::new();
         for entry in read_dir(&object_root)? {
-            let path = entry.path().join("manifest.json");
+            let path = entry.path().join("manifest.sobj");
             if path.is_file() {
-                manifests.push(serde_json::from_slice(&read_file(&path)?)?);
+                manifests.push(decode_manifest(&read_file(&path)?)?);
             }
         }
         manifests.sort_by(|left, right| left.version.cmp(&right.version));
@@ -129,7 +130,7 @@ impl LocalContentStore {
             content_hash: hash,
             size_bytes: bytes.len() as u64,
         };
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_bytes = encode_manifest(&manifest)?;
         write_file_atomic(&self.manifest_path(object_id, version), &manifest_bytes)?;
         Ok(manifest)
     }
@@ -144,12 +145,22 @@ impl LocalContentStore {
             .join("objects")
             .join(object_id)
             .join(version)
-            .join("manifest.json")
+            .join("manifest.sobj")
     }
 
     fn staging_path(&self, intent_id: &str) -> PathBuf {
         self.root.join("staging").join(intent_id)
     }
+}
+
+fn encode_manifest(manifest: &ContentManifest) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(manifest, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
 }
 
 fn content_hash(bytes: &[u8]) -> String {

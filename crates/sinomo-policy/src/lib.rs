@@ -82,7 +82,8 @@ mod tests {
     fn new_capability_requires_more_evidence() {
         let decision = PolicyEngine::new().decide(PolicyInput {
             target_ring: TrustRing::R3SandboxedModule,
-            target_artifact_id: ArtifactId::new("artifact_candidate").expect("artifact"),
+            target_artifact_id: ArtifactId::from_legacy_named("artifact_candidate")
+                .expect("artifact"),
             capability_diff: CapabilityDiff {
                 added_imports: vec![CapabilityName::new("event.read.session").expect("cap")],
                 ..CapabilityDiff::default()

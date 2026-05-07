@@ -332,19 +332,22 @@ mod tests {
 
     #[test]
     fn queue_runs_and_completes_job_with_summary() {
-        let trigger = EventId::new("evt_trigger").expect("event");
+        let trigger = EventId::from_legacy_named("evt_trigger").expect("event");
         let mut queue = DeliberationQueue::new();
         let job = DeliberationJobRecord::new(
             trigger.clone(),
-            Some(SessionId::new("sess_delib").expect("session")),
+            Some(SessionId::from_legacy_named("sess_delib").expect("session")),
             "inspect alert",
             ContextPacket {
                 salient_events: vec![trigger],
                 memory_records: Vec::new(),
             },
             Some(WorkspaceSnapshot {
-                workspace_id: WorkspaceId::new("workspace_evolution_trigger").expect("workspace"),
-                object_ids: vec![DfsObjectId::new("obj_trigger_candidate").expect("object")],
+                workspace_id: WorkspaceId::from_legacy_named("workspace_evolution_trigger")
+                    .expect("workspace"),
+                object_ids: vec![
+                    DfsObjectId::from_legacy_named("obj_trigger_candidate").expect("object"),
+                ],
                 source_event_id: None,
             }),
         );
@@ -353,7 +356,8 @@ mod tests {
         assert_eq!(running.job.status, JobStatus::Running);
 
         let completed =
-            DeliberationWorker::new(NodeId::new("node_server").expect("node")).summarize(running);
+            DeliberationWorker::new(NodeId::from_legacy_named("node_server").expect("node"))
+                .summarize(running);
         let completed = queue.complete(
             completed,
             DeliberationSummary {
@@ -369,7 +373,7 @@ mod tests {
 
     #[test]
     fn queued_job_can_be_cancelled() {
-        let trigger = EventId::new("evt_trigger").expect("event");
+        let trigger = EventId::from_legacy_named("evt_trigger").expect("event");
         let mut queue = DeliberationQueue::new();
         let job = DeliberationJobRecord::new(
             trigger,
@@ -383,7 +387,7 @@ mod tests {
             .cancel(
                 &job_id,
                 "superseded",
-                Some(EventId::new("evt_new").expect("event")),
+                Some(EventId::from_legacy_named("evt_new").expect("event")),
             )
             .expect("cancel");
         assert_eq!(cancellation.reason, "superseded");
@@ -392,11 +396,12 @@ mod tests {
 
     #[test]
     fn worker_builds_structured_model_request() {
-        let trigger = EventId::new("evt_trigger").expect("event");
-        let worker = DeliberationWorker::new(NodeId::new("node_server").expect("node"));
+        let trigger = EventId::from_legacy_named("evt_trigger").expect("event");
+        let worker =
+            DeliberationWorker::new(NodeId::from_legacy_named("node_server").expect("node"));
         let job = DeliberationJobRecord::new(
             trigger.clone(),
-            Some(SessionId::new("sess_delib").expect("session")),
+            Some(SessionId::from_legacy_named("sess_delib").expect("session")),
             "inspect alert",
             ContextPacket {
                 salient_events: vec![trigger],
@@ -419,11 +424,12 @@ mod tests {
 
     #[test]
     fn worker_can_complete_job_with_model_summary() {
-        let trigger = EventId::new("evt_trigger").expect("event");
-        let worker = DeliberationWorker::new(NodeId::new("node_server").expect("node"));
+        let trigger = EventId::from_legacy_named("evt_trigger").expect("event");
+        let worker =
+            DeliberationWorker::new(NodeId::from_legacy_named("node_server").expect("node"));
         let job = DeliberationJobRecord::new(
             trigger.clone(),
-            Some(SessionId::new("sess_delib").expect("session")),
+            Some(SessionId::from_legacy_named("sess_delib").expect("session")),
             "inspect alert",
             ContextPacket {
                 salient_events: vec![trigger.clone()],
@@ -435,7 +441,7 @@ mod tests {
             content: serde_json::json!({
                 "summary": "The alert is worth a slower follow-up.",
                 "supporting_events": [trigger],
-                "memory_promotions": ["evt_trigger"]
+                "memory_promotions": [trigger]
             })
             .to_string(),
         };
