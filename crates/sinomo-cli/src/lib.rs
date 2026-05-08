@@ -92,6 +92,7 @@ use sinomo_runtime::daemon::{
     fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     git_is_available as daemon_git_is_available,
+    handle_daemon_cluster_kv_txn_request as daemon_handle_daemon_cluster_kv_txn_request,
     handle_daemon_connection as daemon_handle_daemon_connection,
     initialize_local_cluster as daemon_initialize_local_cluster,
     install_managed_source_repo as daemon_install_managed_source_repo,
@@ -137,7 +138,6 @@ use sinomo_runtime::daemon::{
     DaemonLock, daemon_rpc_command,
     handle_daemon_cluster_join_request as daemon_handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn_request as daemon_handle_daemon_cluster_kv_txn_request,
     handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
     handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
     handle_daemon_cluster_raft_vote_request,
@@ -161,7 +161,7 @@ use sinomo_runtime::dfs::{
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
-use sinomo_runtime::kv::{InProcessKvStore, KvError, KvSnapshot};
+use sinomo_runtime::kv::{KvError, KvSnapshot};
 #[cfg(test)]
 use sinomo_runtime::kv::{KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;

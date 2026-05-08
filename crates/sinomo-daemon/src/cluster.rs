@@ -19,8 +19,8 @@ use sinomo_core::{
     NodeId, TrustDomain,
 };
 use sinomo_kv::{
-    KvCommand, KvEntry, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesResponse,
-    RaftRequestVoteRequest, RaftRequestVoteResponse, cluster_member_key,
+    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
+    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, cluster_member_key,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -249,34 +249,19 @@ pub fn handle_daemon_cluster_kv_txn_request(
     txn: KvTxn,
 ) -> Result<KvTxnResponse, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let mut state =
-        sinomo_network::read_cluster_state(&cluster_paths).map_err(|error| match error {
+    let mut state = sinomo_network::read_cluster_state_without_kv(&cluster_paths).map_err(
+        |error| match error {
             sinomo_network::NetworkError::ClusterOrphan => DaemonError::ClusterReadOnly {
                 detail: "local node has no cluster state".to_string(),
             },
             other => other.into(),
-        })?;
-    if !cluster_has_local_quorum(&cluster_paths, &state) {
-        return Err(DaemonError::ClusterReadOnly {
-            detail: format!(
-                "quorum unavailable ({} reachable voters, {} required)",
-                cluster_reachable_voter_count(&cluster_paths, &state),
-                sinomo_network::cluster_raft_quorum_size(&state)
-            ),
-        });
-    }
-    if !sinomo_network::cluster_raft_local_is_leader(&cluster_paths, &state)?
-        && !elect_cluster_raft_leader(&cluster_paths, &state)?
-    {
-        return Err(DaemonError::ClusterReadOnly {
-            detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
-        });
-    }
-    let (_snapshot, response) =
-        commit_cluster_raft_command_with_quorum(&cluster_paths, &mut state, KvCommand::Txn(txn))?;
+        },
+    )?;
+    let (snapshot, response) =
+        commit_cluster_kv_txn_with_quorum_response(&cluster_paths, &mut state, txn)?;
     Ok(response.unwrap_or(KvTxnResponse {
         succeeded: true,
-        revision: handle_daemon_cluster_kv_snapshot(paths)?.revision,
+        revision: snapshot.revision,
         responses: Vec::new(),
     }))
 }
@@ -1278,34 +1263,30 @@ pub fn update_cluster_node_role(
     now: OffsetDateTime,
 ) -> Result<ClusterNodeRoleUpdate, DaemonError> {
     let mut state = read_local_cluster_state(paths)?;
-    let update = {
-        let Some(member) = state
-            .members
-            .iter_mut()
-            .find(|member| member.node_id == node_id)
-        else {
-            return Err(DaemonError::Parse {
-                detail: format!("cluster member `{node_id}` was not found"),
-            });
-        };
-        let previous_role = member.node_role.clone();
-        let changed = previous_role != role;
-        if changed {
-            sinomo_network::apply_cluster_node_role(member, role.clone(), now);
-        }
-        ClusterNodeRoleUpdate {
-            node_id,
-            previous_role,
-            role,
-            changed,
-        }
+    let store = current_cluster_kv_store(paths, &state)?;
+    let member_key = cluster_member_key(&node_id);
+    let Some(member_entry) = store.get(&member_key).cloned() else {
+        return Err(DaemonError::Parse {
+            detail: format!("cluster member `{node_id}` was not found"),
+        });
     };
-    if update.changed {
-        state.updated_at = now;
-        sync_cluster_state_to_kv(paths, &state)?;
-        sinomo_network::write_cluster_state(paths, &state)?;
+    let mut member: ClusterMemberRecord = member_entry.decode()?;
+    let previous_role = member.node_role.clone();
+    let changed = previous_role != role;
+    if changed {
+        sinomo_network::apply_cluster_node_role(&mut member, role.clone(), now);
+        commit_cluster_kv_txn_with_quorum(
+            paths,
+            &mut state,
+            cluster_member_update_txn(member_entry, &member)?,
+        )?;
     }
-    Ok(update)
+    Ok(ClusterNodeRoleUpdate {
+        node_id,
+        previous_role,
+        role,
+        changed,
+    })
 }
 
 pub fn update_cluster_raft_role(
@@ -1315,38 +1296,185 @@ pub fn update_cluster_raft_role(
     now: OffsetDateTime,
 ) -> Result<ClusterRaftRoleUpdate, DaemonError> {
     let mut state = read_local_cluster_state(paths)?;
-    let new_state = sinomo_network::cluster_raft_state_for_role(&role);
-    let update = {
-        let Some(member) = state
-            .members
-            .iter_mut()
-            .find(|member| member.node_id == node_id)
-        else {
-            return Err(DaemonError::Parse {
-                detail: format!("cluster member `{node_id}` was not found"),
-            });
-        };
-        let previous_role = member.role.clone();
-        let previous_state = member.state.clone();
-        let changed = previous_role != role || previous_state != new_state;
-        if changed {
-            sinomo_network::apply_cluster_raft_role(member, role.clone(), now);
-        }
-        ClusterRaftRoleUpdate {
-            node_id,
-            previous_role,
-            previous_state,
-            role,
-            state: new_state,
-            changed,
-        }
+    let store = current_cluster_kv_store(paths, &state)?;
+    let member_key = cluster_member_key(&node_id);
+    let Some(member_entry) = store.get(&member_key).cloned() else {
+        return Err(DaemonError::Parse {
+            detail: format!("cluster member `{node_id}` was not found"),
+        });
     };
-    if update.changed {
-        state.updated_at = now;
-        sync_cluster_state_to_kv(paths, &state)?;
-        sinomo_network::write_cluster_state(paths, &state)?;
+    let new_state = sinomo_network::cluster_raft_state_for_role(&role);
+    let mut member: ClusterMemberRecord = member_entry.decode()?;
+    let previous_role = member.role.clone();
+    let previous_state = member.state.clone();
+    let changed = previous_role != role || previous_state != new_state;
+    if changed {
+        sinomo_network::apply_cluster_raft_role(&mut member, role.clone(), now);
+        commit_cluster_kv_txn_with_quorum(
+            paths,
+            &mut state,
+            cluster_member_raft_update_txn(&store, member_entry, &member, now)?,
+        )?;
     }
-    Ok(update)
+    Ok(ClusterRaftRoleUpdate {
+        node_id,
+        previous_role,
+        previous_state,
+        role,
+        state: new_state,
+        changed,
+    })
+}
+
+fn current_cluster_kv_store(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<InProcessKvStore, DaemonError> {
+    let mut targets = sinomo_network::prefer_bounded_daemon_command_targets(
+        sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
+    )
+    .into_iter()
+    .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
+    .collect::<Vec<_>>();
+    if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
+        && let Some(position) = targets
+            .iter()
+            .position(|endpoint| endpoint.node_id == leader_id)
+    {
+        let leader = targets.remove(position);
+        targets.insert(0, leader);
+    }
+    for endpoint in targets {
+        if let Ok(snapshot) =
+            fetch_cluster_kv_snapshot_from_endpoint(&endpoint, DAEMON_CLUSTER_RPC_TIMEOUT)
+        {
+            return Ok(InProcessKvStore::restore(snapshot));
+        }
+    }
+    Ok(InProcessKvStore::restore(
+        sinomo_network::read_cluster_kv_snapshot(paths)?,
+    ))
+}
+
+fn cluster_member_update_txn(
+    current_entry: KvEntry,
+    member: &ClusterMemberRecord,
+) -> Result<KvTxn, DaemonError> {
+    Ok(KvTxn {
+        compares: vec![KvCompare::ValueEquals {
+            key: current_entry.key,
+            value: current_entry.value,
+        }],
+        success: cluster_member_update_ops(member)?,
+        failure: Vec::new(),
+    })
+}
+
+fn cluster_member_raft_update_txn(
+    store: &InProcessKvStore,
+    current_entry: KvEntry,
+    member: &ClusterMemberRecord,
+    now: OffsetDateTime,
+) -> Result<KvTxn, DaemonError> {
+    let raft_config_key = sinomo_network::cluster_raft_config_key();
+    let Some(current_config_entry) = store.get(&raft_config_key).cloned() else {
+        return Err(DaemonError::ClusterReadOnly {
+            detail: "cluster raft config is missing".to_string(),
+        });
+    };
+    let current_config: sinomo_network::ClusterRaftConfigRecord = current_config_entry.decode()?;
+    let next_config = cluster_raft_config_from_store(store, member, &current_config, now)?;
+    sinomo_network::validate_raft_config_transition(&current_config, &next_config)?;
+    let mut success = cluster_member_update_ops(member)?;
+    success.push(KvOp::put_serde(
+        raft_config_key.clone(),
+        &next_config,
+        None,
+    )?);
+    Ok(KvTxn {
+        compares: vec![
+            KvCompare::ValueEquals {
+                key: current_entry.key,
+                value: current_entry.value,
+            },
+            KvCompare::ValueEquals {
+                key: raft_config_key,
+                value: current_config_entry.value,
+            },
+        ],
+        success,
+        failure: Vec::new(),
+    })
+}
+
+fn cluster_member_update_ops(member: &ClusterMemberRecord) -> Result<Vec<KvOp>, DaemonError> {
+    let mut member = member.clone();
+    sinomo_network::cleanup_member_iroh_endpoints(&mut member);
+    let mut ops = vec![
+        KvOp::put_serde(cluster_member_key(&member.node_id), &member, None)?,
+        KvOp::put_serde(
+            sinomo_network::cluster_capability_policy_key(&member.node_id),
+            &sinomo_network::ClusterCapabilityPolicyRecord::from(&member),
+            None,
+        )?,
+        KvOp::DeletePrefix {
+            prefix: sinomo_network::cluster_endpoint_prefix(&member.node_id),
+        },
+    ];
+    for endpoint in &member.endpoints {
+        ops.push(KvOp::put_serde(
+            sinomo_network::cluster_endpoint_key(&member.node_id, endpoint),
+            endpoint,
+            None,
+        )?);
+    }
+    Ok(ops)
+}
+
+fn cluster_raft_config_from_store(
+    store: &InProcessKvStore,
+    updated_member: &ClusterMemberRecord,
+    current_config: &sinomo_network::ClusterRaftConfigRecord,
+    now: OffsetDateTime,
+) -> Result<sinomo_network::ClusterRaftConfigRecord, DaemonError> {
+    let mut voters = Vec::new();
+    let mut learners = Vec::new();
+    let mut non_voting = Vec::new();
+    for entry in store.range_prefix("/cluster/members/") {
+        let mut member: ClusterMemberRecord = entry.decode()?;
+        if member.node_id == updated_member.node_id {
+            member = updated_member.clone();
+        }
+        if !member.state.is_authorized() {
+            continue;
+        }
+        match member.state {
+            ClusterMemberState::Voter => voters.push(member.node_id),
+            ClusterMemberState::Learner => learners.push(member.node_id),
+            ClusterMemberState::NonVoting => non_voting.push(member.node_id),
+            ClusterMemberState::Active => match member.role {
+                ClusterMemberRole::Voter => voters.push(member.node_id),
+                ClusterMemberRole::Learner => learners.push(member.node_id),
+                ClusterMemberRole::NonVoting => non_voting.push(member.node_id),
+            },
+            ClusterMemberState::Pending
+            | ClusterMemberState::Suspect
+            | ClusterMemberState::Offline
+            | ClusterMemberState::Removed => {}
+        }
+    }
+    voters.sort();
+    learners.sort();
+    non_voting.sort();
+    Ok(sinomo_network::ClusterRaftConfigRecord {
+        cluster_id: current_config.cluster_id.clone(),
+        term: current_config.term,
+        kv_revision: current_config.kv_revision,
+        voters,
+        learners,
+        non_voting,
+        updated_at: now,
+    })
 }
 
 pub fn remove_cluster_members(
@@ -1355,6 +1483,8 @@ pub fn remove_cluster_members(
     now: OffsetDateTime,
 ) -> Result<ClusterMemberRemoval, DaemonError> {
     let mut state = read_local_cluster_state(paths)?;
+    let _ = now;
+    let store = current_cluster_kv_store(paths, &state)?;
     let requested = node_ids
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -1372,17 +1502,14 @@ pub fn remove_cluster_members(
 
     let mut removed = Vec::new();
     for node_id in &requested {
-        let Some(member) = state
-            .members
-            .iter()
-            .find(|member| &member.node_id == node_id)
-            .cloned()
-        else {
+        let member_key = cluster_member_key(node_id);
+        let Some(member_entry) = store.get(&member_key).cloned() else {
             return Err(DaemonError::Parse {
                 detail: format!("cluster member `{node_id}` was not found"),
             });
         };
-        if sinomo_network::cluster_raft_node_is_voter(&state, &member.node_id) {
+        let member: ClusterMemberRecord = member_entry.decode()?;
+        if cluster_kv_member_is_voter(&store, &member.node_id)? {
             return Err(DaemonError::ClusterReadOnly {
                 detail: format!(
                     "cluster member `{}` is a voter; change its raft role before removal",
@@ -1393,14 +1520,19 @@ pub fn remove_cluster_members(
         removed.push(member);
     }
 
-    state
-        .members
-        .retain(|member| !requested.contains(&member.node_id));
-    state.updated_at = now;
-    sync_cluster_state_to_kv(paths, &state)?;
     commit_cluster_kv_txn_with_quorum(paths, &mut state, cluster_member_removal_txn(&removed)?)?;
-    sinomo_network::write_cluster_state(paths, &state)?;
     Ok(ClusterMemberRemoval { removed })
+}
+
+fn cluster_kv_member_is_voter(
+    store: &InProcessKvStore,
+    node_id: &NodeId,
+) -> Result<bool, DaemonError> {
+    let Some(config_entry) = store.get(&sinomo_network::cluster_raft_config_key()) else {
+        return Ok(false);
+    };
+    let config: sinomo_network::ClusterRaftConfigRecord = config_entry.decode()?;
+    Ok(config.voters.iter().any(|voter| voter == node_id))
 }
 
 fn cluster_member_removal_txn(members: &[ClusterMemberRecord]) -> Result<KvTxn, DaemonError> {
@@ -1828,6 +1960,14 @@ pub fn commit_cluster_kv_txn_with_quorum(
     state: &mut ClusterBootstrapState,
     txn: KvTxn,
 ) -> Result<KvSnapshot, DaemonError> {
+    commit_cluster_kv_txn_with_quorum_response(paths, state, txn).map(|(snapshot, _)| snapshot)
+}
+
+pub fn commit_cluster_kv_txn_with_quorum_response(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    txn: KvTxn,
+) -> Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError> {
     if !cluster_has_local_quorum(paths, state) {
         if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
             return response;
@@ -1851,14 +1991,13 @@ pub fn commit_cluster_kv_txn_with_quorum(
         });
     }
     commit_cluster_raft_command_with_quorum(paths, state, KvCommand::Txn(txn))
-        .map(|(snapshot, _)| snapshot)
 }
 
 fn forward_cluster_kv_txn_to_voter(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     txn: &KvTxn,
-) -> Option<Result<KvSnapshot, DaemonError>> {
+) -> Option<Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError>> {
     let mut targets = sinomo_network::prefer_bounded_daemon_command_targets(
         sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
     )
@@ -1880,11 +2019,11 @@ fn forward_cluster_kv_txn_to_voter(
     let mut last_error = None;
     for endpoint in targets {
         match send_cluster_kv_txn(&endpoint, txn, DAEMON_CLUSTER_RPC_TIMEOUT) {
-            Ok(_) => {
-                return Some(fetch_cluster_kv_snapshot_from_endpoint(
-                    &endpoint,
-                    DAEMON_CLUSTER_RPC_TIMEOUT,
-                ));
+            Ok(response) => {
+                return Some(
+                    fetch_cluster_kv_snapshot_from_endpoint(&endpoint, DAEMON_CLUSTER_RPC_TIMEOUT)
+                        .map(|snapshot| (snapshot, Some(response))),
+                );
             }
             Err(error) => last_error = Some(error),
         }

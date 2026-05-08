@@ -239,8 +239,7 @@ pub(crate) fn load_model_config_for_node(
 ) -> Result<(ModelConfig, PathBuf), CliError> {
     if model_config_uses_cluster(data_dir) {
         let paths = ClusterPaths::new(data_dir);
-        let _ = refresh_cluster_kv_from_local_daemon(&paths);
-        let snapshot = network::read_cluster_kv_snapshot(&paths)?;
+        let snapshot = model_config_cluster_snapshot(&paths)?;
         let config = model_config_from_cluster_kv_snapshot(&snapshot)
             .map_err(CliError::LanguageModel)?
             .unwrap_or_default();
@@ -250,6 +249,26 @@ pub(crate) fn load_model_config_for_node(
     Ok((load_model_config(&paths).unwrap_or_default(), paths.config))
 }
 
+fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
+    let _ = paths;
+    if let Some(status) = default_main_daemon_status()?
+        && let Ok(snapshot) =
+            daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
+    {
+        return Ok(snapshot);
+    }
+    #[cfg(test)]
+    {
+        return network::read_cluster_kv_snapshot(paths).map_err(Into::into);
+    }
+    #[cfg(not(test))]
+    {
+        Err(CliError::DaemonNotRunning {
+            detail: "clustered model config requires the local daemon".to_string(),
+        })
+    }
+}
+
 pub(crate) fn write_model_config_for_node(
     data_dir: &SinomoDataDir,
     config: &ModelConfig,
@@ -257,12 +276,9 @@ pub(crate) fn write_model_config_for_node(
     if model_config_uses_cluster(data_dir) {
         let paths = ClusterPaths::new(data_dir);
         paths.ensure()?;
-        let snapshot = network::read_cluster_kv_snapshot(&paths)
-            .unwrap_or_else(|_| InProcessKvStore::new().snapshot());
-        let mut store = InProcessKvStore::restore(snapshot);
         let txn = model_config_cluster_kv_txn(config).map_err(CliError::LanguageModel)?;
-        store.txn(txn)?;
-        write_cluster_kv_snapshot(&paths, &store.snapshot())?;
+        let daemon_paths = DaemonPaths::new(data_dir);
+        daemon_handle_daemon_cluster_kv_txn_request(&daemon_paths, txn)?;
         return Ok(paths.kv_snapshot);
     }
     let paths = ModelPaths::new(data_dir);

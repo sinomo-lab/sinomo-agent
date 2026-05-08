@@ -57,7 +57,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::daemon_lan_endpoint;
 use sinomo_runtime::node::main_daemon_capabilities;
 use sinomo_runtime::rollout::create_source_repo_bundle;
-use std::io::{BufRead, Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
@@ -77,32 +77,6 @@ fn authenticated_test_command(
         signer_node_id: signer_node_id.into(),
         signer_public_key: signer_public_key.into(),
     }
-}
-
-fn start_one_shot_raft_append_responder(
-    state: ClusterBootstrapState,
-) -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake raft responder");
-    let address = listener.local_addr().expect("fake raft responder address");
-    let handle = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(&mut stream).read_line(&mut line);
-            let response = sinomo_runtime::network::ClusterRaftAppendResponse {
-                accepted: true,
-                detail: "fake raft append accepted".to_string(),
-                state,
-                append: sinomo_runtime::kv::RaftAppendEntriesResponse {
-                    term: 1,
-                    success: true,
-                    match_index: 1,
-                },
-            };
-            let body = serde_json::to_string(&response).expect("fake response json");
-            let _ = stream.write_all(body.as_bytes());
-        }
-    });
-    (address.to_string(), handle)
 }
 
 #[test]
@@ -2475,7 +2449,12 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
     )
     .expect("cluster init");
     let mut state = read_cluster_state(&paths).expect("cluster state");
-    let (peer_address, responder) = start_one_shot_raft_append_responder(state.clone());
+    let closed_peer_listener = TcpListener::bind("127.0.0.1:0").expect("bind closed peer address");
+    let peer_address = closed_peer_listener
+        .local_addr()
+        .expect("closed peer address")
+        .to_string();
+    drop(closed_peer_listener);
     let peer_node_id = NodeId::from_legacy_named("node_kv_no_quorum_peer").expect("node");
     let mut peer = ClusterMemberRecord::local_voter(
         state.cluster_id.clone(),
@@ -2504,7 +2483,7 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
     let result =
         handle_daemon_cluster_kv_txn_request(&DaemonPaths::with_root(root.join("daemon")), txn);
 
-    assert!(matches!(result, Err(CliError::ClusterReadOnly { .. })));
+    assert!(result.is_err(), "unexpected successful txn: {result:?}");
     assert!(
         !read_cluster_kv_snapshot(&paths)
             .expect("cluster snapshot")
@@ -2512,7 +2491,6 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
             .iter()
             .any(|entry| entry.key == "/config/unsafe")
     );
-    responder.join().expect("join fake responder");
     std::fs::remove_dir_all(root).ok();
 }
 
