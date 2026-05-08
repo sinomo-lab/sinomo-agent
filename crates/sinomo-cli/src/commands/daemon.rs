@@ -422,7 +422,9 @@ pub(crate) fn stage_rollout_main_activation(
     rollout_paths: &SelfRolloutPaths,
     activation: RolloutMainActivation,
 ) -> Result<(), CliError> {
-    daemon_stage_rollout_main_activation(data_dir, rollout_paths, activation).map_err(Into::into)
+    let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
+    daemon_stage_rollout_main_activation(&main_paths, data_dir, rollout_paths, activation)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

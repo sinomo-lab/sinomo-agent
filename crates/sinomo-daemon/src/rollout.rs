@@ -546,6 +546,7 @@ pub fn handle_daemon_rollout_binary_request(
         detail: source.to_string(),
     })?;
     stage_rollout_main_activation(
+        paths,
         data_dir,
         &rollout_paths,
         RolloutMainActivation {
@@ -575,15 +576,19 @@ pub fn handle_daemon_rollout_binary_request(
 }
 
 pub fn stage_rollout_main_activation(
+    current_daemon_paths: &DaemonPaths,
     data_dir: &Path,
     rollout_paths: &SelfRolloutPaths,
     activation: RolloutMainActivation,
 ) -> Result<(), DaemonError> {
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
-    if !matches!(
-        probe_daemon_status(&shadow_paths, CLUSTER_HEALTH_PROBE_TIMEOUT),
-        DaemonProbeStatus::Running(_)
-    ) {
+    let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
+    if !current_daemon_is_shadow
+        && !matches!(
+            probe_daemon_status(&shadow_paths, CLUSTER_HEALTH_PROBE_TIMEOUT),
+            DaemonProbeStatus::Running(_)
+        )
+    {
         return Err(DaemonError::NotRunning {
             detail: "safe rollout requires the existing shadow daemon to be running".to_string(),
         });
@@ -1066,6 +1071,7 @@ pub fn handle_daemon_rollout_build_request(
     let source = request.source.clone();
     let requested_at = request.requested_at.clone();
     stage_rollout_main_activation(
+        paths,
         data_dir,
         &rollout_paths,
         RolloutMainActivation {
@@ -1178,6 +1184,13 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&Path, DaemonError> {
     })
 }
 
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1227,6 +1240,40 @@ mod tests {
     fn pending_shadow_rollout_uses_fast_main_health_probe() {
         assert!(shadow_main_probe_interval(true) < Duration::from_secs(1));
         assert!(shadow_main_probe_interval(false) >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn stage_rollout_main_activation_accepts_current_shadow_without_self_probe() {
+        let root = temp_rollout_test_root("shadow-self-probe");
+        std::fs::create_dir_all(root.join("shadow-daemon")).expect("shadow root");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
+        let activation = test_main_activation(&rollout_paths);
+
+        stage_rollout_main_activation(&shadow_paths, &root, &rollout_paths, activation.clone())
+            .expect("current shadow can stage activation without recursive status probe");
+
+        let staged = read_rollout_main_activation(&rollout_paths)
+            .expect("read activation")
+            .expect("activation staged");
+        assert_eq!(staged, activation);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stage_rollout_main_activation_still_requires_shadow_when_called_from_main() {
+        let root = temp_rollout_test_root("main-requires-shadow");
+        std::fs::create_dir_all(root.join("daemon")).expect("main root");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        let activation = test_main_activation(&rollout_paths);
+
+        let error = stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
+            .expect_err("main daemon must still verify a separate shadow daemon");
+        assert!(error.to_string().contains("safe rollout requires"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1285,5 +1332,31 @@ mod tests {
         assert_eq!(plan.activation.main_port, 21353);
         assert_eq!(plan.activation.shadow_port, 21354);
         assert_eq!(plan.activation.mode, "local-apply");
+    }
+
+    fn temp_rollout_test_root(label: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "sinomo-daemon-rollout-{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn test_main_activation(rollout_paths: &SelfRolloutPaths) -> RolloutMainActivation {
+        RolloutMainActivation {
+            source: "test-source".to_string(),
+            main_binary: rollout_paths.main_binary.clone(),
+            shadow_binary: rollout_paths.shadow_binary.clone(),
+            staged_main_binary: Some(rollout_staged_main_binary(rollout_paths)),
+            staged_shadow_binary: Some(rollout_staged_shadow_binary(rollout_paths)),
+            previous_main_binary: Some(rollout_paths.main_binary.clone()),
+            main_host: "127.0.0.1".to_string(),
+            main_port: 21353,
+            shadow_port: 21354,
+            requested_at: "2026-05-08T00:00:00Z".to_string(),
+            mode: "cluster-remote-build".to_string(),
+        }
     }
 }
