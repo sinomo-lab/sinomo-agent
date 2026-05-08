@@ -234,6 +234,9 @@ pub fn advertise_daemon_iroh_endpoint(
         state.updated_at = OffsetDateTime::now_utc();
         sinomo_network::write_cluster_state(&cluster_paths, &state)?;
         sync_cluster_state_to_kv(&cluster_paths, &state)?;
+        if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
+            eprintln!("sinomo iroh endpoint quorum publication failed: {error}");
+        }
     }
     Ok(())
 }
