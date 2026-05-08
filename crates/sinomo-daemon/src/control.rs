@@ -37,17 +37,32 @@ where
     E: From<DaemonError>,
 {
     prepare_daemon_client_stream(stream)?;
-    let mut request = read_daemon_control_frame(stream)?;
+    let mut request = match read_daemon_control_frame(stream) {
+        Ok(request) => request,
+        Err(_) => {
+            stream.shutdown_both();
+            return Ok(false);
+        }
+    };
     let command = request.command.trim().to_string();
     if command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE) {
-        let rpc_request = request.rpc.as_ref().ok_or(DaemonError::AuthDenied)?;
+        let Some(rpc_request) = request.rpc.as_ref() else {
+            stream.shutdown_both();
+            return Ok(false);
+        };
         if rpc_request.route != sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE
             || rpc_request.category != sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
         {
-            return Err(DaemonError::AuthDenied.into());
+            stream.shutdown_both();
+            return Ok(false);
         }
-        let challenge: ClusterInviteChallengeRequest =
-            rpc_request.decode_body().map_err(DaemonError::from)?;
+        let challenge: ClusterInviteChallengeRequest = match rpc_request.decode_body() {
+            Ok(challenge) => challenge,
+            Err(_) => {
+                stream.shutdown_both();
+                return Ok(false);
+            }
+        };
         let proof = match create_cluster_invite_challenge_proof(paths, &challenge) {
             Ok(proof) => proof,
             Err(_error) => {
@@ -73,12 +88,53 @@ where
     let authenticated = match authenticate_daemon_control_request(paths, &request) {
         Ok(authenticated) => authenticated,
         Err(error) => {
-            eprintln!("sinomo daemon client auth failed for {command}: {error}");
+            if is_recognized_daemon_rpc_request(&request) {
+                eprintln!("sinomo daemon client auth failed for {command}: {error}");
+            }
             stream.shutdown_both();
             return Ok(false);
         }
     };
     handler(authenticated, request.rpc, stream)
+}
+
+fn is_recognized_daemon_rpc_request(request: &sinomo_network::DaemonControlRequest) -> bool {
+    let Some(rpc) = request.rpc.as_ref() else {
+        return false;
+    };
+    let command = request.command.trim();
+    recognized_daemon_rpc_category(&rpc.route).is_some_and(|category| {
+        command == daemon_rpc_command(&rpc.route) && rpc.category == category
+    })
+}
+
+fn recognized_daemon_rpc_category(route: &str) -> Option<&'static str> {
+    Some(match route {
+        sinomo_network::DAEMON_STATUS_ROUTE | sinomo_network::DAEMON_SHUTDOWN_ROUTE => {
+            sinomo_network::DAEMON_RPC_CATEGORY
+        }
+        sinomo_network::CLUSTER_KV_SNAPSHOT_ROUTE
+        | sinomo_network::CLUSTER_KV_TXN_ROUTE
+        | sinomo_network::CLUSTER_KV_RANGE_PREFIX_ROUTE
+        | sinomo_network::CLUSTER_KV_WATCH_PREFIX_ROUTE
+        | sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE
+        | sinomo_network::CLUSTER_KV_WATCH_EVENTS_ROUTE => sinomo_network::CLUSTER_KV_RPC_CATEGORY,
+        sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE
+        | sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE
+        | sinomo_network::CLUSTER_INVITE_PUBLISH_ROUTE
+        | sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE => {
+            sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+        }
+        sinomo_network::CLUSTER_RAFT_APPEND_ROUTE | sinomo_network::CLUSTER_RAFT_VOTE_ROUTE => {
+            sinomo_network::CLUSTER_RAFT_RPC_CATEGORY
+        }
+        sinomo_network::DFS_EXPOSE_CONFIG_ROUTE => sinomo_network::DFS_RPC_CATEGORY,
+        sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE
+        | sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE
+        | sinomo_network::ROLLOUT_BINARY_ROUTE
+        | sinomo_network::ROLLOUT_BUILD_ROUTE => sinomo_network::ROLLOUT_RPC_CATEGORY,
+        _ => return None,
+    })
 }
 
 fn prepare_daemon_client_stream(
