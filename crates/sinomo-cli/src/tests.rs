@@ -17,7 +17,7 @@ use super::{
     cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
     daemon_advertised_endpoints_for_state, daemon_package_version, daemon_remove_cluster_members,
     decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
-    ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
     handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
     handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
     handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
@@ -3461,6 +3461,48 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     assert_eq!(
         endpoints.first().expect("endpoint").endpoint_id,
         iroh_endpoint.endpoint_id
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-kv-endpoint-candidates-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let remote_node_id =
+        NodeId::from_legacy_named("node_rollout_kv_endpoint_remote").expect("node");
+    let iroh_endpoint = invite_introducer_endpoint(
+        &remote_node_id,
+        "iroh://rollout_kv_endpoint?relay=https://relay.example./".to_string(),
+    );
+
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(
+            sinomo_runtime::network::cluster_endpoint_key(&remote_node_id, &iroh_endpoint),
+            &iroh_endpoint,
+            None,
+        )
+        .expect("endpoint record");
+    sinomo_runtime::network::write_cluster_kv_snapshot(&paths, &store.snapshot())
+        .expect("cluster kv snapshot");
+
+    let mut endpoints = Vec::new();
+    extend_rollout_endpoints_from_kv(&paths, &mut endpoints);
+
+    assert!(
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.endpoint_id == iroh_endpoint.endpoint_id)
     );
     std::fs::remove_dir_all(root).ok();
 }

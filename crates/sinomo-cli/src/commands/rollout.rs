@@ -560,6 +560,7 @@ pub(crate) fn rollout_cluster_targets(
         }
         let sync_targets = network::cluster_sync_targets_with_connectivity(&paths, state);
         let mut rollout_endpoints = rollout_endpoint_candidates(state);
+        extend_rollout_endpoints_from_kv(&paths, &mut rollout_endpoints);
         sort_rollout_endpoints_by_connectivity(&paths, state, &mut rollout_endpoints);
         let mut selected_remote_nodes = std::collections::BTreeSet::new();
         for endpoint in sync_targets.clone() {
@@ -628,6 +629,23 @@ pub(crate) fn rollout_endpoint_candidates(
         );
     }
     endpoints
+}
+
+pub(crate) fn extend_rollout_endpoints_from_kv(
+    paths: &ClusterPaths,
+    endpoints: &mut Vec<ClusterEndpointRecord>,
+) {
+    let Ok(kv_endpoints) = network::read_cluster_endpoints_from_kv(paths) else {
+        return;
+    };
+    for endpoint in kv_endpoints {
+        if !endpoints
+            .iter()
+            .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+        {
+            endpoints.push(endpoint);
+        }
+    }
 }
 
 pub(crate) fn rollout_target_endpoint_for_main(
