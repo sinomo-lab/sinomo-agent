@@ -258,6 +258,7 @@ where
     let mut pending_rollout: Option<ShadowMainRolloutMonitor> = None;
     let shadow_idle_interval = Duration::from_millis(100);
     let mut last_main_probe = Instant::now() - shadow_main_probe_interval(false);
+    let mut next_pending_activation_shutdown_nudge = Instant::now();
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
 
     loop {
@@ -281,6 +282,19 @@ where
         if now.duration_since(last_main_probe) >= main_probe_interval {
             main_probe_status = probe_daemon_status(&main_paths, probe_timeout);
             last_main_probe = now;
+        }
+
+        if pending_rollout.is_none()
+            && matches!(main_probe_status, DaemonProbeStatus::Running(_))
+            && rollout_main_activation_path(&rollout_paths).exists()
+            && Instant::now() >= next_pending_activation_shutdown_nudge
+        {
+            if let DaemonProbeStatus::Running(status) =
+                probe_daemon_status(&main_paths, probe_timeout)
+            {
+                let _ = send_daemon_shutdown_request(&status.address, probe_timeout);
+            }
+            next_pending_activation_shutdown_nudge = Instant::now() + Duration::from_secs(2);
         }
 
         if let Some(pending) = pending_rollout.as_ref() {
