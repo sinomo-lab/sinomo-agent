@@ -34,9 +34,10 @@ use super::{
     push_unique_introducer, read_cluster_kv_snapshot, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
     refresh_daemon_node_status_in_kv, rollout_cluster_targets, rollout_endpoint_candidates,
-    rollout_target_endpoint_for_main, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
-    run_evolve_command, run_shadow_daemon_with_paths, send_cluster_join_registration_over_iroh,
-    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
+    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
+    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
+    run_shadow_daemon_with_paths, send_cluster_join_registration_over_iroh, shadow_daemon_node_id,
+    sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
     sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
     sync_cluster_state_to_kv, uninstall_with_layout, write_daemon_status, write_rollout_status,
 };
@@ -3355,6 +3356,25 @@ fn rollout_cluster_target_prefers_lower_priority_shadow_endpoint() {
 
     let selected = rollout_target_endpoint_for_main(&main_node_id, &[lan_endpoint, iroh_endpoint])
         .expect("shadow target");
+
+    assert_eq!(selected.node_id, shadow_node_id);
+    assert_eq!(selected.transport, ClusterTransportKind::Iroh);
+}
+
+#[test]
+fn rollout_cluster_target_can_preserve_connectivity_order() {
+    let main_node_id =
+        NodeId::from_legacy_named("node_rollout_shadow_connectivity_main").expect("main node");
+    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
+    let lan_endpoint = invite_introducer_endpoint(&shadow_node_id, "192.0.2.42:21354".to_string());
+    let iroh_endpoint = invite_introducer_endpoint(
+        &shadow_node_id,
+        "iroh://shadow_connectivity_rollout?relay=https://relay.example./".to_string(),
+    );
+
+    let selected =
+        rollout_target_endpoint_for_main_in_order(&main_node_id, &[iroh_endpoint, lan_endpoint])
+            .expect("shadow target");
 
     assert_eq!(selected.node_id, shadow_node_id);
     assert_eq!(selected.transport, ClusterTransportKind::Iroh);

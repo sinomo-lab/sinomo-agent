@@ -583,8 +583,11 @@ pub(crate) fn rollout_cluster_targets(
                 continue;
             }
             let rollout_endpoint =
-                rollout_target_endpoint_for_main(&endpoint.node_id, &rollout_endpoints)
-                    .unwrap_or_else(|| endpoint.clone());
+                rollout_target_endpoint_for_main_in_order(&endpoint.node_id, &rollout_endpoints)
+                    .unwrap_or_else(|| {
+                        rollout_target_endpoint_for_main(&endpoint.node_id, &rollout_endpoints)
+                            .unwrap_or_else(|| endpoint.clone())
+                    });
             push_unique_rollout_target(&mut targets, RolloutTarget::endpoint(rollout_endpoint));
         }
         return Ok(targets);
@@ -642,6 +645,20 @@ pub(crate) fn rollout_target_endpoint_for_main(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|endpoint| (endpoint.priority, endpoint.address.clone()));
     candidates.into_iter().next()
+}
+
+pub(crate) fn rollout_target_endpoint_for_main_in_order(
+    main_node_id: &NodeId,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    let shadow_node_id = shadow_daemon_node_id(main_node_id);
+    candidates
+        .iter()
+        .find(|endpoint| {
+            endpoint.node_id == shadow_node_id
+                && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
+        })
+        .cloned()
 }
 
 pub(crate) fn sort_rollout_endpoints_by_connectivity(
