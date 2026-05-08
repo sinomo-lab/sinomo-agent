@@ -630,13 +630,29 @@ pub(crate) fn rollout_target_endpoint_for_main(
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
     let shadow_node_id = shadow_daemon_node_id(main_node_id);
-    candidates
+    let mut candidates = candidates
         .iter()
-        .find(|endpoint| {
+        .filter(|endpoint| {
             endpoint.node_id == shadow_node_id
                 && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
         })
         .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|endpoint| {
+        (
+            !matches!(
+                endpoint.transport,
+                sinomo_runtime::core::ClusterTransportKind::Iroh
+            ),
+            matches!(
+                endpoint.privacy,
+                sinomo_runtime::core::ClusterEndpointPrivacy::Lan
+            ),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+    candidates.into_iter().next()
 }
 
 fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {

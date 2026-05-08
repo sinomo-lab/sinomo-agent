@@ -3342,6 +3342,25 @@ fn rollout_cluster_target_prefers_shadow_endpoint_for_main_member() {
 }
 
 #[test]
+fn rollout_cluster_target_prefers_shadow_iroh_over_lan_endpoint() {
+    let main_node_id = NodeId::from_legacy_named("node_rollout_shadow_iroh_main")
+        .expect("main node");
+    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
+    let lan_endpoint =
+        invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
+    let iroh_endpoint = invite_introducer_endpoint(
+        &shadow_node_id,
+        "iroh://shadow_iroh_rollout?relay=https://relay.example./".to_string(),
+    );
+
+    let selected = rollout_target_endpoint_for_main(&main_node_id, &[lan_endpoint, iroh_endpoint])
+        .expect("shadow target");
+
+    assert_eq!(selected.node_id, shadow_node_id);
+    assert_eq!(selected.transport, ClusterTransportKind::Iroh);
+}
+
+#[test]
 fn rollout_cluster_target_ignores_local_only_shadow_endpoint() {
     let main_node_id = NodeId::from_legacy_named("node_rollout_local_shadow").expect("main node");
     let shadow_node_id = shadow_daemon_node_id(&main_node_id);
