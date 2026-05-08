@@ -535,7 +535,7 @@ async fn run_iroh_daemon_proxy(
                         forward_daemon_control_payload(
                             &daemon_address,
                             &request,
-                            Duration::from_secs(60),
+                            Duration::from_secs(10),
                         )
                     })
                     .await

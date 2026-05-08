@@ -20,7 +20,7 @@ use std::thread;
 use std::time::Duration;
 
 pub const DAEMON_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
-pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 pub fn handle_authenticated_daemon_connection<F, E>(

@@ -259,7 +259,7 @@ pub(crate) fn start_daemon_with_paths_with_env(
         command_prefix,
         label,
         extra_env,
-        Duration::from_secs(90),
+        Duration::from_secs(10),
         DAEMON_PROBE_TIMEOUT,
     )?;
     println!(

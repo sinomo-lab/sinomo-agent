@@ -625,9 +625,15 @@ pub fn start_installed_sinomo_daemon(
     let deadline = Instant::now() + ready_timeout;
     let mut exited_before_ready: Option<(String, i32)> = None;
     while Instant::now() < deadline {
-        if let crate::DaemonProbeStatus::Running(status) = probe_daemon_status(paths, probe_timeout)
-        {
-            return Ok(InstalledDaemonStartStatus::Started(status));
+        match probe_daemon_status(paths, probe_timeout) {
+            crate::DaemonProbeStatus::Running(status)
+            | crate::DaemonProbeStatus::Locked {
+                status: Some(status),
+            } => {
+                return Ok(InstalledDaemonStartStatus::Started(status));
+            }
+            crate::DaemonProbeStatus::Locked { status: None }
+            | crate::DaemonProbeStatus::NotRunning => {}
         }
 
         if exited_before_ready.is_none()

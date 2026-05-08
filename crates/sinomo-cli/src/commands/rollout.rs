@@ -550,7 +550,7 @@ pub(crate) fn wait_for_main_daemon_health(
         &options.host,
         options.port,
         previous_pid,
-        Duration::from_secs(90),
+        Duration::from_secs(10),
         DAEMON_PROBE_TIMEOUT,
     )?;
     println!(
@@ -572,7 +572,7 @@ pub(crate) fn wait_for_local_shadow_rollout_completion(
         options.port,
         &options.host,
         options.shadow_port,
-        Duration::from_secs(90),
+        Duration::from_secs(10),
         DAEMON_PROBE_TIMEOUT,
     )
     .map_err(Into::into)

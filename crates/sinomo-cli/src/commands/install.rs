@@ -389,7 +389,7 @@ pub(crate) fn stop_daemon_before_install(
 ) -> Result<(), CliError> {
     match daemon_install_stop_daemon_before_install(
         paths,
-        Duration::from_secs(90),
+        Duration::from_secs(10),
         DAEMON_PROBE_TIMEOUT,
     )? {
         DaemonStopBeforeInstallStatus::NotRunning => Ok(()),
@@ -447,7 +447,7 @@ pub(crate) fn start_installed_sinomo_daemon(
         args,
         paths,
         extra_env,
-        Duration::from_secs(90),
+        Duration::from_secs(10),
         DAEMON_PROBE_TIMEOUT,
     )? {
         InstalledDaemonStartStatus::Started(status) => {

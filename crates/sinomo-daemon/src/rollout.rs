@@ -602,7 +602,7 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
         probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT)
     {
         let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if matches!(
                 probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
@@ -635,7 +635,7 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
             data_dir,
             &finalize.shadow_host,
             finalize.shadow_port,
-            Duration::from_secs(30),
+            Duration::from_secs(10),
         )
     });
     if let Err(error) = candidate_result {
@@ -643,7 +643,7 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
             data_dir,
             &finalize.shadow_host,
             finalize.shadow_port,
-            Duration::from_secs(15),
+            Duration::from_secs(10),
         )
         .is_ok()
         {
