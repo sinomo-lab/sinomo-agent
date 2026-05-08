@@ -18,8 +18,11 @@ ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 sinomo-core = { path = "../sinomo-core" }
+sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
+sinomo-rollout = { path = "../sinomo-rollout" }
 thiserror.workspace = true
 time.workspace = true

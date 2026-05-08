@@ -8,8 +8,10 @@ use sinomo_core::{
     ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
     ClusterNodeRolloutStatus, ClusterNodeStatusRecord, NodeId,
 };
+use sinomo_local::SinomoDataDir;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -109,6 +111,69 @@ pub fn daemon_cluster_status(
         member_role: member.role.clone(),
         member_state: member.state.clone(),
     })
+}
+
+pub fn ensure_daemon_cluster_members(
+    state: &mut ClusterBootstrapState,
+    main_options: &DaemonRunOptions,
+    shadow_options: &DaemonRunOptions,
+    timestamp: OffsetDateTime,
+) -> bool {
+    let main_node_id = state.local_node_id.clone();
+    let shadow_node_id = sinomo_node::shadow_daemon_node_id(&state.local_node_id);
+    let lan_ips = sinomo_network::discover_default_lan_ip_candidates();
+    let route_ips = sinomo_network::discover_peer_route_ip_candidates(state);
+    let main_endpoints = daemon_advertised_endpoints_for_state(
+        state,
+        &main_node_id,
+        main_options,
+        0,
+        &lan_ips,
+        &route_ips,
+    );
+    let shadow_endpoints = daemon_advertised_endpoints_for_state(
+        state,
+        &shadow_node_id,
+        shadow_options,
+        10,
+        &lan_ips,
+        &route_ips,
+    );
+    sinomo_network::ensure_daemon_cluster_members(
+        state,
+        main_endpoints,
+        shadow_endpoints,
+        timestamp,
+    )
+}
+
+pub fn daemon_advertised_endpoints_for_state(
+    _state: &ClusterBootstrapState,
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+) -> Vec<ClusterEndpointRecord> {
+    daemon_advertised_endpoints_from_ips(node_id, options, priority, lan_ips, route_ips)
+}
+
+pub fn daemon_advertised_endpoints_from_ips(
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+) -> Vec<ClusterEndpointRecord> {
+    sinomo_network::daemon_advertised_endpoints_from_addresses(
+        node_id,
+        daemon_connect_address(&options.host, options.port),
+        &options.host,
+        options.port,
+        priority,
+        lan_ips,
+        route_ips,
+    )
 }
 
 pub fn current_shadow_daemon_options(data_dir: &Path, timeout: Duration) -> DaemonRunOptions {
@@ -484,6 +549,16 @@ pub fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProb
         }
         Err(_) => DaemonProbeStatus::Locked { status },
     }
+}
+
+pub fn default_main_daemon_status(timeout: Duration) -> Result<Option<DaemonStatus>, DaemonError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let paths = DaemonPaths::new(&data_dir);
+    Ok(match probe_daemon_status(&paths, timeout) {
+        DaemonProbeStatus::Running(status) => Some(status),
+        DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => None,
+    })
 }
 
 pub fn daemon_status_matches_probe(expected: &DaemonStatus, actual: &DaemonStatus) -> bool {
