@@ -37,8 +37,8 @@ use super::{
     rollout_target_endpoint_for_main, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
     run_evolve_command, run_shadow_daemon_with_paths, send_cluster_join_registration_over_iroh,
     shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout,
-    write_daemon_status, write_rollout_status,
+    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, uninstall_with_layout, write_daemon_status, write_rollout_status,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -3342,22 +3342,107 @@ fn rollout_cluster_target_prefers_shadow_endpoint_for_main_member() {
 }
 
 #[test]
-fn rollout_cluster_target_prefers_shadow_iroh_over_lan_endpoint() {
-    let main_node_id = NodeId::from_legacy_named("node_rollout_shadow_iroh_main")
-        .expect("main node");
+fn rollout_cluster_target_prefers_lower_priority_shadow_endpoint() {
+    let main_node_id =
+        NodeId::from_legacy_named("node_rollout_shadow_iroh_main").expect("main node");
     let shadow_node_id = shadow_daemon_node_id(&main_node_id);
-    let lan_endpoint =
-        invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
-    let iroh_endpoint = invite_introducer_endpoint(
+    let lan_endpoint = invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
+    let mut iroh_endpoint = invite_introducer_endpoint(
         &shadow_node_id,
         "iroh://shadow_iroh_rollout?relay=https://relay.example./".to_string(),
     );
+    iroh_endpoint.priority = 10;
 
     let selected = rollout_target_endpoint_for_main(&main_node_id, &[lan_endpoint, iroh_endpoint])
         .expect("shadow target");
 
     assert_eq!(selected.node_id, shadow_node_id);
     assert_eq!(selected.transport, ClusterTransportKind::Iroh);
+}
+
+#[test]
+fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-connectivity-order-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_connectivity_order").expect("cluster");
+    let local_node_id = NodeId::from_legacy_named("node_rollout_connectivity_local").expect("node");
+    let remote_node_id =
+        NodeId::from_legacy_named("node_rollout_connectivity_remote").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout connectivity order",
+        local_node_id.clone(),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+
+    let lan_endpoint = invite_introducer_endpoint(&remote_node_id, "192.0.2.42:21354".to_string());
+    let iroh_endpoint = invite_introducer_endpoint(
+        &remote_node_id,
+        "iroh://rollout_connectivity_remote?relay=https://relay.example./".to_string(),
+    );
+
+    let now = OffsetDateTime::now_utc();
+    let mut store = InProcessKvStore::new();
+    for (endpoint, connectivity_state) in [
+        (
+            &lan_endpoint,
+            sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+        ),
+        (
+            &iroh_endpoint,
+            sinomo_runtime::network::ClusterConnectivityState::Healthy,
+        ),
+    ] {
+        let record = sinomo_runtime::network::ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: local_node_id.clone(),
+            target_node_id: remote_node_id.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            state: connectivity_state,
+            latency_ms: None,
+            consecutive_failures: 0,
+            last_success_at: None,
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(120),
+        };
+        store
+            .put_serde(
+                sinomo_runtime::network::cluster_connectivity_key(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    &record.endpoint_id,
+                ),
+                &record,
+                None,
+            )
+            .expect("connectivity record");
+    }
+    sinomo_runtime::network::write_cluster_kv_snapshot(&paths, &store.snapshot())
+        .expect("cluster kv snapshot");
+
+    let mut endpoints = vec![lan_endpoint, iroh_endpoint.clone()];
+    sort_rollout_endpoints_by_connectivity(&paths, &state, &mut endpoints);
+
+    assert_eq!(
+        endpoints.first().expect("endpoint").endpoint_id,
+        iroh_endpoint.endpoint_id
+    );
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
