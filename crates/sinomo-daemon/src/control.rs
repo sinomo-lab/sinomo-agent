@@ -1,8 +1,9 @@
 use crate::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeRequest, ClusterNetworkMaintenance,
     DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
-    authenticate_daemon_control_request, create_cluster_invite_challenge_proof, daemon_rpc_command,
-    ensure_daemon_status_cluster, ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
+    authenticate_daemon_control_request, create_cluster_invite_challenge_proof,
+    daemon_paths_are_shadow, daemon_rpc_command, ensure_daemon_status_cluster,
+    ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
     handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
@@ -546,7 +547,9 @@ pub fn handle_daemon_connection(
                     detail: source.to_string(),
                 })?;
                 stream.shutdown_write();
-                Ok(response.status == "accepted")
+                Ok(accepted_rollout_should_stop_current_daemon(
+                    paths, &response,
+                ))
             }
             command if command == daemon_rpc_command(sinomo_network::ROLLOUT_BUILD_ROUTE) => {
                 let request = require_daemon_rpc_request(
@@ -576,11 +579,20 @@ pub fn handle_daemon_connection(
                     detail: source.to_string(),
                 })?;
                 stream.shutdown_write();
-                Ok(response.status == "accepted")
+                Ok(accepted_rollout_should_stop_current_daemon(
+                    paths, &response,
+                ))
             }
             _ => Ok(false),
         }
     })
+}
+
+fn accepted_rollout_should_stop_current_daemon(
+    paths: &DaemonPaths,
+    response: &sinomo_rollout::ClusterRolloutBinaryResponse,
+) -> bool {
+    response.status == "accepted" && !daemon_paths_are_shadow(paths)
 }
 
 fn require_daemon_rpc_request(
@@ -668,6 +680,38 @@ mod tests {
             status_result.is_ok(),
             "status should not be blocked by an idle TCP probe: {status_result:?}"
         );
+    }
+
+    #[test]
+    fn accepted_rollout_keeps_shadow_control_loop_running() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-daemon-control-rollout-shadow-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("daemon")).expect("main root");
+        std::fs::create_dir_all(root.join("shadow-daemon")).expect("shadow root");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
+        let accepted = sinomo_rollout::ClusterRolloutBinaryResponse {
+            status: "accepted".to_string(),
+            detail: "staged".to_string(),
+            main_binary: root.join("bin/sinomo"),
+            shadow_binary: root.join("bin/sinomo-shadow"),
+            source_head: None,
+        };
+
+        assert!(accepted_rollout_should_stop_current_daemon(
+            &main_paths,
+            &accepted
+        ));
+        assert!(!accepted_rollout_should_stop_current_daemon(
+            &shadow_paths,
+            &accepted
+        ));
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn send_test_status_request(

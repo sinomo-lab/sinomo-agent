@@ -584,6 +584,35 @@ pub fn stage_rollout_main_activation(
     }
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
+    if current_daemon_is_shadow {
+        request_main_shutdown_for_shadow_rollout(data_dir, &activation)?;
+    }
+    Ok(())
+}
+
+pub fn daemon_paths_are_shadow(paths: &DaemonPaths) -> bool {
+    let Ok(data_dir) = daemon_data_dir(paths) else {
+        return false;
+    };
+    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    paths_equivalent(&paths.root, &shadow_paths.root)
+}
+
+fn request_main_shutdown_for_shadow_rollout(
+    data_dir: &Path,
+    activation: &RolloutMainActivation,
+) -> Result<(), DaemonError> {
+    let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
+    let status = match probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => Some(status),
+        DaemonProbeStatus::Locked { status } => status,
+        DaemonProbeStatus::NotRunning => None,
+    };
+    let address = status
+        .as_ref()
+        .map(|status| status.address.clone())
+        .unwrap_or_else(|| daemon_connect_address(&activation.main_host, activation.main_port));
+    let _ = send_daemon_shutdown_request(&address, DAEMON_PROBE_TIMEOUT);
     Ok(())
 }
 
