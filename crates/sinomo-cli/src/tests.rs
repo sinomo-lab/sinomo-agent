@@ -6,23 +6,24 @@ use super::{
     DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus,
     EvolutionPaths, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
     InteractionSession, InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
-    ModelsCliCommand, ProviderCliCommand, ProviderName, RolloutCliCommand, RolloutMainActivation,
-    RolloutOptions, SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets,
-    apply_cluster_node_role, apply_cluster_raft_role, authenticate_daemon_control_request,
-    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
-    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
-    daemon_advertised_endpoints_for_state, daemon_package_version, decode_cluster_join_invite,
-    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
-    expire_cluster_network_records_in_kv, handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
-    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
-    handle_daemon_cluster_raft_append_request, handle_daemon_cluster_raft_vote_request,
-    handle_daemon_connection, handle_daemon_rollout_build_request, install_should_update_binary,
-    install_with_layout, invite_channels_for_join_registration, invite_communication_channels,
+    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName, RolloutCliCommand,
+    RolloutMainActivation, RolloutOptions, SelfRolloutPaths, UninstallOptions,
+    advertised_peer_route_targets, apply_cluster_node_role, apply_cluster_raft_role,
+    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
+    cli_command_requires_cluster_state, cluster_connectivity_sync_ops, cluster_doctor_findings,
+    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_publish_targets,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
+    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
+    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
+    daemon_package_version, decode_cluster_join_invite, elect_cluster_raft_leader,
+    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
+    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
+    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
+    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
+    handle_daemon_cluster_raft_vote_request, handle_daemon_connection,
+    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
+    invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
     managed_source_status, models_default_with_data_dir, normalize_model_provider,
     parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
@@ -108,17 +109,31 @@ fn provider_commands_parse_action_before_provider() {
     assert_eq!(
         parse_provider_command(&["auth".to_string(), "gemini".to_string(),])
             .expect("provider command"),
-        ProviderCliCommand::Auth(ProviderName::Gemini)
+        ProviderCliCommand::Auth(ProviderCommandOptions {
+            provider: ProviderName::Gemini,
+            account: "default".to_string(),
+        })
     );
     assert_eq!(
         parse_provider_command(&["test".to_string(), "github-copilot".to_string(),])
             .expect("provider command"),
-        ProviderCliCommand::Test(ProviderName::GitHubCopilot)
+        ProviderCliCommand::Test(ProviderCommandOptions {
+            provider: ProviderName::GitHubCopilot,
+            account: "default".to_string(),
+        })
     );
     assert_eq!(
-        parse_provider_command(&["auth".to_string(), "codex".to_string(),])
-            .expect("provider command"),
-        ProviderCliCommand::Auth(ProviderName::Codex)
+        parse_provider_command(&[
+            "auth".to_string(),
+            "codex".to_string(),
+            "--account".to_string(),
+            "team-a".to_string(),
+        ])
+        .expect("provider command"),
+        ProviderCliCommand::Auth(ProviderCommandOptions {
+            provider: ProviderName::Codex,
+            account: "team-a".to_string(),
+        })
     );
 }
 
@@ -179,7 +194,10 @@ fn top_level_cli_parser_routes_subcommands() {
             "openai".to_string()
         ])
         .expect("providers"),
-        CliCommand::Providers(ProviderCliCommand::Test(ProviderName::OpenAi))
+        CliCommand::Providers(ProviderCliCommand::Test(ProviderCommandOptions {
+            provider: ProviderName::OpenAi,
+            account: _,
+        }))
     ));
     assert!(matches!(
         parse_cli_command(&["models".to_string(), "list".to_string()]).expect("models"),
@@ -4511,6 +4529,7 @@ fn models_default_writes_global_model_config() {
     models_default_with_data_dir(
         super::ModelDefaultOptions {
             provider: "openai".to_string(),
+            account: "default".to_string(),
             model: "gpt-5.5".to_string(),
         },
         &data_dir,
@@ -4523,7 +4542,54 @@ fn models_default_writes_global_model_config() {
     )
     .expect("model config json");
     assert_eq!(config["default_provider"], "openai");
+    assert_eq!(config["default_account"], "default");
     assert_eq!(config["default_model"], "gpt-5.5");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn models_default_writes_cluster_model_config_to_kv_for_clustered_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-models-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("lm_config").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("lm_config_node").expect("node")),
+            name: "lm config".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+
+    models_default_with_data_dir(
+        super::ModelDefaultOptions {
+            provider: "openai".to_string(),
+            account: "work".to_string(),
+            model: "gpt-5.5".to_string(),
+        },
+        &data_dir,
+    )
+    .expect("write clustered model defaults");
+
+    assert!(!root.join("config").join("models.json").exists());
+    let store = sinomo_runtime::kv::InProcessKvStore::restore(
+        sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
+    );
+    let entry = store
+        .get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY)
+        .expect("lm config kv entry");
+    let config: sinomo_lm::ModelConfig = entry.decode().expect("lm config");
+    assert_eq!(config.default_provider.as_deref(), Some("openai"));
+    assert_eq!(config.default_account.as_deref(), Some("work"));
+    assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
 
     std::fs::remove_dir_all(root).ok();
 }

@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelDefaultOptions {
     pub(crate) provider: String,
+    pub(crate) account: String,
     pub(crate) model: String,
 }
 
@@ -53,14 +54,19 @@ pub(crate) fn parse_model_default_options(
     })?;
     let model = flag_value(args, "--model").ok_or(CliError::Usage)?;
     let model = normalize_model_id_for_provider(&provider, &model);
+    let account = normalize_provider_account_name(flag_value(args, "--account").as_deref());
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--provider" | "--model" => index += 2,
+            "--provider" | "--model" | "--account" => index += 2,
             _ => return Err(CliError::Usage),
         }
     }
-    Ok(ModelDefaultOptions { provider, model })
+    Ok(ModelDefaultOptions {
+        provider,
+        account,
+        model,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +116,17 @@ pub(crate) fn parse_usage_options(args: &[String]) -> Result<UsageOptions, CliEr
 
 pub(crate) fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
+    if model_config_uses_cluster(&data_dir) {
+        let (config, config_path) = load_model_config_for_node(&data_dir)?;
+        let resolved = resolve_default_model(Some(&config), None)?;
+        return Ok(CurrentDefaultModel {
+            provider: resolved.provider,
+            account: resolved.account,
+            configured_model: resolved.configured_model,
+            model: resolved.model,
+            config_path,
+        });
+    }
     resolve_current_default_model(&data_dir).map_err(CliError::LanguageModel)
 }
 
@@ -125,6 +142,7 @@ pub(crate) fn models_help() -> Result<(), CliError> {
     let current = current_default_model()?;
     println!("Current default model:");
     println!("  provider: {}", current.provider);
+    println!("  account: {}", current.account);
     println!("  model: {}", current.model);
     println!("  configured model: {}", current.configured_model);
     println!("  config: {}", current.config_path.display());
@@ -168,19 +186,88 @@ pub(crate) fn models_default_with_data_dir(
     options: ModelDefaultOptions,
     data_dir: &SinomoDataDir,
 ) -> Result<(), CliError> {
-    let update = write_default_model_config(data_dir, options.provider, options.model)
-        .map_err(CliError::LanguageModel)?;
+    if !model_config_uses_cluster(data_dir) {
+        let update =
+            write_default_model_config(data_dir, options.provider.clone(), options.model.clone())
+                .map_err(CliError::LanguageModel)?;
+        let mut config = update.config;
+        config.default_account = Some(options.account.clone());
+        let config_path = write_model_config_for_node(data_dir, &config)?;
+        println!(
+            "default provider: {}",
+            config.default_provider.as_deref().unwrap_or("")
+        );
+        println!(
+            "default account: {}",
+            config.default_account.as_deref().unwrap_or("")
+        );
+        println!(
+            "default model: {}",
+            config.default_model.as_deref().unwrap_or("")
+        );
+        println!("config: {}", config_path.display());
+        return Ok(());
+    }
+    let (mut config, _) = load_model_config_for_node(data_dir)?;
+    config.default_provider = Some(options.provider);
+    config.default_account = Some(options.account);
+    config.default_model = Some(options.model);
+    let config_path = write_model_config_for_node(data_dir, &config)?;
 
     println!(
         "default provider: {}",
-        update.config.default_provider.as_deref().unwrap_or("")
+        config.default_provider.as_deref().unwrap_or("")
+    );
+    println!(
+        "default account: {}",
+        config.default_account.as_deref().unwrap_or("")
     );
     println!(
         "default model: {}",
-        update.config.default_model.as_deref().unwrap_or("")
+        config.default_model.as_deref().unwrap_or("")
     );
-    println!("config: {}", update.config_path.display());
+    println!("config: {}", config_path.display());
     Ok(())
+}
+
+pub(crate) fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {
+    network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
+}
+
+pub(crate) fn load_model_config_for_node(
+    data_dir: &SinomoDataDir,
+) -> Result<(ModelConfig, PathBuf), CliError> {
+    if model_config_uses_cluster(data_dir) {
+        let paths = ClusterPaths::new(data_dir);
+        let _ = refresh_cluster_kv_from_local_daemon(&paths);
+        let snapshot = network::read_cluster_kv_snapshot(&paths)?;
+        let config = model_config_from_cluster_kv_snapshot(&snapshot)
+            .map_err(CliError::LanguageModel)?
+            .unwrap_or_default();
+        return Ok((config, paths.kv_snapshot));
+    }
+    let paths = ModelPaths::new(data_dir);
+    Ok((load_model_config(&paths).unwrap_or_default(), paths.config))
+}
+
+pub(crate) fn write_model_config_for_node(
+    data_dir: &SinomoDataDir,
+    config: &ModelConfig,
+) -> Result<PathBuf, CliError> {
+    if model_config_uses_cluster(data_dir) {
+        let paths = ClusterPaths::new(data_dir);
+        paths.ensure()?;
+        let snapshot = network::read_cluster_kv_snapshot(&paths)
+            .unwrap_or_else(|_| InProcessKvStore::new().snapshot());
+        let mut store = InProcessKvStore::restore(snapshot);
+        let txn = model_config_cluster_kv_txn(config).map_err(CliError::LanguageModel)?;
+        store.txn(txn)?;
+        write_cluster_kv_snapshot(&paths, &store.snapshot())?;
+        return Ok(paths.kv_snapshot);
+    }
+    let paths = ModelPaths::new(data_dir);
+    save_model_config(&paths.config, config).map_err(CliError::LanguageModel)?;
+    Ok(paths.config)
 }
 
 pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {

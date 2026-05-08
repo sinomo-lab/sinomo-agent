@@ -311,7 +311,9 @@ impl<M: InteractionModel> InteractionEventHandler for ModelBackedInteractionHand
 #[derive(Clone, Debug)]
 pub struct CliConversationModel {
     provider: String,
+    account: String,
     model: String,
+    model_config: sinomo_lm::ModelConfig,
     data_dir: SinomoDataDir,
 }
 
@@ -322,19 +324,22 @@ impl CliConversationModel {
         let paths = EvolutionPaths::new(&data_dir);
         paths.ensure()?;
         let evolution_config = read_config(&paths).ok();
-        let model_config = load_model_config(&ModelPaths::new(&data_dir)).ok();
+        let (model_config, _) = load_model_config_for_node(&data_dir)?;
         let evolution_model_config =
             evolution_config
                 .as_ref()
                 .map(|config| sinomo_lm::ModelConfig {
                     default_provider: config.default_provider.clone(),
+                    default_account: None,
                     default_model: config.default_model.clone(),
+                    accounts: Vec::new(),
                 });
-        let resolved =
-            resolve_default_model(model_config.as_ref(), evolution_model_config.as_ref())?;
+        let resolved = resolve_default_model(Some(&model_config), evolution_model_config.as_ref())?;
         Ok(Self {
             provider: resolved.provider,
+            account: resolved.account,
             model: resolved.model,
+            model_config,
             data_dir,
         })
     }
@@ -345,10 +350,13 @@ impl InteractionModel for CliConversationModel {
         &self,
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
-        complete_configured_model_request(
+        let account =
+            provider_account_config(&self.model_config, &self.provider, Some(&self.account));
+        complete_configured_model_request_with_account(
             &self.data_dir,
             &self.provider,
             &self.model,
+            account,
             env::current_dir().ok(),
             request,
         )

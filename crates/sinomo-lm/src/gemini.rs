@@ -13,6 +13,7 @@ use std::path::PathBuf;
 pub struct GeminiConfig {
     pub api_base_url: String,
     pub default_model: String,
+    pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
 }
 
@@ -21,6 +22,7 @@ impl Default for GeminiConfig {
         Self {
             api_base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             default_model: "gemini-2.5-flash".to_string(),
+            api_key: None,
             credentials_path: default_api_key_credentials_path(
                 "SINOMO_GEMINI_CREDENTIALS_FILE",
                 GeminiProvider::PROVIDER_ID,
@@ -52,6 +54,7 @@ impl GeminiProvider {
     pub fn api_key(&self) -> Result<String, LanguageModelError> {
         resolve_api_key(
             Self::PROVIDER_ID,
+            &self.config.api_key,
             &self.config.credentials_path,
             &[
                 "SINOMO_GEMINI_API_KEY",

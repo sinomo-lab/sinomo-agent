@@ -13,10 +13,17 @@ struct StoredApiKeyCredential {
 
 pub(crate) fn resolve_api_key(
     provider: &str,
+    configured_api_key: &Option<String>,
     credentials_path: &Option<PathBuf>,
     env_vars: &[&str],
     missing_detail: &str,
 ) -> Result<String, LanguageModelError> {
+    if let Some(api_key) = configured_api_key
+        && !api_key.trim().is_empty()
+    {
+        return Ok(api_key.trim().to_string());
+    }
+
     if let Some(stored) = load_api_key_credential(credentials_path)?
         && !stored.api_key.trim().is_empty()
     {

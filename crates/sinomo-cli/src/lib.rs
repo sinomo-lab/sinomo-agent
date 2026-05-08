@@ -32,14 +32,17 @@ use sinomo_evolution::{
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_PROVIDER_ID, CurrentDefaultModel, GeminiProvider, GitHubCopilotConfig,
-    GitHubCopilotProvider, LanguageModelError, LanguageModelProviderUsage, LanguageModelRequest,
-    LanguageModelResponse, ModelPaths, NvidiaProvider, OpenAiProvider, codex_provider,
-    collect_provider_model_catalogs, collect_provider_usage, complete_configured_model_request,
+    GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY, LanguageModelError,
+    LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse, ModelConfig,
+    ModelPaths, NvidiaProvider, OpenAiProvider, codex_provider, collect_provider_model_catalogs,
+    collect_provider_usage, complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
-    github_copilot_provider, load_model_config, normalize_model_id_for_provider,
-    normalize_model_provider, provider_api_key_from_env, resolve_default_model,
-    save_provider_api_key, subscription_usage_provider_ids, test_provider_credentials,
-    write_default_model_config,
+    github_copilot_provider, load_model_config, model_config_cluster_kv_txn,
+    model_config_from_cluster_kv_snapshot, normalize_model_id_for_provider,
+    normalize_model_provider, normalize_provider_account_name, provider_account_config,
+    provider_api_key_from_env, resolve_default_model, save_model_config, save_provider_api_key,
+    save_provider_api_key_in_model_config, subscription_usage_provider_ids,
+    test_provider_account_credentials, test_provider_credentials, write_default_model_config,
 };
 #[cfg(test)]
 use sinomo_runtime::core::EvolutionJobStatus;
@@ -157,7 +160,7 @@ use sinomo_runtime::dfs::{
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
-use sinomo_runtime::kv::{KvError, KvSnapshot};
+use sinomo_runtime::kv::{InProcessKvStore, KvError, KvSnapshot};
 #[cfg(test)]
 use sinomo_runtime::kv::{KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;

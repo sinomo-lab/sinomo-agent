@@ -648,6 +648,7 @@ fn configured_deliberation_model()
         let provider_client = AnthropicProvider::new(AnthropicConfig {
             api_base_url,
             default_model: model.clone(),
+            api_key: None,
             credentials_path: AnthropicConfig::default().credentials_path,
         });
 
@@ -665,6 +666,7 @@ fn configured_deliberation_model()
         let provider_client = GeminiProvider::new(GeminiConfig {
             api_base_url,
             default_model: model.clone(),
+            api_key: None,
             credentials_path: GeminiConfig::default().credentials_path,
         });
 
@@ -683,6 +685,7 @@ fn configured_deliberation_model()
         let provider_client = OpenAiProvider::new(OpenAiConfig {
             api_base_url,
             default_model: model.clone(),
+            api_key: None,
             credentials_path: OpenAiConfig::default().credentials_path,
         });
 

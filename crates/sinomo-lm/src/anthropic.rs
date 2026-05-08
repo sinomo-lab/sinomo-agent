@@ -13,6 +13,7 @@ use std::path::PathBuf;
 pub struct AnthropicConfig {
     pub api_base_url: String,
     pub default_model: String,
+    pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
 }
 
@@ -21,6 +22,7 @@ impl Default for AnthropicConfig {
         Self {
             api_base_url: "https://api.anthropic.com".to_string(),
             default_model: "claude-sonnet-4-20250514".to_string(),
+            api_key: None,
             credentials_path: default_api_key_credentials_path(
                 "SINOMO_ANTHROPIC_CREDENTIALS_FILE",
                 AnthropicProvider::PROVIDER_ID,
@@ -52,6 +54,7 @@ impl AnthropicProvider {
     pub fn api_key(&self) -> Result<String, LanguageModelError> {
         resolve_api_key(
             Self::PROVIDER_ID,
+            &self.config.api_key,
             &self.config.credentials_path,
             &[
                 "SINOMO_ANTHROPIC_API_KEY",

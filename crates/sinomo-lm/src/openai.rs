@@ -13,6 +13,7 @@ use std::path::PathBuf;
 pub struct OpenAiConfig {
     pub api_base_url: String,
     pub default_model: String,
+    pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
 }
 
@@ -21,6 +22,7 @@ impl Default for OpenAiConfig {
         Self {
             api_base_url: "https://api.openai.com/v1".to_string(),
             default_model: "gpt-5.2-codex".to_string(),
+            api_key: None,
             credentials_path: default_api_key_credentials_path(
                 "SINOMO_OPENAI_CREDENTIALS_FILE",
                 OpenAiProvider::PROVIDER_ID,
@@ -52,6 +54,7 @@ impl OpenAiProvider {
     pub fn api_key(&self) -> Result<String, LanguageModelError> {
         resolve_api_key(
             Self::PROVIDER_ID,
+            &self.config.api_key,
             &self.config.credentials_path,
             &["SINOMO_OPENAI_API_KEY", "OPENAI_API_KEY"],
             "no OpenAI API key found; set OPENAI_API_KEY or run `sinomo providers auth openai`",

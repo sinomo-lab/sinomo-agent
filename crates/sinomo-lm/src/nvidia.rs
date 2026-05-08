@@ -22,6 +22,7 @@ const NVIDIA_MODEL_IDS: &[&str] = &[
 pub struct NvidiaConfig {
     pub api_base_url: String,
     pub default_model: String,
+    pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
 }
 
@@ -30,6 +31,7 @@ impl Default for NvidiaConfig {
         Self {
             api_base_url: "https://integrate.api.nvidia.com/v1".to_string(),
             default_model: NVIDIA_DEFAULT_MODEL.to_string(),
+            api_key: None,
             credentials_path: default_api_key_credentials_path(
                 "SINOMO_NVIDIA_CREDENTIALS_FILE",
                 NvidiaProvider::PROVIDER_ID,
@@ -61,6 +63,7 @@ impl NvidiaProvider {
     pub fn api_key(&self) -> Result<String, LanguageModelError> {
         resolve_api_key(
             Self::PROVIDER_ID,
+            &self.config.api_key,
             &self.config.credentials_path,
             &["SINOMO_NVIDIA_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY"],
             "no NVIDIA API key found; set NVIDIA_API_KEY or run `sinomo providers auth nvidia`",

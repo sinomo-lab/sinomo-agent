@@ -670,13 +670,15 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let config = read_config(&paths).ok();
-    let model_config = load_model_config(&ModelPaths::new(&data_dir)).ok();
+    let (model_config, _) = load_model_config_for_node(&data_dir)?;
     let evolution_model_config = config.as_ref().map(|config| sinomo_lm::ModelConfig {
         default_provider: config.default_provider.clone(),
+        default_account: None,
         default_model: config.default_model.clone(),
+        accounts: Vec::new(),
     });
     let default_model =
-        resolve_default_model(model_config.as_ref(), evolution_model_config.as_ref())?;
+        resolve_default_model(Some(&model_config), evolution_model_config.as_ref())?;
     let repo = if let Some(repo) = options
         .repo
         .clone()

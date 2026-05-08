@@ -10,11 +10,17 @@ pub(super) enum ProviderName {
     Nvidia,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ProviderCliCommand {
     Help,
-    Auth(ProviderName),
-    Test(ProviderName),
+    Auth(ProviderCommandOptions),
+    Test(ProviderCommandOptions),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProviderCommandOptions {
+    pub(super) provider: ProviderName,
+    pub(super) account: String,
 }
 
 pub(super) fn parse_provider_command(args: &[String]) -> Result<ProviderCliCommand, CliError> {
@@ -26,7 +32,7 @@ pub(super) fn parse_provider_command(args: &[String]) -> Result<ProviderCliComma
         _ => {}
     }
 
-    let [action, provider] = args else {
+    let [action, provider, rest @ ..] = args else {
         return Err(CliError::Usage);
     };
 
@@ -48,9 +54,16 @@ pub(super) fn parse_provider_command(args: &[String]) -> Result<ProviderCliComma
         }
     };
 
+    let account = match rest {
+        [] => normalize_provider_account_name(None),
+        [flag, account] if flag == "--account" => normalize_provider_account_name(Some(account)),
+        _ => return Err(CliError::Usage),
+    };
+    let options = ProviderCommandOptions { provider, account };
+
     match action.as_str() {
-        "auth" => Ok(ProviderCliCommand::Auth(provider)),
-        "test" => Ok(ProviderCliCommand::Test(provider)),
+        "auth" => Ok(ProviderCliCommand::Auth(options)),
+        "test" => Ok(ProviderCliCommand::Test(options)),
         _ => unreachable!("provider action was checked before provider parsing"),
     }
 }
@@ -61,18 +74,42 @@ pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), Cl
             print_providers_help();
             Ok(())
         }
-        ProviderCliCommand::Auth(ProviderName::GitHubCopilot) => auth_github_copilot(),
-        ProviderCliCommand::Test(ProviderName::GitHubCopilot) => test_github_copilot(),
-        ProviderCliCommand::Auth(ProviderName::Codex) => auth_codex(),
-        ProviderCliCommand::Test(ProviderName::Codex) => test_codex(),
-        ProviderCliCommand::Auth(ProviderName::Anthropic) => auth_anthropic(),
-        ProviderCliCommand::Test(ProviderName::Anthropic) => test_anthropic(),
-        ProviderCliCommand::Auth(ProviderName::OpenAi) => auth_openai(),
-        ProviderCliCommand::Test(ProviderName::OpenAi) => test_openai(),
-        ProviderCliCommand::Auth(ProviderName::Gemini) => auth_gemini(),
-        ProviderCliCommand::Test(ProviderName::Gemini) => test_gemini(),
-        ProviderCliCommand::Auth(ProviderName::Nvidia) => auth_nvidia(),
-        ProviderCliCommand::Test(ProviderName::Nvidia) => test_nvidia(),
+        ProviderCliCommand::Auth(options) => match options.provider {
+            ProviderName::GitHubCopilot => auth_github_copilot(),
+            ProviderName::Codex => auth_codex(),
+            ProviderName::Anthropic => auth_api_key_provider(
+                "Anthropic",
+                AnthropicProvider::PROVIDER_ID,
+                &options.account,
+            ),
+            ProviderName::OpenAi => {
+                auth_api_key_provider("OpenAI", OpenAiProvider::PROVIDER_ID, &options.account)
+            }
+            ProviderName::Gemini => {
+                auth_api_key_provider("Gemini", GeminiProvider::PROVIDER_ID, &options.account)
+            }
+            ProviderName::Nvidia => {
+                auth_api_key_provider("NVIDIA", NvidiaProvider::PROVIDER_ID, &options.account)
+            }
+        },
+        ProviderCliCommand::Test(options) => match options.provider {
+            ProviderName::GitHubCopilot => test_github_copilot(),
+            ProviderName::Codex => test_codex(),
+            ProviderName::Anthropic => test_api_key_provider(
+                "Anthropic",
+                AnthropicProvider::PROVIDER_ID,
+                &options.account,
+            ),
+            ProviderName::OpenAi => {
+                test_api_key_provider("OpenAI", OpenAiProvider::PROVIDER_ID, &options.account)
+            }
+            ProviderName::Gemini => {
+                test_api_key_provider("Gemini", GeminiProvider::PROVIDER_ID, &options.account)
+            }
+            ProviderName::Nvidia => {
+                test_api_key_provider("NVIDIA", NvidiaProvider::PROVIDER_ID, &options.account)
+            }
+        },
     }
 }
 
@@ -273,6 +310,77 @@ pub fn test_nvidia() -> Result<(), CliError> {
     );
     println!("NVIDIA API key: ok");
     println!("NVIDIA provider connection: ok");
+    Ok(())
+}
+
+fn auth_api_key_provider(
+    provider_name: &str,
+    provider_id: &str,
+    account: &str,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let (api_key, source) = api_key_from_env_or_prompt(provider_name, provider_id)?;
+    if model_config_uses_cluster(&data_dir) {
+        let (mut config, _) = load_model_config_for_node(&data_dir)?;
+        let account_info = save_provider_api_key_in_model_config(
+            &mut config,
+            provider_id,
+            Some(account),
+            &api_key,
+        )?;
+        let config_path = write_model_config_for_node(&data_dir, &config)?;
+        println!("Testing {provider_name} provider connection...");
+        let account_config = provider_account_config(&config, provider_id, Some(account));
+        test_provider_account_credentials(provider_id, account_config)?;
+        println!(
+            "{provider_name} account `{}` saved to cluster KV at {} ({})",
+            account_info.account,
+            config_path.display(),
+            LM_PROVIDER_CONFIG_KV_KEY
+        );
+        return Ok(());
+    }
+    let result = save_provider_api_key(provider_id, &api_key, &source)?;
+    println!("Testing {provider_name} provider connection...");
+    test_provider_credentials(provider_id)?;
+    println!(
+        "{provider_name} account `{account}` credentials saved to {}",
+        result.credentials_path.display()
+    );
+    Ok(())
+}
+
+fn test_api_key_provider(
+    provider_name: &str,
+    provider_id: &str,
+    account: &str,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    if model_config_uses_cluster(&data_dir) {
+        let (config, config_path) = load_model_config_for_node(&data_dir)?;
+        let account_config = provider_account_config(&config, provider_id, Some(account))
+            .ok_or_else(|| CliError::AuthProvider {
+                detail: format!(
+                    "{provider_name} account `{account}` is not configured in cluster KV"
+                ),
+            })?;
+        println!(
+            "Testing {provider_name} account `{account}` from {} ({})",
+            config_path.display(),
+            LM_PROVIDER_CONFIG_KV_KEY
+        );
+        test_provider_account_credentials(provider_id, Some(account_config))?;
+        println!("{provider_name} API key: ok");
+        println!("{provider_name} provider connection: ok");
+        return Ok(());
+    }
+    let result = test_provider_credentials(provider_id)?;
+    println!(
+        "Testing {provider_name} account `{account}` credentials at {}",
+        result.credentials_path.display()
+    );
+    println!("{provider_name} API key: ok");
+    println!("{provider_name} provider connection: ok");
     Ok(())
 }
 

@@ -38,6 +38,7 @@ pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_n
 pub use openai::{OpenAiConfig, OpenAiProvider};
 
 use serde::{Deserialize, Serialize};
+use sinomo_runtime::kv::{KvEntry, KvOp, KvSnapshot, KvTxn, decode_kv_value};
 use sinomo_runtime::local::SinomoDataDir;
 use std::env;
 use std::fs;
@@ -157,7 +158,86 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<ProviderAccountConfig>,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            default_provider: None,
+            default_account: None,
+            default_model: None,
+            accounts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ProviderAccountConfig {
+    pub provider: String,
+    #[serde(default = "default_provider_account_name")]
+    pub account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default = "provider_account_enabled_default")]
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ProviderAccountInfo {
+    pub provider: String,
+    pub account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    pub has_api_key: bool,
+    pub enabled: bool,
+}
+
+pub const DEFAULT_PROVIDER_ACCOUNT: &str = "default";
+pub const LM_PROVIDER_CONFIG_KV_KEY: &str = "/config/lm/providers";
+
+fn default_provider_account_name() -> String {
+    DEFAULT_PROVIDER_ACCOUNT.to_string()
+}
+
+fn provider_account_enabled_default() -> bool {
+    true
+}
+
+pub fn normalize_provider_account_name(account: Option<&str>) -> String {
+    account
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_PROVIDER_ACCOUNT)
+        .to_string()
+}
+
+pub fn provider_accounts(config: &ModelConfig) -> Vec<ProviderAccountInfo> {
+    config
+        .accounts
+        .iter()
+        .map(|account| ProviderAccountInfo {
+            provider: account.provider.clone(),
+            account: normalize_provider_account_name(Some(&account.account)),
+            default_model: account.default_model.clone(),
+            api_base_url: account.api_base_url.clone(),
+            has_api_key: account
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()),
+            enabled: account.enabled,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +266,7 @@ impl ModelPaths {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CurrentDefaultModel {
     pub provider: String,
+    pub account: String,
     pub configured_model: String,
     pub model: String,
     pub config_path: PathBuf,
@@ -194,6 +275,7 @@ pub struct CurrentDefaultModel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedDefaultModel {
     pub provider: String,
+    pub account: String,
     pub configured_model: String,
     pub model: String,
 }
@@ -224,6 +306,49 @@ pub fn load_model_config(paths: &ModelPaths) -> Result<ModelConfig, LanguageMode
     })
 }
 
+pub fn model_config_from_cluster_kv_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Option<ModelConfig>, LanguageModelError> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == LM_PROVIDER_CONFIG_KV_KEY)
+        .map(decode_model_config_entry)
+        .transpose()
+}
+
+pub fn model_config_from_cluster_kv_entries(
+    entries: &[KvEntry],
+) -> Result<Option<ModelConfig>, LanguageModelError> {
+    entries
+        .iter()
+        .find(|entry| entry.key == LM_PROVIDER_CONFIG_KV_KEY)
+        .map(decode_model_config_entry)
+        .transpose()
+}
+
+fn decode_model_config_entry(entry: &KvEntry) -> Result<ModelConfig, LanguageModelError> {
+    decode_kv_value(&entry.value).map_err(|source| LanguageModelError::ConfigStore {
+        path: LM_PROVIDER_CONFIG_KV_KEY.to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub fn model_config_cluster_kv_txn(config: &ModelConfig) -> Result<KvTxn, LanguageModelError> {
+    Ok(KvTxn {
+        compares: Vec::new(),
+        success: vec![
+            KvOp::put_serde(LM_PROVIDER_CONFIG_KV_KEY, config, None).map_err(|source| {
+                LanguageModelError::ConfigStore {
+                    path: LM_PROVIDER_CONFIG_KV_KEY.to_string(),
+                    detail: source.to_string(),
+                }
+            })?,
+        ],
+        failure: Vec::new(),
+    })
+}
+
 pub fn save_model_config(path: &Path, value: &ModelConfig) -> Result<(), LanguageModelError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| LanguageModelError::ConfigStore {
@@ -250,6 +375,7 @@ pub fn current_default_model(
     let resolved = resolve_default_model(model_config.as_ref(), None)?;
     Ok(CurrentDefaultModel {
         provider: resolved.provider,
+        account: resolved.account,
         configured_model: resolved.configured_model,
         model: resolved.model,
         config_path: model_paths.config,
@@ -271,13 +397,24 @@ pub fn resolve_default_model(
             detail: format!("unknown provider `{provider}`"),
         }
     })?;
+    let account = normalize_provider_account_name(
+        model_config
+            .and_then(|config| config.default_account.as_deref())
+            .or_else(|| fallback_config.and_then(|config| config.default_account.as_deref())),
+    );
     let configured_model = model_config
         .and_then(|config| config.default_model.clone())
         .or_else(|| fallback_config.and_then(|config| config.default_model.clone()))
+        .or_else(|| {
+            model_config
+                .and_then(|config| provider_account_config(config, &provider, Some(&account)))
+                .and_then(|account| account.default_model.clone())
+        })
         .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
     let model = effective_model_name(&provider, &configured_model);
     Ok(ResolvedDefaultModel {
         provider,
+        account,
         configured_model,
         model,
     })
@@ -298,12 +435,58 @@ pub fn write_default_model_config(
     model_paths.ensure()?;
     let config = ModelConfig {
         default_provider: Some(provider.into()),
+        default_account: Some(DEFAULT_PROVIDER_ACCOUNT.to_string()),
         default_model: Some(model.into()),
+        accounts: Vec::new(),
     };
     save_model_config(&model_paths.config, &config)?;
     Ok(DefaultModelConfigUpdate {
         config,
         config_path: model_paths.config,
+    })
+}
+
+pub fn upsert_provider_account_config(
+    config: &mut ModelConfig,
+    account: ProviderAccountConfig,
+) -> Result<(), LanguageModelError> {
+    let provider = normalize_model_provider(&account.provider).ok_or_else(|| {
+        LanguageModelError::ProviderInvocationFailed {
+            provider: account.provider.clone(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: format!("unknown provider `{}`", account.provider),
+        }
+    })?;
+    let mut account = ProviderAccountConfig {
+        provider,
+        account: normalize_provider_account_name(Some(&account.account)),
+        enabled: true,
+        ..account
+    };
+    account.default_model = account
+        .default_model
+        .map(|model| normalize_model_id_for_provider(&account.provider, &model));
+    if let Some(existing) = config.accounts.iter_mut().find(|existing| {
+        existing.provider == account.provider
+            && normalize_provider_account_name(Some(&existing.account)) == account.account
+    }) {
+        *existing = account;
+    } else {
+        config.accounts.push(account);
+    }
+    Ok(())
+}
+
+pub fn provider_account_config<'a>(
+    config: &'a ModelConfig,
+    provider: &str,
+    account: Option<&str>,
+) -> Option<&'a ProviderAccountConfig> {
+    let account = normalize_provider_account_name(account);
+    config.accounts.iter().find(|candidate| {
+        candidate.provider == provider
+            && normalize_provider_account_name(Some(&candidate.account)) == account
+            && candidate.enabled
     })
 }
 
@@ -473,6 +656,24 @@ pub fn complete_configured_model_request(
     working_dir: Option<PathBuf>,
     request: &LanguageModelRequest,
 ) -> Result<LanguageModelResponse, LanguageModelError> {
+    complete_configured_model_request_with_account(
+        data_dir,
+        provider,
+        model,
+        None,
+        working_dir,
+        request,
+    )
+}
+
+pub fn complete_configured_model_request_with_account(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    model: &str,
+    account: Option<&ProviderAccountConfig>,
+    working_dir: Option<PathBuf>,
+    request: &LanguageModelRequest,
+) -> Result<LanguageModelResponse, LanguageModelError> {
     let request = LanguageModelRequest {
         provider: provider.to_string(),
         model: model.to_string(),
@@ -524,38 +725,66 @@ pub fn complete_configured_model_request(
         AnthropicProvider::PROVIDER_ID => {
             let credentials_path =
                 data_dir.provider_credentials_file(AnthropicProvider::PROVIDER_ID);
+            let default_config = AnthropicConfig::default();
             let provider = AnthropicProvider::new(AnthropicConfig {
-                default_model: model_or_default(model, AnthropicConfig::default().default_model),
-                credentials_path: Some(credentials_path),
-                ..AnthropicConfig::default()
+                api_base_url: account
+                    .and_then(|account| account.api_base_url.clone())
+                    .unwrap_or(default_config.api_base_url),
+                default_model: model_or_default(model, default_config.default_model),
+                api_key: account.and_then(|account| account.api_key.clone()),
+                credentials_path: account
+                    .and_then(|account| account.api_key.as_ref())
+                    .map(|_| None)
+                    .unwrap_or(Some(credentials_path)),
             });
             provider.complete(&request)
         }
         OpenAiProvider::PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
+            let default_config = OpenAiConfig::default();
             let provider = OpenAiProvider::new(OpenAiConfig {
-                default_model: model_or_default(model, OpenAiConfig::default().default_model),
-                credentials_path: Some(credentials_path),
-                ..OpenAiConfig::default()
+                api_base_url: account
+                    .and_then(|account| account.api_base_url.clone())
+                    .unwrap_or(default_config.api_base_url),
+                default_model: model_or_default(model, default_config.default_model),
+                api_key: account.and_then(|account| account.api_key.clone()),
+                credentials_path: account
+                    .and_then(|account| account.api_key.as_ref())
+                    .map(|_| None)
+                    .unwrap_or(Some(credentials_path)),
             });
             provider.complete(&request)
         }
         GeminiProvider::PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
+            let default_config = GeminiConfig::default();
             let provider = GeminiProvider::new(GeminiConfig {
-                default_model: model_or_default(model, GeminiConfig::default().default_model),
-                credentials_path: Some(credentials_path),
-                ..GeminiConfig::default()
+                api_base_url: account
+                    .and_then(|account| account.api_base_url.clone())
+                    .unwrap_or(default_config.api_base_url),
+                default_model: model_or_default(model, default_config.default_model),
+                api_key: account.and_then(|account| account.api_key.clone()),
+                credentials_path: account
+                    .and_then(|account| account.api_key.as_ref())
+                    .map(|_| None)
+                    .unwrap_or(Some(credentials_path)),
             });
             provider.complete(&request)
         }
         NvidiaProvider::PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
+            let default_config = NvidiaConfig::default();
             let provider = NvidiaProvider::new(NvidiaConfig {
                 api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
-                    .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
-                default_model: model_or_default(model, NvidiaConfig::default().default_model),
-                credentials_path: Some(credentials_path),
+                    .ok()
+                    .or_else(|| account.and_then(|account| account.api_base_url.clone()))
+                    .unwrap_or(default_config.api_base_url),
+                default_model: model_or_default(model, default_config.default_model),
+                api_key: account.and_then(|account| account.api_key.clone()),
+                credentials_path: account
+                    .and_then(|account| account.api_key.as_ref())
+                    .map(|_| None)
+                    .unwrap_or(Some(credentials_path)),
             });
             provider.complete(&request)
         }
@@ -609,6 +838,7 @@ pub fn anthropic_provider() -> Result<(AnthropicProvider, PathBuf), LanguageMode
             .or_else(|_| env::var("SINOMO_CLAUDE_API_BASE_URL"))
             .unwrap_or_else(|_| AnthropicConfig::default().api_base_url),
         default_model: AnthropicConfig::default().default_model,
+        api_key: None,
         credentials_path: Some(credentials_path.clone()),
     });
     Ok((provider, credentials_path))
@@ -621,6 +851,7 @@ pub fn openai_provider() -> Result<(OpenAiProvider, PathBuf), LanguageModelError
         api_base_url: env::var("SINOMO_OPENAI_API_BASE_URL")
             .unwrap_or_else(|_| OpenAiConfig::default().api_base_url),
         default_model: OpenAiConfig::default().default_model,
+        api_key: None,
         credentials_path: Some(credentials_path.clone()),
     });
     Ok((provider, credentials_path))
@@ -633,6 +864,7 @@ pub fn gemini_provider() -> Result<(GeminiProvider, PathBuf), LanguageModelError
         api_base_url: env::var("SINOMO_GEMINI_API_BASE_URL")
             .unwrap_or_else(|_| GeminiConfig::default().api_base_url),
         default_model: GeminiConfig::default().default_model,
+        api_key: None,
         credentials_path: Some(credentials_path.clone()),
     });
     Ok((provider, credentials_path))
@@ -645,6 +877,7 @@ pub fn nvidia_provider() -> Result<(NvidiaProvider, PathBuf), LanguageModelError
         api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
             .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
         default_model: NvidiaConfig::default().default_model,
+        api_key: None,
         credentials_path: Some(credentials_path.clone()),
     });
     Ok((provider, credentials_path))
@@ -761,6 +994,48 @@ pub fn save_provider_api_key(
     }
 }
 
+pub fn save_provider_api_key_in_model_config(
+    config: &mut ModelConfig,
+    provider: &str,
+    account: Option<&str>,
+    api_key: &str,
+) -> Result<ProviderAccountInfo, LanguageModelError> {
+    let provider = normalize_model_provider(provider).ok_or_else(|| {
+        LanguageModelError::ProviderInvocationFailed {
+            provider: provider.to_string(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: format!("unknown provider `{provider}`"),
+        }
+    })?;
+    if provider_api_key_env_vars(&provider).is_none() {
+        return Err(LanguageModelError::ProviderInvocationFailed {
+            provider,
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: "provider does not support API-key credential storage".to_string(),
+        });
+    }
+    let account = normalize_provider_account_name(account);
+    let default_model = provider_account_config(config, &provider, Some(&account))
+        .and_then(|existing| existing.default_model.clone())
+        .unwrap_or_else(|| effective_model_name(&provider, PROVIDER_DEFAULT_MODEL));
+    upsert_provider_account_config(
+        config,
+        ProviderAccountConfig {
+            provider: provider.clone(),
+            account: account.clone(),
+            default_model: Some(default_model),
+            api_base_url: provider_account_config(config, &provider, Some(&account))
+                .and_then(|existing| existing.api_base_url.clone()),
+            api_key: Some(api_key.trim().to_string()),
+            enabled: true,
+        },
+    )?;
+    Ok(provider_accounts(config)
+        .into_iter()
+        .find(|candidate| candidate.provider == provider && candidate.account == account)
+        .expect("upserted account is present"))
+}
+
 pub fn provider_api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
     match provider {
         AnthropicProvider::PROVIDER_ID => Some(&[
@@ -859,6 +1134,36 @@ pub fn test_provider_credentials(
             detail: "unknown language model provider".to_string(),
         }),
     }
+}
+
+pub fn test_provider_account_credentials(
+    provider: &str,
+    account: Option<&ProviderAccountConfig>,
+) -> Result<(), LanguageModelError> {
+    let model = account
+        .and_then(|account| account.default_model.as_deref())
+        .unwrap_or(PROVIDER_DEFAULT_MODEL);
+    let data_dir =
+        SinomoDataDir::from_env_or_home().map_err(|source| LanguageModelError::ConfigStore {
+            path: "<data-dir>".to_string(),
+            detail: source.to_string(),
+        })?;
+    let request = LanguageModelRequest {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        messages: vec![LanguageModelMessage {
+            role: LanguageModelRole::User,
+            content: "Reply with ok.".to_string(),
+        }],
+        temperature: None,
+        max_output_tokens: Some(8),
+        response_format: LanguageModelResponseFormat::Text,
+        metadata: serde_json::Value::Null,
+    };
+    complete_configured_model_request_with_account(
+        &data_dir, provider, model, account, None, &request,
+    )
+    .map(|_| ())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1137,10 +1442,12 @@ mod tests {
         let model_config = ModelConfig {
             default_provider: Some("openai".to_string()),
             default_model: Some("gpt-5.5".to_string()),
+            ..ModelConfig::default()
         };
         let fallback_config = ModelConfig {
             default_provider: Some("gemini".to_string()),
             default_model: Some("gemini-2.5-pro".to_string()),
+            ..ModelConfig::default()
         };
 
         let resolved =
@@ -1156,6 +1463,7 @@ mod tests {
         let fallback_config = ModelConfig {
             default_provider: Some("nvidia".to_string()),
             default_model: None,
+            ..ModelConfig::default()
         };
 
         let resolved = resolve_default_model(None, Some(&fallback_config)).expect("defaults");

@@ -4175,6 +4175,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                         &self.model,
                         NvidiaConfig::default().default_model,
                     ),
+                    api_key: None,
                     credentials_path: Some(credentials_path),
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
