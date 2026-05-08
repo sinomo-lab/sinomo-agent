@@ -256,9 +256,8 @@ where
     let mut supervised_main: Option<Child> = None;
     let mut main_restart_suppressed = false;
     let mut pending_rollout: Option<ShadowMainRolloutMonitor> = None;
-    let main_probe_interval = Duration::from_secs(10);
     let shadow_idle_interval = Duration::from_millis(100);
-    let mut last_main_probe = Instant::now() - main_probe_interval;
+    let mut last_main_probe = Instant::now() - shadow_main_probe_interval(false);
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
 
     loop {
@@ -278,6 +277,7 @@ where
             }
         }
 
+        let main_probe_interval = shadow_main_probe_interval(pending_rollout.is_some());
         if now.duration_since(last_main_probe) >= main_probe_interval {
             main_probe_status = probe_daemon_status(&main_paths, probe_timeout);
             last_main_probe = now;
@@ -329,7 +329,7 @@ where
                     supervised_main = Some(child);
                     pending_rollout = Some(monitor);
                     main_probe_status = DaemonProbeStatus::NotRunning;
-                    last_main_probe = Instant::now() - main_probe_interval;
+                    last_main_probe = Instant::now() - shadow_main_probe_interval(true);
                 }
                 ShadowMainStart::Recovered {
                     child,
@@ -453,6 +453,14 @@ pub fn rollout_target_platform_matches_local(status: &DaemonStatus) -> Option<bo
             Some(target_os == env::consts::OS && target_arch == env::consts::ARCH)
         }
         _ => None,
+    }
+}
+
+fn shadow_main_probe_interval(pending_rollout: bool) -> Duration {
+    if pending_rollout {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(10)
     }
 }
 
@@ -1213,6 +1221,12 @@ mod tests {
             true,
             Some(true)
         ));
+    }
+
+    #[test]
+    fn pending_shadow_rollout_uses_fast_main_health_probe() {
+        assert!(shadow_main_probe_interval(true) < Duration::from_secs(1));
+        assert!(shadow_main_probe_interval(false) >= Duration::from_secs(10));
     }
 
     #[test]

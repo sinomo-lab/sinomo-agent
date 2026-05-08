@@ -41,6 +41,10 @@ pub fn send_daemon_rpc_to_endpoint(
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
+    let timeout = match endpoint.transport {
+        ClusterTransportKind::Iroh => timeout.max(Duration::from_secs(5)),
+        _ => timeout,
+    };
     sinomo_network::send_daemon_rpc_to_cluster_endpoint(
         endpoint,
         &daemon_rpc_command(&request.route),
@@ -368,6 +372,20 @@ pub fn send_daemon_rollout_binary(
     response.decode_body().map_err(DaemonError::from)
 }
 
+pub fn send_daemon_rollout_binary_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterRolloutBinaryRequest,
+    timeout: Duration,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        sinomo_network::ROLLOUT_BINARY_ROUTE,
+        sinomo_network::ROLLOUT_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
 pub fn send_daemon_rollout_build(
     address: &str,
     request: &ClusterRolloutBuildRequest,
@@ -379,6 +397,20 @@ pub fn send_daemon_rollout_build(
         request,
     )?;
     let response = send_daemon_rpc(address, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn send_daemon_rollout_build_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterRolloutBuildRequest,
+    timeout: Duration,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        sinomo_network::ROLLOUT_BUILD_ROUTE,
+        sinomo_network::ROLLOUT_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 

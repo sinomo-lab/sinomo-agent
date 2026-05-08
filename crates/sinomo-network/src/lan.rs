@@ -63,6 +63,84 @@ pub fn discover_default_lan_ip_candidates() -> Vec<IpAddr> {
     discover_local_ip_candidates_for_targets(targets)
 }
 
+pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
+    discover_public_ip_candidates_from_hosts(&[("api.ipify.org", "/"), ("ifconfig.me", "/ip")])
+}
+
+pub fn discover_public_ip_candidates_from_hosts(hosts: &[(&str, &str)]) -> Vec<IpAddr> {
+    let mut candidates = Vec::new();
+    if std::env::var("SINOMO_DISABLE_PUBLIC_IP_DISCOVERY")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return candidates;
+    }
+    for (host, path) in hosts {
+        let Some(address) = resolve_public_ip_service_address(host, Duration::from_millis(750))
+        else {
+            continue;
+        };
+        let Ok(mut stream) =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(750))
+        else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(750)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(750)));
+        let request = format!(
+            "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: sinomo-public-ip-discovery/0.1\r\nConnection: close\r\n\r\n"
+        );
+        if std::io::Write::write_all(&mut stream, request.as_bytes()).is_err() {
+            continue;
+        }
+        let mut response = String::new();
+        if std::io::Read::read_to_string(&mut stream, &mut response).is_err() {
+            continue;
+        }
+        let body = response.rsplit("\r\n\r\n").next().unwrap_or(&response);
+        for token in body
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '"' | '\''))
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let Ok(ip) = token.parse::<IpAddr>() else {
+                continue;
+            };
+            if is_invitable_ip(ip) && !is_private_or_link_local_ip(ip) && !candidates.contains(&ip)
+            {
+                candidates.push(ip);
+            }
+        }
+    }
+    candidates
+}
+
+fn resolve_public_ip_service_address(host: &str, timeout: Duration) -> Option<SocketAddr> {
+    let host = host.to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let address = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), 80))
+            .ok()
+            .and_then(|mut addresses| addresses.next());
+        let _ = sender.send(address);
+    });
+    receiver.recv_timeout(timeout).ok().flatten()
+}
+
+pub fn is_private_or_link_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private() || ip.is_link_local() || ip.is_broadcast() || ip.is_documentation()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || matches!(ip.segments(), [0x2001, 0x0db8, _, _, _, _, _, _])
+        }
+    }
+}
+
 pub fn discover_local_ip_candidates_for_targets<I>(targets: I) -> Vec<IpAddr>
 where
     I: IntoIterator<Item = SocketAddr>,

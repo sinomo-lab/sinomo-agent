@@ -24,7 +24,8 @@ pub use client::{
     send_cluster_join_registration_to_endpoint, send_cluster_kv_txn, send_cluster_kv_watch_events,
     send_cluster_member_publish, send_cluster_raft_append, send_cluster_raft_vote,
     send_daemon_finalize_shadow_rollout_request, send_daemon_rollout_binary,
-    send_daemon_rollout_build, send_daemon_rollout_diagnostics, send_daemon_rpc,
+    send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_build,
+    send_daemon_rollout_build_to_endpoint, send_daemon_rollout_diagnostics, send_daemon_rpc,
     send_daemon_rpc_to_endpoint, send_daemon_shutdown_request,
 };
 pub use cluster::{

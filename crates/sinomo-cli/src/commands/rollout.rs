@@ -42,6 +42,32 @@ impl Default for RolloutOptions {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct RolloutTarget {
+    pub(crate) address: String,
+    pub(crate) endpoint: Option<ClusterEndpointRecord>,
+}
+
+impl RolloutTarget {
+    pub(crate) fn address(address: String) -> Self {
+        Self {
+            address,
+            endpoint: None,
+        }
+    }
+
+    pub(crate) fn endpoint(endpoint: ClusterEndpointRecord) -> Self {
+        Self {
+            address: endpoint.address.clone(),
+            endpoint: Some(endpoint),
+        }
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.address
+    }
+}
+
 pub(crate) fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand, CliError> {
     match args.split_first() {
         None => Ok(RolloutCliCommand::Help),
@@ -383,13 +409,13 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         let target_status = match read_rollout_target_status(&target) {
             Ok(status) => status,
             Err(error) => {
-                println!("{target}: failed: {error}");
+                println!("{}: failed: {error}", target.label());
                 continue;
             }
         };
         let platform_match = rollout_target_platform_matches_local(&target_status);
         let use_remote_build = daemon_cluster_rollout_should_use_remote_build(
-            &target,
+            target.label(),
             options.remote_build,
             options.binary.is_some(),
             platform_match,
@@ -414,28 +440,30 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                             request.source_head.as_deref().unwrap_or_default(),
                         );
                     if source_head_mismatch {
-                        println!("{target}: rejected");
+                        println!("{}: rejected", target.label());
                         println!(
                             "  remote build did not acknowledge requested source head {}; target reported {}",
                             request.source_head.as_deref().unwrap_or("unknown"),
                             response.source_head.as_deref().unwrap_or("unknown")
                         );
                     } else {
-                        println!("{target}: {}", response.status);
+                        println!("{}: {}", target.label(), response.status);
                     }
                     if !response.detail.is_empty() {
                         println!("  {}", response.detail);
                     }
                 }
                 Err(error) => {
-                    println!("{target}: failed: {error}");
+                    println!("{}: failed: {error}", target.label());
                 }
             }
             continue;
         }
 
-        if let Err(error) = ensure_rollout_target_platform_from_status(&target, &target_status) {
-            println!("{target}: skipped: {error}");
+        if let Err(error) =
+            ensure_rollout_target_platform_from_status(target.label(), &target_status)
+        {
+            println!("{}: skipped: {error}", target.label());
             continue;
         }
         if binary_request.is_none() {
@@ -453,12 +481,12 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         let request = binary_request.as_ref().expect("binary rollout request");
         match send_daemon_rollout_binary(&target, request) {
             Ok(response) => {
-                println!("{target}: {}", response.status);
+                println!("{}: {}", target.label(), response.status);
                 if !response.detail.is_empty() {
                     println!("  {}", response.detail);
                 }
             }
-            Err(error) => println!("{target}: failed: {error}"),
+            Err(error) => println!("{}: failed: {error}", target.label()),
         }
     }
     Ok(())
@@ -489,7 +517,9 @@ pub(crate) fn rollout_source_repo_from_options(
     })
 }
 
-pub(crate) fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<String>, CliError> {
+pub(crate) fn rollout_cluster_targets(
+    options: &RolloutOptions,
+) -> Result<Vec<RolloutTarget>, CliError> {
     let local_target = if options.targets.is_empty() && !options.skip_local {
         if let Some(status) = default_main_daemon_status()? {
             Some(status.address)
@@ -504,15 +534,83 @@ pub(crate) fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<St
     } else {
         None
     };
-    Ok(prepare_rollout_cluster_targets(
-        options.targets.clone(),
-        local_target,
-        state.as_ref(),
-    ))
+    if !options.targets.is_empty() {
+        let mut targets = Vec::new();
+        for address in options.targets.iter().cloned() {
+            let target = if address.starts_with("iroh://") {
+                RolloutTarget::endpoint(network::invite_introducer_endpoint(
+                    &NodeId::from_legacy_named("node_rollout_explicit_target")
+                        .expect("static rollout target node id"),
+                    address,
+                ))
+            } else {
+                RolloutTarget::address(address)
+            };
+            push_unique_rollout_target(&mut targets, target);
+        }
+        return Ok(targets);
+    }
+    if let Some(state) = state.as_ref() {
+        let mut targets = Vec::new();
+        if let Some(local_target) = local_target {
+            push_unique_rollout_target(&mut targets, RolloutTarget::address(local_target));
+        }
+        let data_dir = SinomoDataDir::from_env_or_home()?;
+        let paths = ClusterPaths::new(&data_dir);
+        let sync_targets = network::cluster_sync_targets_with_connectivity(&paths, state);
+        let mut selected_remote_nodes = std::collections::BTreeSet::new();
+        for endpoint in sync_targets {
+            if endpoint.node_id == state.local_node_id
+                || endpoint.privacy == sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
+            {
+                continue;
+            }
+            let Some(member) = state
+                .members
+                .iter()
+                .find(|member| member.node_id == endpoint.node_id)
+            else {
+                continue;
+            };
+            let is_main_daemon = member
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == "daemon.main.run");
+            if !is_main_daemon || !selected_remote_nodes.insert(endpoint.node_id.clone()) {
+                continue;
+            }
+            push_unique_rollout_target(&mut targets, RolloutTarget::endpoint(endpoint));
+        }
+        return Ok(targets);
+    }
+    Ok(
+        prepare_rollout_cluster_targets(Vec::new(), local_target, None)
+            .into_iter()
+            .map(RolloutTarget::address)
+            .fold(Vec::new(), |mut targets, target| {
+                push_unique_rollout_target(&mut targets, target);
+                targets
+            }),
+    )
 }
 
-pub(crate) fn read_rollout_target_status(address: &str) -> Result<DaemonStatus, CliError> {
-    daemon_fetch_daemon_status_from_address(address, DAEMON_JOIN_TIMEOUT).map_err(Into::into)
+fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {
+    if !targets
+        .iter()
+        .any(|candidate| candidate.address == target.address)
+    {
+        targets.push(target);
+    }
+}
+
+pub(crate) fn read_rollout_target_status(target: &RolloutTarget) -> Result<DaemonStatus, CliError> {
+    if let Some(endpoint) = &target.endpoint {
+        sinomo_runtime::daemon::fetch_daemon_status_from_endpoint(endpoint, DAEMON_JOIN_TIMEOUT)
+            .map_err(Into::into)
+    } else {
+        daemon_fetch_daemon_status_from_address(&target.address, DAEMON_JOIN_TIMEOUT)
+            .map_err(Into::into)
+    }
 }
 
 pub(crate) fn rollout_target_platform_matches_local(status: &DaemonStatus) -> Option<bool> {
@@ -527,17 +625,41 @@ pub(crate) fn ensure_rollout_target_platform_from_status(
 }
 
 pub(crate) fn send_daemon_rollout_binary(
-    address: &str,
+    target: &RolloutTarget,
     request: &ClusterRolloutBinaryRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    daemon_send_daemon_rollout_binary(address, request, DAEMON_ROLLOUT_TIMEOUT).map_err(Into::into)
+    if let Some(endpoint) = &target.endpoint {
+        daemon_send_daemon_rollout_binary_to_endpoint(endpoint, request, DAEMON_ROLLOUT_TIMEOUT)
+            .map_err(Into::into)
+    } else {
+        daemon_send_daemon_rollout_binary(&target.address, request, DAEMON_ROLLOUT_TIMEOUT)
+            .map_err(Into::into)
+    }
 }
 
 pub(crate) fn send_daemon_rollout_build(
-    address: &str,
+    target: &RolloutTarget,
     request: &ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    daemon_send_daemon_rollout_build(address, request, DAEMON_ROLLOUT_TIMEOUT).map_err(Into::into)
+    if let Some(endpoint) = &target.endpoint {
+        daemon_send_daemon_rollout_build_to_endpoint(
+            endpoint,
+            request,
+            remote_build_rollout_timeout(),
+        )
+        .map_err(Into::into)
+    } else {
+        daemon_send_daemon_rollout_build(&target.address, request, remote_build_rollout_timeout())
+            .map_err(Into::into)
+    }
+}
+
+fn remote_build_rollout_timeout() -> Duration {
+    Duration::from_secs(15 * 60)
+}
+
+pub(crate) fn local_rollout_wait_timeout() -> Duration {
+    Duration::from_secs(60)
 }
 
 pub(crate) fn wait_for_main_daemon_health(
@@ -550,7 +672,7 @@ pub(crate) fn wait_for_main_daemon_health(
         &options.host,
         options.port,
         previous_pid,
-        Duration::from_secs(10),
+        local_rollout_wait_timeout(),
         DAEMON_PROBE_TIMEOUT,
     )?;
     println!(
@@ -572,7 +694,7 @@ pub(crate) fn wait_for_local_shadow_rollout_completion(
         options.port,
         &options.host,
         options.shadow_port,
-        Duration::from_secs(10),
+        local_rollout_wait_timeout(),
         DAEMON_PROBE_TIMEOUT,
     )
     .map_err(Into::into)

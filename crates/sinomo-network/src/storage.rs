@@ -2,8 +2,8 @@ use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
 use crate::{
-    discover_local_ip_candidates_for_targets, format_ip_port, is_invitable_ip,
-    is_loopback_connect_address,
+    discover_default_public_ip_candidates, discover_local_ip_candidates_for_targets,
+    format_ip_port, is_invitable_ip, is_loopback_connect_address,
 };
 use sinomo_kv::cluster_member_key;
 
@@ -1530,8 +1530,8 @@ pub fn cluster_sync_targets_with_connectivity(
             })
             .unwrap_or(2);
         (
-            cluster_daemon_command_transport_rank(endpoint),
             score,
+            cluster_daemon_command_transport_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
         )
@@ -1558,18 +1558,39 @@ pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<Clust
 pub fn prefer_bounded_daemon_command_targets(
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints: Vec<_> = endpoints.into_iter().collect();
+    let endpoints: Vec<_> = endpoints.into_iter().collect();
+    let mut selected = Vec::new();
     let mut nodes_with_bounded_transport = BTreeSet::new();
+    let mut nodes_with_iroh_fallback = BTreeSet::new();
     for endpoint in &endpoints {
         if cluster_daemon_command_transport_rank(endpoint) == 0 {
             nodes_with_bounded_transport.insert(endpoint.node_id.clone());
         }
     }
-    endpoints.retain(|endpoint| {
-        cluster_daemon_command_transport_rank(endpoint) == 0
-            || !nodes_with_bounded_transport.contains(&endpoint.node_id)
+    for endpoint in endpoints {
+        if cluster_daemon_command_transport_rank(&endpoint) == 0 {
+            selected.push(endpoint);
+            continue;
+        }
+        if endpoint.transport == ClusterTransportKind::Iroh {
+            if nodes_with_iroh_fallback.insert(endpoint.node_id.clone()) {
+                selected.push(endpoint);
+            }
+            continue;
+        }
+        if !nodes_with_bounded_transport.contains(&endpoint.node_id) {
+            selected.push(endpoint);
+        }
+    }
+    selected.sort_by_key(|endpoint| {
+        (
+            endpoint.node_id.clone(),
+            cluster_daemon_command_transport_rank(endpoint),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
     });
-    endpoints
+    selected
 }
 
 pub fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -> u8 {
@@ -1660,6 +1681,18 @@ pub fn daemon_advertised_endpoints_from_addresses(
                 push_unique_address(&mut lan_addresses, format_ip_port(ip, port));
             }
         }
+        let has_public_candidate = lan_ips
+            .iter()
+            .chain(route_ips.iter())
+            .copied()
+            .any(|ip| is_invitable_ip(ip) && !crate::is_private_or_link_local_ip(ip));
+        if !has_public_candidate {
+            for ip in discover_default_public_ip_candidates() {
+                if is_invitable_ip(ip) {
+                    push_unique_address(&mut lan_addresses, format_ip_port(ip, port));
+                }
+            }
+        }
     } else if host.parse::<IpAddr>().is_ok_and(is_invitable_ip)
         || !is_loopback_connect_address(&format!("{host}:{port}"))
     {
@@ -1698,13 +1731,20 @@ pub fn daemon_lan_endpoint(
     address: String,
     priority: u16,
 ) -> ClusterEndpointRecord {
+    let privacy = address
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|address| address.ip())
+        .filter(|ip| !crate::is_private_or_link_local_ip(*ip))
+        .map(|_| ClusterEndpointPrivacy::InternetDirect)
+        .unwrap_or(ClusterEndpointPrivacy::Lan);
     ClusterEndpointRecord {
         endpoint_id: daemon_lan_endpoint_id(node_id, &address),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::LanTcp,
         address,
         source: ClusterEndpointSource::Observed,
-        privacy: ClusterEndpointPrivacy::Lan,
+        privacy,
         priority,
         last_observed_latency_ms: None,
     }

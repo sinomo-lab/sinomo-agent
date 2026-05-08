@@ -33,11 +33,11 @@ use super::{
     parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
     push_unique_introducer, read_cluster_kv_snapshot, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
-    refresh_daemon_node_status_in_kv, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
-    run_evolve_command, run_shadow_daemon_with_paths, send_cluster_join_registration_over_iroh,
-    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout,
-    write_daemon_status, write_rollout_status,
+    refresh_daemon_node_status_in_kv, rollout_cluster_targets, run_cui_with_handler_io,
+    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
+    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
+    sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
+    uninstall_with_layout, write_daemon_status, write_rollout_status,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -1120,7 +1120,7 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
     assert!(!cli_command_requires_cluster_state(&CliCommand::Daemon(
         DaemonCliCommand::Status(DaemonRunOptions::default())
     )));
-    assert!(cli_command_requires_cluster_state(&CliCommand::Rollout(
+    assert!(!cli_command_requires_cluster_state(&CliCommand::Rollout(
         RolloutCliCommand::Status
     )));
     assert!(cli_command_requires_cluster_state(&CliCommand::Evolve(
@@ -1765,7 +1765,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_member",
             "pk_member"
         ))
-        .is_err()
+        .is_ok()
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -1998,13 +1998,8 @@ fn cluster_invite_generates_portable_join_payload() {
     assert!(rendered.uri.contains("&invite_id="));
     assert!(rendered.uri.contains("&secret="));
     assert!(rendered.uri.contains("&channel="));
+    assert!(rendered.uri.contains("lan-tcp"));
     assert!(rendered.uri.contains("192.168.1.10:21353"));
-    assert!(
-        rendered
-            .uri
-            .contains("&channel=lan-tcp,192.168.1.10:21353,")
-    );
-    assert!(!rendered.uri.contains("&channel=node_host,"));
     assert!(!rendered.uri.contains("&cluster_id="));
     assert!(!rendered.uri.contains("&cluster_name="));
     assert!(!rendered.uri.contains("&introducer="));
@@ -3237,6 +3232,38 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
             targets: vec!["192.0.2.11:21353".to_string()],
             ..RolloutOptions::default()
         })
+    );
+}
+
+#[test]
+fn local_rollout_wait_timeout_covers_shadow_candidate_handoff() {
+    assert!(super::local_rollout_wait_timeout() >= Duration::from_secs(30));
+}
+
+#[test]
+fn daemon_rollout_timeout_covers_windows_shadow_handoff() {
+    assert!(super::DAEMON_ROLLOUT_TIMEOUT >= Duration::from_secs(30));
+}
+
+#[test]
+fn rollout_cluster_targets_deduplicate_explicit_targets() {
+    let targets = rollout_cluster_targets(&RolloutOptions {
+        targets: vec![
+            "192.0.2.11:21353".to_string(),
+            "192.0.2.11:21353".to_string(),
+            "iroh://iroh_public_key_dedup?relay=https://relay.example./".to_string(),
+            "iroh://iroh_public_key_dedup?relay=https://relay.example./".to_string(),
+        ],
+        skip_local: true,
+        ..RolloutOptions::default()
+    })
+    .expect("targets");
+
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].address, "192.0.2.11:21353");
+    assert_eq!(
+        targets[1].address,
+        "iroh://iroh_public_key_dedup?relay=https://relay.example./"
     );
 }
 

@@ -1,6 +1,6 @@
 use crate::error::NetworkError;
-use crate::iroh_endpoint_public_key;
 use crate::prelude::*;
+use crate::{iroh_endpoint_public_key, stable_iroh_endpoint_id};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -286,7 +286,35 @@ pub fn is_loopback_connect_address(address: &str) -> bool {
         || address.starts_with("::1:")
 }
 
+fn iroh_address_has_direct_query(address: &str) -> bool {
+    let Some((_, query)) = address.split_once('?') else {
+        return false;
+    };
+    let query = query.split('#').next().unwrap_or(query);
+    query.split('&').any(|part| part.starts_with("direct="))
+}
+
 pub fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterEndpointRecord {
+    if let Some(rest) = address.strip_prefix("iroh://") {
+        let public_key = rest.split(['?', '#']).next().unwrap_or_default().trim();
+        if !public_key.is_empty() {
+            let has_direct_address = iroh_address_has_direct_query(&address);
+            return ClusterEndpointRecord {
+                endpoint_id: stable_iroh_endpoint_id(node_id, public_key),
+                node_id: node_id.clone(),
+                transport: ClusterTransportKind::Iroh,
+                address,
+                source: ClusterEndpointSource::Rendezvous,
+                privacy: if has_direct_address {
+                    ClusterEndpointPrivacy::InternetDirect
+                } else {
+                    ClusterEndpointPrivacy::Relayed
+                },
+                priority: if has_direct_address { 40 } else { 90 },
+                last_observed_latency_ms: None,
+            };
+        }
+    }
     let is_loopback = is_loopback_connect_address(&address);
     ClusterEndpointRecord {
         endpoint_id: ClusterEndpointId::generate(),
@@ -474,11 +502,27 @@ fn parse_invite_query(payload: &str) -> Result<Vec<(String, String)>, NetworkErr
 }
 
 fn encode_invite_channel(channel: &ClusterInvitationChannel) -> Result<String, NetworkError> {
-    Ok(join_invite_parts(&[
-        query_enum(&channel.endpoint.transport)?,
-        channel.endpoint.address.clone(),
-        channel.node_public_key.clone(),
-    ]))
+    let mut parts = encode_invite_endpoint_parts(&channel.endpoint)?;
+    parts.push(channel.node_public_key.clone());
+    Ok(join_invite_parts(&parts))
+}
+
+fn encode_invite_endpoint_parts(
+    endpoint: &ClusterEndpointRecord,
+) -> Result<Vec<String>, NetworkError> {
+    Ok(vec![
+        endpoint.endpoint_id.to_string(),
+        endpoint.node_id.to_string(),
+        query_enum(&endpoint.transport)?,
+        endpoint.address.clone(),
+        query_enum(&endpoint.source)?,
+        query_enum(&endpoint.privacy)?,
+        endpoint.priority.to_string(),
+        endpoint
+            .last_observed_latency_ms
+            .map(|latency| latency.to_string())
+            .unwrap_or_default(),
+    ])
 }
 
 fn decode_invite_channel(value: &str) -> Result<ClusterInvitationChannel, NetworkError> {

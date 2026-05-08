@@ -117,7 +117,9 @@ use sinomo_runtime::daemon::{
     run_daemon_control_loop as daemon_run_daemon_control_loop,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
+    send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
     send_daemon_rollout_build as daemon_send_daemon_rollout_build,
+    send_daemon_rollout_build_to_endpoint as daemon_send_daemon_rollout_build_to_endpoint,
     send_daemon_rollout_diagnostics as daemon_send_daemon_rollout_diagnostics,
     send_daemon_shutdown_request,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
@@ -215,7 +217,7 @@ mod commands;
 pub(crate) use commands::*;
 
 pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
-    matches!(command, CliCommand::Evolve(_) | CliCommand::Rollout(_))
+    matches!(command, CliCommand::Evolve(_))
 }
 
 #[derive(Debug, Clone)]
@@ -320,7 +322,7 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
 }
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
