@@ -332,6 +332,12 @@ pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
         StorageRing::R1,
         "cluster/kv-raft/wal.sobjlog",
     )?;
+    layout.register_escape(StorageEscapePath::new(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-raft",
+        "durable raft nodes use dynamic node-id subdirectories for locks, WALs, hard state, and snapshots",
+    )?)?;
     register_object(
         &mut layout,
         "sinomo-network",
@@ -774,6 +780,13 @@ mod tests {
         };
         assert_eq!(daemon_status.encoding, StorageEncoding::SinomoObject);
 
+        let Some(StoragePathOwner::Escape(kv_raft_node)) =
+            layout.owner_for("cluster/kv-raft/01kr3d54d45zkm0p0xgps8k7mt/wal.sobjlog")
+        else {
+            panic!("expected dynamic raft node escape");
+        };
+        assert_eq!(kv_raft_node.module, "sinomo-kv");
+
         let Some(StoragePathOwner::Escape(dfs_record)) =
             layout.owner_for("dfs/metadata/records/objects/01/object.sobj")
         else {
@@ -853,6 +866,25 @@ mod tests {
 
         assert!(report.unregistered.is_empty());
         assert_eq!(report.covered[0].module, "sinomo-rollout");
+    }
+
+    #[test]
+    fn verifier_covers_dynamic_cluster_raft_node_files() {
+        let layout = sinomo_data_dir_layout().expect("layout");
+        let report = layout
+            .verify_relative_paths([
+                "cluster/kv-raft/01kr3d54d45zkm0p0xgps8k7mt/node.lock",
+                "cluster/kv-raft/01kr3d54d45zkm0p0xgps8k7mt/wal.sobjlog",
+                "cluster/kv-raft/01kr3d54d45zkm0p0xgps8k7mt/snapshot.sobj",
+                "cluster/kv-raft/01kr3d54d45zkm0p0xgps8k7mt/hard-state.sobj",
+            ])
+            .expect("verify");
+
+        assert!(report.unregistered.is_empty());
+        assert_eq!(report.covered.len(), 4);
+        assert!(report.covered.iter().all(|path| {
+            path.module == "sinomo-kv" && path.coverage == StorageCoverage::Escape
+        }));
     }
 
     #[test]
