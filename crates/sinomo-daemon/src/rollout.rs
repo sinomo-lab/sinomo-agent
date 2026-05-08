@@ -540,35 +540,24 @@ pub fn handle_daemon_rollout_binary_request(
     stage_rollout_bytes(&binary, &staged_main_binary)?;
     stage_rollout_bytes(&binary, &staged_shadow_binary)?;
 
-    let current = read_daemon_status(paths)?;
-    let previous_main_binary = env::current_exe().map_err(|source| DaemonError::Io {
-        path: "current executable".to_string(),
-        detail: source.to_string(),
-    })?;
-    stage_rollout_main_activation(
+    let plan = prepare_cluster_rollout_main_activation(
         paths,
         data_dir,
-        &rollout_paths,
-        RolloutMainActivation {
-            source: request.source,
-            main_binary: main_binary.clone(),
-            shadow_binary: shadow_binary.clone(),
-            staged_main_binary: Some(staged_main_binary),
-            staged_shadow_binary: Some(staged_shadow_binary),
-            previous_main_binary: Some(previous_main_binary),
-            main_host: current.host.clone(),
-            main_port: current.port,
-            shadow_port: request.shadow_port,
-            requested_at: request.requested_at,
-            mode: "cluster-binary-push".to_string(),
-        },
+        request.source,
+        main_binary.clone(),
+        shadow_binary.clone(),
+        Some(staged_main_binary),
+        Some(staged_shadow_binary),
+        request.host,
+        request.port,
+        request.shadow_port,
+        request.requested_at,
+        "cluster-binary-push",
     )?;
+    stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
-        detail: format!(
-            "candidate main staged; existing shadow daemon will restart main, verify health, then update shadow (current main pid {} will stop)",
-            current.pid
-        ),
+        detail: rollout_staged_detail("candidate main staged", plan.current_main_pid),
         main_binary,
         shadow_binary,
         source_head: None,
@@ -596,6 +585,86 @@ pub fn stage_rollout_main_activation(
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterRolloutMainActivationPlan {
+    activation: RolloutMainActivation,
+    current_main_pid: Option<u32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_cluster_rollout_main_activation(
+    current_daemon_paths: &DaemonPaths,
+    data_dir: &Path,
+    source: String,
+    main_binary: PathBuf,
+    shadow_binary: PathBuf,
+    staged_main_binary: Option<PathBuf>,
+    staged_shadow_binary: Option<PathBuf>,
+    requested_host: String,
+    requested_port: u16,
+    shadow_port: u16,
+    requested_at: String,
+    mode: &str,
+) -> Result<ClusterRolloutMainActivationPlan, DaemonError> {
+    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
+    let main_status = if current_daemon_is_shadow {
+        let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
+        match probe_daemon_status(&main_paths, CLUSTER_HEALTH_PROBE_TIMEOUT) {
+            DaemonProbeStatus::Running(status) => Some(status),
+            DaemonProbeStatus::Locked { status } => status,
+            DaemonProbeStatus::NotRunning => None,
+        }
+    } else {
+        Some(read_daemon_status(current_daemon_paths)?)
+    };
+    let previous_main_binary = main_status
+        .as_ref()
+        .and_then(|status| status.executable.clone())
+        .unwrap_or_else(|| main_binary.clone());
+    let main_host = main_status
+        .as_ref()
+        .map(|status| status.host.clone())
+        .or_else(|| env::var(SHADOW_MAIN_HOST_ENV).ok())
+        .unwrap_or(requested_host);
+    let main_port = main_status
+        .as_ref()
+        .map(|status| status.port)
+        .or_else(|| {
+            env::var(SHADOW_MAIN_PORT_ENV)
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+        })
+        .unwrap_or(requested_port);
+    Ok(ClusterRolloutMainActivationPlan {
+        activation: RolloutMainActivation {
+            source,
+            main_binary,
+            shadow_binary,
+            staged_main_binary,
+            staged_shadow_binary,
+            previous_main_binary: Some(previous_main_binary),
+            main_host,
+            main_port,
+            shadow_port,
+            requested_at,
+            mode: mode.to_string(),
+        },
+        current_main_pid: main_status.as_ref().map(|status| status.pid),
+    })
+}
+
+fn rollout_staged_detail(prefix: &str, current_main_pid: Option<u32>) -> String {
+    match current_main_pid {
+        Some(pid) => format!(
+            "{prefix}; existing shadow daemon will restart main, verify health, then update shadow (current main pid {pid} will stop)"
+        ),
+        None => format!(
+            "{prefix}; existing shadow daemon will start main, verify health, then update shadow"
+        ),
+    }
 }
 
 pub fn handle_daemon_rollout_diagnostics(paths: &DaemonPaths) -> Result<String, DaemonError> {
@@ -1063,31 +1132,23 @@ pub fn handle_daemon_rollout_build_request(
     stage_rollout_file(&built_binary, &staged_main_binary)?;
     stage_rollout_file(&built_binary, &staged_shadow_binary)?;
 
-    let current = read_daemon_status(paths)?;
-    let previous_main_binary = env::current_exe().map_err(|source| DaemonError::Io {
-        path: "current executable".to_string(),
-        detail: source.to_string(),
-    })?;
     let source = request.source.clone();
     let requested_at = request.requested_at.clone();
-    stage_rollout_main_activation(
+    let plan = prepare_cluster_rollout_main_activation(
         paths,
         data_dir,
-        &rollout_paths,
-        RolloutMainActivation {
-            source: source.clone(),
-            main_binary: main_binary.clone(),
-            shadow_binary: shadow_binary.clone(),
-            staged_main_binary: Some(staged_main_binary),
-            staged_shadow_binary: Some(staged_shadow_binary),
-            previous_main_binary: Some(previous_main_binary),
-            main_host: current.host.clone(),
-            main_port: current.port,
-            shadow_port: request.shadow_port,
-            requested_at: requested_at.clone(),
-            mode: "cluster-remote-build".to_string(),
-        },
+        source.clone(),
+        main_binary.clone(),
+        shadow_binary.clone(),
+        Some(staged_main_binary),
+        Some(staged_shadow_binary),
+        request.host.clone(),
+        request.port,
+        request.shadow_port,
+        requested_at.clone(),
+        "cluster-remote-build",
     )?;
+    stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
     let _ = (repo, built_binary);
     write_rollout_status(
         &rollout_paths,
@@ -1113,10 +1174,7 @@ pub fn handle_daemon_rollout_build_request(
     )?;
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
-        detail: format!(
-            "remote build staged; existing shadow daemon will restart main, verify health, then update shadow (current main pid {} will stop)",
-            current.pid
-        ),
+        detail: rollout_staged_detail("remote build staged", plan.current_main_pid),
         main_binary,
         shadow_binary,
         source_head: managed_source_status(&rollout_paths)?.head,
@@ -1273,6 +1331,44 @@ mod tests {
         let error = stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
             .expect_err("main daemon must still verify a separate shadow daemon");
         assert!(error.to_string().contains("safe rollout requires"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn shadow_targeted_cluster_rollout_uses_main_defaults_not_shadow_status() {
+        let root = temp_rollout_test_root("shadow-target-main-defaults");
+        std::fs::create_dir_all(root.join("shadow-daemon")).expect("shadow root");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
+        let main_binary = rollout_paths.main_binary.clone();
+        let shadow_binary = rollout_paths.shadow_binary.clone();
+
+        let plan = prepare_cluster_rollout_main_activation(
+            &shadow_paths,
+            &root,
+            "test-source".to_string(),
+            main_binary.clone(),
+            shadow_binary,
+            Some(rollout_staged_main_binary(&rollout_paths)),
+            Some(rollout_staged_shadow_binary(&rollout_paths)),
+            "0.0.0.0".to_string(),
+            21353,
+            21354,
+            "2026-05-08T00:00:00Z".to_string(),
+            "cluster-remote-build",
+        )
+        .expect("prepare activation");
+
+        assert_eq!(plan.activation.main_binary, main_binary);
+        assert_eq!(
+            plan.activation.previous_main_binary.as_deref(),
+            Some(main_binary.as_path())
+        );
+        assert_eq!(plan.activation.main_host, "0.0.0.0");
+        assert_eq!(plan.activation.main_port, 21353);
+        assert_eq!(plan.activation.shadow_port, 21354);
+        assert_eq!(plan.current_main_pid, None);
         std::fs::remove_dir_all(root).ok();
     }
 
