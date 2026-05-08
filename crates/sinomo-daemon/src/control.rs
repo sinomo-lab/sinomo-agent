@@ -72,7 +72,8 @@ where
     }
     let authenticated = match authenticate_daemon_control_request(paths, &request) {
         Ok(authenticated) => authenticated,
-        Err(_error) => {
+        Err(error) => {
+            eprintln!("sinomo daemon client auth failed for {command}: {error}");
             stream.shutdown_both();
             return Ok(false);
         }

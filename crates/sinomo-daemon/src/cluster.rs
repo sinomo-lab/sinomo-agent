@@ -1669,33 +1669,64 @@ pub fn commit_cluster_raft_command_with_quorum(
     if sinomo_network::cluster_raft_local_is_voter(state) {
         voter_acks.insert(state.local_node_id.clone());
     }
-    for endpoint in sinomo_network::cluster_sync_targets_with_connectivity(paths, state) {
+    let quorum_size = sinomo_network::cluster_raft_quorum_size(state);
+    for endpoint in sinomo_network::prefer_bounded_daemon_command_targets(
+        sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
+    ) {
+        if voter_acks.len() >= quorum_size {
+            break;
+        }
+        if !sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id) {
+            continue;
+        }
         let Ok(response) = replicate_cluster_raft_to_endpoint(paths, state, &endpoint) else {
             continue;
         };
         if !response.accepted {
             continue;
         }
-        if sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id) {
-            voter_acks.insert(endpoint.node_id.clone());
-        }
+        voter_acks.insert(endpoint.node_id.clone());
         sinomo_network::merge_cluster_state_from_peer(state, response.state);
     }
-    if voter_acks.len() < sinomo_network::cluster_raft_quorum_size(state) {
+    if voter_acks.len() < quorum_size {
         let _ = sinomo_network::clear_cluster_raft_leader(paths, &state.local_node_id);
         return Err(DaemonError::ClusterReadOnly {
             detail: format!(
                 "raft command at index {} replicated to {} voters, {} required",
                 entry.index,
                 voter_acks.len(),
-                sinomo_network::cluster_raft_quorum_size(state)
+                quorum_size
             ),
         });
     }
 
     let (snapshot, txn_response) =
         sinomo_network::commit_cluster_raft_index(paths, &state.local_node_id, entry.index)?;
-    for endpoint in sinomo_network::cluster_sync_targets_with_connectivity(paths, state) {
+    fan_out_committed_cluster_raft_command(paths.clone(), state.clone(), snapshot.clone());
+    Ok((snapshot, txn_response))
+}
+
+fn fan_out_committed_cluster_raft_command(
+    paths: ClusterPaths,
+    state: ClusterBootstrapState,
+    snapshot: KvSnapshot,
+) {
+    thread::Builder::new()
+        .name("sinomo-cluster-raft-fanout".to_string())
+        .spawn(move || {
+            fan_out_committed_cluster_raft_command_blocking(&paths, &state, &snapshot);
+        })
+        .ok();
+}
+
+fn fan_out_committed_cluster_raft_command_blocking(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    snapshot: &KvSnapshot,
+) {
+    for endpoint in sinomo_network::prefer_bounded_daemon_command_targets(
+        sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
+    ) {
         if let Ok(response) = replicate_cluster_raft_to_endpoint(paths, state, &endpoint) {
             if response.accepted {
                 let _ = send_cluster_kv_watch_events(
@@ -1707,11 +1738,9 @@ pub fn commit_cluster_raft_command_with_quorum(
                     },
                     DAEMON_CLUSTER_RPC_TIMEOUT,
                 );
-                sinomo_network::merge_cluster_state_from_peer(state, response.state);
             }
         }
     }
-    Ok((snapshot, txn_response))
 }
 
 pub fn commit_cluster_kv_txn_with_quorum(
