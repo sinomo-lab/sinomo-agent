@@ -382,7 +382,12 @@ pub fn authorize_authenticated_daemon_command(
             authenticated.signer.can_run_admin_command()
         }
         command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_TXN_ROUTE) => {
-            authenticated.signer.can_run_admin_command()
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
         }
         _ => false,
     };
@@ -705,4 +710,30 @@ fn auth_nonce_suffix() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!("{nanos}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn authenticated_command(
+        command: String,
+        signer: DaemonSignerAuthority,
+    ) -> AuthenticatedDaemonCommand {
+        AuthenticatedDaemonCommand {
+            command,
+            signer,
+            signer_node_id: "node_test".to_string(),
+            signer_public_key: "public-key".to_string(),
+        }
+    }
+
+    #[test]
+    fn cluster_kv_txn_authorizes_cluster_members_for_voter_forwarding() {
+        let command = daemon_rpc_command(sinomo_network::CLUSTER_KV_TXN_ROUTE);
+        let authenticated = authenticated_command(command, DaemonSignerAuthority::Member);
+
+        authorize_authenticated_daemon_command(&authenticated)
+            .expect("cluster members must be able to forward KV txns to voters");
+    }
 }
