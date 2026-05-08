@@ -222,7 +222,8 @@ pub fn advertise_daemon_iroh_endpoint(
     record: IrohEndpointRecord,
 ) -> Result<(), DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let mut state = read_local_cluster_state(&cluster_paths)?;
+    let mut state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    prepare_local_cluster_state(&cluster_paths, &mut state)?;
     let endpoint = record.endpoint();
     if let Some(member) = state
         .members
@@ -249,6 +250,36 @@ pub fn advertise_daemon_iroh_endpoint(
         }
     }
     Ok(())
+}
+
+pub fn refresh_local_iroh_endpoints_from_disk(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+) -> Result<bool, DaemonError> {
+    let mut changed = false;
+    let local_nodes = [
+        state.local_node_id.clone(),
+        shadow_daemon_node_id(&state.local_node_id),
+    ];
+    for node_id in local_nodes {
+        let Ok(record) = read_local_iroh_endpoint_record(paths, &node_id) else {
+            continue;
+        };
+        let endpoint = record.endpoint();
+        let Some(member) = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == endpoint.node_id)
+        else {
+            continue;
+        };
+        changed |= sinomo_network::upsert_member_endpoint(member, endpoint);
+        changed |= sinomo_network::cleanup_member_iroh_endpoints(member);
+    }
+    if changed {
+        state.updated_at = OffsetDateTime::now_utc();
+    }
+    Ok(changed)
 }
 
 pub fn handle_daemon_cluster_kv_snapshot(paths: &DaemonPaths) -> Result<KvSnapshot, DaemonError> {
@@ -627,6 +658,7 @@ impl ClusterNetworkMaintenance {
                 time::OffsetDateTime::now_utc(),
             );
             assign_local_node_public_keys(&cluster_paths, &mut state)?;
+            let _ = refresh_local_iroh_endpoints_from_disk(&cluster_paths, &mut state)?;
         }
 
         if publish_due {
