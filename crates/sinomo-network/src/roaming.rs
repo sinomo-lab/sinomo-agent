@@ -9,9 +9,10 @@ pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
-    "https://use1-1.relay.iroh.network/",
-    "https://euw1-1.relay.iroh.network/",
-    "https://aps1-1.relay.iroh.network/",
+    "https://use1-1.relay.n0.iroh-canary.iroh.link./",
+    "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
+    "https://euc1-1.relay.n0.iroh-canary.iroh.link./",
+    "https://aps1-1.relay.n0.iroh-canary.iroh.link./",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -281,7 +282,13 @@ pub(crate) fn sinomo_iroh_relay_url_strings_from_env(value: Option<String>) -> V
 
 #[cfg(feature = "iroh-transport")]
 fn sinomo_iroh_relay_mode() -> Result<iroh::RelayMode, NetworkError> {
-    let relay_urls = default_sinomo_iroh_relay_urls();
+    let Some(relay_env) = std::env::var(SINOMO_IROH_RELAY_URLS_ENV).ok() else {
+        return Ok(iroh::RelayMode::Default);
+    };
+    if relay_env.split(',').all(|entry| entry.trim().is_empty()) {
+        return Ok(iroh::RelayMode::Default);
+    }
+    let relay_urls = sinomo_iroh_relay_url_strings_from_env(Some(relay_env));
     let parsed = relay_urls
         .iter()
         .map(|url| {

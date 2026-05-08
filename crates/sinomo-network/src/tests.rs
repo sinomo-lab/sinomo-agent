@@ -527,15 +527,15 @@ fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
 }
 
 #[test]
-fn default_iroh_relay_urls_are_tls_hostname_safe() {
+fn default_iroh_relay_urls_match_iroh_n0_preset_hosts() {
     for relay_url in default_sinomo_iroh_relay_urls() {
         let host = relay_url
             .strip_prefix("https://")
             .and_then(|rest| rest.split('/').next())
             .expect("https relay host");
         assert!(
-            !host.ends_with('.'),
-            "relay host must not end with a trailing DNS dot because TLS certificates are issued for the bare hostname: {relay_url}"
+            host.ends_with(".relay.n0.iroh-canary.iroh.link."),
+            "default relay should follow the Iroh N0 preset relay map: {relay_url}"
         );
     }
 }
@@ -603,12 +603,13 @@ fn sinomo_default_iroh_relays_use_stable_network_hosts() {
     assert_eq!(
         urls,
         vec![
-            "https://use1-1.relay.iroh.network./".to_string(),
-            "https://euw1-1.relay.iroh.network./".to_string(),
-            "https://aps1-1.relay.iroh.network./".to_string(),
+            "https://use1-1.relay.n0.iroh-canary.iroh.link./".to_string(),
+            "https://usw1-1.relay.n0.iroh-canary.iroh.link./".to_string(),
+            "https://euc1-1.relay.n0.iroh-canary.iroh.link./".to_string(),
+            "https://aps1-1.relay.n0.iroh-canary.iroh.link./".to_string(),
         ]
     );
-    assert!(urls.iter().all(|url| !url.contains("iroh-canary")));
+    assert!(urls.iter().all(|url| url.contains("iroh-canary")));
 }
 
 #[test]
