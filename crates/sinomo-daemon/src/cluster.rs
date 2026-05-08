@@ -37,6 +37,7 @@ use sinomo_node::shadow_daemon_node_id;
 use sinomo_node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
 use sinomo_rollout::{SelfRolloutPaths, read_rollout_status};
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -53,6 +54,15 @@ pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 180;
 pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 180;
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 8;
+static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct ClusterRaftFanoutGuard;
+
+impl Drop for ClusterRaftFanoutGuard {
+    fn drop(&mut self) {
+        CLUSTER_RAFT_FANOUT_ACTIVE.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ClusterHealthRow {
@@ -1932,12 +1942,19 @@ fn fan_out_committed_cluster_raft_command(
     state: ClusterBootstrapState,
     snapshot: KvSnapshot,
 ) {
-    thread::Builder::new()
+    if CLUSTER_RAFT_FANOUT_ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if thread::Builder::new()
         .name("sinomo-cluster-raft-fanout".to_string())
         .spawn(move || {
+            let _guard = ClusterRaftFanoutGuard;
             fan_out_committed_cluster_raft_command_blocking(&paths, &state, &snapshot);
         })
-        .ok();
+        .is_err()
+    {
+        CLUSTER_RAFT_FANOUT_ACTIVE.store(false, Ordering::Release);
+    }
 }
 
 fn fan_out_committed_cluster_raft_command_blocking(
