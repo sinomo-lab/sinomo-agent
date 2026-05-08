@@ -9,6 +9,7 @@ use sinomo_runtime::core::{
     CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, EvaluationOutcome,
     EvaluationScorecard, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
 };
+use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::local::SinomoDataDir;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -37,6 +38,33 @@ pub struct StoredEvolutionJob {
     pub changed_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<CandidateDecision>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedCandidateDecision {
+    pub record: StoredEvolutionJob,
+    pub decision_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedCandidateVerification {
+    pub record: StoredEvolutionJob,
+    pub scorecard_path: PathBuf,
+    pub command_log_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvolutionJobSelectionMode {
+    Active,
+    AwaitingApproval,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoredJobArtifactKind {
+    Diff,
+    Scorecard,
+    Decision,
+    MutationPacket,
 }
 
 #[derive(Clone, Debug)]
@@ -200,8 +228,145 @@ pub fn write_stored_job(
     write_json(&paths.job_path(&record.job.job_id), record)
 }
 
+pub fn record_candidate_decision(
+    paths: &EvolutionPaths,
+    mut record: StoredEvolutionJob,
+    outcome: CandidateDecisionOutcome,
+    decided_by: impl Into<String>,
+    note: impl Into<String>,
+) -> Result<RecordedCandidateDecision, EvolutionPersistenceError> {
+    let decision = CandidateDecision::new(
+        &record.job,
+        outcome,
+        decided_by,
+        record.candidate_workspace.path.display().to_string(),
+        record.bundle.bundle_path.clone(),
+        record.verification_outcome.clone(),
+        record.changed_files.clone(),
+        note,
+    );
+    let decision_path = PathBuf::from(&record.bundle.bundle_path).join("approval-decision.json");
+    write_json(&decision_path, &decision)?;
+    record.job.status = decision.resulting_status.clone();
+    record.bundle.decision_path = Some(decision_path.display().to_string());
+    record.decision = Some(decision);
+    write_bundle_manifest(&record)?;
+    if let Some(job_path) = &record.bundle.job_path {
+        write_json(Path::new(job_path), &record.job)?;
+    }
+    write_stored_job(paths, &record)?;
+    Ok(RecordedCandidateDecision {
+        record,
+        decision_path,
+    })
+}
+
+pub fn record_candidate_verification(
+    paths: &EvolutionPaths,
+    mut record: StoredEvolutionJob,
+    scorecard: &EvaluationScorecard,
+    command_results: &[CommandRunResult],
+) -> Result<RecordedCandidateVerification, EvolutionPersistenceError> {
+    let scorecard_path = PathBuf::from(&record.bundle.bundle_path).join("scorecard.json");
+    write_json(&scorecard_path, scorecard)?;
+    let mut command_log_paths = Vec::new();
+    for result in command_results {
+        let safe_name = safe_file_stem(&result.name);
+        let path = PathBuf::from(&record.bundle.bundle_path)
+            .join("command-logs")
+            .join(format!("{safe_name}.txt"));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| EvolutionPersistenceError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        fs::write(
+            &path,
+            format!(
+                "name: {}\ncommand: {}\nexpected_exit_code: {}\nexit_code: {}\nduration_ms: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+                result.name,
+                result.command,
+                result.expected_exit_code,
+                result.exit_code,
+                result.duration_ms,
+                result.stdout,
+                result.stderr
+            ),
+        )
+        .map_err(|source| EvolutionPersistenceError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        command_log_paths.push(path);
+    }
+    record.verification_outcome = Some(scorecard.outcome.clone());
+    record.bundle.scorecard_path = Some(scorecard_path.display().to_string());
+    write_stored_job(paths, &record)?;
+    Ok(RecordedCandidateVerification {
+        record,
+        scorecard_path,
+        command_log_paths,
+    })
+}
+
 pub fn read_stored_job(path: &Path) -> Result<StoredEvolutionJob, EvolutionPersistenceError> {
     read_json_file(path)
+}
+
+pub fn select_stored_job(
+    paths: &EvolutionPaths,
+    job_id: Option<&EvolutionJobId>,
+    mode: EvolutionJobSelectionMode,
+) -> Result<StoredEvolutionJob, EvolutionJobSelectionError> {
+    if let Some(job_id) = job_id {
+        return read_stored_job(&paths.job_path(job_id)).map_err(Into::into);
+    }
+
+    let records = list_job_records(paths)?;
+    let candidates: Vec<_> = records
+        .into_iter()
+        .filter(|record| match mode {
+            EvolutionJobSelectionMode::Active => !is_terminal_status(&record.job.status),
+            EvolutionJobSelectionMode::AwaitingApproval => {
+                record.job.status == EvolutionJobStatus::AwaitingApproval
+            }
+        })
+        .collect();
+    match candidates.as_slice() {
+        [record] => Ok(record.clone()),
+        [] => Err(EvolutionJobSelectionError::NoActiveJob),
+        _ => Err(EvolutionJobSelectionError::AmbiguousJob {
+            job_ids: candidates
+                .iter()
+                .map(|record| record.job.job_id.to_string())
+                .collect(),
+        }),
+    }
+}
+
+pub fn ensure_stored_job_awaiting_approval(
+    record: &StoredEvolutionJob,
+) -> Result<(), EvolutionJobStateError> {
+    if record.job.status == EvolutionJobStatus::AwaitingApproval {
+        return Ok(());
+    }
+    Err(EvolutionJobStateError::UnexpectedStatus {
+        job_id: record.job.job_id.to_string(),
+        status: job_status_label(&record.job.status).to_string(),
+        expected: job_status_label(&EvolutionJobStatus::AwaitingApproval).to_string(),
+    })
+}
+
+pub fn job_status_label(status: &EvolutionJobStatus) -> &'static str {
+    match status {
+        EvolutionJobStatus::AwaitingApproval => "awaiting-approval",
+        EvolutionJobStatus::Approved => "approved",
+        EvolutionJobStatus::Rejected => "rejected",
+        EvolutionJobStatus::Created => "created",
+        EvolutionJobStatus::Failed => "failed",
+        _ => "in-progress",
+    }
 }
 
 pub fn evolution_report_from_record(
@@ -223,6 +388,33 @@ pub fn evolution_report_from_record(
         bundle: record.bundle,
         scorecard,
         changed_files: record.changed_files,
+    })
+}
+
+pub fn stored_job_artifact_path(
+    record: &StoredEvolutionJob,
+    artifact: StoredJobArtifactKind,
+) -> Result<PathBuf, EvolutionPersistenceError> {
+    let path = match artifact {
+        StoredJobArtifactKind::Diff => record.bundle.diff_path.clone(),
+        StoredJobArtifactKind::Scorecard => record.bundle.scorecard_path.clone(),
+        StoredJobArtifactKind::Decision => record.bundle.decision_path.clone(),
+        StoredJobArtifactKind::MutationPacket => Some(record.bundle.mutation_packet_path.clone()),
+    }
+    .ok_or_else(|| EvolutionPersistenceError::MissingArtifact {
+        artifact: format!("{artifact:?}"),
+    })?;
+    Ok(PathBuf::from(path))
+}
+
+pub fn read_stored_job_artifact(
+    record: &StoredEvolutionJob,
+    artifact: StoredJobArtifactKind,
+) -> Result<String, EvolutionPersistenceError> {
+    let path = stored_job_artifact_path(record, artifact)?;
+    fs::read_to_string(&path).map_err(|source| EvolutionPersistenceError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
     })
 }
 
@@ -599,6 +791,403 @@ pub fn decision_outcome_label(outcome: &CandidateDecisionOutcome) -> &'static st
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CandidateWorkspace;
+    use sinomo_runtime::core::{
+        EditScope, EvaluationGate, EvolutionScope, RecoveryPlan, RollbackPolicy, ScorecardId,
+        TrustRing, VerificationPlan, WorkspaceId,
+    };
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn record_candidate_decision_persists_decision_manifest_job_and_record() {
+        let root = temp_dir("record-decision");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let job_id = EvolutionJobId::generate();
+        let bundle_dir = root.join("bundle");
+        let job_artifact = bundle_dir.join("job.json");
+        let record = StoredEvolutionJob {
+            job: EvolutionJob {
+                job_id: job_id.clone(),
+                objective: "record a candidate decision".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                target_module_id: None,
+                edit_scope: EditScope {
+                    workspace_root: root.display().to_string(),
+                    intended_paths: vec!["README.md".to_string()],
+                    notes: String::new(),
+                },
+                verification: VerificationPlan {
+                    commands: Vec::new(),
+                },
+                recovery: RecoveryPlan::default(),
+                scope: EvolutionScope {
+                    allowed_paths: vec!["README.md".to_string()],
+                    forbidden_paths: Vec::new(),
+                    workspace_id: Some(
+                        WorkspaceId::from_legacy_named("workspace_record_decision")
+                            .expect("workspace"),
+                    ),
+                },
+                status: EvolutionJobStatus::AwaitingApproval,
+                required_gates: vec![EvaluationGate::StaticChecks],
+                rollback_policy: RollbackPolicy::default(),
+            },
+            candidate_workspace: CandidateWorkspace {
+                job_id: job_id.clone(),
+                path: root.join("worktree"),
+                branch_name: "codex/evolve/record-decision".to_string(),
+                source_revision: Some("abc123".to_string()),
+            },
+            bundle: CandidateBundleManifest {
+                job_id: job_id.clone(),
+                bundle_path: bundle_dir.display().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: bundle_dir
+                    .join("mutation-packet.json")
+                    .display()
+                    .to_string(),
+                job_path: Some(job_artifact.display().to_string()),
+                model_output_path: None,
+                changed_files_path: None,
+                diff_path: None,
+                scorecard_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: Some(EvaluationOutcome::Passed),
+            changed_files: vec!["README.md".to_string()],
+            decision: None,
+        };
+
+        let recorded = record_candidate_decision(
+            &paths,
+            record,
+            CandidateDecisionOutcome::Rejected,
+            "test-reviewer",
+            "needs another pass",
+        )
+        .expect("decision");
+
+        assert_eq!(recorded.record.job.status, EvolutionJobStatus::Rejected);
+        assert_eq!(
+            recorded.record.decision.as_ref().unwrap().note,
+            "needs another pass"
+        );
+        assert!(recorded.decision_path.exists());
+        let manifest: CandidateBundleManifest =
+            read_json_file(&bundle_dir.join("manifest.json")).expect("manifest");
+        assert_eq!(
+            manifest.decision_path,
+            Some(recorded.decision_path.display().to_string())
+        );
+        let job_artifact: EvolutionJob = read_json_file(&job_artifact).expect("job artifact");
+        assert_eq!(job_artifact.status, EvolutionJobStatus::Rejected);
+        let stored = read_stored_job(&paths.job_path(&job_id)).expect("stored job");
+        assert_eq!(stored.job.status, EvolutionJobStatus::Rejected);
+        assert_eq!(stored.decision.unwrap().decided_by, "test-reviewer");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_candidate_verification_persists_scorecard_logs_and_record() {
+        let root = temp_dir("record-verification");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let job_id = EvolutionJobId::generate();
+        let bundle_dir = root.join("bundle");
+        let record = StoredEvolutionJob {
+            job: EvolutionJob {
+                job_id: job_id.clone(),
+                objective: "record verification".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                target_module_id: None,
+                edit_scope: EditScope {
+                    workspace_root: root.display().to_string(),
+                    intended_paths: vec!["README.md".to_string()],
+                    notes: String::new(),
+                },
+                verification: VerificationPlan {
+                    commands: Vec::new(),
+                },
+                recovery: RecoveryPlan::default(),
+                scope: EvolutionScope {
+                    allowed_paths: vec!["README.md".to_string()],
+                    forbidden_paths: Vec::new(),
+                    workspace_id: Some(
+                        WorkspaceId::from_legacy_named("workspace_record_verification")
+                            .expect("workspace"),
+                    ),
+                },
+                status: EvolutionJobStatus::AwaitingApproval,
+                required_gates: vec![EvaluationGate::StaticChecks],
+                rollback_policy: RollbackPolicy::default(),
+            },
+            candidate_workspace: CandidateWorkspace {
+                job_id: job_id.clone(),
+                path: root.join("worktree"),
+                branch_name: "codex/evolve/record-verification".to_string(),
+                source_revision: Some("abc123".to_string()),
+            },
+            bundle: CandidateBundleManifest {
+                job_id: job_id.clone(),
+                bundle_path: bundle_dir.display().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: bundle_dir
+                    .join("mutation-packet.json")
+                    .display()
+                    .to_string(),
+                job_path: None,
+                model_output_path: None,
+                changed_files_path: None,
+                diff_path: None,
+                scorecard_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: None,
+            changed_files: Vec::new(),
+            decision: None,
+        };
+        let scorecard = EvaluationScorecard {
+            scorecard_id: ScorecardId::generate(),
+            baseline_artifact_id: None,
+            candidate_artifact_id: None,
+            outcome: EvaluationOutcome::Passed,
+            gates: Vec::new(),
+            metrics: Vec::new(),
+        };
+        let results = vec![CommandRunResult {
+            run_id: None,
+            name: "cargo test".to_string(),
+            command: "cargo test -p sinomo-evolution".to_string(),
+            expected_exit_code: 0,
+            exit_code: 0,
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            duration_ms: 12,
+        }];
+
+        let recorded =
+            record_candidate_verification(&paths, record, &scorecard, &results).expect("record");
+
+        assert_eq!(
+            recorded.record.verification_outcome,
+            Some(EvaluationOutcome::Passed)
+        );
+        assert_eq!(recorded.scorecard_path, bundle_dir.join("scorecard.json"));
+        assert!(recorded.scorecard_path.exists());
+        assert_eq!(recorded.command_log_paths.len(), 1);
+        let log = fs::read_to_string(&recorded.command_log_paths[0]).expect("command log");
+        assert!(log.contains("stdout:\nok"));
+        let stored = read_stored_job(&paths.job_path(&job_id)).expect("stored job");
+        assert_eq!(
+            stored.bundle.scorecard_path,
+            Some(recorded.scorecard_path.display().to_string())
+        );
+        assert_eq!(stored.verification_outcome, Some(EvaluationOutcome::Passed));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_stored_job_artifact_reads_selected_bundle_artifact() {
+        let root = temp_dir("read-artifact");
+        let job_id = EvolutionJobId::generate();
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle");
+        let diff = bundle_dir.join("diff.patch");
+        let packet = bundle_dir.join("mutation-packet.json");
+        fs::write(&diff, "diff-content").expect("diff");
+        fs::write(&packet, "packet-content").expect("packet");
+        let record = StoredEvolutionJob {
+            job: EvolutionJob {
+                job_id: job_id.clone(),
+                objective: "read artifact".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                target_module_id: None,
+                edit_scope: EditScope {
+                    workspace_root: root.display().to_string(),
+                    intended_paths: vec!["README.md".to_string()],
+                    notes: String::new(),
+                },
+                verification: VerificationPlan {
+                    commands: Vec::new(),
+                },
+                recovery: RecoveryPlan::default(),
+                scope: EvolutionScope {
+                    allowed_paths: vec!["README.md".to_string()],
+                    forbidden_paths: Vec::new(),
+                    workspace_id: None,
+                },
+                status: EvolutionJobStatus::AwaitingApproval,
+                required_gates: vec![EvaluationGate::StaticChecks],
+                rollback_policy: RollbackPolicy::default(),
+            },
+            candidate_workspace: CandidateWorkspace {
+                job_id: job_id.clone(),
+                path: root.join("worktree"),
+                branch_name: "codex/evolve/read-artifact".to_string(),
+                source_revision: None,
+            },
+            bundle: CandidateBundleManifest {
+                job_id,
+                bundle_path: bundle_dir.display().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: packet.display().to_string(),
+                job_path: None,
+                model_output_path: None,
+                changed_files_path: None,
+                diff_path: Some(diff.display().to_string()),
+                scorecard_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: None,
+            changed_files: Vec::new(),
+            decision: None,
+        };
+
+        assert_eq!(
+            read_stored_job_artifact(&record, StoredJobArtifactKind::Diff).expect("diff"),
+            "diff-content"
+        );
+        assert_eq!(
+            read_stored_job_artifact(&record, StoredJobArtifactKind::MutationPacket)
+                .expect("packet"),
+            "packet-content"
+        );
+        assert!(matches!(
+            stored_job_artifact_path(&record, StoredJobArtifactKind::Scorecard),
+            Err(EvolutionPersistenceError::MissingArtifact { .. })
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn select_stored_job_filters_active_jobs_and_honors_explicit_job_id() {
+        let root = temp_dir("select-job");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let active = stored_record_fixture(&root, EvolutionJobStatus::AwaitingApproval);
+        let terminal = stored_record_fixture(&root, EvolutionJobStatus::Approved);
+        write_stored_job(&paths, &active).expect("active");
+        write_stored_job(&paths, &terminal).expect("terminal");
+
+        let selected =
+            select_stored_job(&paths, None, EvolutionJobSelectionMode::Active).expect("selected");
+        assert_eq!(selected.job.job_id, active.job.job_id);
+
+        let explicit = select_stored_job(
+            &paths,
+            Some(&terminal.job.job_id),
+            EvolutionJobSelectionMode::Active,
+        )
+        .expect("explicit");
+        assert_eq!(explicit.job.job_id, terminal.job.job_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_stored_job_awaiting_approval_reports_status_mismatch() {
+        let root = temp_dir("job-state");
+        let approved = stored_record_fixture(&root, EvolutionJobStatus::Approved);
+        assert!(
+            ensure_stored_job_awaiting_approval(&stored_record_fixture(
+                &root,
+                EvolutionJobStatus::AwaitingApproval
+            ))
+            .is_ok()
+        );
+        let error = ensure_stored_job_awaiting_approval(&approved).expect_err("status mismatch");
+        assert!(matches!(
+            error,
+            EvolutionJobStateError::UnexpectedStatus {
+                status,
+                expected,
+                ..
+            } if status == "approved" && expected == "awaiting-approval"
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        std::env::temp_dir().join(format!("sinomo-evolution-persistence-{name}-{stamp}"))
+    }
+
+    fn stored_record_fixture(root: &Path, status: EvolutionJobStatus) -> StoredEvolutionJob {
+        let job_id = EvolutionJobId::generate();
+        StoredEvolutionJob {
+            job: EvolutionJob {
+                job_id: job_id.clone(),
+                objective: format!("fixture {}", job_id),
+                target_ring: TrustRing::R1TrustedRuntime,
+                target_module_id: None,
+                edit_scope: EditScope {
+                    workspace_root: root.display().to_string(),
+                    intended_paths: vec!["README.md".to_string()],
+                    notes: String::new(),
+                },
+                verification: VerificationPlan {
+                    commands: Vec::new(),
+                },
+                recovery: RecoveryPlan::default(),
+                scope: EvolutionScope {
+                    allowed_paths: vec!["README.md".to_string()],
+                    forbidden_paths: Vec::new(),
+                    workspace_id: Some(
+                        WorkspaceId::from_legacy_named(format!("workspace_{}", job_id))
+                            .expect("workspace"),
+                    ),
+                },
+                status,
+                required_gates: vec![EvaluationGate::StaticChecks],
+                rollback_policy: RollbackPolicy::default(),
+            },
+            candidate_workspace: CandidateWorkspace {
+                job_id: job_id.clone(),
+                path: root.join(job_id.as_str()).join("worktree"),
+                branch_name: format!("codex/evolve/{}", job_id),
+                source_revision: Some("abc123".to_string()),
+            },
+            bundle: CandidateBundleManifest {
+                job_id: job_id.clone(),
+                bundle_path: root
+                    .join(job_id.as_str())
+                    .join("bundle")
+                    .display()
+                    .to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: root
+                    .join(job_id.as_str())
+                    .join("bundle")
+                    .join("mutation-packet.json")
+                    .display()
+                    .to_string(),
+                job_path: None,
+                model_output_path: None,
+                changed_files_path: None,
+                diff_path: None,
+                scorecard_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: None,
+            changed_files: Vec::new(),
+            decision: None,
+        }
+    }
+}
+
 pub fn safe_file_stem(value: &str) -> String {
     let stem: String = value
         .chars()
@@ -624,4 +1213,26 @@ pub enum EvolutionPersistenceError {
     Io { path: String, detail: String },
     #[error("evolution JSON error at {path}: {detail}")]
     Json { path: String, detail: String },
+    #[error("missing evolution artifact: {artifact}")]
+    MissingArtifact { artifact: String },
+}
+
+#[derive(Debug, Error)]
+pub enum EvolutionJobSelectionError {
+    #[error("no active evolution job")]
+    NoActiveJob,
+    #[error("multiple active evolution jobs: {}", job_ids.join(", "))]
+    AmbiguousJob { job_ids: Vec<String> },
+    #[error(transparent)]
+    Persistence(#[from] EvolutionPersistenceError),
+}
+
+#[derive(Debug, Error)]
+pub enum EvolutionJobStateError {
+    #[error("evolution job {job_id} is {status}; expected {expected}")]
+    UnexpectedStatus {
+        job_id: String,
+        status: String,
+        expected: String,
+    },
 }

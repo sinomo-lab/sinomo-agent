@@ -1,20 +1,32 @@
 //! Core autonomous self-evolution planning and orchestration.
 
-use crate::EvolutionPersistenceError;
+use crate::{
+    EvolutionPaths, EvolutionPersistenceError, RecordedCandidateDecision,
+    RecordedCandidateVerification, StoredEvolutionJob, record_candidate_decision,
+    record_candidate_verification,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use sinomo_lm::{
-    LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
-    LanguageModelRequest, LanguageModelResponseFormat, LanguageModelRole,
+    AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
+    CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig, CodexCliProvider,
+    GeminiConfig, GeminiProvider, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
+    GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError, LanguageModelInvocation,
+    LanguageModelMessage, LanguageModelProvider, LanguageModelRequest, LanguageModelResponseFormat,
+    LanguageModelRole, NvidiaConfig, NvidiaProvider, OpenAiConfig, OpenAiProvider,
+    PROVIDER_DEFAULT_MODEL, codex_provider_for_model, model_or_default,
+    normalize_model_id_for_provider, normalize_model_provider,
 };
 use sinomo_runtime::core::{
-    CandidateBundleManifest, CommandLogRef, Confidence, EditScope, EvaluationGate,
-    EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJob,
-    EvolutionJobId, EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass, ModuleId,
-    MutationOutputContract, MutationPacket, NodeId, PrivacyClass, RecoveryPlan, RollbackPolicy,
-    RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing, VerificationCommand,
-    VerificationPlan, WorkspaceId,
+    CandidateBundleManifest, CandidateDecisionOutcome, CommandLogRef, Confidence, EditScope,
+    EvaluationGate, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind,
+    EvolutionJob, EvolutionJobId, EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass,
+    ModuleId, MutationOutputContract, MutationPacket, NodeId, PrivacyClass, RecoveryPlan,
+    RollbackPolicy, RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
+    VerificationCommand, VerificationPlan, WorkspaceId,
 };
 use sinomo_runtime::eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
+use sinomo_runtime::local::SinomoDataDir;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -83,6 +95,57 @@ pub struct CampaignProposalRequest {
     pub target_ring: TrustRing,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CampaignProposalInput {
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserve_floor_specs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wall_time: Option<String>,
+    #[serde(default)]
+    pub pause_after_proposal: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub approved: bool,
+    pub target_ring: TrustRing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EvolutionRequestInput {
+    pub objective: String,
+    pub target_ring: TrustRing,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intended_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PreparedEvolutionRequest {
+    pub request: EvolutionRequest,
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -329,6 +392,453 @@ pub struct ResourceClassDefinition {
     pub notes: String,
 }
 
+pub fn resource_class_from_reserve_floor(
+    floor: &ReserveFloor,
+    notes: &str,
+) -> ResourceClassDefinition {
+    ResourceClassDefinition {
+        resource_id: floor.resource.clone(),
+        unit: "percent".to_string(),
+        total_units: 100,
+        used_units: 0,
+        reserve_floor_percent: floor.floor_percent,
+        reset_window: "current reset window".to_string(),
+        notes: notes.to_string(),
+    }
+}
+
+pub fn resource_classes_from_reserve_floors(
+    floors: &[ReserveFloor],
+    notes: &str,
+) -> Vec<ResourceClassDefinition> {
+    floors
+        .iter()
+        .map(|floor| resource_class_from_reserve_floor(floor, notes))
+        .collect()
+}
+
+pub fn prepare_campaign_proposal_request(
+    input: CampaignProposalInput,
+) -> Result<CampaignProposalRequest, EvolutionInputParseError> {
+    Ok(CampaignProposalRequest {
+        objective: input.objective,
+        horizon: input.horizon.unwrap_or_else(|| "30 days".to_string()),
+        budget_policy: input
+            .budget_policy
+            .unwrap_or_else(|| "free-and-prepaid".to_string()),
+        reserve_floors: parse_reserve_floors(&input.reserve_floor_specs)?,
+        approval_policy: input
+            .approval_policy
+            .unwrap_or_else(|| "stage-rollout".to_string()),
+        max_wall_time: input.max_wall_time,
+        pause_after_proposal: input.pause_after_proposal,
+        dry_run: input.dry_run,
+        approved: input.approved,
+        target_ring: input.target_ring,
+        source_repo: input.source_repo,
+    })
+}
+
+pub fn prepare_evolution_request(
+    input: EvolutionRequestInput,
+) -> Result<PreparedEvolutionRequest, EvolutionInputParseError> {
+    let provider = input
+        .provider
+        .or(input.default_provider)
+        .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
+    let provider =
+        normalize_model_provider(&provider).ok_or_else(|| EvolutionInputParseError::Invalid {
+            detail: format!("unknown provider `{provider}`"),
+        })?;
+    let model = input
+        .model
+        .or(input.default_model)
+        .map(|model| normalize_model_id_for_provider(&provider, &model));
+    let verification_commands = input
+        .verification_commands
+        .into_iter()
+        .enumerate()
+        .map(|(index, command)| VerificationCommand {
+            name: format!("verify-{}", index + 1),
+            command,
+            expected_exit_code: 0,
+            gate: EvaluationGate::StaticChecks,
+        })
+        .collect();
+    let request = EvolutionRequest {
+        objective: input.objective,
+        target_ring: input.target_ring,
+        intended_paths: input.intended_paths,
+        verification_commands,
+        model_provider: Some(provider.clone()),
+        model: model.clone(),
+        dry_run: input.dry_run,
+    };
+
+    Ok(PreparedEvolutionRequest {
+        request,
+        provider,
+        model: model.unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string()),
+    })
+}
+
+pub fn parse_reserve_floors(
+    values: &[String],
+) -> Result<Vec<ReserveFloor>, EvolutionInputParseError> {
+    values
+        .iter()
+        .map(|value| parse_reserve_floor(value))
+        .collect()
+}
+
+pub fn parse_reserve_floor(value: &str) -> Result<ReserveFloor, EvolutionInputParseError> {
+    let (resource, floor) =
+        value
+            .rsplit_once(':')
+            .ok_or_else(|| EvolutionInputParseError::Invalid {
+                detail: format!("reserve floor `{value}` must look like resource:30%"),
+            })?;
+    let floor = floor
+        .trim_end_matches('%')
+        .parse::<u8>()
+        .map_err(|source| EvolutionInputParseError::Invalid {
+            detail: format!("invalid reserve floor `{value}`: {source}"),
+        })?;
+    if floor > 100 || resource.trim().is_empty() {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: format!(
+                "reserve floor `{value}` must have a non-empty resource and 0-100 percent"
+            ),
+        });
+    }
+    Ok(ReserveFloor {
+        resource: resource.to_string(),
+        floor_percent: floor,
+    })
+}
+
+pub fn parse_failure_class(value: &str) -> Result<EvolutionFailureClass, EvolutionInputParseError> {
+    match value {
+        "build-test-failure" => Ok(EvolutionFailureClass::BuildTestFailure),
+        "eval-regression" => Ok(EvolutionFailureClass::EvalRegression),
+        "artifact-quality-failure" => Ok(EvolutionFailureClass::ArtifactQualityFailure),
+        "rollout-failure" => Ok(EvolutionFailureClass::RolloutFailure),
+        "resource-exhaustion" => Ok(EvolutionFailureClass::ResourceExhaustion),
+        "repeated-implementation-failure" => {
+            Ok(EvolutionFailureClass::RepeatedImplementationFailure)
+        }
+        "foundation-blocker" => Ok(EvolutionFailureClass::FoundationBlocker),
+        "ambiguous-metric" => Ok(EvolutionFailureClass::AmbiguousMetric),
+        "wrong-task-selection" => Ok(EvolutionFailureClass::WrongTaskSelection),
+        "inconclusive-evidence" => Ok(EvolutionFailureClass::InconclusiveEvidence),
+        _ => Err(EvolutionInputParseError::Invalid {
+            detail: format!("unknown failure class `{value}`"),
+        }),
+    }
+}
+
+pub fn parse_stage_resource_usage(
+    value: &str,
+    default_task_id: Option<&str>,
+) -> Result<ResourceUsageEstimate, EvolutionInputParseError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let (task_id, resource, estimated, actual) = match parts.as_slice() {
+        [resource, estimated] => (
+            default_task_id.ok_or_else(|| EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "usage `{value}` needs --task first or task:resource:estimated[:actual]"
+                ),
+            })?,
+            resource.trim(),
+            estimated.trim(),
+            None,
+        ),
+        [resource, estimated, actual] => (
+            default_task_id.ok_or_else(|| EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "usage `{value}` needs --task first or task:resource:estimated[:actual]"
+                ),
+            })?,
+            resource.trim(),
+            estimated.trim(),
+            Some(actual.trim()),
+        ),
+        [task_id, resource, estimated, actual] => (
+            task_id.trim(),
+            resource.trim(),
+            estimated.trim(),
+            Some(actual.trim()),
+        ),
+        _ => {
+            return Err(EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "usage `{value}` must look like resource:estimated[:actual] or task:resource:estimated:actual"
+                ),
+            });
+        }
+    };
+    let estimated_units =
+        estimated
+            .parse::<u64>()
+            .map_err(|source| EvolutionInputParseError::Invalid {
+                detail: format!("invalid estimated usage units in `{value}`: {source}"),
+            })?;
+    let actual_units = actual
+        .map(|actual| {
+            actual
+                .parse::<u64>()
+                .map_err(|source| EvolutionInputParseError::Invalid {
+                    detail: format!("invalid actual usage units in `{value}`: {source}"),
+                })
+        })
+        .transpose()?;
+    Ok(ResourceUsageEstimate {
+        task_id: task_id.to_string(),
+        resource: resource.to_string(),
+        estimated_units,
+        actual_units,
+    })
+}
+
+pub fn parse_schedule_resources(
+    values: &[String],
+    campaign: &EvolutionCampaign,
+) -> Result<Vec<ResourceClassDefinition>, EvolutionInputParseError> {
+    if values.is_empty() {
+        return Ok(resource_classes_from_reserve_floors(
+            &campaign.budget_policy.reserve_floors,
+            "derived from campaign reserve-floor config",
+        ));
+    }
+
+    values
+        .iter()
+        .map(|value| parse_schedule_resource(value, campaign))
+        .collect()
+}
+
+pub fn parse_background_tick_resources(
+    values: &[String],
+    campaigns: &[EvolutionCampaign],
+) -> Result<Vec<ResourceClassDefinition>, EvolutionInputParseError> {
+    if values.is_empty() {
+        return Ok(background_resource_classes_from_campaign_reserve_floors(
+            campaigns,
+            "derived from background campaign reserve floors",
+        ));
+    }
+    let fallback = campaigns
+        .first()
+        .cloned()
+        .unwrap_or_else(background_tick_fallback_campaign);
+    values
+        .iter()
+        .map(|value| parse_schedule_resource(value, &fallback))
+        .collect()
+}
+
+pub fn parse_schedule_resource(
+    value: &str,
+    campaign: &EvolutionCampaign,
+) -> Result<ResourceClassDefinition, EvolutionInputParseError> {
+    let mut parts = value.split(':');
+    let resource_id = parts.next().unwrap_or_default().trim();
+    let usage = parts
+        .next()
+        .ok_or_else(|| EvolutionInputParseError::Invalid {
+            detail: format!("resource `{value}` must look like resource:used/total[:reset-window]"),
+        })?;
+    let reset_window = parts.next().unwrap_or("current reset window");
+    if parts.next().is_some() || resource_id.is_empty() {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: format!("resource `{value}` must look like resource:used/total[:reset-window]"),
+        });
+    }
+    let (used, total) = usage
+        .split_once('/')
+        .ok_or_else(|| EvolutionInputParseError::Invalid {
+            detail: format!("resource `{value}` must include used/total units"),
+        })?;
+    let used_units = used
+        .parse::<u64>()
+        .map_err(|source| EvolutionInputParseError::Invalid {
+            detail: format!("invalid used units in resource `{value}`: {source}"),
+        })?;
+    let total_units = total
+        .parse::<u64>()
+        .map_err(|source| EvolutionInputParseError::Invalid {
+            detail: format!("invalid total units in resource `{value}`: {source}"),
+        })?;
+    if total_units == 0 || used_units > total_units {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: format!("resource `{value}` must have 0 <= used <= total and total > 0"),
+        });
+    }
+    let reserve_floor_percent = campaign
+        .budget_policy
+        .reserve_floors
+        .iter()
+        .find(|floor| floor.resource == resource_id)
+        .map(|floor| floor.floor_percent)
+        .unwrap_or(0);
+    Ok(ResourceClassDefinition {
+        resource_id: resource_id.to_string(),
+        unit: "percent".to_string(),
+        total_units,
+        used_units,
+        reserve_floor_percent,
+        reset_window: reset_window.to_string(),
+        notes: "provided by schedule dry-run command".to_string(),
+    })
+}
+
+pub fn parse_schedule_estimates(
+    values: &[String],
+    campaign: &EvolutionCampaign,
+    resources: &[ResourceClassDefinition],
+) -> Result<Vec<ResourceUsageEstimate>, EvolutionInputParseError> {
+    if values.is_empty() {
+        return Ok(default_resource_usage_estimates(campaign, resources));
+    }
+
+    values
+        .iter()
+        .map(|value| parse_schedule_estimate(value, campaign))
+        .collect()
+}
+
+pub fn parse_background_tick_estimates(
+    values: &[String],
+    campaigns: &[EvolutionCampaign],
+) -> Result<Vec<ResourceUsageEstimate>, EvolutionInputParseError> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(first_campaign) = campaigns.first() else {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: "background estimates need at least one campaign".to_string(),
+        });
+    };
+    values
+        .iter()
+        .map(|value| parse_schedule_estimate(value, first_campaign))
+        .collect()
+}
+
+pub fn parse_schedule_estimate(
+    value: &str,
+    campaign: &EvolutionCampaign,
+) -> Result<ResourceUsageEstimate, EvolutionInputParseError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let (task_id, resource, units) = match parts.as_slice() {
+        [resource, units] => {
+            let Some(task) = campaign.near_term_tasks.first() else {
+                return Err(EvolutionInputParseError::Invalid {
+                    detail: "cannot infer task id because campaign has no near-term tasks"
+                        .to_string(),
+                });
+            };
+            (task.task_id.clone(), resource.trim(), units.trim())
+        }
+        [task_id, resource, units] => (task_id.trim().to_string(), resource.trim(), units.trim()),
+        _ => {
+            return Err(EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "estimate `{value}` must look like resource:units or task:resource:units"
+                ),
+            });
+        }
+    };
+    if resource.is_empty() || units.is_empty() {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: format!("estimate `{value}` must include resource and units"),
+        });
+    }
+    let estimated_units =
+        units
+            .parse::<u64>()
+            .map_err(|source| EvolutionInputParseError::Invalid {
+                detail: format!("invalid estimated units in `{value}`: {source}"),
+            })?;
+    Ok(ResourceUsageEstimate {
+        task_id,
+        resource: resource.to_string(),
+        estimated_units,
+        actual_units: None,
+    })
+}
+
+pub fn background_resource_classes_from_campaign_reserve_floors(
+    campaigns: &[EvolutionCampaign],
+    notes: &str,
+) -> Vec<ResourceClassDefinition> {
+    let mut resources: Vec<ResourceClassDefinition> = Vec::new();
+    for campaign in campaigns {
+        for floor in &campaign.budget_policy.reserve_floors {
+            if let Some(resource) = resources
+                .iter_mut()
+                .find(|resource| resource.resource_id == floor.resource)
+            {
+                resource.reserve_floor_percent =
+                    resource.reserve_floor_percent.max(floor.floor_percent);
+            } else {
+                resources.push(resource_class_from_reserve_floor(floor, notes));
+            }
+        }
+    }
+    resources
+}
+
+pub fn background_tick_fallback_campaign() -> EvolutionCampaign {
+    EvolutionCampaign {
+        campaign_id: "background_tick".to_string(),
+        status: EvolutionCampaignStatus::Scheduled,
+        objective_card: ObjectiveCard {
+            objective_id: "objective_background_tick".to_string(),
+            human_text: "background scheduler tick".to_string(),
+            interpreted_goal: "background scheduler tick".to_string(),
+            non_goals: Vec::new(),
+            assumptions: Vec::new(),
+            constraints: Vec::new(),
+            success_metrics: Vec::new(),
+            failure_conditions: Vec::new(),
+            safety_notes: Vec::new(),
+            resource_policy: "background".to_string(),
+            approval_policy: "manual-only".to_string(),
+            initial_horizon: "24h".to_string(),
+            assumptions_needing_human_review: Vec::new(),
+        },
+        stages: Vec::new(),
+        near_term_tasks: Vec::new(),
+        iteration_results: Vec::new(),
+        decisions: Vec::new(),
+        budget_policy: CampaignBudgetPolicy {
+            policy_id: "background".to_string(),
+            reserve_floors: Vec::new(),
+            scheduling_notes: Vec::new(),
+            confidence: "unknown".to_string(),
+            debt_note: "unknown".to_string(),
+        },
+        resource_schedule_preview: ResourceSchedulePreview {
+            horizon: "24h".to_string(),
+            entries: Vec::new(),
+        },
+        approval_checkpoint: ApprovalCheckpoint {
+            policy: "manual-only".to_string(),
+            status: ApprovalCheckpointStatus::Approved,
+            required_before: "background tick".to_string(),
+            editable_fields: Vec::new(),
+            possible_actions: Vec::new(),
+        },
+        target_ring: TrustRing::R1TrustedRuntime,
+        dry_run: true,
+        capability_registry_required: Some(false),
+        created_at: "unknown-time".to_string(),
+        updated_at: "unknown-time".to_string(),
+        source_repo: None,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ResourceUsageEstimate {
     pub task_id: String,
@@ -516,6 +1026,67 @@ pub enum ClusterLongHorizonWorkloadStatus {
     PausedHuman,
     Complete,
     Cancelled,
+}
+
+pub fn new_cluster_long_horizon_workload(
+    system: impl Into<String>,
+    workload_id: impl Into<String>,
+    title: impl Into<String>,
+    status: ClusterLongHorizonWorkloadStatus,
+    evidence_refs: Vec<String>,
+) -> ClusterLongHorizonWorkload {
+    let terminal = cluster_long_horizon_workload_status_is_terminal(&status);
+    ClusterLongHorizonWorkload {
+        workload_id: workload_id.into(),
+        system: system.into(),
+        title: title.into(),
+        status,
+        resource_estimates: Vec::new(),
+        human_checkpoint_required: false,
+        terminal,
+        evidence_refs,
+    }
+}
+
+pub fn cluster_long_horizon_workload_status_is_terminal(
+    status: &ClusterLongHorizonWorkloadStatus,
+) -> bool {
+    matches!(
+        status,
+        ClusterLongHorizonWorkloadStatus::Complete | ClusterLongHorizonWorkloadStatus::Cancelled
+    )
+}
+
+pub fn ensure_cluster_long_horizon_workload<'a>(
+    workloads: &'a mut Vec<ClusterLongHorizonWorkload>,
+    system: &str,
+    workload_id: &str,
+) -> &'a mut ClusterLongHorizonWorkload {
+    if let Some(index) = workloads
+        .iter()
+        .position(|workload| workload.system == system && workload.workload_id == workload_id)
+    {
+        return &mut workloads[index];
+    }
+    workloads.push(new_cluster_long_horizon_workload(
+        system,
+        workload_id,
+        workload_id,
+        ClusterLongHorizonWorkloadStatus::Ready,
+        Vec::new(),
+    ));
+    workloads
+        .last_mut()
+        .expect("just inserted external workload")
+}
+
+pub fn require_cluster_long_horizon_workload_human_checkpoint(
+    workload: &mut ClusterLongHorizonWorkload,
+) {
+    workload.human_checkpoint_required = true;
+    if workload.status == ClusterLongHorizonWorkloadStatus::Ready {
+        workload.status = ClusterLongHorizonWorkloadStatus::PausedHuman;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1299,8 +1870,162 @@ pub fn plan_background_scheduling_tick(
     }
 }
 
-fn cluster_workload_key(workload: &ClusterLongHorizonWorkload) -> String {
+pub fn cluster_workload_key(workload: &ClusterLongHorizonWorkload) -> String {
     format!("{}:{}", workload.system, workload.workload_id)
+}
+
+pub fn parse_background_tick_external_workloads(
+    workload_specs: &[String],
+    estimate_specs: &[String],
+    checkpoint_specs: &[String],
+) -> Result<Vec<ClusterLongHorizonWorkload>, EvolutionInputParseError> {
+    let mut workloads = Vec::new();
+    for spec in workload_specs {
+        let workload = parse_external_workload_spec(spec)?;
+        if workloads
+            .iter()
+            .any(|existing: &ClusterLongHorizonWorkload| {
+                existing.system == workload.system && existing.workload_id == workload.workload_id
+            })
+        {
+            return Err(EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "duplicate external workload `{}`",
+                    cluster_workload_key(&workload)
+                ),
+            });
+        }
+        workloads.push(workload);
+    }
+    for spec in estimate_specs {
+        let (system, workload_id, estimate) = parse_external_workload_estimate(spec)?;
+        let workload = ensure_cluster_long_horizon_workload(&mut workloads, &system, &workload_id);
+        workload.resource_estimates.push(estimate);
+    }
+    for spec in checkpoint_specs {
+        let (system, workload_id) = parse_external_workload_key(spec)?;
+        let workload = ensure_cluster_long_horizon_workload(&mut workloads, &system, &workload_id);
+        require_cluster_long_horizon_workload_human_checkpoint(workload);
+    }
+    Ok(workloads)
+}
+
+pub fn parse_external_workload_spec(
+    value: &str,
+) -> Result<ClusterLongHorizonWorkload, EvolutionInputParseError> {
+    let parts: Vec<&str> = value.splitn(4, ':').collect();
+    let [system, workload_id, status, title] = match parts.as_slice() {
+        [system, workload_id, status] => [*system, *workload_id, *status, *workload_id],
+        [system, workload_id, status, title] => [*system, *workload_id, *status, *title],
+        _ => {
+            return Err(EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "external workload `{value}` must look like system:workload_id:status[:title]"
+                ),
+            });
+        }
+    };
+    if system.trim().is_empty() || workload_id.trim().is_empty() {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: format!("external workload `{value}` needs non-empty system and workload id"),
+        });
+    }
+    let status = parse_external_workload_status(status)?;
+    Ok(new_cluster_long_horizon_workload(
+        system.trim(),
+        workload_id.trim(),
+        title.trim(),
+        status,
+        vec!["sinomo evolve tick external workload input".to_string()],
+    ))
+}
+
+pub fn parse_external_workload_estimate(
+    value: &str,
+) -> Result<(String, String, ResourceUsageEstimate), EvolutionInputParseError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let [system, workload_id, resource, units] = match parts.as_slice() {
+        [system, workload_id, resource, units] => [*system, *workload_id, *resource, *units],
+        _ => {
+            return Err(EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "external workload estimate `{value}` must look like system:workload_id:resource:units"
+                ),
+            });
+        }
+    };
+    if system.trim().is_empty() || workload_id.trim().is_empty() || resource.trim().is_empty() {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: format!(
+                "external workload estimate `{value}` needs non-empty system, workload id, and resource"
+            ),
+        });
+    }
+    let estimated_units =
+        units
+            .trim()
+            .parse::<u64>()
+            .map_err(|source| EvolutionInputParseError::Invalid {
+                detail: format!("invalid external workload estimate `{value}`: {source}"),
+            })?;
+    Ok((
+        system.trim().to_string(),
+        workload_id.trim().to_string(),
+        ResourceUsageEstimate {
+            task_id: workload_id.trim().to_string(),
+            resource: resource.trim().to_string(),
+            estimated_units,
+            actual_units: None,
+        },
+    ))
+}
+
+pub fn parse_external_workload_key(
+    value: &str,
+) -> Result<(String, String), EvolutionInputParseError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let [system, workload_id] = match parts.as_slice() {
+        [system, workload_id] => [*system, *workload_id],
+        _ => {
+            return Err(EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "external workload key `{value}` must look like system:workload_id"
+                ),
+            });
+        }
+    };
+    if system.trim().is_empty() || workload_id.trim().is_empty() {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: format!(
+                "external workload key `{value}` needs non-empty system and workload id"
+            ),
+        });
+    }
+    Ok((system.trim().to_string(), workload_id.trim().to_string()))
+}
+
+pub fn parse_external_workload_status(
+    value: &str,
+) -> Result<ClusterLongHorizonWorkloadStatus, EvolutionInputParseError> {
+    match value {
+        "ready" => Ok(ClusterLongHorizonWorkloadStatus::Ready),
+        "running" => Ok(ClusterLongHorizonWorkloadStatus::Running),
+        "paused-budget" => Ok(ClusterLongHorizonWorkloadStatus::PausedBudget),
+        "paused-human" => Ok(ClusterLongHorizonWorkloadStatus::PausedHuman),
+        "complete" => Ok(ClusterLongHorizonWorkloadStatus::Complete),
+        "cancelled" | "canceled" => Ok(ClusterLongHorizonWorkloadStatus::Cancelled),
+        _ => Err(EvolutionInputParseError::Invalid {
+            detail: format!(
+                "unknown external workload status `{value}`; expected ready, running, paused-budget, paused-human, complete, or cancelled"
+            ),
+        }),
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum EvolutionInputParseError {
+    #[error("{detail}")]
+    Invalid { detail: String },
 }
 
 fn lease_estimates_against_cluster_resources(
@@ -1465,23 +2190,13 @@ fn default_resource_classes(campaign: &EvolutionCampaign) -> Vec<ResourceClassDe
                     .to_string(),
         }];
     }
-    campaign
-        .budget_policy
-        .reserve_floors
-        .iter()
-        .map(|floor| ResourceClassDefinition {
-            resource_id: floor.resource.clone(),
-            unit: "percent".to_string(),
-            total_units: 100,
-            used_units: 0,
-            reserve_floor_percent: floor.floor_percent,
-            reset_window: "current reset window".to_string(),
-            notes: "derived from campaign reserve-floor config".to_string(),
-        })
-        .collect()
+    resource_classes_from_reserve_floors(
+        &campaign.budget_policy.reserve_floors,
+        "derived from campaign reserve-floor config",
+    )
 }
 
-fn default_resource_usage_estimates(
+pub fn default_resource_usage_estimates(
     campaign: &EvolutionCampaign,
     resources: &[ResourceClassDefinition],
 ) -> Vec<ResourceUsageEstimate> {
@@ -2765,6 +3480,122 @@ impl WorkspaceAdapter for GitWorkspaceAdapter {
     }
 }
 
+pub fn commit_and_fast_forward_approved_candidate(
+    record: &StoredEvolutionJob,
+) -> Result<(), WorkspaceError> {
+    let worktree = &record.candidate_workspace.path;
+    run_git_command(worktree, &["add", "-A"])?;
+    let status = run_git_command(worktree, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        run_git_command(
+            worktree,
+            &[
+                "commit",
+                "-m",
+                &format!("Apply evolution job {}", record.job.job_id),
+            ],
+        )?;
+    }
+    let source_root = Path::new(&record.job.edit_scope.workspace_root);
+    run_git_command(
+        source_root,
+        &[
+            "merge",
+            "--ff-only",
+            &record.candidate_workspace.branch_name,
+        ],
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvolutionCleanupSummary {
+    pub job_id: EvolutionJobId,
+    pub worktree_path: PathBuf,
+    pub job_dir: PathBuf,
+    pub bundle_path: Option<PathBuf>,
+}
+
+pub fn cleanup_stored_evolution_job(
+    paths: &EvolutionPaths,
+    record: &StoredEvolutionJob,
+) -> Result<EvolutionCleanupSummary, WorkspaceError> {
+    let worktree_path = record.candidate_workspace.path.clone();
+    if worktree_path.exists() {
+        let output = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&worktree_path)
+            .current_dir(Path::new(&record.job.edit_scope.workspace_root))
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                fs::remove_dir_all(&worktree_path).map_err(|source| WorkspaceError::Io {
+                    path: worktree_path.display().to_string(),
+                    detail: format!(
+                        "git worktree remove failed: {}; remove_dir_all failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim(),
+                        source
+                    ),
+                })?;
+            }
+            Err(error) => {
+                fs::remove_dir_all(&worktree_path).map_err(|source| WorkspaceError::Io {
+                    path: worktree_path.display().to_string(),
+                    detail: format!(
+                        "git worktree remove could not start: {}; remove_dir_all failed: {}",
+                        error, source
+                    ),
+                })?;
+            }
+        }
+    }
+
+    let job_dir = paths.job_dir(&record.job.job_id);
+    if job_dir.exists() {
+        fs::remove_dir_all(&job_dir).map_err(|source| WorkspaceError::Io {
+            path: job_dir.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+
+    let bundle_path = PathBuf::from(&record.bundle.bundle_path);
+    let removed_bundle_path = if bundle_path.exists() && bundle_path != job_dir {
+        fs::remove_dir_all(&bundle_path).map_err(|source| WorkspaceError::Io {
+            path: bundle_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        Some(bundle_path)
+    } else {
+        None
+    };
+
+    Ok(EvolutionCleanupSummary {
+        job_id: record.job.job_id.clone(),
+        worktree_path,
+        job_dir,
+        bundle_path: removed_bundle_path,
+    })
+}
+
+fn run_git_command(cwd: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|source| WorkspaceError::Git {
+            command: format!("git {}", args.join(" ")),
+            detail: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(WorkspaceError::Git {
+            command: format!("git {}", args.join(" ")),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 pub fn parse_git_status_paths(status: &str) -> Result<Vec<String>, String> {
     let mut paths = Vec::new();
     for line in status.lines().filter(|line| !line.trim().is_empty()) {
@@ -3220,6 +4051,143 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
             tool_results: all_tool_results,
             model_turns,
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EvolutionLanguageModelMutationModel {
+    pub provider: String,
+    pub model: String,
+    pub data_dir: SinomoDataDir,
+}
+
+impl MutationModel for EvolutionLanguageModelMutationModel {
+    fn mutate(
+        &self,
+        packet: &MutationPacket,
+        workspace: &CandidateWorkspace,
+    ) -> Result<ModelMutationResult, MutationModelError> {
+        match self.provider.as_str() {
+            GitHubCopilotProvider::PROVIDER_ID => {
+                let credentials_path = self
+                    .data_dir
+                    .provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
+                let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
+                    client_id: env::var("SINOMO_COPILOT_CLIENT_ID")
+                        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id),
+                    github_host: env::var("SINOMO_COPILOT_GITHUB_HOST")
+                        .unwrap_or_else(|_| GitHubCopilotConfig::default().github_host),
+                    api_base_url: env::var("SINOMO_COPILOT_API_BASE_URL")
+                        .unwrap_or_else(|_| GitHubCopilotConfig::default().api_base_url),
+                    default_model: model_or_default(
+                        &self.model,
+                        GitHubCopilotConfig::default().default_model,
+                    ),
+                    token_store_path: Some(credentials_path),
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            GitHubCopilotCliProvider::PROVIDER_ID => {
+                let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
+                    model: model_or_default(&self.model, GitHubCopilotCliConfig::default().model),
+                    ..GitHubCopilotCliConfig::default()
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            CodexCliProvider::PROVIDER_ID => {
+                let provider = CodexCliProvider::new(CodexCliConfig {
+                    model: model_or_default(&self.model, CODEX_CLI_DEFAULT_MODEL.to_string()),
+                    working_dir: Some(workspace.path.clone()),
+                    ..CodexCliConfig::default()
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            CODEX_PROVIDER_ID => {
+                let provider = codex_provider_for_model(&self.model);
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
+                let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
+                    model: model_or_default(&self.model, CLAUDE_CODE_DEFAULT_MODEL.to_string()),
+                    working_dir: Some(workspace.path.clone()),
+                    ..ClaudeCodeConfig::default()
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            AnthropicProvider::PROVIDER_ID | "claude" => {
+                let credentials_path = self
+                    .data_dir
+                    .provider_credentials_file(AnthropicProvider::PROVIDER_ID);
+                let provider = AnthropicProvider::new(AnthropicConfig {
+                    default_model: model_or_default(
+                        &self.model,
+                        AnthropicConfig::default().default_model,
+                    ),
+                    credentials_path: Some(credentials_path),
+                    ..AnthropicConfig::default()
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            OpenAiProvider::PROVIDER_ID | "openai-api" => {
+                let credentials_path = self
+                    .data_dir
+                    .provider_credentials_file(OpenAiProvider::PROVIDER_ID);
+                let provider = OpenAiProvider::new(OpenAiConfig {
+                    default_model: model_or_default(
+                        &self.model,
+                        OpenAiConfig::default().default_model,
+                    ),
+                    credentials_path: Some(credentials_path),
+                    ..OpenAiConfig::default()
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            GeminiProvider::PROVIDER_ID | "google-gemini" => {
+                let credentials_path = self
+                    .data_dir
+                    .provider_credentials_file(GeminiProvider::PROVIDER_ID);
+                let provider = GeminiProvider::new(GeminiConfig {
+                    default_model: model_or_default(
+                        &self.model,
+                        GeminiConfig::default().default_model,
+                    ),
+                    credentials_path: Some(credentials_path),
+                    ..GeminiConfig::default()
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            NvidiaProvider::PROVIDER_ID => {
+                let credentials_path = self
+                    .data_dir
+                    .provider_credentials_file(NvidiaProvider::PROVIDER_ID);
+                let provider = NvidiaProvider::new(NvidiaConfig {
+                    api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
+                        .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
+                    default_model: model_or_default(
+                        &self.model,
+                        NvidiaConfig::default().default_model,
+                    ),
+                    credentials_path: Some(credentials_path),
+                });
+                LanguageModelMutationBridge::new(provider, self.model.clone())
+                    .mutate(packet, workspace)
+            }
+            _ => Err(MutationModelError::LanguageModel(
+                LanguageModelError::ProviderInvocationFailed {
+                    provider: self.provider.clone(),
+                    model: self.model.clone(),
+                    detail: "unknown evolution model provider".to_string(),
+                },
+            )),
+        }
     }
 }
 
@@ -3733,6 +4701,32 @@ impl IfEmpty for String {
     }
 }
 
+pub fn verify_stored_evolution_job<R: CommandRunner>(
+    paths: &EvolutionPaths,
+    record: StoredEvolutionJob,
+    harness: &ExecutingEvalHarness<R>,
+) -> Result<RecordedCandidateVerification, EvolutionError> {
+    let (scorecard, results) = harness.run_verification_plan(
+        record.job.verification.clone(),
+        &record.candidate_workspace.path,
+    )?;
+    record_candidate_verification(paths, record, &scorecard, &results).map_err(Into::into)
+}
+
+pub fn decide_stored_evolution_job(
+    paths: &EvolutionPaths,
+    record: StoredEvolutionJob,
+    outcome: CandidateDecisionOutcome,
+    decided_by: impl Into<String>,
+    note: impl Into<String>,
+) -> Result<RecordedCandidateDecision, EvolutionError> {
+    let recorded = record_candidate_decision(paths, record, outcome.clone(), decided_by, note)?;
+    if outcome == CandidateDecisionOutcome::Approved {
+        commit_and_fast_forward_approved_candidate(&recorded.record)?;
+    }
+    Ok(recorded)
+}
+
 #[derive(Debug, Error)]
 pub enum EvolutionError {
     #[error(transparent)]
@@ -3902,6 +4896,7 @@ fn trust_ring_hint(target_ring: &TrustRing) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::read_stored_job;
     use sinomo_lm::{
         LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
         PROVIDER_DEFAULT_MODEL,
@@ -3985,6 +4980,429 @@ mod tests {
             ApprovalCheckpointStatus::AwaitingHuman
         );
         assert!(proposal.capability_registry_required == Some(false));
+    }
+
+    #[test]
+    fn external_workload_helpers_create_defaults_and_reuse_existing_records() {
+        let mut workloads = Vec::new();
+        let workload =
+            ensure_cluster_long_horizon_workload(&mut workloads, "backup", "snapshot-01");
+        workload.resource_estimates.push(ResourceUsageEstimate {
+            task_id: "snapshot-01".to_string(),
+            resource: "coding-plan-weekly".to_string(),
+            estimated_units: 10,
+            actual_units: None,
+        });
+
+        let same = ensure_cluster_long_horizon_workload(&mut workloads, "backup", "snapshot-01");
+
+        assert_eq!(same.title, "snapshot-01");
+        assert_eq!(same.status, ClusterLongHorizonWorkloadStatus::Ready);
+        assert_eq!(same.resource_estimates.len(), 1);
+        assert_eq!(workloads.len(), 1);
+    }
+
+    #[test]
+    fn external_workload_human_checkpoint_pauses_ready_workload() {
+        let mut workload = new_cluster_long_horizon_workload(
+            "curation",
+            "dataset-42",
+            "Dataset 42",
+            ClusterLongHorizonWorkloadStatus::Ready,
+            Vec::new(),
+        );
+
+        require_cluster_long_horizon_workload_human_checkpoint(&mut workload);
+
+        assert!(workload.human_checkpoint_required);
+        assert_eq!(
+            workload.status,
+            ClusterLongHorizonWorkloadStatus::PausedHuman
+        );
+        assert_eq!(cluster_workload_key(&workload), "curation:dataset-42");
+    }
+
+    #[test]
+    fn external_workload_parser_merges_estimates_and_checkpoints() {
+        let workloads = parse_background_tick_external_workloads(
+            &["backup:snapshot-01:ready:Backup snapshot".to_string()],
+            &["backup:snapshot-01:cluster-hours:40".to_string()],
+            &["curation:dataset-42".to_string()],
+        )
+        .expect("workloads");
+
+        assert_eq!(workloads.len(), 2);
+        assert_eq!(workloads[0].system, "backup");
+        assert_eq!(workloads[0].title, "Backup snapshot");
+        assert_eq!(workloads[0].resource_estimates[0].resource, "cluster-hours");
+        assert_eq!(workloads[0].resource_estimates[0].estimated_units, 40);
+        assert_eq!(workloads[1].system, "curation");
+        assert!(workloads[1].human_checkpoint_required);
+        assert_eq!(
+            workloads[1].status,
+            ClusterLongHorizonWorkloadStatus::PausedHuman
+        );
+    }
+
+    #[test]
+    fn external_workload_parser_rejects_duplicate_specs() {
+        let error = parse_background_tick_external_workloads(
+            &[
+                "backup:snapshot-01:ready".to_string(),
+                "backup:snapshot-01:running".to_string(),
+            ],
+            &[],
+            &[],
+        )
+        .expect_err("duplicate workload");
+
+        assert!(matches!(
+            error,
+            EvolutionInputParseError::Invalid { detail } if detail.contains("duplicate external workload")
+        ));
+    }
+
+    #[test]
+    fn reserve_floor_parser_accepts_percent_and_rejects_invalid_values() {
+        let floors = parse_reserve_floors(&["coding-plan-weekly:30%".to_string()]).expect("floors");
+        assert_eq!(
+            floors,
+            vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30
+            }]
+        );
+
+        let error = parse_reserve_floor("coding-plan-weekly:130%").expect_err("invalid floor");
+        assert!(matches!(
+            error,
+            EvolutionInputParseError::Invalid { detail } if detail.contains("0-100 percent")
+        ));
+    }
+
+    #[test]
+    fn campaign_proposal_request_preparation_applies_defaults() {
+        let request = prepare_campaign_proposal_request(CampaignProposalInput {
+            objective: "improve the scheduler".to_string(),
+            horizon: None,
+            budget_policy: None,
+            reserve_floor_specs: vec!["coding-plan-weekly:25%".to_string()],
+            approval_policy: None,
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: true,
+            dry_run: true,
+            approved: false,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        })
+        .expect("request");
+
+        assert_eq!(request.horizon, "30 days");
+        assert_eq!(request.budget_policy, "free-and-prepaid");
+        assert_eq!(request.approval_policy, "stage-rollout");
+        assert_eq!(request.reserve_floors[0].resource, "coding-plan-weekly");
+        assert_eq!(request.reserve_floors[0].floor_percent, 25);
+        assert_eq!(request.max_wall_time.as_deref(), Some("10m"));
+        assert!(request.pause_after_proposal);
+        assert!(request.dry_run);
+    }
+
+    #[test]
+    fn evolution_request_preparation_selects_model_defaults_and_verification() {
+        let prepared = prepare_evolution_request(EvolutionRequestInput {
+            objective: "refactor the scheduler".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            intended_paths: vec!["crates/sinomo-evolution".to_string()],
+            verification_commands: vec!["cargo test -p sinomo-evolution".to_string()],
+            provider: None,
+            model: None,
+            default_provider: Some("google-gemini".to_string()),
+            default_model: Some("gemini-2.5-pro".to_string()),
+            dry_run: false,
+        })
+        .expect("prepared request");
+
+        assert_eq!(prepared.provider, GeminiProvider::PROVIDER_ID);
+        assert_eq!(prepared.model, "gemini-2.5-pro");
+        assert_eq!(
+            prepared.request.model_provider.as_deref(),
+            Some(GeminiProvider::PROVIDER_ID)
+        );
+        assert_eq!(prepared.request.model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(prepared.request.verification_commands.len(), 1);
+        assert_eq!(prepared.request.verification_commands[0].name, "verify-1");
+        assert_eq!(
+            prepared.request.verification_commands[0].gate,
+            EvaluationGate::StaticChecks
+        );
+    }
+
+    #[test]
+    fn evolution_request_preparation_rejects_unknown_provider() {
+        let error = prepare_evolution_request(EvolutionRequestInput {
+            objective: "refactor the scheduler".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            intended_paths: Vec::new(),
+            verification_commands: Vec::new(),
+            provider: Some("unknown-provider".to_string()),
+            model: None,
+            default_provider: None,
+            default_model: None,
+            dry_run: true,
+        })
+        .expect_err("unknown provider");
+
+        assert!(matches!(
+            error,
+            EvolutionInputParseError::Invalid { detail } if detail.contains("unknown provider")
+        ));
+    }
+
+    #[test]
+    fn stage_evaluation_input_parsers_accept_known_formats() {
+        assert_eq!(
+            parse_failure_class("rollout-failure").expect("failure class"),
+            EvolutionFailureClass::RolloutFailure
+        );
+        let usage = parse_stage_resource_usage("task-1:cluster-hours:8:6", None).expect("usage");
+        assert_eq!(usage.task_id, "task-1");
+        assert_eq!(usage.resource, "cluster-hours");
+        assert_eq!(usage.estimated_units, 8);
+        assert_eq!(usage.actual_units, Some(6));
+
+        let inferred =
+            parse_stage_resource_usage("cluster-hours:5", Some("task-2")).expect("inferred");
+        assert_eq!(inferred.task_id, "task-2");
+        assert_eq!(inferred.actual_units, None);
+    }
+
+    #[test]
+    fn stage_resource_usage_parser_requires_task_context() {
+        let error = parse_stage_resource_usage("cluster-hours:5", None).expect_err("missing task");
+        assert!(matches!(
+            error,
+            EvolutionInputParseError::Invalid { detail } if detail.contains("needs --task first")
+        ));
+    }
+
+    #[test]
+    fn external_workload_constructor_marks_terminal_statuses() {
+        let workload = new_cluster_long_horizon_workload(
+            "ops",
+            "complete-01",
+            "complete-01",
+            ClusterLongHorizonWorkloadStatus::Complete,
+            Vec::new(),
+        );
+
+        assert!(workload.terminal);
+    }
+
+    #[test]
+    fn resource_classes_can_be_derived_from_reserve_floors() {
+        let resources = resource_classes_from_reserve_floors(
+            &[ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            "derived in test",
+        );
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].resource_id, "coding-plan-weekly");
+        assert_eq!(resources[0].total_units, 100);
+        assert_eq!(resources[0].reserve_floor_percent, 30);
+        assert_eq!(resources[0].notes, "derived in test");
+    }
+
+    #[test]
+    fn background_resource_classes_merge_duplicate_reserve_floors() {
+        let mut campaign_a = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "improve the scheduler".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: None,
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: None,
+        });
+        let mut campaign_b = campaign_a.clone();
+        campaign_a.campaign_id = "camp_a".to_string();
+        campaign_b.campaign_id = "camp_b".to_string();
+        campaign_b.budget_policy.reserve_floors[0].floor_percent = 45;
+
+        let resources = background_resource_classes_from_campaign_reserve_floors(
+            &[campaign_a, campaign_b],
+            "derived in test",
+        );
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].resource_id, "coding-plan-weekly");
+        assert_eq!(resources[0].reserve_floor_percent, 45);
+    }
+
+    #[test]
+    fn default_resource_usage_estimates_use_first_task_and_resource() {
+        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "improve the scheduler".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: None,
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: None,
+        });
+        let resources = resource_classes_from_reserve_floors(
+            &campaign.budget_policy.reserve_floors,
+            "derived in test",
+        );
+
+        let estimates = default_resource_usage_estimates(&campaign, &resources);
+
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(estimates[0].task_id, campaign.near_term_tasks[0].task_id);
+        assert_eq!(estimates[0].resource, "coding-plan-weekly");
+        assert_eq!(estimates[0].estimated_units, 10);
+    }
+
+    #[test]
+    fn schedule_resource_parser_uses_campaign_reserve_floor() {
+        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "improve the scheduler".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 35,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: None,
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: None,
+        });
+
+        let resource = parse_schedule_resource("coding-plan-weekly:75/100:weekly", &campaign)
+            .expect("resource");
+
+        assert_eq!(resource.resource_id, "coding-plan-weekly");
+        assert_eq!(resource.used_units, 75);
+        assert_eq!(resource.total_units, 100);
+        assert_eq!(resource.reserve_floor_percent, 35);
+        assert_eq!(resource.reset_window, "weekly");
+    }
+
+    #[test]
+    fn schedule_parsers_derive_defaults_from_campaign() {
+        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "improve the scheduler".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: None,
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: None,
+        });
+
+        let resources = parse_schedule_resources(&[], &campaign).expect("resources");
+        let estimates = parse_schedule_estimates(&[], &campaign, &resources).expect("estimates");
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].resource_id, "coding-plan-weekly");
+        assert_eq!(resources[0].reserve_floor_percent, 30);
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(estimates[0].task_id, campaign.near_term_tasks[0].task_id);
+        assert_eq!(estimates[0].resource, "coding-plan-weekly");
+        assert_eq!(estimates[0].estimated_units, 10);
+    }
+
+    #[test]
+    fn background_tick_estimates_require_campaign_context() {
+        let error = parse_background_tick_estimates(&["coding-plan-weekly:10".to_string()], &[])
+            .expect_err("missing campaign");
+
+        assert!(matches!(
+            error,
+            EvolutionInputParseError::Invalid { detail } if detail.contains("at least one campaign")
+        ));
+    }
+
+    #[test]
+    fn evolution_language_model_mutation_model_reports_unknown_provider() {
+        let root = temp_dir("unknown-provider-model");
+        fs::create_dir_all(&root).expect("root");
+        let packet = MutationPacket {
+            job_id: EvolutionJobId::from_legacy_named("evojob_unknown_provider").expect("job"),
+            objective: "test unknown provider".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            edit_scope: EditScope {
+                workspace_root: root.display().to_string(),
+                intended_paths: vec!["README.md".to_string()],
+                notes: "test".to_string(),
+            },
+            relevant_files: Vec::new(),
+            verification: VerificationPlan {
+                commands: Vec::new(),
+            },
+            output_contract: MutationOutputContract::default(),
+            recovery: RecoveryPlan::default(),
+        };
+        let model = EvolutionLanguageModelMutationModel {
+            provider: "unknown-provider".to_string(),
+            model: "test-model".to_string(),
+            data_dir: SinomoDataDir::new(root.join("data")),
+        };
+
+        let error = model
+            .mutate(&packet, &candidate_workspace(&root))
+            .expect_err("unknown provider should fail");
+
+        assert!(matches!(
+            error,
+            MutationModelError::LanguageModel(LanguageModelError::ProviderInvocationFailed {
+                provider,
+                model,
+                ..
+            }) if provider == "unknown-provider" && model == "test-model"
+        ));
+    }
+
+    #[test]
+    fn background_tick_fallback_campaign_describes_scheduler_context() {
+        let campaign = background_tick_fallback_campaign();
+
+        assert_eq!(campaign.campaign_id, "background_tick");
+        assert_eq!(campaign.status, EvolutionCampaignStatus::Scheduled);
+        assert_eq!(campaign.objective_card.resource_policy, "background");
+        assert_eq!(
+            campaign.approval_checkpoint.status,
+            ApprovalCheckpointStatus::Approved
+        );
+        assert_eq!(campaign.target_ring, TrustRing::R1TrustedRuntime);
+        assert!(campaign.dry_run);
     }
 
     #[test]
@@ -5314,6 +6732,279 @@ mod tests {
         );
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(jobs_root);
+    }
+
+    #[test]
+    fn verify_stored_evolution_job_runs_plan_and_records_scorecard() {
+        let source = git_repo("verify-stored-job-source");
+        fs::write(source.join("README.md"), "# source\n").expect("readme");
+        run_in(&source, "git add README.md").expect("git add");
+        run_in(&source, "git commit -m init").expect("git commit");
+        let data_root = temp_dir("verify-stored-job-data");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&data_root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let jobs_root = temp_dir("verify-stored-job-jobs");
+        let job = create_bootstrap_job(
+            &EvolutionRequest {
+                objective: "verify stored candidate".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["README.md".to_string()],
+                verification_commands: vec![VerificationCommand {
+                    name: "verify".to_string(),
+                    command: "printf verified".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }],
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            &source,
+        );
+        let workspace = GitWorkspaceAdapter::new(&source, &jobs_root)
+            .prepare_candidate(&job)
+            .expect("candidate");
+        let bundle_dir = paths.job_dir(&job.job_id).join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle");
+        let record = StoredEvolutionJob {
+            job: job.clone(),
+            candidate_workspace: workspace.clone(),
+            bundle: CandidateBundleManifest {
+                job_id: job.job_id.clone(),
+                bundle_path: bundle_dir.display().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: String::new(),
+                job_path: None,
+                model_output_path: None,
+                changed_files_path: None,
+                diff_path: None,
+                scorecard_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: None,
+            changed_files: Vec::new(),
+            decision: None,
+        };
+        let harness = ExecutingEvalHarness::new(LocalCommandRunner::new());
+
+        let recorded = verify_stored_evolution_job(&paths, record, &harness).expect("verification");
+
+        assert_eq!(
+            recorded.record.verification_outcome,
+            Some(EvaluationOutcome::Passed)
+        );
+        assert!(recorded.scorecard_path.exists());
+        assert_eq!(recorded.command_log_paths.len(), 1);
+        assert!(
+            fs::read_to_string(&recorded.command_log_paths[0])
+                .expect("command log")
+                .contains("verified")
+        );
+        let stored = read_stored_job(&paths.job_path(&job.job_id)).expect("stored");
+        assert_eq!(stored.verification_outcome, Some(EvaluationOutcome::Passed));
+        let _ = run_in(
+            &source,
+            &format!("git worktree remove --force {}", workspace.path.display()),
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(jobs_root);
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn decide_stored_evolution_job_records_rejected_decision() {
+        let data_root = temp_dir("decide-stored-job-data");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&data_root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let job = create_bootstrap_job(
+            &EvolutionRequest {
+                objective: "decide stored candidate".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["README.md".to_string()],
+                verification_commands: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            &data_root,
+        );
+        let bundle_dir = paths.job_dir(&job.job_id).join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle");
+        let record = StoredEvolutionJob {
+            job: job.clone(),
+            candidate_workspace: CandidateWorkspace {
+                job_id: job.job_id.clone(),
+                path: data_root.join("worktree"),
+                branch_name: "codex/evolve/decide-stored".to_string(),
+                source_revision: None,
+            },
+            bundle: CandidateBundleManifest {
+                job_id: job.job_id.clone(),
+                bundle_path: bundle_dir.display().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: String::new(),
+                job_path: None,
+                model_output_path: None,
+                changed_files_path: None,
+                diff_path: None,
+                scorecard_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: None,
+            changed_files: Vec::new(),
+            decision: None,
+        };
+
+        let recorded = decide_stored_evolution_job(
+            &paths,
+            record,
+            CandidateDecisionOutcome::Rejected,
+            "test-reviewer",
+            "not ready",
+        )
+        .expect("decision");
+
+        assert_eq!(recorded.record.job.status, EvolutionJobStatus::Rejected);
+        assert!(recorded.decision_path.exists());
+        let stored = read_stored_job(&paths.job_path(&job.job_id)).expect("stored");
+        assert_eq!(stored.job.status, EvolutionJobStatus::Rejected);
+        assert_eq!(stored.decision.expect("decision").note, "not ready");
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn approved_candidate_commit_fast_forwards_source_checkout() {
+        let source = git_repo("approved-candidate-source");
+        fs::write(source.join("README.md"), "# source\n").expect("readme");
+        run_in(&source, "git add README.md").expect("git add");
+        run_in(&source, "git commit -m init").expect("git commit");
+        let jobs_root = temp_dir("approved-candidate-jobs");
+        let job = create_bootstrap_job(
+            &EvolutionRequest {
+                objective: "apply approved candidate".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["README.md".to_string()],
+                verification_commands: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            &source,
+        );
+        let adapter = GitWorkspaceAdapter::new(&source, &jobs_root);
+        let workspace = adapter.prepare_candidate(&job).expect("candidate");
+        fs::write(workspace.path.join("README.md"), "# source\n\napproved\n").expect("candidate");
+        let record = StoredEvolutionJob {
+            job: job.clone(),
+            candidate_workspace: workspace.clone(),
+            bundle: CandidateBundleManifest {
+                job_id: job.job_id.clone(),
+                bundle_path: jobs_root
+                    .join(job.job_id.as_str())
+                    .join("bundle")
+                    .display()
+                    .to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: String::new(),
+                job_path: None,
+                model_output_path: None,
+                changed_files_path: None,
+                diff_path: None,
+                scorecard_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: None,
+            changed_files: vec!["README.md".to_string()],
+            decision: None,
+        };
+
+        commit_and_fast_forward_approved_candidate(&record).expect("approved candidate");
+
+        assert_eq!(
+            fs::read_to_string(source.join("README.md")).expect("source readme"),
+            "# source\n\napproved\n"
+        );
+        assert_eq!(
+            run_git_command(&source, &["log", "-1", "--pretty=%s"]).expect("log"),
+            format!("Apply evolution job {}", job.job_id)
+        );
+        let _ = run_in(
+            &source,
+            &format!("git worktree remove --force {}", workspace.path.display()),
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(jobs_root);
+    }
+
+    #[test]
+    fn cleanup_stored_evolution_job_removes_worktree_job_and_bundle_dirs() {
+        let source = git_repo("cleanup-candidate-source");
+        fs::write(source.join("README.md"), "# source\n").expect("readme");
+        run_in(&source, "git add README.md").expect("git add");
+        run_in(&source, "git commit -m init").expect("git commit");
+        let worktrees_root = temp_dir("cleanup-candidate-worktrees");
+        let data_root = temp_dir("cleanup-candidate-data");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&data_root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let job = create_bootstrap_job(
+            &EvolutionRequest {
+                objective: "cleanup approved candidate".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["README.md".to_string()],
+                verification_commands: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            &source,
+        );
+        let adapter = GitWorkspaceAdapter::new(&source, &worktrees_root);
+        let workspace = adapter.prepare_candidate(&job).expect("candidate");
+        let job_dir = paths.job_dir(&job.job_id);
+        fs::create_dir_all(&job_dir).expect("job dir");
+        fs::write(job_dir.join("record.json"), "{}").expect("record");
+        let bundle_dir = data_root.join("external-bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir");
+        fs::write(bundle_dir.join("manifest.json"), "{}").expect("manifest");
+        let record = StoredEvolutionJob {
+            job: job.clone(),
+            candidate_workspace: workspace.clone(),
+            bundle: CandidateBundleManifest {
+                job_id: job.job_id.clone(),
+                bundle_path: bundle_dir.display().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: String::new(),
+                job_path: None,
+                model_output_path: None,
+                changed_files_path: None,
+                diff_path: None,
+                scorecard_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: None,
+            changed_files: Vec::new(),
+            decision: None,
+        };
+
+        let summary = cleanup_stored_evolution_job(&paths, &record).expect("cleanup");
+
+        assert_eq!(summary.job_id, job.job_id);
+        assert_eq!(summary.worktree_path, workspace.path);
+        assert_eq!(summary.job_dir, job_dir);
+        assert_eq!(summary.bundle_path, Some(bundle_dir.clone()));
+        assert!(!summary.worktree_path.exists());
+        assert!(!summary.job_dir.exists());
+        assert!(!bundle_dir.exists());
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(worktrees_root);
+        let _ = fs::remove_dir_all(data_root);
     }
 
     #[test]
