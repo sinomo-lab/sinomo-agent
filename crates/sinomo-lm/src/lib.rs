@@ -191,6 +191,25 @@ pub struct CurrentDefaultModel {
     pub config_path: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedDefaultModel {
+    pub provider: String,
+    pub configured_model: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DefaultModelConfigUpdate {
+    pub config: ModelConfig,
+    pub config_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LanguageModelProviderCatalog {
+    pub provider: String,
+    pub models: Vec<String>,
+}
+
 pub fn load_model_config(paths: &ModelPaths) -> Result<ModelConfig, LanguageModelError> {
     let content =
         fs::read_to_string(&paths.config).map_err(|source| LanguageModelError::ConfigStore {
@@ -228,9 +247,22 @@ pub fn current_default_model(
 ) -> Result<CurrentDefaultModel, LanguageModelError> {
     let model_paths = ModelPaths::new(data_dir);
     let model_config = load_model_config(&model_paths).ok();
+    let resolved = resolve_default_model(model_config.as_ref(), None)?;
+    Ok(CurrentDefaultModel {
+        provider: resolved.provider,
+        configured_model: resolved.configured_model,
+        model: resolved.model,
+        config_path: model_paths.config,
+    })
+}
+
+pub fn resolve_default_model(
+    model_config: Option<&ModelConfig>,
+    fallback_config: Option<&ModelConfig>,
+) -> Result<ResolvedDefaultModel, LanguageModelError> {
     let provider = model_config
-        .as_ref()
         .and_then(|config| config.default_provider.clone())
+        .or_else(|| fallback_config.and_then(|config| config.default_provider.clone()))
         .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
     let provider = normalize_model_provider(&provider).ok_or_else(|| {
         LanguageModelError::ProviderInvocationFailed {
@@ -240,14 +272,37 @@ pub fn current_default_model(
         }
     })?;
     let configured_model = model_config
-        .as_ref()
         .and_then(|config| config.default_model.clone())
+        .or_else(|| fallback_config.and_then(|config| config.default_model.clone()))
         .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
     let model = effective_model_name(&provider, &configured_model);
-    Ok(CurrentDefaultModel {
+    Ok(ResolvedDefaultModel {
         provider,
         configured_model,
         model,
+    })
+}
+
+pub fn write_default_model_config(
+    data_dir: &SinomoDataDir,
+    provider: impl Into<String>,
+    model: impl Into<String>,
+) -> Result<DefaultModelConfigUpdate, LanguageModelError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| LanguageModelError::ConfigStore {
+            path: data_dir.root().display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let model_paths = ModelPaths::new(data_dir);
+    model_paths.ensure()?;
+    let config = ModelConfig {
+        default_provider: Some(provider.into()),
+        default_model: Some(model.into()),
+    };
+    save_model_config(&model_paths.config, &config)?;
+    Ok(DefaultModelConfigUpdate {
+        config,
         config_path: model_paths.config,
     })
 }
@@ -359,6 +414,28 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
     }
 }
 
+pub fn collect_provider_model_catalogs(
+    providers: impl IntoIterator<Item = impl AsRef<str>>,
+    explicit_provider: bool,
+) -> Result<Vec<LanguageModelProviderCatalog>, LanguageModelError> {
+    let mut catalogs = Vec::new();
+    for provider in providers {
+        let provider = provider.as_ref();
+        let models = match provider_available_model_ids(provider) {
+            Ok(models) => models,
+            Err(error) if explicit_provider => return Err(error),
+            Err(_) => continue,
+        };
+        if !models.is_empty() {
+            catalogs.push(LanguageModelProviderCatalog {
+                provider: provider.to_string(),
+                models,
+            });
+        }
+    }
+    Ok(catalogs)
+}
+
 pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, LanguageModelError> {
     match provider {
         CODEX_PROVIDER_ID => codex_provider_for_model(PROVIDER_DEFAULT_MODEL).usage(),
@@ -370,6 +447,122 @@ pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, Lang
             provider: provider.to_string(),
             model: PROVIDER_DEFAULT_MODEL.to_string(),
             detail: format!("provider `{provider}` does not expose subscription usage"),
+        }),
+    }
+}
+
+pub fn collect_provider_usage(
+    providers: impl IntoIterator<Item = impl AsRef<str>>,
+    explicit_provider: bool,
+) -> Result<Vec<LanguageModelProviderUsage>, LanguageModelError> {
+    let mut snapshots = Vec::new();
+    for provider in providers {
+        match provider_usage(provider.as_ref()) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) if explicit_provider => return Err(error),
+            Err(_) => {}
+        }
+    }
+    Ok(snapshots)
+}
+
+pub fn complete_configured_model_request(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    model: &str,
+    working_dir: Option<PathBuf>,
+    request: &LanguageModelRequest,
+) -> Result<LanguageModelResponse, LanguageModelError> {
+    let request = LanguageModelRequest {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        ..request.clone()
+    };
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let credentials_path =
+                data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
+            let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
+                client_id: env::var("SINOMO_COPILOT_CLIENT_ID")
+                    .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id),
+                github_host: env::var("SINOMO_COPILOT_GITHUB_HOST")
+                    .unwrap_or_else(|_| GitHubCopilotConfig::default().github_host),
+                api_base_url: env::var("SINOMO_COPILOT_API_BASE_URL")
+                    .unwrap_or_else(|_| GitHubCopilotConfig::default().api_base_url),
+                default_model: model_or_default(
+                    model,
+                    GitHubCopilotConfig::default().default_model,
+                ),
+                token_store_path: Some(credentials_path),
+            });
+            provider.complete(&request)
+        }
+        GitHubCopilotCliProvider::PROVIDER_ID => {
+            let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
+                model: model_or_default(model, GitHubCopilotCliConfig::default().model),
+                ..GitHubCopilotCliConfig::default()
+            });
+            provider.complete(&request)
+        }
+        CodexCliProvider::PROVIDER_ID => {
+            let provider = CodexCliProvider::new(CodexCliConfig {
+                model: model_or_default(model, CODEX_CLI_DEFAULT_MODEL.to_string()),
+                working_dir: working_dir.clone(),
+                ..CodexCliConfig::default()
+            });
+            provider.complete(&request)
+        }
+        CODEX_PROVIDER_ID => codex_provider_for_model(model).complete(&request),
+        ClaudeCodeProvider::PROVIDER_ID => {
+            let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
+                model: model_or_default(model, CLAUDE_CODE_DEFAULT_MODEL.to_string()),
+                working_dir,
+                ..ClaudeCodeConfig::default()
+            });
+            provider.complete(&request)
+        }
+        AnthropicProvider::PROVIDER_ID => {
+            let credentials_path =
+                data_dir.provider_credentials_file(AnthropicProvider::PROVIDER_ID);
+            let provider = AnthropicProvider::new(AnthropicConfig {
+                default_model: model_or_default(model, AnthropicConfig::default().default_model),
+                credentials_path: Some(credentials_path),
+                ..AnthropicConfig::default()
+            });
+            provider.complete(&request)
+        }
+        OpenAiProvider::PROVIDER_ID => {
+            let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
+            let provider = OpenAiProvider::new(OpenAiConfig {
+                default_model: model_or_default(model, OpenAiConfig::default().default_model),
+                credentials_path: Some(credentials_path),
+                ..OpenAiConfig::default()
+            });
+            provider.complete(&request)
+        }
+        GeminiProvider::PROVIDER_ID => {
+            let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
+            let provider = GeminiProvider::new(GeminiConfig {
+                default_model: model_or_default(model, GeminiConfig::default().default_model),
+                credentials_path: Some(credentials_path),
+                ..GeminiConfig::default()
+            });
+            provider.complete(&request)
+        }
+        NvidiaProvider::PROVIDER_ID => {
+            let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
+            let provider = NvidiaProvider::new(NvidiaConfig {
+                api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
+                    .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
+                default_model: model_or_default(model, NvidiaConfig::default().default_model),
+                credentials_path: Some(credentials_path),
+            });
+            provider.complete(&request)
+        }
+        _ => Err(LanguageModelError::ProviderInvocationFailed {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            detail: "unknown language model provider".to_string(),
         }),
     }
 }
@@ -457,6 +650,18 @@ pub fn nvidia_provider() -> Result<(NvidiaProvider, PathBuf), LanguageModelError
     Ok((provider, credentials_path))
 }
 
+pub fn codex_provider() -> Result<(CodexProvider, PathBuf), LanguageModelError> {
+    let provider = codex_provider_for_model(PROVIDER_DEFAULT_MODEL);
+    let credentials_path =
+        provider
+            .credentials_path()
+            .ok_or_else(|| LanguageModelError::ConfigStore {
+                path: "<codex-credentials>".to_string(),
+                detail: "could not resolve Sinomo Codex credentials path; set SINOMO_DATA_DIR or SINOMO_CODEX_CREDENTIALS_FILE".to_string(),
+            })?;
+    Ok((provider, credentials_path))
+}
+
 pub fn codex_provider_for_model(model: &str) -> CodexProvider {
     let default_model = model_or_default(model, CODEX_DEFAULT_MODEL.to_string());
     let config_default = OpenAiResponsesCodexConfig::default();
@@ -496,6 +701,164 @@ fn provider_data_dir(provider: &str) -> Result<SinomoDataDir, LanguageModelError
             detail: source.to_string(),
         })?;
     Ok(data_dir)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCredentialWrite {
+    pub provider: String,
+    pub credentials_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCredentialTest {
+    pub provider: String,
+    pub credentials_path: PathBuf,
+}
+
+pub fn save_provider_api_key(
+    provider: &str,
+    api_key: &str,
+    source: &str,
+) -> Result<ProviderCredentialWrite, LanguageModelError> {
+    match provider {
+        AnthropicProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = anthropic_provider()?;
+            provider.save_api_key(api_key, source)?;
+            Ok(ProviderCredentialWrite {
+                provider: AnthropicProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        OpenAiProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = openai_provider()?;
+            provider.save_api_key(api_key, source)?;
+            Ok(ProviderCredentialWrite {
+                provider: OpenAiProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        GeminiProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = gemini_provider()?;
+            provider.save_api_key(api_key, source)?;
+            Ok(ProviderCredentialWrite {
+                provider: GeminiProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        NvidiaProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = nvidia_provider()?;
+            provider.save_api_key(api_key, source)?;
+            Ok(ProviderCredentialWrite {
+                provider: NvidiaProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        _ => Err(LanguageModelError::ProviderInvocationFailed {
+            provider: provider.to_string(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: "provider does not support API-key credential storage".to_string(),
+        }),
+    }
+}
+
+pub fn provider_api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
+    match provider {
+        AnthropicProvider::PROVIDER_ID => Some(&[
+            "SINOMO_ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_API_KEY",
+            "SINOMO_CLAUDE_API_KEY",
+        ]),
+        OpenAiProvider::PROVIDER_ID => Some(&["SINOMO_OPENAI_API_KEY", "OPENAI_API_KEY"]),
+        GeminiProvider::PROVIDER_ID => Some(&[
+            "SINOMO_GEMINI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_AI_API_KEY",
+        ]),
+        NvidiaProvider::PROVIDER_ID => {
+            Some(&["SINOMO_NVIDIA_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY"])
+        }
+        _ => None,
+    }
+}
+
+pub fn provider_api_key_from_env(provider: &str) -> Option<(String, String)> {
+    for env_var in provider_api_key_env_vars(provider)? {
+        if let Ok(api_key) = env::var(env_var) {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                return Some((api_key.to_string(), format!("env:{env_var}")));
+            }
+        }
+    }
+    None
+}
+
+pub fn test_provider_credentials(
+    provider: &str,
+) -> Result<ProviderCredentialTest, LanguageModelError> {
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = github_copilot_provider()?;
+            provider.github_token()?;
+            provider.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: GitHubCopilotProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        CODEX_PROVIDER_ID => {
+            let (provider, credentials_path) = codex_provider()?;
+            provider.chatgpt_tokens()?;
+            provider.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: CODEX_PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        AnthropicProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = anthropic_provider()?;
+            provider.api_key()?;
+            provider.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: AnthropicProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        OpenAiProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = openai_provider()?;
+            provider.api_key()?;
+            provider.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: OpenAiProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        GeminiProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = gemini_provider()?;
+            provider.api_key()?;
+            provider.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: GeminiProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        NvidiaProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = nvidia_provider()?;
+            provider.api_key()?;
+            provider.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: NvidiaProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        _ => Err(LanguageModelError::ProviderInvocationFailed {
+            provider: provider.to_string(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: "unknown language model provider".to_string(),
+        }),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -746,6 +1109,63 @@ mod tests {
     }
 
     #[test]
+    fn write_default_model_config_persists_model_defaults() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-lm-models-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+
+        let update =
+            write_default_model_config(&data_dir, "openai", "gpt-5.5").expect("write defaults");
+
+        assert_eq!(update.config.default_provider.as_deref(), Some("openai"));
+        assert_eq!(update.config.default_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(update.config_path, root.join("config").join("models.json"));
+        let config = load_model_config(&ModelPaths::new(&data_dir)).expect("model config");
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolve_default_model_prefers_model_config_over_fallback() {
+        let model_config = ModelConfig {
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+        };
+        let fallback_config = ModelConfig {
+            default_provider: Some("gemini".to_string()),
+            default_model: Some("gemini-2.5-pro".to_string()),
+        };
+
+        let resolved =
+            resolve_default_model(Some(&model_config), Some(&fallback_config)).expect("defaults");
+
+        assert_eq!(resolved.provider, "openai");
+        assert_eq!(resolved.configured_model, "gpt-5.5");
+        assert_eq!(resolved.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn resolve_default_model_uses_fallback_and_provider_default_model() {
+        let fallback_config = ModelConfig {
+            default_provider: Some("nvidia".to_string()),
+            default_model: None,
+        };
+
+        let resolved = resolve_default_model(None, Some(&fallback_config)).expect("defaults");
+
+        assert_eq!(resolved.provider, "nvidia");
+        assert_eq!(resolved.configured_model, PROVIDER_DEFAULT_MODEL);
+        assert_eq!(resolved.model, NVIDIA_DEFAULT_MODEL);
+    }
+
+    #[test]
     fn plain_prompt_renders_chat_roles() {
         let prompt = render_plain_prompt(&request());
 
@@ -912,6 +1332,132 @@ mod tests {
         assert_eq!(info.provider, GitHubCopilotCliProvider::PROVIDER_ID);
         assert_eq!(info.invocation, LanguageModelInvocation::Process);
         assert!(info.supports_tool_permissions);
+    }
+
+    #[test]
+    fn collect_provider_usage_skips_default_provider_failures() {
+        let snapshots = collect_provider_usage(["unknown-provider"], false).unwrap();
+
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn collect_provider_usage_reports_explicit_provider_failures() {
+        let error = collect_provider_usage(["unknown-provider"], true).unwrap_err();
+
+        assert!(matches!(
+            error,
+            LanguageModelError::ProviderInvocationFailed { provider, .. }
+                if provider == "unknown-provider"
+        ));
+    }
+
+    #[test]
+    fn collect_provider_model_catalogs_skips_default_provider_failures() {
+        let catalogs = collect_provider_model_catalogs(["unknown-provider"], false).unwrap();
+
+        assert!(catalogs.is_empty());
+    }
+
+    #[test]
+    fn collect_provider_model_catalogs_reports_explicit_provider_failures() {
+        let error = collect_provider_model_catalogs(["unknown-provider"], true).unwrap_err();
+
+        assert!(matches!(
+            error,
+            LanguageModelError::ProviderInvocationFailed { provider, .. }
+                if provider == "unknown-provider"
+        ));
+    }
+
+    #[test]
+    fn complete_configured_model_request_reports_unknown_provider() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-lm-complete-unknown-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(root);
+
+        let error = complete_configured_model_request(
+            &data_dir,
+            "unknown-provider",
+            "test-model",
+            None,
+            &request(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LanguageModelError::ProviderInvocationFailed {
+                provider,
+                model,
+                ..
+            } if provider == "unknown-provider" && model == "test-model"
+        ));
+    }
+
+    #[test]
+    fn save_provider_api_key_rejects_non_api_key_provider() {
+        let error = save_provider_api_key(GitHubCopilotProvider::PROVIDER_ID, "secret", "test")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LanguageModelError::ProviderInvocationFailed {
+                provider,
+                model,
+                detail
+            } if provider == GitHubCopilotProvider::PROVIDER_ID
+                && model == PROVIDER_DEFAULT_MODEL
+                && detail.contains("API-key credential storage")
+        ));
+    }
+
+    #[test]
+    fn provider_api_key_env_vars_cover_api_key_providers() {
+        assert_eq!(
+            provider_api_key_env_vars(OpenAiProvider::PROVIDER_ID),
+            Some(&["SINOMO_OPENAI_API_KEY", "OPENAI_API_KEY"][..])
+        );
+        assert!(
+            provider_api_key_env_vars(AnthropicProvider::PROVIDER_ID)
+                .unwrap()
+                .contains(&"ANTHROPIC_API_KEY")
+        );
+        assert!(
+            provider_api_key_env_vars(GeminiProvider::PROVIDER_ID)
+                .unwrap()
+                .contains(&"GOOGLE_API_KEY")
+        );
+        assert!(
+            provider_api_key_env_vars(NvidiaProvider::PROVIDER_ID)
+                .unwrap()
+                .contains(&"NIM_API_KEY")
+        );
+        assert_eq!(
+            provider_api_key_env_vars(GitHubCopilotProvider::PROVIDER_ID),
+            None
+        );
+    }
+
+    #[test]
+    fn test_provider_credentials_reports_unknown_provider() {
+        let error = test_provider_credentials("unknown-provider").unwrap_err();
+
+        assert!(matches!(
+            error,
+            LanguageModelError::ProviderInvocationFailed {
+                provider,
+                model,
+                detail
+            } if provider == "unknown-provider"
+                && model == PROVIDER_DEFAULT_MODEL
+                && detail.contains("unknown language model provider")
+        ));
     }
 
     #[test]

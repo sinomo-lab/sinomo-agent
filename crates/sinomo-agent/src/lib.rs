@@ -1,6 +1,10 @@
 //! Bounded interactive controller skeleton.
 
 use serde::{Deserialize, Serialize};
+use sinomo_lm::{
+    LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
+};
 use sinomo_runtime::core::{
     ActionRequest, Confidence, ContextPacket, EntityId, EventEnvelope, EventId, EventKind,
     LatencyClass, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
@@ -9,6 +13,199 @@ use sinomo_runtime::core::{
 use sinomo_runtime::device::{DeviceKind, DeviceProfile};
 use sinomo_runtime::events::{EventStore, ReplayDirection, ReplayQuery, StoredEvent};
 use thiserror::Error;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct InteractionSession {
+    pub session_id: SessionId,
+    pub node_id: NodeId,
+    pub surface: InteractionSurface,
+}
+
+impl InteractionSession {
+    pub fn new(session_id: SessionId, node_id: NodeId, surface: InteractionSurface) -> Self {
+        Self {
+            session_id,
+            node_id,
+            surface,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct InteractionSurface {
+    pub surface_id: String,
+    pub kind: InteractionSurfaceKind,
+}
+
+impl InteractionSurface {
+    pub fn new(surface_id: impl Into<String>, kind: InteractionSurfaceKind) -> InteractionSurface {
+        InteractionSurface {
+            surface_id: surface_id.into(),
+            kind,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InteractionSurfaceKind {
+    CommandLine,
+    App,
+    Api,
+    Voice,
+    Remote,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InteractionInputKind {
+    Message,
+    Command,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InteractionOutput {
+    Line(String),
+    Exit,
+}
+
+pub trait InteractionModel {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError>;
+}
+
+impl<T: LanguageModelProvider> InteractionModel for T {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        LanguageModelProvider::complete(self, request)
+    }
+}
+
+pub trait EventEnvelopeExt {
+    fn caused_by(self, event_id: &EventId) -> Self;
+}
+
+impl EventEnvelopeExt for EventEnvelope {
+    fn caused_by(mut self, event_id: &EventId) -> Self {
+        self.links.caused_by.push(event_id.clone());
+        self
+    }
+}
+
+pub fn user_interaction_input_event(session: &InteractionSession, text: &str) -> EventEnvelope {
+    let input_kind = if text.trim_start().starts_with('/') {
+        InteractionInputKind::Command
+    } else {
+        InteractionInputKind::Message
+    };
+    interaction_event(
+        session,
+        "interaction.input.received",
+        serde_json::json!({
+            "text": text,
+            "input_kind": input_kind,
+            "surface": session.surface,
+        }),
+    )
+}
+
+pub fn interaction_event(
+    session: &InteractionSession,
+    kind: &str,
+    payload: serde_json::Value,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        EventId::generate(),
+        time::OffsetDateTime::now_utc(),
+        session.node_id.clone(),
+        Source::new("interaction.surface").expect("valid source"),
+        EventKind::new(kind).expect("valid event kind"),
+        Salience::new(0.62).expect("valid salience"),
+        Confidence::new(0.98).expect("valid confidence"),
+        RoutingMetadata::new(
+            RoutingScope::Session,
+            LatencyClass::Interactive,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_session(session.session_id.clone())
+    .with_payload(payload)
+}
+
+pub fn interaction_model_request<S: EventStore>(
+    store: &S,
+    session: &InteractionSession,
+    message_event_id: &EventId,
+    text: &str,
+    provider: &str,
+    model: &str,
+) -> Result<LanguageModelRequest, AgentError> {
+    let recent = store.replay(ReplayQuery {
+        session_id: Some(session.session_id.clone()),
+        kind_prefix: Some("interaction.model.responded".to_string()),
+        origin_node_id: None,
+        after_sequence: None,
+        start_time: None,
+        end_time: None,
+        direction: ReplayDirection::Reverse,
+        limit: Some(6),
+    })?;
+    let mut recent_turns: Vec<String> = recent
+        .into_iter()
+        .rev()
+        .filter_map(|stored| {
+            stored
+                .event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    if recent_turns.is_empty() {
+        recent_turns.push("No prior assistant turns in this session.".to_string());
+    }
+
+    Ok(LanguageModelRequest {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        messages: vec![
+            LanguageModelMessage {
+                role: LanguageModelRole::System,
+                content: INTERACTION_SYSTEM_PROMPT.to_string(),
+            },
+            LanguageModelMessage {
+                role: LanguageModelRole::User,
+                content: serde_json::to_string_pretty(&serde_json::json!({
+                    "session_id": session.session_id,
+                    "surface": session.surface,
+                    "input_event_id": message_event_id,
+                    "recent_assistant_turns": recent_turns,
+                    "user_input": text
+                }))
+                .expect("interaction request serializes"),
+            },
+        ],
+        temperature: Some(0.4),
+        max_output_tokens: Some(800),
+        response_format: LanguageModelResponseFormat::Text,
+        metadata: serde_json::json!({
+            "loop": "interactive",
+            "node_id": session.node_id,
+            "session_id": session.session_id,
+            "input_event_id": message_event_id
+        }),
+    })
+}
+
+const INTERACTION_SYSTEM_PROMPT: &str = r#"You are Sinomo's command-line conversation loop.
+Respond directly to the user in plain text.
+Use the supplied event ids and session metadata as context, but do not expose internal event JSON unless asked.
+Slash commands are handled by Sinomo outside the model; ordinary user input reaches you only after being recorded as an interaction event."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BoundedContext {
@@ -279,6 +476,78 @@ mod tests {
 
         assert_eq!(context.events.len(), 2);
         assert_eq!(context.packet.salient_events.len(), 2);
+    }
+
+    #[test]
+    fn interaction_input_event_tags_slash_commands() {
+        let session = InteractionSession::new(
+            SessionId::from_legacy_named("sess_interaction").expect("session"),
+            NodeId::from_legacy_named("node_interaction").expect("node"),
+            InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+        );
+
+        let event = user_interaction_input_event(&session, " /status");
+
+        assert_eq!(
+            event
+                .payload
+                .get("input_kind")
+                .and_then(serde_json::Value::as_str),
+            Some("command")
+        );
+        assert_eq!(event.session_id, Some(session.session_id));
+    }
+
+    #[test]
+    fn interaction_events_can_record_causality() {
+        let session = InteractionSession::new(
+            SessionId::from_legacy_named("sess_interaction").expect("session"),
+            NodeId::from_legacy_named("node_interaction").expect("node"),
+            InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+        );
+        let cause = EventId::from_legacy_named("evt_cause").expect("event");
+
+        let event = interaction_event(
+            &session,
+            "interaction.message.received",
+            serde_json::json!({ "text": "hello" }),
+        )
+        .caused_by(&cause);
+
+        assert_eq!(event.links.caused_by, vec![cause]);
+    }
+
+    #[test]
+    fn interaction_model_request_includes_recent_assistant_turns() {
+        let session = InteractionSession::new(
+            SessionId::from_legacy_named("sess_interaction").expect("session"),
+            NodeId::from_legacy_named("node_interaction").expect("node"),
+            InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+        );
+        let mut store = InMemoryEventStore::new();
+        store
+            .append(interaction_event(
+                &session,
+                "interaction.model.responded",
+                serde_json::json!({ "text": "previous answer" }),
+            ))
+            .expect("append");
+        let message_event_id = EventId::from_legacy_named("evt_message").expect("event");
+
+        let request = interaction_model_request(
+            &store,
+            &session,
+            &message_event_id,
+            "what next?",
+            "provider",
+            "model",
+        )
+        .expect("request");
+
+        assert_eq!(request.provider, "provider");
+        assert_eq!(request.model, "model");
+        assert!(request.messages[1].content.contains("previous answer"));
+        assert!(request.messages[1].content.contains("what next?"));
     }
 
     #[test]
