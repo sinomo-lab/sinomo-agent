@@ -103,6 +103,7 @@ pub(crate) fn install_with_layout(
     options: InstallOptions,
     layout: &InstallLayout,
 ) -> Result<(), CliError> {
+    let managed_source_head_before = installed_managed_source_head(layout);
     let plan = daemon_prepare_installed_daemon_install_plan(
         layout,
         InstalledDaemonInstallPlanRequest {
@@ -120,6 +121,8 @@ pub(crate) fn install_with_layout(
     install_current_binary(&layout.binary)?;
     install_current_binary(&layout.shadow_binary)?;
     install_managed_source_repo(layout)?;
+    let managed_source_updated =
+        managed_source_head_before != installed_managed_source_head(layout);
     write_boot_entries(layout, &options)?;
     activate_boot_entries(layout);
     #[cfg(not(test))]
@@ -143,6 +146,10 @@ pub(crate) fn install_with_layout(
         print_existing_install_rollout_hint(layout);
     }
 
+    if options.start && plan.stop_reason.is_none() && managed_source_updated {
+        stop_installed_daemons_before_install(layout, "managed source update")?;
+    }
+
     for spec in plan.start_specs {
         ensure_installed_daemon_started(
             layout,
@@ -154,6 +161,12 @@ pub(crate) fn install_with_layout(
         )?;
     }
     Ok(())
+}
+
+fn installed_managed_source_head(layout: &InstallLayout) -> Option<String> {
+    managed_source_status(&SelfRolloutPaths::new(&layout.data_dir))
+        .ok()
+        .and_then(|status| status.head)
 }
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<(), CliError> {
