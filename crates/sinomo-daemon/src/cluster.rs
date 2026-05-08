@@ -231,11 +231,21 @@ pub fn advertise_daemon_iroh_endpoint(
     {
         sinomo_network::upsert_member_endpoint(member, endpoint);
         sinomo_network::cleanup_member_iroh_endpoints(member);
+        let published_member = member.clone();
         state.updated_at = OffsetDateTime::now_utc();
         sinomo_network::write_cluster_state(&cluster_paths, &state)?;
         sync_cluster_state_to_kv(&cluster_paths, &state)?;
-        if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
-            eprintln!("sinomo iroh endpoint quorum publication failed: {error}");
+        let mut commit_state = state.clone();
+        let publish_result = commit_cluster_kv_txn_with_quorum(
+            &cluster_paths,
+            &mut commit_state,
+            sinomo_network::cluster_member_publish_txn(&[published_member])?,
+        );
+        if let Err(error) = publish_result {
+            eprintln!("sinomo iroh endpoint local quorum publication failed: {error}");
+            if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
+                eprintln!("sinomo iroh endpoint voter publication failed: {error}");
+            }
         }
     }
     Ok(())
