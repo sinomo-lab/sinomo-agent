@@ -10,11 +10,13 @@ use sinomo_network::{
     ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterKvWatchEventsRequest,
     ClusterKvWatchEventsResponse, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
     ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
-    ClusterRaftVoteResponse, ObjectRpcRequest, random_url_secret,
+    ClusterRaftVoteResponse, DaemonControlRequest, DaemonControlResponse, DaemonControlStream,
+    ObjectRpcRequest, random_url_secret,
 };
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
 };
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 pub fn send_daemon_rpc(
@@ -148,6 +150,15 @@ pub fn send_cluster_join_registration(
     request: &ClusterJoinRegistrationRequest,
     timeout: Duration,
 ) -> Result<ClusterJoinRegistrationResponse, DaemonError> {
+    send_cluster_join_registration_single_connection(address, request, timeout)
+}
+
+fn send_cluster_join_registration_single_connection(
+    address: &str,
+    request: &ClusterJoinRegistrationRequest,
+    timeout: Duration,
+) -> Result<ClusterJoinRegistrationResponse, DaemonError> {
+    let mut stream = connect_daemon_control_stream(address, timeout)?;
     let challenge = random_url_secret(32)?;
     let challenge_request = ClusterInviteChallengeRequest {
         protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
@@ -159,12 +170,15 @@ pub fn send_cluster_join_registration(
         sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
         &challenge_request,
     )?;
-    let proof_response = sinomo_network::send_daemon_rpc_raw(
+    let challenge_control = DaemonControlRequest::rpc(
+        daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE),
+        challenge_rpc,
+    );
+    sinomo_network::write_object_frame_blocking(&mut stream, &challenge_control)?;
+    let proof_response = read_join_rpc_response(
+        &mut stream,
         address,
-        &daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE),
-        None,
-        &challenge_rpc,
-        timeout,
+        sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE,
     )?;
     let proof: ClusterInviteChallengeProof = proof_response.decode_body()?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
@@ -174,14 +188,67 @@ pub fn send_cluster_join_registration(
         request,
     )?;
     let signed = sign_daemon_rpc_request_for_local_node(&register_rpc)?;
-    let response = sinomo_network::send_daemon_rpc_raw(
+    let register_control = DaemonControlRequest::authenticated_rpc(
+        daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE),
+        register_rpc,
+        signed,
+    );
+    sinomo_network::write_object_frame_blocking(&mut stream, &register_control)?;
+    stream.shutdown_write();
+    let response = read_join_rpc_response(
+        &mut stream,
         address,
-        &daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE),
-        Some(&signed),
-        &register_rpc,
-        timeout,
+        sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE,
     )?;
     response.decode_body().map_err(DaemonError::from)
+}
+
+fn connect_daemon_control_stream(
+    address: &str,
+    timeout: Duration,
+) -> Result<DaemonControlStream, DaemonError> {
+    let socket_address = address
+        .to_socket_addrs()
+        .map_err(|source| DaemonError::Network {
+            address: address.to_string(),
+            detail: format!("failed to resolve join introducer: {source}"),
+        })?
+        .next()
+        .ok_or_else(|| DaemonError::Network {
+            address: address.to_string(),
+            detail: "failed to resolve join introducer: no socket addresses".to_string(),
+        })?;
+    let stream = TcpStream::connect_timeout(&socket_address, timeout).map_err(|source| {
+        DaemonError::Network {
+            address: address.to_string(),
+            detail: format!("failed to connect join introducer: {source}"),
+        }
+    })?;
+    let stream = DaemonControlStream::new(stream);
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
+
+fn read_join_rpc_response(
+    stream: &mut DaemonControlStream,
+    address: &str,
+    route: &str,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let response: DaemonControlResponse = sinomo_network::read_object_frame_blocking(
+        stream,
+        sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+    )
+    .map_err(|source| DaemonError::Network {
+        address: address.to_string(),
+        detail: format!(
+            "join RPC `{route}` closed before a response: {source}. The introducer daemon may have rejected the invite or join signature before it could return a structured response; check the introducer daemon log for the matching client error."
+        ),
+    })?;
+    response.rpc.ok_or_else(|| DaemonError::Network {
+        address: address.to_string(),
+        detail: format!("join RPC `{route}` returned a non-rpc response"),
+    })
 }
 
 pub fn send_cluster_join_registration_to_endpoint(
