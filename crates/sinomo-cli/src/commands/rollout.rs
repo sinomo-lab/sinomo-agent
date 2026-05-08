@@ -529,7 +529,10 @@ pub(crate) fn rollout_cluster_targets(
     } else {
         None
     };
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = ClusterPaths::new(&data_dir);
     let state = if options.targets.is_empty() {
+        let _ = refresh_cluster_kv_from_local_daemon(&paths);
         require_cluster_bootstrap_state().ok()
     } else {
         None
@@ -555,8 +558,6 @@ pub(crate) fn rollout_cluster_targets(
         if let Some(local_target) = local_target {
             push_unique_rollout_target(&mut targets, RolloutTarget::address(local_target));
         }
-        let data_dir = SinomoDataDir::from_env_or_home()?;
-        let paths = ClusterPaths::new(&data_dir);
         let sync_targets = network::cluster_sync_targets_with_connectivity(&paths, state);
         let rollout_endpoints = rollout_endpoint_candidates(state);
         let mut selected_remote_nodes = std::collections::BTreeSet::new();
