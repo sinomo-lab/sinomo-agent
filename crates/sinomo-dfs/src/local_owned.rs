@@ -109,6 +109,18 @@ pub struct DfsExposeEntry {
     pub created_at: OffsetDateTime,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsExposeAddRequest {
+    pub id: Option<String>,
+    pub file_system_id: DfsFileSystemId,
+    pub dfs_path: String,
+    pub source_path: PathBuf,
+    pub owner_node_id: NodeId,
+    pub writable: bool,
+    pub follow_symlinks: bool,
+    pub created_at: OffsetDateTime,
+}
+
 impl DfsExposeEntry {
     pub fn validate(&self) -> Result<(), String> {
         if self.id.trim().is_empty() {
@@ -195,6 +207,42 @@ impl DfsExposeStore {
             self.save(&config)?;
         }
         Ok(config)
+    }
+
+    pub fn add_entry(
+        &self,
+        request: DfsExposeAddRequest,
+    ) -> Result<DfsExposeConfig, DfsExposeStoreError> {
+        let mut config = self.load()?;
+        let id = request.id.unwrap_or_else(|| {
+            format!(
+                "expose-{}-{}",
+                request.owner_node_id,
+                request.dfs_path.trim_matches('/').replace('/', "-")
+            )
+        });
+        config.entries.retain(|entry| entry.id != id);
+        config.entries.push(DfsExposeEntry {
+            id,
+            file_system_id: request.file_system_id,
+            dfs_path: request.dfs_path,
+            source_path: request.source_path,
+            owner_node_id: request.owner_node_id,
+            writable: request.writable,
+            follow_symlinks: request.follow_symlinks,
+            created_at: request.created_at,
+        });
+        self.save(&config)?;
+        Ok(config)
+    }
+
+    pub fn remove_entry(&self, id: &str) -> Result<(DfsExposeConfig, bool), DfsExposeStoreError> {
+        let mut config = self.load()?;
+        let before = config.entries.len();
+        config.entries.retain(|entry| entry.id != id);
+        let removed = before != config.entries.len();
+        self.save(&config)?;
+        Ok((config, removed))
     }
 }
 
@@ -508,6 +556,50 @@ mod tests {
             .expect("read");
 
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn expose_store_adds_replaces_and_removes_entries() {
+        let root = temp_root("store_mutations");
+        let store = DfsExposeStore::new(root.join("expose.json"));
+        let node_id = NodeId::from_legacy_named("node_alpha").expect("node id");
+
+        let config = store
+            .add_entry(DfsExposeAddRequest {
+                id: Some("project".to_string()),
+                file_system_id: sifs_id(),
+                dfs_path: "/sinomo/nodes/node_alpha/files/project".to_string(),
+                source_path: root.join("project"),
+                owner_node_id: node_id.clone(),
+                writable: true,
+                follow_symlinks: false,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("add");
+        assert_eq!(config.entries.len(), 1);
+
+        let config = store
+            .add_entry(DfsExposeAddRequest {
+                id: Some("project".to_string()),
+                file_system_id: sifs_id(),
+                dfs_path: "/sinomo/nodes/node_alpha/files/project2".to_string(),
+                source_path: root.join("project2"),
+                owner_node_id: node_id,
+                writable: false,
+                follow_symlinks: true,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("replace");
+        assert_eq!(config.entries.len(), 1);
+        assert_eq!(
+            config.entries[0].dfs_path,
+            "/sinomo/nodes/node_alpha/files/project2"
+        );
+
+        let (config, removed) = store.remove_entry("project").expect("remove");
+        assert!(removed);
+        assert!(config.entries.is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_config() -> DfsExposeConfig {

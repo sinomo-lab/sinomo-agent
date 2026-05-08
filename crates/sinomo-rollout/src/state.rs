@@ -4,9 +4,12 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::ClusterNodeRolloutStatus;
 use sinomo_object::{LengthMode, serde_ext};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+pub const ROLLOUT_DIAGNOSTIC_TAIL_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RolloutMainActivation {
@@ -97,6 +100,152 @@ pub fn rollout_staged_main_binary(paths: &SelfRolloutPaths) -> PathBuf {
 
 pub fn rollout_staged_shadow_binary(paths: &SelfRolloutPaths) -> PathBuf {
     rollout_staging_dir(paths).join(executable_name("sinomo-shadow"))
+}
+
+pub fn read_tail_lossy(path: &Path, max_bytes: usize) -> Result<Option<String>, RolloutError> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let start = bytes.len().saturating_sub(max_bytes);
+            Ok(Some(String::from_utf8_lossy(&bytes[start..]).to_string()))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RolloutError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+pub fn rollout_diagnostics_report(
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<String, RolloutError> {
+    let mut output = String::new();
+    output.push_str(&format!("rollout root: {}\n", rollout_paths.root.display()));
+    append_rollout_status_diagnostic(&mut output, rollout_paths)?;
+    append_rollout_diagnostic_file(&mut output, "build log", &rollout_paths.build_log)?;
+    append_rollout_diagnostic_file(
+        &mut output,
+        "pending main",
+        &rollout_main_activation_path(rollout_paths),
+    )?;
+    append_rollout_diagnostic_file(
+        &mut output,
+        "pending shadow",
+        &rollout_shadow_finalize_path(rollout_paths),
+    )?;
+    append_rollout_main_exit_diagnostic(&mut output, rollout_paths)?;
+
+    if let Ok(Some(status)) = read_rollout_status(rollout_paths) {
+        if let Some(path) = status.diagnostics.as_deref() {
+            append_rollout_diagnostic_file(&mut output, "failure diagnostics", Path::new(path))?;
+        }
+        if let Some(path) = status.stdout_log.as_deref() {
+            append_rollout_diagnostic_file(&mut output, "candidate stdout", Path::new(path))?;
+        }
+        if let Some(path) = status.stderr_log.as_deref() {
+            append_rollout_diagnostic_file(&mut output, "candidate stderr", Path::new(path))?;
+        }
+    }
+
+    let logs_dir = rollout_paths.root.join("logs");
+    if logs_dir.exists() {
+        output.push_str("\n[rollout logs]\n");
+        let mut entries = fs::read_dir(&logs_dir)
+            .map_err(|source| RolloutError::Io {
+                path: logs_dir.display().to_string(),
+                detail: source.to_string(),
+            })?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = entry.metadata().ok()?;
+                Some((entry.path(), metadata.modified().ok(), metadata.len()))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, modified, _)| *modified);
+        for (path, _, len) in entries.into_iter().rev().take(8) {
+            output.push_str(&format!("{} ({} bytes)\n", path.display(), len));
+        }
+    }
+
+    Ok(output)
+}
+
+pub fn append_rollout_status_diagnostic(
+    output: &mut String,
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<(), RolloutError> {
+    output.push_str(&format!("\n[state] {}\n", rollout_paths.state.display()));
+    match read_rollout_status(rollout_paths)? {
+        Some(status) => {
+            output.push_str(&format!("status: {}\n", status.status));
+            if let Some(mode) = status.mode {
+                output.push_str(&format!("mode: {mode}\n"));
+            }
+            if let Some(detail) = status.detail {
+                output.push_str(&format!("detail: {detail}\n"));
+            }
+            if let Some(source) = status.source {
+                output.push_str(&format!("source: {source}\n"));
+            }
+            if let Some(requested_at) = status.requested_at {
+                output.push_str(&format!("requested_at: {requested_at}\n"));
+            }
+            if let Some(staged_at) = status.staged_at {
+                output.push_str(&format!("staged_at: {staged_at}\n"));
+            }
+            if let Some(updated_at) = status.updated_at {
+                output.push_str(&format!("updated_at: {updated_at}\n"));
+            }
+            if let Some(failed_at) = status.failed_at {
+                output.push_str(&format!("failed_at: {failed_at}\n"));
+            }
+        }
+        None => output.push_str("<missing>\n"),
+    }
+    Ok(())
+}
+
+pub fn append_rollout_diagnostic_file(
+    output: &mut String,
+    label: &str,
+    path: &Path,
+) -> Result<(), RolloutError> {
+    output.push_str(&format!("\n[{label}] {}\n", path.display()));
+    match read_tail_lossy(path, ROLLOUT_DIAGNOSTIC_TAIL_BYTES)? {
+        Some(content) if !content.is_empty() => output.push_str(&content),
+        Some(_) => output.push_str("<empty>\n"),
+        None => output.push_str("<missing>\n"),
+    }
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    Ok(())
+}
+
+pub fn append_rollout_main_exit_diagnostic(
+    output: &mut String,
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<(), RolloutError> {
+    let path = rollout_main_exit_path(rollout_paths);
+    output.push_str(&format!("\n[last main exit] {}\n", path.display()));
+    match read_rollout_main_exit(rollout_paths)? {
+        Some(record) => {
+            output.push_str(&format!("kind: {:?}\n", record.kind));
+            if let Some(exit_code) = record.exit_code {
+                output.push_str(&format!("exit_code: {exit_code}\n"));
+            }
+            if let Some(signal) = record.signal {
+                output.push_str(&format!("signal: {signal}\n"));
+            }
+            output.push_str(&format!(
+                "requested_shutdown: {}\n",
+                record.requested_shutdown
+            ));
+            output.push_str(&format!("observed_at: {}\n", record.observed_at));
+        }
+        None => output.push_str("<missing>\n"),
+    }
+    Ok(())
 }
 
 pub fn read_rollout_main_activation(
@@ -390,3 +539,75 @@ fn format_now() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 const ROLLOUT_OBJECT_VERSION: u16 = 1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn read_tail_lossy_limits_bytes_and_handles_missing_file() {
+        let root = unique_temp("sinomo-rollout-tail");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("tail.log");
+        fs::write(&path, "0123456789").expect("log");
+
+        assert_eq!(
+            read_tail_lossy(&path, 4).expect("tail"),
+            Some("6789".to_string())
+        );
+        assert_eq!(
+            read_tail_lossy(&root.join("missing.log"), 4).expect("missing"),
+            None
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rollout_diagnostics_report_includes_state_and_tail_files() {
+        let root = unique_temp("sinomo-rollout-diagnostics");
+        let paths = SelfRolloutPaths::new(&root);
+        fs::create_dir_all(&paths.root).expect("rollout root");
+        fs::write(&paths.build_log, "build log\n").expect("build log");
+        write_rollout_status(
+            &paths,
+            &ClusterNodeRolloutStatus {
+                status: "main-staged".to_string(),
+                mode: Some("cluster-remote-build".to_string()),
+                detail: Some("ready".to_string()),
+                source: Some("source-head".to_string()),
+                requested_at: Some("2026-05-08T00:00:00Z".to_string()),
+                staged_at: None,
+                updated_at: None,
+                failed_at: None,
+                diagnostics: None,
+                stdout_log: None,
+                stderr_log: None,
+                stdout_tail: None,
+                stderr_tail: None,
+            },
+        )
+        .expect("status");
+
+        let report = rollout_diagnostics_report(&paths).expect("diagnostics");
+
+        assert!(report.contains("rollout root:"));
+        assert!(report.contains("status: main-staged"));
+        assert!(report.contains("mode: cluster-remote-build"));
+        assert!(report.contains("[build log]"));
+        assert!(report.contains("build log"));
+        assert!(report.contains("[last main exit]"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn unique_temp(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}",
+            prefix,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+}

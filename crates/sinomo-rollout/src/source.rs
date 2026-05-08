@@ -1,8 +1,14 @@
-use crate::{RolloutError, SelfRolloutPaths};
+use crate::{
+    RolloutError, SelfRolloutPaths, ensure_rollout_layout, rollout_staged_main_binary,
+    rollout_staged_shadow_binary, stage_rollout_file,
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn discover_current_git_repo() -> Result<Option<PathBuf>, RolloutError> {
     let current_dir = std::env::current_dir().map_err(|source| RolloutError::Io {
@@ -33,6 +39,163 @@ pub fn discover_current_git_repo() -> Result<Option<PathBuf>, RolloutError> {
             detail: source.to_string(),
         }),
     }
+}
+
+pub fn rollout_artifact_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
+}
+
+pub fn rollout_source_head(repo: &Path) -> Result<String, RolloutError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .output()
+        .map_err(|source| RolloutError::Io {
+            path: format!("git -C {} rev-parse --short=8 HEAD", repo.display()),
+            detail: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(RolloutError::Process {
+            command: format!("git -C {} rev-parse --short=8 HEAD", repo.display()),
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn source_heads_match(actual: Option<&str>, expected: &str) -> bool {
+    let Some(actual) = actual else {
+        return false;
+    };
+    actual == expected || actual.starts_with(expected) || expected.starts_with(actual)
+}
+
+pub fn rollout_build_dev_binary(repo: &Path, build_log: &Path) -> Result<PathBuf, RolloutError> {
+    let build = Command::new("cargo")
+        .args(["build", "-p", "sinomo"])
+        .current_dir(repo)
+        .output()
+        .map_err(|source| RolloutError::Io {
+            path: "cargo build -p sinomo".to_string(),
+            detail: source.to_string(),
+        })?;
+    let log = format!(
+        "command: cargo build -p sinomo\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+        repo.display(),
+        build.status,
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    fs::write(build_log, log).map_err(|source| RolloutError::Io {
+        path: build_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if !build.status.success() {
+        return Err(RolloutError::Process {
+            command: "cargo build -p sinomo".to_string(),
+            status: build.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
+        });
+    }
+    Ok(repo
+        .join("target")
+        .join("debug")
+        .join(format!("sinomo{}", env::consts::EXE_SUFFIX)))
+}
+
+pub fn prepare_rollout_dev_binary(
+    paths: &SelfRolloutPaths,
+    repo: &Path,
+    binary: Option<&Path>,
+) -> Result<PathBuf, RolloutError> {
+    ensure_rollout_layout(paths)?;
+    if let Some(binary) = binary {
+        if !binary.exists() {
+            return Err(RolloutError::MissingArtifact {
+                artifact: binary.display().to_string(),
+            });
+        }
+        return Ok(binary.to_path_buf());
+    }
+    rollout_build_dev_binary(repo, &paths.plan().build_log)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRolloutArtifacts {
+    pub built_binary: PathBuf,
+    pub staged_main_binary: PathBuf,
+    pub staged_shadow_binary: PathBuf,
+}
+
+pub fn prepare_local_rollout_artifacts(
+    paths: &SelfRolloutPaths,
+    repo: Option<&Path>,
+) -> Result<LocalRolloutArtifacts, RolloutError> {
+    ensure_rollout_layout(paths)?;
+    ensure_rollout_source_repo(paths, repo)?;
+    let plan = paths.plan();
+    let built_binary = rollout_build_dev_binary(&plan.build_dir, &plan.build_log)?;
+    stage_local_rollout_artifacts(paths, built_binary)
+}
+
+pub fn stage_local_rollout_artifacts(
+    paths: &SelfRolloutPaths,
+    built_binary: PathBuf,
+) -> Result<LocalRolloutArtifacts, RolloutError> {
+    let staged_main_binary = rollout_staged_main_binary(paths);
+    let staged_shadow_binary = rollout_staged_shadow_binary(paths);
+    stage_rollout_file(&built_binary, &staged_main_binary)?;
+    stage_rollout_file(&built_binary, &staged_shadow_binary)?;
+    Ok(LocalRolloutArtifacts {
+        built_binary,
+        staged_main_binary,
+        staged_shadow_binary,
+    })
+}
+
+pub fn rollout_remote_repo_path(paths: &SelfRolloutPaths, repo: Option<&Path>) -> PathBuf {
+    match repo {
+        Some(repo) if repo.is_absolute() => repo.to_path_buf(),
+        Some(repo) => paths.root.parent().unwrap_or(&paths.root).join(repo),
+        None => paths.source_repo.clone(),
+    }
+}
+
+pub fn ensure_rollout_source_repo(
+    paths: &SelfRolloutPaths,
+    repo: Option<&Path>,
+) -> Result<(), RolloutError> {
+    deploy_managed_source_repo_or_current(paths, repo).map(|_| ())
+}
+
+pub fn create_source_repo_bundle_base64(
+    paths: &SelfRolloutPaths,
+    repo: &Path,
+) -> Result<(String, String), RolloutError> {
+    let bundle = paths
+        .root
+        .join("staged")
+        .join(format!("source-{}.bundle", rollout_artifact_suffix()));
+    create_source_repo_bundle(repo, &bundle)?;
+    let bytes = fs::read(&bundle).map_err(|source| RolloutError::Io {
+        path: bundle.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok((URL_SAFE_NO_PAD.encode(bytes), rollout_source_head(repo)?))
+}
+
+pub fn prepare_rollout_source_bundle_base64(
+    paths: &SelfRolloutPaths,
+    repo: &Path,
+) -> Result<(String, String), RolloutError> {
+    ensure_rollout_layout(paths)?;
+    create_source_repo_bundle_base64(paths, repo)
 }
 
 pub fn deploy_managed_source_repo(
@@ -102,6 +265,21 @@ pub fn sync_external_repo_from_managed(
     require_git_repo(&paths.source_repo, "managed source repo")?;
     require_git_repo(external_repo, "external source repo")?;
     merge_repo_head(external_repo, &paths.source_repo, "sinomo-internal")
+}
+
+pub fn deploy_managed_source_repo_or_current(
+    paths: &SelfRolloutPaths,
+    repo: Option<&Path>,
+) -> Result<PathBuf, RolloutError> {
+    let source = match repo {
+        Some(repo) => repo.to_path_buf(),
+        None => env::current_dir().map_err(|source| RolloutError::Io {
+            path: ".".to_string(),
+            detail: source.to_string(),
+        })?,
+    };
+    deploy_managed_source_repo(paths, &source)?;
+    Ok(source)
 }
 
 pub fn create_source_repo_bundle(
@@ -235,6 +413,19 @@ pub fn managed_source_status(
     })
 }
 
+pub fn rollout_status_view(paths: &SelfRolloutPaths) -> Result<RolloutStatusView, RolloutError> {
+    Ok(RolloutStatusView {
+        source_repo: paths.source_repo.clone(),
+        main_binary: paths.main_binary.clone(),
+        shadow_binary: paths.shadow_binary.clone(),
+        state: paths.state.clone(),
+        source_repo_exists: paths.source_repo.join(".git").exists(),
+        main_binary_exists: paths.main_binary.exists(),
+        shadow_binary_exists: paths.shadow_binary.exists(),
+        source_status: managed_source_status(paths)?,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedSourceStatus {
     pub path: PathBuf,
@@ -243,6 +434,18 @@ pub struct ManagedSourceStatus {
     pub has_external_remotes: bool,
     pub remotes: Vec<String>,
     pub head: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RolloutStatusView {
+    pub source_repo: PathBuf,
+    pub main_binary: PathBuf,
+    pub shadow_binary: PathBuf,
+    pub state: PathBuf,
+    pub source_repo_exists: bool,
+    pub main_binary_exists: bool,
+    pub shadow_binary_exists: bool,
+    pub source_status: ManagedSourceStatus,
 }
 
 fn merge_external_repo_into_managed(
@@ -434,6 +637,91 @@ mod tests {
     use super::*;
     use crate::SelfRolloutPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn source_heads_match_accepts_equal_or_prefix_heads() {
+        assert!(source_heads_match(Some("abcdef12"), "abcdef12"));
+        assert!(source_heads_match(Some("abcdef123456"), "abcdef12"));
+        assert!(source_heads_match(Some("abcdef12"), "abcdef123456"));
+        assert!(!source_heads_match(Some("abcdef12"), "12345678"));
+        assert!(!source_heads_match(None, "abcdef12"));
+    }
+
+    #[test]
+    fn rollout_remote_repo_path_resolves_relative_repos_under_data_dir() {
+        let data_dir = PathBuf::from("/tmp/sinomo-rollout-data");
+        let paths = SelfRolloutPaths::new(&data_dir);
+
+        assert_eq!(
+            rollout_remote_repo_path(&paths, None),
+            paths.source_repo.clone()
+        );
+        assert_eq!(
+            rollout_remote_repo_path(&paths, Some(Path::new("remote-source"))),
+            data_dir.join("remote-source")
+        );
+        assert_eq!(
+            rollout_remote_repo_path(&paths, Some(Path::new("/opt/sinomo-source"))),
+            PathBuf::from("/opt/sinomo-source")
+        );
+    }
+
+    #[test]
+    fn stage_local_rollout_artifacts_stages_main_and_shadow_binaries() {
+        let root = unique_temp("sinomo-rollout-local-artifacts");
+        let data = root.join("data");
+        let source = root.join(format!("source{}", env::consts::EXE_SUFFIX));
+        fs::create_dir_all(&data).expect("data dir");
+        fs::write(&source, b"binary").expect("source binary");
+        let paths = SelfRolloutPaths::new(&data);
+        ensure_rollout_layout(&paths).expect("layout");
+
+        let artifacts =
+            stage_local_rollout_artifacts(&paths, source.clone()).expect("local artifacts");
+
+        assert_eq!(artifacts.built_binary, source);
+        assert_eq!(
+            artifacts.staged_main_binary,
+            rollout_staged_main_binary(&paths)
+        );
+        assert_eq!(
+            artifacts.staged_shadow_binary,
+            rollout_staged_shadow_binary(&paths)
+        );
+        assert_eq!(
+            fs::read(&artifacts.staged_main_binary).expect("main staged"),
+            b"binary"
+        );
+        assert_eq!(
+            fs::read(&artifacts.staged_shadow_binary).expect("shadow staged"),
+            b"binary"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn create_source_repo_bundle_base64_returns_bundle_and_head() {
+        let root = unique_temp("sinomo-rollout-source-bundle-base64");
+        let external = root.join("external");
+        let data = root.join("data");
+        fs::create_dir_all(&external).expect("external dir");
+        run_git_for_test(&external, &["init"]);
+        run_git_for_test(&external, &["config", "user.email", "test@example.invalid"]);
+        run_git_for_test(&external, &["config", "user.name", "Sinomo Test"]);
+        fs::write(external.join("Cargo.toml"), "[workspace]\n").expect("cargo");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "initial"]);
+        let expected_head =
+            git_one_line(&external, &["rev-parse", "--short=8", "HEAD"]).expect("head");
+
+        let paths = SelfRolloutPaths::new(&data);
+        let (bundle, head) = create_source_repo_bundle_base64(&paths, &external).expect("bundle");
+
+        assert!(!bundle.is_empty());
+        assert_eq!(head, expected_head);
+        assert!(paths.root.join("staged").exists());
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn deploy_managed_source_bundle_initializes_missing_managed_repo() {

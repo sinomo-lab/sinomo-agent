@@ -27,8 +27,8 @@ pub use distributed::{
     DistributedWriteIntent, plan_replicas,
 };
 pub use local_owned::{
-    DfsExposeConfig, DfsExposeEntry, DfsExposeFileInfo, DfsExposeStore, DfsExposeStoreError,
-    DfsExposedDirectory, LocalOwnedDfsError,
+    DfsExposeAddRequest, DfsExposeConfig, DfsExposeEntry, DfsExposeFileInfo, DfsExposeStore,
+    DfsExposeStoreError, DfsExposedDirectory, LocalOwnedDfsError,
 };
 pub use metadata_backend::{
     DfsConflictRecord, DfsConflictStatus, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId,
@@ -45,7 +45,8 @@ pub use namespace::{
 pub use operator::{
     DfsAgentFileSystemSummary, DfsAgentObjectState, DfsAgentObjectSummary,
     DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
-    DfsOperatorStatus, DfsPinMode, DfsPinRecord, DfsPinStoreError, LocalDfsPinStore,
+    DfsOperatorStatus, DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError,
+    LocalDfsPinStore,
 };
 pub use posix::{DfsDirEntry, DfsPosixError, DfsStat, DfsWriteOptions};
 
@@ -56,18 +57,23 @@ use sinomo_core::{
     RoutingMetadata, RoutingScope, Salience, Source,
 };
 use sinomo_kv::KvError;
-use sinomo_local::SinomoDataDir;
+use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
     MeshMessage, MeshMessageBody, MeshMessageId, NetworkError, NetworkFrame, NetworkFrameId,
     NetworkTransport, ProtocolMessage,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
+pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
+
+pub fn fallback_dfs_node_id() -> NodeId {
+    NodeId::from_legacy_named(DEFAULT_DFS_NODE_ID).expect("valid fallback DFS node id")
+}
 
 pub fn sifs_file_system_id() -> DfsFileSystemId {
     DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).expect("valid sifs filesystem id")
@@ -77,8 +83,26 @@ pub fn default_dfs_metadata_root(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir.dfs_dir().join("metadata").join("root")
 }
 
+pub fn resolve_dfs_metadata_root(explicit: Option<PathBuf>) -> Result<PathBuf, LocalDataError> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    Ok(default_dfs_metadata_root(&data_dir))
+}
+
 pub fn default_dfs_pin_root(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir.dfs_dir().join("pins")
+}
+
+pub fn resolve_dfs_pin_root(explicit: Option<PathBuf>) -> Result<PathBuf, LocalDataError> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    Ok(default_dfs_pin_root(&data_dir))
 }
 
 pub fn default_dfs_expose_config_path(data_dir: &SinomoDataDir) -> PathBuf {
@@ -89,10 +113,103 @@ pub fn dfs_expose_config_path(explicit: Option<PathBuf>, data_dir: &SinomoDataDi
     explicit.unwrap_or_else(|| default_dfs_expose_config_path(data_dir))
 }
 
+pub fn ensure_default_dfs_expose_config(
+    config_path: impl AsRef<Path>,
+    data_dir: impl AsRef<Path>,
+    node_id: NodeId,
+) -> Result<DfsExposeConfig, DfsExposeStoreError> {
+    DfsExposeStore::new(config_path.as_ref().to_path_buf())
+        .ensure_default(data_dir.as_ref(), node_id)
+}
+
+pub fn load_dfs_expose_config(
+    config_path: impl AsRef<Path>,
+) -> Result<DfsExposeConfig, DfsExposeStoreError> {
+    DfsExposeStore::new(config_path.as_ref().to_path_buf()).load()
+}
+
+pub fn add_dfs_expose_entry(
+    config_path: impl AsRef<Path>,
+    request: DfsExposeAddRequest,
+) -> Result<DfsExposeConfig, DfsExposeStoreError> {
+    DfsExposeStore::new(config_path.as_ref().to_path_buf()).add_entry(request)
+}
+
+pub fn remove_dfs_expose_entry(
+    config_path: impl AsRef<Path>,
+    id: &str,
+) -> Result<(DfsExposeConfig, bool), DfsExposeStoreError> {
+    DfsExposeStore::new(config_path.as_ref().to_path_buf()).remove_entry(id)
+}
+
+pub fn list_local_dfs_pins(
+    root: impl Into<PathBuf>,
+    file_system_id: Option<&DfsFileSystemId>,
+) -> Result<Vec<DfsPinRecord>, DfsPinStoreError> {
+    LocalDfsPinStore::new(root).list_pins(file_system_id)
+}
+
+pub fn add_local_dfs_pin(
+    root: impl Into<PathBuf>,
+    request: DfsPinAddRequest,
+) -> Result<DfsPinRecord, DfsPinStoreError> {
+    LocalDfsPinStore::new(root).add_pin(request)
+}
+
+pub fn remove_local_dfs_pin(
+    root: impl Into<PathBuf>,
+    file_system_id: &DfsFileSystemId,
+    path: &str,
+    node_id: Option<&NodeId>,
+) -> Result<bool, DfsPinStoreError> {
+    LocalDfsPinStore::new(root).remove_pin(file_system_id, path, node_id)
+}
+
 pub fn open_root_local_metadata_backend(
     root: impl Into<PathBuf>,
 ) -> Result<LocalJsonMetadataBackend, MetadataBackendError> {
     LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.into())
+}
+
+pub fn inspect_dfs_status(
+    root: impl Into<PathBuf>,
+) -> Result<DfsOperatorStatus, MetadataBackendError> {
+    let backend = open_root_local_metadata_backend(root)?;
+    DfsOperatorInspector::new(&backend).status()
+}
+
+pub fn inspect_dfs_file_system(
+    root: impl Into<PathBuf>,
+    file_system_id: &DfsFileSystemId,
+) -> Result<Option<DfsOperatorFileSystemView>, MetadataBackendError> {
+    let backend = open_root_local_metadata_backend(root)?;
+    DfsOperatorInspector::new(&backend).file_system(file_system_id)
+}
+
+pub fn inspect_dfs_object(
+    root: impl Into<PathBuf>,
+    object_id: &DfsObjectId,
+) -> Result<Option<DfsOperatorObjectView>, MetadataBackendError> {
+    let backend = open_root_local_metadata_backend(root)?;
+    DfsOperatorInspector::new(&backend).object(object_id)
+}
+
+pub fn inspect_dfs_conflicts(
+    root: impl Into<PathBuf>,
+    file_system_id: Option<&DfsFileSystemId>,
+    object_id: Option<&DfsObjectId>,
+) -> Result<Vec<DfsConflictRecord>, MetadataBackendError> {
+    let backend = open_root_local_metadata_backend(root)?;
+    DfsOperatorInspector::new(&backend).conflicts(file_system_id, object_id)
+}
+
+pub fn inspect_dfs_repairs(
+    root: impl Into<PathBuf>,
+    file_system_id: Option<&DfsFileSystemId>,
+    object_id: Option<&DfsObjectId>,
+) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
+    let backend = open_root_local_metadata_backend(root)?;
+    DfsOperatorInspector::new(&backend).repairs(file_system_id, object_id)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -3166,6 +3283,20 @@ mod tests {
             DfsFileSystemId::from_legacy_named("sifs")
                 .expect("filesystem")
                 .as_str()
+        );
+    }
+
+    #[test]
+    fn explicit_dfs_roots_are_preserved() {
+        let root = PathBuf::from("/tmp/sinomo-dfs-explicit-root");
+
+        assert_eq!(
+            resolve_dfs_metadata_root(Some(root.join("metadata"))).expect("metadata root"),
+            root.join("metadata")
+        );
+        assert_eq!(
+            resolve_dfs_pin_root(Some(root.join("pins"))).expect("pin root"),
+            root.join("pins")
         );
     }
 }

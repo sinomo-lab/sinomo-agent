@@ -12,6 +12,7 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+base64 = "0.22"
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true

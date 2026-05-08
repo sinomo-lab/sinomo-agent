@@ -352,6 +352,16 @@ pub enum DfsPinMode {
     Content,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsPinAddRequest {
+    pub file_system_id: DfsFileSystemId,
+    pub path: String,
+    pub object_id: Option<DfsObjectId>,
+    pub pinned_by_node_id: NodeId,
+    pub mode: DfsPinMode,
+    pub created_at: OffsetDateTime,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalDfsPinStore {
     root: PathBuf,
@@ -414,6 +424,19 @@ impl LocalDfsPinStore {
                 .then_with(|| left.pinned_by_node_id.cmp(&right.pinned_by_node_id))
         });
         Ok(records)
+    }
+
+    pub fn add_pin(&self, request: DfsPinAddRequest) -> Result<DfsPinRecord, DfsPinStoreError> {
+        let record = DfsPinRecord {
+            file_system_id: request.file_system_id,
+            path: request.path,
+            object_id: request.object_id,
+            pinned_by_node_id: request.pinned_by_node_id,
+            mode: request.mode,
+            created_at: request.created_at,
+        };
+        self.put_pin(&record)?;
+        Ok(record)
     }
 
     fn pin_path(&self, record: &DfsPinRecord) -> PathBuf {
@@ -653,16 +676,17 @@ mod tests {
     fn local_pin_store_adds_lists_and_removes_records() {
         let root = temp_root("local_pin_store_adds_lists_and_removes_records");
         let store = LocalDfsPinStore::new(&root);
-        let record = DfsPinRecord {
-            file_system_id: file_system_id(),
-            path: "src/lib.rs".to_string(),
-            object_id: Some(object_id()),
-            pinned_by_node_id: node("node_laptop"),
-            mode: DfsPinMode::Content,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
+        let record = store
+            .add_pin(DfsPinAddRequest {
+                file_system_id: file_system_id(),
+                path: "src/lib.rs".to_string(),
+                object_id: Some(object_id()),
+                pinned_by_node_id: node("node_laptop"),
+                mode: DfsPinMode::Content,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("add pin");
 
-        store.put_pin(&record).expect("put pin");
         assert_eq!(store.list_pins(None).expect("pins"), vec![record.clone()]);
         assert!(
             store
