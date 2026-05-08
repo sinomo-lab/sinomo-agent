@@ -1374,7 +1374,16 @@ pub fn update_cluster_raft_role(
     let mut member: ClusterMemberRecord = member_entry.decode()?;
     let previous_role = member.role.clone();
     let previous_state = member.state.clone();
-    let changed = previous_role != role || previous_state != new_state;
+    let config_role = store
+        .get(&sinomo_network::cluster_raft_config_key())
+        .and_then(|entry| {
+            entry
+                .decode::<sinomo_network::ClusterRaftConfigRecord>()
+                .ok()
+        })
+        .and_then(|config| cluster_raft_config_member_role(&config, &node_id));
+    let changed =
+        previous_role != role || previous_state != new_state || config_role.as_ref() != Some(&role);
     if changed {
         sinomo_network::apply_cluster_raft_role(&mut member, role.clone(), now);
         commit_cluster_kv_txn_with_quorum(
@@ -1443,6 +1452,25 @@ fn cluster_member_update_txn(
         success: cluster_member_update_ops(member)?,
         failure: Vec::new(),
     })
+}
+
+fn cluster_raft_config_member_role(
+    config: &sinomo_network::ClusterRaftConfigRecord,
+    node_id: &NodeId,
+) -> Option<ClusterMemberRole> {
+    if config.voters.iter().any(|candidate| candidate == node_id) {
+        Some(ClusterMemberRole::Voter)
+    } else if config.learners.iter().any(|candidate| candidate == node_id) {
+        Some(ClusterMemberRole::Learner)
+    } else if config
+        .non_voting
+        .iter()
+        .any(|candidate| candidate == node_id)
+    {
+        Some(ClusterMemberRole::NonVoting)
+    } else {
+        None
+    }
 }
 
 fn cluster_member_raft_update_txn(
