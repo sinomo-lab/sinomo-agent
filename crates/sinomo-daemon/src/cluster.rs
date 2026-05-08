@@ -422,13 +422,22 @@ pub fn reconcile_cluster_join_with_introducers(
         invite: invite.clone(),
         members: state.members.clone(),
     };
+    let deadline = Instant::now() + tcp_timeout.max(iroh_timeout);
+    let remaining_for = |channel_timeout: Duration| {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_else(|| Duration::from_millis(1));
+        remaining.min(channel_timeout)
+    };
     let mut failures = Vec::new();
     for channel in invite_channels_for_join_registration(&request.invite) {
+        let tcp_remaining = remaining_for(tcp_timeout);
+        let iroh_remaining = remaining_for(iroh_timeout);
         match send_cluster_join_registration_to_channel(
             &channel.endpoint,
             &request,
-            tcp_timeout,
-            iroh_timeout,
+            tcp_remaining,
+            iroh_remaining,
         ) {
             Ok(response) => {
                 if response.accepted {

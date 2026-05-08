@@ -244,8 +244,8 @@ fn install_parser_accepts_custom_daemon_ports() {
 fn cluster_join_timeout_covers_registration_work_and_stays_capped() {
     assert!(super::DAEMON_JOIN_TIMEOUT >= Duration::from_secs(3));
     assert!(super::DAEMON_JOIN_TIMEOUT <= Duration::from_secs(10));
-    assert!(super::IROH_DAEMON_JOIN_TIMEOUT >= Duration::from_secs(30));
-    assert!(super::IROH_DAEMON_JOIN_TIMEOUT <= Duration::from_secs(60));
+    assert!(super::IROH_DAEMON_JOIN_TIMEOUT >= Duration::from_secs(3));
+    assert!(super::IROH_DAEMON_JOIN_TIMEOUT <= Duration::from_secs(5));
 }
 
 #[test]

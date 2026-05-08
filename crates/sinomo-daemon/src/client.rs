@@ -17,7 +17,7 @@ use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
 };
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn send_daemon_rpc(
     address: &str,
@@ -287,6 +287,12 @@ pub fn send_cluster_join_registration_to_endpoint(
     request: &ClusterJoinRegistrationRequest,
     timeout: Duration,
 ) -> Result<ClusterJoinRegistrationResponse, DaemonError> {
+    let deadline = Instant::now() + timeout;
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_else(|| Duration::from_millis(1))
+    };
     let challenge = random_url_secret(32)?;
     let challenge_request = ClusterInviteChallengeRequest {
         protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
@@ -303,7 +309,7 @@ pub fn send_cluster_join_registration_to_endpoint(
         &daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE),
         None,
         &challenge_rpc,
-        timeout,
+        remaining(),
     )?;
     let proof: ClusterInviteChallengeProof = proof_response.decode_body()?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
@@ -318,7 +324,7 @@ pub fn send_cluster_join_registration_to_endpoint(
         &daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE),
         Some(&signed),
         &register_rpc,
-        timeout,
+        remaining(),
     )?;
     response.decode_body().map_err(DaemonError::from)
 }
