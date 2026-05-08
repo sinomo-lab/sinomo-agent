@@ -1,7 +1,8 @@
 use crate::rollout::{SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV};
 use crate::{
-    DaemonError, DaemonPaths, daemon_probe_status_needs_restart_for_options, probe_daemon_status,
-    send_daemon_shutdown_request,
+    DaemonError, DaemonPaths, DaemonRunOptions, DaemonStatus, daemon_connect_address,
+    daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
+    probe_daemon_status, probe_daemon_status_at_address, send_daemon_shutdown_request,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_rollout::{
@@ -606,6 +607,11 @@ pub fn start_installed_sinomo_daemon(
     ready_timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<InstalledDaemonStartStatus, DaemonError> {
+    if let Some(status) = probe_installed_daemon_start_status(paths, args, probe_timeout) {
+        return Ok(InstalledDaemonStartStatus::Started(status));
+    }
+    terminate_matching_installed_daemon_process(binary, args, ready_timeout)?;
+
     let mut command = Command::new(binary);
     command.args(args).env("SINOMO_DATA_DIR", data_dir);
     for (key, value) in extra_env {
@@ -625,15 +631,8 @@ pub fn start_installed_sinomo_daemon(
     let deadline = Instant::now() + ready_timeout;
     let mut exited_before_ready: Option<(String, i32)> = None;
     while Instant::now() < deadline {
-        match probe_daemon_status(paths, probe_timeout) {
-            crate::DaemonProbeStatus::Running(status)
-            | crate::DaemonProbeStatus::Locked {
-                status: Some(status),
-            } => {
-                return Ok(InstalledDaemonStartStatus::Started(status));
-            }
-            crate::DaemonProbeStatus::Locked { status: None }
-            | crate::DaemonProbeStatus::NotRunning => {}
+        if let Some(status) = probe_installed_daemon_start_status(paths, args, probe_timeout) {
+            return Ok(InstalledDaemonStartStatus::Started(status));
         }
 
         if exited_before_ready.is_none()
@@ -657,6 +656,152 @@ pub fn start_installed_sinomo_daemon(
     Ok(InstalledDaemonStartStatus::TimedOut {
         status_path: paths.status.clone(),
         child_id: child.id(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_matching_installed_daemon_process(
+    binary: &Path,
+    args: &[String],
+    wait_timeout: Duration,
+) -> Result<Option<u32>, DaemonError> {
+    let Some(pid) = find_matching_installed_daemon_process(binary, args)? else {
+        return Ok(None);
+    };
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGTERM: i32 = 15;
+    let result = unsafe { kill(pid as i32, SIGTERM) };
+    if result == -1 {
+        return Err(DaemonError::Io {
+            path: format!("pid {pid}"),
+            detail: std::io::Error::last_os_error().to_string(),
+        });
+    }
+
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let deadline = Instant::now() + wait_timeout;
+    while Instant::now() < deadline {
+        if !proc_dir.exists() || process_cmdline(&proc_dir).is_none_or(|cmdline| cmdline.is_empty())
+        {
+            return Ok(Some(pid));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(Some(pid))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminate_matching_installed_daemon_process(
+    _binary: &Path,
+    _args: &[String],
+    _wait_timeout: Duration,
+) -> Result<Option<u32>, DaemonError> {
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn find_matching_installed_daemon_process(
+    binary: &Path,
+    args: &[String],
+) -> Result<Option<u32>, DaemonError> {
+    let current_pid = std::process::id();
+    let entries = fs::read_dir("/proc").map_err(|source| DaemonError::Io {
+        path: "/proc".to_string(),
+        detail: source.to_string(),
+    })?;
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = file_name.parse::<u32>() else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        let Some(cmdline) = process_cmdline(&entry.path()) else {
+            continue;
+        };
+        if installed_daemon_cmdline_matches(&cmdline, binary, args) {
+            return Ok(Some(pid));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn process_cmdline(proc_dir: &Path) -> Option<Vec<String>> {
+    let bytes = fs::read(proc_dir.join("cmdline")).ok()?;
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn installed_daemon_cmdline_matches(cmdline: &[String], binary: &Path, args: &[String]) -> bool {
+    if cmdline.len() != args.len() + 1 {
+        return false;
+    }
+    if Path::new(&cmdline[0]) != binary {
+        return false;
+    }
+    cmdline[1..] == *args
+}
+
+fn probe_installed_daemon_start_status(
+    paths: &DaemonPaths,
+    args: &[String],
+    timeout: Duration,
+) -> Option<DaemonStatus> {
+    match probe_daemon_status(paths, timeout) {
+        crate::DaemonProbeStatus::Running(status)
+        | crate::DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => return Some(status),
+        crate::DaemonProbeStatus::Locked { status: None }
+        | crate::DaemonProbeStatus::NotRunning => {}
+    }
+
+    let options = daemon_run_options_from_args(args)?;
+    let address = daemon_connect_address(&options.host, options.port);
+    let status = probe_daemon_status_at_address(&address, timeout)?;
+    if daemon_status_matches_options(&status, &options.host, options.port) {
+        Some(status)
+    } else {
+        None
+    }
+}
+
+fn daemon_run_options_from_args(args: &[String]) -> Option<DaemonRunOptions> {
+    let mut host = None;
+    let mut port = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--host" => host = iter.next().cloned(),
+            "--port" => {
+                port = iter.next().and_then(|value| value.parse::<u16>().ok());
+            }
+            _ => {}
+        }
+    }
+    Some(DaemonRunOptions {
+        host: host?,
+        port: port?,
     })
 }
 
@@ -920,6 +1065,62 @@ mod tests {
             Some("install option update")
         );
         assert_eq!(installed_daemon_install_stop_reason(false, false), None);
+    }
+
+    #[test]
+    fn daemon_run_options_from_args_parses_main_and_shadow_specs() {
+        let main = daemon_run_options_from_args(&[
+            "daemon".to_string(),
+            "run".to_string(),
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--port".to_string(),
+            "21353".to_string(),
+        ])
+        .expect("main options");
+        assert_eq!(main.host, "0.0.0.0");
+        assert_eq!(main.port, 21353);
+
+        let shadow = daemon_run_options_from_args(&[
+            "daemon".to_string(),
+            "shadow".to_string(),
+            "run".to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "21354".to_string(),
+        ])
+        .expect("shadow options");
+        assert_eq!(shadow.host, "127.0.0.1");
+        assert_eq!(shadow.port, 21354);
+
+        assert!(daemon_run_options_from_args(&["daemon".to_string(), "run".to_string()]).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_daemon_cmdline_matches_exact_installed_command() {
+        let binary = Path::new("/home/test/.sinomo/bin/sinomo");
+        let args = vec![
+            "daemon".to_string(),
+            "run".to_string(),
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--port".to_string(),
+            "21353".to_string(),
+        ];
+        let mut cmdline = vec![binary.display().to_string()];
+        cmdline.extend(args.clone());
+
+        assert!(installed_daemon_cmdline_matches(&cmdline, binary, &args));
+
+        let mut wrong_port = cmdline.clone();
+        *wrong_port.last_mut().expect("port") = "21354".to_string();
+        assert!(!installed_daemon_cmdline_matches(
+            &wrong_port,
+            binary,
+            &args
+        ));
     }
 
     #[test]

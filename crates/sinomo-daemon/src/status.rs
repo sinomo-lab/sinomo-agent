@@ -510,15 +510,7 @@ impl Drop for DaemonLock {
 pub fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProbeStatus {
     let status = read_daemon_status(paths).ok();
     if let Some(status) = &status {
-        let request = sinomo_network::ObjectRpcRequest::encode_body(
-            sinomo_network::DAEMON_STATUS_ROUTE,
-            sinomo_network::DAEMON_RPC_CATEGORY,
-            &(),
-        );
-        if request
-            .ok()
-            .and_then(|request| send_daemon_rpc(&status.address, &request, timeout).ok())
-            .and_then(|response| response.decode_body::<DaemonStatus>().ok())
+        if probe_daemon_status_at_address(&status.address, timeout)
             .is_some_and(|remote_status| daemon_status_matches_probe(status, &remote_status))
         {
             return DaemonProbeStatus::Running(status.clone());
@@ -549,6 +541,19 @@ pub fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProb
         }
         Err(_) => DaemonProbeStatus::Locked { status },
     }
+}
+
+pub fn probe_daemon_status_at_address(address: &str, timeout: Duration) -> Option<DaemonStatus> {
+    let request = sinomo_network::ObjectRpcRequest::encode_body(
+        sinomo_network::DAEMON_STATUS_ROUTE,
+        sinomo_network::DAEMON_RPC_CATEGORY,
+        &(),
+    )
+    .ok()?;
+    send_daemon_rpc(address, &request, timeout)
+        .ok()?
+        .decode_body::<DaemonStatus>()
+        .ok()
 }
 
 pub fn default_main_daemon_status(timeout: Duration) -> Result<Option<DaemonStatus>, DaemonError> {

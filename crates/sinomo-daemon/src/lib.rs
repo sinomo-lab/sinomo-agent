@@ -124,6 +124,6 @@ pub use status::{
     daemon_connect_address, daemon_options_from_status, daemon_package_version,
     daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
     daemon_status_matches_probe, default_main_daemon_status, ensure_daemon_cluster_members,
-    invite_introducers_from_daemon_status, probe_daemon_status, read_daemon_status,
-    unknown_cluster_node_status, write_daemon_status,
+    invite_introducers_from_daemon_status, probe_daemon_status, probe_daemon_status_at_address,
+    read_daemon_status, unknown_cluster_node_status, write_daemon_status,
 };
