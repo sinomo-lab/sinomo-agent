@@ -193,18 +193,24 @@ pub fn invite_channels(invite: &ClusterJoinInvite) -> Vec<ClusterInvitationChann
 pub fn invite_channels_for_join_registration(
     invite: &ClusterJoinInvite,
 ) -> Vec<ClusterInvitationChannel> {
-    let channels = invite_channels(invite);
+    let mut channels = invite_channels(invite);
     if channels
         .iter()
         .any(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
     {
-        channels
+        channels = channels
             .into_iter()
             .filter(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
-            .collect()
-    } else {
-        channels
+            .collect();
     }
+    channels.sort_by_key(|channel| {
+        (
+            !matches!(channel.endpoint.transport, ClusterTransportKind::Iroh),
+            channel.endpoint.priority,
+            channel.endpoint.address.clone(),
+        )
+    });
+    channels
 }
 
 pub fn is_remote_join_registration_endpoint(endpoint: &ClusterEndpointRecord) -> bool {

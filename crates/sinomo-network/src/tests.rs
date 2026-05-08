@@ -299,6 +299,66 @@ fn explicit_iroh_invite_introducer_only_treats_top_level_direct_query_as_direct(
 }
 
 #[test]
+fn join_registration_channels_prioritize_iroh_before_direct_lan() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_invite_iroh_first").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_invite_iroh_first").expect("node");
+    let lan_endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_iroh_first_lan")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "192.0.2.10:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 20,
+        last_observed_latency_ms: None,
+    };
+    let iroh_endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_iroh_first_iroh")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_first?relay=https://relay.example./".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let invite = ClusterJoinInvite {
+        invite_id: sinomo_core::ClusterInviteId::from_legacy_named("invite_iroh_first")
+            .expect("invite"),
+        cluster_id,
+        cluster_name: Some("iroh first".to_string()),
+        cluster_public_key: "cluster-pk".to_string(),
+        invitation_secret: "secret".to_string(),
+        communication_channels: vec![
+            ClusterInvitationChannel {
+                endpoint: lan_endpoint,
+                node_public_key: "node-pk".to_string(),
+            },
+            ClusterInvitationChannel {
+                endpoint: iroh_endpoint,
+                node_public_key: "node-pk".to_string(),
+            },
+        ],
+        introducers: Vec::new(),
+        token_id: "token".to_string(),
+        expires_at: OffsetDateTime::UNIX_EPOCH,
+        trust_domain: TrustDomain::new("trust.local").expect("trust domain"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: node_id,
+        issuer_public_key: "issuer-pk".to_string(),
+        signature: String::new(),
+    };
+
+    let channels = invite_channels_for_join_registration(&invite);
+
+    assert_eq!(channels.len(), 2);
+    assert_eq!(channels[0].endpoint.transport, ClusterTransportKind::Iroh);
+    assert_eq!(channels[1].endpoint.transport, ClusterTransportKind::LanTcp);
+}
+
+#[test]
 fn command_target_selection_orders_bounded_transport_before_iroh_fallback() {
     let node_id = NodeId::from_legacy_named("node_target_iroh_order").expect("node");
     let direct = daemon_lan_endpoint(&node_id, "192.0.2.45:21353".to_string(), 20);
