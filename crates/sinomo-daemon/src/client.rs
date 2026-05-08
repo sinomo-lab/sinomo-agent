@@ -5,7 +5,7 @@ use crate::{
     verify_cluster_invite_challenge_proof,
 };
 use sinomo_core::{ClusterEndpointRecord, ClusterTransportKind};
-use sinomo_kv::KvSnapshot;
+use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_network::{
     ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterKvWatchEventsRequest,
     ClusterKvWatchEventsResponse, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
@@ -100,6 +100,33 @@ pub fn fetch_cluster_kv_snapshot(
         &(),
     )?;
     let response = send_daemon_rpc(address, &request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn fetch_cluster_kv_snapshot_from_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<KvSnapshot, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        sinomo_network::CLUSTER_KV_SNAPSHOT_ROUTE,
+        sinomo_network::CLUSTER_KV_RPC_CATEGORY,
+        &(),
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn send_cluster_kv_txn(
+    endpoint: &ClusterEndpointRecord,
+    txn: &KvTxn,
+    timeout: Duration,
+) -> Result<KvTxnResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        sinomo_network::CLUSTER_KV_TXN_ROUTE,
+        sinomo_network::CLUSTER_KV_RPC_CATEGORY,
+        txn,
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 

@@ -4,9 +4,10 @@ use crate::{
     cluster_node_status_from_daemon_status, current_shadow_daemon_options,
     daemon_cluster_options_from_status, daemon_cluster_process_from_paths, daemon_cluster_status,
     daemon_cluster_status_matches, daemon_connect_address, daemon_options_from_status,
-    default_main_daemon_status, ensure_daemon_cluster_members, fetch_daemon_status_from_endpoint,
+    default_main_daemon_status, ensure_daemon_cluster_members,
+    fetch_cluster_kv_snapshot_from_endpoint, fetch_daemon_status_from_endpoint,
     invite_introducers_from_daemon_status, probe_daemon_status, read_daemon_status,
-    send_cluster_join_registration_to_channel, send_cluster_kv_watch_events,
+    send_cluster_join_registration_to_channel, send_cluster_kv_txn, send_cluster_kv_watch_events,
     send_cluster_member_publish, send_cluster_raft_append, send_cluster_raft_vote,
     unknown_cluster_node_status, write_daemon_status,
 };
@@ -1828,6 +1829,9 @@ pub fn commit_cluster_kv_txn_with_quorum(
     txn: KvTxn,
 ) -> Result<KvSnapshot, DaemonError> {
     if !cluster_has_local_quorum(paths, state) {
+        if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
+            return response;
+        }
         return Err(DaemonError::ClusterReadOnly {
             detail: format!(
                 "quorum unavailable ({} reachable voters, {} required)",
@@ -1839,12 +1843,53 @@ pub fn commit_cluster_kv_txn_with_quorum(
     if !sinomo_network::cluster_raft_local_is_leader(paths, state)?
         && !elect_cluster_raft_leader(paths, state)?
     {
+        if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
+            return response;
+        }
         return Err(DaemonError::ClusterReadOnly {
             detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
         });
     }
     commit_cluster_raft_command_with_quorum(paths, state, KvCommand::Txn(txn))
         .map(|(snapshot, _)| snapshot)
+}
+
+fn forward_cluster_kv_txn_to_voter(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    txn: &KvTxn,
+) -> Option<Result<KvSnapshot, DaemonError>> {
+    let mut targets = sinomo_network::prefer_bounded_daemon_command_targets(
+        sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
+    )
+    .into_iter()
+    .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
+    .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return None;
+    }
+    if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
+        && let Some(position) = targets
+            .iter()
+            .position(|endpoint| endpoint.node_id == leader_id)
+    {
+        let leader = targets.remove(position);
+        targets.insert(0, leader);
+    }
+
+    let mut last_error = None;
+    for endpoint in targets {
+        match send_cluster_kv_txn(&endpoint, txn, DAEMON_CLUSTER_RPC_TIMEOUT) {
+            Ok(_) => {
+                return Some(fetch_cluster_kv_snapshot_from_endpoint(
+                    &endpoint,
+                    DAEMON_CLUSTER_RPC_TIMEOUT,
+                ));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    last_error.map(Err)
 }
 
 pub fn elect_cluster_raft_leader(

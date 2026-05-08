@@ -18,9 +18,10 @@ pub use auth::{
     sign_daemon_rpc_request_from_data_dir, verify_cluster_invite_challenge_proof,
 };
 pub use client::{
-    fetch_cluster_kv_snapshot, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
+    fetch_cluster_kv_snapshot, fetch_cluster_kv_snapshot_from_endpoint,
+    fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
     send_cluster_join_registration, send_cluster_join_registration_to_channel,
-    send_cluster_join_registration_to_endpoint, send_cluster_kv_watch_events,
+    send_cluster_join_registration_to_endpoint, send_cluster_kv_txn, send_cluster_kv_watch_events,
     send_cluster_member_publish, send_cluster_raft_append, send_cluster_raft_vote,
     send_daemon_finalize_shadow_rollout_request, send_daemon_rollout_binary,
     send_daemon_rollout_build, send_daemon_rollout_diagnostics, send_daemon_rpc,
