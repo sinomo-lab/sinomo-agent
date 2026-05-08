@@ -623,35 +623,29 @@ pub fn start_installed_sinomo_daemon(
         })?;
 
     let deadline = Instant::now() + ready_timeout;
-    let mut exited_before_ready: Option<(String, i32, Instant)> = None;
+    let mut exited_before_ready: Option<(String, i32)> = None;
     while Instant::now() < deadline {
-        let probe = probe_daemon_status(paths, probe_timeout);
-        let probe_was_locked = match probe {
-            crate::DaemonProbeStatus::Running(status) => {
-                return Ok(InstalledDaemonStartStatus::Started(status));
-            }
-            crate::DaemonProbeStatus::Locked { .. } => true,
-            crate::DaemonProbeStatus::NotRunning => false,
-        };
+        if let crate::DaemonProbeStatus::Running(status) = probe_daemon_status(paths, probe_timeout)
+        {
+            return Ok(InstalledDaemonStartStatus::Started(status));
+        }
 
-        if let Some((command, status, grace_deadline)) = &exited_before_ready {
-            if !probe_was_locked && Instant::now() >= *grace_deadline {
-                return Ok(InstalledDaemonStartStatus::ExitedBeforeReady {
-                    command: command.clone(),
-                    status: *status,
-                });
-            }
-        } else if let Some(status) = child.try_wait().map_err(|source| DaemonError::Io {
-            path: binary.display().to_string(),
-            detail: source.to_string(),
-        })? {
+        if exited_before_ready.is_none()
+            && let Some(status) = child.try_wait().map_err(|source| DaemonError::Io {
+                path: binary.display().to_string(),
+                detail: source.to_string(),
+            })?
+        {
             exited_before_ready = Some((
                 format!("{} {}", binary.display(), args.join(" ")),
                 status.code().unwrap_or(-1),
-                Instant::now() + Duration::from_secs(2),
             ));
         }
         thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some((command, status)) = exited_before_ready {
+        return Ok(InstalledDaemonStartStatus::ExitedBeforeReady { command, status });
     }
 
     Ok(InstalledDaemonStartStatus::TimedOut {
