@@ -922,7 +922,7 @@ pub fn ensure_daemon_status_cluster(
     if !cluster_paths.state.exists() {
         return Ok(());
     }
-    let mut state = sinomo_network::read_cluster_state(&cluster_paths)?;
+    let mut state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
     let process = daemon_cluster_process_from_paths(data_dir, paths);
     let (main_options, shadow_options) =
         daemon_cluster_options_from_status(data_dir, paths, status, process);
@@ -933,6 +933,7 @@ pub fn ensure_daemon_status_cluster(
         time::OffsetDateTime::now_utc(),
     );
     assign_local_node_public_keys(&cluster_paths, &mut state)?;
+    let _ = refresh_local_iroh_endpoints_from_disk(&cluster_paths, &mut state)?;
     sinomo_network::write_cluster_state(&cluster_paths, &state)?;
     if let Some(cluster) = daemon_cluster_status(&state, process) {
         status.cluster = Some(cluster);
