@@ -377,6 +377,11 @@ pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
             .field("kind", "MainExitKind")
             .field("observed_at", "String"),
     )?;
+    layout.register_file(StorageFileContract::human_text(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/last-main-exit.json",
+    )?)?;
     register_object(
         &mut layout,
         "sinomo-rollout",
@@ -642,10 +647,16 @@ fn normalize_relative_path(path: &Path) -> Result<String, StorageContractError> 
             path: path.display().to_string(),
         });
     }
-    let mut normalized = PathBuf::new();
+    let mut parts = Vec::new();
     for component in path.components() {
         match component {
-            Component::Normal(value) => normalized.push(value),
+            Component::Normal(value) => {
+                parts.push(value.to_str().ok_or_else(|| {
+                    StorageContractError::InvalidRelativePath {
+                        path: path.display().to_string(),
+                    }
+                })?);
+            }
             _ => {
                 return Err(StorageContractError::InvalidRelativePath {
                     path: path.display().to_string(),
@@ -653,18 +664,14 @@ fn normalize_relative_path(path: &Path) -> Result<String, StorageContractError> 
             }
         }
     }
-    normalized.to_str().map(str::to_string).ok_or_else(|| {
-        StorageContractError::InvalidRelativePath {
-            path: path.display().to_string(),
-        }
-    })
+    Ok(parts.join("/"))
 }
 
 fn path_has_prefix(relative_path: &str, prefix: &str) -> bool {
     relative_path == prefix
         || relative_path
             .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
+            .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
 }
 
 impl fmt::Display for StoragePathOwner<'_> {
@@ -838,6 +845,38 @@ mod tests {
     }
 
     #[test]
+    fn verifier_covers_legacy_rollout_exit_record() {
+        let layout = sinomo_data_dir_layout().expect("layout");
+        let report = layout
+            .verify_relative_paths(["rollout/last-main-exit.json"])
+            .expect("verify");
+
+        assert!(report.unregistered.is_empty());
+        assert_eq!(report.covered[0].module, "sinomo-rollout");
+    }
+
+    #[test]
+    fn verifier_covers_windows_style_escape_paths() {
+        let layout = sinomo_data_dir_layout().expect("layout");
+        let report = layout
+            .verify_relative_paths([
+                "bin\\sinomo.exe",
+                "bin\\sinomo-shadow.exe",
+                "source\\sinomo\\.git\\config",
+            ])
+            .expect("verify");
+
+        assert!(report.unregistered.is_empty());
+        assert_eq!(report.covered.len(), 3);
+        assert!(
+            report
+                .covered
+                .iter()
+                .all(|path| path.module == "sinomo-rollout")
+        );
+    }
+
+    #[test]
     fn verifier_walks_data_dir_files() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-storage-verify-{}",
@@ -874,6 +913,8 @@ mod tests {
         )
         .expect("dfs metadata");
         std::fs::write(root.join("dfs/pins/root-hash-node.sobj"), b"pin").expect("dfs pin");
+        std::fs::write(root.join("rollout/last-main-exit.json"), b"{}")
+            .expect("legacy rollout exit");
         std::fs::write(root.join("rollout/logs/candidate.diagnostics.json"), b"{}")
             .expect("rollout diagnostics");
         std::fs::write(root.join("startup/sinomo.service"), b"service").expect("startup");
@@ -885,7 +926,7 @@ mod tests {
             .expect("verify");
 
         assert_eq!(report.unregistered, vec!["unknown/file.bin"]);
-        assert_eq!(report.covered.len(), 9);
+        assert_eq!(report.covered.len(), 10);
         std::fs::remove_dir_all(root).ok();
     }
 }
