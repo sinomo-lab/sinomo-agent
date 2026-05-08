@@ -916,6 +916,7 @@ pub(crate) fn cluster_peers() -> Result<(), CliError> {
 
 pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
     let update = daemon_update_cluster_node_role(
         &paths,
         options.node_id.clone(),
@@ -942,6 +943,7 @@ pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> 
 
 pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
     let update = daemon_update_cluster_raft_role(
         &paths,
         options.node_id.clone(),

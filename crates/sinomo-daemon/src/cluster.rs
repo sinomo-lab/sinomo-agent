@@ -1349,6 +1349,10 @@ fn current_cluster_kv_store(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<InProcessKvStore, DaemonError> {
+    let mut snapshots = Vec::new();
+    if let Ok(snapshot) = sinomo_network::read_cluster_kv_snapshot(paths) {
+        snapshots.push(snapshot);
+    }
     let mut targets = sinomo_network::prefer_bounded_daemon_command_targets(
         sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
     )
@@ -1367,12 +1371,16 @@ fn current_cluster_kv_store(
         if let Ok(snapshot) =
             fetch_cluster_kv_snapshot_from_endpoint(&endpoint, DAEMON_CLUSTER_RPC_TIMEOUT)
         {
-            return Ok(InProcessKvStore::restore(snapshot));
+            snapshots.push(snapshot);
         }
     }
-    Ok(InProcessKvStore::restore(
-        sinomo_network::read_cluster_kv_snapshot(paths)?,
-    ))
+    snapshots
+        .into_iter()
+        .max_by_key(|snapshot| snapshot.revision)
+        .map(InProcessKvStore::restore)
+        .ok_or_else(|| DaemonError::ClusterReadOnly {
+            detail: "no local or reachable cluster KV snapshot is available".to_string(),
+        })
 }
 
 fn cluster_member_update_txn(
