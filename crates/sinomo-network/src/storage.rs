@@ -42,6 +42,23 @@ impl ClusterPaths {
     }
 }
 
+pub fn remove_local_cluster_state(paths: &ClusterPaths) -> Result<(), NetworkError> {
+    if !paths.state.exists() {
+        return Err(NetworkError::ClusterOrphan);
+    }
+    fs::remove_file(&paths.state).map_err(|source| NetworkError::StorageIo {
+        path: paths.state.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if paths.kv_snapshot.exists() {
+        fs::remove_file(&paths.kv_snapshot).map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_snapshot.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterJoinRegistrationRequest {
     pub invite: sinomo_core::ClusterJoinInvite,
@@ -55,6 +72,32 @@ pub struct ClusterJoinRegistrationResponse {
     pub detail: String,
     pub state: ClusterBootstrapState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_snapshot: Option<KvSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterInvitePublishRequest {
+    pub invite: ClusterJoinInvite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterInvitePublishResponse {
+    pub accepted: bool,
+    pub detail: String,
+    pub state: ClusterBootstrapState,
+    pub kv_snapshot: Option<KvSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterMemberPublishRequest {
+    pub members: Vec<ClusterMemberRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterMemberPublishResponse {
+    pub accepted: bool,
+    pub detail: String,
+    pub state: ClusterBootstrapState,
     pub kv_snapshot: Option<KvSnapshot>,
 }
 
@@ -632,6 +675,17 @@ pub fn write_cluster_kv_snapshot(
     write_object_file(&paths.kv_snapshot, snapshot)
 }
 
+pub fn write_cluster_kv_snapshot_if_changed(
+    paths: &ClusterPaths,
+    snapshot: &KvSnapshot,
+) -> Result<bool, NetworkError> {
+    if read_cluster_kv_snapshot(paths).is_ok_and(|existing| existing == *snapshot) {
+        return Ok(false);
+    }
+    write_cluster_kv_snapshot(paths, snapshot)?;
+    Ok(true)
+}
+
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
     if paths.kv_raft.exists() {
         let state = read_cluster_state_without_kv(paths)?;
@@ -840,6 +894,38 @@ pub fn clear_cluster_raft_leader(
     node.clear_known_leader()?;
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
     mirror_cluster_raft_snapshot(paths, &node)
+}
+
+pub fn cluster_raft_known_leader_id(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Option<NodeId>, NetworkError> {
+    let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
+    Ok(node
+        .hard_state()
+        .leader_id
+        .clone()
+        .filter(|leader_id| cluster_raft_node_is_voter(state, leader_id)))
+}
+
+pub fn cluster_raft_local_is_leader(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<bool, NetworkError> {
+    Ok(
+        cluster_raft_known_leader_id(paths, state)?.as_ref() == Some(&state.local_node_id)
+            && cluster_raft_local_is_voter(state),
+    )
+}
+
+pub fn cluster_raft_vote_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_sync_targets_with_connectivity(paths, state)
+        .into_iter()
+        .filter(|endpoint| cluster_raft_node_is_voter(state, &endpoint.node_id))
+        .collect()
 }
 
 pub fn compact_cluster_raft_node_if_needed(
@@ -1911,6 +1997,39 @@ pub fn cluster_member_publish_matches_kv(
     Ok(true)
 }
 
+pub fn cluster_member_publish_txn(members: &[ClusterMemberRecord]) -> Result<KvTxn, NetworkError> {
+    let mut success = Vec::new();
+    for member in members {
+        let mut member = member.clone();
+        cleanup_member_iroh_endpoints(&mut member);
+        success.push(KvOp::put_serde(
+            cluster_member_key(&member.node_id),
+            &member,
+            None,
+        )?);
+        success.push(KvOp::put_serde(
+            cluster_capability_policy_key(&member.node_id),
+            &ClusterCapabilityPolicyRecord::from(&member),
+            None,
+        )?);
+        success.push(KvOp::DeletePrefix {
+            prefix: cluster_endpoint_prefix(&member.node_id),
+        });
+        for endpoint in &member.endpoints {
+            success.push(KvOp::put_serde(
+                cluster_endpoint_key(&member.node_id, endpoint),
+                endpoint,
+                None,
+            )?);
+        }
+    }
+    Ok(KvTxn {
+        compares: Vec::new(),
+        success,
+        failure: Vec::new(),
+    })
+}
+
 pub fn expire_cluster_network_records(
     paths: &ClusterPaths,
     now: OffsetDateTime,
@@ -2023,6 +2142,31 @@ pub fn read_cluster_invitation_from_kv(
         detail: "cluster invitation is not published".to_string(),
     })?;
     entry.decode().map_err(Into::into)
+}
+
+pub fn cluster_invitation_publish_txn(
+    invite: &sinomo_core::ClusterJoinInvite,
+) -> Result<KvTxn, NetworkError> {
+    let invitation_state = ClusterInvitationStateRecord {
+        cluster_id: invite.cluster_id.clone(),
+        invite_id: invite.invite_id.clone(),
+        state: "active".to_string(),
+        issuer_node_id: invite.issuer_node_id.clone(),
+        expires_at: invite.expires_at,
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    Ok(KvTxn {
+        compares: Vec::new(),
+        success: vec![
+            KvOp::put_serde(cluster_invitation_key(&invite.invite_id), invite, None)?,
+            KvOp::put_serde(
+                cluster_invitation_state_key(&invite.invite_id),
+                &invitation_state,
+                None,
+            )?,
+        ],
+        failure: Vec::new(),
+    })
 }
 
 pub fn sync_cluster_invitation_to_kv(
@@ -2205,6 +2349,18 @@ pub fn merge_member_record(
         cleanup_member_iroh_endpoints(&mut incoming);
         local.members.push(incoming);
         true
+    }
+}
+
+pub fn upsert_member_record(state: &mut ClusterBootstrapState, member: ClusterMemberRecord) {
+    if let Some(existing) = state
+        .members
+        .iter_mut()
+        .find(|existing| existing.node_id == member.node_id)
+    {
+        *existing = member;
+    } else {
+        state.members.push(member);
     }
 }
 

@@ -11,6 +11,10 @@ pub const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
 pub const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
 pub const PENDING_INVITE_CLUSTER_ID: &str = "01hxy6qa9k0t9vr4g9n8d3q5c0";
 
+pub fn cluster_join_command(uri: &str) -> String {
+    format!("sinomo cluster join \"{uri}\"")
+}
+
 pub fn encode_cluster_join_invite(invite: &ClusterJoinInvite) -> Result<String, NetworkError> {
     let mut params = Vec::new();
     push_invite_param(&mut params, "public_key", &invite.cluster_public_key);
@@ -38,6 +42,24 @@ pub fn decode_cluster_join_invite(raw: &str) -> Result<ClusterJoinInvite, Networ
                     .to_string(),
         })
     }
+}
+
+pub fn extract_invite_from_join_command(raw: &str) -> &str {
+    let first_line = raw
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(raw);
+    let trimmed = first_line.trim();
+    let Some(rest) = trimmed.strip_prefix("sinomo cluster join ") else {
+        return raw.trim();
+    };
+    let rest = rest.trim();
+    if let Some(after_quote) = rest.strip_prefix('"')
+        && let Some(end) = after_quote.find('"')
+    {
+        return &after_quote[..end];
+    }
+    rest.split_whitespace().next().unwrap_or(rest)
 }
 
 pub fn cluster_invite_signing_payload(invite: &ClusterJoinInvite) -> Result<String, NetworkError> {
