@@ -558,8 +558,9 @@ pub(crate) fn rollout_cluster_targets(
         let data_dir = SinomoDataDir::from_env_or_home()?;
         let paths = ClusterPaths::new(&data_dir);
         let sync_targets = network::cluster_sync_targets_with_connectivity(&paths, state);
+        let rollout_endpoints = rollout_endpoint_candidates(state);
         let mut selected_remote_nodes = std::collections::BTreeSet::new();
-        for endpoint in sync_targets {
+        for endpoint in sync_targets.clone() {
             if endpoint.node_id == state.local_node_id
                 || endpoint.privacy == sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
             {
@@ -579,7 +580,10 @@ pub(crate) fn rollout_cluster_targets(
             if !is_main_daemon || !selected_remote_nodes.insert(endpoint.node_id.clone()) {
                 continue;
             }
-            push_unique_rollout_target(&mut targets, RolloutTarget::endpoint(endpoint));
+            let rollout_endpoint =
+                rollout_target_endpoint_for_main(&endpoint.node_id, &rollout_endpoints)
+                    .unwrap_or_else(|| endpoint.clone());
+            push_unique_rollout_target(&mut targets, RolloutTarget::endpoint(rollout_endpoint));
         }
         return Ok(targets);
     }
@@ -592,6 +596,47 @@ pub(crate) fn rollout_cluster_targets(
                 targets
             }),
     )
+}
+
+pub(crate) fn rollout_endpoint_candidates(
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints = Vec::new();
+    for member in &state.members {
+        if member.node_id == state.local_node_id || !member.state.is_authorized() {
+            continue;
+        }
+        endpoints.extend(
+            member
+                .endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
+                        && matches!(
+                            endpoint.transport,
+                            sinomo_runtime::core::ClusterTransportKind::LanTcp
+                                | sinomo_runtime::core::ClusterTransportKind::Loopback
+                                | sinomo_runtime::core::ClusterTransportKind::Iroh
+                        )
+                })
+                .cloned(),
+        );
+    }
+    endpoints
+}
+
+pub(crate) fn rollout_target_endpoint_for_main(
+    main_node_id: &NodeId,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    let shadow_node_id = shadow_daemon_node_id(main_node_id);
+    candidates
+        .iter()
+        .find(|endpoint| {
+            endpoint.node_id == shadow_node_id
+                && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
+        })
+        .cloned()
 }
 
 fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {

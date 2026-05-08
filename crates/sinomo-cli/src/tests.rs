@@ -33,11 +33,12 @@ use super::{
     parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
     push_unique_introducer, read_cluster_kv_snapshot, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
-    refresh_daemon_node_status_in_kv, rollout_cluster_targets, run_cui_with_handler_io,
-    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
-    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
-    sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
-    uninstall_with_layout, write_daemon_status, write_rollout_status,
+    refresh_daemon_node_status_in_kv, rollout_cluster_targets, rollout_endpoint_candidates,
+    rollout_target_endpoint_for_main, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
+    run_evolve_command, run_shadow_daemon_with_paths, send_cluster_join_registration_over_iroh,
+    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
+    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout,
+    write_daemon_status, write_rollout_status,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -243,7 +244,8 @@ fn install_parser_accepts_custom_daemon_ports() {
 fn cluster_join_timeout_covers_registration_work_and_stays_capped() {
     assert!(super::DAEMON_JOIN_TIMEOUT >= Duration::from_secs(3));
     assert!(super::DAEMON_JOIN_TIMEOUT <= Duration::from_secs(10));
-    assert!(super::IROH_DAEMON_JOIN_TIMEOUT <= Duration::from_secs(10));
+    assert!(super::IROH_DAEMON_JOIN_TIMEOUT >= Duration::from_secs(30));
+    assert!(super::IROH_DAEMON_JOIN_TIMEOUT <= Duration::from_secs(60));
 }
 
 #[test]
@@ -3265,6 +3267,88 @@ fn rollout_cluster_targets_deduplicate_explicit_targets() {
         targets[1].address,
         "iroh://iroh_public_key_dedup?relay=https://relay.example./"
     );
+}
+
+#[test]
+fn rollout_endpoint_candidates_include_remote_shadow_members() {
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_endpoint_candidates").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_endpoint_candidates_local").expect("local node");
+    let remote_main_id =
+        NodeId::from_legacy_named("node_rollout_endpoint_candidates_remote").expect("remote node");
+    let remote_shadow_id = shadow_daemon_node_id(&remote_main_id);
+    let now = OffsetDateTime::now_utc();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout endpoint candidates",
+        local_node_id,
+        "local",
+        "local-key",
+        now,
+    );
+    let mut remote_main = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        remote_main_id.clone(),
+        "remote main",
+        "remote-main-key",
+        now,
+    );
+    remote_main.role = ClusterMemberRole::Learner;
+    remote_main.state = ClusterMemberState::Learner;
+    remote_main.capabilities = main_daemon_capabilities(&ClusterMemberRole::Learner);
+    remote_main.allowed_capabilities = remote_main.capabilities.clone();
+    remote_main.endpoints.push(invite_introducer_endpoint(
+        &remote_main_id,
+        "10.0.0.42:21353".to_string(),
+    ));
+    let mut remote_shadow = ClusterMemberRecord::local_non_voting(
+        cluster_id,
+        remote_shadow_id.clone(),
+        "remote shadow",
+        "remote-shadow-key",
+        now,
+    );
+    remote_shadow.endpoints.push(invite_introducer_endpoint(
+        &remote_shadow_id,
+        "10.0.0.42:21354".to_string(),
+    ));
+    state.members.push(remote_main);
+    state.members.push(remote_shadow);
+
+    let endpoints = rollout_endpoint_candidates(&state);
+
+    assert!(endpoints.iter().any(|endpoint| {
+        endpoint.node_id == remote_shadow_id && endpoint.address == "10.0.0.42:21354"
+    }));
+}
+
+#[test]
+fn rollout_cluster_target_prefers_shadow_endpoint_for_main_member() {
+    let main_node_id = NodeId::from_legacy_named("node_rollout_shadow_main").expect("main node");
+    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
+    let main_endpoint = invite_introducer_endpoint(&main_node_id, "10.0.0.42:21353".to_string());
+    let shadow_endpoint =
+        invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
+
+    let selected = rollout_target_endpoint_for_main(
+        &main_node_id,
+        &[main_endpoint.clone(), shadow_endpoint.clone()],
+    )
+    .expect("shadow target");
+
+    assert_eq!(selected.node_id, shadow_node_id);
+    assert_eq!(selected.address, "10.0.0.42:21354");
+}
+
+#[test]
+fn rollout_cluster_target_ignores_local_only_shadow_endpoint() {
+    let main_node_id = NodeId::from_legacy_named("node_rollout_local_shadow").expect("main node");
+    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
+    let shadow_endpoint =
+        invite_introducer_endpoint(&shadow_node_id, "127.0.0.1:21354".to_string());
+
+    assert!(rollout_target_endpoint_for_main(&main_node_id, &[shadow_endpoint]).is_none());
 }
 
 #[test]

@@ -9,9 +9,9 @@ pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
-    "https://use1-1.relay.iroh.network./",
-    "https://euw1-1.relay.iroh.network./",
-    "https://aps1-1.relay.iroh.network./",
+    "https://use1-1.relay.iroh.network/",
+    "https://euw1-1.relay.iroh.network/",
+    "https://aps1-1.relay.iroh.network/",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -738,6 +738,8 @@ async fn send_iroh_daemon_control_request_async(
         }
         Err(_) => return Err(iroh_daemon_command_timeout_error(timeout)),
     };
+    let online_timeout = remaining().min(Duration::from_millis(1000));
+    let _ = tokio::time::timeout(online_timeout, endpoint.online()).await;
     let connection = match tokio::time::timeout(
         remaining(),
         endpoint.connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes()),

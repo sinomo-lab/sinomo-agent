@@ -174,7 +174,6 @@ use sinomo_runtime::network::ClusterJoinRegistrationResponse;
 use sinomo_runtime::network::{self, ClusterPaths};
 #[cfg(test)]
 use sinomo_runtime::node::load_or_create_main_node_identity;
-#[cfg(test)]
 use sinomo_runtime::node::shadow_daemon_node_id;
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;
@@ -324,7 +323,7 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const SINOMO_JOIN_URI_PREFIX: &str = network::SINOMO_JOIN_URI_PREFIX;

@@ -1669,6 +1669,28 @@ pub fn daemon_advertised_endpoints_from_addresses(
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
+    daemon_advertised_endpoints_from_addresses_with_public_discovery(
+        node_id,
+        loopback_address,
+        host,
+        port,
+        priority,
+        lan_ips,
+        route_ips,
+        true,
+    )
+}
+
+pub fn daemon_advertised_endpoints_from_addresses_with_public_discovery(
+    node_id: &NodeId,
+    loopback_address: String,
+    host: &str,
+    port: u16,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+    allow_public_ip_discovery: bool,
+) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = vec![daemon_loopback_endpoint(
         node_id,
         loopback_address,
@@ -1677,7 +1699,9 @@ pub fn daemon_advertised_endpoints_from_addresses(
     let mut lan_addresses = Vec::new();
     if matches!(host, "0.0.0.0" | "::") {
         for ip in lan_ips.iter().chain(route_ips.iter()).copied() {
-            if is_invitable_ip(ip) {
+            if is_invitable_ip(ip)
+                && (allow_public_ip_discovery || crate::is_private_or_link_local_ip(ip))
+            {
                 push_unique_address(&mut lan_addresses, format_ip_port(ip, port));
             }
         }
@@ -1686,7 +1710,7 @@ pub fn daemon_advertised_endpoints_from_addresses(
             .chain(route_ips.iter())
             .copied()
             .any(|ip| is_invitable_ip(ip) && !crate::is_private_or_link_local_ip(ip));
-        if !has_public_candidate {
+        if allow_public_ip_discovery && !has_public_candidate {
             for ip in discover_default_public_ip_candidates() {
                 if is_invitable_ip(ip) {
                     push_unique_address(&mut lan_addresses, format_ip_port(ip, port));

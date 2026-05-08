@@ -432,6 +432,45 @@ fn public_ip_endpoint_is_marked_internet_direct() {
     }));
 }
 
+#[test]
+fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
+    let node_id = NodeId::from_legacy_named("node_shadow_public_endpoint").expect("node");
+    let endpoints = daemon_advertised_endpoints_from_addresses_with_public_discovery(
+        &node_id,
+        "127.0.0.1:21354".to_string(),
+        "0.0.0.0",
+        21354,
+        10,
+        &["10.0.0.41".parse().expect("private")],
+        &["129.146.106.76".parse().expect("public")],
+        false,
+    );
+
+    assert!(
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "10.0.0.41:21354")
+    );
+    assert!(!endpoints.iter().any(|endpoint| {
+        endpoint.address == "129.146.106.76:21354"
+            && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
+    }));
+}
+
+#[test]
+fn default_iroh_relay_urls_are_tls_hostname_safe() {
+    for relay_url in default_sinomo_iroh_relay_urls() {
+        let host = relay_url
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split('/').next())
+            .expect("https relay host");
+        assert!(
+            !host.ends_with('.'),
+            "relay host must not end with a trailing DNS dot because TLS certificates are issued for the bare hostname: {relay_url}"
+        );
+    }
+}
+
 #[cfg(feature = "iroh-transport")]
 #[test]
 fn iroh_daemon_proxy_round_trips_rpc_request() {

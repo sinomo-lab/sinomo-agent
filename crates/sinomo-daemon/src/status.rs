@@ -148,14 +148,22 @@ pub fn ensure_daemon_cluster_members(
 }
 
 pub fn daemon_advertised_endpoints_for_state(
-    _state: &ClusterBootstrapState,
+    state: &ClusterBootstrapState,
     node_id: &NodeId,
     options: &DaemonRunOptions,
     priority: u16,
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
-    daemon_advertised_endpoints_from_ips(node_id, options, priority, lan_ips, route_ips)
+    let allow_public_ip_discovery = *node_id == state.local_node_id;
+    daemon_advertised_endpoints_from_ips(
+        node_id,
+        options,
+        priority,
+        lan_ips,
+        route_ips,
+        allow_public_ip_discovery,
+    )
 }
 
 pub fn daemon_advertised_endpoints_from_ips(
@@ -164,8 +172,9 @@ pub fn daemon_advertised_endpoints_from_ips(
     priority: u16,
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
+    allow_public_ip_discovery: bool,
 ) -> Vec<ClusterEndpointRecord> {
-    sinomo_network::daemon_advertised_endpoints_from_addresses(
+    sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery(
         node_id,
         daemon_connect_address(&options.host, options.port),
         &options.host,
@@ -173,6 +182,7 @@ pub fn daemon_advertised_endpoints_from_ips(
         priority,
         lan_ips,
         route_ips,
+        allow_public_ip_discovery,
     )
 }
 
