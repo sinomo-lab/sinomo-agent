@@ -35,11 +35,12 @@ use super::{
     read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
     refresh_daemon_node_status_in_kv, rollout_cluster_targets, rollout_endpoint_candidates,
     rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
-    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-    run_shadow_daemon_with_paths, send_cluster_join_registration_over_iroh, shadow_daemon_node_id,
-    sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
-    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, uninstall_with_layout, write_daemon_status, write_rollout_status,
+    rollout_target_endpoint_for_main_with_connectivity, run_cui_with_handler_io,
+    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
+    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
+    sign_daemon_rpc_request_from_data_dir, sort_rollout_endpoints_by_connectivity,
+    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout,
+    write_daemon_status, write_rollout_status,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -3462,6 +3463,93 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         endpoints.first().expect("endpoint").endpoint_id,
         iroh_endpoint.endpoint_id
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-main-fallback-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_main_fallback").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_main_fallback_local").expect("node");
+    let main_node_id =
+        NodeId::from_legacy_named("node_rollout_main_fallback_remote").expect("node");
+    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout main fallback",
+        local_node_id.clone(),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+
+    let main_endpoint = invite_introducer_endpoint(&main_node_id, "192.0.2.53:21353".to_string());
+    let shadow_endpoint =
+        invite_introducer_endpoint(&shadow_node_id, "192.0.2.54:21354".to_string());
+    let now = OffsetDateTime::now_utc();
+    let mut store = InProcessKvStore::new();
+    for (endpoint, connectivity_state) in [
+        (
+            &main_endpoint,
+            sinomo_runtime::network::ClusterConnectivityState::Healthy,
+        ),
+        (
+            &shadow_endpoint,
+            sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+        ),
+    ] {
+        let record = sinomo_runtime::network::ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: local_node_id.clone(),
+            target_node_id: endpoint.node_id.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            state: connectivity_state,
+            latency_ms: None,
+            consecutive_failures: 0,
+            last_success_at: None,
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(120),
+        };
+        store
+            .put_serde(
+                sinomo_runtime::network::cluster_connectivity_key(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    &record.endpoint_id,
+                ),
+                &record,
+                None,
+            )
+            .expect("connectivity record");
+    }
+    sinomo_runtime::network::write_cluster_kv_snapshot(&paths, &store.snapshot())
+        .expect("cluster kv snapshot");
+
+    let selected = rollout_target_endpoint_for_main_with_connectivity(
+        &paths,
+        &state,
+        &main_node_id,
+        &[shadow_endpoint, main_endpoint.clone()],
+    )
+    .expect("rollout target");
+
+    assert_eq!(selected.node_id, main_node_id);
+    assert_eq!(selected.endpoint_id, main_endpoint.endpoint_id);
     std::fs::remove_dir_all(root).ok();
 }
 
