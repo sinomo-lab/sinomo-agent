@@ -1431,13 +1431,14 @@ fn current_cluster_kv_store(
             snapshots.push(snapshot);
         }
     }
-    snapshots
+    let snapshot = snapshots
         .into_iter()
         .max_by_key(|snapshot| snapshot.revision)
-        .map(InProcessKvStore::restore)
         .ok_or_else(|| DaemonError::ClusterReadOnly {
             detail: "no local or reachable cluster KV snapshot is available".to_string(),
-        })
+        })?;
+    sinomo_network::write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+    Ok(InProcessKvStore::restore(snapshot))
 }
 
 fn cluster_member_update_txn(
