@@ -386,6 +386,11 @@ pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
     layout.register_file(StorageFileContract::human_text(
         "sinomo-rollout",
         StorageRing::R1,
+        "rollout/build.log",
+    )?)?;
+    layout.register_file(StorageFileContract::human_text(
+        "sinomo-rollout",
+        StorageRing::R1,
         "rollout/last-main-exit.json",
     )?)?;
     register_object(
