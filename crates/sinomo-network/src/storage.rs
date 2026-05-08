@@ -650,9 +650,12 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
             Vec::new()
         }
     };
-    if !kv_members.is_empty() {
-        state.members = kv_members;
+    for member in kv_members {
+        merge_member_record(&mut state, member);
     }
+    state
+        .members
+        .sort_by(|left, right| left.node_id.cmp(&right.node_id));
     cleanup_cluster_iroh_endpoints(&mut state);
     Ok(state)
 }
