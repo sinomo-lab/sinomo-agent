@@ -88,61 +88,6 @@ pub(super) fn run_cui_with_handler_io_and_daemon<
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct InteractionSession {
-    pub session_id: SessionId,
-    pub node_id: NodeId,
-    pub surface: InteractionSurface,
-}
-
-impl InteractionSession {
-    pub fn new(session_id: SessionId, node_id: NodeId, surface: InteractionSurface) -> Self {
-        Self {
-            session_id,
-            node_id,
-            surface,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct InteractionSurface {
-    pub surface_id: String,
-    pub kind: InteractionSurfaceKind,
-}
-
-impl InteractionSurface {
-    pub fn new(surface_id: impl Into<String>, kind: InteractionSurfaceKind) -> InteractionSurface {
-        InteractionSurface {
-            surface_id: surface_id.into(),
-            kind,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum InteractionSurfaceKind {
-    CommandLine,
-    App,
-    Api,
-    Voice,
-    Remote,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum InteractionInputKind {
-    Message,
-    Command,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum InteractionOutput {
-    Line(String),
-    Exit,
-}
-
 pub trait InteractionEventHandler {
     fn handle_event<S: EventStore>(
         &mut self,
@@ -169,7 +114,7 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
     }
 
     pub fn ingest_user_input(&mut self, text: &str) -> Result<Vec<InteractionOutput>, CliError> {
-        let event = user_input_event(&self.session, text);
+        let event = user_interaction_input_event(&self.session, text);
         self.store.append(event.clone())?;
         self.handler
             .handle_event(&mut self.store, &self.session, &event)
@@ -181,22 +126,6 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
 
     pub fn session(&self) -> &InteractionSession {
         &self.session
-    }
-}
-
-pub trait InteractionModel {
-    fn complete(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError>;
-}
-
-impl<T: LanguageModelProvider> InteractionModel for T {
-    fn complete(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        LanguageModelProvider::complete(self, request)
     }
 }
 
@@ -256,7 +185,7 @@ impl<M: InteractionModel> InteractionEventHandler for ModelBackedInteractionHand
             )
             .caused_by(&event.event_id);
             store.append(message.clone())?;
-            let request = conversation_model_request(
+            let request = interaction_model_request(
                 store,
                 session,
                 &message.event_id,
@@ -394,31 +323,18 @@ impl CliConversationModel {
         paths.ensure()?;
         let evolution_config = read_config(&paths).ok();
         let model_config = load_model_config(&ModelPaths::new(&data_dir)).ok();
-        let provider = model_config
-            .as_ref()
-            .and_then(|config| config.default_provider.clone())
-            .or_else(|| {
-                evolution_config
-                    .as_ref()
-                    .and_then(|config| config.default_provider.clone())
-            })
-            .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
-        let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
-            detail: format!("unknown provider `{provider}`"),
-        })?;
-        let model = model_config
-            .as_ref()
-            .and_then(|config| config.default_model.clone())
-            .or_else(|| {
-                evolution_config
-                    .as_ref()
-                    .and_then(|config| config.default_model.clone())
-            })
-            .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
-        let model = normalize_model_id_for_provider(&provider, &model);
+        let evolution_model_config =
+            evolution_config
+                .as_ref()
+                .map(|config| sinomo_lm::ModelConfig {
+                    default_provider: config.default_provider.clone(),
+                    default_model: config.default_model.clone(),
+                });
+        let resolved =
+            resolve_default_model(model_config.as_ref(), evolution_model_config.as_ref())?;
         Ok(Self {
-            provider,
-            model,
+            provider: resolved.provider,
+            model: resolved.model,
             data_dir,
         })
     }
@@ -429,245 +345,15 @@ impl InteractionModel for CliConversationModel {
         &self,
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
-        let request = LanguageModelRequest {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            ..request.clone()
-        };
-        match self.provider.as_str() {
-            GitHubCopilotProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
-                let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
-                    client_id: env::var("SINOMO_COPILOT_CLIENT_ID")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id),
-                    github_host: env::var("SINOMO_COPILOT_GITHUB_HOST")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().github_host),
-                    api_base_url: env::var("SINOMO_COPILOT_API_BASE_URL")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().api_base_url),
-                    default_model: model_or_default(
-                        &self.model,
-                        GitHubCopilotConfig::default().default_model,
-                    ),
-                    token_store_path: Some(credentials_path),
-                });
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            GitHubCopilotCliProvider::PROVIDER_ID => {
-                let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
-                    model: model_or_default(&self.model, GitHubCopilotCliConfig::default().model),
-                    ..GitHubCopilotCliConfig::default()
-                });
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            CodexCliProvider::PROVIDER_ID => {
-                let provider = CodexCliProvider::new(CodexCliConfig {
-                    model: model_or_default(&self.model, CODEX_CLI_DEFAULT_MODEL.to_string()),
-                    working_dir: env::current_dir().ok(),
-                    ..CodexCliConfig::default()
-                });
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            CODEX_PROVIDER_ID => {
-                let provider = codex_provider_for_model(&self.model);
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            ClaudeCodeProvider::PROVIDER_ID => {
-                let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
-                    model: model_or_default(&self.model, CLAUDE_CODE_DEFAULT_MODEL.to_string()),
-                    working_dir: env::current_dir().ok(),
-                    ..ClaudeCodeConfig::default()
-                });
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            AnthropicProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(AnthropicProvider::PROVIDER_ID);
-                let provider = AnthropicProvider::new(AnthropicConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        AnthropicConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..AnthropicConfig::default()
-                });
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            OpenAiProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(OpenAiProvider::PROVIDER_ID);
-                let provider = OpenAiProvider::new(OpenAiConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        OpenAiConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..OpenAiConfig::default()
-                });
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            GeminiProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(GeminiProvider::PROVIDER_ID);
-                let provider = GeminiProvider::new(GeminiConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        GeminiConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..GeminiConfig::default()
-                });
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            NvidiaProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(NvidiaProvider::PROVIDER_ID);
-                let provider = NvidiaProvider::new(NvidiaConfig {
-                    api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
-                        .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
-                    default_model: model_or_default(
-                        &self.model,
-                        NvidiaConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                });
-                LanguageModelProvider::complete(&provider, &request)
-            }
-            _ => Err(LanguageModelError::ProviderInvocationFailed {
-                provider: self.provider.clone(),
-                model: self.model.clone(),
-                detail: "unknown interaction model provider".to_string(),
-            }),
-        }
+        complete_configured_model_request(
+            &self.data_dir,
+            &self.provider,
+            &self.model,
+            env::current_dir().ok(),
+            request,
+        )
     }
 }
-
-trait EventEnvelopeExt {
-    fn caused_by(self, event_id: &EventId) -> Self;
-}
-
-impl EventEnvelopeExt for EventEnvelope {
-    fn caused_by(mut self, event_id: &EventId) -> Self {
-        self.links.caused_by.push(event_id.clone());
-        self
-    }
-}
-
-fn user_input_event(session: &InteractionSession, text: &str) -> EventEnvelope {
-    let input_kind = if text.trim_start().starts_with('/') {
-        InteractionInputKind::Command
-    } else {
-        InteractionInputKind::Message
-    };
-    interaction_event(
-        session,
-        "interaction.input.received",
-        serde_json::json!({
-            "text": text,
-            "input_kind": input_kind,
-            "surface": session.surface,
-        }),
-    )
-}
-
-fn interaction_event(
-    session: &InteractionSession,
-    kind: &str,
-    payload: serde_json::Value,
-) -> EventEnvelope {
-    EventEnvelope::new(
-        EventId::generate(),
-        OffsetDateTime::now_utc(),
-        session.node_id.clone(),
-        Source::new("interaction.surface").expect("valid source"),
-        EventKind::new(kind).expect("valid event kind"),
-        Salience::new(0.62).expect("valid salience"),
-        Confidence::new(0.98).expect("valid confidence"),
-        RoutingMetadata::new(
-            RoutingScope::Session,
-            LatencyClass::Interactive,
-            PrivacyClass::Derived,
-        ),
-    )
-    .with_session(session.session_id.clone())
-    .with_payload(payload)
-}
-
-fn conversation_model_request<S: EventStore>(
-    store: &S,
-    session: &InteractionSession,
-    message_event_id: &EventId,
-    text: &str,
-    provider: &str,
-    model: &str,
-) -> Result<LanguageModelRequest, CliError> {
-    let recent = store.replay(ReplayQuery {
-        session_id: Some(session.session_id.clone()),
-        kind_prefix: Some("interaction.model.responded".to_string()),
-        origin_node_id: None,
-        after_sequence: None,
-        start_time: None,
-        end_time: None,
-        direction: ReplayDirection::Reverse,
-        limit: Some(6),
-    })?;
-    let mut recent_turns: Vec<String> = recent
-        .into_iter()
-        .rev()
-        .filter_map(|stored| {
-            stored
-                .event
-                .payload
-                .get("text")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
-    if recent_turns.is_empty() {
-        recent_turns.push("No prior assistant turns in this session.".to_string());
-    }
-
-    Ok(LanguageModelRequest {
-        provider: provider.to_string(),
-        model: model.to_string(),
-        messages: vec![
-            LanguageModelMessage {
-                role: LanguageModelRole::System,
-                content: INTERACTION_SYSTEM_PROMPT.to_string(),
-            },
-            LanguageModelMessage {
-                role: LanguageModelRole::User,
-                content: serde_json::to_string_pretty(&serde_json::json!({
-                    "session_id": session.session_id,
-                    "surface": session.surface,
-                    "input_event_id": message_event_id,
-                    "recent_assistant_turns": recent_turns,
-                    "user_input": text
-                }))
-                .expect("interaction request serializes"),
-            },
-        ],
-        temperature: Some(0.4),
-        max_output_tokens: Some(800),
-        response_format: LanguageModelResponseFormat::Text,
-        metadata: serde_json::json!({
-            "loop": "interactive",
-            "node_id": session.node_id,
-            "session_id": session.session_id,
-            "input_event_id": message_event_id
-        }),
-    })
-}
-
-const INTERACTION_SYSTEM_PROMPT: &str = r#"You are Sinomo's command-line conversation loop.
-Respond directly to the user in plain text.
-Use the supplied event ids and session metadata as context, but do not expose internal event JSON unless asked.
-Slash commands are handled by Sinomo outside the model; ordinary user input reaches you only after being recorded as an interaction event."#;
 
 pub fn parse_slash_command(input: &str) -> Result<Option<Vec<String>>, CliError> {
     let trimmed = input.trim();

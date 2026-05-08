@@ -83,6 +83,14 @@ impl From<sinomo_runtime::events::EventStoreError> for CliError {
     }
 }
 
+impl From<sinomo_agent::AgentError> for CliError {
+    fn from(error: sinomo_agent::AgentError) -> Self {
+        match error {
+            sinomo_agent::AgentError::EventStore(error) => Self::EventStore(error),
+        }
+    }
+}
+
 impl From<sinomo_runtime::dfs::MetadataBackendError> for CliError {
     fn from(error: sinomo_runtime::dfs::MetadataBackendError) -> Self {
         Self::DfsMetadata(error)
@@ -156,7 +164,13 @@ impl From<sinomo_runtime::daemon::DaemonError> for CliError {
             sinomo_runtime::daemon::DaemonError::AlreadyRunning { lock_file, detail } => {
                 Self::DaemonAlreadyRunning { lock_file, detail }
             }
+            sinomo_runtime::daemon::DaemonError::NotRunning { detail } => {
+                Self::DaemonNotRunning { detail }
+            }
             sinomo_runtime::daemon::DaemonError::ClusterOrphan => Self::ClusterOrphan,
+            sinomo_runtime::daemon::DaemonError::ClusterReadOnly { detail } => {
+                Self::ClusterReadOnly { detail }
+            }
         }
     }
 }
@@ -198,6 +212,47 @@ impl From<sinomo_evolution::EvolutionPersistenceError> for CliError {
             }
             sinomo_evolution::EvolutionPersistenceError::Json { path, detail } => {
                 Self::Json { path, detail }
+            }
+            sinomo_evolution::EvolutionPersistenceError::MissingArtifact { artifact } => {
+                Self::MissingArtifact { artifact }
+            }
+        }
+    }
+}
+
+impl From<sinomo_evolution::EvolutionJobSelectionError> for CliError {
+    fn from(error: sinomo_evolution::EvolutionJobSelectionError) -> Self {
+        match error {
+            sinomo_evolution::EvolutionJobSelectionError::NoActiveJob => Self::NoActiveJob,
+            sinomo_evolution::EvolutionJobSelectionError::AmbiguousJob { job_ids } => {
+                Self::AmbiguousJob { job_ids }
+            }
+            sinomo_evolution::EvolutionJobSelectionError::Persistence(error) => error.into(),
+        }
+    }
+}
+
+impl From<sinomo_evolution::EvolutionJobStateError> for CliError {
+    fn from(error: sinomo_evolution::EvolutionJobStateError) -> Self {
+        match error {
+            sinomo_evolution::EvolutionJobStateError::UnexpectedStatus {
+                job_id,
+                status,
+                expected,
+            } => Self::InvalidJobState {
+                job_id,
+                status,
+                expected,
+            },
+        }
+    }
+}
+
+impl From<sinomo_evolution::EvolutionInputParseError> for CliError {
+    fn from(error: sinomo_evolution::EvolutionInputParseError) -> Self {
+        match error {
+            sinomo_evolution::EvolutionInputParseError::Invalid { detail } => {
+                Self::Parse { detail }
             }
         }
     }

@@ -177,7 +177,7 @@ pub(crate) fn rollout_paths_from_defaults() -> Result<SelfRolloutPaths, CliError
 pub(crate) fn rollout_init_source(options: RolloutOptions) -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
     ensure_rollout_layout(&paths)?;
-    ensure_source_repo(&paths, options.repo.as_deref())?;
+    ensure_rollout_source_repo(&paths, options.repo.as_deref())?;
     println!("source repo: {}", paths.source_repo.display());
     Ok(())
 }
@@ -185,7 +185,7 @@ pub(crate) fn rollout_init_source(options: RolloutOptions) -> Result<(), CliErro
 pub(crate) fn rollout_import_source(options: RolloutOptions) -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
     ensure_rollout_layout(&paths)?;
-    ensure_source_repo(&paths, options.repo.as_deref())?;
+    ensure_rollout_source_repo(&paths, options.repo.as_deref())?;
     println!("imported external source into managed repo");
     println!("  managed source: {}", paths.source_repo.display());
     print_managed_source_status(&paths)?;
@@ -216,17 +216,15 @@ pub(crate) fn rollout_apply_external(options: RolloutOptions) -> Result<(), CliE
 
 pub(crate) fn rollout_status() -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
-    println!("rollout source: {}", paths.source_repo.display());
-    println!("main binary: {}", paths.main_binary.display());
-    println!("shadow binary: {}", paths.shadow_binary.display());
-    println!("state: {}", paths.state.display());
-    println!(
-        "source repo exists: {}",
-        paths.source_repo.join(".git").exists()
-    );
-    println!("main binary exists: {}", paths.main_binary.exists());
-    println!("shadow binary exists: {}", paths.shadow_binary.exists());
-    print_managed_source_status(&paths)?;
+    let status = rollout_status_view(&paths)?;
+    println!("rollout source: {}", status.source_repo.display());
+    println!("main binary: {}", status.main_binary.display());
+    println!("shadow binary: {}", status.shadow_binary.display());
+    println!("state: {}", status.state.display());
+    println!("source repo exists: {}", status.source_repo_exists);
+    println!("main binary exists: {}", status.main_binary_exists);
+    println!("shadow binary exists: {}", status.shadow_binary_exists);
+    print_managed_source_status_view(status.source_status);
     Ok(())
 }
 
@@ -242,13 +240,8 @@ pub(crate) fn rollout_diagnostics(options: RolloutOptions) -> Result<(), CliErro
     };
     for target in targets {
         println!("== {target} ==");
-        let request = network::ObjectRpcRequest::encode_body(
-            network::ROLLOUT_DIAGNOSTICS_ROUTE,
-            network::ROLLOUT_RPC_CATEGORY,
-            &(),
-        )?;
-        match send_daemon_rpc(&target, &request, CLUSTER_HEALTH_PROBE_TIMEOUT)
-            .and_then(|response| response.decode_body::<String>().map_err(Into::into))
+        match daemon_send_daemon_rollout_diagnostics(&target, CLUSTER_HEALTH_PROBE_TIMEOUT)
+            .map_err(CliError::from)
         {
             Ok(response) => print!("{response}"),
             Err(error) => println!("failed: {error}"),
@@ -259,6 +252,11 @@ pub(crate) fn rollout_diagnostics(options: RolloutOptions) -> Result<(), CliErro
 
 pub(crate) fn print_managed_source_status(paths: &SelfRolloutPaths) -> Result<(), CliError> {
     let status = managed_source_status(paths)?;
+    print_managed_source_status_view(status);
+    Ok(())
+}
+
+pub(crate) fn print_managed_source_status_view(status: ManagedSourceStatus) {
     println!("source git repo: {}", status.is_git_repo);
     if let Some(head) = status.head {
         println!("source head: {head}");
@@ -267,106 +265,55 @@ pub(crate) fn print_managed_source_status(paths: &SelfRolloutPaths) -> Result<()
     if !status.remotes.is_empty() {
         println!("source remotes: {}", status.remotes.join(", "));
     }
-    Ok(())
 }
 
 pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
-    ensure_rollout_layout(&paths)?;
-    ensure_source_repo(&paths, options.repo.as_deref())?;
-    let plan = paths.plan();
-    let build = Command::new(&plan.build_program)
-        .args(&plan.build_args)
-        .current_dir(&plan.build_dir)
-        .output()
-        .map_err(|source| CliError::Io {
-            path: format!("{} {}", plan.build_program, plan.build_args.join(" ")),
-            detail: source.to_string(),
-        })?;
-    let build_log = format!(
-        "command: {} {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-        plan.build_program,
-        plan.build_args.join(" "),
-        build.status,
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
-    fs::write(&plan.build_log, build_log).map_err(|source| CliError::Io {
-        path: plan.build_log.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if !build.status.success() {
-        return Err(CliError::Process {
-            command: format!("{} {}", plan.build_program, plan.build_args.join(" ")),
-            status: build.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
-        });
-    }
+    let rollout_plan = paths.plan();
+    let artifacts = prepare_local_rollout_artifacts(&paths, options.repo.as_deref())?;
 
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    let main_paths = DaemonPaths::new(&data_dir);
-    let previous_main_status = match probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT) {
-        DaemonProbeStatus::Running(status) => Some(status),
-        DaemonProbeStatus::Locked { status } => status,
-        DaemonProbeStatus::NotRunning => None,
-    };
-    let previous_main_binary = previous_main_status
-        .as_ref()
-        .and_then(|status| status.executable.clone())
-        .unwrap_or_else(|| plan.install_main_binary.clone());
-    let staged_main_binary = rollout_staged_main_binary(&paths);
-    let staged_shadow_binary = rollout_staged_shadow_binary(&paths);
-    stage_rollout_file(&plan.built_binary, &staged_main_binary)?;
-    stage_rollout_file(&plan.built_binary, &staged_shadow_binary)?;
-
-    let main_host = previous_main_status
-        .as_ref()
-        .map(|status| status.host.clone())
-        .unwrap_or_else(|| options.host.clone());
-    let main_port = previous_main_status
-        .as_ref()
-        .map(|status| status.port)
-        .unwrap_or(options.port);
-    restart_local_shadow_for_rollout(
-        &plan.built_binary,
-        &plan.install_shadow_binary,
-        &plan.install_main_binary,
-        &data_dir,
-        &options,
-        &main_host,
-        main_port,
-    )?;
-    stage_rollout_main_activation(
+    let requested_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let plan = daemon_prepare_local_rollout_main_activation(
         &data_dir.root(),
         &paths,
-        RolloutMainActivation {
-            source: paths.source_repo.display().to_string(),
-            main_binary: plan.install_main_binary.clone(),
-            shadow_binary: plan.install_shadow_binary.clone(),
-            staged_main_binary: Some(staged_main_binary),
-            staged_shadow_binary: Some(staged_shadow_binary),
-            previous_main_binary: Some(previous_main_binary),
-            main_host,
-            main_port,
-            shadow_port: options.shadow_port,
-            requested_at: OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "unknown".to_string()),
-            mode: "local-apply".to_string(),
-        },
+        &artifacts,
+        &options.host,
+        options.port,
+        options.shadow_port,
+        requested_at,
+        DAEMON_PROBE_TIMEOUT,
+    );
+    restart_local_shadow_for_rollout(
+        &artifacts.built_binary,
+        &plan.activation.shadow_binary,
+        &plan.activation.main_binary,
+        &data_dir,
+        &options,
+        &plan.activation.main_host,
+        plan.activation.main_port,
     )?;
-    if let Some(status) = previous_main_status.as_ref() {
+    stage_rollout_main_activation(&data_dir.root(), &paths, plan.activation)?;
+    if let Some(status) = plan.previous_main_status.as_ref() {
         let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
     }
     wait_for_main_daemon_health(
         &options,
-        previous_main_status.as_ref().map(|status| status.pid),
+        plan.previous_main_status.as_ref().map(|status| status.pid),
     )?;
     wait_for_local_shadow_rollout_completion(&data_dir, &options)?;
     println!("rollout applied");
-    println!("  source: {}", plan.build_dir.display());
-    println!("  main binary: {}", plan.install_main_binary.display());
-    println!("  shadow binary: {}", plan.install_shadow_binary.display());
+    println!("  source: {}", rollout_plan.build_dir.display());
+    println!(
+        "  main binary: {}",
+        rollout_plan.install_main_binary.display()
+    );
+    println!(
+        "  shadow binary: {}",
+        rollout_plan.install_shadow_binary.display()
+    );
     Ok(())
 }
 
@@ -379,52 +326,28 @@ pub(crate) fn restart_local_shadow_for_rollout(
     main_host: &str,
     main_port: u16,
 ) -> Result<(), CliError> {
-    let shadow_paths = DaemonPaths::for_shadow(data_dir);
-    let shadow_options = match probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT) {
-        DaemonProbeStatus::Running(status) => DaemonRunOptions {
-            host: status.host,
-            port: status.port,
-        },
-        DaemonProbeStatus::Locked {
-            status: Some(status),
-        } => DaemonRunOptions {
-            host: status.host,
-            port: status.port,
-        },
-        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
-            DaemonRunOptions {
-                host: options.host.clone(),
-                port: options.shadow_port,
-            }
-        }
-    };
+    let restart = daemon_prepare_local_shadow_rollout_restart(
+        &data_dir.root(),
+        main_binary,
+        main_host,
+        main_port,
+        &options.host,
+        options.shadow_port,
+        DAEMON_PROBE_TIMEOUT,
+    );
     stop_daemon_before_install(
-        &shadow_paths,
+        &restart.shadow_paths,
         "shadow daemon",
         "local rollout shadow update",
     )?;
     install_binary_atomically(built_binary, shadow_binary)?;
-    let args = vec![
-        "daemon".to_string(),
-        "shadow".to_string(),
-        "run".to_string(),
-        "--host".to_string(),
-        shadow_options.host.clone(),
-        "--port".to_string(),
-        shadow_options.port.to_string(),
-    ];
-    let extra_env = vec![
-        (SHADOW_MAIN_BINARY_ENV, main_binary.display().to_string()),
-        (SHADOW_MAIN_HOST_ENV, main_host.to_string()),
-        (SHADOW_MAIN_PORT_ENV, main_port.to_string()),
-    ];
     start_installed_sinomo_daemon(
         shadow_binary,
         &data_dir.root(),
-        &args,
-        &shadow_paths,
+        &restart.args,
+        &restart.shadow_paths,
         "shadow daemon",
-        &extra_env,
+        &restart.extra_env,
     )
 }
 
@@ -445,16 +368,14 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
     let requested_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
-    let build_request = ClusterRolloutBuildRequest {
-        source: source.clone(),
-        remote_repo: options.remote_repo.clone(),
-        source_bundle_base64: None,
-        source_head: None,
-        host: options.host.clone(),
-        port: options.port,
-        shadow_port: options.shadow_port,
-        requested_at: requested_at.clone(),
-    };
+    let build_request = prepare_cluster_rollout_build_request(
+        source.clone(),
+        options.remote_repo.clone(),
+        options.host.clone(),
+        options.port,
+        options.shadow_port,
+        requested_at.clone(),
+    );
     let mut binary_request: Option<ClusterRolloutBinaryRequest> = None;
     let mut source_bundle: Option<(String, String)> = None;
 
@@ -467,10 +388,12 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             }
         };
         let platform_match = rollout_target_platform_matches_local(&target_status);
-        let use_remote_build = options.remote_build
-            || (!is_loopback_connect_address(&target)
-                && options.binary.is_none()
-                && platform_match != Some(true));
+        let use_remote_build = daemon_cluster_rollout_should_use_remote_build(
+            &target,
+            options.remote_build,
+            options.binary.is_some(),
+            platform_match,
+        );
         if use_remote_build {
             let mut request = build_request.clone();
             if request.remote_repo.is_none() {
@@ -517,21 +440,15 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         }
         if binary_request.is_none() {
             let binary = rollout_prepare_dev_binary(&options)?;
-            let binary_bytes = fs::read(&binary).map_err(|source| CliError::Io {
-                path: binary.display().to_string(),
-                detail: source.to_string(),
-            })?;
             println!("cluster rollout binary: {}", binary.display());
-            binary_request = Some(ClusterRolloutBinaryRequest {
-                source: source.clone(),
-                binary_base64: URL_SAFE_NO_PAD.encode(binary_bytes),
-                target_os: env::consts::OS.to_string(),
-                target_arch: env::consts::ARCH.to_string(),
-                host: options.host.clone(),
-                port: options.port,
-                shadow_port: options.shadow_port,
-                requested_at: requested_at.clone(),
-            });
+            binary_request = Some(prepare_cluster_rollout_binary_request(
+                source.clone(),
+                &binary,
+                options.host.clone(),
+                options.port,
+                options.shadow_port,
+                requested_at.clone(),
+            )?);
         }
         let request = binary_request.as_ref().expect("binary rollout request");
         match send_daemon_rollout_binary(&target, request) {
@@ -550,256 +467,77 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
 pub(crate) fn rollout_source_bundle_base64(
     options: &RolloutOptions,
 ) -> Result<(String, String), CliError> {
-    let repo = options
-        .repo
-        .clone()
-        .unwrap_or(env::current_dir().map_err(|source| CliError::Io {
-            path: ".".to_string(),
-            detail: source.to_string(),
-        })?);
+    let repo = rollout_source_repo_from_options(options)?;
     let paths = rollout_paths_from_defaults()?;
-    ensure_rollout_layout(&paths)?;
-    let bundle = paths
-        .root
-        .join("staged")
-        .join(format!("source-{}.bundle", rollout_artifact_suffix()));
-    create_source_repo_bundle(&repo, &bundle)?;
-    let bytes = fs::read(&bundle).map_err(|source| CliError::Io {
-        path: bundle.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok((URL_SAFE_NO_PAD.encode(bytes), rollout_source_head(&repo)?))
-}
-
-pub(crate) fn rollout_source_head(repo: &Path) -> Result<String, CliError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--short=8", "HEAD"])
-        .output()
-        .map_err(|source| CliError::Io {
-            path: format!("git -C {} rev-parse --short=8 HEAD", repo.display()),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(CliError::Process {
-            command: format!("git -C {} rev-parse --short=8 HEAD", repo.display()),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-pub(crate) fn source_heads_match(actual: Option<&str>, expected: &str) -> bool {
-    let Some(actual) = actual else {
-        return false;
-    };
-    actual == expected || actual.starts_with(expected) || expected.starts_with(actual)
+    prepare_rollout_source_bundle_base64(&paths, &repo).map_err(Into::into)
 }
 
 pub(crate) fn rollout_prepare_dev_binary(options: &RolloutOptions) -> Result<PathBuf, CliError> {
-    if let Some(binary) = &options.binary {
-        if !binary.exists() {
-            return Err(CliError::MissingArtifact {
-                artifact: binary.display().to_string(),
-            });
-        }
-        return Ok(binary.clone());
-    }
-    let repo = options
-        .repo
-        .clone()
-        .unwrap_or(env::current_dir().map_err(|source| CliError::Io {
+    let repo = rollout_source_repo_from_options(options)?;
+    let paths = rollout_paths_from_defaults()?;
+    prepare_rollout_dev_binary(&paths, &repo, options.binary.as_deref()).map_err(Into::into)
+}
+
+pub(crate) fn rollout_source_repo_from_options(
+    options: &RolloutOptions,
+) -> Result<PathBuf, CliError> {
+    options.repo.clone().map(Ok).unwrap_or_else(|| {
+        env::current_dir().map_err(|source| CliError::Io {
             path: ".".to_string(),
             detail: source.to_string(),
-        })?);
-    let paths = rollout_paths_from_defaults()?;
-    ensure_rollout_layout(&paths)?;
-    let plan = SelfRolloutPaths::new(paths.root.parent().ok_or_else(|| CliError::Io {
-        path: paths.root.display().to_string(),
-        detail: "rollout root has no data directory parent".to_string(),
-    })?)
-    .plan();
-    rollout_build_dev_binary(&repo, &plan.build_log)
-}
-
-pub(crate) fn rollout_build_dev_binary(repo: &Path, build_log: &Path) -> Result<PathBuf, CliError> {
-    let build = Command::new("cargo")
-        .args(["build", "-p", "sinomo"])
-        .current_dir(repo)
-        .output()
-        .map_err(|source| CliError::Io {
-            path: "cargo build -p sinomo".to_string(),
-            detail: source.to_string(),
-        })?;
-    let log = format!(
-        "command: cargo build -p sinomo\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-        repo.display(),
-        build.status,
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
-    fs::write(build_log, log).map_err(|source| CliError::Io {
-        path: build_log.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if !build.status.success() {
-        return Err(CliError::Process {
-            command: "cargo build -p sinomo".to_string(),
-            status: build.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
-        });
-    }
-    Ok(repo
-        .join("target")
-        .join("debug")
-        .join(format!("sinomo{}", env::consts::EXE_SUFFIX)))
-}
-
-pub(crate) fn rollout_remote_repo_path(paths: &SelfRolloutPaths, repo: Option<&Path>) -> PathBuf {
-    match repo {
-        Some(repo) if repo.is_absolute() => repo.to_path_buf(),
-        Some(repo) => paths.root.parent().unwrap_or(&paths.root).join(repo),
-        None => paths.source_repo.clone(),
-    }
+        })
+    })
 }
 
 pub(crate) fn rollout_cluster_targets(options: &RolloutOptions) -> Result<Vec<String>, CliError> {
-    if !options.targets.is_empty() {
-        return Ok(unique_rollout_targets(options.targets.clone()));
-    }
-
-    let mut targets = Vec::new();
-    if !options.skip_local {
+    let local_target = if options.targets.is_empty() && !options.skip_local {
         if let Some(status) = default_main_daemon_status()? {
-            targets.push(status.address);
+            Some(status.address)
         } else {
-            targets.push(daemon_connect_address(&options.host, options.port));
+            Some(daemon_connect_address(&options.host, options.port))
         }
-    }
-    targets.extend(options.targets.iter().cloned());
-
-    if let Ok(state) = require_cluster_bootstrap_state() {
-        for member in state.members {
-            let is_local_member = member.node_id == state.local_node_id;
-            if is_local_member {
-                continue;
-            }
-            let is_main_daemon = member
-                .capabilities
-                .iter()
-                .any(|capability| capability.as_str() == "daemon.main.run");
-            if !is_main_daemon {
-                continue;
-            }
-            for endpoint in member.endpoints {
-                if !is_local_member && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
-                {
-                    continue;
-                }
-                targets.push(endpoint.address);
-            }
-        }
-    }
-
-    Ok(unique_rollout_targets(targets))
-}
-
-pub(crate) fn unique_rollout_targets(targets: Vec<String>) -> Vec<String> {
-    let mut unique = Vec::new();
-    for target in targets {
-        if !unique.contains(&target) {
-            unique.push(target);
-        }
-    }
-    unique
+    } else {
+        None
+    };
+    let state = if options.targets.is_empty() {
+        require_cluster_bootstrap_state().ok()
+    } else {
+        None
+    };
+    Ok(prepare_rollout_cluster_targets(
+        options.targets.clone(),
+        local_target,
+        state.as_ref(),
+    ))
 }
 
 pub(crate) fn read_rollout_target_status(address: &str) -> Result<DaemonStatus, CliError> {
-    let request = network::ObjectRpcRequest::encode_body(
-        network::DAEMON_STATUS_ROUTE,
-        network::DAEMON_RPC_CATEGORY,
-        &(),
-    )?;
-    let response = send_daemon_rpc(address, &request, DAEMON_JOIN_TIMEOUT)?;
-    response.decode_body().map_err(CliError::from)
+    daemon_fetch_daemon_status_from_address(address, DAEMON_JOIN_TIMEOUT).map_err(Into::into)
 }
 
 pub(crate) fn rollout_target_platform_matches_local(status: &DaemonStatus) -> Option<bool> {
-    match (&status.target_os, &status.target_arch) {
-        (Some(target_os), Some(target_arch)) => {
-            Some(target_os == env::consts::OS && target_arch == env::consts::ARCH)
-        }
-        _ => None,
-    }
+    daemon_rollout_target_platform_matches_local(status)
 }
 
 pub(crate) fn ensure_rollout_target_platform_from_status(
     address: &str,
     status: &DaemonStatus,
 ) -> Result<(), CliError> {
-    let local = is_loopback_connect_address(address);
-    match (&status.target_os, &status.target_arch) {
-        (Some(target_os), Some(target_arch))
-            if target_os == env::consts::OS && target_arch == env::consts::ARCH =>
-        {
-            Ok(())
-        }
-        (Some(target_os), Some(target_arch)) => Err(CliError::Parse {
-            detail: format!(
-                "target platform {target_os}/{target_arch} does not match local artifact platform {}/{}",
-                env::consts::OS,
-                env::consts::ARCH
-            ),
-        }),
-        _ if local => Ok(()),
-        _ => Err(CliError::Parse {
-            detail:
-                "target daemon does not report platform metadata; update it locally before binary rollout"
-                    .to_string(),
-        }),
-    }
+    daemon_ensure_rollout_target_platform_matches_local(address, status).map_err(Into::into)
 }
 
 pub(crate) fn send_daemon_rollout_binary(
     address: &str,
     request: &ClusterRolloutBinaryRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    let request = network::ObjectRpcRequest::encode_body(
-        network::ROLLOUT_BINARY_ROUTE,
-        network::ROLLOUT_RPC_CATEGORY,
-        request,
-    )?;
-    let response = send_daemon_rpc(address, &request, DAEMON_ROLLOUT_TIMEOUT)?;
-    response.decode_body().map_err(CliError::from)
+    daemon_send_daemon_rollout_binary(address, request, DAEMON_ROLLOUT_TIMEOUT).map_err(Into::into)
 }
 
 pub(crate) fn send_daemon_rollout_build(
     address: &str,
     request: &ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    let request = network::ObjectRpcRequest::encode_body(
-        network::ROLLOUT_BUILD_ROUTE,
-        network::ROLLOUT_RPC_CATEGORY,
-        request,
-    )?;
-    let response = send_daemon_rpc(address, &request, DAEMON_ROLLOUT_TIMEOUT)?;
-    response.decode_body().map_err(CliError::from)
-}
-
-pub(crate) fn ensure_source_repo(
-    paths: &SelfRolloutPaths,
-    repo: Option<&Path>,
-) -> Result<(), CliError> {
-    let source = match repo {
-        Some(repo) => repo.to_path_buf(),
-        None => env::current_dir().map_err(|source| CliError::Io {
-            path: ".".to_string(),
-            detail: source.to_string(),
-        })?,
-    };
-    Ok(deploy_managed_source_repo(paths, &source)?)
+    daemon_send_daemon_rollout_build(address, request, DAEMON_ROLLOUT_TIMEOUT).map_err(Into::into)
 }
 
 pub(crate) fn wait_for_main_daemon_health(
@@ -807,63 +545,35 @@ pub(crate) fn wait_for_main_daemon_health(
     previous_pid: Option<u32>,
 ) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    let paths = DaemonPaths::new(&data_dir);
-    let deadline = Instant::now() + Duration::from_secs(90);
-    while Instant::now() < deadline {
-        if let DaemonProbeStatus::Running(status) =
-            probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT)
-        {
-            if previous_pid.is_none_or(|pid| status.pid != pid) {
-                println!(
-                    "main daemon healthy: pid={} bind={} control={}",
-                    status.pid,
-                    daemon_bind_address(&status),
-                    status.address
-                );
-                return Ok(());
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(CliError::Network {
-        address: daemon_connect_address(&options.host, options.port),
-        detail: "rolled out main daemon did not become ready under shadow supervision".to_string(),
-    })
+    let status = daemon_wait_for_main_daemon_health(
+        &data_dir.root(),
+        &options.host,
+        options.port,
+        previous_pid,
+        Duration::from_secs(90),
+        DAEMON_PROBE_TIMEOUT,
+    )?;
+    println!(
+        "main daemon healthy: pid={} bind={} control={}",
+        status.pid,
+        daemon_bind_address(&status),
+        status.address
+    );
+    Ok(())
 }
 
 pub(crate) fn wait_for_local_shadow_rollout_completion(
     data_dir: &SinomoDataDir,
     options: &RolloutOptions,
 ) -> Result<(), CliError> {
-    let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
-    let shadow_paths = DaemonPaths::for_shadow(data_dir);
-    let main_paths = DaemonPaths::new(data_dir);
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut next_restart_nudge = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        let pending_main = rollout_main_activation_path(&rollout_paths).exists();
-        let pending_shadow = rollout_shadow_finalize_path(&rollout_paths).exists();
-        if !pending_main
-            && !pending_shadow
-            && matches!(
-                probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
-                DaemonProbeStatus::Running(_)
-            )
-        {
-            return Ok(());
-        }
-        if pending_main && Instant::now() >= next_restart_nudge {
-            if let DaemonProbeStatus::Running(status) =
-                probe_daemon_status(&main_paths, DAEMON_PROBE_TIMEOUT)
-            {
-                let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
-            }
-            next_restart_nudge = Instant::now() + Duration::from_secs(2);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(CliError::Network {
-        address: daemon_connect_address(&options.host, options.shadow_port),
-        detail: "rolled out shadow daemon did not complete local rollout finalization".to_string(),
-    })
+    daemon_wait_for_local_shadow_rollout_completion(
+        &data_dir.root(),
+        &options.host,
+        options.port,
+        &options.host,
+        options.shadow_port,
+        Duration::from_secs(90),
+        DAEMON_PROBE_TIMEOUT,
+    )
+    .map_err(Into::into)
 }

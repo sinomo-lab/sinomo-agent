@@ -324,84 +324,6 @@ pub(crate) fn parse_stage_evaluation_options(
     })
 }
 
-pub(crate) fn parse_failure_class(value: &str) -> Result<EvolutionFailureClass, CliError> {
-    match value {
-        "build-test-failure" => Ok(EvolutionFailureClass::BuildTestFailure),
-        "eval-regression" => Ok(EvolutionFailureClass::EvalRegression),
-        "artifact-quality-failure" => Ok(EvolutionFailureClass::ArtifactQualityFailure),
-        "rollout-failure" => Ok(EvolutionFailureClass::RolloutFailure),
-        "resource-exhaustion" => Ok(EvolutionFailureClass::ResourceExhaustion),
-        "repeated-implementation-failure" => {
-            Ok(EvolutionFailureClass::RepeatedImplementationFailure)
-        }
-        "foundation-blocker" => Ok(EvolutionFailureClass::FoundationBlocker),
-        "ambiguous-metric" => Ok(EvolutionFailureClass::AmbiguousMetric),
-        "wrong-task-selection" => Ok(EvolutionFailureClass::WrongTaskSelection),
-        "inconclusive-evidence" => Ok(EvolutionFailureClass::InconclusiveEvidence),
-        _ => Err(CliError::Parse {
-            detail: format!("unknown failure class `{value}`"),
-        }),
-    }
-}
-
-pub(crate) fn parse_stage_resource_usage(
-    value: &str,
-    default_task_id: Option<&str>,
-) -> Result<ResourceUsageEstimate, CliError> {
-    let parts: Vec<&str> = value.split(':').collect();
-    let (task_id, resource, estimated, actual) = match parts.as_slice() {
-        [resource, estimated] => (
-            default_task_id.ok_or_else(|| CliError::Parse {
-                detail: format!(
-                    "usage `{value}` needs --task first or task:resource:estimated[:actual]"
-                ),
-            })?,
-            resource.trim(),
-            estimated.trim(),
-            None,
-        ),
-        [resource, estimated, actual] => (
-            default_task_id.ok_or_else(|| CliError::Parse {
-                detail: format!(
-                    "usage `{value}` needs --task first or task:resource:estimated[:actual]"
-                ),
-            })?,
-            resource.trim(),
-            estimated.trim(),
-            Some(actual.trim()),
-        ),
-        [task_id, resource, estimated, actual] => (
-            task_id.trim(),
-            resource.trim(),
-            estimated.trim(),
-            Some(actual.trim()),
-        ),
-        _ => {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "usage `{value}` must look like resource:estimated[:actual] or task:resource:estimated:actual"
-                ),
-            });
-        }
-    };
-    let estimated_units = estimated.parse::<u64>().map_err(|source| CliError::Parse {
-        detail: format!("invalid estimated usage units in `{value}`: {source}"),
-    })?;
-    let actual_units = actual
-        .map(|actual| {
-            actual.parse::<u64>().map_err(|source| CliError::Parse {
-                detail: format!("invalid actual usage units in `{value}`: {source}"),
-            })
-        })
-        .transpose()?;
-    Ok(ResourceUsageEstimate {
-        task_id: task_id.to_string(),
-        resource: resource.to_string(),
-        estimated_units,
-        actual_units,
-    })
-}
-
 pub(crate) fn parse_iteration_options(args: &[String]) -> Result<IterationOptions, CliError> {
     let mut campaign_id = None;
     let mut task_id = None;
@@ -639,390 +561,6 @@ pub(crate) fn parse_schedule_options(args: &[String]) -> Result<ScheduleOptions,
     })
 }
 
-pub(crate) fn parse_schedule_resources(
-    values: &[String],
-    campaign: &EvolutionCampaign,
-) -> Result<Vec<ResourceClassDefinition>, CliError> {
-    if values.is_empty() {
-        return Ok(campaign
-            .budget_policy
-            .reserve_floors
-            .iter()
-            .map(|floor| ResourceClassDefinition {
-                resource_id: floor.resource.clone(),
-                unit: "percent".to_string(),
-                total_units: 100,
-                used_units: 0,
-                reserve_floor_percent: floor.floor_percent,
-                reset_window: "current reset window".to_string(),
-                notes: "derived from campaign reserve-floor config".to_string(),
-            })
-            .collect());
-    }
-
-    values
-        .iter()
-        .map(|value| parse_schedule_resource(value, campaign))
-        .collect()
-}
-
-pub(crate) fn parse_background_tick_resources(
-    values: &[String],
-    campaigns: &[EvolutionCampaign],
-) -> Result<Vec<ResourceClassDefinition>, CliError> {
-    if values.is_empty() {
-        let mut resources = Vec::new();
-        for campaign in campaigns {
-            for floor in &campaign.budget_policy.reserve_floors {
-                if let Some(resource) =
-                    resources
-                        .iter_mut()
-                        .find(|resource: &&mut ResourceClassDefinition| {
-                            resource.resource_id == floor.resource
-                        })
-                {
-                    resource.reserve_floor_percent =
-                        resource.reserve_floor_percent.max(floor.floor_percent);
-                } else {
-                    resources.push(ResourceClassDefinition {
-                        resource_id: floor.resource.clone(),
-                        unit: "percent".to_string(),
-                        total_units: 100,
-                        used_units: 0,
-                        reserve_floor_percent: floor.floor_percent,
-                        reset_window: "current reset window".to_string(),
-                        notes: "derived from background campaign reserve floors".to_string(),
-                    });
-                }
-            }
-        }
-        return Ok(resources);
-    }
-    let fallback = campaigns
-        .first()
-        .cloned()
-        .unwrap_or_else(|| EvolutionCampaign {
-            campaign_id: "background_tick".to_string(),
-            status: EvolutionCampaignStatus::Scheduled,
-            objective_card: sinomo_evolution::ObjectiveCard {
-                objective_id: "objective_background_tick".to_string(),
-                human_text: "background scheduler tick".to_string(),
-                interpreted_goal: "background scheduler tick".to_string(),
-                non_goals: Vec::new(),
-                assumptions: Vec::new(),
-                constraints: Vec::new(),
-                success_metrics: Vec::new(),
-                failure_conditions: Vec::new(),
-                safety_notes: Vec::new(),
-                resource_policy: "background".to_string(),
-                approval_policy: "manual-only".to_string(),
-                initial_horizon: "24h".to_string(),
-                assumptions_needing_human_review: Vec::new(),
-            },
-            stages: Vec::new(),
-            near_term_tasks: Vec::new(),
-            iteration_results: Vec::new(),
-            decisions: Vec::new(),
-            budget_policy: sinomo_evolution::CampaignBudgetPolicy {
-                policy_id: "background".to_string(),
-                reserve_floors: Vec::new(),
-                scheduling_notes: Vec::new(),
-                confidence: "unknown".to_string(),
-                debt_note: "unknown".to_string(),
-            },
-            resource_schedule_preview: sinomo_evolution::ResourceSchedulePreview {
-                horizon: "24h".to_string(),
-                entries: Vec::new(),
-            },
-            approval_checkpoint: sinomo_evolution::ApprovalCheckpoint {
-                policy: "manual-only".to_string(),
-                status: sinomo_evolution::ApprovalCheckpointStatus::Approved,
-                required_before: "background tick".to_string(),
-                editable_fields: Vec::new(),
-                possible_actions: Vec::new(),
-            },
-            target_ring: TrustRing::R1TrustedRuntime,
-            dry_run: true,
-            capability_registry_required: Some(false),
-            created_at: "unknown-time".to_string(),
-            updated_at: "unknown-time".to_string(),
-            source_repo: None,
-        });
-    values
-        .iter()
-        .map(|value| parse_schedule_resource(value, &fallback))
-        .collect()
-}
-
-pub(crate) fn parse_schedule_resource(
-    value: &str,
-    campaign: &EvolutionCampaign,
-) -> Result<ResourceClassDefinition, CliError> {
-    let mut parts = value.split(':');
-    let resource_id = parts.next().unwrap_or_default().trim();
-    let usage = parts.next().ok_or_else(|| CliError::Parse {
-        detail: format!("resource `{value}` must look like resource:used/total[:reset-window]"),
-    })?;
-    let reset_window = parts.next().unwrap_or("current reset window");
-    if parts.next().is_some() || resource_id.is_empty() {
-        return Err(CliError::Parse {
-            detail: format!("resource `{value}` must look like resource:used/total[:reset-window]"),
-        });
-    }
-    let (used, total) = usage.split_once('/').ok_or_else(|| CliError::Parse {
-        detail: format!("resource `{value}` must include used/total units"),
-    })?;
-    let used_units = used.parse::<u64>().map_err(|source| CliError::Parse {
-        detail: format!("invalid used units in resource `{value}`: {source}"),
-    })?;
-    let total_units = total.parse::<u64>().map_err(|source| CliError::Parse {
-        detail: format!("invalid total units in resource `{value}`: {source}"),
-    })?;
-    if total_units == 0 || used_units > total_units {
-        return Err(CliError::Parse {
-            detail: format!("resource `{value}` must have 0 <= used <= total and total > 0"),
-        });
-    }
-    let reserve_floor_percent = campaign
-        .budget_policy
-        .reserve_floors
-        .iter()
-        .find(|floor| floor.resource == resource_id)
-        .map(|floor| floor.floor_percent)
-        .unwrap_or(0);
-    Ok(ResourceClassDefinition {
-        resource_id: resource_id.to_string(),
-        unit: "percent".to_string(),
-        total_units,
-        used_units,
-        reserve_floor_percent,
-        reset_window: reset_window.to_string(),
-        notes: "provided by schedule dry-run command".to_string(),
-    })
-}
-
-pub(crate) fn parse_schedule_estimates(
-    values: &[String],
-    campaign: &EvolutionCampaign,
-    resources: &[ResourceClassDefinition],
-) -> Result<Vec<ResourceUsageEstimate>, CliError> {
-    if values.is_empty() {
-        let Some(task) = campaign.near_term_tasks.first() else {
-            return Ok(Vec::new());
-        };
-        let resource = resources
-            .first()
-            .map(|resource| resource.resource_id.clone())
-            .unwrap_or_else(|| "local-agent-wall-time".to_string());
-        return Ok(vec![ResourceUsageEstimate {
-            task_id: task.task_id.clone(),
-            resource,
-            estimated_units: 10,
-            actual_units: None,
-        }]);
-    }
-
-    values
-        .iter()
-        .map(|value| parse_schedule_estimate(value, campaign))
-        .collect()
-}
-
-pub(crate) fn parse_background_tick_estimates(
-    values: &[String],
-    campaigns: &[EvolutionCampaign],
-) -> Result<Vec<ResourceUsageEstimate>, CliError> {
-    if values.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(first_campaign) = campaigns.first() else {
-        return Err(CliError::Parse {
-            detail: "background estimates need at least one campaign".to_string(),
-        });
-    };
-    values
-        .iter()
-        .map(|value| parse_schedule_estimate(value, first_campaign))
-        .collect()
-}
-
-pub(crate) fn parse_schedule_estimate(
-    value: &str,
-    campaign: &EvolutionCampaign,
-) -> Result<ResourceUsageEstimate, CliError> {
-    let parts: Vec<&str> = value.split(':').collect();
-    let (task_id, resource, units) = match parts.as_slice() {
-        [resource, units] => {
-            let Some(task) = campaign.near_term_tasks.first() else {
-                return Err(CliError::Parse {
-                    detail: "cannot infer task id because campaign has no near-term tasks"
-                        .to_string(),
-                });
-            };
-            (task.task_id.clone(), resource.trim(), units.trim())
-        }
-        [task_id, resource, units] => (task_id.trim().to_string(), resource.trim(), units.trim()),
-        _ => {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "estimate `{value}` must look like resource:units or task:resource:units"
-                ),
-            });
-        }
-    };
-    if resource.is_empty() || units.is_empty() {
-        return Err(CliError::Parse {
-            detail: format!("estimate `{value}` must include resource and units"),
-        });
-    }
-    let estimated_units = units.parse::<u64>().map_err(|source| CliError::Parse {
-        detail: format!("invalid estimated units in `{value}`: {source}"),
-    })?;
-    Ok(ResourceUsageEstimate {
-        task_id,
-        resource: resource.to_string(),
-        estimated_units,
-        actual_units: None,
-    })
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CliMutationModel {
-    pub(crate) provider: String,
-    pub(crate) model: String,
-    pub(crate) data_dir: SinomoDataDir,
-}
-
-impl MutationModel for CliMutationModel {
-    fn mutate(
-        &self,
-        packet: &MutationPacket,
-        workspace: &CandidateWorkspace,
-    ) -> Result<sinomo_evolution::ModelMutationResult, MutationModelError> {
-        match self.provider.as_str() {
-            GitHubCopilotProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
-                let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
-                    client_id: env::var("SINOMO_COPILOT_CLIENT_ID")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id),
-                    github_host: env::var("SINOMO_COPILOT_GITHUB_HOST")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().github_host),
-                    api_base_url: env::var("SINOMO_COPILOT_API_BASE_URL")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().api_base_url),
-                    default_model: model_or_default(
-                        &self.model,
-                        GitHubCopilotConfig::default().default_model,
-                    ),
-                    token_store_path: Some(credentials_path),
-                });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            GitHubCopilotCliProvider::PROVIDER_ID => {
-                let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
-                    model: model_or_default(&self.model, GitHubCopilotCliConfig::default().model),
-                    ..GitHubCopilotCliConfig::default()
-                });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            CodexCliProvider::PROVIDER_ID => {
-                let provider = CodexCliProvider::new(CodexCliConfig {
-                    model: model_or_default(&self.model, CODEX_CLI_DEFAULT_MODEL.to_string()),
-                    working_dir: Some(workspace.path.clone()),
-                    ..CodexCliConfig::default()
-                });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            CODEX_PROVIDER_ID => {
-                let provider = codex_provider_for_model(&self.model);
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
-                let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
-                    model: model_or_default(&self.model, CLAUDE_CODE_DEFAULT_MODEL.to_string()),
-                    working_dir: Some(workspace.path.clone()),
-                    ..ClaudeCodeConfig::default()
-                });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            AnthropicProvider::PROVIDER_ID | "claude" => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(AnthropicProvider::PROVIDER_ID);
-                let provider = AnthropicProvider::new(AnthropicConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        AnthropicConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..AnthropicConfig::default()
-                });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            OpenAiProvider::PROVIDER_ID | "openai-api" => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(OpenAiProvider::PROVIDER_ID);
-                let provider = OpenAiProvider::new(OpenAiConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        OpenAiConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..OpenAiConfig::default()
-                });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            GeminiProvider::PROVIDER_ID | "google-gemini" => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(GeminiProvider::PROVIDER_ID);
-                let provider = GeminiProvider::new(GeminiConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        GeminiConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..GeminiConfig::default()
-                });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            NvidiaProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(NvidiaProvider::PROVIDER_ID);
-                let provider = NvidiaProvider::new(NvidiaConfig {
-                    api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
-                        .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
-                    default_model: model_or_default(
-                        &self.model,
-                        NvidiaConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                });
-                LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
-            }
-            _ => Err(MutationModelError::LanguageModel(
-                LanguageModelError::ProviderInvocationFailed {
-                    provider: self.provider.clone(),
-                    model: self.model.clone(),
-                    detail: "unknown evolution model provider".to_string(),
-                },
-            )),
-        }
-    }
-}
-
 pub(crate) fn resolve_job_from_args(
     args: &[String],
     waiting_only: bool,
@@ -1030,275 +568,14 @@ pub(crate) fn resolve_job_from_args(
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
-    if let Some(job_id) = job_flag(args)? {
-        let record = read_stored_job(&paths.job_path(&job_id))?;
-        return Ok((paths, record));
-    }
-
-    let records = list_job_records(&paths)?;
-    let candidates: Vec<_> = records
-        .into_iter()
-        .filter(|record| {
-            if waiting_only {
-                record.job.status == EvolutionJobStatus::AwaitingApproval
-            } else {
-                !is_terminal_status(&record.job.status)
-            }
-        })
-        .collect();
-    match candidates.as_slice() {
-        [record] => Ok((paths, record.clone())),
-        [] => Err(CliError::NoActiveJob),
-        _ => Err(CliError::AmbiguousJob {
-            job_ids: candidates
-                .iter()
-                .map(|record| record.job.job_id.to_string())
-                .collect(),
-        }),
-    }
-}
-
-pub(crate) fn ensure_awaiting_approval(record: &StoredEvolutionJob) -> Result<(), CliError> {
-    if record.job.status == EvolutionJobStatus::AwaitingApproval {
-        return Ok(());
-    }
-    Err(CliError::InvalidJobState {
-        job_id: record.job.job_id.to_string(),
-        status: job_status_label(&record.job.status).to_string(),
-        expected: "awaiting-approval".to_string(),
-    })
-}
-
-pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let content = serde_json::to_string_pretty(value).map_err(|source| CliError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::write(path, content).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-pub(crate) fn parse_background_tick_external_workloads(
-    workload_specs: &[String],
-    estimate_specs: &[String],
-    checkpoint_specs: &[String],
-) -> Result<Vec<ClusterLongHorizonWorkload>, CliError> {
-    let mut workloads = Vec::new();
-    for spec in workload_specs {
-        let workload = parse_external_workload_spec(spec)?;
-        if workloads
-            .iter()
-            .any(|existing: &ClusterLongHorizonWorkload| {
-                existing.system == workload.system && existing.workload_id == workload.workload_id
-            })
-        {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "duplicate external workload `{}`",
-                    external_workload_key(&workload)
-                ),
-            });
-        }
-        workloads.push(workload);
-    }
-    for spec in estimate_specs {
-        let (system, workload_id, estimate) = parse_external_workload_estimate(spec)?;
-        let workload = ensure_external_workload(&mut workloads, &system, &workload_id);
-        workload.resource_estimates.push(estimate);
-    }
-    for spec in checkpoint_specs {
-        let (system, workload_id) = parse_external_workload_key(spec)?;
-        let workload = ensure_external_workload(&mut workloads, &system, &workload_id);
-        workload.human_checkpoint_required = true;
-        if workload.status == ClusterLongHorizonWorkloadStatus::Ready {
-            workload.status = ClusterLongHorizonWorkloadStatus::PausedHuman;
-        }
-    }
-    Ok(workloads)
-}
-
-pub(crate) fn ensure_external_workload<'a>(
-    workloads: &'a mut Vec<ClusterLongHorizonWorkload>,
-    system: &str,
-    workload_id: &str,
-) -> &'a mut ClusterLongHorizonWorkload {
-    if let Some(index) = workloads
-        .iter()
-        .position(|workload| workload.system == system && workload.workload_id == workload_id)
-    {
-        return &mut workloads[index];
-    }
-    workloads.push(ClusterLongHorizonWorkload {
-        workload_id: workload_id.to_string(),
-        system: system.to_string(),
-        title: workload_id.to_string(),
-        status: ClusterLongHorizonWorkloadStatus::Ready,
-        resource_estimates: Vec::new(),
-        human_checkpoint_required: false,
-        terminal: false,
-        evidence_refs: Vec::new(),
-    });
-    workloads
-        .last_mut()
-        .expect("just inserted external workload")
-}
-
-pub(crate) fn parse_external_workload_spec(
-    value: &str,
-) -> Result<ClusterLongHorizonWorkload, CliError> {
-    let parts: Vec<&str> = value.splitn(4, ':').collect();
-    let [system, workload_id, status, title] = match parts.as_slice() {
-        [system, workload_id, status] => [*system, *workload_id, *status, *workload_id],
-        [system, workload_id, status, title] => [*system, *workload_id, *status, *title],
-        _ => {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "external workload `{value}` must look like system:workload_id:status[:title]"
-                ),
-            });
-        }
+    let job_id = job_flag(args)?;
+    let mode = if waiting_only {
+        EvolutionJobSelectionMode::AwaitingApproval
+    } else {
+        EvolutionJobSelectionMode::Active
     };
-    if system.trim().is_empty() || workload_id.trim().is_empty() {
-        return Err(CliError::Parse {
-            detail: format!("external workload `{value}` needs non-empty system and workload id"),
-        });
-    }
-    let status = parse_external_workload_status(status)?;
-    let terminal = matches!(
-        status,
-        ClusterLongHorizonWorkloadStatus::Complete | ClusterLongHorizonWorkloadStatus::Cancelled
-    );
-    Ok(ClusterLongHorizonWorkload {
-        workload_id: workload_id.trim().to_string(),
-        system: system.trim().to_string(),
-        title: title.trim().to_string(),
-        status,
-        resource_estimates: Vec::new(),
-        human_checkpoint_required: false,
-        terminal,
-        evidence_refs: vec!["sinomo evolve tick external workload input".to_string()],
-    })
-}
-
-pub(crate) fn parse_external_workload_estimate(
-    value: &str,
-) -> Result<(String, String, ResourceUsageEstimate), CliError> {
-    let parts: Vec<&str> = value.split(':').collect();
-    let [system, workload_id, resource, units] = match parts.as_slice() {
-        [system, workload_id, resource, units] => [*system, *workload_id, *resource, *units],
-        _ => {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "external workload estimate `{value}` must look like system:workload_id:resource:units"
-                ),
-            });
-        }
-    };
-    if system.trim().is_empty() || workload_id.trim().is_empty() || resource.trim().is_empty() {
-        return Err(CliError::Parse {
-            detail: format!(
-                "external workload estimate `{value}` needs non-empty system, workload id, and resource"
-            ),
-        });
-    }
-    let estimated_units = units
-        .trim()
-        .parse::<u64>()
-        .map_err(|source| CliError::Parse {
-            detail: format!("invalid external workload estimate `{value}`: {source}"),
-        })?;
-    Ok((
-        system.trim().to_string(),
-        workload_id.trim().to_string(),
-        ResourceUsageEstimate {
-            task_id: workload_id.trim().to_string(),
-            resource: resource.trim().to_string(),
-            estimated_units,
-            actual_units: None,
-        },
-    ))
-}
-
-pub(crate) fn parse_external_workload_key(value: &str) -> Result<(String, String), CliError> {
-    let parts: Vec<&str> = value.split(':').collect();
-    let [system, workload_id] = match parts.as_slice() {
-        [system, workload_id] => [*system, *workload_id],
-        _ => {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "external workload key `{value}` must look like system:workload_id"
-                ),
-            });
-        }
-    };
-    if system.trim().is_empty() || workload_id.trim().is_empty() {
-        return Err(CliError::Parse {
-            detail: format!(
-                "external workload key `{value}` needs non-empty system and workload id"
-            ),
-        });
-    }
-    Ok((system.trim().to_string(), workload_id.trim().to_string()))
-}
-
-pub(crate) fn parse_external_workload_status(
-    value: &str,
-) -> Result<ClusterLongHorizonWorkloadStatus, CliError> {
-    match value {
-        "ready" => Ok(ClusterLongHorizonWorkloadStatus::Ready),
-        "running" => Ok(ClusterLongHorizonWorkloadStatus::Running),
-        "paused-budget" => Ok(ClusterLongHorizonWorkloadStatus::PausedBudget),
-        "paused-human" => Ok(ClusterLongHorizonWorkloadStatus::PausedHuman),
-        "complete" => Ok(ClusterLongHorizonWorkloadStatus::Complete),
-        "cancelled" | "canceled" => Ok(ClusterLongHorizonWorkloadStatus::Cancelled),
-        _ => Err(CliError::Parse {
-            detail: format!(
-                "unknown external workload status `{value}`; expected ready, running, paused-budget, paused-human, complete, or cancelled"
-            ),
-        }),
-    }
-}
-
-pub(crate) fn external_workload_key(workload: &ClusterLongHorizonWorkload) -> String {
-    format!("{}:{}", workload.system, workload.workload_id)
-}
-
-pub(crate) fn parse_reserve_floors(values: &[String]) -> Result<Vec<ReserveFloor>, CliError> {
-    values
-        .iter()
-        .map(|value| parse_reserve_floor(value))
-        .collect()
-}
-
-pub(crate) fn parse_reserve_floor(value: &str) -> Result<ReserveFloor, CliError> {
-    let (resource, floor) = value.rsplit_once(':').ok_or_else(|| CliError::Parse {
-        detail: format!("reserve floor `{value}` must look like resource:30%"),
-    })?;
-    let floor = floor
-        .trim_end_matches('%')
-        .parse::<u8>()
-        .map_err(|source| CliError::Parse {
-            detail: format!("invalid reserve floor `{value}`: {source}"),
-        })?;
-    if floor > 100 || resource.trim().is_empty() {
-        return Err(CliError::Parse {
-            detail: format!(
-                "reserve floor `{value}` must have a non-empty resource and 0-100 percent"
-            ),
-        });
-    }
-    Ok(ReserveFloor {
-        resource: resource.to_string(),
-        floor_percent: floor,
-    })
+    let record = select_stored_job(&paths, job_id.as_ref(), mode)?;
+    Ok((paths, record))
 }
 
 pub(crate) fn println_campaign_proposal(
@@ -1394,6 +671,12 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     paths.ensure()?;
     let config = read_config(&paths).ok();
     let model_config = load_model_config(&ModelPaths::new(&data_dir)).ok();
+    let evolution_model_config = config.as_ref().map(|config| sinomo_lm::ModelConfig {
+        default_provider: config.default_provider.clone(),
+        default_model: config.default_model.clone(),
+    });
+    let default_model =
+        resolve_default_model(model_config.as_ref(), evolution_model_config.as_ref())?;
     let repo = if let Some(repo) = options
         .repo
         .clone()
@@ -1407,98 +690,51 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
             path: ".".to_string(),
             detail: source.to_string(),
         })?;
-        ensure_source_repo(&rollout_paths, Some(&current_repo))?;
+        ensure_rollout_source_repo(&rollout_paths, Some(&current_repo))?;
         rollout_paths.source_repo
     };
 
     if options.dry_run || options.pause_after_proposal {
-        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+        let request = prepare_campaign_proposal_request(CampaignProposalInput {
             objective: options.objective.clone(),
-            horizon: options
-                .horizon
-                .clone()
-                .unwrap_or_else(|| "30 days".to_string()),
-            budget_policy: options
-                .budget_policy
-                .clone()
-                .unwrap_or_else(|| "free-and-prepaid".to_string()),
-            reserve_floors: parse_reserve_floors(&options.reserve_floors)?,
-            approval_policy: options
-                .approval_policy
-                .clone()
-                .unwrap_or_else(|| "stage-rollout".to_string()),
+            horizon: options.horizon.clone(),
+            budget_policy: options.budget_policy.clone(),
+            reserve_floor_specs: options.reserve_floors.clone(),
+            approval_policy: options.approval_policy.clone(),
             max_wall_time: options.max_wall_time.clone(),
             pause_after_proposal: options.pause_after_proposal,
             dry_run: true,
             approved: options.approve_campaign,
             target_ring: options.target_ring.clone(),
             source_repo: Some(repo.display().to_string()),
-        });
+        })?;
+        let campaign = propose_evolution_campaign(request);
         let bundle = write_campaign_bundle(&paths, &campaign)?;
         println_campaign_proposal(&campaign, &bundle);
         return Ok(());
     }
 
-    let provider = options
-        .provider
-        .or_else(|| {
-            model_config
-                .as_ref()
-                .and_then(|config| config.default_provider.clone())
-        })
-        .or_else(|| {
-            config
-                .as_ref()
-                .and_then(|config| config.default_provider.clone())
-        })
-        .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
-    let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
-        detail: format!("unknown provider `{provider}`"),
-    })?;
-    let model = options.model.or_else(|| {
-        model_config
-            .as_ref()
-            .and_then(|config| config.default_model.clone())
-            .or_else(|| {
-                config
-                    .as_ref()
-                    .and_then(|config| config.default_model.clone())
-            })
-    });
-    let model = model.map(|model| normalize_model_id_for_provider(&provider, &model));
-    let verification_commands = if options.verify.is_empty() {
-        Vec::new()
-    } else {
-        options
-            .verify
-            .iter()
-            .enumerate()
-            .map(|(index, command)| VerificationCommand {
-                name: format!("verify-{}", index + 1),
-                command: command.clone(),
-                expected_exit_code: 0,
-                gate: EvaluationGate::StaticChecks,
-            })
-            .collect()
-    };
-    let request = EvolutionRequest {
+    let prepared = prepare_evolution_request(EvolutionRequestInput {
         objective: options.objective,
         target_ring: options.target_ring,
         intended_paths: options.allow,
-        verification_commands,
-        model_provider: Some(provider.clone()),
-        model: model.clone(),
+        verification_commands: options.verify,
+        provider: options.provider,
+        model: options.model,
+        default_provider: Some(default_model.provider),
+        default_model: Some(default_model.configured_model),
         dry_run: options.dry_run,
-    };
+    })?;
+    let request = prepared.request;
 
     let orchestrator = EvolutionOrchestrator::new(
         GitWorkspaceAdapter::new(&repo, &paths.jobs),
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
         LocalCandidateBundleStore::new(&paths.jobs),
     );
-    let model_runner = CliMutationModel {
-        provider,
-        model: model.unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string()),
+    let model_runner = EvolutionLanguageModelMutationModel {
+        provider: prepared.provider,
+        model: prepared.model,
         data_dir: data_dir.clone(),
     };
     let report = if request.dry_run {
@@ -1621,85 +857,19 @@ pub(crate) fn evolve_decide(
     args: &[String],
     outcome: CandidateDecisionOutcome,
 ) -> Result<(), CliError> {
-    let (paths, mut record) = resolve_job_from_args(args, true)?;
-    ensure_awaiting_approval(&record)?;
+    let (paths, record) = resolve_job_from_args(args, true)?;
+    ensure_stored_job_awaiting_approval(&record)?;
     let note = flag_value(args, "--note").unwrap_or_default();
-    let decision = CandidateDecision::new(
-        &record.job,
-        outcome.clone(),
-        "cli-supervisor",
-        record.candidate_workspace.path.display().to_string(),
-        record.bundle.bundle_path.clone(),
-        record.verification_outcome.clone(),
-        record.changed_files.clone(),
-        note,
+    let recorded = decide_stored_evolution_job(&paths, record, outcome, "cli-supervisor", note)?;
+    println!("job: {}", recorded.record.job.job_id);
+    println!("status: {}", job_status_label(&recorded.record.job.status));
+    println!(
+        "worktree: {}",
+        recorded.record.candidate_workspace.path.display()
     );
-    let decision_path = PathBuf::from(&record.bundle.bundle_path).join("approval-decision.json");
-    write_json(&decision_path, &decision)?;
-    record.job.status = decision.resulting_status.clone();
-    record.bundle.decision_path = Some(decision_path.display().to_string());
-    record.decision = Some(decision);
-    write_bundle_manifest(&record)?;
-    if let Some(job_path) = &record.bundle.job_path {
-        write_json(Path::new(job_path), &record.job)?;
-    }
-    write_stored_job(&paths, &record)?;
-    if outcome == CandidateDecisionOutcome::Approved {
-        commit_and_fast_forward_approved_candidate(&record)?;
-    }
-    println!("job: {}", record.job.job_id);
-    println!("status: {}", job_status_label(&record.job.status));
-    println!("worktree: {}", record.candidate_workspace.path.display());
-    println!("bundle: {}", record.bundle.bundle_path);
-    println!("decision: {}", decision_path.display());
+    println!("bundle: {}", recorded.record.bundle.bundle_path);
+    println!("decision: {}", recorded.decision_path.display());
     Ok(())
-}
-
-pub(crate) fn commit_and_fast_forward_approved_candidate(
-    record: &StoredEvolutionJob,
-) -> Result<(), CliError> {
-    let worktree = &record.candidate_workspace.path;
-    run_git_command(worktree, &["add", "-A"])?;
-    let status = run_git_command(worktree, &["status", "--porcelain"])?;
-    if !status.trim().is_empty() {
-        run_git_command(
-            worktree,
-            &[
-                "commit",
-                "-m",
-                &format!("Apply evolution job {}", record.job.job_id),
-            ],
-        )?;
-    }
-    let source_root = Path::new(&record.job.edit_scope.workspace_root);
-    run_git_command(
-        source_root,
-        &[
-            "merge",
-            "--ff-only",
-            &record.candidate_workspace.branch_name,
-        ],
-    )?;
-    Ok(())
-}
-
-pub(crate) fn run_git_command(cwd: &Path, args: &[&str]) -> Result<String, CliError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|source| CliError::Io {
-            path: format!("git {}", args.join(" ")),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(CliError::Process {
-            command: format!("git {}", args.join(" ")),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub(crate) fn evolve_status(args: &[String]) -> Result<(), CliError> {
@@ -1727,23 +897,17 @@ pub(crate) fn evolve_status(args: &[String]) -> Result<(), CliError> {
 pub(crate) fn evolve_show(args: &[String]) -> Result<(), CliError> {
     let (_paths, record) = resolve_job_from_args(args, false)?;
     let artifact = if has_flag(args, "--diff") {
-        record.bundle.diff_path.clone()
+        StoredJobArtifactKind::Diff
     } else if has_flag(args, "--scorecard") {
-        record.bundle.scorecard_path.clone()
+        StoredJobArtifactKind::Scorecard
     } else if has_flag(args, "--decision") {
-        record.bundle.decision_path.clone()
+        StoredJobArtifactKind::Decision
     } else if has_flag(args, "--packet") {
-        Some(record.bundle.mutation_packet_path.clone())
+        StoredJobArtifactKind::MutationPacket
     } else {
-        record.bundle.diff_path.clone()
-    }
-    .ok_or_else(|| CliError::MissingArtifact {
-        artifact: "requested artifact".to_string(),
-    })?;
-    let content = fs::read_to_string(&artifact).map_err(|source| CliError::Io {
-        path: artifact.clone(),
-        detail: source.to_string(),
-    })?;
+        StoredJobArtifactKind::Diff
+    };
+    let content = read_stored_job_artifact(&record, artifact)?;
     println!("{content}");
     Ok(())
 }
@@ -1755,96 +919,30 @@ pub(crate) fn evolve_show_packet(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(crate) fn evolve_verify(args: &[String]) -> Result<(), CliError> {
-    let (paths, mut record) = resolve_job_from_args(args, false)?;
+    let (paths, record) = resolve_job_from_args(args, false)?;
     let harness = ExecutingEvalHarness::new(LocalCommandRunner::new());
-    let (scorecard, results) = harness
-        .run_verification_plan(
-            record.job.verification.clone(),
-            &record.candidate_workspace.path,
+    let recorded = verify_stored_evolution_job(&paths, record, &harness)?;
+    println!("job: {}", recorded.record.job.job_id);
+    println!(
+        "verification: {}",
+        outcome_label(
+            recorded
+                .record
+                .verification_outcome
+                .as_ref()
+                .expect("recorded verification outcome")
         )
-        .map_err(CliError::Eval)?;
-    let scorecard_path = PathBuf::from(&record.bundle.bundle_path).join("scorecard.json");
-    write_json(&scorecard_path, &scorecard)?;
-    for result in &results {
-        let safe_name = safe_file_stem(&result.name);
-        let path = PathBuf::from(&record.bundle.bundle_path)
-            .join("command-logs")
-            .join(format!("{safe_name}.txt"));
-        fs::write(
-            &path,
-            format!(
-                "name: {}\ncommand: {}\nexpected_exit_code: {}\nexit_code: {}\nduration_ms: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-                result.name,
-                result.command,
-                result.expected_exit_code,
-                result.exit_code,
-                result.duration_ms,
-                result.stdout,
-                result.stderr
-            ),
-        )
-        .map_err(|source| CliError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    record.verification_outcome = Some(scorecard.outcome.clone());
-    record.bundle.scorecard_path = Some(scorecard_path.display().to_string());
-    write_stored_job(&paths, &record)?;
-    println!("job: {}", record.job.job_id);
-    println!("verification: {}", outcome_label(&scorecard.outcome));
-    println!("scorecard: {}", scorecard_path.display());
+    );
+    println!("scorecard: {}", recorded.scorecard_path.display());
     Ok(())
 }
 
 pub(crate) fn evolve_cleanup(args: &[String]) -> Result<(), CliError> {
     let (paths, record) = resolve_job_from_args(args, false)?;
-    let path = &record.candidate_workspace.path;
-    if path.exists() {
-        let output = std::process::Command::new("git")
-            .args(["worktree", "remove", "--force"])
-            .arg(path)
-            .current_dir(&record.job.edit_scope.workspace_root)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                fs::remove_dir_all(path).map_err(|source| CliError::Io {
-                    path: path.display().to_string(),
-                    detail: format!(
-                        "git worktree remove failed: {}; remove_dir_all failed: {}",
-                        String::from_utf8_lossy(&output.stderr).trim(),
-                        source
-                    ),
-                })?;
-            }
-            Err(error) => {
-                fs::remove_dir_all(path).map_err(|source| CliError::Io {
-                    path: path.display().to_string(),
-                    detail: format!(
-                        "git worktree remove could not start: {}; remove_dir_all failed: {}",
-                        error, source
-                    ),
-                })?;
-            }
-        }
-    }
-    let job_dir = paths.job_dir(&record.job.job_id);
-    if job_dir.exists() {
-        fs::remove_dir_all(&job_dir).map_err(|source| CliError::Io {
-            path: job_dir.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let bundle_path = PathBuf::from(&record.bundle.bundle_path);
-    if bundle_path.exists() && bundle_path != job_dir {
-        fs::remove_dir_all(&bundle_path).map_err(|source| CliError::Io {
-            path: bundle_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    println!("removed job: {}", record.job.job_id);
-    println!("removed worktree: {}", path.display());
+    let summary = sinomo_evolution::cleanup_stored_evolution_job(&paths, &record)
+        .map_err(sinomo_evolution::EvolutionError::from)?;
+    println!("removed job: {}", summary.job_id);
+    println!("removed worktree: {}", summary.worktree_path.display());
     Ok(())
 }
 

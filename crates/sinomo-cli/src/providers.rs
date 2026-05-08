@@ -104,7 +104,7 @@ pub fn auth_github_copilot() -> Result<(), CliError> {
         thread::sleep(interval);
         let poll = provider.device_login_poll(&device.device_code)?;
         if poll.access_token.is_some() {
-            provider.test_connection()?;
+            test_provider_credentials(GitHubCopilotProvider::PROVIDER_ID)?;
             println!(
                 "GitHub Copilot credentials saved to {}",
                 credentials_path.display()
@@ -129,73 +129,60 @@ pub fn auth_github_copilot() -> Result<(), CliError> {
 }
 
 pub fn test_github_copilot() -> Result<(), CliError> {
-    let (provider, credentials_path) = github_copilot_provider()?;
+    let result = test_provider_credentials(GitHubCopilotProvider::PROVIDER_ID)?;
     println!(
         "Testing GitHub Copilot credentials at {}",
-        credentials_path.display()
+        result.credentials_path.display()
     );
-    provider.github_token()?;
     println!("GitHub token: ok");
-    provider.test_connection()?;
     println!("Copilot API models endpoint: ok");
     println!("GitHub Copilot provider connection: ok");
     Ok(())
 }
 
 pub fn auth_anthropic() -> Result<(), CliError> {
-    let (provider, credentials_path) = anthropic_provider()?;
-    let (api_key, source) = api_key_from_env_or_prompt(
-        "Anthropic",
-        &[
-            "SINOMO_ANTHROPIC_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_API_KEY",
-            "SINOMO_CLAUDE_API_KEY",
-        ],
-    )?;
-    provider.save_api_key(&api_key, &source)?;
+    let (api_key, source) =
+        api_key_from_env_or_prompt("Anthropic", AnthropicProvider::PROVIDER_ID)?;
+    let result = save_provider_api_key(AnthropicProvider::PROVIDER_ID, &api_key, &source)?;
     println!("Testing Anthropic provider connection...");
-    provider.test_connection()?;
+    test_provider_credentials(AnthropicProvider::PROVIDER_ID)?;
     println!(
         "Anthropic credentials saved to {}",
-        credentials_path.display()
+        result.credentials_path.display()
     );
     Ok(())
 }
 
 pub fn test_anthropic() -> Result<(), CliError> {
-    let (provider, credentials_path) = anthropic_provider()?;
+    let result = test_provider_credentials(AnthropicProvider::PROVIDER_ID)?;
     println!(
         "Testing Anthropic credentials at {}",
-        credentials_path.display()
+        result.credentials_path.display()
     );
-    provider.api_key()?;
     println!("Anthropic API key: ok");
-    provider.test_connection()?;
     println!("Anthropic provider connection: ok");
     Ok(())
 }
 
 pub fn auth_openai() -> Result<(), CliError> {
-    let (provider, credentials_path) = openai_provider()?;
-    let (api_key, source) =
-        api_key_from_env_or_prompt("OpenAI", &["SINOMO_OPENAI_API_KEY", "OPENAI_API_KEY"])?;
-    provider.save_api_key(&api_key, &source)?;
+    let (api_key, source) = api_key_from_env_or_prompt("OpenAI", OpenAiProvider::PROVIDER_ID)?;
+    let result = save_provider_api_key(OpenAiProvider::PROVIDER_ID, &api_key, &source)?;
     println!("Testing OpenAI provider connection...");
-    provider.test_connection()?;
-    println!("OpenAI credentials saved to {}", credentials_path.display());
+    test_provider_credentials(OpenAiProvider::PROVIDER_ID)?;
+    println!(
+        "OpenAI credentials saved to {}",
+        result.credentials_path.display()
+    );
     Ok(())
 }
 
 pub fn test_openai() -> Result<(), CliError> {
-    let (provider, credentials_path) = openai_provider()?;
+    let result = test_provider_credentials(OpenAiProvider::PROVIDER_ID)?;
     println!(
         "Testing OpenAI credentials at {}",
-        credentials_path.display()
+        result.credentials_path.display()
     );
-    provider.api_key()?;
     println!("OpenAI API key: ok");
-    provider.test_connection()?;
     println!("OpenAI provider connection: ok");
     Ok(())
 }
@@ -224,7 +211,7 @@ pub fn auth_codex() -> Result<(), CliError> {
         let poll = provider.device_login_poll(&device)?;
         if poll.tokens.is_some() {
             println!("Testing Codex provider connection...");
-            provider.test_connection()?;
+            test_provider_credentials(CODEX_PROVIDER_ID)?;
             break;
         }
     }
@@ -233,93 +220,68 @@ pub fn auth_codex() -> Result<(), CliError> {
 }
 
 pub fn test_codex() -> Result<(), CliError> {
-    let (provider, auth_path) = codex_provider()?;
-    println!("Testing Codex credentials at {}", auth_path.display());
-    provider.chatgpt_tokens()?;
+    let result = test_provider_credentials(CODEX_PROVIDER_ID)?;
+    println!(
+        "Testing Codex credentials at {}",
+        result.credentials_path.display()
+    );
     println!("Codex ChatGPT auth: ok");
-    provider.test_connection()?;
     println!("Codex provider connection: ok");
     Ok(())
 }
 
 pub fn auth_gemini() -> Result<(), CliError> {
-    let (provider, credentials_path) = gemini_provider()?;
-    let (api_key, source) = api_key_from_env_or_prompt(
-        "Gemini",
-        &[
-            "SINOMO_GEMINI_API_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-            "GOOGLE_AI_API_KEY",
-        ],
-    )?;
-    provider.save_api_key(&api_key, &source)?;
+    let (api_key, source) = api_key_from_env_or_prompt("Gemini", GeminiProvider::PROVIDER_ID)?;
+    let result = save_provider_api_key(GeminiProvider::PROVIDER_ID, &api_key, &source)?;
     println!("Testing Gemini provider connection...");
-    provider.test_connection()?;
-    println!("Gemini credentials saved to {}", credentials_path.display());
+    test_provider_credentials(GeminiProvider::PROVIDER_ID)?;
+    println!(
+        "Gemini credentials saved to {}",
+        result.credentials_path.display()
+    );
     Ok(())
 }
 
 pub fn test_gemini() -> Result<(), CliError> {
-    let (provider, credentials_path) = gemini_provider()?;
+    let result = test_provider_credentials(GeminiProvider::PROVIDER_ID)?;
     println!(
         "Testing Gemini credentials at {}",
-        credentials_path.display()
+        result.credentials_path.display()
     );
-    provider.api_key()?;
     println!("Gemini API key: ok");
-    provider.test_connection()?;
     println!("Gemini provider connection: ok");
     Ok(())
 }
 
 pub fn auth_nvidia() -> Result<(), CliError> {
-    let (provider, credentials_path) = nvidia_provider()?;
-    let (api_key, source) = api_key_from_env_or_prompt(
-        "NVIDIA",
-        &["SINOMO_NVIDIA_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY"],
-    )?;
-    provider.save_api_key(&api_key, &source)?;
+    let (api_key, source) = api_key_from_env_or_prompt("NVIDIA", NvidiaProvider::PROVIDER_ID)?;
+    let result = save_provider_api_key(NvidiaProvider::PROVIDER_ID, &api_key, &source)?;
     println!("Testing NVIDIA provider connection...");
-    provider.test_connection()?;
-    println!("NVIDIA credentials saved to {}", credentials_path.display());
+    test_provider_credentials(NvidiaProvider::PROVIDER_ID)?;
+    println!(
+        "NVIDIA credentials saved to {}",
+        result.credentials_path.display()
+    );
     Ok(())
 }
 
 pub fn test_nvidia() -> Result<(), CliError> {
-    let (provider, credentials_path) = nvidia_provider()?;
+    let result = test_provider_credentials(NvidiaProvider::PROVIDER_ID)?;
     println!(
         "Testing NVIDIA credentials at {}",
-        credentials_path.display()
+        result.credentials_path.display()
     );
-    provider.api_key()?;
     println!("NVIDIA API key: ok");
-    provider.test_connection()?;
     println!("NVIDIA provider connection: ok");
     Ok(())
 }
 
-pub(super) fn codex_provider() -> Result<(CodexProvider, PathBuf), CliError> {
-    let provider = codex_provider_for_model(PROVIDER_DEFAULT_MODEL);
-    let auth_path = provider
-        .credentials_path()
-        .ok_or_else(|| CliError::AuthProvider {
-            detail: "could not resolve Sinomo Codex credentials path; set SINOMO_DATA_DIR or SINOMO_CODEX_CREDENTIALS_FILE".to_string(),
-        })?;
-    Ok((provider, auth_path))
-}
-
 fn api_key_from_env_or_prompt(
     provider_name: &str,
-    env_vars: &[&str],
+    provider_id: &str,
 ) -> Result<(String, String), CliError> {
-    for env_var in env_vars {
-        if let Ok(api_key) = env::var(env_var) {
-            let api_key = api_key.trim();
-            if !api_key.is_empty() {
-                return Ok((api_key.to_string(), format!("env:{env_var}")));
-            }
-        }
+    if let Some(api_key) = provider_api_key_from_env(provider_id) {
+        return Ok(api_key);
     }
 
     println!("No {provider_name} API key found in environment. Paste an API key to store locally.");

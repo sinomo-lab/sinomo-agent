@@ -3033,6 +3033,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sinomo-lm",
  "sinomo-runtime",
  "thiserror",
  "time",
@@ -3093,6 +3094,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sinomo-agent",
  "sinomo-evolution",
  "sinomo-lm",
  "sinomo-runtime",
@@ -3120,9 +3122,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-dfs",
+ "sinomo-kv",
  "sinomo-local",
  "sinomo-network",
  "sinomo-node",
+ "sinomo-rollout",
  "thiserror",
  "time",
 ]
@@ -3343,6 +3348,7 @@ dependencies = [
 name = "sinomo-rollout"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "sinomo-core",

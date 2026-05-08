@@ -14,16 +14,15 @@ use super::{
     cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
     cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
     cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
-    create_source_repo_bundle, daemon_advertised_endpoints_for_state, daemon_package_version,
-    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
-    ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
-    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
-    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
-    handle_daemon_cluster_raft_vote_request, handle_daemon_connection,
-    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
+    daemon_advertised_endpoints_for_state, daemon_package_version, decode_cluster_join_invite,
+    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
+    expire_cluster_network_records_in_kv, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
+    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
+    handle_daemon_cluster_raft_append_request, handle_daemon_cluster_raft_vote_request,
+    handle_daemon_connection, handle_daemon_rollout_build_request, install_should_update_binary,
+    install_with_layout, invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
     managed_source_status, models_default_with_data_dir, normalize_model_provider,
     parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
@@ -55,6 +54,7 @@ use sinomo_runtime::kv::{InProcessKvStore, KvCompare, KvOp, KvRevision, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::daemon_lan_endpoint;
 use sinomo_runtime::node::main_daemon_capabilities;
+use sinomo_runtime::rollout::create_source_repo_bundle;
 use std::io::{BufRead, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

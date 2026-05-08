@@ -469,8 +469,7 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Status(options) => {
-            let backend = open_dfs_metadata_backend(&options)?;
-            let status = DfsOperatorInspector::new(&backend).status()?;
+            let status = inspect_dfs_status(dfs_metadata_root(options.metadata_root.clone())?)?;
             if options.json {
                 print_json("<dfs-status>", &status)?;
             } else {
@@ -490,9 +489,11 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             file_system_id,
             options,
         } => {
-            let backend = open_dfs_metadata_backend(&options)?;
-            let inspector = DfsOperatorInspector::new(&backend);
-            let Some(file_system) = inspector.file_system(&file_system_id)? else {
+            let Some(file_system) = inspect_dfs_file_system(
+                dfs_metadata_root(options.metadata_root.clone())?,
+                &file_system_id,
+            )?
+            else {
                 return Err(CliError::MissingArtifact {
                     artifact: format!("DFS filesystem {file_system_id}"),
                 });
@@ -514,9 +515,11 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Object { object_id, options } => {
-            let backend = open_dfs_metadata_backend(&options)?;
-            let inspector = DfsOperatorInspector::new(&backend);
-            let Some(object) = inspector.object(&object_id)? else {
+            let Some(object) = inspect_dfs_object(
+                dfs_metadata_root(options.metadata_root.clone())?,
+                &object_id,
+            )?
+            else {
                 return Err(CliError::MissingArtifact {
                     artifact: format!("DFS object {object_id}"),
                 });
@@ -556,9 +559,11 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Conflicts(options) => {
-            let backend = open_dfs_metadata_backend(&options.common)?;
-            let conflicts = DfsOperatorInspector::new(&backend)
-                .conflicts(options.file_system_id.as_ref(), options.object_id.as_ref())?;
+            let conflicts = inspect_dfs_conflicts(
+                dfs_metadata_root(options.common.metadata_root.clone())?,
+                options.file_system_id.as_ref(),
+                options.object_id.as_ref(),
+            )?;
             if options.common.json {
                 print_json("<dfs-conflicts>", &conflicts)?;
             } else if conflicts.is_empty() {
@@ -579,9 +584,11 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Repair(options) => {
-            let backend = open_dfs_metadata_backend(&options.common)?;
-            let repairs = DfsOperatorInspector::new(&backend)
-                .repairs(options.file_system_id.as_ref(), options.object_id.as_ref())?;
+            let repairs = inspect_dfs_repairs(
+                dfs_metadata_root(options.common.metadata_root.clone())?,
+                options.file_system_id.as_ref(),
+                options.object_id.as_ref(),
+            )?;
             if options.common.json {
                 print_json("<dfs-repair>", &repairs)?;
             } else if repairs.is_empty() {
@@ -611,12 +618,12 @@ pub(crate) fn run_dfs_expose_command(command: DfsExposeCliCommand) -> Result<(),
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
             let node_id = default_dfs_node_id();
-            let store = DfsExposeStore::new(dfs_expose_config_path(options.config, &data_dir));
-            let config = store.ensure_default(&data_dir.root(), node_id)?;
+            let config_path = dfs_expose_config_path(options.config, &data_dir);
+            let config = ensure_default_dfs_expose_config(&config_path, data_dir.root(), node_id)?;
             if options.json {
                 print_json("<dfs-expose-config>", &config)?;
             } else {
-                println!("DFS expose config: {}", store.path().display());
+                println!("DFS expose config: {}", config_path.display());
                 for entry in config.entries {
                     println!(
                         "{} {} -> {} owner={} writable={}",
@@ -633,8 +640,8 @@ pub(crate) fn run_dfs_expose_command(command: DfsExposeCliCommand) -> Result<(),
         DfsExposeCliCommand::List(options) => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
-            let store = DfsExposeStore::new(dfs_expose_config_path(options.config, &data_dir));
-            let config = store.load()?;
+            let config_path = dfs_expose_config_path(options.config, &data_dir);
+            let config = load_dfs_expose_config(&config_path)?;
             if options.json {
                 print_json("<dfs-expose-config>", &config)?;
             } else if config.entries.is_empty() {
@@ -657,50 +664,33 @@ pub(crate) fn run_dfs_expose_command(command: DfsExposeCliCommand) -> Result<(),
         DfsExposeCliCommand::Add(options) => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
-            let store = DfsExposeStore::new(dfs_expose_config_path(
-                options.common.config.clone(),
-                &data_dir,
-            ));
-            let mut config = store.load()?;
+            let config_path = dfs_expose_config_path(options.common.config.clone(), &data_dir);
             let node_id = options.node_id.unwrap_or_else(default_dfs_node_id);
-            let id = options.id.unwrap_or_else(|| {
-                format!(
-                    "expose-{}-{}",
-                    node_id,
-                    options.dfs_path.trim_matches('/').replace('/', "-")
-                )
-            });
-            config.entries.retain(|entry| entry.id != id);
-            config.entries.push(DfsExposeEntry {
-                id,
-                file_system_id: options.file_system_id,
-                dfs_path: options.dfs_path,
-                source_path: options.source,
-                owner_node_id: node_id,
-                writable: options.writable,
-                follow_symlinks: options.follow_symlinks,
-                created_at: OffsetDateTime::now_utc(),
-            });
-            store.save(&config)?;
+            let config = add_dfs_expose_entry(
+                &config_path,
+                DfsExposeAddRequest {
+                    id: options.id,
+                    file_system_id: options.file_system_id,
+                    dfs_path: options.dfs_path,
+                    source_path: options.source,
+                    owner_node_id: node_id,
+                    writable: options.writable,
+                    follow_symlinks: options.follow_symlinks,
+                    created_at: OffsetDateTime::now_utc(),
+                },
+            )?;
             if options.common.json {
                 print_json("<dfs-expose-config>", &config)?;
             } else {
-                println!("DFS expose config updated: {}", store.path().display());
+                println!("DFS expose config updated: {}", config_path.display());
             }
             Ok(())
         }
         DfsExposeCliCommand::Remove(options) => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
-            let store = DfsExposeStore::new(dfs_expose_config_path(
-                options.common.config.clone(),
-                &data_dir,
-            ));
-            let mut config = store.load()?;
-            let before = config.entries.len();
-            config.entries.retain(|entry| entry.id != options.id);
-            let removed = before != config.entries.len();
-            store.save(&config)?;
+            let config_path = dfs_expose_config_path(options.common.config.clone(), &data_dir);
+            let (_config, removed) = remove_dfs_expose_entry(&config_path, &options.id)?;
             if options.common.json {
                 print_json(
                     "<dfs-expose-remove>",
@@ -719,8 +709,10 @@ pub(crate) fn run_dfs_expose_command(command: DfsExposeCliCommand) -> Result<(),
 pub(crate) fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliError> {
     match command {
         DfsPinCliCommand::List(options) => {
-            let store = LocalDfsPinStore::new(dfs_pin_root(options.pin_root)?);
-            let pins = store.list_pins(options.file_system_id.as_ref())?;
+            let pins = list_local_dfs_pins(
+                dfs_pin_root(options.pin_root)?,
+                options.file_system_id.as_ref(),
+            )?;
             if options.json {
                 print_json("<dfs-pins>", &pins)?;
             } else if pins.is_empty() {
@@ -743,17 +735,18 @@ pub(crate) fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliEr
             Ok(())
         }
         DfsPinCliCommand::Add(options) => {
-            let store = LocalDfsPinStore::new(dfs_pin_root(options.pin_root)?);
             let node_id = options.node_id.unwrap_or_else(default_dfs_node_id);
-            let record = DfsPinRecord {
-                file_system_id: options.file_system_id,
-                path: options.path,
-                object_id: options.object_id,
-                pinned_by_node_id: node_id,
-                mode: options.mode,
-                created_at: OffsetDateTime::now_utc(),
-            };
-            store.put_pin(&record)?;
+            let record = add_local_dfs_pin(
+                dfs_pin_root(options.pin_root)?,
+                DfsPinAddRequest {
+                    file_system_id: options.file_system_id,
+                    path: options.path,
+                    object_id: options.object_id,
+                    pinned_by_node_id: node_id,
+                    mode: options.mode,
+                    created_at: OffsetDateTime::now_utc(),
+                },
+            )?;
             if options.json {
                 print_json("<dfs-pin>", &record)?;
             } else {
@@ -765,8 +758,8 @@ pub(crate) fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliEr
             Ok(())
         }
         DfsPinCliCommand::Remove(options) => {
-            let store = LocalDfsPinStore::new(dfs_pin_root(options.pin_root)?);
-            let removed = store.remove_pin(
+            let removed = remove_local_dfs_pin(
+                dfs_pin_root(options.pin_root)?,
                 &options.file_system_id,
                 &options.path,
                 options.node_id.as_ref(),
@@ -796,29 +789,12 @@ pub(crate) fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliEr
     }
 }
 
-pub(crate) fn open_dfs_metadata_backend(
-    options: &DfsCommonOptions,
-) -> Result<LocalJsonMetadataBackend, CliError> {
-    open_root_local_metadata_backend(dfs_metadata_root(options.metadata_root.clone())?)
-        .map_err(CliError::from)
-}
-
 pub(crate) fn dfs_metadata_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    if let Some(path) = explicit {
-        return Ok(path);
-    }
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_root_layout()?;
-    Ok(default_dfs_metadata_root(&data_dir))
+    resolve_dfs_metadata_root(explicit).map_err(Into::into)
 }
 
 pub(crate) fn dfs_pin_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    if let Some(path) = explicit {
-        return Ok(path);
-    }
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_root_layout()?;
-    Ok(default_dfs_pin_root(&data_dir))
+    resolve_dfs_pin_root(explicit).map_err(Into::into)
 }
 
 pub(crate) fn parse_dfs_file_system_id(value: &str) -> Result<DfsFileSystemId, CliError> {
@@ -828,7 +804,7 @@ pub(crate) fn parse_dfs_file_system_id(value: &str) -> Result<DfsFileSystemId, C
 }
 
 pub(crate) fn default_dfs_file_system_id() -> DfsFileSystemId {
-    DfsFileSystemId::from_legacy_named("sifs").expect("valid default DFS filesystem id")
+    sifs_file_system_id()
 }
 
 pub(crate) fn parse_dfs_object_id(value: &str) -> Result<DfsObjectId, CliError> {
@@ -857,9 +833,7 @@ pub(crate) fn default_dfs_node_id() -> NodeId {
     cluster_paths_from_defaults()
         .and_then(|paths| read_cluster_state(&paths))
         .map(|state| state.local_node_id)
-        .unwrap_or_else(|_| {
-            NodeId::from_legacy_named("node_local").expect("valid fallback node id")
-        })
+        .unwrap_or_else(|_| fallback_dfs_node_id())
 }
 
 pub(crate) fn non_empty_string(value: &str, field: &str) -> Result<String, CliError> {

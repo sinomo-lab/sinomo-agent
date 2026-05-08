@@ -148,19 +148,12 @@ pub(crate) fn models_list(options: ModelListOptions) -> Result<(), CliError> {
             .map(|value| value.to_string())
             .collect(),
     };
-    for provider in providers {
-        let models = if explicit_provider {
-            Some(provider_available_model_ids(&provider)?)
-        } else {
-            provider_available_model_ids(&provider).ok()
-        };
-        if let Some(models) = models {
-            if !models.is_empty() {
-                println!("{provider}:");
-                for model in models {
-                    println!("  {model}");
-                }
-            }
+    let catalogs = collect_provider_model_catalogs(providers, explicit_provider)
+        .map_err(CliError::LanguageModel)?;
+    for catalog in catalogs {
+        println!("{}:", catalog.provider);
+        for model in catalog.models {
+            println!("  {model}");
         }
     }
     Ok(())
@@ -175,24 +168,18 @@ pub(crate) fn models_default_with_data_dir(
     options: ModelDefaultOptions,
     data_dir: &SinomoDataDir,
 ) -> Result<(), CliError> {
-    data_dir.ensure_root_layout()?;
-    let model_paths = ModelPaths::new(data_dir);
-    model_paths.ensure()?;
-    let config = ModelConfig {
-        default_provider: Some(options.provider),
-        default_model: Some(options.model),
-    };
-    save_model_config(&model_paths.config, &config)?;
+    let update = write_default_model_config(data_dir, options.provider, options.model)
+        .map_err(CliError::LanguageModel)?;
 
     println!(
         "default provider: {}",
-        config.default_provider.as_deref().unwrap_or("")
+        update.config.default_provider.as_deref().unwrap_or("")
     );
     println!(
         "default model: {}",
-        config.default_model.as_deref().unwrap_or("")
+        update.config.default_model.as_deref().unwrap_or("")
     );
-    println!("config: {}", model_paths.config.display());
+    println!("config: {}", update.config_path.display());
     Ok(())
 }
 
@@ -216,14 +203,8 @@ pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {
             .collect(),
     };
 
-    let mut snapshots = Vec::new();
-    for provider in providers {
-        match provider_usage(&provider).map_err(CliError::LanguageModel) {
-            Ok(snapshot) => snapshots.push(snapshot),
-            Err(error) if explicit_provider => return Err(error),
-            Err(_) => {}
-        }
-    }
+    let snapshots =
+        collect_provider_usage(providers, explicit_provider).map_err(CliError::LanguageModel)?;
 
     if options.json {
         let value = if explicit_provider {
@@ -457,17 +438,6 @@ pub(crate) fn parse_trust_ring(value: &str) -> Result<TrustRing, CliError> {
         _ => Err(CliError::Parse {
             detail: format!("unknown trust ring `{value}`"),
         }),
-    }
-}
-
-pub(crate) fn job_status_label(status: &EvolutionJobStatus) -> &'static str {
-    match status {
-        EvolutionJobStatus::AwaitingApproval => "awaiting-approval",
-        EvolutionJobStatus::Approved => "approved",
-        EvolutionJobStatus::Rejected => "rejected",
-        EvolutionJobStatus::Created => "created",
-        EvolutionJobStatus::Failed => "failed",
-        _ => "in-progress",
     }
 }
 
