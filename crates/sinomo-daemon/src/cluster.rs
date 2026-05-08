@@ -658,7 +658,9 @@ impl ClusterNetworkMaintenance {
                 time::OffsetDateTime::now_utc(),
             );
             assign_local_node_public_keys(&cluster_paths, &mut state)?;
-            let _ = refresh_local_iroh_endpoints_from_disk(&cluster_paths, &mut state)?;
+            if refresh_local_iroh_endpoints_from_disk(&cluster_paths, &mut state)? {
+                sinomo_network::write_cluster_state(&cluster_paths, &state)?;
+            }
         }
 
         if publish_due {
