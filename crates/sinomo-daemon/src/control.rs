@@ -22,6 +22,7 @@ use std::time::Duration;
 pub const DAEMON_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
+pub const DAEMON_ACCEPT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn handle_authenticated_daemon_connection<F, E>(
     stream: &mut sinomo_network::DaemonControlStream,
@@ -151,6 +152,7 @@ pub fn run_daemon_control_loop(
     }
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = sinomo_network::DaemonControlListener::bind(&bind_address)?;
+    listener.set_nonblocking(true)?;
     println!("sinomo {label} listening on {bind_address}");
     if let Err(error) =
         start_daemon_iroh_proxy_if_clustered(&paths, &options, cluster.as_ref(), label)
@@ -196,14 +198,33 @@ pub fn run_daemon_control_loop(
             detail: source.to_string(),
         })?;
 
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
     loop {
+        if shutdown_rx.try_recv().is_ok() {
+            break;
+        }
         match listener.accept() {
-            Ok(Some(mut stream)) => match handle_daemon_connection(&mut stream, &paths) {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => eprintln!("sinomo {label} client error: {error}"),
-            },
-            Ok(None) => {}
+            Ok(Some(mut stream)) => {
+                let client_paths = paths.clone();
+                let client_label = label.to_string();
+                let client_shutdown_tx = shutdown_tx.clone();
+                thread::Builder::new()
+                    .name(format!("sinomo-{label}-client"))
+                    .spawn(
+                        move || match handle_daemon_connection(&mut stream, &client_paths) {
+                            Ok(true) => {
+                                let _ = client_shutdown_tx.send(());
+                            }
+                            Ok(false) => {}
+                            Err(error) => eprintln!("sinomo {client_label} client error: {error}"),
+                        },
+                    )
+                    .map_err(|source| DaemonError::Io {
+                        path: "spawn daemon client handler".to_string(),
+                        detail: source.to_string(),
+                    })?;
+            }
+            Ok(None) => thread::sleep(DAEMON_ACCEPT_IDLE_INTERVAL),
             Err(source) => {
                 return Err(DaemonError::Network {
                     address: bind_address.clone(),
@@ -588,4 +609,109 @@ fn daemon_status_response(paths: &DaemonPaths) -> Result<crate::DaemonStatus, Da
         status.rollout = read_rollout_status(&SelfRolloutPaths::new(data_dir))?;
     }
     Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DaemonRunOptions, sign_daemon_rpc_request_from_data_dir};
+    use sinomo_local::SinomoDataDir;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn daemon_control_loop_answers_status_while_idle_probe_connection_is_open() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-daemon-control-concurrent-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let port_listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let port = port_listener.local_addr().expect("local addr").port();
+        drop(port_listener);
+        let address = format!("127.0.0.1:{port}");
+        let paths = DaemonPaths::new(&data_dir);
+        let options = DaemonRunOptions {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let daemon = thread::spawn({
+            let paths = paths.clone();
+            move || run_daemon_control_loop(options, paths, "daemon-test", None)
+        });
+        let start = Instant::now();
+        while send_test_status_request(&data_dir, &address, Duration::from_millis(200)).is_err() {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "daemon did not become ready"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let idle_probe = TcpStream::connect(&address).expect("connect idle probe");
+        thread::sleep(Duration::from_millis(100));
+        let status_result =
+            send_test_status_request(&data_dir, &address, Duration::from_millis(500));
+        drop(idle_probe);
+        let _ = send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3));
+        daemon
+            .join()
+            .expect("daemon thread")
+            .expect("daemon exits cleanly");
+        std::fs::remove_dir_all(root).ok();
+
+        assert!(
+            status_result.is_ok(),
+            "status should not be blocked by an idle TCP probe: {status_result:?}"
+        );
+    }
+
+    fn send_test_status_request(
+        data_dir: &SinomoDataDir,
+        address: &str,
+        timeout: Duration,
+    ) -> Result<crate::DaemonStatus, DaemonError> {
+        let request = sinomo_network::ObjectRpcRequest::encode_body(
+            sinomo_network::DAEMON_STATUS_ROUTE,
+            sinomo_network::DAEMON_RPC_CATEGORY,
+            &(),
+        )?;
+        let response = send_test_rpc(data_dir, address, &request, timeout)?;
+        response.decode_body().map_err(DaemonError::from)
+    }
+
+    fn send_test_shutdown_request(
+        data_dir: &SinomoDataDir,
+        address: &str,
+        timeout: Duration,
+    ) -> Result<String, DaemonError> {
+        let request = sinomo_network::ObjectRpcRequest::encode_body(
+            sinomo_network::DAEMON_SHUTDOWN_ROUTE,
+            sinomo_network::DAEMON_RPC_CATEGORY,
+            &(),
+        )?;
+        let response = send_test_rpc(data_dir, address, &request, timeout)?;
+        response.decode_body().map_err(DaemonError::from)
+    }
+
+    fn send_test_rpc(
+        data_dir: &SinomoDataDir,
+        address: &str,
+        request: &sinomo_network::ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+        let signed = sign_daemon_rpc_request_from_data_dir(data_dir, request)?;
+        sinomo_network::send_daemon_rpc_raw(
+            address,
+            &daemon_rpc_command(&request.route),
+            Some(&signed),
+            request,
+            timeout,
+        )
+        .map_err(DaemonError::from)
+    }
 }

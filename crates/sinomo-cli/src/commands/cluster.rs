@@ -497,7 +497,7 @@ pub(crate) fn cluster_invite_with_paths(
     paths: &ClusterPaths,
 ) -> Result<RenderedClusterInvite, CliError> {
     paths.ensure()?;
-    let state = read_cluster_state_without_kv(paths)?;
+    let state = read_cluster_state(paths)?;
     if !cluster_raft_local_is_voter(&state) {
         return Err(cluster_invite_requires_voter_error(paths, &state));
     }

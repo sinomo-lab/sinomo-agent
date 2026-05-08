@@ -1968,6 +1968,18 @@ pub fn commit_cluster_kv_txn_with_quorum_response(
     state: &mut ClusterBootstrapState,
     txn: KvTxn,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError> {
+    if !sinomo_network::cluster_raft_local_is_voter(state) {
+        if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
+            return response;
+        }
+        return Err(DaemonError::ClusterReadOnly {
+            detail: format!(
+                "local daemon is not a Raft voter and could not forward to a voter ({} reachable voters, {} required)",
+                cluster_reachable_voter_count(paths, state),
+                sinomo_network::cluster_raft_quorum_size(state)
+            ),
+        });
+    }
     if !cluster_has_local_quorum(paths, state) {
         if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
             return response;
