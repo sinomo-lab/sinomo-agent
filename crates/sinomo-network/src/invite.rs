@@ -502,27 +502,12 @@ fn parse_invite_query(payload: &str) -> Result<Vec<(String, String)>, NetworkErr
 }
 
 fn encode_invite_channel(channel: &ClusterInvitationChannel) -> Result<String, NetworkError> {
-    let mut parts = encode_invite_endpoint_parts(&channel.endpoint)?;
-    parts.push(channel.node_public_key.clone());
+    let parts = vec![
+        query_enum(&channel.endpoint.transport)?,
+        channel.endpoint.address.clone(),
+        channel.node_public_key.clone(),
+    ];
     Ok(join_invite_parts(&parts))
-}
-
-fn encode_invite_endpoint_parts(
-    endpoint: &ClusterEndpointRecord,
-) -> Result<Vec<String>, NetworkError> {
-    Ok(vec![
-        endpoint.endpoint_id.to_string(),
-        endpoint.node_id.to_string(),
-        query_enum(&endpoint.transport)?,
-        endpoint.address.clone(),
-        query_enum(&endpoint.source)?,
-        query_enum(&endpoint.privacy)?,
-        endpoint.priority.to_string(),
-        endpoint
-            .last_observed_latency_ms
-            .map(|latency| latency.to_string())
-            .unwrap_or_default(),
-    ])
 }
 
 fn decode_invite_channel(value: &str) -> Result<ClusterInvitationChannel, NetworkError> {

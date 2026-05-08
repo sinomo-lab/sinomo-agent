@@ -213,7 +213,7 @@ fn lan_ip_filter_rejects_non_invitable_addresses() {
 }
 
 #[test]
-fn invite_channel_uri_preserves_full_iroh_endpoint_identity() {
+fn invite_channel_uri_uses_compact_iroh_endpoint() {
     let cluster_id = ClusterId::from_legacy_named("cluster_invite_full_iroh").expect("cluster");
     let node_id = NodeId::from_legacy_named("node_invite_full_iroh").expect("node");
     let endpoint = ClusterEndpointRecord {
@@ -250,8 +250,17 @@ fn invite_channel_uri_preserves_full_iroh_endpoint_identity() {
     let uri = encode_cluster_join_invite(&invite).expect("encode invite");
     let decoded = decode_cluster_join_invite(&uri).expect("decode invite");
 
+    assert!(!uri.contains(node_id.as_str()));
+    assert!(!uri.contains(endpoint.endpoint_id.as_str()));
     assert_eq!(decoded.communication_channels.len(), 1);
-    assert_eq!(decoded.communication_channels[0].endpoint, endpoint);
+    assert_eq!(
+        decoded.communication_channels[0].endpoint.transport,
+        endpoint.transport
+    );
+    assert_eq!(
+        decoded.communication_channels[0].endpoint.address,
+        endpoint.address
+    );
     assert_eq!(decoded.communication_channels[0].node_public_key, "node-pk");
 }
 
