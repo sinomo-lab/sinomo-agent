@@ -110,6 +110,7 @@ use sinomo_runtime::daemon::{
     reconcile_cluster_join_with_introducers as daemon_reconcile_cluster_join_with_introducers,
     register_daemon_cluster_node as daemon_register_daemon_cluster_node,
     remove_boot_entry as daemon_remove_boot_entry,
+    remove_cluster_members as daemon_remove_cluster_members,
     remove_local_cluster_state as daemon_remove_local_cluster_state,
     rollout_target_platform_matches_local as daemon_rollout_target_platform_matches_local,
     run_daemon_control_loop as daemon_run_daemon_control_loop,

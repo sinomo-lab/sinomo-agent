@@ -19,7 +19,7 @@ use sinomo_core::{
 };
 use sinomo_kv::{
     KvCommand, KvEntry, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesResponse,
-    RaftRequestVoteRequest, RaftRequestVoteResponse,
+    RaftRequestVoteRequest, RaftRequestVoteResponse, cluster_member_key,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -99,6 +99,11 @@ pub struct ClusterRaftRoleUpdate {
     pub role: ClusterMemberRole,
     pub state: ClusterMemberState,
     pub changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterMemberRemoval {
+    pub removed: Vec<ClusterMemberRecord>,
 }
 
 pub fn cluster_paths_from_daemon_paths(paths: &DaemonPaths) -> Result<ClusterPaths, DaemonError> {
@@ -1341,6 +1346,80 @@ pub fn update_cluster_raft_role(
         sinomo_network::write_cluster_state(paths, &state)?;
     }
     Ok(update)
+}
+
+pub fn remove_cluster_members(
+    paths: &ClusterPaths,
+    node_ids: Vec<NodeId>,
+    now: OffsetDateTime,
+) -> Result<ClusterMemberRemoval, DaemonError> {
+    let mut state = read_local_cluster_state(paths)?;
+    let requested = node_ids
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if requested.is_empty() {
+        return Err(DaemonError::Parse {
+            detail: "no cluster members were specified".to_string(),
+        });
+    }
+    let local_shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+    if requested.contains(&state.local_node_id) || requested.contains(&local_shadow_node_id) {
+        return Err(DaemonError::Parse {
+            detail: "use `sinomo cluster leave` to remove the local daemon members".to_string(),
+        });
+    }
+
+    let mut removed = Vec::new();
+    for node_id in &requested {
+        let Some(member) = state
+            .members
+            .iter()
+            .find(|member| &member.node_id == node_id)
+            .cloned()
+        else {
+            return Err(DaemonError::Parse {
+                detail: format!("cluster member `{node_id}` was not found"),
+            });
+        };
+        if sinomo_network::cluster_raft_node_is_voter(&state, &member.node_id) {
+            return Err(DaemonError::ClusterReadOnly {
+                detail: format!(
+                    "cluster member `{}` is a voter; change its raft role before removal",
+                    member.node_id
+                ),
+            });
+        }
+        removed.push(member);
+    }
+
+    state
+        .members
+        .retain(|member| !requested.contains(&member.node_id));
+    state.updated_at = now;
+    sync_cluster_state_to_kv(paths, &state)?;
+    commit_cluster_kv_txn_with_quorum(paths, &mut state, cluster_member_removal_txn(&removed)?)?;
+    sinomo_network::write_cluster_state(paths, &state)?;
+    Ok(ClusterMemberRemoval { removed })
+}
+
+fn cluster_member_removal_txn(members: &[ClusterMemberRecord]) -> Result<KvTxn, DaemonError> {
+    let mut success = Vec::new();
+    for member in members {
+        success.push(KvOp::Delete {
+            key: cluster_member_key(&member.node_id),
+        });
+        success.push(KvOp::Delete {
+            key: sinomo_network::cluster_capability_policy_key(&member.node_id),
+        });
+        success.push(KvOp::DeletePrefix {
+            prefix: sinomo_network::cluster_endpoint_prefix(&member.node_id),
+        });
+    }
+    Ok(KvTxn {
+        compares: Vec::new(),
+        success,
+        failure: Vec::new(),
+    })
 }
 
 pub fn cluster_peer_members(

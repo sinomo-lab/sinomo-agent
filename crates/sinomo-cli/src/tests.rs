@@ -1,22 +1,23 @@
 use super::{
     CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
     ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRaftRoleOptions,
-    ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand,
-    DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus,
-    EvolutionPaths, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
-    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName, RolloutCliCommand,
-    RolloutMainActivation, RolloutOptions, SelfRolloutPaths, UninstallOptions,
-    advertised_peer_route_targets, apply_cluster_node_role, apply_cluster_raft_role,
-    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
-    cli_command_requires_cluster_state, cluster_connectivity_sync_ops, cluster_doctor_findings,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_publish_targets,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
-    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
-    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
-    daemon_package_version, decode_cluster_join_invite, elect_cluster_raft_leader,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
+    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand,
+    EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions, InteractionModel,
+    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    ModelBackedInteractionHandler, ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions,
+    ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
+    UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    apply_cluster_raft_role, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
+    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
+    cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
+    daemon_advertised_endpoints_for_state, daemon_package_version, daemon_remove_cluster_members,
+    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv,
     handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
     handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
     handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
@@ -1349,6 +1350,20 @@ fn cluster_parser_accepts_init_and_join_options() {
             role: ClusterMemberRole::Voter,
         })
     );
+    assert_eq!(
+        parse_cluster_command(&[
+            "remove".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d7".to_string(),
+        ])
+        .expect("cluster remove"),
+        ClusterCliCommand::Remove(ClusterRemoveOptions {
+            node_ids: vec![
+                NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("node"),
+                NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d7").expect("node"),
+            ],
+        })
+    );
 }
 
 #[test]
@@ -1481,6 +1496,76 @@ fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
     let added_error =
         sync_cluster_state_to_kv(&paths, &direct_voter_state).expect_err("reject direct voter add");
     assert!(matches!(added_error, CliError::ClusterReadOnly { .. }));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_remove_deletes_non_voter_members_from_state_and_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-remove-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("cluster_remove").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("node_remove_host").expect("node")),
+            name: "remove cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let mut state = read_cluster_state(&paths).expect("cluster state");
+    let learner_id = NodeId::from_legacy_named("node_remove_learner").expect("learner");
+    let non_voter_id = NodeId::from_legacy_named("node_remove_non_voter").expect("non voter");
+    state.members.push(ClusterMemberRecord::pending_learner(
+        state.cluster_id.clone(),
+        learner_id.clone(),
+        "learner",
+        "pk_learner",
+        OffsetDateTime::now_utc(),
+    ));
+    state.members.push(ClusterMemberRecord::local_non_voting(
+        state.cluster_id.clone(),
+        non_voter_id.clone(),
+        "non voter",
+        "pk_non_voter",
+        OffsetDateTime::now_utc(),
+    ));
+    sync_cluster_state_to_kv(&paths, &state).expect("sync state");
+    super::daemon_write_local_cluster_state(&paths, &state).expect("write state");
+
+    let removal = daemon_remove_cluster_members(
+        &paths,
+        vec![learner_id.clone(), non_voter_id.clone()],
+        OffsetDateTime::now_utc(),
+    )
+    .expect("remove members");
+
+    assert_eq!(removal.removed.len(), 2);
+    let state = read_cluster_state(&paths).expect("updated state");
+    assert!(
+        !state
+            .members
+            .iter()
+            .any(|member| member.node_id == learner_id)
+    );
+    assert!(
+        !state
+            .members
+            .iter()
+            .any(|member| member.node_id == non_voter_id)
+    );
+    let kv_members = read_cluster_members_from_kv(&paths).expect("kv members");
+    assert!(!kv_members.iter().any(|member| member.node_id == learner_id));
+    assert!(
+        !kv_members
+            .iter()
+            .any(|member| member.node_id == non_voter_id)
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

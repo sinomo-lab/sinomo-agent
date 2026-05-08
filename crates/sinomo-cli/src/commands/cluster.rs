@@ -46,6 +46,7 @@ pub(crate) enum ClusterCliCommand {
     Join(ClusterJoinOptions),
     Role(ClusterRoleOptions),
     RaftRole(ClusterRaftRoleOptions),
+    Remove(ClusterRemoveOptions),
     Status,
     Health,
     Doctor,
@@ -97,6 +98,11 @@ pub(crate) struct ClusterRaftRoleOptions {
     pub(crate) role: ClusterMemberRole,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterRemoveOptions {
+    pub(crate) node_ids: Vec<NodeId>,
+}
+
 impl Default for ClusterInviteOptions {
     fn default() -> Self {
         Self {
@@ -131,6 +137,9 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         Some((command, rest)) if command == "promote" => Ok(ClusterCliCommand::RaftRole(
             parse_cluster_promote_options(rest)?,
         )),
+        Some((command, rest)) if matches!(command.as_str(), "remove" | "rm") => Ok(
+            ClusterCliCommand::Remove(parse_cluster_remove_options(rest)?),
+        ),
         Some((command, [])) if command == "status" => Ok(ClusterCliCommand::Status),
         Some((command, [])) if matches!(command.as_str(), "health" | "nodes") => {
             Ok(ClusterCliCommand::Health)
@@ -314,6 +323,23 @@ pub(crate) fn parse_cluster_promote_options(
     }
 }
 
+pub(crate) fn parse_cluster_remove_options(
+    args: &[String],
+) -> Result<ClusterRemoveOptions, CliError> {
+    if args.is_empty() {
+        return Err(CliError::Usage);
+    }
+    let mut node_ids = Vec::with_capacity(args.len());
+    for node_id in args {
+        node_ids.push(
+            NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
+                detail: format!("invalid node id `{node_id}`: {source}"),
+            })?,
+        );
+    }
+    Ok(ClusterRemoveOptions { node_ids })
+}
+
 pub(crate) fn parse_cluster_node_role(role: &str) -> Result<ClusterNodeRole, CliError> {
     match role.trim().to_ascii_lowercase().as_str() {
         "workstation" => Ok(ClusterNodeRole::Workstation),
@@ -379,6 +405,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Role(options) => cluster_role(options),
         ClusterCliCommand::RaftRole(options) => cluster_raft_role(options),
+        ClusterCliCommand::Remove(options) => cluster_remove(options),
         ClusterCliCommand::Status => cluster_status(),
         ClusterCliCommand::Health => cluster_health(),
         ClusterCliCommand::Doctor => cluster_doctor(),
@@ -938,6 +965,21 @@ pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), C
         format_member_role(&update.role),
         format_member_state(&update.state)
     );
+    Ok(())
+}
+
+pub(crate) fn cluster_remove(options: ClusterRemoveOptions) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    let removal =
+        daemon_remove_cluster_members(&paths, options.node_ids.clone(), OffsetDateTime::now_utc())?;
+    for member in removal.removed {
+        println!(
+            "cluster member {} removed: {} {}",
+            member.node_id,
+            format_node_role(&member.node_role),
+            format_member_state(&member.state)
+        );
+    }
     Ok(())
 }
 
