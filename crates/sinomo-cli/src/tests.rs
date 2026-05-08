@@ -265,6 +265,13 @@ fn install_parser_accepts_custom_daemon_ports() {
 }
 
 #[test]
+fn cluster_join_timeout_covers_registration_work_and_stays_capped() {
+    assert!(super::DAEMON_JOIN_TIMEOUT >= Duration::from_secs(3));
+    assert!(super::DAEMON_JOIN_TIMEOUT <= Duration::from_secs(10));
+    assert!(super::IROH_DAEMON_JOIN_TIMEOUT <= Duration::from_secs(10));
+}
+
+#[test]
 fn cluster_sync_targets_skip_remote_local_only_endpoints() {
     let cluster_id = ClusterId::from_legacy_named("cluster_sync_targets").expect("cluster");
     let local_node = NodeId::from_legacy_named("node_sync_local").expect("node");
