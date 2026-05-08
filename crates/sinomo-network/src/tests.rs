@@ -602,6 +602,66 @@ fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
 }
 
 #[test]
+fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-raft-append-compacted-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_raft_append_compacted").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_raft_append_compacted").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "raft append compacted",
+        node_id.clone(),
+        "raft node",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+
+    for index in 0..130 {
+        append_cluster_raft_command(
+            &paths,
+            &node_id,
+            KvCommand::Op(KvOp::Put {
+                key: format!("/raft/compacted/{index:03}"),
+                value: index.to_string().into_bytes(),
+                lease_id: None,
+            }),
+        )
+        .expect("append command");
+    }
+    let mut node = open_cluster_raft_kv_node(&paths, &node_id).expect("open raft node");
+    node.save_snapshot().expect("compact raft node");
+    assert!(node.snapshot_index() > 0);
+    assert!(node.log().is_empty());
+    let snapshot_index = node.snapshot_index();
+    let last_log_index = node.last_log_index();
+    drop(node);
+
+    let heartbeat = build_cluster_raft_append_request_from_next_index(
+        &paths,
+        &state,
+        last_log_index.saturating_add(1),
+    )
+    .expect("build heartbeat");
+    let catchup = build_cluster_raft_append_request_from_next_index(&paths, &state, snapshot_index)
+        .expect("build catchup");
+
+    assert!(heartbeat.snapshot.is_none());
+    assert!(heartbeat.append.entries.is_empty());
+    assert_eq!(heartbeat.append.prev_log_index, snapshot_index);
+    assert!(catchup.snapshot.is_some());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_storage_syncs_members_and_node_status_to_kv() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-storage-{}",

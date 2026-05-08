@@ -1470,8 +1470,7 @@ pub fn build_cluster_raft_append_request_from_next_index(
 ) -> Result<ClusterRaftAppendRequest, NetworkError> {
     let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
     let prev_log_index = next_index.saturating_sub(1).min(node.last_log_index());
-    let include_snapshot = node.log().is_empty()
-        || (node.snapshot_index() > 0 && prev_log_index <= node.snapshot_index());
+    let include_snapshot = node.snapshot_index() > 0 && prev_log_index < node.snapshot_index();
     let (snapshot, prev_log_index, entries) = if include_snapshot {
         let snapshot = RaftSnapshot {
             last_included_index: node.applied_index(),
