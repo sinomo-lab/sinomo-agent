@@ -729,7 +729,11 @@ impl ClusterNetworkMaintenance {
             return Ok(());
         }
 
-        let mut state = sinomo_network::read_cluster_state(&cluster_paths)?;
+        let mut state = if publish_due || probe_due {
+            sinomo_network::read_cluster_state(&cluster_paths)?
+        } else {
+            sinomo_network::read_cluster_state_without_kv(&cluster_paths)?
+        };
         let state_before_maintenance = state.clone();
         let mut discovered = false;
 
