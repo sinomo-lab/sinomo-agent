@@ -716,11 +716,6 @@ impl ClusterNetworkMaintenance {
                     &state.local_node_id,
                     records,
                 );
-                let _ = expire_cluster_network_records_in_kv(
-                    &cluster_paths,
-                    &state,
-                    time::OffsetDateTime::now_utc(),
-                );
             }
         }
 

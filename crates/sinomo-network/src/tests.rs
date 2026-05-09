@@ -1226,6 +1226,55 @@ fn cluster_network_records_publish_overwrite_and_expire() {
     let graph = read_cluster_connectivity_graph_from_kv(&paths).expect("graph");
     assert_eq!(graph.len(), 1);
     assert_eq!(graph[0].state, ClusterConnectivityState::Healthy);
+
+    sync_cluster_network_info_to_kv(
+        &paths,
+        ClusterNetworkInfoRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_b.clone(),
+            environment_id: "env_expired".to_string(),
+            observed_addresses: vec!["203.0.113.20".to_string()],
+            endpoints: Vec::new(),
+            observed_at: now - time::Duration::seconds(60),
+            expires_at: now - time::Duration::seconds(1),
+        },
+    )
+    .expect("sync expired network info");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &node_b,
+        vec![ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: node_b.clone(),
+            target_node_id: node_a.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(11),
+            consecutive_failures: 0,
+            last_success_at: Some("expired".to_string()),
+            last_failure_at: None,
+            observed_at: now - time::Duration::seconds(60),
+            expires_at: now - time::Duration::seconds(1),
+        }],
+    )
+    .expect("sync expired connectivity");
+    assert_eq!(
+        read_cluster_network_info_from_kv(&paths)
+            .expect("read live infos")
+            .len(),
+        1,
+        "expired network info should be ignored by read views"
+    );
+    assert_eq!(
+        read_cluster_connectivity_graph_from_kv(&paths)
+            .expect("read live graph")
+            .len(),
+        1,
+        "expired connectivity should be ignored by read views"
+    );
+
     let partial_probe_ops =
         cluster_connectivity_sync_ops(&paths, &node_a, &[]).expect("partial probe ops");
     assert!(

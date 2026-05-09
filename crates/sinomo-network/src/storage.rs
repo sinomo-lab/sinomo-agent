@@ -1274,9 +1274,13 @@ pub fn read_cluster_network_info_from_kv(
         return Ok(Vec::new());
     }
     let store = read_cluster_kv_snapshot_store(paths)?;
+    let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterNetworkInfoRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/network/info/") {
-        records.push(entry.decode()?);
+        let record: ClusterNetworkInfoRecord = entry.decode()?;
+        if cluster_network_record_live(record.expires_at, now) {
+            records.push(record);
+        }
     }
     records.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(records)
@@ -1289,9 +1293,13 @@ pub fn read_cluster_connectivity_graph_from_kv(
         return Ok(Vec::new());
     }
     let store = read_cluster_kv_snapshot_store(paths)?;
+    let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
     for entry in store.range_prefix("/cluster/network/connectivity/") {
-        records.push(entry.decode()?);
+        let record: ClusterConnectivityRecord = entry.decode()?;
+        if cluster_network_record_live(record.expires_at, now) {
+            records.push(record);
+        }
     }
     records.sort_by(|left, right| {
         (
@@ -2049,6 +2057,10 @@ pub fn expire_cluster_network_record_ops(
 
 fn cluster_network_record_expired(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {
     expires_at + time::Duration::seconds(CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS) <= now
+}
+
+fn cluster_network_record_live(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {
+    expires_at > now
 }
 
 fn cluster_connectivity_stable_eq(
