@@ -8,6 +8,7 @@ use crate::{
 use sinomo_kv::cluster_member_key;
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
+const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterPaths {
@@ -1992,7 +1993,7 @@ pub fn cluster_connectivity_sync_ops(
 
     let mut ops = Vec::new();
     for (key, record) in &existing {
-        if !incoming.contains_key(key) && record.expires_at <= now {
+        if !incoming.contains_key(key) && cluster_network_record_expired(record.expires_at, now) {
             ops.push(KvOp::Delete { key: key.clone() });
         }
     }
@@ -2022,7 +2023,7 @@ pub fn expire_cluster_network_record_ops(
         if cluster_node_is_local_process(state, &record.node_id) {
             continue;
         }
-        if record.expires_at <= now {
+        if cluster_network_record_expired(record.expires_at, now) {
             ops.push(KvOp::Delete { key: entry.key });
         }
     }
@@ -2033,11 +2034,15 @@ pub fn expire_cluster_network_record_ops(
         if record.source_node_id == state.local_node_id {
             continue;
         }
-        if record.expires_at <= now {
+        if cluster_network_record_expired(record.expires_at, now) {
             ops.push(KvOp::Delete { key: entry.key });
         }
     }
     Ok(ops)
+}
+
+fn cluster_network_record_expired(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {
+    expires_at + time::Duration::seconds(CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS) <= now
 }
 
 fn cluster_connectivity_stable_eq(
