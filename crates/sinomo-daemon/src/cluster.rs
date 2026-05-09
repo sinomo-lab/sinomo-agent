@@ -1428,10 +1428,21 @@ fn current_cluster_kv_store(
         let leader = targets.remove(position);
         targets.insert(0, leader);
     }
+    let refresh_budget = if snapshots.is_empty() {
+        DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT
+    } else {
+        DAEMON_CLUSTER_RPC_TIMEOUT
+    };
+    let deadline = Instant::now() + refresh_budget;
     for endpoint in targets {
-        if let Ok(snapshot) =
-            fetch_cluster_kv_snapshot_from_endpoint(&endpoint, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT)
-        {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let snapshot_timeout = remaining.min(DAEMON_CLUSTER_RPC_TIMEOUT);
+        if let Ok(snapshot) = fetch_cluster_kv_snapshot_from_endpoint(&endpoint, snapshot_timeout) {
             snapshots.push(snapshot);
         }
     }
@@ -1996,16 +2007,27 @@ pub fn commit_cluster_raft_command_with_quorum(
     }
     let quorum_size = sinomo_network::cluster_raft_quorum_size(state);
     let mut failures = Vec::new();
+    let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
     for endpoint in sinomo_network::prefer_bounded_daemon_command_targets(
         sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
     ) {
         if voter_acks.len() >= quorum_size {
             break;
         }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            failures.push(format!(
+                "raft command did not reach quorum before {}ms replication budget",
+                DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT.as_millis()
+            ));
+            break;
+        }
         if !sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id) {
             continue;
         }
-        match replicate_cluster_raft_to_endpoint(paths, state, &endpoint) {
+        match replicate_cluster_raft_to_endpoint_with_timeout(paths, state, &endpoint, remaining) {
             Ok(response) if response.accepted => {
                 voter_acks.insert(endpoint.node_id.clone());
                 sinomo_network::merge_cluster_state_from_peer(state, response.state);
@@ -2247,16 +2269,40 @@ pub fn replicate_cluster_raft_to_endpoint(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
 ) -> Result<ClusterRaftAppendResponse, DaemonError> {
+    replicate_cluster_raft_to_endpoint_with_timeout(
+        paths,
+        state,
+        endpoint,
+        DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT,
+    )
+}
+
+fn replicate_cluster_raft_to_endpoint_with_timeout(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<ClusterRaftAppendResponse, DaemonError> {
+    let deadline = Instant::now() + timeout;
     let mut next_index = sinomo_network::open_cluster_raft_kv_node(paths, &state.local_node_id)?
         .last_log_index()
         .saturating_add(1);
     let mut last_response = None;
     for _ in 0..CLUSTER_RAFT_APPEND_MAX_ATTEMPTS {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
         let request = sinomo_network::build_cluster_raft_append_request_from_next_index(
             paths, state, next_index,
         )?;
-        let response =
-            send_cluster_raft_append(endpoint, &request, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT)?;
+        let attempt_timeout = match endpoint.transport {
+            ClusterTransportKind::Iroh => remaining,
+            _ => remaining.min(DAEMON_CLUSTER_RPC_TIMEOUT),
+        };
+        let response = send_cluster_raft_append(endpoint, &request, attempt_timeout)?;
         if response.accepted {
             return Ok(response);
         }
@@ -2272,7 +2318,10 @@ pub fn replicate_cluster_raft_to_endpoint(
     }
     Ok(last_response.unwrap_or_else(|| ClusterRaftAppendResponse {
         accepted: false,
-        detail: "raft append was not attempted".to_string(),
+        detail: format!(
+            "raft append did not complete before {}ms catch-up budget",
+            timeout.as_millis()
+        ),
         state: state.clone(),
         append: RaftAppendEntriesResponse {
             term: 0,

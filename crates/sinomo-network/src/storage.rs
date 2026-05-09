@@ -1574,6 +1574,7 @@ pub fn cluster_sync_targets_with_connectivity(
         (
             score,
             cluster_daemon_command_transport_rank(endpoint),
+            cluster_daemon_command_address_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
         )
@@ -1602,36 +1603,21 @@ pub fn prefer_bounded_daemon_command_targets(
 ) -> Vec<ClusterEndpointRecord> {
     let endpoints: Vec<_> = endpoints.into_iter().collect();
     let mut selected = Vec::new();
-    let mut nodes_with_bounded_transport = BTreeSet::new();
-    let mut nodes_with_iroh_fallback = BTreeSet::new();
+    let mut selected_endpoint_ids = BTreeSet::new();
+    let mut nodes_with_primary = BTreeSet::new();
     for endpoint in &endpoints {
-        if cluster_daemon_command_transport_rank(endpoint) == 0 {
-            nodes_with_bounded_transport.insert(endpoint.node_id.clone());
+        if cluster_daemon_command_transport_rank(endpoint) <= 1
+            && nodes_with_primary.insert(endpoint.node_id.clone())
+        {
+            selected_endpoint_ids.insert(endpoint.endpoint_id.clone());
+            selected.push(endpoint.clone());
         }
     }
     for endpoint in endpoints {
-        if cluster_daemon_command_transport_rank(&endpoint) == 0 {
-            selected.push(endpoint);
-            continue;
-        }
-        if endpoint.transport == ClusterTransportKind::Iroh {
-            if nodes_with_iroh_fallback.insert(endpoint.node_id.clone()) {
-                selected.push(endpoint);
-            }
-            continue;
-        }
-        if !nodes_with_bounded_transport.contains(&endpoint.node_id) {
+        if selected_endpoint_ids.insert(endpoint.endpoint_id.clone()) {
             selected.push(endpoint);
         }
     }
-    selected.sort_by_key(|endpoint| {
-        (
-            endpoint.node_id.clone(),
-            cluster_daemon_command_transport_rank(endpoint),
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
     selected
 }
 
@@ -1640,6 +1626,24 @@ pub fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => 0,
         ClusterTransportKind::Iroh => 1,
         _ => 2,
+    }
+}
+
+fn cluster_daemon_command_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    if !matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) {
+        return 1;
+    }
+    let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
+        return 1;
+    };
+    match address.ip() {
+        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 2,
+        IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 2,
+        ip if ip.is_loopback() || ip.is_unspecified() => 3,
+        _ => 0,
     }
 }
 

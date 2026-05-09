@@ -41,10 +41,6 @@ pub fn send_daemon_rpc_to_endpoint(
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
-    let timeout = match endpoint.transport {
-        ClusterTransportKind::Iroh => timeout.max(Duration::from_secs(5)),
-        _ => timeout,
-    };
     sinomo_network::send_daemon_rpc_to_cluster_endpoint(
         endpoint,
         &daemon_rpc_command(&request.route),
