@@ -2148,11 +2148,16 @@ fn fan_out_committed_cluster_raft_command_blocking(
     state: &ClusterBootstrapState,
     snapshot: &KvSnapshot,
 ) {
+    let mut replicated_nodes = std::collections::BTreeSet::new();
     for endpoint in sinomo_network::prefer_bounded_daemon_command_targets(
         sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
     ) {
+        if replicated_nodes.contains(&endpoint.node_id) {
+            continue;
+        }
         if let Ok(response) = replicate_cluster_raft_to_endpoint(paths, state, &endpoint) {
             if response.accepted {
+                replicated_nodes.insert(endpoint.node_id.clone());
                 let _ = send_cluster_kv_watch_events(
                     &endpoint,
                     &ClusterKvWatchEventsRequest {
