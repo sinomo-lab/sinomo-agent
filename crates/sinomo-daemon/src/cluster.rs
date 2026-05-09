@@ -642,7 +642,7 @@ impl ClusterNetworkMaintenance {
             return Ok(());
         }
 
-        let mut state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+        let mut state = sinomo_network::read_cluster_state(&cluster_paths)?;
         let state_before_maintenance = state.clone();
         let mut discovered = false;
 
@@ -920,7 +920,7 @@ pub fn refresh_daemon_node_status_in_kv(
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let rollout_paths = SelfRolloutPaths::new(data_dir);
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let state = sinomo_network::read_cluster_state(&cluster_paths)?;
     let network_info = sinomo_network::build_cluster_network_info_record(
         &state,
         &cluster.node_id,
@@ -1062,7 +1062,7 @@ pub fn read_local_cluster_state(
 pub fn read_local_cluster_state_without_kv(
     paths: &ClusterPaths,
 ) -> Result<ClusterBootstrapState, DaemonError> {
-    let mut state = sinomo_network::read_cluster_state_without_kv(paths)?;
+    let mut state = sinomo_network::read_cluster_state(paths)?;
     prepare_local_cluster_state(paths, &mut state)?;
     Ok(state)
 }
@@ -1862,7 +1862,7 @@ pub fn put_cluster_kv_control_record<T: Serialize>(
     {
         return Ok(());
     }
-    let mut state = sinomo_network::read_cluster_state_without_kv(paths)?;
+    let mut state = sinomo_network::read_cluster_state(paths)?;
     if &state.local_node_id != node_id {
         return Err(DaemonError::ClusterReadOnly {
             detail: format!(
@@ -1890,7 +1890,7 @@ pub fn sync_cluster_node_status_to_kv(
     if sinomo_network::stored_cluster_node_status_matches(paths, &status)? {
         return Ok(None);
     }
-    let mut state = sinomo_network::read_cluster_state_without_kv(paths)?;
+    let mut state = sinomo_network::read_cluster_state(paths)?;
     let mut success = vec![KvOp::put_serde(
         sinomo_network::cluster_node_status_key(&status.node_id),
         &status,
@@ -1922,7 +1922,7 @@ pub fn sync_cluster_network_info_to_kv(
     if sinomo_network::stored_cluster_network_info_matches(paths, &info)? {
         return Ok(None);
     }
-    let mut state = sinomo_network::read_cluster_state_without_kv(paths)?;
+    let mut state = sinomo_network::read_cluster_state(paths)?;
     commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
@@ -1948,7 +1948,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
     if success.is_empty() {
         return Ok(None);
     }
-    let mut state = sinomo_network::read_cluster_state_without_kv(paths)?;
+    let mut state = sinomo_network::read_cluster_state(paths)?;
     commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
