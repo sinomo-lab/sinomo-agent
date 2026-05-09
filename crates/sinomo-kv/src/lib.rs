@@ -1408,9 +1408,9 @@ impl DurableRaftKvNode {
     pub fn open(node_id: NodeId, paths: KvWalPaths) -> Result<Self, KvError> {
         paths.ensure()?;
         let lock = open_node_lock(&paths)?;
-        lock.lock_exclusive().map_err(|source| KvError::Io {
+        lock.try_lock_exclusive().map_err(|source| KvError::Io {
             path: paths.lock.display().to_string(),
-            detail: source.to_string(),
+            detail: format!("raft node is busy: {source}"),
         })?;
         let snapshot = read_optional_object::<RaftSnapshot>(&paths.snapshot)?;
         let hard_state: RaftHardState =
