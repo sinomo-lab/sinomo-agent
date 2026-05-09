@@ -2104,6 +2104,7 @@ pub fn commit_cluster_kv_txn_with_quorum_response(
     state: &mut ClusterBootstrapState,
     txn: KvTxn,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError> {
+    let _ = current_cluster_kv_store(paths, state);
     if !sinomo_network::cluster_raft_local_is_voter(state) {
         if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
             return response;
