@@ -1031,7 +1031,7 @@ pub fn refresh_daemon_node_status_in_kv(
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let rollout_paths = SelfRolloutPaths::new(data_dir);
-    let state = sinomo_network::read_cluster_state(&cluster_paths)?;
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
     let network_info = sinomo_network::build_cluster_network_info_record(
         &state,
         &cluster.node_id,
