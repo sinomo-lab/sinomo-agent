@@ -723,7 +723,9 @@ pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, N
                     "warning: ignoring unreadable local cluster raft view and using materialized snapshot: {error}"
                 );
                 let snapshot = read_cluster_kv_snapshot(paths)?;
-                quarantine_unreadable_cluster_raft_view(paths, &state.local_node_id);
+                if !cluster_raft_error_is_busy(&error) {
+                    quarantine_unreadable_cluster_raft_view(paths, &state.local_node_id);
+                }
                 return Ok(InProcessKvStore::restore(snapshot));
             }
             Err(error) => {
@@ -774,6 +776,10 @@ fn quarantine_unreadable_cluster_raft_view(paths: &ClusterPaths, node_id: &NodeI
         }
         return;
     }
+}
+
+fn cluster_raft_error_is_busy(error: &NetworkError) -> bool {
+    matches!(error, NetworkError::Kv(KvError::Busy { .. }))
 }
 
 pub fn cluster_raft_wal_paths(paths: &ClusterPaths, node_id: &NodeId) -> KvWalPaths {

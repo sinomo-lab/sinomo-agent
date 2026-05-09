@@ -1408,9 +1408,17 @@ impl DurableRaftKvNode {
     pub fn open(node_id: NodeId, paths: KvWalPaths) -> Result<Self, KvError> {
         paths.ensure()?;
         let lock = open_node_lock(&paths)?;
-        lock.try_lock_exclusive().map_err(|source| KvError::Io {
-            path: paths.lock.display().to_string(),
-            detail: format!("raft node is busy: {source}"),
+        lock.try_lock_exclusive().map_err(|source| {
+            if source.kind() == std::io::ErrorKind::WouldBlock {
+                KvError::Busy {
+                    path: paths.lock.display().to_string(),
+                }
+            } else {
+                KvError::Io {
+                    path: paths.lock.display().to_string(),
+                    detail: source.to_string(),
+                }
+            }
         })?;
         let snapshot = read_optional_object::<RaftSnapshot>(&paths.snapshot)?;
         let hard_state: RaftHardState =
@@ -1846,6 +1854,8 @@ pub enum KvError {
     Serialization { detail: String },
     #[error("filesystem error at {path}: {detail}")]
     Io { path: String, detail: String },
+    #[error("raft node is busy at {path}")]
+    Busy { path: String },
     #[error("raft cluster requires at least one voter")]
     NoVoters,
     #[error("unknown replicated node: {node_id}")]
