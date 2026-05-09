@@ -55,6 +55,7 @@ pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 180;
 pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 180;
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
+const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 3;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -587,6 +588,7 @@ pub struct ClusterNetworkMaintenance {
     pub discovery: Option<MdnsDiscoverySocket>,
     pub discovery_cache: MdnsDiscoveryCache,
     pub connectivity: std::collections::BTreeMap<String, ClusterConnectivityProbeState>,
+    pub connectivity_cursor: usize,
     pub environment_id: Option<String>,
     pub tick: u64,
     pub last_publish: Instant,
@@ -606,6 +608,7 @@ impl ClusterNetworkMaintenance {
             discovery: MdnsDiscoverySocket::bind_default().ok(),
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
+            connectivity_cursor: 0,
             environment_id: None,
             tick: 0,
             last_publish: now,
@@ -802,23 +805,41 @@ impl ClusterNetworkMaintenance {
         let timestamp = now
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string());
-        let mut active_keys = std::collections::BTreeSet::new();
-        for endpoint in sinomo_network::cluster_network_probe_targets(state) {
+        let targets = sinomo_network::cluster_network_probe_targets(state);
+        let active_keys = targets
+            .iter()
+            .map(|endpoint| {
+                sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let probe_count = targets
+            .len()
+            .min(CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK);
+        let probe_start = if targets.is_empty() {
+            0
+        } else {
+            self.connectivity_cursor % targets.len()
+        };
+        self.connectivity_cursor = if targets.is_empty() {
+            0
+        } else {
+            (probe_start + probe_count) % targets.len()
+        };
+        for endpoint in targets.iter().cycle().skip(probe_start).take(probe_count) {
             let key =
-                sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, &endpoint);
-            active_keys.insert(key.clone());
+                sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint);
             let started = Instant::now();
-            let result = fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT);
+            let result = fetch_daemon_status_from_endpoint(endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT);
             let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let previous = self
                 .connectivity
                 .get(&key)
                 .map(|state| state.record.clone());
             let record = match result {
-                Ok(status) if daemon_cluster_status_matches(state, &endpoint, &status) => {
+                Ok(status) if daemon_cluster_status_matches(state, endpoint, &status) => {
                     sinomo_network::cluster_connectivity_record(
                         state,
-                        &endpoint,
+                        endpoint,
                         sinomo_network::ClusterConnectivityState::Healthy,
                         Some(latency_ms),
                         0,
@@ -849,7 +870,7 @@ impl ClusterNetworkMaintenance {
                     let failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
                     sinomo_network::cluster_connectivity_record(
                         state,
-                        &endpoint,
+                        endpoint,
                         state_label,
                         previous.and_then(|record| record.latency_ms),
                         failures,
