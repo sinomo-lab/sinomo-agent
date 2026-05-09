@@ -64,6 +64,8 @@ static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInf
     OnceLock::new();
 static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusRecord>>> =
     OnceLock::new();
+static PUBLISHED_CONNECTIVITY: OnceLock<Mutex<BTreeMap<String, ClusterConnectivityRecord>>> =
+    OnceLock::new();
 
 fn publish_cache_key(paths: &ClusterPaths, node_id: &NodeId) -> String {
     format!("{}:{node_id}", paths.root.display())
@@ -110,6 +112,37 @@ fn remember_node_status(paths: &ClusterPaths, status: &ClusterNodeStatusRecord) 
         .lock()
     {
         cache.insert(key, status.clone());
+    }
+}
+
+fn connectivity_cache_key(record: &ClusterConnectivityRecord) -> String {
+    sinomo_network::cluster_connectivity_key(
+        &record.source_node_id,
+        &record.target_node_id,
+        &record.endpoint_id,
+    )
+}
+
+fn cached_connectivity_matches(record: &ClusterConnectivityRecord) -> bool {
+    let key = connectivity_cache_key(record);
+    PUBLISHED_CONNECTIVITY
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .is_ok_and(|cache| {
+            cache
+                .get(&key)
+                .is_some_and(|known| sinomo_network::cluster_connectivity_stable_eq(known, record))
+        })
+}
+
+fn remember_connectivity_records(records: &[ClusterConnectivityRecord]) {
+    if let Ok(mut cache) = PUBLISHED_CONNECTIVITY
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        for record in records {
+            cache.insert(connectivity_cache_key(record), record.clone());
+        }
     }
 }
 
@@ -2014,12 +2047,21 @@ pub fn sync_cluster_connectivity_records_to_kv(
     source_node_id: &NodeId,
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    let success = sinomo_network::cluster_connectivity_sync_ops(paths, source_node_id, &records)?;
+    let publishable = records
+        .into_iter()
+        .filter(|record| !cached_connectivity_matches(record))
+        .collect::<Vec<_>>();
+    if publishable.is_empty() {
+        return Ok(None);
+    }
+    let success =
+        sinomo_network::cluster_connectivity_sync_ops(paths, source_node_id, &publishable)?;
     if success.is_empty() {
+        remember_connectivity_records(&publishable);
         return Ok(None);
     }
     let mut state = sinomo_network::read_cluster_state(paths)?;
-    commit_cluster_kv_txn_with_quorum(
+    let result = commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
         KvTxn {
@@ -2028,7 +2070,11 @@ pub fn sync_cluster_connectivity_records_to_kv(
             failure: Vec::new(),
         },
     )
-    .map(Some)
+    .map(Some);
+    if result.is_ok() {
+        remember_connectivity_records(&publishable);
+    }
+    result
 }
 
 pub fn expire_cluster_network_records_in_kv(

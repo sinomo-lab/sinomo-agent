@@ -2105,7 +2105,7 @@ fn cluster_network_record_live(expires_at: OffsetDateTime, now: OffsetDateTime) 
     expires_at > now
 }
 
-fn cluster_connectivity_stable_eq(
+pub fn cluster_connectivity_stable_eq(
     left: &ClusterConnectivityRecord,
     right: &ClusterConnectivityRecord,
 ) -> bool {
