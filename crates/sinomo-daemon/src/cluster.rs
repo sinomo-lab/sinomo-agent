@@ -56,6 +56,7 @@ pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 600;
 pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 900;
+pub const CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS: i64 = 7200;
 pub const CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS: i64 = 120;
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 1;
@@ -993,6 +994,12 @@ impl ClusterNetworkMaintenance {
                         sinomo_network::ClusterConnectivityState::Degraded
                     };
                     let failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
+                    let ttl_seconds = if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+                    {
+                        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
+                    } else {
+                        CLUSTER_CONNECTIVITY_TTL_SECONDS
+                    };
                     sinomo_network::cluster_connectivity_record(
                         state,
                         endpoint,
@@ -1002,7 +1009,7 @@ impl ClusterNetworkMaintenance {
                         retained_success,
                         Some(timestamp.clone()),
                         now,
-                        CLUSTER_CONNECTIVITY_TTL_SECONDS,
+                        ttl_seconds,
                     )
                 }
             };
