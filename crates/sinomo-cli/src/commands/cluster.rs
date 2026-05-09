@@ -779,7 +779,8 @@ pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoi
 
 pub(crate) fn cluster_status() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    match read_cluster_state_without_kv(&paths) {
+    let _ = refresh_cluster_kv_from_local_daemon(&paths);
+    match read_cluster_state(&paths) {
         Ok(state) => {
             println!("cluster: {}", state.cluster_id);
             println!("name: {}", state.cluster_name);
@@ -1008,12 +1009,6 @@ pub(crate) fn cluster_leave() -> Result<(), CliError> {
 
 pub(crate) fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, CliError> {
     daemon_read_local_cluster_state(paths).map_err(Into::into)
-}
-
-pub(crate) fn read_cluster_state_without_kv(
-    paths: &ClusterPaths,
-) -> Result<ClusterBootstrapState, CliError> {
-    daemon_read_local_cluster_state_without_kv(paths).map_err(Into::into)
 }
 
 pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Result<(), CliError> {

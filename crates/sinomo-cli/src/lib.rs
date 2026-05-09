@@ -107,7 +107,6 @@ use sinomo_runtime::daemon::{
     probe_daemon_status, publish_cluster_invitation_to_quorum,
     read_cluster_connectivity_graph_from_kv as daemon_read_cluster_connectivity_graph_from_kv,
     read_local_cluster_state as daemon_read_local_cluster_state,
-    read_local_cluster_state_without_kv as daemon_read_local_cluster_state_without_kv,
     reconcile_cluster_join_with_introducers as daemon_reconcile_cluster_join_with_introducers,
     register_daemon_cluster_node as daemon_register_daemon_cluster_node,
     remove_boot_entry as daemon_remove_boot_entry,
