@@ -924,8 +924,10 @@ impl ClusterNetworkMaintenance {
                 let key =
                     sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint);
                 self.connectivity.get(&key).is_none_or(|probe| {
-                    probe.record.state != sinomo_network::ClusterConnectivityState::Healthy
-                        || probe.record.expires_at <= refresh_deadline
+                    probe.record.expires_at <= refresh_deadline
+                        || (probe.record.state != sinomo_network::ClusterConnectivityState::Healthy
+                            && probe.record.consecutive_failures
+                                < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD)
                 })
             })
             .cloned()
