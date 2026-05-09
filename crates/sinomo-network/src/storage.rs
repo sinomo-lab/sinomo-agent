@@ -658,7 +658,6 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
                 .find(|candidate| candidate.node_id == member.node_id)
                 .cloned()
             && local_member.state.is_authorized()
-            && local_member.node_public_key == member.node_public_key
         {
             for endpoint in member.endpoints {
                 upsert_member_endpoint(&mut local_member, endpoint);
