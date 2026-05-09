@@ -879,9 +879,8 @@ pub fn apply_cluster_raft_append(
         let snapshot_kv_is_newer = snapshot.kv.revision > node.store().snapshot().revision;
         let append_term_is_current = append.term >= node.hard_state().current_term;
         if append_term_is_current
-            && snapshot_is_newer
-            && snapshot_kv_is_newer
             && snapshot_matches_append
+            && (snapshot_is_newer || snapshot_kv_is_newer)
         {
             node.restore_snapshot(snapshot)?;
         }
