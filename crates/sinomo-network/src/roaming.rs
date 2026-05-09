@@ -536,11 +536,8 @@ async fn run_iroh_daemon_proxy(
                         return;
                     };
                     let Ok(response) = tokio::task::spawn_blocking(move || {
-                        forward_daemon_control_payload(
-                            &daemon_address,
-                            &request,
-                            Duration::from_secs(10),
-                        )
+                        let timeout = iroh_daemon_command_forward_timeout(&request);
+                        forward_daemon_control_payload(&daemon_address, &request, timeout)
                     })
                     .await
                     .unwrap_or_else(|source| {
@@ -1031,6 +1028,25 @@ fn forward_daemon_control_payload(
     let mut response_bytes = Vec::new();
     crate::write_object_frame_blocking(&mut response_bytes, &response)?;
     Ok(response_bytes)
+}
+
+pub(crate) fn iroh_daemon_command_forward_timeout(payload: &[u8]) -> Duration {
+    let mut cursor = std::io::Cursor::new(payload);
+    let request: Result<crate::DaemonControlRequest, _> =
+        crate::read_object_frame_blocking(&mut cursor, IROH_DAEMON_COMMAND_MAX_BYTES);
+    match request {
+        Ok(request)
+            if request.rpc.as_ref().is_some_and(|rpc| {
+                rpc.route == crate::ROLLOUT_BUILD_ROUTE || rpc.route == crate::ROLLOUT_BINARY_ROUTE
+            }) || matches!(
+                request.command.strip_prefix("RPC "),
+                Some(crate::ROLLOUT_BUILD_ROUTE | crate::ROLLOUT_BINARY_ROUTE)
+            ) =>
+        {
+            Duration::from_secs(600)
+        }
+        _ => Duration::from_secs(10),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

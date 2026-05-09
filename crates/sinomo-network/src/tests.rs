@@ -494,6 +494,29 @@ fn command_target_selection_tries_iroh_before_extra_tcp_fallbacks() {
 }
 
 #[test]
+fn iroh_daemon_proxy_uses_long_timeout_for_rollout_build() {
+    let request =
+        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, &"build request")
+            .expect("request");
+    let control = DaemonControlRequest::rpc(format!("RPC {ROLLOUT_BUILD_ROUTE}"), request);
+    let mut payload = Vec::new();
+    write_object_frame_blocking(&mut payload, &control).expect("frame");
+
+    assert!(iroh_daemon_command_forward_timeout(&payload) >= std::time::Duration::from_secs(600));
+}
+
+#[test]
+fn iroh_daemon_proxy_keeps_short_timeout_for_regular_commands() {
+    let mut payload = Vec::new();
+    write_object_frame_blocking(&mut payload, &DaemonControlRequest::new("status")).expect("frame");
+
+    assert_eq!(
+        iroh_daemon_command_forward_timeout(&payload),
+        std::time::Duration::from_secs(10)
+    );
+}
+
+#[test]
 fn connectivity_sort_prefers_healthy_iroh_over_unreachable_tcp() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-connectivity-sort-{}",
