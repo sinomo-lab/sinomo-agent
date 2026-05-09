@@ -651,6 +651,22 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         }
     };
     for member in kv_members {
+        if member.node_id == state.local_node_id
+            && let Some(mut local_member) = state
+                .members
+                .iter()
+                .find(|candidate| candidate.node_id == member.node_id)
+                .cloned()
+            && local_member.state.is_authorized()
+            && local_member.node_public_key == member.node_public_key
+        {
+            for endpoint in member.endpoints {
+                upsert_member_endpoint(&mut local_member, endpoint);
+            }
+            cleanup_member_iroh_endpoints(&mut local_member);
+            upsert_member_record(&mut state, local_member);
+            continue;
+        }
         merge_member_record(&mut state, member);
     }
     state

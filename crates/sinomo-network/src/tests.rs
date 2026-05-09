@@ -915,6 +915,51 @@ fn cluster_state_load_preserves_newer_local_member_records() {
 }
 
 #[test]
+fn cluster_state_load_does_not_downgrade_local_member_from_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-local-member-merge-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let earlier = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    let later = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_local_member_merge").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_local_member_merge").expect("node");
+    let mut stale = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "local member merge",
+        node_id.clone(),
+        "merge node",
+        "public-key",
+        later,
+    );
+    stale.members[0].role = ClusterMemberRole::Learner;
+    stale.members[0].state = ClusterMemberState::Learner;
+    stale.members[0].updated_at = later;
+    sync_cluster_state_to_local_raft_unchecked(&paths, &stale).expect("sync stale kv");
+
+    let mut local = stale.clone();
+    local.members[0].role = ClusterMemberRole::Voter;
+    local.members[0].state = ClusterMemberState::Voter;
+    local.members[0].updated_at = earlier;
+    local.updated_at = earlier;
+    write_cluster_state(&paths, &local).expect("write local state");
+
+    let loaded = read_cluster_state(&paths).expect("read merged state");
+    assert_eq!(loaded.members[0].node_id, node_id);
+    assert_eq!(loaded.members[0].role, ClusterMemberRole::Voter);
+    assert_eq!(loaded.members[0].state, ClusterMemberState::Voter);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_read_view_falls_back_to_snapshot_when_local_raft_state_is_corrupt() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-corrupt-read-view-{}",
