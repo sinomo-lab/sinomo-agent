@@ -1226,6 +1226,12 @@ fn cluster_network_records_publish_overwrite_and_expire() {
     let graph = read_cluster_connectivity_graph_from_kv(&paths).expect("graph");
     assert_eq!(graph.len(), 1);
     assert_eq!(graph[0].state, ClusterConnectivityState::Healthy);
+    let partial_probe_ops =
+        cluster_connectivity_sync_ops(&paths, &node_a, &[]).expect("partial probe ops");
+    assert!(
+        partial_probe_ops.is_empty(),
+        "unprobed but unexpired connectivity records should be retained"
+    );
 
     expire_cluster_network_records(&paths, now + time::Duration::seconds(31))
         .expect("expire network");

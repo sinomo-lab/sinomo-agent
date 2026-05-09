@@ -52,8 +52,8 @@ pub const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(60);
-pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 180;
-pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 180;
+pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 600;
+pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 900;
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 3;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
@@ -670,12 +670,12 @@ impl ClusterNetworkMaintenance {
 
         if publish_due {
             self.last_publish = now;
-            if cluster_has_local_quorum(&cluster_paths, &state) {
+            if sinomo_network::cluster_raft_local_is_voter(&state) {
                 if !sinomo_network::cluster_bootstrap_state_stable_eq(
                     &state_before_maintenance,
                     &state,
                 ) {
-                    let _ = sync_cluster_state_to_kv(&cluster_paths, &state)?;
+                    let _ = sync_cluster_state_to_kv(&cluster_paths, &state);
                 }
                 let local_network_info = sinomo_network::build_cluster_network_info_record(
                     &state,
@@ -691,14 +691,14 @@ impl ClusterNetworkMaintenance {
                     self.connectivity.clear();
                 }
                 self.environment_id = Some(local_network_info.environment_id.clone());
-                let _ = sync_cluster_network_info_to_kv(&cluster_paths, local_network_info)?;
-                let _ = refresh_daemon_node_status_in_kv(paths)?;
+                let _ = sync_cluster_network_info_to_kv(&cluster_paths, local_network_info);
+                let _ = refresh_daemon_node_status_in_kv(paths);
                 let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
                 if matches!(
                     probe_daemon_status(&shadow_paths, DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT),
                     DaemonProbeStatus::Running(_)
                 ) {
-                    let _ = refresh_daemon_node_status_in_kv(&shadow_paths)?;
+                    let _ = refresh_daemon_node_status_in_kv(&shadow_paths);
                 }
             } else if !sinomo_network::cluster_raft_local_is_voter(&state) {
                 if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
@@ -709,18 +709,18 @@ impl ClusterNetworkMaintenance {
 
         if probe_due {
             self.last_probe = now;
-            if cluster_has_local_quorum(&cluster_paths, &state) {
+            if sinomo_network::cluster_raft_local_is_voter(&state) {
                 let records = self.probe_connectivity(&cluster_paths, &state);
                 let _ = sync_cluster_connectivity_records_to_kv(
                     &cluster_paths,
                     &state.local_node_id,
                     records,
-                )?;
+                );
                 let _ = expire_cluster_network_records_in_kv(
                     &cluster_paths,
                     &state,
                     time::OffsetDateTime::now_utc(),
-                )?;
+                );
             }
         }
 

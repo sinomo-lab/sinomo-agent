@@ -1966,6 +1966,7 @@ pub fn cluster_connectivity_sync_ops(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, NetworkError> {
+    let now = OffsetDateTime::now_utc();
     let store = read_cluster_kv_snapshot_store(paths)?;
     let mut existing = BTreeMap::new();
     for entry in store.range_prefix(&cluster_connectivity_source_prefix(source_node_id)) {
@@ -1990,8 +1991,8 @@ pub fn cluster_connectivity_sync_ops(
     }
 
     let mut ops = Vec::new();
-    for key in existing.keys() {
-        if !incoming.contains_key(key) {
+    for (key, record) in &existing {
+        if !incoming.contains_key(key) && record.expires_at <= now {
             ops.push(KvOp::Delete { key: key.clone() });
         }
     }
