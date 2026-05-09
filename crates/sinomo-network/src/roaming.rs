@@ -974,7 +974,11 @@ async fn send_daemon_control_request_async(
     .map_err(|_| NetworkError::Io {
         operation: format!("read daemon control address {address}"),
         detail: format!("timed out after {}ms", timeout.as_millis()),
-    })??;
+    })?
+    .map_err(|source| NetworkError::Io {
+        operation: format!("read daemon control address {address}"),
+        detail: source.to_string(),
+    })?;
     Ok(response)
 }
 

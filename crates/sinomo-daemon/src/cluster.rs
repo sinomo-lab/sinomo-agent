@@ -2139,7 +2139,7 @@ fn forward_cluster_kv_txn_to_voter(
         targets.insert(0, leader);
     }
 
-    let mut last_error = None;
+    let mut failures = Vec::new();
     for endpoint in targets {
         match send_cluster_kv_txn(&endpoint, txn, DAEMON_CLUSTER_RPC_TIMEOUT) {
             Ok(response) => {
@@ -2148,10 +2148,22 @@ fn forward_cluster_kv_txn_to_voter(
                         .map(|snapshot| (snapshot, Some(response))),
                 );
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => failures.push(format!(
+                "{} ({:?}) failed: {}",
+                endpoint.address, endpoint.transport, error
+            )),
         }
     }
-    last_error.map(Err)
+    Some(Err(DaemonError::ClusterReadOnly {
+        detail: format!(
+            "could not forward cluster KV transaction to any known voter{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    }))
 }
 
 pub fn elect_cluster_raft_leader(
