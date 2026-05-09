@@ -3602,6 +3602,83 @@ fn rollout_target_prefers_shadow_iroh_over_unknown_private_tcp() {
 }
 
 #[test]
+fn rollout_target_prefers_unknown_shadow_iroh_over_healthy_main_tcp() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-shadow-before-main-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_shadow_before_main").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_shadow_before_main_local").expect("node");
+    let main_node_id =
+        NodeId::from_legacy_named("node_rollout_shadow_before_main_remote").expect("node");
+    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout shadow before main",
+        local_node_id.clone(),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+
+    let main_endpoint = invite_introducer_endpoint(&main_node_id, "192.0.2.53:21353".to_string());
+    let shadow_endpoint = invite_introducer_endpoint(
+        &shadow_node_id,
+        "iroh://rollout_shadow_before_main?relay=https://relay.example./".to_string(),
+    );
+    let now = OffsetDateTime::now_utc();
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(
+            sinomo_runtime::network::cluster_connectivity_key(
+                &local_node_id,
+                &main_node_id,
+                &main_endpoint.endpoint_id,
+            ),
+            &sinomo_runtime::network::ClusterConnectivityRecord {
+                cluster_id,
+                source_node_id: local_node_id,
+                target_node_id: main_node_id.clone(),
+                endpoint_id: main_endpoint.endpoint_id.clone(),
+                transport: main_endpoint.transport.clone(),
+                address: main_endpoint.address.clone(),
+                state: sinomo_runtime::network::ClusterConnectivityState::Healthy,
+                latency_ms: None,
+                consecutive_failures: 0,
+                last_success_at: Some("ok".to_string()),
+                last_failure_at: None,
+                observed_at: now,
+                expires_at: now + time::Duration::seconds(120),
+            },
+            None,
+        )
+        .expect("connectivity record");
+    sinomo_runtime::network::write_cluster_kv_snapshot(&paths, &store.snapshot())
+        .expect("cluster kv snapshot");
+
+    let selected = rollout_target_endpoint_for_main_with_connectivity(
+        &paths,
+        &state,
+        &main_node_id,
+        &[main_endpoint, shadow_endpoint.clone()],
+    )
+    .expect("rollout target");
+
+    assert_eq!(selected.node_id, shadow_node_id);
+    assert_eq!(selected.endpoint_id, shadow_endpoint.endpoint_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-rollout-kv-endpoint-candidates-{}",

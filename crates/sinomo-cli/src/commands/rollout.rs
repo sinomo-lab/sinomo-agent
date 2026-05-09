@@ -699,9 +699,13 @@ pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
         .cloned()
         .collect::<Vec<_>>();
     candidates.sort_by_key(|endpoint| {
+        let score = rollout_endpoint_connectivity_score(state, &graph, endpoint);
+        let unreachable_shadow_endpoint =
+            endpoint.node_id == shadow_node_id && score >= ROLLOUT_ENDPOINT_UNREACHABLE_SCORE;
         (
-            rollout_endpoint_connectivity_score(state, &graph, endpoint),
+            unreachable_shadow_endpoint,
             endpoint.node_id != shadow_node_id,
+            score,
             network::cluster_daemon_command_address_rank(endpoint),
             network::cluster_daemon_command_transport_rank(endpoint),
             endpoint.priority,
@@ -746,8 +750,11 @@ fn rollout_endpoint_connectivity_score(
             network::ClusterConnectivityState::Degraded => 1,
             network::ClusterConnectivityState::Unreachable => 3,
         })
-        .unwrap_or(2)
+        .unwrap_or(ROLLOUT_ENDPOINT_UNKNOWN_SCORE)
 }
+
+const ROLLOUT_ENDPOINT_UNKNOWN_SCORE: u8 = 2;
+const ROLLOUT_ENDPOINT_UNREACHABLE_SCORE: u8 = 3;
 
 fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {
     if !targets
