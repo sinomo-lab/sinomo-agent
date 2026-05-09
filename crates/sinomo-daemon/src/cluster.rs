@@ -999,6 +999,7 @@ pub fn sync_cluster_state_to_kv(
 ) -> Result<KvSnapshot, DaemonError> {
     let mut keyed_state = state.clone();
     assign_local_node_public_keys(paths, &mut keyed_state)?;
+    refresh_local_iroh_endpoints_from_disk(paths, &mut keyed_state)?;
     sinomo_network::cleanup_cluster_iroh_endpoints(&mut keyed_state);
     let mut commit_state = keyed_state.clone();
     commit_cluster_kv_txn_with_quorum(
@@ -1234,7 +1235,9 @@ pub fn prepare_local_cluster_state(
         &DaemonRunOptions::shadow_default(),
         time::OffsetDateTime::now_utc(),
     );
-    assign_local_node_public_keys(paths, state)
+    assign_local_node_public_keys(paths, state)?;
+    refresh_local_iroh_endpoints_from_disk(paths, state)?;
+    Ok(())
 }
 
 pub fn initialize_local_cluster(
