@@ -1557,7 +1557,17 @@ pub fn cluster_sync_targets_with_connectivity(
 ) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = cluster_sync_targets(state);
     let graph = read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
+    let node_statuses = read_cluster_node_statuses_from_kv(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|status| (status.node_id, status.availability))
+        .collect::<BTreeMap<_, _>>();
     endpoints.sort_by_key(|endpoint| {
+        let node_status_rank = match node_statuses.get(&endpoint.node_id) {
+            Some(sinomo_core::ClusterNodeAvailability::Online) => 0,
+            Some(sinomo_core::ClusterNodeAvailability::Unknown) | None => 1,
+            Some(sinomo_core::ClusterNodeAvailability::Offline) => 2,
+        };
         let score = graph
             .iter()
             .find(|record| {
@@ -1572,6 +1582,7 @@ pub fn cluster_sync_targets_with_connectivity(
             })
             .unwrap_or(2);
         (
+            node_status_rank,
             score,
             cluster_daemon_command_transport_rank(endpoint),
             cluster_daemon_command_address_rank(endpoint),
