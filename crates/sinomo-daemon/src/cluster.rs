@@ -710,7 +710,7 @@ impl ClusterNetworkMaintenance {
         if probe_due {
             self.last_probe = now;
             if cluster_has_local_quorum(&cluster_paths, &state) {
-                let records = self.probe_connectivity(&state);
+                let records = self.probe_connectivity(&cluster_paths, &state);
                 let _ = sync_cluster_connectivity_records_to_kv(
                     &cluster_paths,
                     &state.local_node_id,
@@ -799,12 +799,29 @@ impl ClusterNetworkMaintenance {
 
     fn probe_connectivity(
         &mut self,
+        paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Vec<ClusterConnectivityRecord> {
         let now = time::OffsetDateTime::now_utc();
         let timestamp = now
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string());
+        if self.connectivity.is_empty()
+            && let Ok(records) = sinomo_network::read_cluster_connectivity_graph_from_kv(paths)
+        {
+            for record in records
+                .into_iter()
+                .filter(|record| record.source_node_id == state.local_node_id)
+            {
+                let key = sinomo_network::cluster_connectivity_key(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    &record.endpoint_id,
+                );
+                self.connectivity
+                    .insert(key, ClusterConnectivityProbeState { record });
+            }
+        }
         let targets = sinomo_network::cluster_network_probe_targets(state);
         let active_keys = targets
             .iter()
