@@ -36,8 +36,10 @@ use sinomo_network::{
 use sinomo_node::shadow_daemon_node_id;
 use sinomo_node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
 use sinomo_rollout::{SelfRolloutPaths, read_rollout_status};
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -58,6 +60,58 @@ pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 1;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInfoRecord>>> =
+    OnceLock::new();
+static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusRecord>>> =
+    OnceLock::new();
+
+fn publish_cache_key(paths: &ClusterPaths, node_id: &NodeId) -> String {
+    format!("{}:{node_id}", paths.root.display())
+}
+
+fn cached_network_info_matches(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) -> bool {
+    let key = publish_cache_key(paths, &info.node_id);
+    PUBLISHED_NETWORK_INFO
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .is_ok_and(|cache| {
+            cache
+                .get(&key)
+                .is_some_and(|known| sinomo_network::cluster_network_info_stable_eq(known, info))
+        })
+}
+
+fn remember_network_info(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) {
+    let key = publish_cache_key(paths, &info.node_id);
+    if let Ok(mut cache) = PUBLISHED_NETWORK_INFO
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        cache.insert(key, info.clone());
+    }
+}
+
+fn cached_node_status_matches(paths: &ClusterPaths, status: &ClusterNodeStatusRecord) -> bool {
+    let key = publish_cache_key(paths, &status.node_id);
+    PUBLISHED_NODE_STATUS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .is_ok_and(|cache| {
+            cache
+                .get(&key)
+                .is_some_and(|known| sinomo_network::cluster_node_status_stable_eq(known, status))
+        })
+}
+
+fn remember_node_status(paths: &ClusterPaths, status: &ClusterNodeStatusRecord) {
+    let key = publish_cache_key(paths, &status.node_id);
+    if let Ok(mut cache) = PUBLISHED_NODE_STATUS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        cache.insert(key, status.clone());
+    }
+}
 
 struct ClusterRaftFanoutGuard;
 
@@ -1887,7 +1941,11 @@ pub fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
+    if cached_node_status_matches(paths, &status) {
+        return Ok(None);
+    }
     if sinomo_network::stored_cluster_node_status_matches(paths, &status)? {
+        remember_node_status(paths, &status);
         return Ok(None);
     }
     let mut state = sinomo_network::read_cluster_state(paths)?;
@@ -1903,7 +1961,7 @@ pub fn sync_cluster_node_status_to_kv(
             None,
         )?);
     }
-    commit_cluster_kv_txn_with_quorum(
+    let result = commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
         KvTxn {
@@ -1912,18 +1970,26 @@ pub fn sync_cluster_node_status_to_kv(
             failure: Vec::new(),
         },
     )
-    .map(Some)
+    .map(Some);
+    if result.is_ok() {
+        remember_node_status(paths, &status);
+    }
+    result
 }
 
 pub fn sync_cluster_network_info_to_kv(
     paths: &ClusterPaths,
     info: ClusterNetworkInfoRecord,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
+    if cached_network_info_matches(paths, &info) {
+        return Ok(None);
+    }
     if sinomo_network::stored_cluster_network_info_matches(paths, &info)? {
+        remember_network_info(paths, &info);
         return Ok(None);
     }
     let mut state = sinomo_network::read_cluster_state(paths)?;
-    commit_cluster_kv_txn_with_quorum(
+    let result = commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
         KvTxn {
@@ -1936,7 +2002,11 @@ pub fn sync_cluster_network_info_to_kv(
             failure: Vec::new(),
         },
     )
-    .map(Some)
+    .map(Some);
+    if result.is_ok() {
+        remember_network_info(paths, &info);
+    }
+    result
 }
 
 pub fn sync_cluster_connectivity_records_to_kv(
