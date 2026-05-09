@@ -1026,8 +1026,15 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     std::fs::remove_dir_all(root).ok();
 }
 
+fn sobj_reported_len(bytes: &[u8]) -> usize {
+    assert!(bytes.len() >= 12);
+    assert_eq!(&bytes[..4], b"SOBJ");
+    assert_eq!(bytes[6], 4, "network objects use u32 lengths");
+    u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize
+}
+
 #[test]
-fn cluster_state_read_tolerates_trailing_file_bytes() {
+fn cluster_state_read_rejects_trailing_file_bytes() {
     use std::io::Write;
 
     let root = std::env::temp_dir().join(format!(
@@ -1058,10 +1065,105 @@ fn cluster_state_read_tolerates_trailing_file_bytes() {
         .expect("open state")
         .write_all(b"stale-trailing-bytes")
         .expect("append trailing bytes");
+    let bytes = std::fs::read(&paths.state).expect("read raw state");
 
-    let loaded = read_cluster_state(&paths).expect("read state with trailing bytes");
+    assert_eq!(sobj_reported_len(&bytes), bytes.len() - 20);
+    assert!(
+        read_cluster_state(&paths).is_err(),
+        "stored SOBJ files with trailing bytes violate the object length invariant"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
 
-    assert_eq!(loaded.cluster_id, cluster_id);
+#[test]
+fn cluster_state_rewrite_removes_trailing_file_bytes() {
+    use std::io::Write;
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-state-rewrite-trailing-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rewrite_trailing_state").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_rewrite_trailing_state").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rewrite trailing state",
+        node_id,
+        "node",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    let initial = std::fs::read(&paths.state).expect("read initial raw state");
+    assert_eq!(sobj_reported_len(&initial), initial.len());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths.state)
+        .expect("open state")
+        .write_all(b"stale-trailing-bytes")
+        .expect("append trailing bytes");
+
+    state.cluster_name = "rewritten trailing state".to_string();
+    write_cluster_state(&paths, &state).expect("rewrite state");
+
+    let bytes = std::fs::read(&paths.state).expect("read raw state");
+    assert_eq!(sobj_reported_len(&bytes), bytes.len());
+    let strict: ClusterBootstrapState = SinomoObjectCodec::default()
+        .decode(&bytes)
+        .expect("strict state decode");
+    assert_eq!(strict.cluster_id, cluster_id);
+    assert_eq!(strict.cluster_name, "rewritten trailing state");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_state_read_rejects_prefixed_or_truncated_file_bytes() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-state-invalid-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id = ClusterId::from_legacy_named("cluster_invalid_state").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_invalid_state").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "invalid state",
+        node_id,
+        "node",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    let valid = std::fs::read(&paths.state).expect("read state");
+    assert_eq!(sobj_reported_len(&valid), valid.len());
+
+    let mut prefixed = b"junk".to_vec();
+    prefixed.extend_from_slice(&valid);
+    std::fs::write(&paths.state, prefixed).expect("write prefixed state");
+    assert!(
+        read_cluster_state(&paths).is_err(),
+        "prefixed bytes must not be treated as a recoverable trailing write"
+    );
+
+    std::fs::write(&paths.state, &valid[..valid.len() - 1]).expect("write truncated state");
+    assert!(
+        read_cluster_state(&paths).is_err(),
+        "truncated objects must not be accepted"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
