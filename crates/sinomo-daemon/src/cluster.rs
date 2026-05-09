@@ -1971,7 +1971,7 @@ pub fn expire_cluster_network_records_in_kv(
     state: &ClusterBootstrapState,
     now: time::OffsetDateTime,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    let success = sinomo_network::expire_cluster_network_record_ops(paths, state, now)?;
+    let (compares, success) = sinomo_network::expire_cluster_network_record_ops(paths, state, now)?;
     if success.is_empty() {
         return Ok(None);
     }
@@ -1980,7 +1980,7 @@ pub fn expire_cluster_network_records_in_kv(
         paths,
         &mut state,
         KvTxn {
-            compares: Vec::new(),
+            compares,
             success,
             failure: Vec::new(),
         },

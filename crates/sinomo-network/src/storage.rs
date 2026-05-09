@@ -2013,8 +2013,9 @@ pub fn expire_cluster_network_record_ops(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     now: OffsetDateTime,
-) -> Result<Vec<KvOp>, NetworkError> {
+) -> Result<(Vec<KvCompare>, Vec<KvOp>), NetworkError> {
     let store = read_cluster_kv_snapshot_store(paths)?;
+    let mut compares = Vec::new();
     let mut ops = Vec::new();
     for entry in store.range_prefix("/cluster/network/info/") {
         let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
@@ -2024,6 +2025,10 @@ pub fn expire_cluster_network_record_ops(
             continue;
         }
         if cluster_network_record_expired(record.expires_at, now) {
+            compares.push(KvCompare::ValueEquals {
+                key: entry.key.clone(),
+                value: entry.value,
+            });
             ops.push(KvOp::Delete { key: entry.key });
         }
     }
@@ -2035,10 +2040,14 @@ pub fn expire_cluster_network_record_ops(
             continue;
         }
         if cluster_network_record_expired(record.expires_at, now) {
+            compares.push(KvCompare::ValueEquals {
+                key: entry.key.clone(),
+                value: entry.value,
+            });
             ops.push(KvOp::Delete { key: entry.key });
         }
     }
-    Ok(ops)
+    Ok((compares, ops))
 }
 
 fn cluster_network_record_expired(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {
