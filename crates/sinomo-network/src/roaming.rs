@@ -1021,12 +1021,16 @@ fn forward_daemon_control_payload(
             detail: source.to_string(),
         })?;
     let _ = stream.shutdown(Shutdown::Write);
-    let mut response = Vec::new();
-    std::io::Read::read_to_end(&mut stream, &mut response).map_err(|source| NetworkError::Io {
-        operation: format!("read daemon control address {address}"),
-        detail: source.to_string(),
-    })?;
-    Ok(response)
+    let response: crate::DaemonControlResponse =
+        crate::read_object_frame_blocking(&mut stream, IROH_DAEMON_COMMAND_MAX_BYTES).map_err(
+            |source| NetworkError::Io {
+                operation: format!("read daemon control address {address}"),
+                detail: source.to_string(),
+            },
+        )?;
+    let mut response_bytes = Vec::new();
+    crate::write_object_frame_blocking(&mut response_bytes, &response)?;
+    Ok(response_bytes)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
