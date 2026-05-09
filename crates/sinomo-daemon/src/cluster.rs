@@ -1989,6 +1989,7 @@ pub fn commit_cluster_raft_command_with_quorum(
         voter_acks.insert(state.local_node_id.clone());
     }
     let quorum_size = sinomo_network::cluster_raft_quorum_size(state);
+    let mut failures = Vec::new();
     for endpoint in sinomo_network::prefer_bounded_daemon_command_targets(
         sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
     ) {
@@ -1998,23 +1999,34 @@ pub fn commit_cluster_raft_command_with_quorum(
         if !sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id) {
             continue;
         }
-        let Ok(response) = replicate_cluster_raft_to_endpoint(paths, state, &endpoint) else {
-            continue;
-        };
-        if !response.accepted {
-            continue;
+        match replicate_cluster_raft_to_endpoint(paths, state, &endpoint) {
+            Ok(response) if response.accepted => {
+                voter_acks.insert(endpoint.node_id.clone());
+                sinomo_network::merge_cluster_state_from_peer(state, response.state);
+            }
+            Ok(response) => failures.push(format!(
+                "{} ({:?}) rejected append: {}",
+                endpoint.address, endpoint.transport, response.detail
+            )),
+            Err(error) => failures.push(format!(
+                "{} ({:?}) failed: {}",
+                endpoint.address, endpoint.transport, error
+            )),
         }
-        voter_acks.insert(endpoint.node_id.clone());
-        sinomo_network::merge_cluster_state_from_peer(state, response.state);
     }
     if voter_acks.len() < quorum_size {
         let _ = sinomo_network::clear_cluster_raft_leader(paths, &state.local_node_id);
         return Err(DaemonError::ClusterReadOnly {
             detail: format!(
-                "raft command at index {} replicated to {} voters, {} required",
+                "raft command at index {} replicated to {} voters, {} required{}",
                 entry.index,
                 voter_acks.len(),
-                quorum_size
+                quorum_size,
+                if failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", failures.join("; "))
+                }
             ),
         });
     }
