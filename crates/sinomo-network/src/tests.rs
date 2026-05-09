@@ -299,6 +299,50 @@ fn explicit_iroh_invite_introducer_only_treats_top_level_direct_query_as_direct(
 }
 
 #[test]
+fn default_invite_compaction_keeps_fresh_iroh_before_later_peers() {
+    let local = NodeId::from_legacy_named("node_invite_compact_local").expect("local");
+    let peer = NodeId::from_legacy_named("node_invite_compact_peer").expect("peer");
+    let mut introducers = vec![
+        invite_introducer_endpoint(&local, "10.0.0.41:21353".to_string()),
+        invite_introducer_endpoint(&local, "203.0.113.41:21353".to_string()),
+        invite_introducer_endpoint(
+            &local,
+            "iroh://iroh_public_key_local?direct=203.0.113.41:21355&relay=https://relay.example./"
+                .to_string(),
+        ),
+        invite_introducer_endpoint(
+            &peer,
+            "iroh://iroh_public_key_peer?direct=198.51.100.10:21355&relay=https://relay.example./"
+                .to_string(),
+        ),
+    ];
+
+    sort_default_invite_introducers(&mut introducers);
+    compact_default_invite_introducers(&mut introducers);
+
+    assert_eq!(introducers.len(), 3);
+    assert_eq!(introducers[0].address, "203.0.113.41:21353");
+    assert_eq!(introducers[2].node_id, local);
+    assert!(
+        introducers[2]
+            .address
+            .starts_with("iroh://iroh_public_key_local")
+    );
+}
+
+#[test]
+fn default_invite_sort_prefers_public_direct_over_private_direct() {
+    let node = NodeId::from_legacy_named("node_invite_public_direct").expect("node");
+    let private = invite_introducer_endpoint(&node, "10.0.0.41:21353".to_string());
+    let public = invite_introducer_endpoint(&node, "203.0.113.41:21353".to_string());
+    let mut introducers = vec![private, public.clone()];
+
+    sort_default_invite_introducers(&mut introducers);
+
+    assert_eq!(introducers.first(), Some(&public));
+}
+
+#[test]
 fn join_registration_channels_prioritize_iroh_before_direct_lan() {
     let cluster_id = ClusterId::from_legacy_named("cluster_invite_iroh_first").expect("cluster");
     let node_id = NodeId::from_legacy_named("node_invite_iroh_first").expect("node");

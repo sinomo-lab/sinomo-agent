@@ -241,10 +241,28 @@ pub fn sort_default_invite_introducers(introducers: &mut [ClusterEndpointRecord]
     introducers.sort_by_key(|endpoint| {
         (
             !is_remote_usable_invite_endpoint(endpoint),
+            invite_endpoint_address_rank(endpoint),
             endpoint.priority,
-            endpoint.address.clone(),
         )
     });
+}
+
+fn invite_endpoint_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    if !matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) {
+        return 1;
+    }
+    let Ok(address) = endpoint.address.parse::<std::net::SocketAddr>() else {
+        return 1;
+    };
+    match address.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 2,
+        std::net::IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 2,
+        ip if ip.is_loopback() || ip.is_unspecified() => 3,
+        _ => 0,
+    }
 }
 
 pub fn compact_default_invite_introducers(introducers: &mut Vec<ClusterEndpointRecord>) {
