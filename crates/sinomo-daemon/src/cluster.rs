@@ -926,17 +926,11 @@ pub fn refresh_daemon_node_status_in_kv(
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    if !cluster_has_local_quorum(&cluster_paths, &state) {
-        return Ok(None);
-    }
-    let _ = sync_cluster_network_info_to_kv(
-        &cluster_paths,
-        sinomo_network::build_cluster_network_info_record(
-            &state,
-            &cluster.node_id,
-            time::OffsetDateTime::now_utc(),
-            CLUSTER_NETWORK_INFO_TTL_SECONDS,
-        ),
+    let network_info = sinomo_network::build_cluster_network_info_record(
+        &state,
+        &cluster.node_id,
+        time::OffsetDateTime::now_utc(),
+        CLUSTER_NETWORK_INFO_TTL_SECONDS,
     );
     let record = cluster_node_status_from_daemon_status(
         &status,
@@ -944,6 +938,19 @@ pub fn refresh_daemon_node_status_in_kv(
         read_rollout_status(&rollout_paths)?,
         time::OffsetDateTime::now_utc(),
     );
+    let network_info_matches =
+        sinomo_network::stored_cluster_network_info_matches(&cluster_paths, &network_info)
+            .unwrap_or(false);
+    let node_status_matches =
+        sinomo_network::stored_cluster_node_status_matches(&cluster_paths, &record)
+            .unwrap_or(false);
+    if network_info_matches && node_status_matches {
+        return Ok(None);
+    }
+    if !cluster_has_local_quorum(&cluster_paths, &state) {
+        return Ok(None);
+    }
+    let _ = sync_cluster_network_info_to_kv(&cluster_paths, network_info);
     sync_cluster_node_status_to_kv(&cluster_paths, record)
 }
 
