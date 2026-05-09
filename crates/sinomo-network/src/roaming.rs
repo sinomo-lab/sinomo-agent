@@ -207,12 +207,9 @@ pub struct IrohEndpointRecord {
 
 impl IrohEndpointRecord {
     pub fn endpoint(&self) -> ClusterEndpointRecord {
-        let has_direct_address = !self.direct_addresses.is_empty();
-        let address = if has_direct_address || self.relay_url.is_some() {
+        let has_relay = self.relay_url.is_some();
+        let address = if has_relay {
             let mut query = Vec::new();
-            if has_direct_address {
-                query.push(format!("direct={}", self.direct_addresses.join(",")));
-            }
             if let Some(relay_url) = &self.relay_url {
                 query.push(format!("relay={relay_url}"));
             }
@@ -227,12 +224,12 @@ impl IrohEndpointRecord {
             transport: ClusterTransportKind::Iroh,
             address,
             source: ClusterEndpointSource::Rendezvous,
-            privacy: if has_direct_address {
-                ClusterEndpointPrivacy::InternetDirect
-            } else {
+            privacy: if has_relay {
                 ClusterEndpointPrivacy::Relayed
+            } else {
+                ClusterEndpointPrivacy::InternetDirect
             },
-            priority: if has_direct_address { 40 } else { 90 },
+            priority: 90,
             last_observed_latency_ms: None,
         }
     }

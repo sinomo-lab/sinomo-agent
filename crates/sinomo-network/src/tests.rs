@@ -1905,15 +1905,8 @@ fn iroh_kv_exchange_round_trips_endpoint_records() {
     assert_eq!(parsed, endpoint);
     assert_eq!(cluster_endpoint.node_id, node_id);
     assert_eq!(cluster_endpoint.transport, ClusterTransportKind::Iroh);
-    assert_eq!(
-        cluster_endpoint.privacy,
-        ClusterEndpointPrivacy::InternetDirect
-    );
-    assert!(
-        cluster_endpoint
-            .address
-            .contains("direct=203.0.113.10:21356")
-    );
+    assert_eq!(cluster_endpoint.privacy, ClusterEndpointPrivacy::Relayed);
+    assert!(!cluster_endpoint.address.contains("direct="));
     assert!(
         cluster_endpoint
             .address
@@ -1922,7 +1915,7 @@ fn iroh_kv_exchange_round_trips_endpoint_records() {
     let parsed_endpoint =
         iroh_endpoint_record_from_cluster_endpoint(&cluster_endpoint, &cluster_id)
             .expect("cluster endpoint parse");
-    assert_eq!(parsed_endpoint.direct_addresses, endpoint.direct_addresses);
+    assert!(parsed_endpoint.direct_addresses.is_empty());
     assert_eq!(parsed_endpoint.relay_url, endpoint.relay_url);
 }
 
@@ -1952,7 +1945,7 @@ fn iroh_endpoint_record_uses_stable_id_for_public_key() {
     .endpoint();
 
     assert_eq!(first.endpoint_id, second.endpoint_id);
-    assert_ne!(first.address, second.address);
+    assert_eq!(first.address, second.address);
 }
 
 #[test]
@@ -1999,7 +1992,7 @@ fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
     .endpoint();
 
     assert!(upsert_member_endpoint(&mut member, first));
-    assert!(upsert_member_endpoint(&mut member, second));
+    assert!(!upsert_member_endpoint(&mut member, second));
 
     let iroh: Vec<_> = member
         .endpoints
@@ -2007,7 +2000,7 @@ fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
         .filter(|endpoint| endpoint.transport == ClusterTransportKind::Iroh)
         .collect();
     assert_eq!(iroh.len(), 1);
-    assert!(iroh[0].address.contains("203.0.113.11:21356"));
+    assert_eq!(iroh[0].address, "iroh://iroh_public_key");
 }
 
 #[test]
@@ -2087,7 +2080,7 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
 
     assert_eq!(iroh.len(), 1);
     assert_eq!(iroh[0].endpoint_id, stable.endpoint_id);
-    assert!(iroh[0].address.contains("203.0.113.11:21356"));
+    assert_eq!(iroh[0].address, "iroh://same_public_key");
 
     std::fs::remove_dir_all(root).ok();
 }
