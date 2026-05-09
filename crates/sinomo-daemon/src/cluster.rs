@@ -56,6 +56,7 @@ pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 600;
 pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 900;
+pub const CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS: i64 = 120;
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 1;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
@@ -915,20 +916,39 @@ impl ClusterNetworkMaintenance {
                 sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint)
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let probe_count = targets
+        let refresh_deadline =
+            now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
+        let probe_targets = targets
+            .iter()
+            .filter(|endpoint| {
+                let key =
+                    sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint);
+                self.connectivity.get(&key).is_none_or(|probe| {
+                    probe.record.state != sinomo_network::ClusterConnectivityState::Healthy
+                        || probe.record.expires_at <= refresh_deadline
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let probe_count = probe_targets
             .len()
             .min(CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK);
-        let probe_start = if targets.is_empty() {
+        let probe_start = if probe_targets.is_empty() {
             0
         } else {
-            self.connectivity_cursor % targets.len()
+            self.connectivity_cursor % probe_targets.len()
         };
-        self.connectivity_cursor = if targets.is_empty() {
+        self.connectivity_cursor = if probe_targets.is_empty() {
             0
         } else {
-            (probe_start + probe_count) % targets.len()
+            (probe_start + probe_count) % probe_targets.len()
         };
-        for endpoint in targets.iter().cycle().skip(probe_start).take(probe_count) {
+        for endpoint in probe_targets
+            .iter()
+            .cycle()
+            .skip(probe_start)
+            .take(probe_count)
+        {
             let key =
                 sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint);
             let started = Instant::now();
