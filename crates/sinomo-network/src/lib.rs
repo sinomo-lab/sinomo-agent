@@ -18,6 +18,43 @@ pub use roaming::*;
 pub use rpc::*;
 pub use storage::*;
 
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+
+    layout.register_sinomo_object(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/state.sobj",
+        ObjectSchema::new("ClusterBootstrapState", STORAGE_CONTRACT_OBJECT_VERSION)
+            .field("cluster_id", "ClusterId")
+            .field("local_node_id", "NodeId")
+            .field("members", "Vec<ClusterMemberRecord>"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/watch-events.sobj",
+        ObjectSchema::new(
+            "Vec<ClusterKvWatchEventRecord>",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        ),
+    )?;
+    layout.register_escape_path(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/iroh",
+        "dynamic iroh key and endpoint object files keyed by node id",
+    )?;
+    layout.register_escape_path(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/watches",
+        "dynamic cluster KV watch registration object files keyed by watch id",
+    )
+}
+
 pub(crate) mod prelude {
     pub(crate) use serde::{Deserialize, Serialize};
     pub(crate) use sinomo_core::{

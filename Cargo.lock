@@ -3128,6 +3128,7 @@ dependencies = [
  "sinomo-network",
  "sinomo-node",
  "sinomo-rollout",
+ "sinomo-storage",
  "thiserror",
  "time",
 ]
@@ -3166,6 +3167,7 @@ dependencies = [
  "sinomo-local",
  "sinomo-network",
  "sinomo-object",
+ "sinomo-storage",
  "thiserror",
  "time",
 ]
@@ -3200,6 +3202,7 @@ dependencies = [
  "serde_json",
  "sinomo-lm",
  "sinomo-runtime",
+ "sinomo-storage",
  "thiserror",
  "time",
 ]
@@ -3233,6 +3236,7 @@ dependencies = [
  "serde",
  "sinomo-core",
  "sinomo-object",
+ "sinomo-storage",
  "thiserror",
  "time",
  "tokio",
@@ -3255,6 +3259,7 @@ dependencies = [
 name = "sinomo-local"
 version = "0.1.0"
 dependencies = [
+ "sinomo-storage",
  "thiserror",
 ]
 
@@ -3313,6 +3318,7 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-object",
+ "sinomo-storage",
  "thiserror",
  "time",
 ]
@@ -3353,6 +3359,7 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-object",
+ "sinomo-storage",
  "time",
 ]
 

@@ -18,3 +18,4 @@ thiserror.workspace = true
 time.workspace = true
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-runtime = { path = "../sinomo-runtime" }
+sinomo-storage = { path = "../sinomo-storage" }

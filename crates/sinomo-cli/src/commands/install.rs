@@ -88,7 +88,24 @@ pub(crate) fn parse_port(label: &str, value: &str) -> Result<u16, CliError> {
 pub(crate) fn ensure_data_dir_storage_contracts(
     data_dir: impl AsRef<Path>,
 ) -> Result<(), CliError> {
-    Ok(sinomo_runtime::storage::ensure_sinomo_data_dir_is_registered(data_dir)?)
+    let report = cli_data_dir_layout()?.verify_data_dir(data_dir)?;
+    if report.is_complete() {
+        Ok(())
+    } else {
+        Err(
+            sinomo_runtime::storage::StorageContractError::UnregisteredPaths {
+                paths: report.unregistered,
+            }
+            .into(),
+        )
+    }
+}
+
+fn cli_data_dir_layout()
+-> Result<sinomo_runtime::storage::StorageLayout, sinomo_runtime::storage::StorageContractError> {
+    let mut layout = sinomo_runtime::storage::sinomo_data_dir_layout()?;
+    sinomo_evolution::register_storage_paths(&mut layout)?;
+    Ok(layout)
 }
 
 pub(crate) fn install(options: InstallOptions) -> Result<(), CliError> {

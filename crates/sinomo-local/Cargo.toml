@@ -12,4 +12,5 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true

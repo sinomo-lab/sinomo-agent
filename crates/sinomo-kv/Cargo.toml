@@ -20,3 +20,4 @@ time.workspace = true
 fs2.workspace = true
 tokio = { version = "1.44", features = ["rt"] }
 sinomo-core = { path = "../sinomo-core" }
+sinomo-storage = { path = "../sinomo-storage" }

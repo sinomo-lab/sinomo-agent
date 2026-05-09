@@ -23,6 +23,41 @@ pub const KV_WAL_OBJECT_VERSION_ID: u16 = 2;
 const MAX_RETAINED_EVENTS: usize = 4096;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+
+    layout.register_sinomo_object(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-snapshot.sobj",
+        ObjectSchema::new("KvSnapshot", STORAGE_CONTRACT_OBJECT_VERSION)
+            .field("revision", "KvRevision")
+            .field("entries", "Vec<KvEntry>")
+            .field("events", "Vec<KvEvent>"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-raft/hard-state.sobj",
+        ObjectSchema::new("RaftHardState", STORAGE_CONTRACT_OBJECT_VERSION),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-raft/snapshot.sobj",
+        ObjectSchema::new("RaftSnapshot", STORAGE_CONTRACT_OBJECT_VERSION),
+    )?;
+    layout.register_object_log("sinomo-kv", StorageRing::R1, "cluster/kv-raft/wal.sobjlog")?;
+    layout.register_escape_path(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-raft",
+        "durable raft nodes use dynamic node-id subdirectories for locks, WALs, hard state, and snapshots",
+    )
+}
+
 pub fn encode_kv_value<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, KvError> {
     sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32).map_err(|source| {
         KvError::Serialization {

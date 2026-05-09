@@ -24,5 +24,6 @@ sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-rollout = { path = "../sinomo-rollout" }
+sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true
 time.workspace = true

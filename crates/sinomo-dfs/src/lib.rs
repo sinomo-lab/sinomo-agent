@@ -71,6 +71,45 @@ pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
 
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::StorageRing;
+
+    for (relative_path, reason) in [
+        ("dfs/content/blobs", "content-addressed DFS blob bytes"),
+        (
+            "dfs/content/objects",
+            "dynamic DFS object manifests stored as sinomo-object files",
+        ),
+        ("dfs/content/staging", "temporary DFS staging bytes"),
+        (
+            "dfs/metadata/records",
+            "dynamic DFS metadata records stored as sinomo-object files",
+        ),
+        (
+            "dfs/metadata/journal",
+            "dynamic DFS metadata journal entries stored as sinomo-object files",
+        ),
+        (
+            "dfs/metadata/root",
+            "default DFS root metadata shard with object records and journal entries",
+        ),
+        (
+            "dfs/operator",
+            "dynamic DFS operator intent records stored as sinomo-object files",
+        ),
+        (
+            "dfs/pins",
+            "dynamic DFS pin records stored as sinomo-object files",
+        ),
+        ("files", "local-owned user files exposed into DFS"),
+    ] {
+        layout.register_escape_path("sinomo-dfs", StorageRing::R1, relative_path, reason)?;
+    }
+    Ok(())
+}
+
 pub fn fallback_dfs_node_id() -> NodeId {
     NodeId::from_legacy_named(DEFAULT_DFS_NODE_ID).expect("valid fallback DFS node id")
 }

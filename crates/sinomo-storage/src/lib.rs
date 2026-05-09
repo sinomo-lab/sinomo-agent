@@ -1,13 +1,15 @@
-//! Storage layout and object schema contracts for the Sinomo data directory.
+//! Storage path registry and object schema contracts for the Sinomo data directory.
 //!
-//! R0/R1 crates should register every file they own here, or explicitly mark a
-//! subtree as an escape path when user or external-system content may appear
-//! there without a detailed schema.
+//! This crate defines the shared vocabulary and registry mechanics. Crates that
+//! own data-dir files should register their own files or escape subtrees from
+//! their crate, so storage usage can be inspected without hard-coding every
+//! downstream path here.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::RwLock;
 use thiserror::Error;
 
 pub const STORAGE_CONTRACT_OBJECT_VERSION: u16 = 1;
@@ -185,6 +187,60 @@ impl StorageLayout {
         Ok(())
     }
 
+    pub fn register_sinomo_object(
+        &mut self,
+        module: impl Into<String>,
+        ring: StorageRing,
+        relative_path: impl Into<String>,
+        schema: ObjectSchema,
+    ) -> Result<(), StorageContractError> {
+        self.register_file(StorageFileContract::sinomo_object(
+            module,
+            ring,
+            relative_path,
+            schema,
+        )?)
+    }
+
+    pub fn register_object_log(
+        &mut self,
+        module: impl Into<String>,
+        ring: StorageRing,
+        relative_path: impl Into<String>,
+    ) -> Result<(), StorageContractError> {
+        self.register_sinomo_object(
+            module,
+            ring,
+            relative_path,
+            ObjectSchema::new(
+                "Vec<LengthPrefixedSinomoObject>",
+                STORAGE_CONTRACT_OBJECT_VERSION,
+            ),
+        )
+    }
+
+    pub fn register_binary(
+        &mut self,
+        module: impl Into<String>,
+        ring: StorageRing,
+        relative_path: impl Into<String>,
+    ) -> Result<(), StorageContractError> {
+        self.register_file(StorageFileContract::binary(module, ring, relative_path)?)
+    }
+
+    pub fn register_human_text(
+        &mut self,
+        module: impl Into<String>,
+        ring: StorageRing,
+        relative_path: impl Into<String>,
+    ) -> Result<(), StorageContractError> {
+        self.register_file(StorageFileContract::human_text(
+            module,
+            ring,
+            relative_path,
+        )?)
+    }
+
     pub fn register_escape(
         &mut self,
         escape: StorageEscapePath,
@@ -200,6 +256,41 @@ impl StorageLayout {
         }
         self.escape_paths.push(escape);
         Ok(())
+    }
+
+    pub fn register_escape_path(
+        &mut self,
+        module: impl Into<String>,
+        ring: StorageRing,
+        relative_path: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<(), StorageContractError> {
+        self.register_escape(StorageEscapePath::new(module, ring, relative_path, reason)?)
+    }
+
+    pub fn unregister_file(&mut self, relative_path: impl AsRef<Path>) -> bool {
+        let Ok(relative_path) = normalize_relative_path(relative_path.as_ref()) else {
+            return false;
+        };
+        let before = self.files.len();
+        self.files
+            .retain(|existing| existing.relative_path != relative_path);
+        self.files.len() != before
+    }
+
+    pub fn unregister_escape(&mut self, relative_path: impl AsRef<Path>) -> bool {
+        let Ok(relative_path) = normalize_relative_path(relative_path.as_ref()) else {
+            return false;
+        };
+        let before = self.escape_paths.len();
+        self.escape_paths
+            .retain(|existing| existing.relative_path != relative_path);
+        self.escape_paths.len() != before
+    }
+
+    pub fn unregister_path(&mut self, relative_path: impl AsRef<Path>) -> bool {
+        let relative_path = relative_path.as_ref();
+        self.unregister_file(relative_path) | self.unregister_escape(relative_path)
     }
 
     pub fn owner_for(&self, relative_path: impl AsRef<Path>) -> Option<StoragePathOwner<'_>> {
@@ -263,6 +354,90 @@ impl StorageLayout {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct StorageRegistry {
+    layout: RwLock<StorageLayout>,
+}
+
+impl StorageRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_layout(layout: StorageLayout) -> Self {
+        Self {
+            layout: RwLock::new(layout),
+        }
+    }
+
+    pub fn register_file(&self, contract: StorageFileContract) -> Result<(), StorageContractError> {
+        self.layout
+            .write()
+            .map_err(|_| StorageContractError::RegistryPoisoned)?
+            .register_file(contract)
+    }
+
+    pub fn register_escape(&self, escape: StorageEscapePath) -> Result<(), StorageContractError> {
+        self.layout
+            .write()
+            .map_err(|_| StorageContractError::RegistryPoisoned)?
+            .register_escape(escape)
+    }
+
+    pub fn unregister_path(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<bool, StorageContractError> {
+        Ok(self
+            .layout
+            .write()
+            .map_err(|_| StorageContractError::RegistryPoisoned)?
+            .unregister_path(relative_path))
+    }
+
+    pub fn layout(&self) -> Result<StorageLayout, StorageContractError> {
+        self.layout
+            .read()
+            .map_err(|_| StorageContractError::RegistryPoisoned)
+            .map(|layout| layout.clone())
+    }
+
+    pub fn owner_for(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Option<StoragePathOwnerOwned>, StorageContractError> {
+        let layout = self
+            .layout
+            .read()
+            .map_err(|_| StorageContractError::RegistryPoisoned)?;
+        Ok(layout.owner_for(relative_path).map(Into::into))
+    }
+
+    pub fn verify_relative_paths<I, P>(
+        &self,
+        relative_paths: I,
+    ) -> Result<StorageVerificationReport, StorageContractError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.layout
+            .read()
+            .map_err(|_| StorageContractError::RegistryPoisoned)?
+            .verify_relative_paths(relative_paths)
+    }
+
+    pub fn verify_data_dir(
+        &self,
+        root: impl AsRef<Path>,
+    ) -> Result<StorageVerificationReport, StorageContractError> {
+        self.layout
+            .read()
+            .map_err(|_| StorageContractError::RegistryPoisoned)?
+            .verify_data_dir(root)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StorageVerificationReport {
     pub covered: Vec<VerifiedStoragePath>,
@@ -289,316 +464,25 @@ pub enum StorageCoverage {
     Escape,
 }
 
-pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
-    let mut layout = StorageLayout::new();
-
-    register_object(
-        &mut layout,
-        "sinomo-network",
-        StorageRing::R1,
-        "cluster/state.sobj",
-        ObjectSchema::new("ClusterBootstrapState", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("cluster_id", "ClusterId")
-            .field("local_node_id", "NodeId")
-            .field("members", "Vec<ClusterMemberRecord>"),
-    )?;
-    register_object(
-        &mut layout,
-        "sinomo-kv",
-        StorageRing::R1,
-        "cluster/kv-snapshot.sobj",
-        ObjectSchema::new("KvSnapshot", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("revision", "KvRevision")
-            .field("entries", "Vec<KvEntry>")
-            .field("events", "Vec<KvEvent>"),
-    )?;
-    register_object(
-        &mut layout,
-        "sinomo-kv",
-        StorageRing::R1,
-        "cluster/kv-raft/hard-state.sobj",
-        ObjectSchema::new("RaftHardState", STORAGE_CONTRACT_OBJECT_VERSION),
-    )?;
-    register_object(
-        &mut layout,
-        "sinomo-kv",
-        StorageRing::R1,
-        "cluster/kv-raft/snapshot.sobj",
-        ObjectSchema::new("RaftSnapshot", STORAGE_CONTRACT_OBJECT_VERSION),
-    )?;
-    register_object_log(
-        &mut layout,
-        "sinomo-kv",
-        StorageRing::R1,
-        "cluster/kv-raft/wal.sobjlog",
-    )?;
-    layout.register_escape(StorageEscapePath::new(
-        "sinomo-kv",
-        StorageRing::R1,
-        "cluster/kv-raft",
-        "durable raft nodes use dynamic node-id subdirectories for locks, WALs, hard state, and snapshots",
-    )?)?;
-    register_object(
-        &mut layout,
-        "sinomo-network",
-        StorageRing::R1,
-        "cluster/watch-events.sobj",
-        ObjectSchema::new(
-            "Vec<ClusterKvWatchEventRecord>",
-            STORAGE_CONTRACT_OBJECT_VERSION,
-        ),
-    )?;
-    for relative_path in ["daemon/status.sobj", "shadow-daemon/status.sobj"] {
-        register_object(
-            &mut layout,
-            "sinomo-daemon",
-            StorageRing::R1,
-            relative_path,
-            ObjectSchema::new("DaemonStatus", STORAGE_CONTRACT_OBJECT_VERSION)
-                .field("pid", "u32")
-                .field("address", "String")
-                .field("started_at", "String")
-                .field("cluster", "Option<DaemonClusterStatus>"),
-        )?;
-    }
-    register_object(
-        &mut layout,
-        "sinomo-rollout",
-        StorageRing::R1,
-        "rollout/state.sobj",
-        ObjectSchema::new("ClusterNodeRolloutStatus", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("status", "String")
-            .field("mode", "Option<String>")
-            .field("detail", "Option<String>"),
-    )?;
-    register_object(
-        &mut layout,
-        "sinomo-rollout",
-        StorageRing::R1,
-        "rollout/last-main-exit.sobj",
-        ObjectSchema::new("RolloutMainExitRecord", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("exit_code", "Option<i32>")
-            .field("signal", "Option<i32>")
-            .field("requested_shutdown", "bool")
-            .field("kind", "MainExitKind")
-            .field("observed_at", "String"),
-    )?;
-    layout.register_file(StorageFileContract::human_text(
-        "sinomo-rollout",
-        StorageRing::R1,
-        "rollout/build.log",
-    )?)?;
-    layout.register_file(StorageFileContract::human_text(
-        "sinomo-rollout",
-        StorageRing::R1,
-        "rollout/last-main-exit.json",
-    )?)?;
-    register_object(
-        &mut layout,
-        "sinomo-rollout",
-        StorageRing::R1,
-        "rollout/pending-main-rollout.sobj",
-        ObjectSchema::new("RolloutMainActivation", STORAGE_CONTRACT_OBJECT_VERSION),
-    )?;
-    register_object(
-        &mut layout,
-        "sinomo-rollout",
-        StorageRing::R1,
-        "rollout/pending-shadow-rollout.sobj",
-        ObjectSchema::new("PendingShadowRollout", STORAGE_CONTRACT_OBJECT_VERSION),
-    )?;
-
-    for relative_path in ["identity/main-ed25519.sobj", "identity/shadow-ed25519.sobj"] {
-        register_object(
-            &mut layout,
-            "sinomo-node",
-            StorageRing::R1,
-            relative_path,
-            ObjectSchema::new("NodeIdentity", STORAGE_CONTRACT_OBJECT_VERSION)
-                .field("public_key", "String")
-                .field("private_key_pkcs8", "String")
-                .field("created_at", "String"),
-        )?;
-    }
-
-    for relative_path in ["daemon/daemon.lock", "shadow-daemon/daemon.lock"] {
-        layout.register_file(StorageFileContract::binary(
-            "sinomo-daemon",
-            StorageRing::R1,
-            relative_path,
-        )?)?;
-    }
-    for relative_path in ["daemon/auth-nonces.sobj", "shadow-daemon/auth-nonces.sobj"] {
-        register_object(
-            &mut layout,
-            "sinomo-daemon",
-            StorageRing::R1,
-            relative_path,
-            ObjectSchema::new(
-                "BTreeMap<DaemonAuthNonceKey, Timestamp>",
-                STORAGE_CONTRACT_OBJECT_VERSION,
-            ),
-        )?;
-    }
-
-    for (relative_path, reason) in [
-        (
-            "cluster/iroh",
-            "dynamic iroh key and endpoint object files keyed by node id",
-        ),
-        (
-            "cluster/watches",
-            "dynamic cluster KV watch registration object files keyed by watch id",
-        ),
-        ("dfs/content/blobs", "content-addressed DFS blob bytes"),
-        (
-            "dfs/content/objects",
-            "dynamic DFS object manifests stored as sinomo-object files",
-        ),
-        ("dfs/content/staging", "temporary DFS staging bytes"),
-        (
-            "dfs/metadata/records",
-            "dynamic DFS metadata records stored as sinomo-object files",
-        ),
-        (
-            "dfs/metadata/journal",
-            "dynamic DFS metadata journal entries stored as sinomo-object files",
-        ),
-        (
-            "dfs/metadata/root",
-            "default DFS root metadata shard with object records and journal entries",
-        ),
-        (
-            "dfs/operator",
-            "dynamic DFS operator intent records stored as sinomo-object files",
-        ),
-        (
-            "dfs/pins",
-            "dynamic DFS pin records stored as sinomo-object files",
-        ),
-        ("files", "local-owned user files exposed into DFS"),
-        ("workspace", "user-authored workspace files"),
-        ("source", "managed or imported source repositories"),
-        ("bin", "installed runtime binaries"),
-        ("rollout/staged", "staged rollout build artifacts"),
-        (
-            "rollout/logs",
-            "operator-readable rollout logs and diagnostics",
-        ),
-        ("config", "human-readable local configuration files"),
-        (
-            "providers",
-            "external provider credential and configuration files",
-        ),
-        (
-            "evolution",
-            "self-evolution jobs, campaigns, logs, and candidate workspaces",
-        ),
-        ("startup", "installed OS boot entries and launch scripts"),
-    ] {
-        layout.register_escape(StorageEscapePath::new(
-            owner_for_escape(relative_path),
-            ring_for_escape(relative_path),
-            relative_path,
-            reason,
-        )?)?;
-    }
-
-    Ok(layout)
-}
-
-pub fn verify_sinomo_data_dir(
-    data_dir: impl AsRef<Path>,
-) -> Result<StorageVerificationReport, StorageContractError> {
-    sinomo_data_dir_layout()?.verify_data_dir(data_dir)
-}
-
-pub fn ensure_sinomo_data_dir_is_registered(
-    data_dir: impl AsRef<Path>,
-) -> Result<(), StorageContractError> {
-    let report = verify_sinomo_data_dir(data_dir)?;
-    if report.is_complete() {
-        Ok(())
-    } else {
-        Err(StorageContractError::UnregisteredPaths {
-            paths: report.unregistered,
-        })
-    }
-}
-
-fn register_object(
-    layout: &mut StorageLayout,
-    module: &'static str,
-    ring: StorageRing,
-    relative_path: &'static str,
-    schema: ObjectSchema,
-) -> Result<(), StorageContractError> {
-    layout.register_file(StorageFileContract::sinomo_object(
-        module,
-        ring,
-        relative_path,
-        schema,
-    )?)
-}
-
-fn register_object_log(
-    layout: &mut StorageLayout,
-    module: &'static str,
-    ring: StorageRing,
-    relative_path: &'static str,
-) -> Result<(), StorageContractError> {
-    layout.register_file(StorageFileContract::sinomo_object(
-        module,
-        ring,
-        relative_path,
-        ObjectSchema::new(
-            "Vec<LengthPrefixedSinomoObject>",
-            STORAGE_CONTRACT_OBJECT_VERSION,
-        ),
-    )?)
-}
-
-fn owner_for_escape(relative_path: &str) -> &'static str {
-    if relative_path.starts_with("cluster/") {
-        "sinomo-network"
-    } else if relative_path.starts_with("dfs/") || relative_path == "files" {
-        "sinomo-dfs"
-    } else if relative_path.starts_with("rollout/")
-        || relative_path == "source"
-        || relative_path == "bin"
-    {
-        "sinomo-rollout"
-    } else if relative_path == "startup" {
-        "sinomo-cli"
-    } else if relative_path == "config" || relative_path == "providers" {
-        "sinomo-local"
-    } else if relative_path == "evolution" {
-        "sinomo-evolution"
-    } else {
-        "sinomo-workspace"
-    }
-}
-
-fn ring_for_escape(relative_path: &str) -> StorageRing {
-    if relative_path.starts_with("cluster/") || relative_path.starts_with("dfs/") {
-        StorageRing::R1
-    } else if relative_path == "files" {
-        StorageRing::R1
-    } else if relative_path == "startup" {
-        StorageRing::Application
-    } else if relative_path == "config" || relative_path == "providers" {
-        StorageRing::Application
-    } else if relative_path == "evolution" {
-        StorageRing::R2
-    } else {
-        StorageRing::R2
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoragePathOwner<'a> {
     File(&'a StorageFileContract),
     Escape(&'a StorageEscapePath),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoragePathOwnerOwned {
+    File(StorageFileContract),
+    Escape(StorageEscapePath),
+}
+
+impl From<StoragePathOwner<'_>> for StoragePathOwnerOwned {
+    fn from(owner: StoragePathOwner<'_>) -> Self {
+        match owner {
+            StoragePathOwner::File(file) => Self::File(file.clone()),
+            StoragePathOwner::Escape(escape) => Self::Escape(escape.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -611,6 +495,8 @@ pub enum StorageContractError {
     UnregisteredPaths { paths: Vec<String> },
     #[error("storage verifier I/O error at {path}: {detail}")]
     Io { path: String, detail: String },
+    #[error("storage registry lock is poisoned")]
+    RegistryPoisoned,
 }
 
 fn collect_files(
@@ -769,80 +655,24 @@ mod tests {
     }
 
     #[test]
-    fn default_layout_registers_core_data_dir_contracts() {
-        let layout = sinomo_data_dir_layout().expect("layout");
-
-        let Some(StoragePathOwner::File(cluster_state)) = layout.owner_for("cluster/state.sobj")
-        else {
-            panic!("expected cluster state contract");
-        };
-        assert_eq!(cluster_state.module, "sinomo-network");
-        assert_eq!(cluster_state.encoding, StorageEncoding::SinomoObject);
-
-        let Some(StoragePathOwner::File(daemon_status)) = layout.owner_for("daemon/status.sobj")
-        else {
-            panic!("expected daemon status contract");
-        };
-        assert_eq!(daemon_status.encoding, StorageEncoding::SinomoObject);
-
-        let Some(StoragePathOwner::Escape(kv_raft_node)) =
-            layout.owner_for("cluster/kv-raft/01kr3d54d45zkm0p0xgps8k7mt/wal.sobjlog")
-        else {
-            panic!("expected dynamic raft node escape");
-        };
-        assert_eq!(kv_raft_node.module, "sinomo-kv");
-
-        let Some(StoragePathOwner::Escape(dfs_record)) =
-            layout.owner_for("dfs/metadata/records/objects/01/object.sobj")
-        else {
-            panic!("expected dfs metadata escape");
-        };
-        assert_eq!(dfs_record.module, "sinomo-dfs");
-
-        let Some(StoragePathOwner::Escape(dfs_root_record)) =
-            layout.owner_for("dfs/metadata/root/records/filesystems/root/object.sobj")
-        else {
-            panic!("expected dfs root metadata escape");
-        };
-        assert_eq!(dfs_root_record.module, "sinomo-dfs");
-
-        let Some(StoragePathOwner::Escape(dfs_pin)) =
-            layout.owner_for("dfs/pins/root-hash-node.sobj")
-        else {
-            panic!("expected dfs pin escape");
-        };
-        assert_eq!(dfs_pin.module, "sinomo-dfs");
-
-        let Some(StoragePathOwner::Escape(workspace)) =
-            layout.owner_for("workspace/project/README.md")
-        else {
-            panic!("expected workspace escape");
-        };
-        assert_eq!(workspace.module, "sinomo-workspace");
-
-        let Some(StoragePathOwner::Escape(config)) = layout.owner_for("config/models.json") else {
-            panic!("expected config escape");
-        };
-        assert_eq!(config.module, "sinomo-local");
-
-        let Some(StoragePathOwner::Escape(provider)) =
-            layout.owner_for("providers/openai/credentials.json")
-        else {
-            panic!("expected provider escape");
-        };
-        assert_eq!(provider.module, "sinomo-local");
-
-        let Some(StoragePathOwner::Escape(evolution)) =
-            layout.owner_for("evolution/jobs/01hxy6qa9k0t9vr4g9n8d3q5d4/record.json")
-        else {
-            panic!("expected evolution escape");
-        };
-        assert_eq!(evolution.module, "sinomo-evolution");
-    }
-
-    #[test]
     fn verifier_reports_unregistered_relative_paths() {
-        let layout = sinomo_data_dir_layout().expect("layout");
+        let mut layout = StorageLayout::new();
+        layout
+            .register_sinomo_object(
+                "sinomo-network",
+                StorageRing::R1,
+                "cluster/state.sobj",
+                ObjectSchema::new("ClusterBootstrapState", STORAGE_CONTRACT_OBJECT_VERSION),
+            )
+            .expect("register state");
+        layout
+            .register_escape_path(
+                "sinomo-network",
+                StorageRing::R1,
+                "cluster/iroh",
+                "dynamic iroh endpoint records",
+            )
+            .expect("register iroh");
         let report = layout
             .verify_relative_paths([
                 "cluster/state.sobj",
@@ -863,19 +693,55 @@ mod tests {
     }
 
     #[test]
-    fn verifier_covers_legacy_rollout_exit_record() {
-        let layout = sinomo_data_dir_layout().expect("layout");
-        let report = layout
-            .verify_relative_paths(["rollout/last-main-exit.json"])
-            .expect("verify");
+    fn registry_supports_runtime_registration_and_deregistration() {
+        let registry = StorageRegistry::new();
+        registry
+            .register_file(
+                StorageFileContract::human_text(
+                    "sinomo-rollout",
+                    StorageRing::R1,
+                    "rollout/last-main-exit.json",
+                )
+                .expect("contract"),
+            )
+            .expect("register");
 
-        assert!(report.unregistered.is_empty());
-        assert_eq!(report.covered[0].module, "sinomo-rollout");
+        let owner = registry
+            .owner_for("rollout/last-main-exit.json")
+            .expect("owner")
+            .expect("registered");
+        match owner {
+            StoragePathOwnerOwned::File(contract) => {
+                assert_eq!(contract.module, "sinomo-rollout");
+                assert_eq!(contract.encoding, StorageEncoding::HumanText);
+            }
+            StoragePathOwnerOwned::Escape(_) => panic!("expected file owner"),
+        }
+
+        assert!(
+            registry
+                .unregister_path("rollout/last-main-exit.json")
+                .expect("unregister")
+        );
+        assert!(
+            registry
+                .owner_for("rollout/last-main-exit.json")
+                .expect("owner")
+                .is_none()
+        );
     }
 
     #[test]
     fn verifier_covers_dynamic_cluster_raft_node_files() {
-        let layout = sinomo_data_dir_layout().expect("layout");
+        let mut layout = StorageLayout::new();
+        layout
+            .register_escape_path(
+                "sinomo-kv",
+                StorageRing::R1,
+                "cluster/kv-raft",
+                "durable raft node subdirectories",
+            )
+            .expect("register raft escape");
         let report = layout
             .verify_relative_paths([
                 "cluster/kv-raft/01kr3d54d45zkm0p0xgps8k7mt/node.lock",
@@ -894,7 +760,23 @@ mod tests {
 
     #[test]
     fn verifier_covers_windows_style_escape_paths() {
-        let layout = sinomo_data_dir_layout().expect("layout");
+        let mut layout = StorageLayout::new();
+        layout
+            .register_escape_path(
+                "sinomo-rollout",
+                StorageRing::R1,
+                "bin",
+                "installed runtime binaries",
+            )
+            .expect("register bin");
+        layout
+            .register_escape_path(
+                "sinomo-rollout",
+                StorageRing::R1,
+                "source",
+                "managed source repositories",
+            )
+            .expect("register source");
         let report = layout
             .verify_relative_paths([
                 "bin\\sinomo.exe",
@@ -914,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_walks_data_dir_files() {
+    fn verifier_walks_data_dir_files_with_registered_escapes() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-storage-verify-{}",
             std::time::SystemTime::now()
@@ -957,10 +839,73 @@ mod tests {
         std::fs::write(root.join("startup/sinomo.service"), b"service").expect("startup");
         std::fs::write(root.join("unknown/file.bin"), b"unknown").expect("unknown");
 
-        let report = sinomo_data_dir_layout()
-            .expect("layout")
-            .verify_data_dir(&root)
-            .expect("verify");
+        let mut layout = StorageLayout::new();
+        layout
+            .register_sinomo_object(
+                "sinomo-network",
+                StorageRing::R1,
+                "cluster/state.sobj",
+                ObjectSchema::new("ClusterBootstrapState", STORAGE_CONTRACT_OBJECT_VERSION),
+            )
+            .expect("register state");
+        for (module, ring, relative_path, reason) in [
+            (
+                "sinomo-network",
+                StorageRing::R1,
+                "cluster/iroh",
+                "dynamic iroh records",
+            ),
+            (
+                "sinomo-local",
+                StorageRing::Application,
+                "config",
+                "local config",
+            ),
+            (
+                "sinomo-local",
+                StorageRing::Application,
+                "providers",
+                "provider config",
+            ),
+            (
+                "sinomo-evolution",
+                StorageRing::R2,
+                "evolution",
+                "self-evolution state",
+            ),
+            (
+                "sinomo-dfs",
+                StorageRing::R1,
+                "dfs/metadata/root",
+                "dfs root metadata",
+            ),
+            ("sinomo-dfs", StorageRing::R1, "dfs/pins", "dfs pins"),
+            (
+                "sinomo-rollout",
+                StorageRing::R1,
+                "rollout/logs",
+                "rollout logs",
+            ),
+            (
+                "sinomo-daemon",
+                StorageRing::Application,
+                "startup",
+                "installed OS boot entries",
+            ),
+        ] {
+            layout
+                .register_escape_path(module, ring, relative_path, reason)
+                .expect("register escape");
+        }
+        layout
+            .register_human_text(
+                "sinomo-rollout",
+                StorageRing::R1,
+                "rollout/last-main-exit.json",
+            )
+            .expect("register rollout exit");
+
+        let report = layout.verify_data_dir(&root).expect("verify");
 
         assert_eq!(report.unregistered, vec!["unknown/file.bin"]);
         assert_eq!(report.covered.len(), 10);

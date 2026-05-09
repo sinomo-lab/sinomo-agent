@@ -131,3 +131,42 @@ pub use status::{
     invite_introducers_from_daemon_status, probe_daemon_status, probe_daemon_status_at_address,
     read_daemon_status, unknown_cluster_node_status, write_daemon_status,
 };
+
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+
+    for relative_path in ["daemon/status.sobj", "shadow-daemon/status.sobj"] {
+        layout.register_sinomo_object(
+            "sinomo-daemon",
+            StorageRing::R1,
+            relative_path,
+            ObjectSchema::new("DaemonStatus", STORAGE_CONTRACT_OBJECT_VERSION)
+                .field("pid", "u32")
+                .field("address", "String")
+                .field("started_at", "String")
+                .field("cluster", "Option<DaemonClusterStatus>"),
+        )?;
+    }
+    for relative_path in ["daemon/daemon.lock", "shadow-daemon/daemon.lock"] {
+        layout.register_binary("sinomo-daemon", StorageRing::R1, relative_path)?;
+    }
+    for relative_path in ["daemon/auth-nonces.sobj", "shadow-daemon/auth-nonces.sobj"] {
+        layout.register_sinomo_object(
+            "sinomo-daemon",
+            StorageRing::R1,
+            relative_path,
+            ObjectSchema::new(
+                "BTreeMap<DaemonAuthNonceKey, Timestamp>",
+                STORAGE_CONTRACT_OBJECT_VERSION,
+            ),
+        )?;
+    }
+    layout.register_escape_path(
+        "sinomo-daemon",
+        StorageRing::Application,
+        "startup",
+        "installed OS boot entries and launch scripts",
+    )
+}

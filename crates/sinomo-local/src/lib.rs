@@ -5,6 +5,31 @@ use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::StorageRing;
+
+    layout.register_escape_path(
+        "sinomo-local",
+        StorageRing::Application,
+        "config",
+        "human-readable local configuration files",
+    )?;
+    layout.register_escape_path(
+        "sinomo-local",
+        StorageRing::Application,
+        "providers",
+        "external provider credential and configuration files",
+    )?;
+    layout.register_escape_path(
+        "sinomo-local",
+        StorageRing::R2,
+        "workspace",
+        "user-authored workspace files",
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SinomoDataDir {
     root: PathBuf,

@@ -11,6 +11,25 @@ use sinomo_core::{
     CapabilityName, ModelCapability, NodeCapability, NodeId, ScalarError, TrustDomain,
 };
 
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+
+    for relative_path in ["identity/main-ed25519.sobj", "identity/shadow-ed25519.sobj"] {
+        layout.register_sinomo_object(
+            "sinomo-node",
+            StorageRing::R1,
+            relative_path,
+            ObjectSchema::new("NodeIdentity", STORAGE_CONTRACT_OBJECT_VERSION)
+                .field("public_key", "String")
+                .field("private_key_pkcs8", "String")
+                .field("created_at", "String"),
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NodeProfile {
     pub node_id: NodeId,

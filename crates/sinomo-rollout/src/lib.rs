@@ -48,3 +48,60 @@ pub use state::{
     rollout_staged_shadow_binary, rollout_staging_dir, stage_pending_shadow_rollout, write_json,
     write_main_activation, write_rollout_status,
 };
+
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+
+    layout.register_sinomo_object(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/state.sobj",
+        ObjectSchema::new("ClusterNodeRolloutStatus", STORAGE_CONTRACT_OBJECT_VERSION)
+            .field("status", "String")
+            .field("mode", "Option<String>")
+            .field("detail", "Option<String>"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/last-main-exit.sobj",
+        ObjectSchema::new("RolloutMainExitRecord", STORAGE_CONTRACT_OBJECT_VERSION)
+            .field("exit_code", "Option<i32>")
+            .field("signal", "Option<i32>")
+            .field("requested_shutdown", "bool")
+            .field("kind", "MainExitKind")
+            .field("observed_at", "String"),
+    )?;
+    layout.register_human_text("sinomo-rollout", StorageRing::R1, "rollout/build.log")?;
+    layout.register_human_text(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/last-main-exit.json",
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/pending-main-rollout.sobj",
+        ObjectSchema::new("RolloutMainActivation", STORAGE_CONTRACT_OBJECT_VERSION),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/pending-shadow-rollout.sobj",
+        ObjectSchema::new("PendingShadowRollout", STORAGE_CONTRACT_OBJECT_VERSION),
+    )?;
+    for (relative_path, reason) in [
+        ("source", "managed or imported source repositories"),
+        ("bin", "installed runtime binaries"),
+        ("rollout/staged", "staged rollout build artifacts"),
+        (
+            "rollout/logs",
+            "operator-readable rollout logs and diagnostics",
+        ),
+    ] {
+        layout.register_escape_path("sinomo-rollout", StorageRing::R1, relative_path, reason)?;
+    }
+    Ok(())
+}
