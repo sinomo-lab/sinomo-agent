@@ -1421,6 +1421,7 @@ fn current_cluster_kv_store(
     .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
     .collect::<Vec<_>>();
     if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
+        && !cluster_node_status_is_offline(paths, &leader_id)
         && let Some(position) = targets
             .iter()
             .position(|endpoint| endpoint.node_id == leader_id)
@@ -2191,6 +2192,7 @@ fn forward_cluster_kv_txn_to_voter(
         return None;
     }
     if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
+        && !cluster_node_status_is_offline(paths, &leader_id)
         && let Some(position) = targets
             .iter()
             .position(|endpoint| endpoint.node_id == leader_id)
@@ -2242,6 +2244,15 @@ fn forward_cluster_kv_txn_to_voter(
             }
         ),
     }))
+}
+
+fn cluster_node_status_is_offline(paths: &ClusterPaths, node_id: &NodeId) -> bool {
+    sinomo_network::read_cluster_node_statuses_from_kv(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|status| {
+            status.node_id == *node_id && status.availability == ClusterNodeAvailability::Offline
+        })
 }
 
 pub fn elect_cluster_raft_leader(
