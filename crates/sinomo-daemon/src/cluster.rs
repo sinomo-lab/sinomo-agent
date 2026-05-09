@@ -1975,13 +1975,25 @@ pub fn cluster_reachable_voter_count(paths: &ClusterPaths, state: &ClusterBootst
             return voters.len();
         }
     }
+    let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
     for endpoint in sinomo_network::prefer_bounded_daemon_command_targets(
         sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
     ) {
         if !sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id) {
             continue;
         }
-        if fetch_daemon_status_from_endpoint(&endpoint, DAEMON_CLUSTER_RPC_TIMEOUT).is_ok() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        if fetch_daemon_status_from_endpoint(
+            &endpoint,
+            cluster_endpoint_command_timeout(&endpoint, remaining),
+        )
+        .is_ok()
+        {
             voters.insert(endpoint.node_id);
             if voters.len() >= quorum_size {
                 break;
@@ -2188,12 +2200,30 @@ fn forward_cluster_kv_txn_to_voter(
     }
 
     let mut failures = Vec::new();
+    let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
     for endpoint in targets {
-        match send_cluster_kv_txn(&endpoint, txn, DAEMON_CLUSTER_RPC_TIMEOUT) {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            failures.push(format!(
+                "forwarding did not complete before {}ms command budget",
+                DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT.as_millis()
+            ));
+            break;
+        }
+        match send_cluster_kv_txn(
+            &endpoint,
+            txn,
+            cluster_endpoint_command_timeout(&endpoint, remaining),
+        ) {
             Ok(response) => {
                 return Some(
-                    fetch_cluster_kv_snapshot_from_endpoint(&endpoint, DAEMON_CLUSTER_RPC_TIMEOUT)
-                        .map(|snapshot| (snapshot, Some(response))),
+                    fetch_cluster_kv_snapshot_from_endpoint(
+                        &endpoint,
+                        cluster_endpoint_command_timeout(&endpoint, remaining),
+                    )
+                    .map(|snapshot| (snapshot, Some(response))),
                 );
             }
             Err(error) => failures.push(format!(
@@ -2247,10 +2277,19 @@ pub fn elect_cluster_raft_leader(
     if local_vote.vote_granted {
         granted.insert(state.local_node_id.clone());
     }
+    let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
     for endpoint in sinomo_network::cluster_raft_vote_targets(paths, state) {
-        let Ok(response) =
-            send_cluster_raft_vote(&endpoint, &vote_request, DAEMON_CLUSTER_RPC_TIMEOUT)
-        else {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(response) = send_cluster_raft_vote(
+            &endpoint,
+            &vote_request,
+            cluster_endpoint_command_timeout(&endpoint, remaining),
+        ) else {
             continue;
         };
         if response.vote.vote_granted {
@@ -2298,10 +2337,7 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
         let request = sinomo_network::build_cluster_raft_append_request_from_next_index(
             paths, state, next_index,
         )?;
-        let attempt_timeout = match endpoint.transport {
-            ClusterTransportKind::Iroh => remaining,
-            _ => remaining.min(DAEMON_CLUSTER_RPC_TIMEOUT),
-        };
+        let attempt_timeout = cluster_endpoint_command_timeout(endpoint, remaining);
         let response = send_cluster_raft_append(endpoint, &request, attempt_timeout)?;
         if response.accepted {
             return Ok(response);
@@ -2329,6 +2365,16 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
             match_index: 0,
         },
     }))
+}
+
+fn cluster_endpoint_command_timeout(
+    endpoint: &ClusterEndpointRecord,
+    remaining: Duration,
+) -> Duration {
+    match endpoint.transport {
+        ClusterTransportKind::Iroh => remaining,
+        _ => remaining.min(DAEMON_CLUSTER_RPC_TIMEOUT),
+    }
 }
 
 pub fn handle_daemon_cluster_raft_append_request(
