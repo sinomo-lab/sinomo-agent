@@ -467,6 +467,33 @@ fn command_target_selection_keeps_iroh_fallback_after_direct_endpoint() {
 }
 
 #[test]
+fn command_target_selection_tries_iroh_before_extra_tcp_fallbacks() {
+    let node_id = NodeId::from_legacy_named("node_target_iroh_before_tcp").expect("node");
+    let primary = daemon_lan_endpoint(&node_id, "203.0.113.44:21353".to_string(), 20);
+    let extra_tcp = daemon_lan_endpoint(&node_id, "10.0.0.44:21353".to_string(), 30);
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&node_id, "iroh_public_key_before_tcp"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_before_tcp?relay=https://relay.example./".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+
+    let selected = prefer_bounded_daemon_command_targets(vec![
+        primary.clone(),
+        extra_tcp.clone(),
+        iroh.clone(),
+    ]);
+
+    assert_eq!(selected[0], primary);
+    assert_eq!(selected[1], iroh);
+    assert_eq!(selected[2], extra_tcp);
+}
+
+#[test]
 fn connectivity_sort_prefers_healthy_iroh_over_unreachable_tcp() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-connectivity-sort-{}",

@@ -1613,6 +1613,13 @@ pub fn prefer_bounded_daemon_command_targets(
             selected.push(endpoint.clone());
         }
     }
+    for endpoint in &endpoints {
+        if endpoint.transport == ClusterTransportKind::Iroh
+            && selected_endpoint_ids.insert(endpoint.endpoint_id.clone())
+        {
+            selected.push(endpoint.clone());
+        }
+    }
     for endpoint in endpoints {
         if selected_endpoint_ids.insert(endpoint.endpoint_id.clone()) {
             selected.push(endpoint);
