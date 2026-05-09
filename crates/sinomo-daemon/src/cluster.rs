@@ -2005,8 +2005,12 @@ pub fn commit_cluster_raft_command_with_quorum(
                 sinomo_network::merge_cluster_state_from_peer(state, response.state);
             }
             Ok(response) => failures.push(format!(
-                "{} ({:?}) rejected append: {}",
-                endpoint.address, endpoint.transport, response.detail
+                "{} ({:?}) rejected append: {} (term {}, match_index {})",
+                endpoint.address,
+                endpoint.transport,
+                response.detail,
+                response.append.term,
+                response.append.match_index
             )),
             Err(error) => failures.push(format!(
                 "{} ({:?}) failed: {}",
