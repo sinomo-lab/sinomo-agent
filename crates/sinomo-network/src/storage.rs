@@ -656,6 +656,40 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
             Vec::new()
         }
     };
+    if !kv_members.is_empty() {
+        let local_process_members = state
+            .members
+            .iter()
+            .filter(|member| {
+                cluster_node_is_local_process(&state, &member.node_id)
+                    && member.state.is_authorized()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        state.members = kv_members;
+        for local_member in local_process_members {
+            if let Some(mut kv_member) = state
+                .members
+                .iter()
+                .find(|member| member.node_id == local_member.node_id)
+                .cloned()
+            {
+                let mut local_member = local_member;
+                for endpoint in kv_member.endpoints.drain(..) {
+                    upsert_member_endpoint(&mut local_member, endpoint);
+                }
+                cleanup_member_iroh_endpoints(&mut local_member);
+                upsert_member_record(&mut state, local_member);
+            } else {
+                upsert_member_record(&mut state, local_member);
+            }
+        }
+        state
+            .members
+            .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        cleanup_cluster_iroh_endpoints(&mut state);
+        return Ok(state);
+    }
     for member in kv_members {
         if member.node_id == state.local_node_id
             && let Some(mut local_member) = state

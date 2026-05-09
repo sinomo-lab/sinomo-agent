@@ -1094,6 +1094,66 @@ fn cluster_state_load_does_not_downgrade_local_member_from_kv() {
 }
 
 #[test]
+fn cluster_state_load_drops_remote_members_removed_from_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-removed-member-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_removed_member").expect("cluster");
+    let local_node_id = NodeId::from_legacy_named("node_removed_member_local").expect("local");
+    let remote_node_id = NodeId::from_legacy_named("node_removed_member_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "removed member",
+        local_node_id.clone(),
+        "local",
+        "local-public-key",
+        now,
+    );
+    state.members.push(ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node_id.clone(),
+        "remote",
+        "remote-public-key",
+        now,
+    ));
+    write_cluster_state(&paths, &state).expect("write local state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
+    append_cluster_raft_command(
+        &paths,
+        &local_node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Delete {
+                key: cluster_member_key(&remote_node_id),
+            }],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("remove remote member");
+
+    let loaded = read_cluster_state(&paths).expect("read state");
+    assert_eq!(
+        loaded
+            .members
+            .iter()
+            .map(|member| member.node_id.clone())
+            .collect::<Vec<_>>(),
+        vec![local_node_id]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_read_view_falls_back_to_snapshot_when_local_raft_state_is_corrupt() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-corrupt-read-view-{}",
