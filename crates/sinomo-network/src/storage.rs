@@ -641,6 +641,11 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         return Err(NetworkError::ClusterOrphan);
     }
     let mut state: ClusterBootstrapState = read_object_file(&paths.state)?;
+    let local_member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id && member.state.is_authorized())
+        .cloned();
     let kv_members = match read_cluster_members_from_kv(paths) {
         Ok(members) => members,
         Err(error) => {
@@ -671,6 +676,9 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
     state
         .members
         .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    if let Some(local_member) = local_member {
+        upsert_member_record(&mut state, local_member);
+    }
     cleanup_cluster_iroh_endpoints(&mut state);
     Ok(state)
 }
