@@ -1299,6 +1299,62 @@ fn cluster_network_records_publish_overwrite_and_expire() {
 }
 
 #[test]
+fn raft_config_allows_voter_removal_with_overlapping_quorum() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_raft_config_overlap").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_raft_config_overlap_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_raft_config_overlap_b").expect("node b");
+    let node_c = NodeId::from_legacy_named("node_raft_config_overlap_c").expect("node c");
+    let current = ClusterRaftConfigRecord {
+        cluster_id: cluster_id.clone(),
+        term: 1,
+        kv_revision: 1,
+        voters: vec![node_a.clone(), node_b.clone(), node_c],
+        learners: Vec::new(),
+        non_voting: Vec::new(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let next = ClusterRaftConfigRecord {
+        cluster_id,
+        term: 1,
+        kv_revision: 1,
+        voters: vec![node_a, node_b],
+        learners: Vec::new(),
+        non_voting: Vec::new(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+
+    validate_raft_config_transition(&current, &next).expect("overlapping quorum");
+}
+
+#[test]
+fn raft_config_rejects_voter_removal_without_old_quorum_overlap() {
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_raft_config_no_overlap").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_raft_config_no_overlap_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_raft_config_no_overlap_b").expect("node b");
+    let current = ClusterRaftConfigRecord {
+        cluster_id: cluster_id.clone(),
+        term: 1,
+        kv_revision: 1,
+        voters: vec![node_a.clone(), node_b],
+        learners: Vec::new(),
+        non_voting: Vec::new(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let next = ClusterRaftConfigRecord {
+        cluster_id,
+        term: 1,
+        kv_revision: 1,
+        voters: vec![node_a],
+        learners: Vec::new(),
+        non_voting: Vec::new(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+
+    assert!(validate_raft_config_transition(&current, &next).is_err());
+}
+
+#[test]
 fn cluster_kv_watch_event_log_is_bounded() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-events-{}",

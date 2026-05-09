@@ -1478,16 +1478,24 @@ pub fn validate_raft_config_transition(
         .cloned()
         .collect::<Vec<_>>();
     if !removed_voters.is_empty() {
-        return Err(NetworkError::ClusterReadOnly {
-            detail: format!(
-                "raft voter removal requires a safe reconfiguration protocol; refusing to remove {}",
-                removed_voters
-                    .iter()
-                    .map(NodeId::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        });
+        let retained_voters = current_voters
+            .intersection(&next_voters)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_quorum = current_voters.len() / 2 + 1;
+        let next_quorum = next_voters.len() / 2 + 1;
+        if retained_voters.len() < current_quorum || retained_voters.len() < next_quorum {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "raft voter removal requires overlapping old/new quorum; refusing to remove {}",
+                    removed_voters
+                        .iter()
+                        .map(NodeId::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
     }
     let added_voters = next_voters
         .difference(&current_voters)
