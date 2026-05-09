@@ -1430,7 +1430,7 @@ fn current_cluster_kv_store(
     }
     for endpoint in targets {
         if let Ok(snapshot) =
-            fetch_cluster_kv_snapshot_from_endpoint(&endpoint, DAEMON_CLUSTER_RPC_TIMEOUT)
+            fetch_cluster_kv_snapshot_from_endpoint(&endpoint, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT)
         {
             snapshots.push(snapshot);
         }
@@ -1442,6 +1442,11 @@ fn current_cluster_kv_store(
             detail: "no local or reachable cluster KV snapshot is available".to_string(),
         })?;
     sinomo_network::write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+    sinomo_network::restore_cluster_raft_from_snapshot_if_newer(
+        paths,
+        &state.local_node_id,
+        snapshot.clone(),
+    )?;
     Ok(InProcessKvStore::restore(snapshot))
 }
 

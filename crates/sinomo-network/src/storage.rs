@@ -800,6 +800,24 @@ pub fn open_cluster_raft_kv_node(
     Ok(node)
 }
 
+pub fn restore_cluster_raft_from_snapshot_if_newer(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    snapshot: KvSnapshot,
+) -> Result<bool, NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    if snapshot.revision <= node.store().snapshot().revision {
+        return Ok(false);
+    }
+    node.restore_snapshot(RaftSnapshot {
+        last_included_index: snapshot.revision.0,
+        last_included_term: node.term_at(node.applied_index()).unwrap_or(1),
+        kv: snapshot,
+    })?;
+    mirror_cluster_raft_snapshot(paths, &node)?;
+    Ok(true)
+}
+
 pub async fn open_cluster_raft_kv_node_async(
     paths: &ClusterPaths,
     node_id: &NodeId,
