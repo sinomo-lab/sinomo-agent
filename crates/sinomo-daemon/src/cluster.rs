@@ -54,7 +54,7 @@ pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 180;
 pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 180;
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
-const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 8;
+const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 struct ClusterRaftFanoutGuard;
@@ -2263,6 +2263,8 @@ pub fn replicate_cluster_raft_to_endpoint(
         let rejected_next_index = response.append.match_index.saturating_add(1);
         next_index = if rejected_next_index < next_index {
             rejected_next_index
+        } else if response.append.match_index >= next_index {
+            next_index.saturating_div(2).max(1)
         } else {
             next_index.saturating_sub(1).max(1)
         };
