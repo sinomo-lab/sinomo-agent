@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const DAEMON_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
+pub const DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_millis(750);
 pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2248,7 +2249,8 @@ pub fn replicate_cluster_raft_to_endpoint(
         let request = sinomo_network::build_cluster_raft_append_request_from_next_index(
             paths, state, next_index,
         )?;
-        let response = send_cluster_raft_append(endpoint, &request, DAEMON_CLUSTER_RPC_TIMEOUT)?;
+        let response =
+            send_cluster_raft_append(endpoint, &request, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT)?;
         if response.accepted {
             return Ok(response);
         }
