@@ -1027,6 +1027,45 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
 }
 
 #[test]
+fn cluster_state_read_tolerates_trailing_file_bytes() {
+    use std::io::Write;
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-state-trailing-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id = ClusterId::from_legacy_named("cluster_trailing_state").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_trailing_state").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "trailing state",
+        node_id,
+        "node",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths.state)
+        .expect("open state")
+        .write_all(b"stale-trailing-bytes")
+        .expect("append trailing bytes");
+
+    let loaded = read_cluster_state(&paths).expect("read state with trailing bytes");
+
+    assert_eq!(loaded.cluster_id, cluster_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_state_load_preserves_newer_local_member_records() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-state-merge-{}",

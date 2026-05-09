@@ -2720,7 +2720,18 @@ pub(crate) fn read_object_file<T: serde::de::DeserializeOwned>(
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
-    SinomoObjectCodec::default().decode(&bytes)
+    match SinomoObjectCodec::default().decode(&bytes) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let Some(document_len) = stored_object_document_len(&bytes)? else {
+                return Err(error);
+            };
+            if document_len >= bytes.len() {
+                return Err(error);
+            }
+            SinomoObjectCodec::default().decode(&bytes[..document_len])
+        }
+    }
 }
 
 pub(crate) fn write_object_file<T: Serialize>(
@@ -2782,5 +2793,50 @@ fn sync_directory(path: &std::path::Path) -> Result<(), NetworkError> {
         .map_err(|source| NetworkError::StorageIo {
             path: path.display().to_string(),
             detail: source.to_string(),
+        })
+}
+
+fn stored_object_document_len(bytes: &[u8]) -> Result<Option<usize>, NetworkError> {
+    const HEADER_PREFIX_LEN: usize = 8;
+    if bytes.len() < HEADER_PREFIX_LEN || &bytes[..4] != b"SOBJ" {
+        return Ok(None);
+    }
+    let length_width = usize::from(bytes[6]);
+    let document_len_offset = HEADER_PREFIX_LEN;
+    let document_len_end = document_len_offset
+        .checked_add(length_width)
+        .ok_or_else(|| NetworkError::Serialization {
+            detail: "object document length overflow".to_string(),
+        })?;
+    if bytes.len() < document_len_end {
+        return Ok(None);
+    }
+    let document_len = match length_width {
+        2 => u64::from(u16::from_le_bytes([
+            bytes[document_len_offset],
+            bytes[document_len_offset + 1],
+        ])),
+        4 => u64::from(u32::from_le_bytes([
+            bytes[document_len_offset],
+            bytes[document_len_offset + 1],
+            bytes[document_len_offset + 2],
+            bytes[document_len_offset + 3],
+        ])),
+        8 => u64::from_le_bytes([
+            bytes[document_len_offset],
+            bytes[document_len_offset + 1],
+            bytes[document_len_offset + 2],
+            bytes[document_len_offset + 3],
+            bytes[document_len_offset + 4],
+            bytes[document_len_offset + 5],
+            bytes[document_len_offset + 6],
+            bytes[document_len_offset + 7],
+        ]),
+        _ => return Ok(None),
+    };
+    usize::try_from(document_len)
+        .map(Some)
+        .map_err(|_| NetworkError::Serialization {
+            detail: "object document length does not fit in usize".to_string(),
         })
 }
