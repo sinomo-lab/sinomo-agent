@@ -779,7 +779,7 @@ pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, N
 pub fn read_cluster_kv_snapshot_store(
     paths: &ClusterPaths,
 ) -> Result<InProcessKvStore, NetworkError> {
-    read_cluster_kv_store(paths)
+    read_cluster_kv_snapshot(paths).map(InProcessKvStore::restore)
 }
 
 fn quarantine_unreadable_cluster_raft_view(paths: &ClusterPaths, node_id: &NodeId) {
