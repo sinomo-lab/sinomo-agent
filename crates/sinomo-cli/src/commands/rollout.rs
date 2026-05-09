@@ -702,6 +702,7 @@ pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
         (
             rollout_endpoint_connectivity_score(state, &graph, endpoint),
             endpoint.node_id != shadow_node_id,
+            network::cluster_daemon_command_address_rank(endpoint),
             network::cluster_daemon_command_transport_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
@@ -720,6 +721,7 @@ pub(crate) fn sort_rollout_endpoints_by_connectivity(
         (
             endpoint.node_id.clone(),
             rollout_endpoint_connectivity_score(state, &graph, endpoint),
+            network::cluster_daemon_command_address_rank(endpoint),
             network::cluster_daemon_command_transport_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),

@@ -1701,7 +1701,7 @@ pub fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -
     }
 }
 
-fn cluster_daemon_command_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+pub fn cluster_daemon_command_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
     if !matches!(
         endpoint.transport,
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
