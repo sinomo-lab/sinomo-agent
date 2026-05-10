@@ -19,6 +19,338 @@ use thiserror::Error;
 pub type TaskId = Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentToolSpec {
+    pub kind: AgentToolKind,
+    pub name: String,
+    pub description: String,
+    pub async_default: bool,
+}
+
+impl AgentToolSpec {
+    pub fn new(
+        kind: AgentToolKind,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        async_default: bool,
+    ) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            description: description.into(),
+            async_default,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolKind {
+    StartAsyncTask,
+    InspectAsyncTask,
+    CancelAsyncTask,
+    RunShellCommand,
+    ReadSifs,
+    WriteSifs,
+    ListSifs,
+    ClusterStatus,
+    HandoffToMaid,
+    ObserveVision,
+}
+
+pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
+    vec![
+        AgentToolSpec::new(
+            AgentToolKind::StartAsyncTask,
+            "start_async_task",
+            "Start slow work and return a durable task id immediately.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::InspectAsyncTask,
+            "inspect_async_task",
+            "Read progress, result references, and cancellation state for a task.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::CancelAsyncTask,
+            "cancel_async_task",
+            "Request cancellation for an active background task.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::RunShellCommand,
+            "run_shell_command",
+            "Run a bounded shell command on the selected node.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ReadSifs,
+            "read_sifs",
+            "Read a file from the cluster root filesystem.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::WriteSifs,
+            "write_sifs",
+            "Write a file to an allowed SIFS path.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ListSifs,
+            "list_sifs",
+            "List a SIFS directory with session-aware defaults.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ClusterStatus,
+            "cluster_status",
+            "Summarize local quorum, node placement, and degraded services.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::HandoffToMaid,
+            "handoff_to_maid",
+            "Delegate maintenance, cleanup, rollout, or cluster-health work.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ObserveVision,
+            "observe_vision",
+            "Attach a current screen/camera observation for multimodal reasoning.",
+            false,
+        ),
+    ]
+}
+
+pub fn main_agent_system_prompt(tools: &[AgentToolSpec]) -> String {
+    let tools_json = serde_json::to_string_pretty(tools).expect("tool specs serialize");
+    format!(
+        r#"You are Sinomo, the user-facing main agent.
+
+Operate as a real-time, event-driven agent. Keep live interaction responsive:
+- never block the conversation on slow work;
+- start async tasks for slow shell, research, coding, maintenance, or file work;
+- treat async progress and results as session events;
+- hand cluster maintenance, cleanup, rollout, and diagnostics to the maid agent by default;
+- use SIFS as the default filesystem root;
+- use local MiniCPM-o as the core live model when available, and use stronger models only for deliberate background work.
+
+Return only JSON shaped as:
+{{
+  "response_mode": "answer|acknowledge|clarify|defer|silent",
+  "text": "short user-facing response",
+  "tool_calls": [
+    {{
+      "tool": "tool name",
+      "input": {{}},
+      "async": true,
+      "summary": "why this tool is being used"
+    }}
+  ],
+  "maid_handoff": null,
+  "next_state": "speaking|listening|waiting|delegating|recovering|idle"
+}}
+
+Available tools:
+```json
+{tools_json}
+```"#
+    )
+}
+
+pub fn maid_agent_system_prompt() -> String {
+    "You are Sinomo's maid agent. Stay silent unless escalation is needed. Coalesce maintenance events, inspect evidence through files and tools, prefer minimal operational fixes, and report concise findings back to the main agent.".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AsyncTaskUpdate {
+    pub kind: String,
+    pub task_id: TaskId,
+    pub status: AsyncTaskStatus,
+    pub summary: String,
+    pub needs_user_attention: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<String>,
+    pub next_action_hint: AsyncTaskNextAction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AsyncTaskStatus {
+    Running,
+    Progress,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AsyncTaskNextAction {
+    ContinueSilently,
+    TellUser,
+    AskUser,
+    HandoffToMaid,
+    InspectResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentLoopInput {
+    pub session: InteractionSession,
+    pub latest_event: EventEnvelope,
+    pub context: BoundedContext,
+    #[serde(default)]
+    pub async_update: Option<AsyncTaskUpdate>,
+    #[serde(default)]
+    pub tool_specs: Vec<AgentToolSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentLoopDecision {
+    pub response_mode: AgentLoopResponseMode,
+    pub text: String,
+    #[serde(default)]
+    pub tool_calls: Vec<AgentToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maid_handoff: Option<MaidHandoffRequest>,
+    pub next_state: AgentInteractionState,
+}
+
+impl AgentLoopDecision {
+    pub fn silent() -> Self {
+        Self {
+            response_mode: AgentLoopResponseMode::Silent,
+            text: String::new(),
+            tool_calls: Vec::new(),
+            maid_handoff: None,
+            next_state: AgentInteractionState::Idle,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentLoopResponseMode {
+    Answer,
+    Acknowledge,
+    Clarify,
+    Defer,
+    Silent,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentInteractionState {
+    Speaking,
+    Listening,
+    Waiting,
+    Delegating,
+    Recovering,
+    Idle,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentToolCall {
+    pub tool: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub r#async: bool,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MaidHandoffRequest {
+    pub reason: String,
+    pub evidence_ref: String,
+    pub priority: MaidHandoffPriority,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MaidHandoffPriority {
+    Routine,
+    Important,
+    Emergency,
+}
+
+pub struct MainAgentLoop<M> {
+    model: M,
+    provider: String,
+    model_id: String,
+    tools: Vec<AgentToolSpec>,
+}
+
+impl<M: InteractionModel> MainAgentLoop<M> {
+    pub fn new(model: M, provider: impl Into<String>, model_id: impl Into<String>) -> Self {
+        Self {
+            model,
+            provider: provider.into(),
+            model_id: model_id.into(),
+            tools: default_main_agent_tools(),
+        }
+    }
+
+    pub fn with_tools(mut self, tools: Vec<AgentToolSpec>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn decide(&self, input: &AgentLoopInput) -> Result<AgentLoopDecision, AgentError> {
+        if let Some(update) = &input.async_update
+            && !update.needs_user_attention
+            && update.next_action_hint == AsyncTaskNextAction::ContinueSilently
+        {
+            return Ok(AgentLoopDecision::silent());
+        }
+        let request = self.request(input)?;
+        let response = self.model.complete(&request)?;
+        parse_agent_loop_decision(&response.content)
+    }
+
+    pub fn request(&self, input: &AgentLoopInput) -> Result<LanguageModelRequest, AgentError> {
+        Ok(LanguageModelRequest {
+            provider: self.provider.clone(),
+            model: self.model_id.clone(),
+            messages: vec![
+                LanguageModelMessage {
+                    role: LanguageModelRole::System,
+                    content: main_agent_system_prompt(&self.tools),
+                },
+                LanguageModelMessage {
+                    role: LanguageModelRole::User,
+                    content: serde_json::to_string_pretty(input).map_err(|source| {
+                        AgentError::ModelRequest {
+                            detail: source.to_string(),
+                        }
+                    })?,
+                },
+            ],
+            temperature: Some(0.2),
+            max_output_tokens: Some(900),
+            response_format: LanguageModelResponseFormat::JsonObject,
+            metadata: serde_json::json!({
+                "loop": "main-agent",
+                "session_id": input.session.session_id,
+                "event_id": input.latest_event.event_id
+            }),
+        })
+    }
+}
+
+pub fn parse_agent_loop_decision(raw: &str) -> Result<AgentLoopDecision, AgentError> {
+    let trimmed = raw.trim();
+    let json = trimmed
+        .strip_prefix("```json")
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    serde_json::from_str(json).map_err(|source| AgentError::ModelResponse {
+        detail: format!("{source}: {raw}"),
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct InteractionSession {
     pub session_id: SessionId,
     pub node_id: NodeId,
@@ -433,6 +765,12 @@ fn collect_json_text(value: &serde_json::Value, text: &mut String) {
 pub enum AgentError {
     #[error(transparent)]
     EventStore(#[from] sinomo_runtime::events::EventStoreError),
+    #[error(transparent)]
+    Model(#[from] LanguageModelError),
+    #[error("failed to build model request: {detail}")]
+    ModelRequest { detail: String },
+    #[error("failed to parse model response: {detail}")]
+    ModelResponse { detail: String },
 }
 
 #[cfg(test)]
@@ -445,6 +783,29 @@ mod tests {
     use sinomo_runtime::device::{DeviceId, DeviceState};
     use sinomo_runtime::events::{EventId, EventStore, InMemoryEventStore};
     use sinomo_runtime::node::NodeId;
+
+    struct FakeInteractionModel {
+        response: &'static str,
+    }
+
+    impl InteractionModel for FakeInteractionModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            assert_eq!(
+                request.response_format,
+                LanguageModelResponseFormat::JsonObject
+            );
+            assert!(request.messages[0].content.contains("Available tools"));
+            Ok(LanguageModelResponse {
+                provider: "fake".to_string(),
+                model: "fake".to_string(),
+                content: self.response.to_string(),
+                usage: None,
+            })
+        }
+    }
 
     fn event(id: &str, text: &str, salience: f32) -> EventEnvelope {
         EventEnvelope::new(
@@ -588,5 +949,97 @@ mod tests {
         let action = turn.action_request.expect("action");
         assert_eq!(action.target_node_id, Some(node));
         assert_eq!(action.kind, "ui.inspect.alert");
+    }
+
+    #[test]
+    fn main_agent_loop_requests_json_tool_decision() {
+        let session = InteractionSession::new(
+            SessionId::from_legacy_named("sess_loop").expect("session"),
+            NodeId::from_legacy_named("node_loop").expect("node"),
+            InteractionSurface::new("surface.loop", InteractionSurfaceKind::CommandLine),
+        );
+        let latest_event = user_interaction_input_event(&session, "check the cluster later");
+        let context = BoundedContext {
+            session_id: session.session_id.clone(),
+            events: Vec::new(),
+            packet: ContextPacket::default(),
+        };
+        let loop_input = AgentLoopInput {
+            session,
+            latest_event,
+            context,
+            async_update: None,
+            tool_specs: default_main_agent_tools(),
+        };
+        let agent_loop = MainAgentLoop::new(
+            FakeInteractionModel {
+                response: r#"{
+                    "response_mode": "acknowledge",
+                    "text": "I will check that in the background.",
+                    "tool_calls": [{
+                        "tool": "handoff_to_maid",
+                        "input": {"reason": "cluster check"},
+                        "async": true,
+                        "summary": "Ask maid to inspect cluster health."
+                    }],
+                    "maid_handoff": {
+                        "reason": "cluster health check",
+                        "evidence_ref": "sifs:/services/tasks/task_1/input.json",
+                        "priority": "routine"
+                    },
+                    "next_state": "delegating"
+                }"#,
+            },
+            "fake",
+            "fake",
+        );
+
+        let decision = agent_loop.decide(&loop_input).expect("decision");
+
+        assert_eq!(decision.response_mode, AgentLoopResponseMode::Acknowledge);
+        assert_eq!(decision.tool_calls[0].tool, "handoff_to_maid");
+        assert_eq!(decision.next_state, AgentInteractionState::Delegating);
+    }
+
+    #[test]
+    fn quiet_async_update_does_not_call_model() {
+        let session = InteractionSession::new(
+            SessionId::from_legacy_named("sess_loop").expect("session"),
+            NodeId::from_legacy_named("node_loop").expect("node"),
+            InteractionSurface::new("surface.loop", InteractionSurfaceKind::CommandLine),
+        );
+        let latest_event = user_interaction_input_event(&session, "hello");
+        let context = BoundedContext {
+            session_id: session.session_id.clone(),
+            events: Vec::new(),
+            packet: ContextPacket::default(),
+        };
+        let loop_input = AgentLoopInput {
+            session,
+            latest_event,
+            context,
+            async_update: Some(AsyncTaskUpdate {
+                kind: "async_task_update".to_string(),
+                task_id: TaskId::from_legacy_named("task_background").expect("task"),
+                status: AsyncTaskStatus::Progress,
+                summary: "still running".to_string(),
+                needs_user_attention: false,
+                result_ref: None,
+                next_action_hint: AsyncTaskNextAction::ContinueSilently,
+            }),
+            tool_specs: default_main_agent_tools(),
+        };
+        let agent_loop = MainAgentLoop::new(
+            FakeInteractionModel {
+                response: "this should not be used",
+            },
+            "fake",
+            "fake",
+        );
+
+        let decision = agent_loop.decide(&loop_input).expect("decision");
+
+        assert_eq!(decision.response_mode, AgentLoopResponseMode::Silent);
+        assert!(decision.tool_calls.is_empty());
     }
 }

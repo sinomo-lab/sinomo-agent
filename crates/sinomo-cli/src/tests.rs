@@ -1,14 +1,14 @@
 use super::{
-    CliCommand, CliError, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
-    ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRaftRoleOptions,
-    ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
-    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand,
-    EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions, InteractionModel,
-    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    ModelBackedInteractionHandler, ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions,
-    ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions, SelfRolloutPaths,
-    UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    AgentCliCommand, AgentRunOptions, CliCommand, CliError, ClusterCliCommand, ClusterInitOptions,
+    ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths,
+    ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
+    DaemonCliCommand, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
+    DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
+    DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions,
+    InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, ModelBackedInteractionHandler, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
+    SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
     apply_cluster_raft_role, authenticate_daemon_control_request,
     build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
     cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
@@ -211,9 +211,42 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Dfs(DfsCliCommand::Status(_))
     ));
     assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "run".to_string(),
+            "--prompt".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("agent"),
+        CliCommand::Agent(AgentCliCommand::Run(_))
+    ));
+    assert!(matches!(
         parse_cli_command(&["evolve".to_string()]).expect("evolve help"),
         CliCommand::Evolve(super::EvolveCliCommand::Help)
     ));
+}
+
+#[test]
+fn agent_run_parser_accepts_provider_model_account_and_prompt() {
+    assert_eq!(
+        super::parse_agent_run_options(&[
+            "--provider".to_string(),
+            "codex".to_string(),
+            "--model".to_string(),
+            "gpt-5.2-codex".to_string(),
+            "--account".to_string(),
+            "work".to_string(),
+            "--prompt".to_string(),
+            "check the cluster".to_string(),
+        ])
+        .expect("agent run"),
+        AgentRunOptions {
+            prompt: "check the cluster".to_string(),
+            provider: "codex".to_string(),
+            model: "gpt-5.2-codex".to_string(),
+            account: Some("work".to_string()),
+        }
+    );
 }
 
 #[test]
@@ -1543,6 +1576,65 @@ fn cluster_remove_deletes_non_voter_members_from_state_and_kv() {
         !kv_members
             .iter()
             .any(|member| member.node_id == non_voter_id)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_voter_republishes_local_members_missing_from_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-local-member-republish-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(
+                ClusterId::from_legacy_named("cluster_local_republish").expect("cluster"),
+            ),
+            node_id: Some(NodeId::from_legacy_named("node_local_republish").expect("node")),
+            name: "local republish".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let local_state =
+        super::network::read_cluster_state_without_kv(&paths).expect("state without kv");
+    let shadow_id = shadow_daemon_node_id(&local_state.local_node_id);
+
+    super::network::append_cluster_raft_command_with_response(
+        &paths,
+        &local_state.local_node_id,
+        sinomo_runtime::kv::KvCommand::Op(KvOp::Delete {
+            key: sinomo_runtime::kv::cluster_member_key(&shadow_id),
+        }),
+    )
+    .expect("delete shadow from kv");
+    assert!(
+        !read_cluster_members_from_kv(&paths)
+            .expect("members after delete")
+            .iter()
+            .any(|member| member.node_id == shadow_id)
+    );
+
+    let merged_state = read_cluster_state(&paths).expect("merged local state");
+    assert!(
+        merged_state
+            .members
+            .iter()
+            .any(|member| member.node_id == shadow_id)
+    );
+    sinomo_runtime::daemon::publish_local_members_to_quorum_if_needed(&paths, &merged_state)
+        .expect("republish local members");
+
+    assert!(
+        read_cluster_members_from_kv(&paths)
+            .expect("members after republish")
+            .iter()
+            .any(|member| member.node_id == shadow_id)
     );
     std::fs::remove_dir_all(root).ok();
 }

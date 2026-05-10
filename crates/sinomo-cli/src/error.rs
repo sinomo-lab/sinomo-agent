@@ -87,6 +87,9 @@ impl From<sinomo_agent::AgentError> for CliError {
     fn from(error: sinomo_agent::AgentError) -> Self {
         match error {
             sinomo_agent::AgentError::EventStore(error) => Self::EventStore(error),
+            sinomo_agent::AgentError::Model(error) => Self::LanguageModel(error),
+            sinomo_agent::AgentError::ModelRequest { detail }
+            | sinomo_agent::AgentError::ModelResponse { detail } => Self::Parse { detail },
         }
     }
 }

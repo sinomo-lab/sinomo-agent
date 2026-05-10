@@ -4,9 +4,9 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
 use sinomo_agent::{
-    EventEnvelopeExt, InteractionModel, InteractionOutput, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, interaction_event, interaction_model_request,
-    user_interaction_input_event,
+    AgentLoopInput, BoundedContextBuilder, EventEnvelopeExt, InteractionModel, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, MainAgentLoop,
+    interaction_event, interaction_model_request, user_interaction_input_event,
 };
 use sinomo_evolution::EvolutionJobId;
 #[cfg(test)]
@@ -32,8 +32,8 @@ use sinomo_evolution::{
     write_campaign_stage_evaluation, write_report_record,
 };
 use sinomo_lm::{
-    AnthropicProvider, CODEX_PROVIDER_ID, CurrentDefaultModel, GeminiProvider, GitHubCopilotConfig,
-    GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY, LanguageModelError,
+    AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel, GeminiProvider,
+    GitHubCopilotConfig, GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY, LanguageModelError,
     LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse, ModelConfig,
     ModelPaths, NvidiaProvider, OpenAiProvider, codex_provider, collect_provider_model_catalogs,
     collect_provider_usage, complete_configured_model_request_with_account,
@@ -236,6 +236,7 @@ pub(crate) enum CliCommand {
     Dfs(DfsCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
+    Agent(AgentCliCommand),
     Usage(UsageOptions),
 }
 
@@ -276,11 +277,166 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         Some((command, rest)) if command == "providers" => {
             Ok(CliCommand::Providers(parse_provider_command(rest)?))
         }
+        Some((command, rest)) if command == "agent" => {
+            Ok(CliCommand::Agent(parse_agent_command(rest)?))
+        }
         Some((command, rest)) if command == "usage" => {
             Ok(CliCommand::Usage(parse_usage_options(rest)?))
         }
         _ => Err(CliError::Usage),
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum AgentCliCommand {
+    Run(AgentRunOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentRunOptions {
+    pub prompt: String,
+    pub provider: String,
+    pub model: String,
+    pub account: Option<String>,
+}
+
+pub(crate) fn parse_agent_command(args: &[String]) -> Result<AgentCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "run" => {
+            Ok(AgentCliCommand::Run(parse_agent_run_options(rest)?))
+        }
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions, CliError> {
+    let mut prompt = None;
+    let mut provider = CODEX_PROVIDER_ID.to_string();
+    let mut model = CODEX_DEFAULT_MODEL.to_string();
+    let mut account = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--prompt" => {
+                index += 1;
+                prompt = args.get(index).cloned();
+            }
+            "--provider" => {
+                index += 1;
+                provider = args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--provider requires a value".to_string(),
+                })?;
+            }
+            "--model" => {
+                index += 1;
+                model = args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--model requires a value".to_string(),
+                })?;
+            }
+            "--account" => {
+                index += 1;
+                account = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--account requires a value".to_string(),
+                })?);
+            }
+            value if prompt.is_none() => {
+                prompt = Some(value.to_string());
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent run argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(AgentRunOptions {
+        prompt: prompt.ok_or_else(|| CliError::Parse {
+            detail: "agent run requires --prompt <text>".to_string(),
+        })?,
+        provider,
+        model,
+        account,
+    })
+}
+
+struct ConfiguredInteractionModel {
+    data_dir: SinomoDataDir,
+    provider: String,
+    model: String,
+    account: Option<sinomo_lm::ProviderAccountConfig>,
+}
+
+impl InteractionModel for ConfiguredInteractionModel {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        complete_configured_model_request_with_account(
+            &self.data_dir,
+            &self.provider,
+            &self.model,
+            self.account.as_ref(),
+            None,
+            request,
+        )
+    }
+}
+
+pub(crate) fn run_agent_command(command: AgentCliCommand) -> Result<(), CliError> {
+    match command {
+        AgentCliCommand::Run(options) => run_agent_once(options),
+    }
+}
+
+pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let account = if let Some(account_name) = options.account.as_deref() {
+        let config = load_model_config(&ModelPaths::new(&data_dir))?;
+        provider_account_config(&config, &options.provider, Some(account_name)).cloned()
+    } else {
+        None
+    };
+    let session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_agent_cli").expect("legacy node id"),
+        InteractionSurface::new("cli.agent", InteractionSurfaceKind::CommandLine),
+    );
+    let mut store = InMemoryEventStore::new();
+    let input_event = user_interaction_input_event(&session, &options.prompt);
+    store.append(input_event.clone())?;
+    let context = BoundedContextBuilder::new(12).build(&store, session.session_id.clone())?;
+    let input = AgentLoopInput {
+        session,
+        latest_event: input_event,
+        context,
+        async_update: None,
+        tool_specs: sinomo_agent::default_main_agent_tools(),
+    };
+    let provider = options.provider.clone();
+    let model = options.model.clone();
+    let loop_model = ConfiguredInteractionModel {
+        data_dir,
+        provider: provider.clone(),
+        model: model.clone(),
+        account,
+    };
+    let decision = MainAgentLoop::new(loop_model, provider, model).decide(&input)?;
+    if decision.text.trim().is_empty() {
+        println!("{}", agent_decision_json(&decision)?);
+    } else {
+        println!("{}", decision.text);
+        if !decision.tool_calls.is_empty() || decision.maid_handoff.is_some() {
+            println!("{}", agent_decision_json(&decision)?);
+        }
+    }
+    Ok(())
+}
+
+fn agent_decision_json(decision: &sinomo_agent::AgentLoopDecision) -> Result<String, CliError> {
+    serde_json::to_string_pretty(decision).map_err(|source| CliError::Parse {
+        detail: source.to_string(),
+    })
 }
 
 pub(crate) fn is_help_args(args: &[String]) -> bool {
@@ -319,6 +475,7 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
+        CliCommand::Agent(command) => run_agent_command(command),
         CliCommand::Usage(options) => usage(options),
     }
 }

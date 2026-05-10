@@ -3087,6 +3087,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-benchmarks"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-agent",
+ "sinomo-minicpm",
+ "thiserror",
+]
+
+[[package]]
 name = "sinomo-cli"
 version = "0.1.0"
 dependencies = [
@@ -3097,6 +3108,7 @@ dependencies = [
  "sinomo-agent",
  "sinomo-evolution",
  "sinomo-lm",
+ "sinomo-minicpm",
  "sinomo-runtime",
  "time",
 ]
@@ -3279,6 +3291,16 @@ dependencies = [
  "sinomo-runtime",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "sinomo-minicpm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-lm",
+ "thiserror",
 ]
 
 [[package]]

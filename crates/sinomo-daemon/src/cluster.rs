@@ -624,12 +624,7 @@ pub fn publish_local_members_via_voter(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), DaemonError> {
-    let members: Vec<_> = state
-        .members
-        .iter()
-        .filter(|member| sinomo_network::cluster_member_is_local_process(state, member))
-        .cloned()
-        .collect();
+    let members = local_process_members(state);
     if members.is_empty() {
         return Ok(());
     }
@@ -670,6 +665,40 @@ pub fn publish_local_members_via_voter(
             }
         ),
     })
+}
+
+pub fn publish_local_members_to_quorum_if_needed(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Option<KvSnapshot>, DaemonError> {
+    let members = local_process_members(state);
+    if members.is_empty() {
+        return Ok(None);
+    }
+    if sinomo_network::cluster_member_publish_matches_kv(paths, &members).unwrap_or(false) {
+        return Ok(None);
+    }
+    if sinomo_network::cluster_raft_local_is_voter(state) && cluster_has_local_quorum(paths, state)
+    {
+        let mut commit_state = state.clone();
+        return commit_cluster_kv_txn_with_quorum(
+            paths,
+            &mut commit_state,
+            sinomo_network::cluster_member_publish_txn(&members)?,
+        )
+        .map(Some);
+    }
+    publish_local_members_via_voter(paths, state)?;
+    Ok(None)
+}
+
+fn local_process_members(state: &ClusterBootstrapState) -> Vec<ClusterMemberRecord> {
+    state
+        .members
+        .iter()
+        .filter(|member| sinomo_network::cluster_member_is_local_process(state, member))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug)]
@@ -769,6 +798,11 @@ impl ClusterNetworkMaintenance {
                     &state,
                 ) {
                     let _ = sync_cluster_state_to_kv(&cluster_paths, &state);
+                }
+                if let Err(error) =
+                    publish_local_members_to_quorum_if_needed(&cluster_paths, &state)
+                {
+                    eprintln!("sinomo daemon cluster member publish failed: {error}");
                 }
                 let local_network_info = sinomo_network::build_cluster_network_info_record(
                     &state,

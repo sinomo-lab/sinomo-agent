@@ -11,7 +11,9 @@ It complements the distributed runtime in [architecture.md](architecture.md),
 the cluster control plane in
 [clustering-architecture.md](clustering-architecture.md), the cluster root
 filesystem in [sifs.md](sifs.md), and controlled mutation in
-[self-evolution-architecture.md](self-evolution-architecture.md).
+[self-evolution-architecture.md](self-evolution-architecture.md). Current
+implementation entry points are tracked in
+[agent-system-implementation.md](agent-system-implementation.md).
 
 ## Design Position
 

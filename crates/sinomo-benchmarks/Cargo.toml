@@ -1,0 +1,23 @@
+[package]
+name = "sinomo-benchmarks"
+version.workspace = true
+description = "Optional benchmark environment adapters for Sinomo agents"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "application"
+
+[features]
+default = []
+env-bench = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sinomo-agent = { path = "../sinomo-agent" }
+sinomo-minicpm = { path = "../sinomo-minicpm" }
