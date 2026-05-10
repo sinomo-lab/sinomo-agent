@@ -345,9 +345,24 @@ pub fn parse_agent_loop_decision(raw: &str) -> Result<AgentLoopDecision, AgentEr
         .and_then(|value| value.strip_suffix("```"))
         .map(str::trim)
         .unwrap_or(trimmed);
-    serde_json::from_str(json).map_err(|source| AgentError::ModelResponse {
-        detail: format!("{source}: {raw}"),
-    })
+    match serde_json::from_str(json) {
+        Ok(decision) => Ok(decision),
+        Err(source) => {
+            if trimmed.is_empty() {
+                Err(AgentError::ModelResponse {
+                    detail: format!("{source}: {raw}"),
+                })
+            } else {
+                Ok(AgentLoopDecision {
+                    response_mode: AgentLoopResponseMode::Answer,
+                    text: trimmed.to_string(),
+                    tool_calls: Vec::new(),
+                    maid_handoff: None,
+                    next_state: AgentInteractionState::Listening,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -999,6 +1014,16 @@ mod tests {
         assert_eq!(decision.response_mode, AgentLoopResponseMode::Acknowledge);
         assert_eq!(decision.tool_calls[0].tool, "handoff_to_maid");
         assert_eq!(decision.next_state, AgentInteractionState::Delegating);
+    }
+
+    #[test]
+    fn non_json_model_response_becomes_plain_answer() {
+        let decision = parse_agent_loop_decision("A short plain response.").expect("decision");
+
+        assert_eq!(decision.response_mode, AgentLoopResponseMode::Answer);
+        assert_eq!(decision.text, "A short plain response.");
+        assert!(decision.tool_calls.is_empty());
+        assert_eq!(decision.next_state, AgentInteractionState::Listening);
     }
 
     #[test]

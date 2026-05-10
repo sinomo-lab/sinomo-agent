@@ -9,9 +9,12 @@ side so Rust builds do not depend on local model packages.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -56,12 +59,14 @@ def mock_response(request: dict[str, Any], model: str, device: str) -> dict[str,
         if message.get("role") == "user":
             user_text = message.get("content", "")
     mode = request.get("mode", "text")
-    image = request.get("image_path")
+    image = request.get("image_path") or request.get("image_name")
     suffix = f" image={Path(image).name}" if image else ""
     return {
         "content": f"[mock-minicpm:{mode}] {user_text}{suffix}".strip(),
         "runtime": runtime_status(model, device, "mock runtime"),
         "usage": None,
+        "elapsed_ms": 0,
+        "output_tokens_per_second": None,
     }
 
 
@@ -91,6 +96,56 @@ def load_model(model_id: str, device: str, mode: str):
     return model, "cuda" if use_cuda else "cpu"
 
 
+def request_image_path(request: dict[str, Any], temp_dir: str | None) -> str | None:
+    image_base64 = request.get("image_base64")
+    if image_base64:
+        if temp_dir is None:
+            raise ValueError("image_base64 requires a temporary directory")
+        image_name = Path(request.get("image_name") or "image.png").name
+        image_path = Path(temp_dir) / image_name
+        image_path.write_bytes(base64.b64decode(image_base64))
+        return str(image_path)
+    return request.get("image_path")
+
+
+def complete_loaded_model(
+    model: Any,
+    resolved_device: str,
+    request: dict[str, Any],
+    model_id: str,
+) -> dict[str, Any]:
+    from PIL import Image
+
+    mode = request.get("mode", "text")
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        image_path = request_image_path(request, temp_dir)
+        msgs: list[dict[str, Any]] = []
+        system_prompt = request.get("system_prompt")
+        if system_prompt:
+            msgs.append({"role": "system", "content": system_prompt})
+        for message in request.get("messages", []):
+            role = message.get("role", "user")
+            content: Any = message.get("content", "")
+            if mode in {"vision", "duplex"} and role == "user" and image_path:
+                image = Image.open(image_path).convert("RGB")
+                content = [image, content]
+            msgs.append({"role": role, "content": content})
+
+        response = model.chat(msgs=msgs, use_tts_template=mode in {"audio", "duplex"})
+
+    elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
+    response_text = str(response)
+    output_tokens = max(1, len(response_text.split()))
+    return {
+        "content": response_text,
+        "runtime": runtime_status(model_id, resolved_device, None),
+        "usage": {"output_tokens": output_tokens},
+        "elapsed_ms": elapsed_ms,
+        "output_tokens_per_second": output_tokens / (elapsed_ms / 1000.0),
+    }
+
+
 def run_request(request: dict[str, Any], model_id: str, device: str) -> dict[str, Any]:
     mode = request.get("mode", "text")
     if mode == "probe":
@@ -111,26 +166,7 @@ def run_request(request: dict[str, Any], model_id: str, device: str) -> dict[str
             }
 
     model, resolved_device = load_model(model_id, device, mode)
-    from PIL import Image
-
-    msgs: list[dict[str, Any]] = []
-    system_prompt = request.get("system_prompt")
-    if system_prompt:
-        msgs.append({"role": "system", "content": system_prompt})
-    for message in request.get("messages", []):
-        role = message.get("role", "user")
-        content: Any = message.get("content", "")
-        if mode in {"vision", "duplex"} and role == "user" and request.get("image_path"):
-            image = Image.open(request["image_path"]).convert("RGB")
-            content = [image, content]
-        msgs.append({"role": role, "content": content})
-
-    response = model.chat(msgs=msgs, use_tts_template=mode in {"audio", "duplex"})
-    return {
-        "content": str(response),
-        "runtime": runtime_status(model_id, resolved_device, None),
-        "usage": None,
-    }
+    return complete_loaded_model(model, resolved_device, request, model_id)
 
 
 def main() -> int:

@@ -9,7 +9,8 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo,
     LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -80,6 +81,10 @@ pub struct MiniCpmRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_path: Option<PathBuf>,
     #[serde(default)]
     pub stream: bool,
@@ -106,6 +111,8 @@ impl MiniCpmRequest {
             system_prompt,
             messages,
             image_path: None,
+            image_base64: None,
+            image_name: None,
             audio_path: None,
             stream: false,
             metadata: request.metadata.clone(),
@@ -123,12 +130,16 @@ pub enum MiniCpmMode {
     Probe,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MiniCpmResponse {
     pub content: String,
     pub runtime: MiniCpmRuntimeStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<LanguageModelUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_per_second: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -165,6 +176,8 @@ impl PythonMiniCpmRuntime {
             system_prompt: String::new(),
             messages: Vec::new(),
             image_path: None,
+            image_base64: None,
+            image_name: None,
             audio_path: None,
             stream: false,
             metadata: serde_json::Value::Null,
@@ -248,6 +261,83 @@ impl LanguageModelProvider for PythonMiniCpmRuntime {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RemoteMiniCpmRuntimeConfig {
+    pub endpoint: String,
+    pub timeout_seconds: u64,
+}
+
+impl Default for RemoteMiniCpmRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:32153".to_string(),
+            timeout_seconds: 300,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteMiniCpmRuntime {
+    config: RemoteMiniCpmRuntimeConfig,
+}
+
+impl RemoteMiniCpmRuntime {
+    pub fn new(config: RemoteMiniCpmRuntimeConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn complete(&self, request: MiniCpmRequest) -> Result<MiniCpmResponse, MiniCpmError> {
+        let body = serde_json::to_vec(&request)?;
+        let response = http_post_json(
+            &self.config.endpoint,
+            "/complete",
+            &body,
+            Duration::from_secs(self.config.timeout_seconds),
+        )?;
+        Ok(serde_json::from_slice(&response)?)
+    }
+
+    pub fn probe(&self) -> Result<MiniCpmRuntimeStatus, MiniCpmError> {
+        let response = http_get(
+            &self.config.endpoint,
+            "/health",
+            Duration::from_secs(self.config.timeout_seconds),
+        )?;
+        Ok(serde_json::from_slice(&response)?)
+    }
+}
+
+impl LanguageModelProvider for RemoteMiniCpmRuntime {
+    fn info(&self) -> LanguageModelProviderInfo {
+        LanguageModelProviderInfo {
+            provider: MINICPM_PROVIDER_ID.to_string(),
+            default_model: MINICPM_DEFAULT_MODEL.to_string(),
+            invocation: sinomo_lm::LanguageModelInvocation::Http,
+            supports_json_object: false,
+            supports_tool_permissions: false,
+        }
+    }
+
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let response = self
+            .complete(MiniCpmRequest::from_language_model_request(request))
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: request.model.clone(),
+                detail: source.to_string(),
+            })?;
+        Ok(LanguageModelResponse {
+            provider: MINICPM_PROVIDER_ID.to_string(),
+            model: request.model.clone(),
+            content: response.content,
+            usage: response.usage,
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MiniCpmError {
     #[error("MiniCPM bridge path does not exist: {path}")]
@@ -256,6 +346,8 @@ pub enum MiniCpmError {
     Serde(#[from] serde_json::Error),
     #[error("MiniCPM process error: {detail}")]
     Process { detail: String },
+    #[error("MiniCPM network error: {detail}")]
+    Network { detail: String },
 }
 
 pub fn default_bridge_script() -> PathBuf {
@@ -274,6 +366,100 @@ pub fn ensure_bridge_script(path: &Path) -> Result<(), MiniCpmError> {
 
 pub fn recommended_startup_budget() -> Duration {
     Duration::from_secs(300)
+}
+
+fn http_post_json(
+    endpoint: &str,
+    path: &str,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, MiniCpmError> {
+    http_request(endpoint, "POST", path, Some(body), timeout)
+}
+
+fn http_get(endpoint: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, MiniCpmError> {
+    http_request(endpoint, "GET", path, None, timeout)
+}
+
+fn http_request(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Vec<u8>, MiniCpmError> {
+    let (host, port) = parse_http_endpoint(endpoint)?;
+    let mut addrs =
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|source| MiniCpmError::Network {
+                detail: format!("resolve {host}:{port}: {source}"),
+            })?;
+    let addr = addrs.next().ok_or_else(|| MiniCpmError::Network {
+        detail: format!("no address for {host}:{port}"),
+    })?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|source| MiniCpmError::Network {
+            detail: format!("connect {addr}: {source}"),
+        })?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+    let body = body.unwrap_or(&[]);
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|source| MiniCpmError::Network {
+            detail: format!("write request: {source}"),
+        })?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|source| MiniCpmError::Network {
+            detail: format!("read response: {source}"),
+        })?;
+    parse_http_response(&response)
+}
+
+fn parse_http_endpoint(endpoint: &str) -> Result<(String, u16), MiniCpmError> {
+    let rest = endpoint
+        .strip_prefix("http://")
+        .ok_or_else(|| MiniCpmError::Network {
+            detail: format!("only http:// endpoints are supported: {endpoint}"),
+        })?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| MiniCpmError::Network {
+            detail: format!("endpoint must include a port: {endpoint}"),
+        })?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|source| MiniCpmError::Network {
+            detail: format!("invalid endpoint port `{port}`: {source}"),
+        })?;
+    Ok((host.to_string(), port))
+}
+
+fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, MiniCpmError> {
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| MiniCpmError::Network {
+            detail: "malformed HTTP response".to_string(),
+        })?;
+    let (head, body) = response.split_at(split + 4);
+    let head_text = String::from_utf8_lossy(head);
+    let status = head_text.lines().next().unwrap_or("");
+    if !status.contains(" 200 ") {
+        return Err(MiniCpmError::Network {
+            detail: format!("{status}: {}", String::from_utf8_lossy(body).trim()),
+        });
+    }
+    Ok(body.to_vec())
 }
 
 #[cfg(test)]
@@ -329,6 +515,8 @@ mod tests {
                     content: "hello".to_string(),
                 }],
                 image_path: None,
+                image_base64: None,
+                image_name: None,
                 audio_path: None,
                 stream: false,
                 metadata: serde_json::Value::Null,
@@ -337,5 +525,61 @@ mod tests {
 
         assert!(response.content.contains("hello"));
         assert!(response.runtime.local);
+    }
+
+    #[test]
+    fn remote_runtime_posts_json_to_http_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let size = stream.read(&mut buffer).expect("read");
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(request.starts_with("POST /complete HTTP/1.1"));
+            let body = serde_json::to_string(&MiniCpmResponse {
+                content: "ok".to_string(),
+                runtime: MiniCpmRuntimeStatus {
+                    model: MINICPM_DEFAULT_MODEL.to_string(),
+                    device: MiniCpmDevice::Cuda,
+                    backend: "pytorch-transformers".to_string(),
+                    local: false,
+                    streaming_supported: true,
+                    vision_supported: true,
+                    audio_supported: true,
+                    tts_supported: true,
+                    diagnostic: None,
+                },
+                usage: None,
+                elapsed_ms: Some(10),
+                output_tokens_per_second: Some(100.0),
+            })
+            .expect("json");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+        let runtime = RemoteMiniCpmRuntime::new(RemoteMiniCpmRuntimeConfig {
+            endpoint: format!("http://{addr}"),
+            timeout_seconds: 5,
+        });
+        let response = runtime
+            .complete(MiniCpmRequest {
+                mode: MiniCpmMode::Text,
+                system_prompt: String::new(),
+                messages: vec![],
+                image_path: None,
+                image_base64: None,
+                image_name: None,
+                audio_path: None,
+                stream: false,
+                metadata: serde_json::Value::Null,
+            })
+            .expect("remote response");
+        assert_eq!(response.content, "ok");
+        assert_eq!(response.output_tokens_per_second, Some(100.0));
+        handle.join().expect("server");
     }
 }

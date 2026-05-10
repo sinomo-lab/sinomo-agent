@@ -78,14 +78,20 @@ from harbor.models.agent.context import AgentContext
 
 
 def run_sinomo_agent(prompt: str) -> str:
+    default_provider = "minicpm-o" if os.environ.get("SINOMO_MINICPM_ENDPOINT") else "codex"
+    default_model = (
+        "openbmb/MiniCPM-o-4_5"
+        if default_provider == "minicpm-o"
+        else "gpt-5.2-codex"
+    )
     command = [
         os.environ.get("SINOMO_BIN", "sinomo"),
         "agent",
         "run",
         "--provider",
-        os.environ.get("SINOMO_HARBOR_PROVIDER", "codex"),
+        os.environ.get("SINOMO_HARBOR_PROVIDER", default_provider),
         "--model",
-        os.environ.get("SINOMO_HARBOR_MODEL", "gpt-5.2-codex"),
+        os.environ.get("SINOMO_HARBOR_MODEL", default_model),
         "--prompt",
         prompt,
     ]
@@ -156,9 +162,12 @@ class SinomoHarborAgent(BaseAgent):
 }
 
 pub fn minestudio_smoke_python() -> &'static str {
-    r#"import json
+    r#"import base64
+import json
+import os
 import subprocess
 import tempfile
+import urllib.request
 from pathlib import Path
 
 from PIL import Image
@@ -177,6 +186,20 @@ def main():
             "stream": False,
             "metadata": {"benchmark": "minestudio-smoke"},
         }
+        endpoint = os.environ.get("SINOMO_MINICPM_ENDPOINT")
+        if endpoint:
+            request.pop("image_path", None)
+            request["image_name"] = image_path.name
+            request["image_base64"] = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            http_request = urllib.request.Request(
+                endpoint.rstrip("/") + "/complete",
+                data=json.dumps(request).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(http_request, timeout=300) as response:
+                print(response.read().decode("utf-8"))
+            return 0
         proc = subprocess.run(
             ["sinomo-minicpm-bridge"],
             input=json.dumps(request),

@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 import tempfile
+import urllib.request
+import base64
 from pathlib import Path
 
 from PIL import Image
@@ -28,6 +30,20 @@ def main() -> int:
             "stream": False,
             "metadata": {"benchmark": "minestudio-smoke"},
         }
+        endpoint = os.environ.get("SINOMO_MINICPM_ENDPOINT")
+        if endpoint:
+            request.pop("image_path", None)
+            request["image_name"] = image_path.name
+            request["image_base64"] = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            http_request = urllib.request.Request(
+                endpoint.rstrip("/") + "/complete",
+                data=json.dumps(request).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(http_request, timeout=300) as response:
+                print(response.read().decode("utf-8"))
+            return 0
         env = dict(os.environ)
         env.setdefault("SINOMO_MINICPM_MOCK", "1")
         proc = subprocess.run(

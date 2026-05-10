@@ -45,6 +45,10 @@ use sinomo_lm::{
     save_provider_api_key_in_model_config, subscription_usage_provider_ids,
     test_provider_account_credentials, test_provider_credentials, write_default_model_config,
 };
+use sinomo_minicpm::{
+    MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, MiniCpmDevice, MiniCpmRuntimeConfig,
+    PythonMiniCpmRuntime, RemoteMiniCpmRuntime, RemoteMiniCpmRuntimeConfig,
+};
 #[cfg(test)]
 use sinomo_runtime::core::EvolutionJobStatus;
 use sinomo_runtime::core::{
@@ -371,6 +375,55 @@ impl InteractionModel for ConfiguredInteractionModel {
         &self,
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if self.provider == MINICPM_PROVIDER_ID {
+            let model = if self.model == sinomo_lm::PROVIDER_DEFAULT_MODEL {
+                MINICPM_DEFAULT_MODEL.to_string()
+            } else {
+                self.model.clone()
+            };
+            if let Ok(endpoint) = std::env::var("SINOMO_MINICPM_ENDPOINT") {
+                let provider = RemoteMiniCpmRuntime::new(RemoteMiniCpmRuntimeConfig {
+                    endpoint,
+                    timeout_seconds: std::env::var("SINOMO_MINICPM_TIMEOUT_SECONDS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(300),
+                });
+                return sinomo_lm::LanguageModelProvider::complete(
+                    &provider,
+                    &LanguageModelRequest {
+                        provider: self.provider.clone(),
+                        model,
+                        ..request.clone()
+                    },
+                );
+            }
+            let provider = PythonMiniCpmRuntime::new(MiniCpmRuntimeConfig {
+                python: std::env::var_os("SINOMO_MINICPM_PYTHON")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("python3")),
+                model,
+                device: match std::env::var("SINOMO_MINICPM_DEVICE").as_deref() {
+                    Ok("cpu") => MiniCpmDevice::Cpu,
+                    Ok("cuda") => MiniCpmDevice::Cuda,
+                    _ => MiniCpmDevice::Auto,
+                },
+                timeout_seconds: std::env::var("SINOMO_MINICPM_TIMEOUT_SECONDS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(300),
+                mock: std::env::var("SINOMO_MINICPM_MOCK").as_deref() == Ok("1"),
+                ..MiniCpmRuntimeConfig::default()
+            });
+            return sinomo_lm::LanguageModelProvider::complete(
+                &provider,
+                &LanguageModelRequest {
+                    provider: self.provider.clone(),
+                    model: self.model.clone(),
+                    ..request.clone()
+                },
+            );
+        }
         complete_configured_model_request_with_account(
             &self.data_dir,
             &self.provider,
