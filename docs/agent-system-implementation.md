@@ -13,7 +13,7 @@ provider adapter. PyTorch and Transformers stay isolated in
 The checked-in bridge supports:
 
 - text requests;
-- vision requests with an image path;
+- vision requests with an image path or base64 image payload;
 - audio and duplex request modes in the stable schema;
 - a probe mode for dependency diagnostics;
 - `SINOMO_MINICPM_MOCK=1` for CI and benchmark harness smoke tests without
@@ -41,8 +41,26 @@ Local probe status from this implementation pass:
 - `torch.cuda.is_available()` is false on the local host, so the full 9B
   PyTorch model was not loaded here.
 - a Windows node with an RTX 3090 was able to load `openbmb/MiniCPM-o-4_5`
-  through `sinomo-minicpm-bridge` with CUDA after pinning
-  `transformers==4.53.3`; the smoke request returned a short text response.
+  through the long-running `sinomo-minicpm-server` with CUDA after pinning
+  `transformers==4.53.3`; text and vision smoke requests completed through
+  the remote HTTP runtime.
+
+When the Windows firewall blocks direct inbound traffic to the MiniCPM server,
+run the local MCP forwarding proxy and point benchmark tools at it:
+
+```sh
+SINOMO_WINDOWS_MCP_URL=http://<windows-host>:39999/mcp \
+SINOMO_WINDOWS_MCP_SESSION=<mcp-session-id> \
+python3 crates/sinomo-benchmarks/minicpm_mcp_proxy.py --bind 127.0.0.1 --port 32154
+SINOMO_MINICPM_ENDPOINT=http://127.0.0.1:32154 sinomo agent run \
+  --provider minicpm-o \
+  --model openbmb/MiniCPM-o-4_5 \
+  --prompt "Return a short acknowledgement."
+```
+
+The proxy forwards `/health` and `/complete` through the Windows MCP
+PowerShell channel to the MiniCPM server's Windows-local endpoint. This keeps
+Docker benchmarks on the Linux host independent of Windows firewall state.
 
 ## Main Agent Loop
 
@@ -99,7 +117,8 @@ MineStudio is represented through a vision-path smoke:
   `crates/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py`.
 
 The smoke script uses `SINOMO_MINICPM_MOCK=1` by default so it validates the
-vision request path without requiring the full MiniCPM-o model.
+vision request path without requiring the full MiniCPM-o model. Set
+`SINOMO_MINICPM_ENDPOINT` to run it against a live remote MiniCPM server.
 
 Live smoke status from this implementation pass:
 
@@ -110,10 +129,17 @@ Live smoke status from this implementation pass:
 - `PATH=target/debug:$PATH SINOMO_MINICPM_MOCK=1 python3
   crates/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py` completed
   and returned a MiniCPM vision-mode response from the mock bridge;
-- direct import of the Harbor adapter inside a networked container with
-  workspace source mounted was rejected by the sandbox escalation reviewer as
-  an exfiltration risk. A safer follow-up check installed Harbor into a local
-  Docker image with no workspace mounted, then ran an offline
-  `--network none` import with only
-  `crates/sinomo-benchmarks/harbor/sinomo_harbor_agent.py` mounted read-only;
-  this printed `sinomo`.
+- `SINOMO_MINICPM_ENDPOINT=http://127.0.0.1:32154 sinomo agent run
+  --provider minicpm-o ...` completed through the Windows RTX 3090 server;
+- `docker run --rm --network host ... python
+  /tmp/sinomo_minestudio_smoke.py` completed through the same live MiniCPM
+  endpoint and reported about 7.5 estimated output tokens/sec for the short
+  vision smoke;
+- a longer text completion through the Windows RTX 3090 endpoint reported 79
+  estimated output tokens in 4272 ms, or about 18.5 estimated output
+  tokens/sec;
+- `harbor run -d terminal-bench/terminal-bench-2 -l 1 -n 1
+  --agent-import-path sinomo_harbor_agent:SinomoHarborAgent
+  --disable-verification` completed one Terminal-Bench task with zero
+  adapter exceptions. The sampled task was not solved by the current minimal
+  adapter, so this is an integration smoke rather than a performance result.

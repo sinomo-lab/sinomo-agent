@@ -2,6 +2,7 @@ import json
 import os
 import shlex
 import subprocess
+from pathlib import Path
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
@@ -35,6 +36,11 @@ def run_sinomo_agent(prompt: str) -> str:
     return proc.stdout.strip()
 
 
+def exec_output_text(result, field: str) -> str:
+    value = getattr(result, field, None)
+    return value if value is not None else ""
+
+
 class SinomoHarborAgent(BaseAgent):
     @staticmethod
     def name() -> str:
@@ -61,11 +67,12 @@ class SinomoHarborAgent(BaseAgent):
         context: AgentContext,
     ) -> None:
         first_probe = await environment.exec("pwd && find . -maxdepth 2 -type f | sort | head -80")
+        first_probe_stdout = exec_output_text(first_probe, "stdout")
         prompt = json.dumps(
             {
                 "benchmark": "terminalbench-harbor",
                 "instruction": instruction,
-                "environment_probe": first_probe.stdout,
+                "environment_probe": first_probe_stdout,
                 "available_action": "Return a concise shell plan. The adapter will execute one bounded shell command if it is safe.",
             },
             indent=2,
@@ -74,18 +81,29 @@ class SinomoHarborAgent(BaseAgent):
         safe_command = "true"
         if "pytest" in decision:
             safe_command = "pytest -q"
-        elif "test.sh" in first_probe.stdout:
+        elif "test.sh" in first_probe_stdout:
             safe_command = "bash test.sh"
         elif "ls" in decision:
             safe_command = "ls -la"
         result = await environment.exec(safe_command)
-        context.output = (
+        stdout = exec_output_text(result, "stdout")
+        stderr = exec_output_text(result, "stderr")
+        output = (
             "sinomo_decision:\n"
             + decision
             + "\n\nexecuted:\n"
             + shlex.quote(safe_command)
             + "\n\nstdout:\n"
-            + result.stdout
+            + stdout
             + "\nstderr:\n"
-            + result.stderr
+            + stderr
         )
+        logs_dir = Path(self.logs_dir)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        output_path = logs_dir / "sinomo-output.txt"
+        output_path.write_text(output)
+        context.metadata = {
+            **(context.metadata or {}),
+            "sinomo_output": str(output_path),
+            "sinomo_command": safe_command,
+        }
