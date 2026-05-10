@@ -24,6 +24,14 @@ upstream docs recommend a Linux NVIDIA GPU with more than 28 GB VRAM for the
 full PyTorch demo. CPU mode is useful for dependency and wiring checks, but it
 is not expected to be fast enough for interactive full-duplex operation.
 
+MiniCPM-o 4.5 currently depends on trusted remote model code that uses the
+Transformers 4.53 cache API. Use `transformers==4.53.3`; newer 4.x builds can
+load the checkpoint but fail at generation with `DynamicCache.seen_tokens`
+compatibility errors, and Transformers 5.x fails earlier in model loading.
+The Windows CUDA smoke also required `minicpmo`, `onnx`, `onnxruntime`,
+`hyperpyyaml`, and `diffusers` in addition to the base `torch`, `PIL`, and
+`accelerate` dependencies.
+
 Local probe status from this implementation pass:
 
 - an isolated Python 3.11 venv at `/tmp/sinomo-minicpm-venv` can import
@@ -32,6 +40,9 @@ Local probe status from this implementation pass:
   sinomo-minicpm-bridge` reports MiniCPM dependencies are importable;
 - `torch.cuda.is_available()` is false on the local host, so the full 9B
   PyTorch model was not loaded here.
+- a Windows node with an RTX 3090 was able to load `openbmb/MiniCPM-o-4_5`
+  through `sinomo-minicpm-bridge` with CUDA after pinning
+  `transformers==4.53.3`; the smoke request returned a short text response.
 
 ## Main Agent Loop
 

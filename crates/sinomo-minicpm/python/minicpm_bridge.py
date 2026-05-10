@@ -16,6 +16,26 @@ from pathlib import Path
 from typing import Any
 
 
+MIN_TRANSFORMERS_VERSION = (4, 53)
+MAX_TRANSFORMERS_VERSION = (4, 54)
+
+
+def parse_version_prefix(version: str) -> tuple[int, int]:
+    parts = version.split(".", 2)
+    if len(parts) < 2:
+        raise ValueError(f"unsupported transformers version format: {version}")
+    return int(parts[0]), int(parts[1])
+
+
+def ensure_transformers_compatible(transformers_module: Any) -> None:
+    version = parse_version_prefix(transformers_module.__version__)
+    if version < MIN_TRANSFORMERS_VERSION or version >= MAX_TRANSFORMERS_VERSION:
+        raise RuntimeError(
+            "MiniCPM-o 4.5 trusted remote code requires transformers>=4.53,<4.54; "
+            f"found transformers {transformers_module.__version__}"
+        )
+
+
 def runtime_status(model: str, device: str, diagnostic: str | None = None) -> dict[str, Any]:
     return {
         "model": model,
@@ -47,8 +67,10 @@ def mock_response(request: dict[str, Any], model: str, device: str) -> dict[str,
 
 def load_model(model_id: str, device: str, mode: str):
     import torch
+    import transformers
     from transformers import AutoModel
 
+    ensure_transformers_compatible(transformers)
     use_cuda = device == "cuda" or (device == "auto" and torch.cuda.is_available())
     torch_dtype = torch.bfloat16 if use_cuda else torch.float32
     init_vision = mode in {"vision", "duplex"}
@@ -74,7 +96,8 @@ def run_request(request: dict[str, Any], model_id: str, device: str) -> dict[str
     if mode == "probe":
         try:
             import torch  # noqa: F401
-            import transformers  # noqa: F401
+            import transformers
+            ensure_transformers_compatible(transformers)
             return {
                 "content": "MiniCPM dependencies are importable.",
                 "runtime": runtime_status(model_id, device, None),
