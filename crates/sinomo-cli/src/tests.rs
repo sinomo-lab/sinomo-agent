@@ -250,6 +250,24 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
 }
 
 #[test]
+fn cluster_repair_members_parser_accepts_peer_and_promotion() {
+    assert_eq!(
+        super::parse_cluster_command(&[
+            "repair-members".to_string(),
+            "--from".to_string(),
+            "10.0.0.2:21353".to_string(),
+            "--promote".to_string(),
+            "01kr3jcdha49k8z4qdp9n3wvr8".to_string(),
+        ])
+        .expect("repair members"),
+        ClusterCliCommand::RepairMembers(super::ClusterRepairMembersOptions {
+            from: "10.0.0.2:21353".to_string(),
+            promote: Some(NodeId::new("01kr3jcdha49k8z4qdp9n3wvr8".to_string()).expect("node")),
+        })
+    );
+}
+
+#[test]
 fn install_parser_accepts_custom_daemon_ports() {
     assert_eq!(
         parse_install_options(&[

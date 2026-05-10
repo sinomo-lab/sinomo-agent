@@ -68,6 +68,10 @@ pub(super) fn print_cluster_help() {
     println!("      Change the documented node role in quorum-backed cluster membership.");
     println!("  sinomo cluster raft-role <node-id> <voter|learner|non-voting>");
     println!("      Change the Raft membership state through quorum-backed cluster membership.");
+    println!("  sinomo cluster repair-members --from <host:port> [--promote <node-id>]");
+    println!(
+        "      Import same-cluster members from a reachable peer snapshot, then optionally promote one."
+    );
     println!("  sinomo cluster remove <node-id> [node-id ...]");
     println!("      Remove non-voter members from quorum-backed cluster membership.");
     println!("  sinomo cluster status");

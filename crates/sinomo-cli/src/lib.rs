@@ -56,7 +56,6 @@ use sinomo_runtime::core::{
 use sinomo_runtime::daemon::read_cluster_kv_snapshot as daemon_read_cluster_kv_snapshot;
 #[cfg(test)]
 use sinomo_runtime::daemon::send_cluster_join_registration_to_endpoint as daemon_send_cluster_join_registration_to_endpoint;
-#[cfg(test)]
 use sinomo_runtime::daemon::sync_cluster_state_to_kv as daemon_sync_cluster_state_to_kv;
 #[cfg(test)]
 use sinomo_runtime::daemon::{
@@ -164,7 +163,7 @@ use sinomo_runtime::dfs::{DfsFileSystemId, DfsObjectId};
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
-use sinomo_runtime::kv::{KvError, KvSnapshot};
+use sinomo_runtime::kv::{InProcessKvStore, KvError, KvSnapshot};
 #[cfg(test)]
 use sinomo_runtime::kv::{KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;

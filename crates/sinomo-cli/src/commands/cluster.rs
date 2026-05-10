@@ -46,6 +46,7 @@ pub(crate) enum ClusterCliCommand {
     Join(ClusterJoinOptions),
     Role(ClusterRoleOptions),
     RaftRole(ClusterRaftRoleOptions),
+    RepairMembers(ClusterRepairMembersOptions),
     Remove(ClusterRemoveOptions),
     Status,
     Health,
@@ -99,6 +100,12 @@ pub(crate) struct ClusterRaftRoleOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterRepairMembersOptions {
+    pub(crate) from: String,
+    pub(crate) promote: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClusterRemoveOptions {
     pub(crate) node_ids: Vec<NodeId>,
 }
@@ -137,6 +144,9 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         Some((command, rest)) if command == "promote" => Ok(ClusterCliCommand::RaftRole(
             parse_cluster_promote_options(rest)?,
         )),
+        Some((command, rest)) if matches!(command.as_str(), "repair-members" | "repair") => Ok(
+            ClusterCliCommand::RepairMembers(parse_cluster_repair_members_options(rest)?),
+        ),
         Some((command, rest)) if matches!(command.as_str(), "remove" | "rm") => Ok(
             ClusterCliCommand::Remove(parse_cluster_remove_options(rest)?),
         ),
@@ -323,6 +333,47 @@ pub(crate) fn parse_cluster_promote_options(
     }
 }
 
+pub(crate) fn parse_cluster_repair_members_options(
+    args: &[String],
+) -> Result<ClusterRepairMembersOptions, CliError> {
+    let mut from = None;
+    let mut promote = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--from" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                from = Some(non_empty_address(value)?);
+            }
+            "--promote" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                promote = Some(
+                    NodeId::new(value.clone()).map_err(|source| CliError::Parse {
+                        detail: format!("invalid node id `{value}`: {source}"),
+                    })?,
+                );
+            }
+            value if from.is_none() => {
+                from = Some(non_empty_address(value)?);
+            }
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(ClusterRepairMembersOptions {
+        from: from.ok_or_else(|| CliError::Parse {
+            detail: "cluster repair-members requires --from <host:port>".to_string(),
+        })?,
+        promote,
+    })
+}
+
 pub(crate) fn parse_cluster_remove_options(
     args: &[String],
 ) -> Result<ClusterRemoveOptions, CliError> {
@@ -405,6 +456,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Role(options) => cluster_role(options),
         ClusterCliCommand::RaftRole(options) => cluster_raft_role(options),
+        ClusterCliCommand::RepairMembers(options) => cluster_repair_members(options),
         ClusterCliCommand::Remove(options) => cluster_remove(options),
         ClusterCliCommand::Status => cluster_status(),
         ClusterCliCommand::Health => cluster_health(),
@@ -968,6 +1020,89 @@ pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), C
         format_member_role(&update.role),
         format_member_state(&update.state)
     );
+    Ok(())
+}
+
+pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
+    let mut state = read_cluster_state(&paths)?;
+    let peer_snapshot = daemon_fetch_cluster_kv_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?;
+    let peer_store = InProcessKvStore::restore(peer_snapshot);
+    let existing_nodes = state
+        .members
+        .iter()
+        .map(|member| member.node_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut imported = Vec::new();
+    for entry in peer_store.range_prefix("/cluster/members/") {
+        let mut member: ClusterMemberRecord = entry.decode()?;
+        if member.cluster_id != state.cluster_id || existing_nodes.contains(&member.node_id) {
+            continue;
+        }
+        for endpoint_entry in
+            peer_store.range_prefix(&network::cluster_endpoint_prefix(&member.node_id))
+        {
+            let endpoint: ClusterEndpointRecord = endpoint_entry.decode()?;
+            if !member
+                .endpoints
+                .iter()
+                .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+            {
+                member.endpoints.push(endpoint);
+            }
+        }
+        if matches!(member.role, ClusterMemberRole::Voter)
+            || matches!(member.state, ClusterMemberState::Voter)
+        {
+            member.role = ClusterMemberRole::Learner;
+            member.state = ClusterMemberState::Learner;
+        }
+        member.updated_at = OffsetDateTime::now_utc();
+        imported.push(member);
+    }
+    if imported.is_empty() {
+        println!(
+            "cluster members already include peer records from {}",
+            options.from
+        );
+    } else {
+        for member in &imported {
+            println!(
+                "importing cluster member {} as {} {}",
+                member.node_id,
+                format_member_role(&member.role),
+                format_member_state(&member.state)
+            );
+        }
+        state.members.extend(imported);
+        daemon_sync_cluster_state_to_kv(&paths, &state)?;
+    }
+
+    if let Some(node_id) = options.promote {
+        let update = daemon_update_cluster_raft_role(
+            &paths,
+            node_id,
+            ClusterMemberRole::Voter,
+            OffsetDateTime::now_utc(),
+        )?;
+        if update.changed {
+            println!(
+                "cluster member {} raft role changed: {} {} -> {} {}",
+                update.node_id,
+                format_member_role(&update.previous_role),
+                format_member_state(&update.previous_state),
+                format_member_role(&update.role),
+                format_member_state(&update.state)
+            );
+        } else {
+            println!(
+                "cluster member {} already has raft role {}",
+                update.node_id,
+                format_member_role(&update.role)
+            );
+        }
+    }
     Ok(())
 }
 
