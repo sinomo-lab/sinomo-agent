@@ -1,8 +1,10 @@
 //! Ingress adapter and normalized stream chunk skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_runtime::core::{DeviceId, EventSpan, NodeId, SessionId, Source};
-use sinomo_runtime::device::DeviceProfile;
+use sinomo_runtime::core::{EventSpan, Source};
+use sinomo_runtime::device::{DeviceId, DeviceProfile};
+use sinomo_runtime::events::SessionId;
+use sinomo_runtime::node::NodeId;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -147,7 +149,7 @@ pub enum GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_runtime::core::NodeId;
+    use sinomo_runtime::node::NodeId;
 
     #[test]
     fn synthetic_audio_chunk_carries_node_and_device_provenance() {

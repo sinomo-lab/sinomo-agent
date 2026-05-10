@@ -9,6 +9,9 @@ mod protocol;
 mod source;
 mod state;
 
+pub type RolloutPlanId = sinomo_core::Id;
+pub type ScorecardId = sinomo_core::Id;
+
 pub use artifact::{
     activate_staged_rollout_binary, binary_should_update, current_executable_path,
     current_executable_should_update, install_binary_atomically, install_current_executable,

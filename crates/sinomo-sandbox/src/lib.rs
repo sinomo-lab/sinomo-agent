@@ -2,16 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactId, Confidence, DfsObjectId, EventEnvelope, EventId, EventKind, EvolutionJob,
-    EvolutionJobId, LatencyClass, ModuleResourceLimits, NodeId, PrivacyClass, RoutingMetadata,
-    RoutingScope, Salience, Source, WorkspaceId,
+    Confidence, EventEnvelope, EventKind, EvolutionJob, Id, LatencyClass, ModuleResourceLimits,
+    PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
 };
+use sinomo_dfs::DfsObjectId;
+use sinomo_events::EventId;
+use sinomo_module::ArtifactId;
+use sinomo_node::NodeId;
 use thiserror::Error;
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SandboxWorkspaceSnapshot {
-    pub workspace_id: WorkspaceId,
+    pub workspace_id: Id,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub object_ids: Vec<DfsObjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,7 +49,7 @@ pub struct SandboxRunRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SandboxRunResult {
-    pub job_id: EvolutionJobId,
+    pub job_id: Id,
     pub candidate_artifact_id: ArtifactId,
     pub status: SandboxRunStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -158,6 +161,9 @@ mod tests {
     use sinomo_core::{
         EvaluationGate, EvolutionJobStatus, EvolutionScope, RollbackPolicy, TrustRing,
     };
+
+    type EvolutionJobId = Id;
+    type WorkspaceId = Id;
 
     #[test]
     fn sandbox_run_passes_when_scope_and_commands_pass() {

@@ -407,7 +407,7 @@ impl MdnsDiscoveryRecord {
             record_id,
             cluster_id,
             endpoint: ClusterEndpointRecord {
-                endpoint_id: sinomo_core::ClusterEndpointId::generate(),
+                endpoint_id: ClusterEndpointId::generate(),
                 node_id,
                 transport: ClusterTransportKind::LanQuic,
                 address,

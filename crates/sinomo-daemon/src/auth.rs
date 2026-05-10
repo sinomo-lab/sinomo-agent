@@ -3,9 +3,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use sinomo_core::{ClusterInviteId, ClusterJoinInvite, ClusterMemberRole, ClusterMemberState};
+use sinomo_core::{ClusterJoinInvite, ClusterMemberRole, ClusterMemberState};
 use sinomo_local::SinomoDataDir;
-use sinomo_network::ClusterPaths;
+use sinomo_network::{ClusterInviteId, ClusterPaths};
 use sinomo_node::{
     NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
     load_or_create_node_identity,
@@ -55,7 +55,7 @@ pub struct ClusterInviteChallengeRequest {
 pub struct ClusterInviteChallengeProof {
     pub protocol: String,
     pub invite_id: ClusterInviteId,
-    pub cluster_id: sinomo_core::ClusterId,
+    pub cluster_id: sinomo_network::ClusterId,
     pub responder_node_id: String,
     pub responder_public_key: String,
     pub challenge: String,
@@ -631,7 +631,7 @@ fn cluster_invite_signing_payload(invite: &ClusterJoinInvite) -> Result<String, 
 
 fn cluster_invite_challenge_signing_payload(
     invite_id: &ClusterInviteId,
-    cluster_id: &sinomo_core::ClusterId,
+    cluster_id: &sinomo_network::ClusterId,
     responder_node_id: &str,
     responder_public_key: &str,
     challenge: &str,

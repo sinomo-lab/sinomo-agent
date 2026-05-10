@@ -1,10 +1,8 @@
 //! Artifact registry metadata skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
-    ArtifactId, ArtifactManifest, EvaluationScorecard, EvolutionJobId, ModuleId, PolicyDecision,
-    RolloutPlan,
-};
+use sinomo_core::{ArtifactManifest, EvaluationScorecard, Id, PolicyDecision, RolloutPlan};
+use sinomo_module::{ArtifactId, ModuleId};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -24,7 +22,7 @@ pub struct RegistryEntry {
 pub struct CandidateRecord {
     pub artifact: ArtifactManifest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_job_id: Option<EvolutionJobId>,
+    pub source_job_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scorecard: Option<EvaluationScorecard>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -112,9 +110,12 @@ pub enum RegistryError {
 mod tests {
     use super::*;
     use sinomo_core::{
-        ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
-        ModuleId, ModuleManifest, PolicyAction, PolicyDecision, PolicyDecisionId, TrustRing,
+        ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CapabilityDiff, Id,
+        ModuleManifest, PolicyAction, PolicyDecision, TrustRing,
     };
+
+    type PolicyDecisionId = Id;
+    type EvolutionJobId = Id;
 
     #[test]
     fn registry_tracks_latest_approved_artifact_for_module() {

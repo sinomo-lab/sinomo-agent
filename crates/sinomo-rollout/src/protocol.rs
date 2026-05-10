@@ -143,11 +143,13 @@ pub fn prepare_rollout_cluster_targets(
 mod tests {
     use super::*;
     use sinomo_core::{
-        CapabilityName, ClusterEndpointRecord, ClusterId, ClusterMemberRecord,
-        ClusterTransportKind, NodeId,
+        CapabilityName, ClusterEndpointRecord, ClusterMemberRecord, ClusterTransportKind, Id,
     };
+    use sinomo_node::NodeId;
     use std::time::{SystemTime, UNIX_EPOCH};
     use time::OffsetDateTime;
+
+    type ClusterId = Id;
 
     #[test]
     fn prepare_cluster_rollout_binary_request_reads_and_encodes_binary() {

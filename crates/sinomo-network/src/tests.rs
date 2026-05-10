@@ -2,17 +2,18 @@ use crate::prelude::*;
 use crate::*;
 
 use sinomo_core::{
-    CapabilityName, ClusterCertificate, ClusterCertificateId, ClusterEndpointPrivacy,
-    ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterMemberRecord,
-    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRolloutStatus,
-    ClusterNodeStatusRecord, ClusterTransportKind, Confidence, EventEnvelope, EventId, EventKind,
-    LatencyClass, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
+    CapabilityName, ClusterCertificate, ClusterEndpointPrivacy, ClusterEndpointRecord,
+    ClusterEndpointSource, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
+    ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
+    ClusterTransportKind, Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass,
+    RoutingMetadata, RoutingScope, Salience, Source,
 };
-use sinomo_events::{EventStore, InMemoryEventStore, ReplayQuery};
+use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
     InProcessKvStore, KvCommand, KvCompare, KvEntry, KvEventKind, KvOp, KvRevision, KvSnapshot,
     KvTxn, LeaseId, cluster_member_key,
 };
+use sinomo_node::NodeId;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -227,8 +228,7 @@ fn invite_channel_uri_uses_compact_iroh_endpoint() {
         last_observed_latency_ms: Some(42),
     };
     let invite = ClusterJoinInvite {
-        invite_id: sinomo_core::ClusterInviteId::from_legacy_named("invite_full_iroh")
-            .expect("invite"),
+        invite_id: ClusterInviteId::from_legacy_named("invite_full_iroh").expect("invite"),
         cluster_id,
         cluster_name: Some("full iroh".to_string()),
         cluster_public_key: "cluster-pk".to_string(),
@@ -369,8 +369,7 @@ fn join_registration_channels_prioritize_iroh_before_direct_lan() {
         last_observed_latency_ms: None,
     };
     let invite = ClusterJoinInvite {
-        invite_id: sinomo_core::ClusterInviteId::from_legacy_named("invite_iroh_first")
-            .expect("invite"),
+        invite_id: ClusterInviteId::from_legacy_named("invite_iroh_first").expect("invite"),
         cluster_id,
         cluster_name: Some("iroh first".to_string()),
         cluster_public_key: "cluster-pk".to_string(),
@@ -920,10 +919,8 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
     member.allowed_capabilities = member.capabilities.clone();
     member.endpoints = vec![ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named(
-            "endpoint_network_storage_daemon_lan",
-        )
-        .expect("endpoint id"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_network_storage_daemon_lan")
+            .expect("endpoint id"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::LanTcp,
         address: "127.0.0.1:21353".to_string(),
@@ -1381,7 +1378,7 @@ fn cluster_network_records_publish_overwrite_and_expire() {
     let mut member_b =
         ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "node b", "pk-b", now);
     member_b.endpoints = vec![ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_network_graph_b")
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_network_graph_b")
             .expect("endpoint"),
         node_id: node_b.clone(),
         transport: ClusterTransportKind::LanTcp,
@@ -1671,8 +1668,7 @@ fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
         timestamp,
     );
     member.endpoints.push(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_lan")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_lan").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::LanQuic,
         address: "192.168.1.20:21353".to_string(),
@@ -1682,8 +1678,7 @@ fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
         last_observed_latency_ms: None,
     });
     member.endpoints.push(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_webrtc")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_webrtc").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::WebRtc,
         address: "webrtc://candidate".to_string(),
@@ -1713,8 +1708,7 @@ fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
 fn node_endpoint_maps_cluster_roaming_transports() {
     let node_id = NodeId::from_legacy_named("node_phone").expect("node");
     let endpoint = ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_ice")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_ice").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::WebRtc,
         address: "webrtc://candidate".to_string(),
@@ -1735,8 +1729,7 @@ fn node_endpoint_maps_cluster_roaming_transports() {
 fn node_endpoint_maps_iroh_transport() {
     let node_id = NodeId::from_legacy_named("node_phone").expect("node");
     let endpoint = ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_iroh")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_iroh").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
         address: "iroh://iroh_pk".to_string(),
@@ -1935,8 +1928,7 @@ fn cluster_auth_verifier_rejects_expired_or_wrong_key_certificate() {
 fn lan_connection_planner_prefers_lan_quic_over_relays() {
     let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
     let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_relay")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_relay").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::TurnRelay,
         address: "turn://relay".to_string(),
@@ -1946,8 +1938,7 @@ fn lan_connection_planner_prefers_lan_quic_over_relays() {
         last_observed_latency_ms: None,
     });
     let lan = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_lan")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_lan").expect("endpoint"),
         node_id,
         transport: ClusterTransportKind::LanQuic,
         address: "192.168.1.20:21355".to_string(),
@@ -2124,7 +2115,7 @@ fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
         OffsetDateTime::now_utc(),
     );
     member.endpoints.push(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh")
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh")
             .expect("legacy endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
@@ -2191,7 +2182,7 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
         now,
     );
     member.endpoints.push(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh_a")
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh_a")
             .expect("legacy endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
@@ -2212,7 +2203,7 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
     }
     .endpoint();
     let legacy_b = ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh_b")
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh_b")
             .expect("legacy endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
@@ -2253,8 +2244,7 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
 fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() {
     let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_webrtc")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_webrtc").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::WebRtc,
         address: "webrtc://srflx".to_string(),
@@ -2265,8 +2255,7 @@ fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() 
     })
     .healthy(35);
     let turn = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_turn")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_turn").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::TurnRelay,
         address: "turn://relay".to_string(),
@@ -2299,8 +2288,7 @@ fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() 
 fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
     let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let iroh = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_iroh")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_iroh").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
         address: "iroh://iroh_public_key?relay=https://relay.example".to_string(),
@@ -2310,8 +2298,7 @@ fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
         last_observed_latency_ms: None,
     });
     let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_webrtc")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_webrtc").expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::WebRtc,
         address: "webrtc://srflx".to_string(),
@@ -2321,8 +2308,7 @@ fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
         last_observed_latency_ms: None,
     });
     let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
-        endpoint_id: sinomo_core::ClusterEndpointId::from_legacy_named("endpoint_turn")
-            .expect("endpoint"),
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_turn").expect("endpoint"),
         node_id,
         transport: ClusterTransportKind::TurnRelay,
         address: "turn://relay".to_string(),

@@ -1,7 +1,10 @@
 //! Device profile, permission, and capability metadata.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{CapabilityName, DeviceCapability, DeviceId, NodeId};
+use sinomo_core::{CapabilityName, DeviceCapability};
+use sinomo_node::NodeId;
+
+pub type DeviceId = sinomo_core::Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeviceProfile {

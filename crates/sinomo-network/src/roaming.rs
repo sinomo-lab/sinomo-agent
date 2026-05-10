@@ -113,7 +113,7 @@ impl IceCandidateRecord {
             ),
         };
         ClusterEndpointRecord {
-            endpoint_id: sinomo_core::ClusterEndpointId::generate(),
+            endpoint_id: ClusterEndpointId::generate(),
             node_id: self.node_id.clone(),
             transport,
             address: self.address.clone(),

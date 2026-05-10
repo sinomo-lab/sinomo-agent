@@ -16,3 +16,4 @@ serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-core = { path = "../sinomo-core" }
+sinomo-node = { path = "../sinomo-node" }

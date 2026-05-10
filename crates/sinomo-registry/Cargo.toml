@@ -16,6 +16,7 @@ serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-core = { path = "../sinomo-core" }
+sinomo-module = { path = "../sinomo-module" }
 
 [dev-dependencies]
 serde_json.workspace = true

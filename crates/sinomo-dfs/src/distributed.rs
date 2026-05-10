@@ -1,7 +1,8 @@
 //! Distributed eventual object protocol for DFS.
 
+use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize};
-use sinomo_core::{DfsFileSystemId, DfsObjectId, DfsVersion, NodeId};
+use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -299,6 +300,64 @@ impl DistributedEventualCoordinator {
         self.intents.get(intent_id)
     }
 
+    pub fn restore_intent(
+        &mut self,
+        intent: DistributedWriteIntent,
+    ) -> Result<(), DfsDistributedError> {
+        intent.policy.validate()?;
+        validate_replica_set(&intent.desired_replica_nodes, &intent.policy)?;
+        self.advance_next_intent_id(&intent.intent_id);
+        if matches!(intent.state, DfsWriteIntentState::Committed) {
+            self.committed_versions.insert(
+                ObjectKey::new(intent.file_system_id.clone(), intent.object_id.clone()),
+                intent.target_version.clone(),
+            );
+        }
+        self.intents.insert(intent.intent_id.clone(), intent);
+        self.rebuild_repair_jobs();
+        Ok(())
+    }
+
+    pub fn restore_durable_receipt(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: NodeId,
+    ) -> Result<(), DfsDistributedError> {
+        let intent = self.intents.get(intent_id).cloned().ok_or_else(|| {
+            DfsDistributedError::UnknownIntent {
+                intent_id: intent_id.to_string(),
+            }
+        })?;
+        if !intent.desired_replica_nodes.contains(&replica_node_id) {
+            return Err(DfsDistributedError::UnexpectedReplica {
+                intent_id: intent_id.to_string(),
+                replica_node_id,
+            });
+        }
+        self.receipts.insert(
+            (intent_id.to_string(), replica_node_id.clone()),
+            DistributedReplicaReceipt {
+                intent_id: intent_id.to_string(),
+                file_system_id: intent.file_system_id,
+                object_id: intent.object_id,
+                version: intent.target_version,
+                replica_node_id,
+                state: DfsReplicaReceiptState::Durable,
+            },
+        );
+        if self.is_commit_ready(intent_id)?
+            && self
+                .intents
+                .get(intent_id)
+                .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::AwaitingReceipts))
+        {
+            self.commit_intent(intent_id)?;
+        } else {
+            self.rebuild_repair_jobs();
+        }
+        Ok(())
+    }
+
     pub fn receipts_for_intent(&self, intent_id: &str) -> Vec<&DistributedReplicaReceipt> {
         self.receipts
             .iter()
@@ -506,6 +565,42 @@ impl DistributedEventualCoordinator {
         let intent_id = format!("dfs_intent_{}", self.next_intent_id);
         self.next_intent_id += 1;
         intent_id
+    }
+
+    fn advance_next_intent_id(&mut self, intent_id: &str) {
+        let Some(suffix) = intent_id.strip_prefix("dfs_intent_") else {
+            return;
+        };
+        let Ok(value) = suffix.parse::<u64>() else {
+            return;
+        };
+        self.next_intent_id = self.next_intent_id.max(value.saturating_add(1));
+    }
+
+    fn rebuild_repair_jobs(&mut self) {
+        self.repair_jobs.clear();
+        let committed: Vec<DistributedWriteIntent> = self
+            .intents
+            .values()
+            .filter(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
+            .cloned()
+            .collect();
+        for intent in committed {
+            let durable_nodes = self.durable_receipt_nodes(&intent.intent_id);
+            for missing_replica_node_id in intent
+                .desired_replica_nodes
+                .iter()
+                .filter(|node_id| !durable_nodes.contains(*node_id))
+            {
+                self.repair_jobs.push(DistributedRepairJob {
+                    intent_id: intent.intent_id.clone(),
+                    file_system_id: intent.file_system_id.clone(),
+                    object_id: intent.object_id.clone(),
+                    version: intent.target_version.clone(),
+                    missing_replica_node_id: missing_replica_node_id.clone(),
+                });
+            }
+        }
     }
 }
 

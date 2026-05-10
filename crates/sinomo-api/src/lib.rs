@@ -2,11 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, Source, TaskId,
+    Confidence, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source,
 };
-use sinomo_events::{EventStore, EventStoreError, ReplayQuery, StoredEvent};
-use sinomo_node::{NodeAvailability, NodeProfile};
+use sinomo_events::{EventId, EventStore, EventStoreError, ReplayQuery, StoredEvent};
+use sinomo_node::{NodeAvailability, NodeId, NodeProfile};
 use sinomo_supervision::{SupervisionIndex, SupervisionSnapshot};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -30,7 +30,7 @@ pub enum ApiHealthStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct OperatorCommand {
-    pub command_id: TaskId,
+    pub command_id: Id,
     pub target_node_id: NodeId,
     pub kind: OperatorCommandKind,
     pub reason: String,
@@ -41,7 +41,7 @@ pub struct OperatorCommand {
 pub enum OperatorCommandKind {
     EngageKillSwitch,
     ReleaseKillSwitch,
-    CancelTask { request_id: TaskId },
+    CancelTask { request_id: Id },
 }
 
 #[derive(Clone, Debug)]

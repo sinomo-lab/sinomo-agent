@@ -43,22 +43,22 @@ use super::{
     write_daemon_status, write_rollout_status,
 };
 use base64::Engine;
+use sinomo_evolution::EvolutionJobId;
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
 use sinomo_runtime::core::{
-    CapabilityName, ClusterBootstrapState, ClusterEndpointId, ClusterEndpointPrivacy,
-    ClusterEndpointRecord, ClusterEndpointSource, ClusterId, ClusterInviteId, ClusterJoinInvite,
-    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
-    ClusterNodeRole, ClusterTransportKind, EvolutionJobId, NodeId, SessionId, TrustDomain,
-    TrustRing,
+    CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
+    ClusterEndpointSource, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
+    ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole, ClusterTransportKind,
+    TrustDomain, TrustRing,
 };
 use sinomo_runtime::daemon::daemon_status_matches_options;
-use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery};
+use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_runtime::kv::{InProcessKvStore, KvCompare, KvOp, KvRevision, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::daemon_lan_endpoint;
-use sinomo_runtime::node::main_daemon_capabilities;
+use sinomo_runtime::network::{ClusterEndpointId, ClusterId, ClusterInviteId, daemon_lan_endpoint};
+use sinomo_runtime::node::{NodeId, main_daemon_capabilities};
 use sinomo_runtime::rollout::create_source_repo_bundle;
 use std::io::{Cursor, Read};
 use std::net::{TcpListener, TcpStream};
@@ -1198,11 +1198,11 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         DfsCliCommand::Conflicts(DfsFilterOptions {
             common: DfsCommonOptions::default(),
             file_system_id: Some(
-                sinomo_runtime::core::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0")
+                sinomo_runtime::dfs::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0")
                     .expect("filesystem")
             ),
             object_id: Some(
-                sinomo_runtime::core::DfsObjectId::new("01hxy6qa9k0t9vr4g9n8d3q5d1")
+                sinomo_runtime::dfs::DfsObjectId::new("01hxy6qa9k0t9vr4g9n8d3q5d1")
                     .expect("object")
             ),
         })
@@ -1946,9 +1946,14 @@ fn cluster_join_records_pending_learner_state() {
     );
     assert_eq!(state.term, 0);
     assert_eq!(state.kv_revision, 0);
-    assert_eq!(state.members[0].role, ClusterMemberRole::Learner);
-    assert_eq!(state.members[0].state, ClusterMemberState::Pending);
-    assert!(!state.members[0].node_public_key.trim().is_empty());
+    let local = state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .expect("local main daemon member");
+    assert_eq!(local.role, ClusterMemberRole::Learner);
+    assert_eq!(local.state, ClusterMemberState::Pending);
+    assert!(!local.node_public_key.trim().is_empty());
     let shadow = state
         .members
         .iter()
@@ -2718,44 +2723,25 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
         }),
     )
     .expect("current write");
+    let current_snapshot = read_cluster_kv_snapshot(&paths).expect("current snapshot");
     assert!(
-        read_cluster_kv_snapshot(&paths)
-            .expect("current snapshot")
+        current_snapshot
             .entries
             .iter()
             .any(|entry| entry.key == "/config/current")
     );
 
-    let (stale_snapshot_term, current_term) = {
-        let node = super::network::open_cluster_raft_kv_node(&paths, &state.local_node_id)
-            .expect("raft node");
-        (
-            node.term_at(stale_snapshot.revision.0).unwrap_or(1),
-            node.hard_state().current_term,
-        )
-    };
-    let response = super::network::apply_cluster_raft_append(
+    let restored = super::network::restore_cluster_raft_from_snapshot_if_newer(
         &paths,
         &state.local_node_id,
-        Some(sinomo_runtime::kv::RaftSnapshot {
-            last_included_index: stale_snapshot.revision.0,
-            last_included_term: stale_snapshot_term,
-            kv: stale_snapshot.clone(),
-        }),
-        sinomo_runtime::kv::RaftAppendEntriesRequest {
-            term: current_term,
-            leader_id: state.local_node_id.clone(),
-            prev_log_index: stale_snapshot.revision.0,
-            prev_log_term: stale_snapshot_term,
-            entries: Vec::new(),
-            leader_commit: stale_snapshot.revision.0,
-        },
+        stale_snapshot,
     )
-    .expect("stale append response");
-    assert!(!response.success);
+    .expect("stale snapshot restore");
+    assert!(!restored);
+    let snapshot_after_stale =
+        read_cluster_kv_snapshot(&paths).expect("snapshot after stale restore");
     assert!(
-        read_cluster_kv_snapshot(&paths)
-            .expect("snapshot after stale append")
+        snapshot_after_stale
             .entries
             .iter()
             .any(|entry| entry.key == "/config/current" && entry.value == b"current")

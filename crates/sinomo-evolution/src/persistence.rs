@@ -1,13 +1,13 @@
 use crate::{
     BackgroundCampaignUpdate, BackgroundSchedulingAction, BackgroundSchedulingPlan,
     CampaignDecision, CampaignDecisionKind, CampaignScheduleDecision, EvolutionCampaign,
-    EvolutionCampaignStatus, EvolutionReport, ResourceSchedulerDryRun, ScheduledIterationPlan,
-    StageEvaluationUpdate,
+    EvolutionCampaignStatus, EvolutionJobId, EvolutionReport, ResourceSchedulerDryRun,
+    ScheduledIterationPlan, StageEvaluationUpdate,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{
     CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, EvaluationOutcome,
-    EvaluationScorecard, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
+    EvaluationScorecard, EvolutionJob, EvolutionJobStatus,
 };
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::local::SinomoDataDir;
@@ -794,12 +794,14 @@ pub fn decision_outcome_label(outcome: &CandidateDecisionOutcome) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CandidateWorkspace;
+    use crate::{CandidateWorkspace, WorkspaceId};
     use sinomo_runtime::core::{
-        EditScope, EvaluationGate, EvolutionScope, RecoveryPlan, RollbackPolicy, ScorecardId,
-        TrustRing, VerificationPlan, WorkspaceId,
+        EditScope, EvaluationGate, EvolutionScope, Id, RecoveryPlan, RollbackPolicy, TrustRing,
+        VerificationPlan,
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    type ScorecardId = Id;
 
     #[test]
     fn record_candidate_decision_persists_decision_manifest_job_and_record() {

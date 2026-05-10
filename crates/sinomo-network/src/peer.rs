@@ -1104,7 +1104,7 @@ pub struct RouteDeliveryId(pub u64);
 pub struct RouteDelivery {
     pub delivery_id: RouteDeliveryId,
     pub event_sequence: EventSequence,
-    pub event_id: sinomo_core::EventId,
+    pub event_id: EventId,
     pub target_node_id: NodeId,
     pub latency_class: LatencyClass,
     pub status: DeliveryStatus,

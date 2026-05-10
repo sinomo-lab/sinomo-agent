@@ -2,12 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{
-    Confidence, DeviceId, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, SessionId, Source, TaskId,
+    Confidence, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source,
 };
-use sinomo_runtime::device::{DevicePermission, DeviceProfile};
+use sinomo_runtime::device::{DeviceId, DevicePermission, DeviceProfile};
+use sinomo_runtime::events::{EventId, SessionId};
+use sinomo_runtime::node::NodeId;
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
+
+pub type TaskId = Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SpeechOutputRequest {

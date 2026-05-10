@@ -1,17 +1,17 @@
-use sinomo_core::{
-    DfsFileSystemId, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteRequest, NodeId,
-};
+use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsConflictStatus, DfsControlPlaneStore,
-    DfsFileSystem, DfsMetadataMutation, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectKind, DfsObjectMetadata,
-    DfsOwnerHandoffOutcome, DfsReplicationPolicy, DfsWriteIntentState, DfsWriteIntentStatus,
-    LocalJsonMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
+    DfsFileSystem, DfsFileSystemId, DfsMetadataMutation, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsOwnerHandoffOutcome, DfsReplicationPolicy, DfsVersion,
+    DfsWriteIntentState, DfsWriteIntentStatus, LocalJsonMetadataBackend, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient, file_system_config_key,
+    sifs_node_files_path,
 };
 use sinomo_kv::InProcessRaftKvCluster;
 use sinomo_network::InProcessNetwork;
+use sinomo_node::NodeId;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -131,6 +131,474 @@ fn networked_dfs_commits_after_stage_ack_and_replica_reads_content() {
         .expect("data");
     assert_eq!(read.bytes, b"networked bytes");
     assert_eq!(read.version, version_2);
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_transfers_large_writes_in_chunks() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_large").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("networked_large_chunked_write");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
+    );
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "large.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: None,
+        version: version_1,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("replica filesystem");
+    owner_dfs
+        .add_object_metadata(metadata.clone())
+        .expect("owner object");
+    replica_dfs
+        .add_object_metadata(metadata)
+        .expect("replica object");
+
+    let bytes: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+    let write = owner_dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: owner,
+            },
+            bytes.clone(),
+            vec![owner_dfs.node_id().clone(), replica.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("large write");
+    assert!(matches!(write, NetworkedDfsWriteOutcome::Pending { .. }));
+
+    let replica_events = replica_dfs.process_incoming().expect("replica chunks");
+    assert!(replica_events.iter().any(|event| {
+        matches!(event, NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. } if staged == &object_id)
+    }));
+    owner_dfs.process_incoming().expect("owner ack");
+    replica_dfs.process_incoming().expect("replica commit");
+
+    let read = replica_dfs
+        .read_local_object(&object_id)
+        .expect("read replica")
+        .expect("replica object");
+    assert_eq!(read.version, version_2);
+    assert_eq!(read.bytes, bytes);
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_recovered").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("networked_recovered_repairs");
+    let network = InProcessNetwork::new();
+    let owner_meta = root.join("owner-meta");
+    let owner_content = root.join("owner-content");
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "artifact.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: None,
+        version: version_1.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+
+    {
+        let owner_backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
+                .expect("owner metadata");
+        let mut owner_dfs = NetworkedDfsService::new(
+            network.add_node(owner.clone()),
+            sinomo_dfs::LocalContentStore::new(&owner_content).expect("owner content"),
+        )
+        .with_metadata_backend(owner_backend)
+        .expect("owner metadata backend");
+        owner_dfs
+            .add_file_system(file_system.clone())
+            .expect("owner filesystem");
+        owner_dfs
+            .add_object_metadata(metadata.clone())
+            .expect("owner object");
+
+        let write = owner_dfs
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    target_version: version_2.clone(),
+                    requesting_node_id: owner.clone(),
+                },
+                b"recovered repair bytes".to_vec(),
+                vec![owner.clone(), replica.clone()],
+                DfsReplicationPolicy::new(1, 2).expect("policy"),
+            )
+            .expect("write");
+        assert!(matches!(
+            write,
+            NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } if repair_jobs.len() == 1
+        ));
+    }
+
+    let recovered_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
+            .expect("recovered metadata");
+    let mut recovered_owner = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(&owner_content).expect("recovered content"),
+    )
+    .with_metadata_backend(recovered_backend)
+    .expect("recovered metadata backend");
+    assert_eq!(
+        recovered_owner
+            .metadata()
+            .object(&object_id)
+            .expect("recovered object")
+            .version,
+        version_2
+    );
+
+    let replica_backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("replica"),
+        root.join("replica-meta"),
+    )
+    .expect("replica metadata");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_metadata_backend(replica_backend)
+    .expect("replica metadata backend");
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("replica filesystem");
+    replica_dfs
+        .add_object_metadata(metadata)
+        .expect("replica object");
+
+    assert_eq!(
+        recovered_owner
+            .retry_pending_repairs()
+            .expect("retry recovered repair")
+            .len(),
+        1
+    );
+    let events = replica_dfs.process_incoming().expect("replica repair");
+    assert!(events.iter().any(|event| {
+        matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { object_id: repaired, .. } if repaired == &object_id)
+    }));
+    let read = replica_dfs
+        .read_local_object(&object_id)
+        .expect("read replica")
+        .expect("replica content");
+    assert_eq!(read.bytes, b"recovered repair bytes");
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_fetches_repair_blob_from_alternate_replica_after_restart() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let missing = NodeId::from_legacy_named("node_missing").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_alternate_repair").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("networked_alternate_repair_fetch");
+    let network = InProcessNetwork::new();
+    let owner_meta = root.join("owner-meta");
+    let owner_content = root.join("owner-content");
+    let replica_content = root.join("replica-content");
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "artifact.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: None,
+        version: version_1.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+
+    {
+        let owner_backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
+                .expect("owner metadata");
+        let mut owner_dfs = NetworkedDfsService::new(
+            network.add_node(owner.clone()),
+            sinomo_dfs::LocalContentStore::new(&owner_content).expect("owner content"),
+        )
+        .with_metadata_backend(owner_backend)
+        .expect("owner metadata backend");
+        let mut replica_dfs = NetworkedDfsService::new(
+            network.add_node(replica.clone()),
+            sinomo_dfs::LocalContentStore::new(&replica_content).expect("replica content"),
+        );
+        owner_dfs
+            .add_file_system(file_system.clone())
+            .expect("owner filesystem");
+        replica_dfs
+            .add_file_system(file_system.clone())
+            .expect("replica filesystem");
+        owner_dfs
+            .add_object_metadata(metadata.clone())
+            .expect("owner object");
+        replica_dfs
+            .add_object_metadata(metadata.clone())
+            .expect("replica object");
+
+        let write = owner_dfs
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    target_version: version_2.clone(),
+                    requesting_node_id: owner.clone(),
+                },
+                b"alternate repair bytes".to_vec(),
+                vec![owner.clone(), replica.clone(), missing.clone()],
+                DfsReplicationPolicy::new(2, 3).expect("policy"),
+            )
+            .expect("write");
+        assert!(matches!(
+            write,
+            NetworkedDfsWriteOutcome::Pending {
+                durable_receipts: 1,
+                required_receipts: 2,
+                ..
+            }
+        ));
+        replica_dfs.process_incoming().expect("replica stage");
+        let owner_events = owner_dfs.process_incoming().expect("owner commit");
+        assert!(owner_events.iter().any(|event| {
+            matches!(event, NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. } if staged == &object_id)
+        }));
+        replica_dfs.process_incoming().expect("replica commit");
+        assert_eq!(
+            replica_dfs
+                .read_local_object(&object_id)
+                .expect("replica read")
+                .expect("replica content")
+                .bytes,
+            b"alternate repair bytes"
+        );
+    }
+
+    fs::remove_dir_all(&owner_content).expect("remove owner content");
+    let recovered_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
+            .expect("recovered metadata");
+    let mut recovered_owner = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(&owner_content).expect("recovered owner content"),
+    )
+    .with_metadata_backend(recovered_backend)
+    .expect("recovered owner metadata");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(&replica_content).expect("replica content"),
+    );
+    replica_dfs
+        .add_file_system(file_system.clone())
+        .expect("replica filesystem");
+    let mut replica_metadata = metadata.clone();
+    replica_metadata.version = version_2.clone();
+    replica_metadata.content_hash = recovered_owner
+        .metadata()
+        .object(&object_id)
+        .expect("recovered object")
+        .content_hash
+        .clone();
+    replica_metadata.current_locations = vec![owner.clone(), replica.clone()];
+    replica_dfs
+        .add_object_metadata(replica_metadata)
+        .expect("replica visible object");
+    let mut missing_dfs = NetworkedDfsService::new(
+        network.add_node(missing.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("missing-content")).expect("missing content"),
+    );
+    missing_dfs
+        .add_file_system(file_system)
+        .expect("missing filesystem");
+    missing_dfs
+        .add_object_metadata(metadata)
+        .expect("missing object");
+
+    assert_eq!(
+        recovered_owner
+            .retry_pending_repairs()
+            .expect("request alternate fetch")
+            .len(),
+        0
+    );
+    assert!(replica_dfs
+        .process_incoming()
+        .expect("serve fetch")
+        .iter()
+        .any(|event| matches!(event, NetworkedDfsServiceEvent::BlobFetched { object_id: fetched, .. } if fetched == &object_id)));
+    assert!(recovered_owner
+        .process_incoming()
+        .expect("store fetched blob")
+        .iter()
+        .any(|event| matches!(event, NetworkedDfsServiceEvent::BlobFetched { object_id: fetched, source_node_id, .. } if fetched == &object_id && source_node_id == &replica)));
+    assert_eq!(
+        recovered_owner
+            .retry_pending_repairs()
+            .expect("repair missing replica")
+            .len(),
+        1
+    );
+    assert!(missing_dfs
+        .process_incoming()
+        .expect("repair missing")
+        .iter()
+        .any(|event| matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { object_id: repaired, .. } if repaired == &object_id)));
+    let read = missing_dfs
+        .read_local_object(&object_id)
+        .expect("missing read")
+        .expect("missing content");
+    assert_eq!(read.version, version_2);
+    assert_eq!(read.bytes, b"alternate repair bytes");
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_rejects_stage_blob_from_non_owner() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let attacker = NodeId::from_legacy_named("node_attacker").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_auth").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("networked_rejects_stage_from_non_owner");
+    let network = InProcessNetwork::new();
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "artifact.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: None,
+        version: version_1,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    let mut attacker_dfs = NetworkedDfsService::new(
+        network.add_node(attacker.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("attacker")).expect("attacker content"),
+    );
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica content"),
+    );
+    attacker_dfs
+        .add_file_system(file_system.clone())
+        .expect("attacker filesystem");
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("replica filesystem");
+    attacker_dfs
+        .add_object_metadata(metadata.clone())
+        .expect("attacker object");
+    replica_dfs
+        .add_object_metadata(metadata)
+        .expect("replica object");
+
+    let write = attacker_dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: attacker,
+            },
+            b"unauthorized bytes".to_vec(),
+            vec![attacker_dfs.node_id().clone(), replica.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("attacker write");
+    assert!(matches!(write, NetworkedDfsWriteOutcome::Pending { .. }));
+
+    let events = replica_dfs.process_incoming().expect("replica stage");
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobStageRejected { reason, .. }
+                if reason.contains("unauthorized DFS replica command")
+        )
+    }));
+    assert!(
+        replica_dfs
+            .content()
+            .read_manifest(object_id.as_str(), version_2.as_str())
+            .is_err()
+    );
 
     cleanup(&root);
 }
@@ -256,7 +724,8 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
         sinomo_dfs::LocalContentStore::new(root.join("content")).expect("content store"),
     )
     .with_control_plane(control_plane.clone())
-    .with_metadata_backend(backend);
+    .with_metadata_backend(backend)
+    .expect("metadata backend");
 
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
     control_plane.with_client(|kv| {
@@ -325,7 +794,8 @@ fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
-    .with_metadata_backend(owner_backend);
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
     let replica_backend = LocalJsonMetadataBackend::new(
         DfsMetadataShardId::new("replica"),
         root.join("replica-meta"),
@@ -335,7 +805,8 @@ fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
         network.add_node(replica.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
     )
-    .with_metadata_backend(replica_backend);
+    .with_metadata_backend(replica_backend)
+    .expect("replica metadata backend");
 
     owner_dfs
         .bootstrap_distributed_sifs()
@@ -439,7 +910,8 @@ fn networked_dfs_persists_committed_metadata_through_backend() {
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     )
-    .with_metadata_backend(owner_backend);
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
     let mut replica_dfs = NetworkedDfsService::new(
         network.add_node(replica.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
@@ -933,6 +1405,126 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
 }
 
 #[test]
+fn posix_write_file_does_not_expose_new_file_until_content_commits() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let offline = NodeId::from_legacy_named("node_offline").expect("node");
+    let root = temp_root("posix_new_file_pending_hidden");
+    let network = InProcessNetwork::new();
+    let backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(backend)
+    .expect("metadata backend");
+
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    dfs.posix_mkdir_all("/services/web").expect("mkdir service");
+    let mut options = sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner, offline]);
+    options.policy = DfsReplicationPolicy::new(2, 2).expect("strict eventual policy");
+    options.wait_for_commit = false;
+
+    assert!(matches!(
+        dfs.posix_write_file("/services/web/pending.html", b"pending", options),
+        Err(sinomo_dfs::DfsPosixError::PendingWrite { .. })
+    ));
+    assert!(matches!(
+        dfs.posix_stat("/services/web/pending.html"),
+        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+    ));
+    assert!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .get_object_by_path(
+                &sinomo_dfs::sifs_file_system_id(),
+                "/services/web/pending.html"
+            )
+            .expect("backend lookup")
+            .is_none()
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_rejected_stage_blob_does_not_create_replica_metadata() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let attacker = NodeId::from_legacy_named("node_attacker").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_auth_unknown").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("networked_rejected_stage_no_metadata");
+    let network = InProcessNetwork::new();
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "artifact.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner],
+        content_hash: None,
+        version: version_1,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    let mut attacker_dfs = NetworkedDfsService::new(
+        network.add_node(attacker.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("attacker")).expect("attacker content"),
+    );
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica content"),
+    );
+    attacker_dfs
+        .add_file_system(file_system.clone())
+        .expect("attacker filesystem");
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("replica filesystem");
+    attacker_dfs
+        .add_object_metadata(metadata)
+        .expect("attacker object");
+
+    let write = attacker_dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2,
+                requesting_node_id: attacker,
+            },
+            b"unauthorized bytes".to_vec(),
+            vec![attacker_dfs.node_id().clone(), replica],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("attacker write");
+    assert!(matches!(write, NetworkedDfsWriteOutcome::Pending { .. }));
+
+    let events = replica_dfs.process_incoming().expect("replica stage");
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobStageRejected { reason, .. }
+                if reason.contains("unauthorized DFS replica command")
+        )
+    }));
+    assert!(replica_dfs.metadata().object(&object_id).is_none());
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_replicated_confirmed_commits_after_all_receipts_and_reads_confirmed() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
@@ -949,7 +1541,8 @@ fn networked_dfs_replicated_confirmed_commits_after_all_receipts_and_reads_confi
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     )
-    .with_metadata_backend(owner_backend);
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
     let mut replica_dfs = NetworkedDfsService::new(
         network.add_node(replica.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
@@ -1072,7 +1665,8 @@ fn networked_dfs_replicated_confirmed_timeout_can_abort_pending_intent() {
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     )
-    .with_metadata_backend(owner_backend);
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
     let file_system = DfsFileSystem {
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
@@ -1313,7 +1907,8 @@ fn networked_dfs_stale_replicated_eventual_write_creates_conflict_read_view() {
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     )
-    .with_metadata_backend(backend);
+    .with_metadata_backend(backend)
+    .expect("metadata backend");
     let file_system = DfsFileSystem {
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
@@ -1410,7 +2005,8 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict
         network.add_node(node.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("node")).expect("node store"),
     )
-    .with_metadata_backend(backend);
+    .with_metadata_backend(backend)
+    .expect("metadata backend");
     let file_system = DfsFileSystem {
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),

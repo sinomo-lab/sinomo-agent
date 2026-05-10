@@ -1,8 +1,4 @@
-use crate::{
-    ArtifactId, CapabilityName, DeviceId, DfsFileSystemId, DfsObjectId, DfsVersion, EntityId,
-    EventId, EvolutionJobId, ModuleId, NodeId, PolicyDecisionId, RolloutPlanId, ScorecardId,
-    SessionId, TaskId, TrustDomain, WorkspaceId,
-};
+use crate::{CapabilityName, Id, TrustDomain};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -47,18 +43,18 @@ pub struct ModelCapability {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SessionState {
-    pub session_id: SessionId,
+    pub session_id: Id,
     #[serde(default)]
-    pub participant_nodes: Vec<NodeId>,
+    pub participant_nodes: Vec<Id>,
     #[serde(default)]
-    pub active_devices: Vec<DeviceId>,
+    pub active_devices: Vec<Id>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct TaskState {
-    pub task_id: TaskId,
+    pub task_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<SessionId>,
+    pub session_id: Option<Id>,
     pub status: TaskStatus,
 }
 
@@ -75,12 +71,12 @@ pub enum TaskStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ActionRequest {
-    pub request_id: TaskId,
-    pub origin_node_id: NodeId,
+    pub request_id: Id,
+    pub origin_node_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_node_id: Option<NodeId>,
+    pub target_node_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_device_id: Option<DeviceId>,
+    pub target_device_id: Option<Id>,
     pub kind: String,
     #[serde(default)]
     pub payload: serde_json::Value,
@@ -88,10 +84,10 @@ pub struct ActionRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ActionResult {
-    pub request_id: TaskId,
+    pub request_id: Id,
     pub status: ActionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event_id: Option<EventId>,
+    pub event_id: Option<Id>,
     #[serde(default)]
     pub payload: serde_json::Value,
 }
@@ -107,16 +103,16 @@ pub enum ActionStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MemoryRecord {
-    pub entity_id: EntityId,
+    pub entity_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_event_id: Option<EventId>,
+    pub source_event_id: Option<Id>,
     pub summary: String,
     pub visibility: TrustDomain,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct TriggerDecision {
-    pub trigger_event_id: EventId,
+    pub trigger_event_id: Id,
     pub action: TriggerAction,
     pub reason: String,
 }
@@ -133,8 +129,8 @@ pub enum TriggerAction {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeliberationJob {
-    pub job_id: TaskId,
-    pub trigger_event_id: EventId,
+    pub job_id: Id,
+    pub trigger_event_id: Id,
     pub status: JobStatus,
 }
 
@@ -170,43 +166,43 @@ pub enum DfsObjectPolicy {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteRequest {
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    pub target_version: DfsVersion,
-    pub requesting_node_id: NodeId,
+    pub file_system_id: Id,
+    pub object_id: Id,
+    pub target_version: Id,
+    pub requesting_node_id: Id,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteReceipt {
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    pub committed_version: DfsVersion,
-    pub owner_node_id: NodeId,
-    pub event_id: EventId,
+    pub file_system_id: Id,
+    pub object_id: Id,
+    pub committed_version: Id,
+    pub owner_node_id: Id,
+    pub event_id: Id,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct HotStateSnapshot {
     #[serde(default)]
-    pub recent_events: Vec<EventId>,
+    pub recent_events: Vec<Id>,
     #[serde(default)]
-    pub active_tasks: Vec<TaskId>,
+    pub active_tasks: Vec<Id>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct ContextPacket {
     #[serde(default)]
-    pub salient_events: Vec<EventId>,
+    pub salient_events: Vec<Id>,
     #[serde(default)]
-    pub memory_records: Vec<EntityId>,
+    pub memory_records: Vec<Id>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct JobCancellation {
-    pub job_id: TaskId,
+    pub job_id: Id,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub superseded_by_event_id: Option<EventId>,
+    pub superseded_by_event_id: Option<Id>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -238,7 +234,7 @@ impl TrustRing {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ModuleManifest {
-    pub module_id: ModuleId,
+    pub module_id: Id,
     pub kind: ModuleKind,
     pub version: String,
     pub api_version: String,
@@ -250,11 +246,7 @@ pub struct ModuleManifest {
 }
 
 impl ModuleManifest {
-    pub fn r3_wasm(
-        module_id: ModuleId,
-        version: impl Into<String>,
-        owner: impl Into<String>,
-    ) -> Self {
+    pub fn r3_wasm(module_id: Id, version: impl Into<String>, owner: impl Into<String>) -> Self {
         Self {
             module_id,
             kind: ModuleKind::WasmComponent,
@@ -347,14 +339,14 @@ impl Default for RolloutPolicy {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ArtifactManifest {
-    pub artifact_id: ArtifactId,
-    pub module_id: ModuleId,
+    pub artifact_id: Id,
+    pub module_id: Id,
     pub target_ring: TrustRing,
     pub content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_workspace: Option<WorkspaceId>,
+    pub source_workspace: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_revision: Option<String>,
     pub module_manifest: ModuleManifest,
@@ -365,9 +357,9 @@ pub struct ArtifactManifest {
 pub struct ArtifactProvenance {
     pub produced_by: ActorRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_event_id: Option<EventId>,
+    pub source_event_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_log_artifact_id: Option<ArtifactId>,
+    pub build_log_artifact_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attestations: Vec<String>,
 }
@@ -410,9 +402,9 @@ impl CapabilityDiff {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PolicyDecision {
-    pub decision_id: PolicyDecisionId,
+    pub decision_id: Id,
     pub target_ring: TrustRing,
-    pub target_artifact_id: ArtifactId,
+    pub target_artifact_id: Id,
     pub action: PolicyAction,
     pub capability_diff: CapabilityDiff,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -435,11 +427,11 @@ pub enum PolicyAction {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvaluationScorecard {
-    pub scorecard_id: ScorecardId,
+    pub scorecard_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline_artifact_id: Option<ArtifactId>,
+    pub baseline_artifact_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_artifact_id: Option<ArtifactId>,
+    pub candidate_artifact_id: Option<Id>,
     pub outcome: EvaluationOutcome,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gates: Vec<EvaluationGateResult>,
@@ -497,11 +489,11 @@ pub enum MetricValue {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvolutionJob {
-    pub job_id: EvolutionJobId,
+    pub job_id: Id,
     pub objective: String,
     pub target_ring: TrustRing,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_module_id: Option<ModuleId>,
+    pub target_module_id: Option<Id>,
     pub edit_scope: EditScope,
     pub verification: VerificationPlan,
     pub recovery: RecoveryPlan,
@@ -528,7 +520,7 @@ pub struct EvolutionScope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<WorkspaceId>,
+    pub workspace_id: Option<Id>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -572,7 +564,7 @@ pub enum RecoveryStrategy {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MutationPacket {
-    pub job_id: EvolutionJobId,
+    pub job_id: Id,
     pub objective: String,
     pub target_ring: TrustRing,
     pub edit_scope: EditScope,
@@ -617,7 +609,7 @@ impl Default for MutationOutputContract {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CandidateBundleManifest {
-    pub job_id: EvolutionJobId,
+    pub job_id: Id,
     pub bundle_path: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -681,7 +673,7 @@ pub enum EvolutionJobStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CandidateDecision {
-    pub job_id: EvolutionJobId,
+    pub job_id: Id,
     pub outcome: CandidateDecisionOutcome,
     #[serde(with = "time::serde::rfc3339")]
     pub decided_at: OffsetDateTime,
@@ -747,13 +739,13 @@ impl CandidateDecisionOutcome {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RolloutPlan {
-    pub rollout_plan_id: RolloutPlanId,
-    pub artifact_id: ArtifactId,
-    pub module_id: ModuleId,
+    pub rollout_plan_id: Id,
+    pub artifact_id: Id,
+    pub module_id: Id,
     pub target_ring: TrustRing,
     pub strategy: RolloutStrategy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub target_nodes: Vec<NodeId>,
+    pub target_nodes: Vec<Id>,
     pub initial_weight_bps: u16,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promotion_steps_bps: Vec<u16>,
@@ -776,7 +768,7 @@ pub struct RollbackPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<RollbackTrigger>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restore_artifact_id: Option<ArtifactId>,
+    pub restore_artifact_id: Option<Id>,
 }
 
 impl Default for RollbackPolicy {
@@ -821,14 +813,14 @@ pub enum RollbackTrigger {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ModuleLoaderState {
-    pub module_id: ModuleId,
-    pub active_artifact_id: ArtifactId,
+    pub module_id: Id,
+    pub active_artifact_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_artifact_id: Option<ArtifactId>,
+    pub previous_artifact_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shadow_artifact_id: Option<ArtifactId>,
+    pub shadow_artifact_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_artifact_id: Option<ArtifactId>,
+    pub candidate_artifact_id: Option<Id>,
     pub hot_swap_state: HotSwapState,
 }
 
@@ -859,7 +851,7 @@ mod tests {
     #[test]
     fn r3_module_manifest_serializes_capsule_shape() {
         let mut manifest = ModuleManifest::r3_wasm(
-            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module id"),
+            Id::from_legacy_named("module.trigger.silence_policy").expect("module id"),
             "0.3.7",
             "sinomo-trigger",
         );
@@ -886,11 +878,9 @@ mod tests {
     #[test]
     fn policy_decision_captures_capability_diff_as_data() {
         let decision = PolicyDecision {
-            decision_id: PolicyDecisionId::from_legacy_named("policy_allow_trigger")
-                .expect("decision id"),
+            decision_id: Id::from_legacy_named("policy_allow_trigger").expect("decision id"),
             target_ring: TrustRing::R3SandboxedModule,
-            target_artifact_id: ArtifactId::from_legacy_named("artifact_candidate")
-                .expect("artifact id"),
+            target_artifact_id: Id::from_legacy_named("artifact_candidate").expect("artifact id"),
             action: PolicyAction::RequireMoreEvidence,
             capability_diff: CapabilityDiff {
                 added_imports: vec![CapabilityName::new("event.read.session").expect("capability")],
@@ -908,7 +898,7 @@ mod tests {
     #[test]
     fn evolution_job_serializes_bootstrap_loop_contract() {
         let job = EvolutionJob {
-            job_id: EvolutionJobId::from_legacy_named("evojob_bootstrap").expect("job id"),
+            job_id: Id::from_legacy_named("evojob_bootstrap").expect("job id"),
             objective: "improve command evaluation scorecard details".to_string(),
             target_ring: TrustRing::R1TrustedRuntime,
             target_module_id: None,
@@ -957,7 +947,7 @@ mod tests {
     #[test]
     fn mutation_packet_carries_verification_and_recovery_contract() {
         let packet = MutationPacket {
-            job_id: EvolutionJobId::from_legacy_named("evojob_packet").expect("job id"),
+            job_id: Id::from_legacy_named("evojob_packet").expect("job id"),
             objective: "add bundle writer".to_string(),
             target_ring: TrustRing::R1TrustedRuntime,
             edit_scope: EditScope {

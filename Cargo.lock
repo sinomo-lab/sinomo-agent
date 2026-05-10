@@ -3153,6 +3153,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-node",
 ]
 
 [[package]]
@@ -3163,9 +3164,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-events",
  "sinomo-kv",
  "sinomo-local",
  "sinomo-network",
+ "sinomo-node",
  "sinomo-object",
  "sinomo-storage",
  "thiserror",
@@ -3180,6 +3183,9 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-events",
+ "sinomo-module",
+ "sinomo-node",
+ "sinomo-rollout",
  "thiserror",
  "time",
 ]
@@ -3190,6 +3196,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "sinomo-core",
+ "sinomo-node",
  "thiserror",
  "time",
 ]
@@ -3202,7 +3209,6 @@ dependencies = [
  "serde_json",
  "sinomo-lm",
  "sinomo-runtime",
- "sinomo-storage",
  "thiserror",
  "time",
 ]
@@ -3235,6 +3241,7 @@ dependencies = [
  "fs2",
  "serde",
  "sinomo-core",
+ "sinomo-node",
  "sinomo-object",
  "sinomo-storage",
  "thiserror",
@@ -3281,6 +3288,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-events",
+ "sinomo-node",
  "thiserror",
  "time",
 ]
@@ -3337,6 +3346,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "sinomo-core",
+ "sinomo-module",
 ]
 
 [[package]]
@@ -3346,6 +3356,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-module",
  "thiserror",
  "time",
 ]
@@ -3358,6 +3369,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-events",
+ "sinomo-module",
+ "sinomo-node",
  "sinomo-object",
  "sinomo-storage",
  "time",
@@ -3395,6 +3409,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-dfs",
+ "sinomo-events",
+ "sinomo-module",
+ "sinomo-node",
  "thiserror",
  "time",
 ]
@@ -3415,7 +3433,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-device",
  "sinomo-events",
+ "sinomo-node",
  "time",
 ]
 
@@ -3426,6 +3446,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-device",
+ "sinomo-events",
+ "sinomo-node",
  "thiserror",
  "time",
 ]

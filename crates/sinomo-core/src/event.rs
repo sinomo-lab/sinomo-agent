@@ -1,25 +1,22 @@
-use crate::{
-    Confidence, DeviceId, EntityRef, EventId, EventKind, NodeId, RoutingHint, Salience, SessionId,
-    Source,
-};
+use crate::{Confidence, EntityRef, EventKind, Id, RoutingHint, Salience, Source};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EventEnvelope {
-    pub event_id: EventId,
+    pub event_id: Id,
     #[serde(with = "time::serde::rfc3339")]
     pub time: OffsetDateTime,
-    pub origin_node_id: NodeId,
+    pub origin_node_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_device_id: Option<DeviceId>,
+    pub origin_device_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_node_id: Option<NodeId>,
+    pub target_node_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_device_id: Option<DeviceId>,
+    pub target_device_id: Option<Id>,
     pub source: Source,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<SessionId>,
+    pub session_id: Option<Id>,
     pub kind: EventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<EventSpan>,
@@ -39,9 +36,9 @@ pub struct EventEnvelope {
 impl EventEnvelope {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        event_id: EventId,
+        event_id: Id,
         time: OffsetDateTime,
-        origin_node_id: NodeId,
+        origin_node_id: Id,
         source: Source,
         kind: EventKind,
         salience: Salience,
@@ -69,22 +66,22 @@ impl EventEnvelope {
         }
     }
 
-    pub fn with_origin_device(mut self, device_id: DeviceId) -> Self {
+    pub fn with_origin_device(mut self, device_id: Id) -> Self {
         self.origin_device_id = Some(device_id);
         self
     }
 
-    pub fn with_target_node(mut self, node_id: NodeId) -> Self {
+    pub fn with_target_node(mut self, node_id: Id) -> Self {
         self.target_node_id = Some(node_id);
         self
     }
 
-    pub fn with_target_device(mut self, device_id: DeviceId) -> Self {
+    pub fn with_target_device(mut self, device_id: Id) -> Self {
         self.target_device_id = Some(device_id);
         self
     }
 
-    pub fn with_session(mut self, session_id: SessionId) -> Self {
+    pub fn with_session(mut self, session_id: Id) -> Self {
         self.session_id = Some(session_id);
         self
     }
@@ -153,15 +150,15 @@ pub enum EvidenceKind {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EventLinks {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub caused_by: Vec<EventId>,
+    pub caused_by: Vec<Id>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_to: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub supersedes: Vec<EventId>,
+    pub supersedes: Vec<Id>,
 }
 
 impl EventLinks {
-    pub fn references_event(&self, event_id: &EventId) -> bool {
+    pub fn references_event(&self, event_id: &Id) -> bool {
         self.caused_by.iter().any(|id| id == event_id)
             || self.supersedes.iter().any(|id| id == event_id)
     }
@@ -223,14 +220,14 @@ pub enum PrivacyClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CapabilityName, EventId, NodeId};
+    use crate::{CapabilityName, Id};
 
     #[test]
     fn event_json_matches_documented_shape() {
         let event = EventEnvelope::new(
-            EventId::from_legacy_named("evt_example").expect("event id"),
+            Id::from_legacy_named("evt_example").expect("event id"),
             OffsetDateTime::from_unix_timestamp(1_776_809_414).expect("timestamp"),
-            NodeId::from_legacy_named("node_mobile_phone").expect("node id"),
+            Id::from_legacy_named("node_mobile_phone").expect("node id"),
             Source::new("audio.mic.frontdesk").expect("source"),
             EventKind::new("speech.transcript.final").expect("kind"),
             Salience::new(0.81).expect("salience"),
@@ -242,7 +239,7 @@ mod tests {
             )
             .with_hint(RoutingHint::new("target:desktop").expect("hint")),
         )
-        .with_session(SessionId::from_legacy_named("sess_example").expect("session"))
+        .with_session(Id::from_legacy_named("sess_example").expect("session"))
         .with_payload(serde_json::json!({
             "text": "Please check the alert and tell me if it is urgent"
         }));
@@ -257,7 +254,7 @@ mod tests {
         let round_tripped: EventEnvelope = serde_json::from_value(json).expect("deserialize event");
         assert_eq!(
             round_tripped.event_id,
-            EventId::from_legacy_named("evt_example").expect("event id")
+            Id::from_legacy_named("evt_example").expect("event id")
         );
     }
 

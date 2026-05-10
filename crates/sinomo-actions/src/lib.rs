@@ -2,12 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{
-    ActionRequest, Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId,
-    PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source, TaskId,
+    ActionRequest, Confidence, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass,
+    RoutingMetadata, RoutingScope, Salience, Source,
 };
 use sinomo_runtime::device::{DevicePermission, DeviceProfile};
+use sinomo_runtime::events::{EventId, SessionId};
+use sinomo_runtime::node::NodeId;
 use thiserror::Error;
 use time::OffsetDateTime;
+
+pub type TaskId = Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ActionSandboxPolicy {
@@ -261,8 +265,8 @@ pub enum ActionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_runtime::core::{DeviceCapability, DeviceId};
-    use sinomo_runtime::device::DeviceKind;
+    use sinomo_runtime::core::DeviceCapability;
+    use sinomo_runtime::device::{DeviceId, DeviceKind};
 
     #[test]
     fn local_action_executes_when_kind_and_device_are_allowed() {

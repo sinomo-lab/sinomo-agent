@@ -1,8 +1,8 @@
 //! Core autonomous self-evolution planning and orchestration.
 
 use crate::{
-    EvolutionPaths, EvolutionPersistenceError, RecordedCandidateDecision,
-    RecordedCandidateVerification, StoredEvolutionJob, record_candidate_decision,
+    EvolutionJobId, EvolutionPaths, EvolutionPersistenceError, RecordedCandidateDecision,
+    RecordedCandidateVerification, StoredEvolutionJob, WorkspaceId, record_candidate_decision,
     record_candidate_verification,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -18,14 +18,16 @@ use sinomo_lm::{
 };
 use sinomo_runtime::core::{
     CandidateBundleManifest, CandidateDecisionOutcome, CommandLogRef, Confidence, EditScope,
-    EvaluationGate, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind,
-    EvolutionJob, EvolutionJobId, EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass,
-    ModuleId, MutationOutputContract, MutationPacket, NodeId, PrivacyClass, RecoveryPlan,
-    RollbackPolicy, RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
-    VerificationCommand, VerificationPlan, WorkspaceId,
+    EvaluationGate, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, EvolutionJob,
+    EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass, MutationOutputContract,
+    MutationPacket, PrivacyClass, RecoveryPlan, RollbackPolicy, RoutingHint, RoutingMetadata,
+    RoutingScope, Salience, Source, TrustRing, VerificationCommand, VerificationPlan,
 };
 use sinomo_runtime::eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
+use sinomo_runtime::events::EventId;
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::module::ModuleId;
+use sinomo_runtime::node::NodeId;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -4902,11 +4904,13 @@ mod tests {
         LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
         PROVIDER_DEFAULT_MODEL,
     };
-    use sinomo_runtime::core::{EvaluationOutcome, ScorecardId};
+    use sinomo_runtime::core::{EvaluationOutcome, Id};
     use sinomo_runtime::eval::LocalCommandRunner;
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    type ScorecardId = Id;
 
     #[test]
     fn campaign_proposal_contains_inspectable_phase_zero_plan() {

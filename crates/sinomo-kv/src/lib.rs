@@ -9,7 +9,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sinomo_core::{ClusterMemberRecord, NodeId};
+use sinomo_core::ClusterMemberRecord;
+use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -1910,7 +1911,9 @@ pub enum KvError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{ClusterId, ClusterMemberRecord};
+    use sinomo_core::{ClusterMemberRecord, Id};
+
+    type ClusterId = Id;
 
     #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
     struct TestRecord {

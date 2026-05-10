@@ -1,6 +1,5 @@
-use sinomo_core::{
-    CapabilityName, ClusterEndpointId, ClusterMemberRole, ClusterTransportKind, NodeId,
-};
+use crate::NodeId;
+use sinomo_core::{CapabilityName, ClusterMemberRole, ClusterTransportKind, Id};
 
 pub fn shadow_daemon_node_id(main_node_id: &NodeId) -> NodeId {
     NodeId::derived("sinomo.node.shadow", main_node_id.as_str())
@@ -26,12 +25,12 @@ pub fn shadow_daemon_capabilities() -> Vec<CapabilityName> {
     ]
 }
 
-pub fn daemon_loopback_endpoint_id(node_id: &NodeId) -> ClusterEndpointId {
-    ClusterEndpointId::derived("sinomo.daemon.endpoint.loopback", node_id.as_str())
+pub fn daemon_loopback_endpoint_id(node_id: &NodeId) -> Id {
+    Id::derived("sinomo.daemon.endpoint.loopback", node_id.as_str())
 }
 
-pub fn daemon_lan_endpoint_id(node_id: &NodeId, address: &str) -> ClusterEndpointId {
-    ClusterEndpointId::derived(
+pub fn daemon_lan_endpoint_id(node_id: &NodeId, address: &str) -> Id {
+    Id::derived(
         "sinomo.daemon.endpoint.lan",
         format!("{}\0{address}", node_id.as_str()),
     )

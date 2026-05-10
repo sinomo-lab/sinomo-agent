@@ -6,13 +6,18 @@ use sinomo_lm::{
     LanguageModelResponseFormat, LanguageModelRole,
 };
 use sinomo_runtime::core::{
-    Confidence, ContextPacket, DeliberationJob, DfsObjectId, EventEnvelope, EventId, EventKind,
-    JobCancellation, JobStatus, LatencyClass, NodeId, PrivacyClass, RoutingMetadata, RoutingScope,
-    Salience, SessionId, Source, TaskId, WorkspaceId,
+    Confidence, ContextPacket, DeliberationJob, EventEnvelope, EventKind, Id, JobCancellation,
+    JobStatus, LatencyClass, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
 };
+use sinomo_runtime::dfs::DfsObjectId;
+use sinomo_runtime::events::{EventId, SessionId};
+use sinomo_runtime::node::NodeId;
 use std::collections::VecDeque;
 use thiserror::Error;
 use time::OffsetDateTime;
+
+pub type TaskId = Id;
+pub type WorkspaceId = Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DeliberationJobRecord {

@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 const HASH_PREFIX: &str = "blake3:";
@@ -20,6 +21,15 @@ pub enum ContentStoreError {
     InvalidHash(String),
     #[error("staged content not found for intent: {0}")]
     MissingStaged(String),
+    #[error(
+        "object version manifest already exists with different content: object={object_id}, version={version}, existing={existing_hash}, new={new_hash}"
+    )]
+    VersionHashConflict {
+        object_id: String,
+        version: String,
+        existing_hash: String,
+        new_hash: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ContentStoreError>;
@@ -124,6 +134,20 @@ impl LocalContentStore {
             write_file_atomic(&blob_path, bytes)?;
         }
 
+        let manifest_path = self.manifest_path(object_id, version);
+        if manifest_path.is_file() {
+            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            if existing.content_hash != hash {
+                return Err(ContentStoreError::VersionHashConflict {
+                    object_id: object_id.to_owned(),
+                    version: version.to_owned(),
+                    existing_hash: existing.content_hash,
+                    new_hash: hash,
+                });
+            }
+            return Ok(existing);
+        }
+
         let manifest = ContentManifest {
             object_id: object_id.to_owned(),
             version: version.to_owned(),
@@ -131,7 +155,7 @@ impl LocalContentStore {
             size_bytes: bytes.len() as u64,
         };
         let manifest_bytes = encode_manifest(&manifest)?;
-        write_file_atomic(&self.manifest_path(object_id, version), &manifest_bytes)?;
+        write_file_atomic(&manifest_path, &manifest_bytes)?;
         Ok(manifest)
     }
 
@@ -218,15 +242,49 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         create_dir_all(parent.to_owned())?;
     }
 
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, bytes).map_err(|source| ContentStoreError::Io {
+    let tmp_path = temporary_path_for(path);
+    let mut file = fs::File::create(&tmp_path).map_err(|source| ContentStoreError::Io {
         path: tmp_path.clone(),
         source,
     })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| ContentStoreError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+    drop(file);
     fs::rename(&tmp_path, path).map_err(|source| ContentStoreError::Io {
         path: path.to_owned(),
         source,
-    })
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|source| ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn temporary_path_for(path: &Path) -> PathBuf {
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tmp");
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ))
 }
 
 #[cfg(test)]
@@ -268,6 +326,34 @@ mod tests {
                 .expect("object manifests"),
             vec![manifest]
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_version_rejects_same_version_with_different_bytes() {
+        let root = temp_root("put_object_version_rejects_same_version_with_different_bytes");
+        let store = LocalContentStore::new(&root).expect("create store");
+
+        let first = store
+            .put_object_version("object-a", "v1", b"hello dfs")
+            .expect("first version");
+        let duplicate = store
+            .put_object_version("object-a", "v1", b"hello dfs")
+            .expect("duplicate version");
+        assert_eq!(duplicate, first);
+
+        let error = store
+            .put_object_version("object-a", "v1", b"different bytes")
+            .expect_err("different content for same version");
+        assert!(matches!(
+            error,
+            ContentStoreError::VersionHashConflict {
+                object_id,
+                version,
+                ..
+            } if object_id == "object-a" && version == "v1"
+        ));
 
         cleanup(&root);
     }

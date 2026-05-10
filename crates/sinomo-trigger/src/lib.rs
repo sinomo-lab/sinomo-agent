@@ -1,10 +1,10 @@
 //! Rule-based trigger timing policy skeleton.
 
 use sinomo_runtime::core::{
-    Confidence, EventEnvelope, EventId, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
+    Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
     RoutingScope, Salience, Source, TriggerAction, TriggerDecision,
 };
-use sinomo_runtime::events::StoredEvent;
+use sinomo_runtime::events::{EventId, StoredEvent};
 
 #[derive(Clone, Debug)]
 pub struct TriggerPolicy {
@@ -137,10 +137,11 @@ fn collect_json_text(value: &serde_json::Value, text: &mut String) {
 mod tests {
     use super::*;
     use sinomo_runtime::core::{
-        Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
-        RoutingMetadata, RoutingScope, Salience, SessionId, Source,
+        Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
+        RoutingScope, Salience, Source,
     };
-    use sinomo_runtime::events::EventSequence;
+    use sinomo_runtime::events::{EventSequence, SessionId};
+    use sinomo_runtime::node::NodeId;
 
     fn stored(payload: serde_json::Value, salience: f32) -> StoredEvent {
         StoredEvent {

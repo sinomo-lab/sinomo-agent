@@ -18,6 +18,11 @@ pub use roaming::*;
 pub use rpc::*;
 pub use storage::*;
 
+pub type ClusterId = sinomo_core::Id;
+pub type ClusterEndpointId = sinomo_core::Id;
+pub type ClusterInviteId = sinomo_core::Id;
+pub type ClusterCertificateId = sinomo_core::Id;
+
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
 ) -> Result<(), sinomo_storage::StorageContractError> {
@@ -56,16 +61,18 @@ pub fn register_storage_paths(
 }
 
 pub(crate) mod prelude {
+    pub(crate) use crate::{ClusterEndpointId, ClusterId, ClusterInviteId};
     pub(crate) use serde::{Deserialize, Serialize};
     pub(crate) use sinomo_core::{
-        CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointId,
-        ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterId,
-        ClusterInvitationChannel, ClusterInviteId, ClusterJoinInvite, ClusterMemberRecord,
-        ClusterMemberRole, ClusterMemberState, ClusterNodeRole, ClusterNodeStatusRecord,
-        ClusterTransportKind, EventEnvelope, EventId, LatencyClass, NodeId, RoutingScope,
-        SessionId, TrustDomain,
+        CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointPrivacy,
+        ClusterEndpointRecord, ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite,
+        ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeRole,
+        ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, LatencyClass, RoutingScope,
+        TrustDomain,
     };
-    pub(crate) use sinomo_events::{EventSequence, EventStore, EventStoreError, StoredEvent};
+    pub(crate) use sinomo_events::{
+        EventId, EventSequence, EventStore, EventStoreError, SessionId, StoredEvent,
+    };
     pub(crate) use sinomo_kv::{
         DurableRaftKvNode, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent,
         KvLogEntry, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvWalPaths, LeaseId,
@@ -74,7 +81,7 @@ pub(crate) mod prelude {
     };
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::{
-        NodeAvailability, NodeHealth, NodeProfile, daemon_lan_endpoint_id,
+        NodeAvailability, NodeHealth, NodeId, NodeProfile, daemon_lan_endpoint_id,
         daemon_loopback_endpoint_id, main_daemon_capabilities, shadow_daemon_capabilities,
         shadow_daemon_node_id,
     };

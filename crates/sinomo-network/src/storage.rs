@@ -831,8 +831,8 @@ pub fn open_cluster_raft_kv_node(
     if node.hard_state().commit_index == 0 && paths.kv_snapshot.exists() {
         let snapshot = read_cluster_kv_snapshot(paths)?;
         node.restore_snapshot(RaftSnapshot {
-            last_included_index: snapshot.revision.0,
-            last_included_term: 1,
+            last_included_index: 0,
+            last_included_term: 0,
             kv: snapshot,
         })?;
     }
@@ -845,16 +845,20 @@ pub fn restore_cluster_raft_from_snapshot_if_newer(
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    let node = open_cluster_raft_kv_node(paths, node_id)?;
     if snapshot.revision <= node.store().snapshot().revision {
         return Ok(false);
     }
-    node.restore_snapshot(RaftSnapshot {
-        last_included_index: snapshot.revision.0,
-        last_included_term: node.term_at(node.applied_index()).unwrap_or(1),
-        kv: snapshot,
-    })?;
-    mirror_cluster_raft_snapshot(paths, &node)?;
+    write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+    if node.applied_index() == 0 && node.last_log_index() == 0 {
+        drop(node);
+        let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+        node.restore_snapshot(RaftSnapshot {
+            last_included_index: 0,
+            last_included_term: 0,
+            kv: snapshot,
+        })?;
+    }
     Ok(true)
 }
 
@@ -867,8 +871,8 @@ pub async fn open_cluster_raft_kv_node_async(
     if node.hard_state().commit_index == 0 && paths.kv_snapshot.exists() {
         let snapshot = read_cluster_kv_snapshot(paths)?;
         node.restore_snapshot(RaftSnapshot {
-            last_included_index: snapshot.revision.0,
-            last_included_term: 1,
+            last_included_index: 0,
+            last_included_term: 0,
             kv: snapshot,
         })?;
     }
@@ -934,12 +938,8 @@ pub fn apply_cluster_raft_append(
             && (append.prev_log_index != snapshot.last_included_index
                 || append.prev_log_term == snapshot.last_included_term);
         let snapshot_is_newer = snapshot.last_included_index > node.applied_index();
-        let snapshot_kv_is_newer = snapshot.kv.revision > node.store().snapshot().revision;
         let append_term_is_current = append.term >= node.hard_state().current_term;
-        if append_term_is_current
-            && snapshot_matches_append
-            && (snapshot_is_newer || snapshot_kv_is_newer)
-        {
+        if append_term_is_current && snapshot_matches_append && snapshot_is_newer {
             node.restore_snapshot(snapshot)?;
         }
     }

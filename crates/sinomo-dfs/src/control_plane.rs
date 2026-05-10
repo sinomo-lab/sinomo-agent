@@ -5,12 +5,14 @@
 //! roots and metadata-shard placement. File/object namespace metadata belongs
 //! in the DFS metadata service and its sharded local stores.
 
+use crate::DfsFileSystemId;
 use crate::{DfsFileSystem, DfsSubtreePolicy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sinomo_core::{DfsFileSystemId, DfsObjectPolicy, NodeId};
+use sinomo_core::DfsObjectPolicy;
 use sinomo_kv::{
     InProcessRaftKvCluster, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
+use sinomo_node::NodeId;
 use std::sync::{Arc, Mutex};
 
 const DFS_KV_PREFIX: &str = "/dfs";

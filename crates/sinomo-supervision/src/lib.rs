@@ -1,8 +1,9 @@
 //! Supervision incident traces and audit view skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{DeviceId, EventId, NodeId};
-use sinomo_events::{EventSequence, StoredEvent};
+use sinomo_device::DeviceId;
+use sinomo_events::{EventId, EventSequence, StoredEvent};
+use sinomo_node::NodeId;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SupervisionSnapshot {

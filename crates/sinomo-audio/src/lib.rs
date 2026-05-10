@@ -2,9 +2,10 @@
 
 use sinomo_gateway::{InputChunk, InputModality};
 use sinomo_runtime::core::{
-    Confidence, EventEnvelope, EventId, EventKind, EventSpan, LatencyClass, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, Source,
+    Confidence, EventEnvelope, EventKind, EventSpan, LatencyClass, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source,
 };
+use sinomo_runtime::events::EventId;
 
 #[derive(Clone, Debug, Default)]
 pub struct AudioPerceptionWorker;
@@ -90,8 +91,9 @@ impl WithSpan for EventEnvelope {
 mod tests {
     use super::*;
     use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
-    use sinomo_runtime::core::{NodeId, SessionId};
     use sinomo_runtime::device::DeviceProfile;
+    use sinomo_runtime::events::SessionId;
+    use sinomo_runtime::node::NodeId;
 
     #[test]
     fn audio_worker_emits_vad_and_transcript_events() {

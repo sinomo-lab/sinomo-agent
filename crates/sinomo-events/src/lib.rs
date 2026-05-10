@@ -1,10 +1,15 @@
 //! Event validation, append, and replay backbone.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{EventEnvelope, EventId, EventKind, NodeId, SessionId};
+use sinomo_core::{EventEnvelope, EventKind};
+use sinomo_node::NodeId;
 use std::collections::HashSet;
 use thiserror::Error;
 use time::OffsetDateTime;
+
+pub type EventId = sinomo_core::Id;
+pub type SessionId = sinomo_core::Id;
+pub type EntityId = sinomo_core::Id;
 
 #[derive(Clone, Debug, Default)]
 pub struct EventValidator;
@@ -296,9 +301,10 @@ pub fn kind_has_prefix(kind: &EventKind, prefix: &str) -> bool {
 mod tests {
     use super::*;
     use sinomo_core::{
-        Confidence, EventEnvelope, EventId, EventKind, EventLinks, EventSpan, LatencyClass, NodeId,
-        PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
+        Confidence, EventEnvelope, EventKind, EventLinks, EventSpan, LatencyClass, PrivacyClass,
+        RoutingMetadata, RoutingScope, Salience, Source,
     };
+    use sinomo_node::NodeId;
 
     fn fixture_event(id: &str, session_id: Option<&str>, kind: &str) -> EventEnvelope {
         let mut event = EventEnvelope::new(

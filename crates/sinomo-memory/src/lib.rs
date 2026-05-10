@@ -1,8 +1,8 @@
 //! Hot and warm memory policy skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_runtime::core::{ContextPacket, EntityId, MemoryRecord, SessionId, TrustDomain};
-use sinomo_runtime::events::StoredEvent;
+use sinomo_runtime::core::{ContextPacket, MemoryRecord, TrustDomain};
+use sinomo_runtime::events::{EntityId, SessionId, StoredEvent};
 use std::collections::VecDeque;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -247,10 +247,11 @@ pub enum MemoryError {
 mod tests {
     use super::*;
     use sinomo_runtime::core::{
-        Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
-        RoutingMetadata, RoutingScope, Salience, Source,
+        Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
+        RoutingScope, Salience, Source,
     };
-    use sinomo_runtime::events::EventSequence;
+    use sinomo_runtime::events::{EventId, EventSequence};
+    use sinomo_runtime::node::NodeId;
 
     fn stored(id: &str, kind: &str, salience: f32) -> StoredEvent {
         StoredEvent {

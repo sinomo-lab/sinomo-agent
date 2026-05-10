@@ -2,12 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactId, Confidence, EvaluationGate, EvaluationGateResult, EvaluationMetric,
-    EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId, EventKind, EvolutionJobId,
-    LatencyClass, MetricValue, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
-    ScorecardId, Source, VerificationCommand, VerificationPlan,
+    Confidence, EvaluationGate, EvaluationGateResult, EvaluationMetric, EvaluationOutcome,
+    EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass, MetricValue, PrivacyClass,
+    RoutingMetadata, RoutingScope, Salience, Source, VerificationCommand, VerificationPlan,
 };
-use sinomo_events::ReplayQuery;
+use sinomo_events::{EventId, ReplayQuery};
+use sinomo_module::ArtifactId;
+use sinomo_node::NodeId;
+use sinomo_rollout::ScorecardId;
 use std::{
     collections::BTreeMap,
     io::Read,
@@ -23,6 +25,8 @@ use std::{
 };
 use thiserror::Error;
 use time::OffsetDateTime;
+
+type EvolutionJobId = Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CommandEvaluationSpec {
@@ -780,7 +784,7 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::SessionId;
+    use sinomo_events::SessionId;
     use std::env;
 
     #[test]

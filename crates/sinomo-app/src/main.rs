@@ -4,7 +4,7 @@ use sinomo_audio::AudioPerceptionWorker;
 use sinomo_deliberation::{
     DeliberationJobRecord, DeliberationQueue, DeliberationWorker, WorkspaceSnapshot,
 };
-use sinomo_evolution::{EvolutionOpportunity, EvolutionPlanner};
+use sinomo_evolution::{EvolutionOpportunity, EvolutionPlanner, TaskId, WorkspaceId};
 use sinomo_fusion::FusionWorker;
 use sinomo_gateway::{InputAdapter, SyntheticInputAdapter};
 use sinomo_lm::{
@@ -16,25 +16,24 @@ use sinomo_lm::{
 use sinomo_memory::{MemoryManager, MemoryPolicy};
 use sinomo_runtime::api::ApiService;
 use sinomo_runtime::core::{
-    ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
-    CapabilityName, DeviceCapability, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteRequest,
-    EvaluationGate, ModuleId, ModuleManifest, ModuleResourceLimits, NodeCapability, RolloutPlan,
-    RolloutPlanId, RolloutStrategy, SessionId, SyncPolicy, TaskId, TrustRing, WorkspaceId,
+    ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CapabilityDiff, CapabilityName,
+    DeviceCapability, DfsObjectPolicy, DfsWriteRequest, EvaluationGate, ModuleManifest,
+    ModuleResourceLimits, NodeCapability, RolloutPlan, RolloutStrategy, SyncPolicy, TrustRing,
 };
 use sinomo_runtime::device::{DevicePermission, DeviceProfile};
 use sinomo_runtime::dfs::{
-    DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsSubtreePolicy,
-    sifs_file_system_id,
+    DfsFileSystem, DfsMetadataStore, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsSubtreePolicy, DfsVersion, sifs_file_system_id,
 };
 use sinomo_runtime::eval::{
     CommandEvaluationSpec, CommandEvaluationSuite, LocalEvalHarness, ReplayFixtureRef,
 };
 use sinomo_runtime::events::{
-    EventSequence, EventStore, InMemoryEventStore, ReplayQuery, StoredEvent,
+    EventSequence, EventStore, InMemoryEventStore, ReplayQuery, SessionId, StoredEvent,
 };
-use sinomo_runtime::module::{LoadRequest, ModuleLoader};
+use sinomo_runtime::module::{ArtifactId, LoadRequest, ModuleId, ModuleLoader, RolloutPlanId};
 use sinomo_runtime::network::{InProcessRouter, PeerRegistry};
-use sinomo_runtime::node::{HostedService, NodeProfile};
+use sinomo_runtime::node::{HostedService, NodeId, NodeProfile};
 use sinomo_runtime::policy::{PolicyEngine, PolicyInput};
 use sinomo_runtime::registry::{ArtifactRegistry, CandidateRecord, RegistryEntry, RegistryStatus};
 use sinomo_runtime::rollout::{RolloutController, RolloutObservation};
@@ -71,12 +70,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_capability(NodeCapability::new(voice_capability.clone()))
         .with_capability(NodeCapability::new(api_capability.clone()))
         .with_service(HostedService::new(event_service_capability));
-    workstation.node_id = sinomo_runtime::core::NodeId::from_legacy_named("node_desktop")?;
+    workstation.node_id = NodeId::from_legacy_named("node_desktop")?;
 
     let mut home_server = NodeProfile::local("home server")?
         .with_capability(NodeCapability::new(registry_capability))
         .with_capability(NodeCapability::new(module_loader_capability));
-    home_server.node_id = sinomo_runtime::core::NodeId::from_legacy_named("node_server")?;
+    home_server.node_id = NodeId::from_legacy_named("node_server")?;
 
     let workspace_device = DeviceProfile::new(
         workstation.node_id.clone(),

@@ -2,12 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactId, ArtifactManifest, Confidence, EventEnvelope, EventId, EventKind, HotSwapState,
-    LatencyClass, ModuleId, ModuleLoaderState, NodeId, PolicyAction, PolicyDecision, PrivacyClass,
-    RolloutPlan, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
+    ArtifactManifest, Confidence, EventEnvelope, EventKind, HotSwapState, LatencyClass,
+    ModuleLoaderState, PolicyAction, PolicyDecision, PrivacyClass, RolloutPlan, RoutingMetadata,
+    RoutingScope, Salience, Source, TrustRing,
 };
+use sinomo_events::EventId;
+use sinomo_node::NodeId;
 use thiserror::Error;
 use time::OffsetDateTime;
+
+pub type ArtifactId = sinomo_core::Id;
+pub type ModuleId = sinomo_core::Id;
+pub type RolloutPlanId = sinomo_core::Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LoadRequest {
@@ -21,7 +27,7 @@ pub struct LoadRequest {
 pub struct LoadDecision {
     pub node_id: NodeId,
     pub module_id: ModuleId,
-    pub artifact_id: sinomo_core::ArtifactId,
+    pub artifact_id: ArtifactId,
     pub action: LoaderAction,
     pub reason: String,
 }
@@ -42,7 +48,7 @@ pub struct ModulePolicyViolation {
     pub module_id: ModuleId,
     pub artifact_id: ArtifactId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollout_plan_id: Option<sinomo_core::RolloutPlanId>,
+    pub rollout_plan_id: Option<RolloutPlanId>,
     pub reason: String,
 }
 
@@ -123,7 +129,7 @@ impl ModuleLoader {
     pub fn shadow_state(
         &self,
         request: &LoadRequest,
-        active_artifact_id: sinomo_core::ArtifactId,
+        active_artifact_id: ArtifactId,
     ) -> ModuleLoaderState {
         ModuleLoaderState {
             module_id: request.artifact.module_id.clone(),
@@ -146,9 +152,11 @@ pub enum ModuleLoadError {
 mod tests {
     use super::*;
     use sinomo_core::{
-        ActorKind, ActorRef, ArtifactId, ArtifactManifest, ArtifactProvenance, CapabilityDiff,
-        ModuleManifest, PolicyDecisionId, RollbackPolicy, RolloutPlanId, RolloutStrategy,
+        ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CapabilityDiff, Id,
+        ModuleManifest, RollbackPolicy, RolloutStrategy,
     };
+
+    type PolicyDecisionId = Id;
 
     #[test]
     fn r3_allowed_artifact_loads_in_shadow() {

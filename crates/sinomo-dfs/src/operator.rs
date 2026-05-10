@@ -5,8 +5,9 @@ use crate::{
     DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
     MetadataBackendError,
 };
+use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sinomo_core::{DfsFileSystemId, DfsObjectId, DfsVersion, NodeId};
+use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::BTreeSet;
 use std::fs;
@@ -559,7 +560,8 @@ mod tests {
         DfsObjectKind, DfsObjectMetadata, DfsReplicaReceiptRecord, DfsReplicationPolicy,
         DfsWriteIntentRecord, LocalJsonMetadataBackend,
     };
-    use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, EventId};
+    use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
+    use sinomo_events::EventId;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

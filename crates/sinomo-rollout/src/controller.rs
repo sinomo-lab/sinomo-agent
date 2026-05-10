@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactId, Confidence, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventId,
-    EventKind, HotSwapState, LatencyClass, ModuleLoaderState, NodeId, PrivacyClass, RolloutPlan,
-    RolloutStrategy, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
+    Confidence, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, HotSwapState,
+    LatencyClass, ModuleLoaderState, PrivacyClass, RolloutPlan, RolloutStrategy, RoutingMetadata,
+    RoutingScope, Salience, Source, TrustRing,
 };
+use sinomo_events::EventId;
+use sinomo_module::ArtifactId;
+use sinomo_node::NodeId;
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -204,9 +207,9 @@ fn next_weight(current: u16, steps: &[u16]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{
-        EvaluationGate, EvaluationGateResult, ModuleId, RollbackPolicy, RolloutPlanId, ScorecardId,
-    };
+    use crate::{RolloutPlanId, ScorecardId};
+    use sinomo_core::{EvaluationGate, EvaluationGateResult, RollbackPolicy};
+    use sinomo_module::ModuleId;
 
     #[test]
     fn passed_shadow_scorecard_advances_r3_canary() {

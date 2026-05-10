@@ -6,13 +6,17 @@ use sinomo_lm::{
     LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
 };
 use sinomo_runtime::core::{
-    ActionRequest, Confidence, ContextPacket, EntityId, EventEnvelope, EventId, EventKind,
-    LatencyClass, NodeId, PrivacyClass, RoutingMetadata, RoutingScope, Salience, SessionId, Source,
-    TaskId, TriggerAction, TriggerDecision,
+    ActionRequest, Confidence, ContextPacket, EventEnvelope, EventKind, Id, LatencyClass,
+    PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source, TriggerAction, TriggerDecision,
 };
 use sinomo_runtime::device::{DeviceKind, DeviceProfile};
-use sinomo_runtime::events::{EventStore, ReplayDirection, ReplayQuery, StoredEvent};
+use sinomo_runtime::events::{
+    EntityId, EventId, EventStore, ReplayDirection, ReplayQuery, SessionId, StoredEvent,
+};
+use sinomo_runtime::node::NodeId;
 use thiserror::Error;
+
+pub type TaskId = Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct InteractionSession {
@@ -435,11 +439,12 @@ pub enum AgentError {
 mod tests {
     use super::*;
     use sinomo_runtime::core::{
-        Confidence, DeviceId, EventEnvelope, EventId, EventKind, LatencyClass, NodeId,
-        PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
+        Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
+        RoutingScope, Salience, Source,
     };
-    use sinomo_runtime::device::DeviceState;
-    use sinomo_runtime::events::{EventStore, InMemoryEventStore};
+    use sinomo_runtime::device::{DeviceId, DeviceState};
+    use sinomo_runtime::events::{EventId, EventStore, InMemoryEventStore};
+    use sinomo_runtime::node::NodeId;
 
     fn event(id: &str, text: &str, salience: f32) -> EventEnvelope {
         EventEnvelope::new(

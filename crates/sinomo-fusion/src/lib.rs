@@ -1,9 +1,10 @@
 //! Cross-modal alignment skeleton.
 
 use sinomo_runtime::core::{
-    Confidence, EventEnvelope, EventId, EventKind, EventLinks, LatencyClass, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, Source,
+    Confidence, EventEnvelope, EventKind, EventLinks, LatencyClass, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source,
 };
+use sinomo_runtime::events::EventId;
 
 #[derive(Clone, Debug, Default)]
 pub struct FusionWorker;
@@ -64,9 +65,11 @@ impl FusionWorker {
 mod tests {
     use super::*;
     use sinomo_runtime::core::{
-        Confidence, EventEnvelope, EventId, EventKind, LatencyClass, NodeId, PrivacyClass,
-        RoutingMetadata, RoutingScope, Salience, SessionId, Source,
+        Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
+        RoutingScope, Salience, Source,
     };
+    use sinomo_runtime::events::SessionId;
+    use sinomo_runtime::node::NodeId;
 
     fn observation(id: &str, kind: &str) -> EventEnvelope {
         EventEnvelope::new(

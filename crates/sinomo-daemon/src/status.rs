@@ -4,11 +4,13 @@ use crate::{
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterId,
-    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
-    ClusterNodeRolloutStatus, ClusterNodeStatusRecord, NodeId,
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
+    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRolloutStatus,
+    ClusterNodeStatusRecord,
 };
 use sinomo_local::SinomoDataDir;
+use sinomo_network::ClusterId;
+use sinomo_node::NodeId;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::IpAddr;

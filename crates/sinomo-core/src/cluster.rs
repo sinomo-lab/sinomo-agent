@@ -1,7 +1,4 @@
-use crate::{
-    CapabilityName, ClusterCertificateId, ClusterEndpointId, ClusterId, ClusterInviteId, NodeId,
-    TrustDomain,
-};
+use crate::{CapabilityName, Id, TrustDomain};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -16,7 +13,7 @@ impl ClusterEpoch {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterIdentity {
-    pub cluster_id: ClusterId,
+    pub cluster_id: Id,
     pub cluster_name: String,
     pub cluster_epoch: ClusterEpoch,
     #[serde(with = "time::serde::rfc3339")]
@@ -25,9 +22,9 @@ pub struct ClusterIdentity {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterBootstrapState {
-    pub cluster_id: ClusterId,
+    pub cluster_id: Id,
     pub cluster_name: String,
-    pub local_node_id: NodeId,
+    pub local_node_id: Id,
     pub local_node_display_name: String,
     pub term: u64,
     pub kv_revision: u64,
@@ -41,9 +38,9 @@ pub struct ClusterBootstrapState {
 
 impl ClusterBootstrapState {
     pub fn initialized_locally(
-        cluster_id: ClusterId,
+        cluster_id: Id,
         cluster_name: impl Into<String>,
-        local_node_id: NodeId,
+        local_node_id: Id,
         local_node_display_name: impl Into<String>,
         local_node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
@@ -71,9 +68,9 @@ impl ClusterBootstrapState {
     }
 
     pub fn pending_join(
-        cluster_id: ClusterId,
+        cluster_id: Id,
         cluster_name: impl Into<String>,
-        local_node_id: NodeId,
+        local_node_id: Id,
         local_node_display_name: impl Into<String>,
         local_node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
@@ -103,8 +100,8 @@ impl ClusterBootstrapState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterJoinInvite {
-    pub invite_id: ClusterInviteId,
-    pub cluster_id: ClusterId,
+    pub invite_id: Id,
+    pub cluster_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_name: Option<String>,
     #[serde(default)]
@@ -122,7 +119,7 @@ pub struct ClusterJoinInvite {
     pub trust_domain: TrustDomain,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_member_roles: Vec<ClusterMemberRole>,
-    pub issuer_node_id: NodeId,
+    pub issuer_node_id: Id,
     #[serde(default)]
     pub issuer_public_key: String,
     #[serde(default)]
@@ -137,8 +134,8 @@ pub struct ClusterInvitationChannel {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterMemberRecord {
-    pub cluster_id: ClusterId,
-    pub node_id: NodeId,
+    pub cluster_id: Id,
+    pub node_id: Id,
     pub display_name: String,
     #[serde(default, skip_serializing_if = "ClusterNodeRole::is_default")]
     pub node_role: ClusterNodeRole,
@@ -147,7 +144,7 @@ pub struct ClusterMemberRecord {
     pub trust_domain: TrustDomain,
     pub node_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub certificate_id: Option<ClusterCertificateId>,
+    pub certificate_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<CapabilityName>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -162,8 +159,8 @@ pub struct ClusterMemberRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterNodeStatusRecord {
-    pub cluster_id: ClusterId,
-    pub node_id: NodeId,
+    pub cluster_id: Id,
+    pub node_id: Id,
     pub process: String,
     pub availability: ClusterNodeAvailability,
     pub daemon_version: String,
@@ -226,8 +223,8 @@ pub struct ClusterNodeRolloutStatus {
 
 impl ClusterMemberRecord {
     pub fn local_voter(
-        cluster_id: ClusterId,
-        node_id: NodeId,
+        cluster_id: Id,
+        node_id: Id,
         display_name: impl Into<String>,
         node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
@@ -244,8 +241,8 @@ impl ClusterMemberRecord {
     }
 
     pub fn pending_learner(
-        cluster_id: ClusterId,
-        node_id: NodeId,
+        cluster_id: Id,
+        node_id: Id,
         display_name: impl Into<String>,
         node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
@@ -262,8 +259,8 @@ impl ClusterMemberRecord {
     }
 
     pub fn local_non_voting(
-        cluster_id: ClusterId,
-        node_id: NodeId,
+        cluster_id: Id,
+        node_id: Id,
         display_name: impl Into<String>,
         node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
@@ -280,8 +277,8 @@ impl ClusterMemberRecord {
     }
 
     pub fn pending_non_voting(
-        cluster_id: ClusterId,
-        node_id: NodeId,
+        cluster_id: Id,
+        node_id: Id,
         display_name: impl Into<String>,
         node_public_key: impl Into<String>,
         timestamp: OffsetDateTime,
@@ -298,8 +295,8 @@ impl ClusterMemberRecord {
     }
 
     fn new(
-        cluster_id: ClusterId,
-        node_id: NodeId,
+        cluster_id: Id,
+        node_id: Id,
         display_name: impl Into<String>,
         node_public_key: impl Into<String>,
         role: ClusterMemberRole,
@@ -371,8 +368,8 @@ impl ClusterMemberState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterEndpointRecord {
-    pub endpoint_id: ClusterEndpointId,
-    pub node_id: NodeId,
+    pub endpoint_id: Id,
+    pub node_id: Id,
     pub transport: ClusterTransportKind,
     pub address: String,
     pub source: ClusterEndpointSource,
@@ -383,9 +380,9 @@ pub struct ClusterEndpointRecord {
 }
 
 impl ClusterEndpointRecord {
-    pub fn loopback(node_id: NodeId, address: impl Into<String>) -> Self {
+    pub fn loopback(node_id: Id, address: impl Into<String>) -> Self {
         Self {
-            endpoint_id: ClusterEndpointId::generate(),
+            endpoint_id: Id::generate(),
             node_id,
             transport: ClusterTransportKind::Loopback,
             address: address.into(),
@@ -432,10 +429,10 @@ pub enum ClusterEndpointPrivacy {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterCertificate {
-    pub certificate_id: ClusterCertificateId,
-    pub cluster_id: ClusterId,
-    pub node_id: NodeId,
-    pub issuer_node_id: NodeId,
+    pub certificate_id: Id,
+    pub cluster_id: Id,
+    pub node_id: Id,
+    pub issuer_node_id: Id,
     pub public_key: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capability_scope: Vec<CapabilityName>,
@@ -458,9 +455,9 @@ mod tests {
         )
         .expect("timestamp");
         let state = ClusterBootstrapState::initialized_locally(
-            ClusterId::from_legacy_named("cluster_home").expect("cluster"),
+            Id::from_legacy_named("cluster_home").expect("cluster"),
             "home",
-            NodeId::from_legacy_named("node_desktop").expect("node"),
+            Id::from_legacy_named("node_desktop").expect("node"),
             "desktop",
             "pk_desktop",
             timestamp,
@@ -489,27 +486,27 @@ mod tests {
         )
         .expect("timestamp");
         let invite = ClusterJoinInvite {
-            invite_id: ClusterInviteId::from_legacy_named("invite_phone").expect("invite"),
-            cluster_id: ClusterId::from_legacy_named("cluster_home").expect("cluster"),
+            invite_id: Id::from_legacy_named("invite_phone").expect("invite"),
+            cluster_id: Id::from_legacy_named("cluster_home").expect("cluster"),
             cluster_name: Some("home".to_string()),
             cluster_public_key: "pk_desktop".to_string(),
             invitation_secret: "secret_1".to_string(),
             communication_channels: vec![ClusterInvitationChannel {
                 endpoint: ClusterEndpointRecord::loopback(
-                    NodeId::from_legacy_named("node_desktop").expect("node"),
+                    Id::from_legacy_named("node_desktop").expect("node"),
                     "127.0.0.1:21353",
                 ),
                 node_public_key: "pk_desktop".to_string(),
             }],
             introducers: vec![ClusterEndpointRecord::loopback(
-                NodeId::from_legacy_named("node_desktop").expect("node"),
+                Id::from_legacy_named("node_desktop").expect("node"),
                 "127.0.0.1:21353",
             )],
             token_id: "token_1".to_string(),
             expires_at: timestamp,
             trust_domain: TrustDomain::new("trust.local").expect("trust"),
             allowed_member_roles: vec![ClusterMemberRole::Learner],
-            issuer_node_id: NodeId::from_legacy_named("node_desktop").expect("node"),
+            issuer_node_id: Id::from_legacy_named("node_desktop").expect("node"),
             issuer_public_key: "pk_desktop".to_string(),
             signature: "sig".to_string(),
         };

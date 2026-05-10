@@ -2,9 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactId, CapabilityDiff, EvaluationGate, EvaluationOutcome, EvaluationScorecard,
-    PolicyAction, PolicyDecision, PolicyDecisionId, RolloutPlan, TrustRing,
+    CapabilityDiff, EvaluationGate, EvaluationOutcome, EvaluationScorecard, PolicyAction,
+    PolicyDecision, RolloutPlan, TrustRing,
 };
+use sinomo_module::ArtifactId;
+
+pub type PolicyDecisionId = sinomo_core::Id;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PolicyInput {

@@ -1,7 +1,10 @@
 //! Session membership and synchronization metadata skeleton.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{DeviceId, EventId, NodeId, SessionId, SyncPolicy, TaskId};
+use sinomo_core::{Id, SyncPolicy};
+use sinomo_device::DeviceId;
+use sinomo_events::{EventId, SessionId};
+use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -31,7 +34,7 @@ pub struct SessionSyncState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<SessionParticipant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_task_id: Option<TaskId>,
+    pub active_task_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_event_id: Option<EventId>,
     pub sync_policy: SyncPolicy,

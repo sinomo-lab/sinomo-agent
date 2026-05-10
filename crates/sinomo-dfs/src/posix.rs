@@ -8,13 +8,14 @@
 
 use crate::namespace::{initial_version, metadata_path, next_version, object_id_for_path};
 use crate::{
-    DfsError, DfsFileSystem, DfsObjectKind, DfsObjectMetadata, DfsReadData, DfsReplicationPolicy,
-    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsWriteOutcome, sifs_file_system_id,
+    DfsError, DfsFileSystem, DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata,
+    DfsReadData, DfsReplicationPolicy, NetworkedDfsReadOutcome, NetworkedDfsService,
+    NetworkedDfsWriteOutcome, sifs_file_system_id,
 };
-use sinomo_core::{
-    DfsFileSystemId, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteRequest, NodeId,
-};
+use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
+use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_network::NetworkTransport;
+use sinomo_node::NodeId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -144,6 +145,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let path = normalize_posix_path(path)?;
         self.ensure_parent_directory(&path)?;
+        let mut transient_create = false;
         let object = match self.lookup_sifs_path(&path)? {
             Some(object) if object.kind == DfsObjectKind::Directory => {
                 return Err(DfsPosixError::IsDirectory { path });
@@ -154,13 +156,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 object.version = initial_version();
                 object.content_hash = None;
                 object.current_locations = vec![self.node_id.clone()];
-                self.add_object_metadata(object.clone())?;
+                self.add_transient_object_metadata(object.clone())?;
+                transient_create = true;
                 object
             }
             Some(object) => object,
             None => {
                 let object = self.metadata_object_for_new_path(&path, DfsObjectKind::File);
-                self.add_object_metadata(object.clone())?;
+                self.add_transient_object_metadata(object.clone())?;
+                transient_create = true;
                 object
             }
         };
@@ -179,7 +183,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             bytes.to_vec(),
             candidates,
             options.policy,
-        )?;
+        );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                return Err(error.into());
+            }
+        };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
                 let object = self
@@ -192,6 +205,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 durable_receipts,
                 required_receipts,
             } if !options.wait_for_commit => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                    return Err(DfsPosixError::PendingWrite {
+                        intent_id,
+                        durable_receipts,
+                        required_receipts,
+                    });
+                }
                 let object = self
                     .lookup_sifs_path(&path)?
                     .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
@@ -206,15 +227,25 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 intent_id,
                 durable_receipts,
                 required_receipts,
-            } => Err(DfsPosixError::PendingWrite {
-                intent_id,
-                durable_receipts,
-                required_receipts,
-            }),
-            NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
-                path,
-                reason: conflict.reason,
-            }),
+            } => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                Err(DfsPosixError::PendingWrite {
+                    intent_id,
+                    durable_receipts,
+                    required_receipts,
+                })
+            }
+            NetworkedDfsWriteOutcome::Conflict { conflict } => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                Err(DfsPosixError::Conflict {
+                    path,
+                    reason: conflict.reason,
+                })
+            }
         }
     }
 
@@ -311,6 +342,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
         }
 
+        let old_prefix = format!("{}/", from.trim_end_matches('/'));
+        let new_prefix = format!("{}/", to.trim_end_matches('/'));
+        let mut moved_children = Vec::new();
+
         if let Some(mut destination) = self.lookup_sifs_path(&to)? {
             if destination.kind != DfsObjectKind::Tombstone {
                 match (&source.kind, &destination.kind) {
@@ -331,13 +366,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 destination.version = next_version(&destination.version);
                 destination.content_hash = None;
                 destination.current_locations = vec![self.node_id.clone()];
-                self.add_object_metadata(destination)?;
+                moved_children.push(destination);
             }
         }
 
-        let old_prefix = format!("{}/", from.trim_end_matches('/'));
-        let new_prefix = format!("{}/", to.trim_end_matches('/'));
-        let mut moved_children = Vec::new();
         if source.kind == DfsObjectKind::Directory {
             for mut object in self.objects_for_sifs()? {
                 let object_path = normalize_posix_path(&object.path)?;
@@ -354,10 +386,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
 
         source.path = to;
-        self.add_object_metadata(source.clone())?;
-        for object in moved_children {
-            self.add_object_metadata(object)?;
-        }
+        let mut transaction_objects = vec![source.clone()];
+        transaction_objects.extend(moved_children);
+        self.apply_namespace_transaction(DfsNamespaceTransaction {
+            transaction_id: namespace_transaction_id("rename", &source.object_id, &source.path),
+            file_system_id: source.file_system_id.clone(),
+            objects: transaction_objects,
+            created_at: time::OffsetDateTime::now_utc(),
+        })?;
         self.stat_object(&source)
     }
 
@@ -535,6 +571,14 @@ fn normalize_posix_path(path: &str) -> Result<String> {
     } else {
         Ok(format!("/{}", parts.join("/")))
     }
+}
+
+fn namespace_transaction_id(kind: &str, object_id: &DfsObjectId, path: &str) -> String {
+    format!(
+        "namespace_{}_{}",
+        kind,
+        blake3::hash(format!("{object_id}\0{path}").as_bytes()).to_hex()
+    )
 }
 
 #[allow(dead_code)]

@@ -1,12 +1,12 @@
 [package]
 name = "sinomo-dfs"
 version.workspace = true
-description = "Sinomo local-first distributed filesystem metadata skeleton"
+description = "Sinomo local-first distributed filesystem"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "Cargo.toml"]
+include = ["**/*.rs", "Cargo.toml", "README.md"]
 
 [package.metadata.sinomo]
 ring = "r1"
@@ -18,9 +18,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-core = { path = "../sinomo-core" }
+sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
+sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-storage = { path = "../sinomo-storage" }
 

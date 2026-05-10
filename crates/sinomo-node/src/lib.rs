@@ -6,10 +6,10 @@ mod identity;
 pub use daemon::*;
 pub use identity::*;
 
+pub type NodeId = sinomo_core::Id;
+
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
-    CapabilityName, ModelCapability, NodeCapability, NodeId, ScalarError, TrustDomain,
-};
+use sinomo_core::{CapabilityName, ModelCapability, NodeCapability, ScalarError, TrustDomain};
 
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,

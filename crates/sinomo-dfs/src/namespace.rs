@@ -3,7 +3,9 @@
 use crate::{
     DfsFileSystem, DfsObjectKind, DfsObjectMetadata, DfsSubtreePolicy, sifs_file_system_id,
 };
-use sinomo_core::{DfsObjectId, DfsObjectPolicy, DfsVersion, NodeId};
+use crate::{DfsObjectId, DfsVersion};
+use sinomo_core::DfsObjectPolicy;
+use sinomo_node::NodeId;
 
 pub const SIFS_ROOT_PATH: &str = "/";
 pub const SIFS_SINOMO_PATH: &str = "/sinomo";
