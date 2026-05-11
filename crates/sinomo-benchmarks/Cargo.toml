@@ -20,4 +20,4 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
-sinomo-minicpm = { path = "../sinomo-minicpm" }
+sinomo-pytorch = { path = "../sinomo-pytorch" }

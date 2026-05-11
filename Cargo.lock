@@ -3093,7 +3093,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-agent",
- "sinomo-minicpm",
+ "sinomo-pytorch",
  "thiserror",
 ]
 
@@ -3108,7 +3108,7 @@ dependencies = [
  "sinomo-agent",
  "sinomo-evolution",
  "sinomo-lm",
- "sinomo-minicpm",
+ "sinomo-pytorch",
  "sinomo-runtime",
  "time",
 ]
@@ -3206,9 +3206,12 @@ dependencies = [
 name = "sinomo-events"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
+ "serde_json",
  "sinomo-core",
  "sinomo-node",
+ "sinomo-storage",
  "thiserror",
  "time",
 ]
@@ -3294,16 +3297,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sinomo-minicpm"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sinomo-lm",
- "thiserror",
-]
-
-[[package]]
 name = "sinomo-module"
 version = "0.1.0"
 dependencies = [
@@ -3369,6 +3362,16 @@ dependencies = [
  "serde",
  "sinomo-core",
  "sinomo-module",
+]
+
+[[package]]
+name = "sinomo-pytorch"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-lm",
+ "thiserror",
 ]
 
 [[package]]

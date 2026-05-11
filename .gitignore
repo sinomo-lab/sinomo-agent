@@ -1,4 +1,10 @@
 /target
 /tmp
+/benchmark-results
 
 /.claude/settings.local.json
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

@@ -1,0 +1,32 @@
+services:
+  minestudio:
+    build:
+      context: ../../../..
+      dockerfile: crates/sinomo-benchmarks/minestudio/docker/Dockerfile
+    image: sinomo/minestudio-benchmark:local
+    shm_size: "2gb"
+    ipc: host
+    ports:
+      - "${SINOMO_MINESTUDIO_PORT:-18080}:8080"
+    environment:
+      DISPLAY: ":99"
+      MINESTUDIO_XVFB_GEOMETRY: "${MINESTUDIO_XVFB_GEOMETRY:-1280x720x24}"
+      MINESTUDIO_OBS_WIDTH: "${MINESTUDIO_OBS_WIDTH:-128}"
+      MINESTUDIO_OBS_HEIGHT: "${MINESTUDIO_OBS_HEIGHT:-128}"
+      MINESTUDIO_RENDER_WIDTH: "${MINESTUDIO_RENDER_WIDTH:-640}"
+      MINESTUDIO_RENDER_HEIGHT: "${MINESTUDIO_RENDER_HEIGHT:-360}"
+      HF_HOME: /cache/huggingface
+    volumes:
+      - ../../../../benchmark-results:/workspace/benchmark-results
+      - minestudio-engine:/tmp/MineStudio
+      - huggingface-cache:/cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  minestudio-engine:
+  huggingface-cache:

@@ -45,9 +45,9 @@ use sinomo_lm::{
     save_provider_api_key_in_model_config, subscription_usage_provider_ids,
     test_provider_account_credentials, test_provider_credentials, write_default_model_config,
 };
-use sinomo_minicpm::{
-    MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, MiniCpmDevice, MiniCpmRuntimeConfig,
-    PythonMiniCpmRuntime, RemoteMiniCpmRuntime, RemoteMiniCpmRuntimeConfig,
+use sinomo_pytorch::{
+    MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, PythonPytorchRuntime, PytorchDevice,
+    PytorchRuntimeConfig, RemotePytorchRuntime, RemotePytorchRuntimeConfig,
 };
 #[cfg(test)]
 use sinomo_runtime::core::EvolutionJobStatus;
@@ -370,6 +370,16 @@ struct ConfiguredInteractionModel {
     account: Option<sinomo_lm::ProviderAccountConfig>,
 }
 
+fn env_var_any(primary: &str, fallback: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(fallback).ok())
+}
+
+fn env_var_os_any(primary: &str, fallback: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(primary).or_else(|| std::env::var_os(fallback))
+}
+
 impl InteractionModel for ConfiguredInteractionModel {
     fn complete(
         &self,
@@ -381,13 +391,17 @@ impl InteractionModel for ConfiguredInteractionModel {
             } else {
                 self.model.clone()
             };
-            if let Ok(endpoint) = std::env::var("SINOMO_MINICPM_ENDPOINT") {
-                let provider = RemoteMiniCpmRuntime::new(RemoteMiniCpmRuntimeConfig {
+            if let Some(endpoint) =
+                env_var_any("SINOMO_PYTORCH_ENDPOINT", "SINOMO_MINICPM_ENDPOINT")
+            {
+                let provider = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
                     endpoint,
-                    timeout_seconds: std::env::var("SINOMO_MINICPM_TIMEOUT_SECONDS")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(300),
+                    timeout_seconds: env_var_any(
+                        "SINOMO_PYTORCH_TIMEOUT_SECONDS",
+                        "SINOMO_MINICPM_TIMEOUT_SECONDS",
+                    )
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(300),
                 });
                 return sinomo_lm::LanguageModelProvider::complete(
                     &provider,
@@ -398,22 +412,27 @@ impl InteractionModel for ConfiguredInteractionModel {
                     },
                 );
             }
-            let provider = PythonMiniCpmRuntime::new(MiniCpmRuntimeConfig {
-                python: std::env::var_os("SINOMO_MINICPM_PYTHON")
+            let provider = PythonPytorchRuntime::new(PytorchRuntimeConfig {
+                python: env_var_os_any("SINOMO_PYTORCH_PYTHON", "SINOMO_MINICPM_PYTHON")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from("python3")),
                 model,
-                device: match std::env::var("SINOMO_MINICPM_DEVICE").as_deref() {
-                    Ok("cpu") => MiniCpmDevice::Cpu,
-                    Ok("cuda") => MiniCpmDevice::Cuda,
-                    _ => MiniCpmDevice::Auto,
+                device: match env_var_any("SINOMO_PYTORCH_DEVICE", "SINOMO_MINICPM_DEVICE")
+                    .as_deref()
+                {
+                    Some("cpu") => PytorchDevice::Cpu,
+                    Some("cuda") => PytorchDevice::Cuda,
+                    _ => PytorchDevice::Auto,
                 },
-                timeout_seconds: std::env::var("SINOMO_MINICPM_TIMEOUT_SECONDS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(300),
-                mock: std::env::var("SINOMO_MINICPM_MOCK").as_deref() == Ok("1"),
-                ..MiniCpmRuntimeConfig::default()
+                timeout_seconds: env_var_any(
+                    "SINOMO_PYTORCH_TIMEOUT_SECONDS",
+                    "SINOMO_MINICPM_TIMEOUT_SECONDS",
+                )
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300),
+                mock: env_var_any("SINOMO_PYTORCH_MOCK", "SINOMO_MINICPM_MOCK").as_deref()
+                    == Some("1"),
+                ..PytorchRuntimeConfig::default()
             });
             return sinomo_lm::LanguageModelProvider::complete(
                 &provider,

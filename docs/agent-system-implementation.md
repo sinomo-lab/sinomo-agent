@@ -3,12 +3,12 @@
 This document tracks the implementation entry points for
 [agent-system-architecture.md](agent-system-architecture.md).
 
-## MiniCPM-o Runtime
+## PyTorch Model Bridge
 
-The Rust contract lives in `crates/sinomo-minicpm`. It owns stable request and
+The Rust contract lives in `crates/sinomo-pytorch`. It owns stable request and
 response structs, process invocation, status reporting, and a `LanguageModel`
 provider adapter. PyTorch and Transformers stay isolated in
-`crates/sinomo-minicpm/python/minicpm_bridge.py`.
+`crates/sinomo-pytorch/python/pytorch_bridge.py`.
 
 The checked-in bridge supports:
 
@@ -16,8 +16,15 @@ The checked-in bridge supports:
 - vision requests with an image path or base64 image payload;
 - audio and duplex request modes in the stable schema;
 - a probe mode for dependency diagnostics;
-- `SINOMO_MINICPM_MOCK=1` for CI and benchmark harness smoke tests without
+- `SINOMO_PYTORCH_MOCK=1` for CI and benchmark harness smoke tests without
   downloading the 9B model.
+
+MiniCPM-o remains the first configured backend (`--provider minicpm-o`), but
+the bridge is intentionally named around the implementation boundary: any local
+PyTorch/Transformers model that can satisfy the request schema can be hosted
+behind `sinomo-pytorch-bridge` or `sinomo-pytorch-server`. The old
+`SINOMO_MINICPM_*` environment variables are still accepted as compatibility
+fallbacks; new code should prefer `SINOMO_PYTORCH_*`.
 
 The local model path follows the MiniCPM-o 4.5 PyTorch reference path. Current
 upstream docs recommend a Linux NVIDIA GPU with more than 28 GB VRAM for the
@@ -34,14 +41,14 @@ The Windows CUDA smoke also required `minicpmo`, `onnx`, `onnxruntime`,
 
 Local probe status from this implementation pass:
 
-- an isolated Python 3.11 venv at `/tmp/sinomo-minicpm-venv` can import
+- an isolated Python 3.11 venv at `/tmp/sinomo-pytorch-venv` can import
   `torch`, `transformers`, `PIL`, and `accelerate`;
-- `SINOMO_MINICPM_PYTHON=/tmp/sinomo-minicpm-venv/bin/python
-  sinomo-minicpm-bridge` reports MiniCPM dependencies are importable;
+- `SINOMO_PYTORCH_PYTHON=/tmp/sinomo-pytorch-venv/bin/python
+  sinomo-pytorch-bridge` reports MiniCPM dependencies are importable;
 - `torch.cuda.is_available()` is false on the local host, so the full 9B
   PyTorch model was not loaded here.
 - a Windows node with an RTX 3090 was able to load `openbmb/MiniCPM-o-4_5`
-  through the long-running `sinomo-minicpm-server` with CUDA after pinning
+  through the long-running `sinomo-pytorch-server` with CUDA after pinning
   `transformers==4.53.3`; text and vision smoke requests completed through
   the remote HTTP runtime.
 
@@ -51,8 +58,8 @@ run the local MCP forwarding proxy and point benchmark tools at it:
 ```sh
 SINOMO_WINDOWS_MCP_URL=http://<windows-host>:39999/mcp \
 SINOMO_WINDOWS_MCP_SESSION=<mcp-session-id> \
-python3 crates/sinomo-benchmarks/minicpm_mcp_proxy.py --bind 127.0.0.1 --port 32154
-SINOMO_MINICPM_ENDPOINT=http://127.0.0.1:32154 sinomo agent run \
+python3 crates/sinomo-benchmarks/pytorch_mcp_proxy.py --bind 127.0.0.1 --port 32154
+SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32154 sinomo agent run \
   --provider minicpm-o \
   --model openbmb/MiniCPM-o-4_5 \
   --prompt "Return a short acknowledgement."
@@ -113,12 +120,84 @@ MineStudio is represented through a vision-path smoke:
 
 - current install smoke: `pip install minestudio`;
 - import smoke: `import minestudio`;
-- synthetic frame bridge:
+- synthetic request-path smoke:
   `crates/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py`.
 
-The smoke script uses `SINOMO_MINICPM_MOCK=1` by default so it validates the
+The smoke script uses `SINOMO_PYTORCH_MOCK=1` by default so it validates the
 vision request path without requiring the full MiniCPM-o model. Set
-`SINOMO_MINICPM_ENDPOINT` to run it against a live remote MiniCPM server.
+`SINOMO_PYTORCH_ENDPOINT` to run it against a live remote PyTorch model server.
+The Docker runtime in
+`crates/sinomo-benchmarks/minestudio/docker/compose.yml` builds a headless
+Xvfb/Mesa/OpenJDK 8 MineStudio container with an HTTP wrapper for
+`reset`/`observe`/`step` control from the host.
+The real action-loop runner is
+`crates/sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py`; it
+starts `minestudio.simulator.MinecraftSim`, reads rendered frames from
+`info["pov"]` or `obs["image"]`, asks MiniCPM-o for one action macro, applies
+the action with `env.step`, and repeats. It can also use the Docker wrapper by
+setting `SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080`.
+`crates/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py` uses the
+same wrapper for a live-style duplex workflow: it samples chronological frame
+sequences, sends them to MiniCPM-o as streaming duplex requests, consumes
+incremental output chunks, and applies the recovered action back to MineStudio.
+
+MCU-turbo is represented through a MineStudio-compatible task-config runner:
+
+- clone the benchmark configs from `https://github.com/CraftJarvis/MCU` into
+  `/tmp/mcu` or set `MCU_ROOT`;
+- run `crates/sinomo-benchmarks/mcu/sinomo_mcu_runner.py` with
+  `SINOMO_PYTORCH_ENDPOINT` pointing at the PyTorch model server or proxy;
+- results are written under the gitignored `benchmark-results/` folder as
+  per-task JSON, `summary.json`, and `case_studies.md`.
+
+The MCU runner uses the benchmark YAML files from
+`MCU_benchmark/task_configs` and drives Sinomo's main-agent loop with
+Minecraft task text, init commands, a MineStudio-style observation summary,
+and an expected `send_game_action` macro. This is a lightweight integration
+benchmark for the Sinomo agent interface; full MCU scoring still requires
+running MineStudio simulator episodes and VLM video evaluation.
+
+## Interactive Environment Contracts
+
+Reusable interactive-environment contracts live in `sinomo-events`:
+
+- `InteractiveStatePacket` describes environment kind, adapter, task,
+  inventory, pose, nearby blocks/entities, health, hunger, and metadata;
+- `InteractiveActionMacro` describes a bounded action in environment-neutral
+  terms: verb, target, duration, stop condition, and parameters;
+- `InteractiveTrajectoryStep` links state, action, and artifact references;
+- event constructors emit `interactive.state.observed`,
+  `interactive.action.requested`, and `interactive.trajectory.step.recorded`;
+- `InteractiveArtifactStore` writes replay artifacts under the registered
+  `events/interactive/trajectories` data-dir subtree.
+
+The runtime storage layout registers interactive trajectory and screenshot
+subtrees through `sinomo-events::register_storage_paths`. These contracts are
+not Minecraft-specific and can be reused for other games, remote desktops, UI
+automation, and robotics-style environments.
+
+MineStudio-specific code stays in `sinomo-benchmarks`:
+
+- `minestudio/minestudio_action_bridge.py` maps generic action macros to a
+  MineStudio/VPT-style action dictionary and can call `env.step` repeatedly;
+- the same bridge records benchmark trajectory JSONL and optional screenshots;
+- `mcu/sinomo_mcu_runner.py` uses the bridge to attach MineStudio action
+  mappings and trajectory records to MCU case-study output.
+- `minestudio/minestudio_vision_action_loop.py` runs a vision-only action
+  loop against a real `MinecraftSim`: MiniCPM-o receives task text plus
+  rendered `pov` frames, no structured game-state text, and the resulting
+  action is mapped through the same bridge before calling `env.step`.
+- `minestudio/minestudio_live_duplex_loop.py` emulates live full-duplex control
+  without requiring wall-clock realtime execution: MineStudio frame sequences
+  flow into MiniCPM-o while the model response is consumed as a stream, then
+  the first recoverable action is stepped back into the environment. It also
+  enables MineStudio's `RecordCallback` so high-frame-rate episode MP4s are
+  saved next to the JSON and lower-rate observation PNG artifacts for visual
+  review.
+
+The Minecraft improvement workflow, benchmark failure detectors, evaluation
+criteria, and automation shape are tracked in
+[`minecraft-agent-improvement-workflow.md`](minecraft-agent-improvement-workflow.md).
 
 Live smoke status from this implementation pass:
 
@@ -126,10 +205,10 @@ Live smoke status from this implementation pass:
   completed successfully;
 - `docker run python:3.10 ... pip install minestudio && import minestudio`
   completed successfully;
-- `PATH=target/debug:$PATH SINOMO_MINICPM_MOCK=1 python3
+- `PATH=target/debug:$PATH SINOMO_PYTORCH_MOCK=1 python3
   crates/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py` completed
   and returned a MiniCPM vision-mode response from the mock bridge;
-- `SINOMO_MINICPM_ENDPOINT=http://127.0.0.1:32154 sinomo agent run
+- `SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32154 sinomo agent run
   --provider minicpm-o ...` completed through the Windows RTX 3090 server;
 - `docker run --rm --network host ... python
   /tmp/sinomo_minestudio_smoke.py` completed through the same live MiniCPM
@@ -138,6 +217,9 @@ Live smoke status from this implementation pass:
 - a longer text completion through the Windows RTX 3090 endpoint reported 79
   estimated output tokens in 4272 ms, or about 18.5 estimated output
   tokens/sec;
+- the current `minestudio_vision_action_loop.py` path now requires a real
+  MineStudio simulator runtime. It intentionally rejects the earlier synthetic
+  frame approach for action-loop evaluation;
 - `harbor run -d terminal-bench/terminal-bench-2 -l 1 -n 1
   --agent-import-path sinomo_harbor_agent:SinomoHarborAgent
   --disable-verification` completed one Terminal-Bench task with zero

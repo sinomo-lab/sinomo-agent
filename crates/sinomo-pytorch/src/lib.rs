@@ -1,8 +1,8 @@
-//! MiniCPM-o bridge for Sinomo's local real-time core model.
+//! PyTorch/Transformers bridge for Sinomo's local model runtimes.
 //!
 //! The Rust side intentionally owns the stable request/response contract and
-//! process lifecycle. The Python side owns model loading because the reference
-//! MiniCPM-o runtime is PyTorch/Transformers based.
+//! process lifecycle. The Python side owns model loading because local model
+//! families such as MiniCPM-o depend on PyTorch/Transformers runtime packages.
 
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
@@ -18,32 +18,34 @@ use thiserror::Error;
 
 pub const MINICPM_PROVIDER_ID: &str = "minicpm-o";
 pub const MINICPM_DEFAULT_MODEL: &str = "openbmb/MiniCPM-o-4_5";
+pub const PYTORCH_DEFAULT_PROVIDER_ID: &str = MINICPM_PROVIDER_ID;
+pub const PYTORCH_DEFAULT_MODEL: &str = MINICPM_DEFAULT_MODEL;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct MiniCpmRuntimeConfig {
+pub struct PytorchRuntimeConfig {
     pub python: PathBuf,
     pub bridge_script: PathBuf,
     pub model: String,
-    pub device: MiniCpmDevice,
+    pub device: PytorchDevice,
     pub timeout_seconds: u64,
     #[serde(default)]
     pub mock: bool,
 }
 
-impl Default for MiniCpmRuntimeConfig {
+impl Default for PytorchRuntimeConfig {
     fn default() -> Self {
         Self {
             python: PathBuf::from("python3"),
             bridge_script: default_bridge_script(),
-            model: MINICPM_DEFAULT_MODEL.to_string(),
-            device: MiniCpmDevice::Auto,
+            model: PYTORCH_DEFAULT_MODEL.to_string(),
+            device: PytorchDevice::Auto,
             timeout_seconds: 300,
             mock: false,
         }
     }
 }
 
-impl MiniCpmRuntimeConfig {
+impl PytorchRuntimeConfig {
     pub fn with_bridge_script(mut self, bridge_script: impl Into<PathBuf>) -> Self {
         self.bridge_script = bridge_script.into();
         self
@@ -57,25 +59,25 @@ impl MiniCpmRuntimeConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum MiniCpmDevice {
+pub enum PytorchDevice {
     Auto,
     Cpu,
     Cuda,
 }
 
-impl MiniCpmDevice {
+impl PytorchDevice {
     fn as_arg(&self) -> &'static str {
         match self {
-            MiniCpmDevice::Auto => "auto",
-            MiniCpmDevice::Cpu => "cpu",
-            MiniCpmDevice::Cuda => "cuda",
+            PytorchDevice::Auto => "auto",
+            PytorchDevice::Cpu => "cpu",
+            PytorchDevice::Cuda => "cuda",
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct MiniCpmRequest {
-    pub mode: MiniCpmMode,
+pub struct PytorchRequest {
+    pub mode: PytorchMode,
     pub system_prompt: String,
     pub messages: Vec<LanguageModelMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,7 +94,7 @@ pub struct MiniCpmRequest {
     pub metadata: serde_json::Value,
 }
 
-impl MiniCpmRequest {
+impl PytorchRequest {
     pub fn from_language_model_request(request: &LanguageModelRequest) -> Self {
         let mut system_prompt = String::new();
         let mut messages = Vec::new();
@@ -107,7 +109,7 @@ impl MiniCpmRequest {
             }
         }
         Self {
-            mode: MiniCpmMode::Text,
+            mode: PytorchMode::Text,
             system_prompt,
             messages,
             image_path: None,
@@ -122,7 +124,7 @@ impl MiniCpmRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum MiniCpmMode {
+pub enum PytorchMode {
     Text,
     Vision,
     Audio,
@@ -131,9 +133,9 @@ pub enum MiniCpmMode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct MiniCpmResponse {
+pub struct PytorchResponse {
     pub content: String,
-    pub runtime: MiniCpmRuntimeStatus,
+    pub runtime: PytorchRuntimeStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<LanguageModelUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,9 +145,9 @@ pub struct MiniCpmResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct MiniCpmRuntimeStatus {
+pub struct PytorchRuntimeStatus {
     pub model: String,
-    pub device: MiniCpmDevice,
+    pub device: PytorchDevice,
     pub backend: String,
     pub local: bool,
     pub streaming_supported: bool,
@@ -157,22 +159,22 @@ pub struct MiniCpmRuntimeStatus {
 }
 
 #[derive(Clone, Debug)]
-pub struct PythonMiniCpmRuntime {
-    config: MiniCpmRuntimeConfig,
+pub struct PythonPytorchRuntime {
+    config: PytorchRuntimeConfig,
 }
 
-impl PythonMiniCpmRuntime {
-    pub fn new(config: MiniCpmRuntimeConfig) -> Self {
+impl PythonPytorchRuntime {
+    pub fn new(config: PytorchRuntimeConfig) -> Self {
         Self { config }
     }
 
-    pub fn config(&self) -> &MiniCpmRuntimeConfig {
+    pub fn config(&self) -> &PytorchRuntimeConfig {
         &self.config
     }
 
-    pub fn probe(&self) -> Result<MiniCpmRuntimeStatus, MiniCpmError> {
-        let response = self.complete(MiniCpmRequest {
-            mode: MiniCpmMode::Probe,
+    pub fn probe(&self) -> Result<PytorchRuntimeStatus, PytorchBridgeError> {
+        let response = self.complete(PytorchRequest {
+            mode: PytorchMode::Probe,
             system_prompt: String::new(),
             messages: Vec::new(),
             image_path: None,
@@ -185,7 +187,7 @@ impl PythonMiniCpmRuntime {
         Ok(response.runtime)
     }
 
-    pub fn complete(&self, request: MiniCpmRequest) -> Result<MiniCpmResponse, MiniCpmError> {
+    pub fn complete(&self, request: PytorchRequest) -> Result<PytorchResponse, PytorchBridgeError> {
         ensure_bridge_script(&self.config.bridge_script)?;
         let payload = serde_json::to_vec(&request)?;
         let mut command = Command::new(&self.config.python);
@@ -201,28 +203,31 @@ impl PythonMiniCpmRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if self.config.mock {
+            command.env("SINOMO_PYTORCH_MOCK", "1");
             command.env("SINOMO_MINICPM_MOCK", "1");
         }
-        let mut child = command.spawn().map_err(|source| MiniCpmError::Process {
-            detail: format!("failed to start MiniCPM bridge: {source}"),
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|source| PytorchBridgeError::Process {
+                detail: format!("failed to start PyTorch model bridge: {source}"),
+            })?;
         child
             .stdin
             .as_mut()
-            .ok_or_else(|| MiniCpmError::Process {
-                detail: "MiniCPM bridge stdin was unavailable".to_string(),
+            .ok_or_else(|| PytorchBridgeError::Process {
+                detail: "PyTorch model bridge stdin was unavailable".to_string(),
             })?
             .write_all(&payload)
-            .map_err(|source| MiniCpmError::Process {
-                detail: format!("failed to write MiniCPM request: {source}"),
+            .map_err(|source| PytorchBridgeError::Process {
+                detail: format!("failed to write PyTorch model request: {source}"),
             })?;
         let output = child
             .wait_with_output()
-            .map_err(|source| MiniCpmError::Process {
-                detail: format!("failed to wait for MiniCPM bridge: {source}"),
+            .map_err(|source| PytorchBridgeError::Process {
+                detail: format!("failed to wait for PyTorch model bridge: {source}"),
             })?;
         if !output.status.success() {
-            return Err(MiniCpmError::Process {
+            return Err(PytorchBridgeError::Process {
                 detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
@@ -230,7 +235,7 @@ impl PythonMiniCpmRuntime {
     }
 }
 
-impl LanguageModelProvider for PythonMiniCpmRuntime {
+impl LanguageModelProvider for PythonPytorchRuntime {
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
             provider: MINICPM_PROVIDER_ID.to_string(),
@@ -246,7 +251,7 @@ impl LanguageModelProvider for PythonMiniCpmRuntime {
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let response = self
-            .complete(MiniCpmRequest::from_language_model_request(request))
+            .complete(PytorchRequest::from_language_model_request(request))
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: MINICPM_PROVIDER_ID.to_string(),
                 model: self.config.model.clone(),
@@ -262,12 +267,12 @@ impl LanguageModelProvider for PythonMiniCpmRuntime {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct RemoteMiniCpmRuntimeConfig {
+pub struct RemotePytorchRuntimeConfig {
     pub endpoint: String,
     pub timeout_seconds: u64,
 }
 
-impl Default for RemoteMiniCpmRuntimeConfig {
+impl Default for RemotePytorchRuntimeConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://127.0.0.1:32153".to_string(),
@@ -277,16 +282,16 @@ impl Default for RemoteMiniCpmRuntimeConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct RemoteMiniCpmRuntime {
-    config: RemoteMiniCpmRuntimeConfig,
+pub struct RemotePytorchRuntime {
+    config: RemotePytorchRuntimeConfig,
 }
 
-impl RemoteMiniCpmRuntime {
-    pub fn new(config: RemoteMiniCpmRuntimeConfig) -> Self {
+impl RemotePytorchRuntime {
+    pub fn new(config: RemotePytorchRuntimeConfig) -> Self {
         Self { config }
     }
 
-    pub fn complete(&self, request: MiniCpmRequest) -> Result<MiniCpmResponse, MiniCpmError> {
+    pub fn complete(&self, request: PytorchRequest) -> Result<PytorchResponse, PytorchBridgeError> {
         let body = serde_json::to_vec(&request)?;
         let response = http_post_json(
             &self.config.endpoint,
@@ -297,7 +302,7 @@ impl RemoteMiniCpmRuntime {
         Ok(serde_json::from_slice(&response)?)
     }
 
-    pub fn probe(&self) -> Result<MiniCpmRuntimeStatus, MiniCpmError> {
+    pub fn probe(&self) -> Result<PytorchRuntimeStatus, PytorchBridgeError> {
         let response = http_get(
             &self.config.endpoint,
             "/health",
@@ -307,11 +312,11 @@ impl RemoteMiniCpmRuntime {
     }
 }
 
-impl LanguageModelProvider for RemoteMiniCpmRuntime {
+impl LanguageModelProvider for RemotePytorchRuntime {
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
             provider: MINICPM_PROVIDER_ID.to_string(),
-            default_model: MINICPM_DEFAULT_MODEL.to_string(),
+            default_model: PYTORCH_DEFAULT_MODEL.to_string(),
             invocation: sinomo_lm::LanguageModelInvocation::Http,
             supports_json_object: false,
             supports_tool_permissions: false,
@@ -323,7 +328,7 @@ impl LanguageModelProvider for RemoteMiniCpmRuntime {
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let response = self
-            .complete(MiniCpmRequest::from_language_model_request(request))
+            .complete(PytorchRequest::from_language_model_request(request))
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: MINICPM_PROVIDER_ID.to_string(),
                 model: request.model.clone(),
@@ -339,26 +344,37 @@ impl LanguageModelProvider for RemoteMiniCpmRuntime {
 }
 
 #[derive(Debug, Error)]
-pub enum MiniCpmError {
-    #[error("MiniCPM bridge path does not exist: {path}")]
+pub enum PytorchBridgeError {
+    #[error("PyTorch model bridge path does not exist: {path}")]
     MissingBridge { path: String },
-    #[error("MiniCPM serialization error: {0}")]
+    #[error("PyTorch model serialization error: {0}")]
     Serde(#[from] serde_json::Error),
-    #[error("MiniCPM process error: {detail}")]
+    #[error("PyTorch model process error: {detail}")]
     Process { detail: String },
-    #[error("MiniCPM network error: {detail}")]
+    #[error("PyTorch model network error: {detail}")]
     Network { detail: String },
 }
 
+pub type MiniCpmRuntimeConfig = PytorchRuntimeConfig;
+pub type MiniCpmDevice = PytorchDevice;
+pub type MiniCpmRequest = PytorchRequest;
+pub type MiniCpmMode = PytorchMode;
+pub type MiniCpmResponse = PytorchResponse;
+pub type MiniCpmRuntimeStatus = PytorchRuntimeStatus;
+pub type PythonMiniCpmRuntime = PythonPytorchRuntime;
+pub type RemoteMiniCpmRuntimeConfig = RemotePytorchRuntimeConfig;
+pub type RemoteMiniCpmRuntime = RemotePytorchRuntime;
+pub type MiniCpmError = PytorchBridgeError;
+
 pub fn default_bridge_script() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/minicpm_bridge.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/pytorch_bridge.py")
 }
 
-pub fn ensure_bridge_script(path: &Path) -> Result<(), MiniCpmError> {
+pub fn ensure_bridge_script(path: &Path) -> Result<(), PytorchBridgeError> {
     if path.exists() {
         Ok(())
     } else {
-        Err(MiniCpmError::MissingBridge {
+        Err(PytorchBridgeError::MissingBridge {
             path: path.display().to_string(),
         })
     }
@@ -373,11 +389,11 @@ fn http_post_json(
     path: &str,
     body: &[u8],
     timeout: Duration,
-) -> Result<Vec<u8>, MiniCpmError> {
+) -> Result<Vec<u8>, PytorchBridgeError> {
     http_request(endpoint, "POST", path, Some(body), timeout)
 }
 
-fn http_get(endpoint: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, MiniCpmError> {
+fn http_get(endpoint: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, PytorchBridgeError> {
     http_request(endpoint, "GET", path, None, timeout)
 }
 
@@ -387,21 +403,22 @@ fn http_request(
     path: &str,
     body: Option<&[u8]>,
     timeout: Duration,
-) -> Result<Vec<u8>, MiniCpmError> {
+) -> Result<Vec<u8>, PytorchBridgeError> {
     let (host, port) = parse_http_endpoint(endpoint)?;
     let mut addrs =
         (host.as_str(), port)
             .to_socket_addrs()
-            .map_err(|source| MiniCpmError::Network {
+            .map_err(|source| PytorchBridgeError::Network {
                 detail: format!("resolve {host}:{port}: {source}"),
             })?;
-    let addr = addrs.next().ok_or_else(|| MiniCpmError::Network {
+    let addr = addrs.next().ok_or_else(|| PytorchBridgeError::Network {
         detail: format!("no address for {host}:{port}"),
     })?;
-    let mut stream =
-        TcpStream::connect_timeout(&addr, timeout).map_err(|source| MiniCpmError::Network {
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|source| {
+        PytorchBridgeError::Network {
             detail: format!("connect {addr}: {source}"),
-        })?;
+        }
+    })?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     let body = body.unwrap_or(&[]);
@@ -412,50 +429,50 @@ fn http_request(
     stream
         .write_all(request.as_bytes())
         .and_then(|_| stream.write_all(body))
-        .map_err(|source| MiniCpmError::Network {
+        .map_err(|source| PytorchBridgeError::Network {
             detail: format!("write request: {source}"),
         })?;
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
-        .map_err(|source| MiniCpmError::Network {
+        .map_err(|source| PytorchBridgeError::Network {
             detail: format!("read response: {source}"),
         })?;
     parse_http_response(&response)
 }
 
-fn parse_http_endpoint(endpoint: &str) -> Result<(String, u16), MiniCpmError> {
+fn parse_http_endpoint(endpoint: &str) -> Result<(String, u16), PytorchBridgeError> {
     let rest = endpoint
         .strip_prefix("http://")
-        .ok_or_else(|| MiniCpmError::Network {
+        .ok_or_else(|| PytorchBridgeError::Network {
             detail: format!("only http:// endpoints are supported: {endpoint}"),
         })?;
     let authority = rest.split('/').next().unwrap_or(rest);
     let (host, port) = authority
         .rsplit_once(':')
-        .ok_or_else(|| MiniCpmError::Network {
+        .ok_or_else(|| PytorchBridgeError::Network {
             detail: format!("endpoint must include a port: {endpoint}"),
         })?;
     let port = port
         .parse::<u16>()
-        .map_err(|source| MiniCpmError::Network {
+        .map_err(|source| PytorchBridgeError::Network {
             detail: format!("invalid endpoint port `{port}`: {source}"),
         })?;
     Ok((host.to_string(), port))
 }
 
-fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, MiniCpmError> {
+fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, PytorchBridgeError> {
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| MiniCpmError::Network {
+        .ok_or_else(|| PytorchBridgeError::Network {
             detail: "malformed HTTP response".to_string(),
         })?;
     let (head, body) = response.split_at(split + 4);
     let head_text = String::from_utf8_lossy(head);
     let status = head_text.lines().next().unwrap_or("");
     if !status.contains(" 200 ") {
-        return Err(MiniCpmError::Network {
+        return Err(PytorchBridgeError::Network {
             detail: format!("{status}: {}", String::from_utf8_lossy(body).trim()),
         });
     }
@@ -470,7 +487,7 @@ mod tests {
     #[test]
     fn default_bridge_script_points_inside_crate() {
         let path = default_bridge_script();
-        assert!(path.ends_with("python/minicpm_bridge.py"));
+        assert!(path.ends_with("python/pytorch_bridge.py"));
         ensure_bridge_script(&path).expect("checked-in bridge exists");
     }
 
@@ -495,20 +512,20 @@ mod tests {
             metadata: serde_json::json!({"session": "test"}),
         };
 
-        let mapped = MiniCpmRequest::from_language_model_request(&request);
+        let mapped = PytorchRequest::from_language_model_request(&request);
 
         assert_eq!(mapped.system_prompt, "system");
         assert_eq!(mapped.messages.len(), 1);
-        assert_eq!(mapped.mode, MiniCpmMode::Text);
+        assert_eq!(mapped.mode, PytorchMode::Text);
         assert_eq!(mapped.metadata["session"], "test");
     }
 
     #[test]
     fn mock_bridge_round_trips_without_model_dependencies() {
-        let runtime = PythonMiniCpmRuntime::new(MiniCpmRuntimeConfig::default().with_mock(true));
+        let runtime = PythonPytorchRuntime::new(PytorchRuntimeConfig::default().with_mock(true));
         let response = runtime
-            .complete(MiniCpmRequest {
-                mode: MiniCpmMode::Text,
+            .complete(PytorchRequest {
+                mode: PytorchMode::Text,
                 system_prompt: "respond briefly".to_string(),
                 messages: vec![LanguageModelMessage {
                     role: LanguageModelRole::User,
@@ -537,11 +554,11 @@ mod tests {
             let size = stream.read(&mut buffer).expect("read");
             let request = String::from_utf8_lossy(&buffer[..size]);
             assert!(request.starts_with("POST /complete HTTP/1.1"));
-            let body = serde_json::to_string(&MiniCpmResponse {
+            let body = serde_json::to_string(&PytorchResponse {
                 content: "ok".to_string(),
-                runtime: MiniCpmRuntimeStatus {
+                runtime: PytorchRuntimeStatus {
                     model: MINICPM_DEFAULT_MODEL.to_string(),
-                    device: MiniCpmDevice::Cuda,
+                    device: PytorchDevice::Cuda,
                     backend: "pytorch-transformers".to_string(),
                     local: false,
                     streaming_supported: true,
@@ -561,13 +578,13 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).expect("write");
         });
-        let runtime = RemoteMiniCpmRuntime::new(RemoteMiniCpmRuntimeConfig {
+        let runtime = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
             endpoint: format!("http://{addr}"),
             timeout_seconds: 5,
         });
         let response = runtime
-            .complete(MiniCpmRequest {
-                mode: MiniCpmMode::Text,
+            .complete(PytorchRequest {
+                mode: PytorchMode::Text,
                 system_prompt: String::new(),
                 messages: vec![],
                 image_path: None,

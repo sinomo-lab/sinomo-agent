@@ -5,8 +5,10 @@
 //! MineStudio without making either benchmark a production dependency.
 
 use serde::{Deserialize, Serialize};
-use sinomo_agent::{AgentToolKind, default_main_agent_tools, main_agent_system_prompt};
-use sinomo_minicpm::{MINICPM_DEFAULT_MODEL, MiniCpmDevice, MiniCpmRuntimeConfig};
+use sinomo_agent::{
+    AgentToolKind, AgentToolSpec, default_main_agent_tools, main_agent_system_prompt,
+};
+use sinomo_pytorch::{MINICPM_DEFAULT_MODEL, PytorchDevice, PytorchRuntimeConfig};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -62,6 +64,88 @@ pub fn minestudio_plan() -> BenchmarkHarnessPlan {
             "MineStudio requires JDK 8 plus Xvfb or VirtualGL for rendering.".to_string(),
             "The smoke path captures one observation frame and sends it through the MiniCPM vision mode."
                 .to_string(),
+            "The Docker runtime under minestudio/docker starts a real MinecraftSim behind an HTTP reset/observe/step wrapper."
+                .to_string(),
+        ],
+    }
+}
+
+pub fn mcu_minestudio_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "mcu-minestudio".to_string(),
+        setup_commands: vec![
+            "git clone --depth 1 https://github.com/CraftJarvis/MCU.git /tmp/mcu".to_string(),
+            "docker compose -f crates/sinomo-benchmarks/minestudio/docker/compose.yml up -d --build minestudio".to_string(),
+            "python crates/sinomo-benchmarks/mcu/mcu_live_duplex_runner.py --help".to_string(),
+        ],
+        run_command: "MCU_ROOT=/tmp/mcu SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080 SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python crates/sinomo-benchmarks/mcu/mcu_live_duplex_runner.py"
+            .to_string(),
+        required_tools: vec![AgentToolKind::ObserveVision, AgentToolKind::RunShellCommand],
+        notes: vec![
+            "MCU-turbo task configs are consumed from MCU_benchmark/task_configs and executed through the MineStudio HTTP wrapper.".to_string(),
+            "The full-duplex runner sends frame sequences to MiniCPM-o with stream=true and records MineStudio RecordCallback MP4s for every task.".to_string(),
+        ],
+    }
+}
+
+pub fn mcu_game_tool_specs() -> Vec<AgentToolSpec> {
+    vec![
+        AgentToolSpec::new(
+            AgentToolKind::ObserveVision,
+            "observe_vision",
+            "Attach the current Minecraft camera frame for multimodal reasoning.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::RunShellCommand,
+            "inspect_game_state",
+            "Read structured Minecraft state provided by the benchmark harness: task text, inventory, nearby blocks, entities, health, hunger, and position.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::RunShellCommand,
+            "send_game_action",
+            "Issue one bounded Minecraft action macro through the benchmark harness: look, move, jump, attack, mine, place, craft, use, select_hotbar, or wait.",
+            true,
+        ),
+    ]
+}
+
+pub fn minestudio_vision_action_loop_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "minestudio-vision-action-loop".to_string(),
+        setup_commands: vec![
+            "python -m pip install minestudio".to_string(),
+            "docker compose -f crates/sinomo-benchmarks/minestudio/docker/compose.yml build".to_string(),
+            "python crates/sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py --help"
+                .to_string(),
+        ],
+        run_command: "SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python crates/sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py"
+            .to_string(),
+        required_tools: vec![AgentToolKind::ObserveVision],
+        notes: vec![
+            "The loop starts a real MineStudio MinecraftSim environment and sends task text plus rendered pov frames to MiniCPM-o.".to_string(),
+            "It does not include structured game-state text such as inventory, position, nearby blocks, health, reward, or simulator info dictionaries.".to_string(),
+            "Recovered action macros are mapped through the benchmark-local MineStudio action bridge and recorded as replay trajectory artifacts.".to_string(),
+        ],
+    }
+}
+
+pub fn minestudio_live_duplex_loop_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "minestudio-live-duplex-loop".to_string(),
+        setup_commands: vec![
+            "docker compose -f crates/sinomo-benchmarks/minestudio/docker/compose.yml up -d minestudio".to_string(),
+            "python crates/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py --help"
+                .to_string(),
+        ],
+        run_command: "SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080 SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python crates/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py"
+            .to_string(),
+        required_tools: vec![AgentToolKind::ObserveVision],
+        notes: vec![
+            "The loop sends chronological MineStudio rendered frame sequences to MiniCPM-o with stream=true and consumes streaming response chunks.".to_string(),
+            "It applies the first recovered action macro back to the paused MineStudio environment, so wall-clock speed does not affect benchmark correctness.".to_string(),
+            "Each run asks MineStudio's RecordCallback to write high-frame-rate episode MP4s next to the JSON and observation PNG artifacts.".to_string(),
         ],
     }
 }
@@ -79,7 +163,7 @@ from harbor.models.agent.context import AgentContext
 
 
 def run_sinomo_agent(prompt: str) -> str:
-    default_provider = "minicpm-o" if os.environ.get("SINOMO_MINICPM_ENDPOINT") else "codex"
+    default_provider = "minicpm-o" if os.environ.get("SINOMO_PYTORCH_ENDPOINT", os.environ.get("SINOMO_MINICPM_ENDPOINT")) else "codex"
     default_model = (
         "openbmb/MiniCPM-o-4_5"
         if default_provider == "minicpm-o"
@@ -204,7 +288,7 @@ def main():
             "stream": False,
             "metadata": {"benchmark": "minestudio-smoke"},
         }
-        endpoint = os.environ.get("SINOMO_MINICPM_ENDPOINT")
+        endpoint = os.environ.get("SINOMO_PYTORCH_ENDPOINT", os.environ.get("SINOMO_MINICPM_ENDPOINT"))
         if endpoint:
             request.pop("image_path", None)
             request["image_name"] = image_path.name
@@ -219,7 +303,7 @@ def main():
                 print(response.read().decode("utf-8"))
             return 0
         proc = subprocess.run(
-            ["sinomo-minicpm-bridge"],
+            ["sinomo-pytorch-bridge"],
             input=json.dumps(request),
             text=True,
             capture_output=True,
@@ -236,17 +320,17 @@ if __name__ == "__main__":
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentEnvironmentConfig {
-    pub minicpm: MiniCpmRuntimeConfig,
+    pub pytorch: PytorchRuntimeConfig,
     pub prompt: String,
 }
 
 impl Default for AgentEnvironmentConfig {
     fn default() -> Self {
         Self {
-            minicpm: MiniCpmRuntimeConfig {
+            pytorch: PytorchRuntimeConfig {
                 model: MINICPM_DEFAULT_MODEL.to_string(),
-                device: MiniCpmDevice::Auto,
-                ..MiniCpmRuntimeConfig::default()
+                device: PytorchDevice::Auto,
+                ..PytorchRuntimeConfig::default()
             },
             prompt: main_agent_system_prompt(&default_main_agent_tools()),
         }
@@ -269,6 +353,9 @@ pub fn docker_smoke_command(plan: &BenchmarkHarnessPlan) -> String {
     match plan.name.as_str() {
         "terminalbench-harbor" => "docker run --rm python:3.12 bash -lc 'pip install harbor && harbor run --help'".to_string(),
         "minestudio-smoke" => "docker run --rm python:3.10 bash -lc 'pip install minestudio && python - <<\\'PY\\'\nimport minestudio\nprint(\"minestudio import ok\")\nPY'".to_string(),
+        "mcu-minestudio" => "docker run --rm python:3.10 bash -lc 'pip install minestudio && python - <<\\'PY\\'\nimport minestudio\nprint(\"mcu minestudio import ok\")\nPY'".to_string(),
+        "minestudio-vision-action-loop" => "docker run --rm python:3.10 bash -lc 'pip install minestudio && python - <<\\'PY\\'\nfrom minestudio.simulator import MinecraftSim\nprint(\"real minestudio env import ok\", MinecraftSim)\nPY'".to_string(),
+        "minestudio-live-duplex-loop" => "python3 crates/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py --help".to_string(),
         _ => "docker --version".to_string(),
     }
 }
@@ -302,6 +389,83 @@ mod tests {
         let plan = minestudio_plan();
         assert!(plan.required_tools.contains(&AgentToolKind::ObserveVision));
         assert!(minestudio_smoke_python().contains("\"mode\": \"vision\""));
+    }
+
+    #[test]
+    fn mcu_plan_uses_game_environment_tools() {
+        let plan = mcu_minestudio_plan();
+        assert!(plan.run_command.contains("mcu_live_duplex_runner.py"));
+        assert!(plan.run_command.contains("SINOMO_MINESTUDIO_ENV_URL"));
+        assert!(plan.required_tools.contains(&AgentToolKind::ObserveVision));
+        let tools = mcu_game_tool_specs();
+        assert!(tools.iter().any(|tool| tool.name == "inspect_game_state"));
+        assert!(tools.iter().any(|tool| tool.name == "send_game_action"));
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("MCU_benchmark/task_configs"))
+        );
+        assert!(
+            include_str!("../../sinomo-benchmarks/mcu/mcu_live_duplex_runner.py")
+                .contains("call_minicpm_stream")
+        );
+    }
+
+    #[test]
+    fn minestudio_vision_loop_is_vision_only() {
+        let plan = minestudio_vision_action_loop_plan();
+        assert!(
+            plan.run_command
+                .contains("minestudio_vision_action_loop.py")
+        );
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("minestudio"))
+        );
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("compose.yml build"))
+        );
+        assert!(plan.required_tools.contains(&AgentToolKind::ObserveVision));
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("real MineStudio MinecraftSim"))
+        );
+        assert!(
+            include_str!("../../sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py")
+                .contains("MinecraftSim")
+        );
+        assert!(
+            !include_str!("../../sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py")
+                .contains("ImageDraw")
+        );
+    }
+
+    #[test]
+    fn minestudio_live_duplex_loop_uses_streaming_frames() {
+        let plan = minestudio_live_duplex_loop_plan();
+        assert!(plan.run_command.contains("SINOMO_MINESTUDIO_ENV_URL"));
+        assert!(plan.run_command.contains("minestudio_live_duplex_loop.py"));
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("RecordCallback"))
+        );
+        assert!(
+            include_str!("../../sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py")
+                .contains("\"image_sequence_base64\"")
+        );
+        assert!(
+            include_str!("../../sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py")
+                .contains("\"stream\": True")
+        );
+        assert!(
+            include_str!("../../sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py")
+                .contains("collect_minestudio_recordings")
+        );
     }
 
     #[test]

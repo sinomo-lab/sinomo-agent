@@ -1,15 +1,371 @@
 //! Event validation, append, and replay backbone.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{EventEnvelope, EventKind};
+use sinomo_core::{
+    Confidence, EventEnvelope, EventKind, EvidenceRef, Id, LatencyClass, PrivacyClass,
+    RoutingMetadata, RoutingScope, Salience, Source,
+};
 use sinomo_node::NodeId;
 use std::collections::HashSet;
+use std::fs;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 pub type EventId = sinomo_core::Id;
 pub type SessionId = sinomo_core::Id;
 pub type EntityId = sinomo_core::Id;
+pub type InteractiveEnvironmentId = Id;
+pub type InteractiveTrajectoryId = Id;
+pub type InteractiveActionId = Id;
+pub type InteractiveObservationId = Id;
+
+pub const INTERACTIVE_STATE_OBSERVED: &str = "interactive.state.observed";
+pub const INTERACTIVE_ACTION_REQUESTED: &str = "interactive.action.requested";
+pub const INTERACTIVE_TRAJECTORY_STEP_RECORDED: &str = "interactive.trajectory.step.recorded";
+
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::StorageRing;
+    layout.register_escape_path(
+        "sinomo-events",
+        StorageRing::R1,
+        "events/interactive/trajectories",
+        "interactive environment trajectory JSON, screenshots, and replay artifacts",
+    )?;
+    layout.register_escape_path(
+        "sinomo-events",
+        StorageRing::R1,
+        "events/interactive/screenshots",
+        "interactive environment screenshot artifacts",
+    )
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct InteractiveEnvironmentDescriptor {
+    pub environment_id: InteractiveEnvironmentId,
+    pub kind: String,
+    pub adapter: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InteractiveStatePacket {
+    pub environment: InteractiveEnvironmentDescriptor,
+    pub observation_id: InteractiveObservationId,
+    pub trajectory_id: InteractiveTrajectoryId,
+    pub step_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<InteractiveTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pose: Option<InteractivePose>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inventory: Vec<InteractiveInventoryItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nearby_blocks: Vec<InteractiveWorldObject>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nearby_entities: Vec<InteractiveWorldObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunger: Option<f32>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct InteractiveTask {
+    pub task_id: String,
+    pub instruction: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_uri: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InteractivePose {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yaw: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct InteractiveInventoryItem {
+    pub slot: String,
+    pub item: String,
+    pub count: u32,
+    #[serde(default)]
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InteractiveWorldObject {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f32>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InteractiveActionMacro {
+    pub action_id: InteractiveActionId,
+    pub verb: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ticks: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_condition: Option<String>,
+    #[serde(default)]
+    pub parameters: serde_json::Value,
+}
+
+impl InteractiveActionMacro {
+    pub fn new(verb: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            action_id: InteractiveActionId::generate(),
+            verb: verb.into(),
+            target: target.into(),
+            duration_ticks: None,
+            stop_condition: None,
+            parameters: serde_json::Value::Null,
+        }
+    }
+
+    pub fn with_duration_ticks(mut self, duration_ticks: u32) -> Self {
+        self.duration_ticks = Some(duration_ticks);
+        self
+    }
+
+    pub fn with_stop_condition(mut self, stop_condition: impl Into<String>) -> Self {
+        self.stop_condition = Some(stop_condition.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InteractiveArtifactKind {
+    Screenshot,
+    TrajectoryJson,
+    ReplayBundle,
+    ActionTrace,
+    Other,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct InteractiveArtifactRef {
+    pub uri: String,
+    pub kind: InteractiveArtifactKind,
+    pub content_hash: String,
+    pub byte_len: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InteractiveTrajectoryStep {
+    pub trajectory_id: InteractiveTrajectoryId,
+    pub step_index: u64,
+    pub observation_id: InteractiveObservationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<InteractiveStatePacket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<InteractiveActionMacro>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<InteractiveArtifactRef>,
+}
+
+pub fn interactive_state_event(
+    origin_node_id: NodeId,
+    session_id: SessionId,
+    source: Source,
+    state: InteractiveStatePacket,
+    artifacts: Vec<InteractiveArtifactRef>,
+) -> EventEnvelope {
+    let mut event = EventEnvelope::new(
+        EventId::generate(),
+        OffsetDateTime::now_utc(),
+        origin_node_id,
+        source,
+        EventKind::new(INTERACTIVE_STATE_OBSERVED).expect("event kind"),
+        Salience::new(0.62).expect("salience"),
+        Confidence::new(0.9).expect("confidence"),
+        RoutingMetadata::new(
+            RoutingScope::Session,
+            LatencyClass::Interactive,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_session(session_id)
+    .with_payload(serde_json::json!({
+        "state": state,
+        "artifacts": artifacts,
+    }));
+    event.evidence.refs = artifacts
+        .iter()
+        .map(|artifact| EvidenceRef {
+            uri: artifact.uri.clone(),
+            kind: match artifact.kind {
+                InteractiveArtifactKind::Screenshot => sinomo_core::EvidenceKind::Screen,
+                _ => sinomo_core::EvidenceKind::Artifact,
+            },
+            content_hash: Some(artifact.content_hash.clone()),
+        })
+        .collect();
+    event
+}
+
+pub fn interactive_action_event(
+    origin_node_id: NodeId,
+    session_id: SessionId,
+    source: Source,
+    action: InteractiveActionMacro,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        EventId::generate(),
+        OffsetDateTime::now_utc(),
+        origin_node_id,
+        source,
+        EventKind::new(INTERACTIVE_ACTION_REQUESTED).expect("event kind"),
+        Salience::new(0.7).expect("salience"),
+        Confidence::new(0.88).expect("confidence"),
+        RoutingMetadata::new(
+            RoutingScope::Session,
+            LatencyClass::Reactive,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_session(session_id)
+    .with_payload(serde_json::json!({ "action": action }))
+}
+
+pub fn trajectory_step_event(
+    origin_node_id: NodeId,
+    session_id: SessionId,
+    source: Source,
+    step: InteractiveTrajectoryStep,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        EventId::generate(),
+        OffsetDateTime::now_utc(),
+        origin_node_id,
+        source,
+        EventKind::new(INTERACTIVE_TRAJECTORY_STEP_RECORDED).expect("event kind"),
+        Salience::new(0.48).expect("salience"),
+        Confidence::new(0.93).expect("confidence"),
+        RoutingMetadata::new(
+            RoutingScope::Session,
+            LatencyClass::Background,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_session(session_id)
+    .with_payload(serde_json::json!({ "step": step }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InteractiveArtifactStore {
+    root: PathBuf,
+}
+
+impl InteractiveArtifactStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn write_json_artifact<T: Serialize>(
+        &self,
+        trajectory_id: &InteractiveTrajectoryId,
+        relative_name: impl AsRef<Path>,
+        value: &T,
+        kind: InteractiveArtifactKind,
+    ) -> Result<InteractiveArtifactRef, InteractiveArtifactError> {
+        let bytes = serde_json::to_vec_pretty(value)
+            .map_err(|source| InteractiveArtifactError::Serialize(source.to_string()))?;
+        self.write_binary_artifact(trajectory_id, relative_name, &bytes, kind)
+    }
+
+    pub fn write_binary_artifact(
+        &self,
+        trajectory_id: &InteractiveTrajectoryId,
+        relative_name: impl AsRef<Path>,
+        bytes: &[u8],
+        kind: InteractiveArtifactKind,
+    ) -> Result<InteractiveArtifactRef, InteractiveArtifactError> {
+        let relative_name = normalize_artifact_name(relative_name.as_ref())?;
+        let relative_path = Path::new("events")
+            .join("interactive")
+            .join("trajectories")
+            .join(trajectory_id.as_str())
+            .join(relative_name);
+        let path = self.root.join(&relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| InteractiveArtifactError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        let mut file = fs::File::create(&path).map_err(|source| InteractiveArtifactError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        file.write_all(bytes)
+            .map_err(|source| InteractiveArtifactError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        Ok(InteractiveArtifactRef {
+            uri: format!("sinomo-data://{}", relative_path.to_string_lossy()),
+            kind,
+            content_hash: blake3::hash(bytes).to_hex().to_string(),
+            byte_len: bytes.len() as u64,
+        })
+    }
+}
+
+#[derive(Debug, Error, Clone, Eq, PartialEq)]
+pub enum InteractiveArtifactError {
+    #[error("invalid artifact path: {path}")]
+    InvalidPath { path: String },
+    #[error("failed to serialize artifact: {0}")]
+    Serialize(String),
+    #[error("artifact I/O error at {path}: {detail}")]
+    Io { path: String, detail: String },
+}
+
+fn normalize_artifact_name(path: &Path) -> Result<PathBuf, InteractiveArtifactError> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(InteractiveArtifactError::InvalidPath {
+            path: path.display().to_string(),
+        });
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            _ => {
+                return Err(InteractiveArtifactError::InvalidPath {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+    }
+    Ok(normalized)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct EventValidator;
@@ -414,6 +770,146 @@ mod tests {
         assert_eq!(
             after_second[0].event.event_id,
             EventId::from_legacy_named("evt_three").expect("event")
+        );
+    }
+
+    #[test]
+    fn interactive_state_action_and_trajectory_events_are_generic() {
+        let node = NodeId::from_legacy_named("node_game").expect("node");
+        let session = SessionId::from_legacy_named("sess_game").expect("session");
+        let trajectory_id = InteractiveTrajectoryId::from_legacy_named("traj_game").expect("traj");
+        let state = InteractiveStatePacket {
+            environment: InteractiveEnvironmentDescriptor {
+                environment_id: InteractiveEnvironmentId::from_legacy_named("env_minecraft")
+                    .expect("env"),
+                kind: "voxel-survival".to_string(),
+                adapter: "minestudio".to_string(),
+                display_name: "MineStudio".to_string(),
+                metadata: serde_json::Value::Null,
+            },
+            observation_id: InteractiveObservationId::from_legacy_named("obs_game").expect("obs"),
+            trajectory_id: trajectory_id.clone(),
+            step_index: 7,
+            task: Some(InteractiveTask {
+                task_id: "collect_dirt".to_string(),
+                instruction: "Collect dirt blocks from the ground.".to_string(),
+                source_uri: Some("mcu://simple/collect_dirt".to_string()),
+            }),
+            pose: None,
+            inventory: vec![InteractiveInventoryItem {
+                slot: "hotbar.0".to_string(),
+                item: "minecraft:wooden_shovel".to_string(),
+                count: 1,
+                selected: true,
+            }],
+            nearby_blocks: Vec::new(),
+            nearby_entities: Vec::new(),
+            health: Some(20.0),
+            hunger: Some(20.0),
+            metadata: serde_json::Value::Null,
+        };
+        let action = InteractiveActionMacro::new("dig", "ground")
+            .with_duration_ticks(20)
+            .with_stop_condition("block broken");
+
+        let state_event = interactive_state_event(
+            node.clone(),
+            session.clone(),
+            Source::new("benchmark.minestudio").expect("source"),
+            state.clone(),
+            Vec::new(),
+        );
+        let action_event = interactive_action_event(
+            node.clone(),
+            session.clone(),
+            Source::new("benchmark.minestudio").expect("source"),
+            action.clone(),
+        );
+        let step_event = trajectory_step_event(
+            node,
+            session,
+            Source::new("benchmark.minestudio").expect("source"),
+            InteractiveTrajectoryStep {
+                trajectory_id,
+                step_index: 7,
+                observation_id: state.observation_id.clone(),
+                state: Some(state),
+                action: Some(action),
+                artifacts: Vec::new(),
+            },
+        );
+
+        assert_eq!(state_event.kind.as_str(), INTERACTIVE_STATE_OBSERVED);
+        assert_eq!(action_event.kind.as_str(), INTERACTIVE_ACTION_REQUESTED);
+        assert_eq!(
+            step_event.kind.as_str(),
+            INTERACTIVE_TRAJECTORY_STEP_RECORDED
+        );
+        assert_eq!(step_event.payload["step"]["action"]["verb"], "dig");
+    }
+
+    #[test]
+    fn interactive_artifact_store_writes_under_registered_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-events-artifact-test-{}",
+            InteractiveTrajectoryId::generate()
+        ));
+        let store = InteractiveArtifactStore::new(&root);
+        let trajectory_id =
+            InteractiveTrajectoryId::from_legacy_named("traj_artifact").expect("trajectory");
+        let artifact = store
+            .write_json_artifact(
+                &trajectory_id,
+                "step-0001/state.json",
+                &serde_json::json!({"ok": true}),
+                InteractiveArtifactKind::TrajectoryJson,
+            )
+            .expect("write artifact");
+
+        assert!(artifact.uri.contains("events/interactive/trajectories"));
+        assert_eq!(artifact.byte_len, 16);
+        let written = root
+            .join("events")
+            .join("interactive")
+            .join("trajectories")
+            .join(trajectory_id.as_str())
+            .join("step-0001/state.json");
+        assert!(written.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn interactive_artifact_store_rejects_path_escape() {
+        let store = InteractiveArtifactStore::new(std::env::temp_dir());
+        let trajectory_id =
+            InteractiveTrajectoryId::from_legacy_named("traj_escape").expect("trajectory");
+        let error = store
+            .write_binary_artifact(
+                &trajectory_id,
+                "../outside.png",
+                b"nope",
+                InteractiveArtifactKind::Screenshot,
+            )
+            .expect_err("escape must fail");
+        assert!(matches!(
+            error,
+            InteractiveArtifactError::InvalidPath { .. }
+        ));
+    }
+
+    #[test]
+    fn interactive_storage_paths_are_registered() {
+        let mut layout = sinomo_storage::StorageLayout::new();
+        register_storage_paths(&mut layout).expect("register");
+        assert!(
+            layout
+                .owner_for("events/interactive/trajectories/01hxy6qa9k0t9vr4g9n8d3q5bf/step.json")
+                .is_some()
+        );
+        assert!(
+            layout
+                .owner_for("events/interactive/screenshots/shot.png")
+                .is_some()
         );
     }
 }

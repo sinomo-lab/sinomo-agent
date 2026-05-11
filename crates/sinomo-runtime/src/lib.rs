@@ -53,6 +53,7 @@ pub mod r1 {
             sinomo_node::register_storage_paths(&mut layout)?;
             sinomo_dfs::register_storage_paths(&mut layout)?;
             sinomo_local::register_storage_paths(&mut layout)?;
+            sinomo_events::register_storage_paths(&mut layout)?;
             Ok(layout)
         }
 

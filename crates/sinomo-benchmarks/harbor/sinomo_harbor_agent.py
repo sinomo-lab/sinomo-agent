@@ -10,7 +10,7 @@ from harbor.models.agent.context import AgentContext
 
 
 def run_sinomo_agent(prompt: str) -> str:
-    default_provider = "minicpm-o" if os.environ.get("SINOMO_MINICPM_ENDPOINT") else "codex"
+    default_provider = "minicpm-o" if os.environ.get("SINOMO_PYTORCH_ENDPOINT", os.environ.get("SINOMO_MINICPM_ENDPOINT")) else "codex"
     default_model = (
         "openbmb/MiniCPM-o-4_5"
         if default_provider == "minicpm-o"

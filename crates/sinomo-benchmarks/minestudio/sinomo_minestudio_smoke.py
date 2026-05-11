@@ -30,7 +30,7 @@ def main() -> int:
             "stream": False,
             "metadata": {"benchmark": "minestudio-smoke"},
         }
-        endpoint = os.environ.get("SINOMO_MINICPM_ENDPOINT")
+        endpoint = os.environ.get("SINOMO_PYTORCH_ENDPOINT", os.environ.get("SINOMO_MINICPM_ENDPOINT"))
         if endpoint:
             request.pop("image_path", None)
             request["image_name"] = image_path.name
@@ -45,9 +45,9 @@ def main() -> int:
                 print(response.read().decode("utf-8"))
             return 0
         env = dict(os.environ)
-        env.setdefault("SINOMO_MINICPM_MOCK", "1")
+        env.setdefault("SINOMO_PYTORCH_MOCK", "1")
         proc = subprocess.run(
-            ["sinomo-minicpm-bridge"],
+            ["sinomo-pytorch-bridge"],
             input=json.dumps(request),
             text=True,
             capture_output=True,

@@ -1,16 +1,26 @@
-use sinomo_minicpm::{MINICPM_DEFAULT_MODEL, MiniCpmDevice};
+use sinomo_pytorch::{MINICPM_DEFAULT_MODEL, PytorchDevice};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+fn env_os_any(primary: &str, fallback: &str) -> Option<std::ffi::OsString> {
+    env::var_os(primary).or_else(|| env::var_os(fallback))
+}
+
+fn env_any(primary: &str, fallback: &str) -> Option<String> {
+    env::var(primary).ok().or_else(|| env::var(fallback).ok())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bind = "127.0.0.1".to_string();
     let mut port = "32153".to_string();
-    let mut model =
-        env::var("SINOMO_MINICPM_MODEL").unwrap_or_else(|_| MINICPM_DEFAULT_MODEL.to_string());
-    let mut device = env::var("SINOMO_MINICPM_DEVICE").unwrap_or_else(|_| "auto".to_string());
-    let mut mode = env::var("SINOMO_MINICPM_SERVER_MODE").unwrap_or_else(|_| "vision".to_string());
-    let mut mock = env::var("SINOMO_MINICPM_MOCK").as_deref() == Ok("1");
+    let mut model = env_any("SINOMO_PYTORCH_MODEL", "SINOMO_MINICPM_MODEL")
+        .unwrap_or_else(|| MINICPM_DEFAULT_MODEL.to_string());
+    let mut device = env_any("SINOMO_PYTORCH_DEVICE", "SINOMO_MINICPM_DEVICE")
+        .unwrap_or_else(|| "auto".to_string());
+    let mut mode = env_any("SINOMO_PYTORCH_SERVER_MODE", "SINOMO_MINICPM_SERVER_MODE")
+        .unwrap_or_else(|| "vision".to_string());
+    let mut mock = env_any("SINOMO_PYTORCH_MOCK", "SINOMO_MINICPM_MOCK").as_deref() == Some("1");
 
     let args: Vec<String> = env::args().skip(1).collect();
     let mut index = 0;
@@ -39,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--mock" => mock = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: sinomo-minicpm-server [--bind HOST] [--port PORT] [--model MODEL] [--device auto|cpu|cuda] [--mode text|vision|audio|duplex] [--mock]"
+                    "usage: sinomo-pytorch-server [--bind HOST] [--port PORT] [--model MODEL] [--device auto|cpu|cuda] [--mode text|vision|audio|duplex] [--mock]"
                 );
                 return Ok(());
             }
@@ -56,18 +66,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         value => return Err(format!("unsupported mode `{value}`").into()),
     }
     let _device_marker = match device.as_str() {
-        "cpu" => MiniCpmDevice::Cpu,
-        "cuda" => MiniCpmDevice::Cuda,
-        _ => MiniCpmDevice::Auto,
+        "cpu" => PytorchDevice::Cpu,
+        "cuda" => PytorchDevice::Cuda,
+        _ => PytorchDevice::Auto,
     };
 
-    let python = env::var_os("SINOMO_MINICPM_PYTHON")
+    let python = env_os_any("SINOMO_PYTORCH_PYTHON", "SINOMO_MINICPM_PYTHON")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("python3"));
-    let server_script = env::var_os("SINOMO_MINICPM_SERVER")
+    let server_script = env_os_any("SINOMO_PYTORCH_SERVER", "SINOMO_MINICPM_SERVER")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/minicpm_server.py")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/pytorch_server.py")
         });
 
     let mut command = Command::new(python);
@@ -90,6 +100,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("MiniCPM server exited with status {status}").into())
+        Err(format!("PyTorch model server exited with status {status}").into())
     }
 }

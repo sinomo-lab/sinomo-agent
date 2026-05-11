@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Process-isolated MiniCPM-o bridge.
+"""Process-isolated PyTorch/Transformers model bridge.
 
 The bridge reads one JSON request from stdin and writes one JSON response to
 stdout. It intentionally keeps all PyTorch/Transformers imports on the Python
@@ -60,7 +60,15 @@ def mock_response(request: dict[str, Any], model: str, device: str) -> dict[str,
             user_text = message.get("content", "")
     mode = request.get("mode", "text")
     image = request.get("image_path") or request.get("image_name")
+    image_sequence = request.get("image_sequence_names") or []
     suffix = f" image={Path(image).name}" if image else ""
+    metadata = request.get("metadata") or {}
+    if metadata.get("benchmark") == "minestudio-live-duplex-loop":
+        user_text = (
+            'send_game_action(verb="look", target="visible horizon", '
+            'duration_ticks=3, stop_condition="stop when the camera view changes")'
+        )
+        suffix = f" frames={len(image_sequence)}"
     return {
         "content": f"[mock-minicpm:{mode}] {user_text}{suffix}".strip(),
         "runtime": runtime_status(model, device, "mock runtime"),
@@ -108,6 +116,24 @@ def request_image_path(request: dict[str, Any], temp_dir: str | None) -> str | N
     return request.get("image_path")
 
 
+def request_image_paths(request: dict[str, Any], temp_dir: str | None) -> list[str]:
+    paths: list[str] = []
+    image_sequence = request.get("image_sequence_base64") or []
+    image_names = request.get("image_sequence_names") or []
+    if image_sequence:
+        if temp_dir is None:
+            raise ValueError("image_sequence_base64 requires a temporary directory")
+        for index, encoded in enumerate(image_sequence):
+            image_name = Path(image_names[index] if index < len(image_names) else f"frame-{index:04d}.png").name
+            image_path = Path(temp_dir) / image_name
+            image_path.write_bytes(base64.b64decode(encoded))
+            paths.append(str(image_path))
+    single = request_image_path(request, temp_dir)
+    if single:
+        paths.append(single)
+    return paths
+
+
 def complete_loaded_model(
     model: Any,
     resolved_device: str,
@@ -119,7 +145,7 @@ def complete_loaded_model(
     mode = request.get("mode", "text")
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp_dir:
-        image_path = request_image_path(request, temp_dir)
+        image_paths = request_image_paths(request, temp_dir)
         msgs: list[dict[str, Any]] = []
         system_prompt = request.get("system_prompt")
         if system_prompt:
@@ -127,12 +153,19 @@ def complete_loaded_model(
         for message in request.get("messages", []):
             role = message.get("role", "user")
             content: Any = message.get("content", "")
-            if mode in {"vision", "duplex"} and role == "user" and image_path:
-                image = Image.open(image_path).convert("RGB")
-                content = [image, content]
+            if mode in {"vision", "duplex", "video"} and role == "user" and image_paths:
+                images = [Image.open(image_path).convert("RGB") for image_path in image_paths]
+                content = images + [content]
             msgs.append({"role": role, "content": content})
 
-        response = model.chat(msgs=msgs, use_tts_template=mode in {"audio", "duplex"})
+        try:
+            response = model.chat(
+                msgs=msgs,
+                use_tts_template=mode in {"audio", "duplex"},
+                omni_mode=mode == "duplex" and len(image_paths) > 1,
+            )
+        except TypeError:
+            response = model.chat(msgs=msgs, use_tts_template=mode in {"audio", "duplex"})
 
     elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
     response_text = str(response)
@@ -177,14 +210,14 @@ def main() -> int:
     args = parser.parse_args()
 
     request = json.load(sys.stdin)
-    if os.environ.get("SINOMO_MINICPM_MOCK") == "1":
+    if os.environ.get("SINOMO_PYTORCH_MOCK", os.environ.get("SINOMO_MINICPM_MOCK")) == "1":
         json.dump(mock_response(request, args.model, args.device), sys.stdout)
         return 0
     try:
         json.dump(run_request(request, args.model, args.device), sys.stdout)
         return 0
     except Exception as exc:
-        print(f"MiniCPM bridge failed: {exc}", file=sys.stderr)
+        print(f"PyTorch model bridge failed: {exc}", file=sys.stderr)
         return 2
 
 

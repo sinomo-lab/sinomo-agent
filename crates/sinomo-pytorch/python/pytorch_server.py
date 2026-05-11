@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Warm MiniCPM-o HTTP server for cluster-local benchmark runs."""
+"""Warm PyTorch/Transformers HTTP server for cluster-local model runs."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ import argparse
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from minicpm_bridge import (
+from pytorch_bridge import (
     complete_loaded_model,
     load_model,
     mock_response,
@@ -18,8 +19,8 @@ from minicpm_bridge import (
 )
 
 
-class MiniCpmHandler(BaseHTTPRequestHandler):
-    server: "MiniCpmHttpServer"
+class PytorchModelHandler(BaseHTTPRequestHandler):
+    server: "PytorchModelHttpServer"
 
     def do_GET(self) -> None:
         if self.path != "/health":
@@ -43,7 +44,10 @@ class MiniCpmHandler(BaseHTTPRequestHandler):
                     request,
                     self.server.model_id,
                 )
-            self.write_json(response)
+            if request.get("stream"):
+                self.write_event_stream(response)
+            else:
+                self.write_json(response)
         except Exception as exc:  # pragma: no cover - host/model dependent
             self.write_json({"error": str(exc)}, status=500)
 
@@ -58,8 +62,35 @@ class MiniCpmHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def write_event_stream(self, payload: dict[str, Any]) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        content = str(payload.get("content", ""))
+        words = content.split()
+        if not words:
+            words = [""]
+        accumulated = []
+        for index, word in enumerate(words):
+            accumulated.append(word)
+            event = {
+                "index": index,
+                "delta": word + (" " if index + 1 < len(words) else ""),
+                "content": " ".join(accumulated),
+                "done": False,
+            }
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            time.sleep(0.01)
+        final = dict(payload)
+        final["done"] = True
+        self.wfile.write(f"data: {json.dumps(final)}\n\n".encode("utf-8"))
+        self.wfile.flush()
 
-class MiniCpmHttpServer(ThreadingHTTPServer):
+
+class PytorchModelHttpServer(ThreadingHTTPServer):
     def __init__(
         self,
         address: tuple[str, int],
@@ -77,7 +108,7 @@ class MiniCpmHttpServer(ThreadingHTTPServer):
             self.resolved_device = device
         else:
             self.model, self.resolved_device = load_model(model_id, device, mode)
-        super().__init__(address, MiniCpmHandler)
+        super().__init__(address, PytorchModelHandler)
 
     def status(self) -> dict[str, Any]:
         diagnostic = "mock runtime" if self.mock else "ready"
@@ -88,13 +119,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=32153)
-    parser.add_argument("--model", default=os.environ.get("SINOMO_MINICPM_MODEL", "openbmb/MiniCPM-o-4_5"))
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=os.environ.get("SINOMO_MINICPM_DEVICE", "auto"))
-    parser.add_argument("--mode", choices=["text", "vision", "audio", "duplex"], default=os.environ.get("SINOMO_MINICPM_SERVER_MODE", "vision"))
-    parser.add_argument("--mock", action="store_true", default=os.environ.get("SINOMO_MINICPM_MOCK") == "1")
+    parser.add_argument("--model", default=os.environ.get("SINOMO_PYTORCH_MODEL", os.environ.get("SINOMO_MINICPM_MODEL", "openbmb/MiniCPM-o-4_5")))
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=os.environ.get("SINOMO_PYTORCH_DEVICE", os.environ.get("SINOMO_MINICPM_DEVICE", "auto")))
+    parser.add_argument("--mode", choices=["text", "vision", "audio", "duplex"], default=os.environ.get("SINOMO_PYTORCH_SERVER_MODE", os.environ.get("SINOMO_MINICPM_SERVER_MODE", "vision")))
+    parser.add_argument("--mock", action="store_true", default=os.environ.get("SINOMO_PYTORCH_MOCK", os.environ.get("SINOMO_MINICPM_MOCK")) == "1")
     args = parser.parse_args()
 
-    server = MiniCpmHttpServer((args.bind, args.port), args.model, args.device, args.mode, args.mock)
+    server = PytorchModelHttpServer((args.bind, args.port), args.model, args.device, args.mode, args.mock)
     print(
         json.dumps(
             {
