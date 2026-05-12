@@ -205,6 +205,7 @@ pub struct ProviderAccountInfo {
 
 pub const DEFAULT_PROVIDER_ACCOUNT: &str = "default";
 pub const LM_PROVIDER_CONFIG_KV_KEY: &str = "/config/lm/providers";
+pub const LM_RUNTIME_CONFIG_KV_KEY: &str = "/config/lm/runtime";
 
 fn default_provider_account_name() -> String {
     DEFAULT_PROVIDER_ACCOUNT.to_string()
@@ -238,6 +239,40 @@ pub fn provider_accounts(config: &ModelConfig) -> Vec<ProviderAccountInfo> {
             enabled: account.enabled,
         })
         .collect()
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModelRuntimeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_models_cache_dir: Option<String>,
+    #[serde(default)]
+    pub minicpm_v46: MiniCpmV46RuntimeConfig,
+    #[serde(default)]
+    pub pytorch_bridge: PytorchBridgeRuntimeConfig,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MiniCpmV46RuntimeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PytorchBridgeRuntimeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mock: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +376,43 @@ pub fn model_config_cluster_kv_txn(config: &ModelConfig) -> Result<KvTxn, Langua
             KvOp::put_serde(LM_PROVIDER_CONFIG_KV_KEY, config, None).map_err(|source| {
                 LanguageModelError::ConfigStore {
                     path: LM_PROVIDER_CONFIG_KV_KEY.to_string(),
+                    detail: source.to_string(),
+                }
+            })?,
+        ],
+        failure: Vec::new(),
+    })
+}
+
+pub fn model_runtime_config_from_cluster_kv_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Option<ModelRuntimeConfig>, LanguageModelError> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == LM_RUNTIME_CONFIG_KV_KEY)
+        .map(decode_model_runtime_config_entry)
+        .transpose()
+}
+
+fn decode_model_runtime_config_entry(
+    entry: &KvEntry,
+) -> Result<ModelRuntimeConfig, LanguageModelError> {
+    decode_kv_value(&entry.value).map_err(|source| LanguageModelError::ConfigStore {
+        path: LM_RUNTIME_CONFIG_KV_KEY.to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub fn model_runtime_config_cluster_kv_txn(
+    config: &ModelRuntimeConfig,
+) -> Result<KvTxn, LanguageModelError> {
+    Ok(KvTxn {
+        compares: Vec::new(),
+        success: vec![
+            KvOp::put_serde(LM_RUNTIME_CONFIG_KV_KEY, config, None).map_err(|source| {
+                LanguageModelError::ConfigStore {
+                    path: LM_RUNTIME_CONFIG_KV_KEY.to_string(),
                     detail: source.to_string(),
                 }
             })?,
@@ -683,13 +755,13 @@ pub fn complete_configured_model_request_with_account(
         GitHubCopilotProvider::PROVIDER_ID => {
             let credentials_path =
                 data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
+            let default_config = GitHubCopilotConfig::default();
             let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
-                client_id: env::var("SINOMO_COPILOT_CLIENT_ID")
-                    .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id),
-                github_host: env::var("SINOMO_COPILOT_GITHUB_HOST")
-                    .unwrap_or_else(|_| GitHubCopilotConfig::default().github_host),
-                api_base_url: env::var("SINOMO_COPILOT_API_BASE_URL")
-                    .unwrap_or_else(|_| GitHubCopilotConfig::default().api_base_url),
+                client_id: default_config.client_id,
+                github_host: default_config.github_host,
+                api_base_url: account
+                    .and_then(|account| account.api_base_url.clone())
+                    .unwrap_or(default_config.api_base_url),
                 default_model: model_or_default(
                     model,
                     GitHubCopilotConfig::default().default_model,
@@ -775,9 +847,8 @@ pub fn complete_configured_model_request_with_account(
             let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
             let default_config = NvidiaConfig::default();
             let provider = NvidiaProvider::new(NvidiaConfig {
-                api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
-                    .ok()
-                    .or_else(|| account.and_then(|account| account.api_base_url.clone()))
+                api_base_url: account
+                    .and_then(|account| account.api_base_url.clone())
                     .unwrap_or(default_config.api_base_url),
                 default_model: model_or_default(model, default_config.default_model),
                 api_key: account.and_then(|account| account.api_key.clone()),
@@ -820,8 +891,7 @@ pub fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), Lan
             detail: source.to_string(),
         })?;
     let credentials_path = data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
-    let client_id = env::var("SINOMO_COPILOT_CLIENT_ID")
-        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id);
+    let client_id = GitHubCopilotConfig::default().client_id;
     let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
         client_id,
         token_store_path: Some(credentials_path.clone()),
@@ -834,9 +904,7 @@ pub fn anthropic_provider() -> Result<(AnthropicProvider, PathBuf), LanguageMode
     let data_dir = provider_data_dir(AnthropicProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(AnthropicProvider::PROVIDER_ID);
     let provider = AnthropicProvider::new(AnthropicConfig {
-        api_base_url: env::var("SINOMO_ANTHROPIC_API_BASE_URL")
-            .or_else(|_| env::var("SINOMO_CLAUDE_API_BASE_URL"))
-            .unwrap_or_else(|_| AnthropicConfig::default().api_base_url),
+        api_base_url: AnthropicConfig::default().api_base_url,
         default_model: AnthropicConfig::default().default_model,
         api_key: None,
         credentials_path: Some(credentials_path.clone()),
@@ -848,8 +916,7 @@ pub fn openai_provider() -> Result<(OpenAiProvider, PathBuf), LanguageModelError
     let data_dir = provider_data_dir(OpenAiProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
     let provider = OpenAiProvider::new(OpenAiConfig {
-        api_base_url: env::var("SINOMO_OPENAI_API_BASE_URL")
-            .unwrap_or_else(|_| OpenAiConfig::default().api_base_url),
+        api_base_url: OpenAiConfig::default().api_base_url,
         default_model: OpenAiConfig::default().default_model,
         api_key: None,
         credentials_path: Some(credentials_path.clone()),
@@ -861,8 +928,7 @@ pub fn gemini_provider() -> Result<(GeminiProvider, PathBuf), LanguageModelError
     let data_dir = provider_data_dir(GeminiProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
     let provider = GeminiProvider::new(GeminiConfig {
-        api_base_url: env::var("SINOMO_GEMINI_API_BASE_URL")
-            .unwrap_or_else(|_| GeminiConfig::default().api_base_url),
+        api_base_url: GeminiConfig::default().api_base_url,
         default_model: GeminiConfig::default().default_model,
         api_key: None,
         credentials_path: Some(credentials_path.clone()),
@@ -874,8 +940,7 @@ pub fn nvidia_provider() -> Result<(NvidiaProvider, PathBuf), LanguageModelError
     let data_dir = provider_data_dir(NvidiaProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
     let provider = NvidiaProvider::new(NvidiaConfig {
-        api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
-            .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
+        api_base_url: NvidiaConfig::default().api_base_url,
         default_model: NvidiaConfig::default().default_model,
         api_key: None,
         credentials_path: Some(credentials_path.clone()),
@@ -899,12 +964,9 @@ pub fn codex_provider_for_model(model: &str) -> CodexProvider {
     let default_model = model_or_default(model, CODEX_DEFAULT_MODEL.to_string());
     let config_default = OpenAiResponsesCodexConfig::default();
     let client_config = OpenAiResponsesCodexConfig {
-        api_base_url: env::var("SINOMO_CODEX_API_BASE_URL")
-            .unwrap_or_else(|_| config_default.api_base_url.clone()),
-        auth_issuer: env::var("SINOMO_CODEX_AUTH_ISSUER")
-            .unwrap_or_else(|_| config_default.auth_issuer.clone()),
-        client_id: env::var("SINOMO_CODEX_CLIENT_ID")
-            .unwrap_or_else(|_| config_default.client_id.clone()),
+        api_base_url: config_default.api_base_url.clone(),
+        auth_issuer: config_default.auth_issuer.clone(),
+        client_id: config_default.client_id.clone(),
         client_version: config_default.client_version,
         default_model: default_model.clone(),
         credentials_path: config_default.credentials_path,

@@ -12,11 +12,31 @@ pub(crate) enum ModelsCliCommand {
     Help,
     List(ModelListOptions),
     Default(ModelDefaultOptions),
+    Runtime(ModelRuntimeCliCommand),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelListOptions {
     pub(crate) provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum ModelRuntimeCliCommand {
+    Show,
+    Set(ModelRuntimeSetOptions),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ModelRuntimeSetOptions {
+    pub(crate) native_models_cache_dir: Option<String>,
+    pub(crate) minicpm_v46_model_dir: Option<String>,
+    pub(crate) minicpm_v46_max_input_tokens: Option<usize>,
+    pub(crate) minicpm_v46_max_output_tokens: Option<usize>,
+    pub(crate) pytorch_endpoint: Option<String>,
+    pub(crate) pytorch_python: Option<String>,
+    pub(crate) pytorch_device: Option<String>,
+    pub(crate) pytorch_timeout_seconds: Option<u64>,
+    pub(crate) pytorch_mock: Option<bool>,
 }
 
 pub(crate) fn parse_models_command(args: &[String]) -> Result<ModelsCliCommand, CliError> {
@@ -31,7 +51,127 @@ pub(crate) fn parse_models_command(args: &[String]) -> Result<ModelsCliCommand, 
         Some((command, rest)) if command == "default" => Ok(ModelsCliCommand::Default(
             parse_model_default_options(rest)?,
         )),
+        Some((command, rest)) if command == "runtime" => Ok(ModelsCliCommand::Runtime(
+            parse_models_runtime_command(rest)?,
+        )),
         _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_models_runtime_command(
+    args: &[String],
+) -> Result<ModelRuntimeCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(ModelRuntimeCliCommand::Show),
+        Some((command, [])) if matches!(command.as_str(), "show" | "help" | "--help" | "-h") => {
+            Ok(ModelRuntimeCliCommand::Show)
+        }
+        Some((command, rest)) if command == "set" => Ok(ModelRuntimeCliCommand::Set(
+            parse_model_runtime_set_options(rest)?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_model_runtime_set_options(
+    args: &[String],
+) -> Result<ModelRuntimeSetOptions, CliError> {
+    let mut options = ModelRuntimeSetOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--native-models-cache-dir" => {
+                options.native_models_cache_dir = Some(
+                    args.get(index + 1)
+                        .ok_or(CliError::Usage)?
+                        .trim()
+                        .to_string(),
+                );
+                index += 2;
+            }
+            "--minicpm-v46-model-dir" => {
+                options.minicpm_v46_model_dir = Some(
+                    args.get(index + 1)
+                        .ok_or(CliError::Usage)?
+                        .trim()
+                        .to_string(),
+                );
+                index += 2;
+            }
+            "--minicpm-v46-max-input-tokens" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                options.minicpm_v46_max_input_tokens =
+                    Some(value.parse().map_err(|source| CliError::Parse {
+                        detail: format!(
+                            "invalid --minicpm-v46-max-input-tokens `{value}`: {source}"
+                        ),
+                    })?);
+                index += 2;
+            }
+            "--minicpm-v46-max-output-tokens" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                options.minicpm_v46_max_output_tokens =
+                    Some(value.parse().map_err(|source| CliError::Parse {
+                        detail: format!(
+                            "invalid --minicpm-v46-max-output-tokens `{value}`: {source}"
+                        ),
+                    })?);
+                index += 2;
+            }
+            "--pytorch-endpoint" => {
+                options.pytorch_endpoint = Some(
+                    args.get(index + 1)
+                        .ok_or(CliError::Usage)?
+                        .trim()
+                        .to_string(),
+                );
+                index += 2;
+            }
+            "--pytorch-python" => {
+                options.pytorch_python = Some(
+                    args.get(index + 1)
+                        .ok_or(CliError::Usage)?
+                        .trim()
+                        .to_string(),
+                );
+                index += 2;
+            }
+            "--pytorch-device" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                if !matches!(value.as_str(), "auto" | "cpu" | "cuda") {
+                    return Err(CliError::Parse {
+                        detail: format!("invalid --pytorch-device `{value}`"),
+                    });
+                }
+                options.pytorch_device = Some(value.clone());
+                index += 2;
+            }
+            "--pytorch-timeout-seconds" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                options.pytorch_timeout_seconds =
+                    Some(value.parse().map_err(|source| CliError::Parse {
+                        detail: format!("invalid --pytorch-timeout-seconds `{value}`: {source}"),
+                    })?);
+                index += 2;
+            }
+            "--pytorch-mock" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                options.pytorch_mock = Some(parse_bool_flag_value(value)?);
+                index += 2;
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(options)
+}
+
+fn parse_bool_flag_value(value: &str) -> Result<bool, CliError> {
+    match value {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(CliError::Parse {
+            detail: format!("invalid boolean value `{value}`"),
+        }),
     }
 }
 
@@ -135,6 +275,7 @@ pub(crate) fn run_models_command(command: ModelsCliCommand) -> Result<(), CliErr
         ModelsCliCommand::Help => models_help(),
         ModelsCliCommand::List(options) => models_list(options),
         ModelsCliCommand::Default(options) => models_default(options),
+        ModelsCliCommand::Runtime(command) => models_runtime(command),
     }
 }
 
@@ -284,6 +425,149 @@ pub(crate) fn write_model_config_for_node(
     let paths = ModelPaths::new(data_dir);
     save_model_config(&paths.config, config).map_err(CliError::LanguageModel)?;
     Ok(paths.config)
+}
+
+pub(crate) fn load_model_runtime_config_for_node(
+    data_dir: &SinomoDataDir,
+) -> Result<(ModelRuntimeConfig, PathBuf), CliError> {
+    if model_config_uses_cluster(data_dir) {
+        let paths = ClusterPaths::new(data_dir);
+        let snapshot = model_config_cluster_snapshot(&paths)?;
+        let config = model_runtime_config_from_cluster_kv_snapshot(&snapshot)
+            .map_err(CliError::LanguageModel)?
+            .unwrap_or_default();
+        return Ok((config, paths.kv_snapshot));
+    }
+    Ok((
+        ModelRuntimeConfig::default(),
+        data_dir.configs_dir().join("models-runtime.json"),
+    ))
+}
+
+pub(crate) fn write_model_runtime_config_for_node(
+    data_dir: &SinomoDataDir,
+    config: &ModelRuntimeConfig,
+) -> Result<PathBuf, CliError> {
+    if !model_config_uses_cluster(data_dir) {
+        return Err(CliError::DaemonNotRunning {
+            detail:
+                "model runtime config is cluster scoped and requires an initialized local cluster"
+                    .to_string(),
+        });
+    }
+    let paths = ClusterPaths::new(data_dir);
+    paths.ensure()?;
+    let txn = model_runtime_config_cluster_kv_txn(config).map_err(CliError::LanguageModel)?;
+    let daemon_paths = DaemonPaths::new(data_dir);
+    daemon_handle_daemon_cluster_kv_txn_request(&daemon_paths, txn)?;
+    Ok(paths.kv_snapshot)
+}
+
+pub(crate) fn models_runtime(command: ModelRuntimeCliCommand) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    match command {
+        ModelRuntimeCliCommand::Show => {
+            let (config, path) = load_model_runtime_config_for_node(&data_dir)?;
+            println!("model runtime config:");
+            println!(
+                "  native models cache dir: {}",
+                config.native_models_cache_dir.as_deref().unwrap_or("")
+            );
+            println!(
+                "  minicpm-v46 model dir: {}",
+                config.minicpm_v46.model_dir.as_deref().unwrap_or("")
+            );
+            println!(
+                "  minicpm-v46 max input tokens: {}",
+                config
+                    .minicpm_v46
+                    .max_input_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            );
+            println!(
+                "  minicpm-v46 max output tokens: {}",
+                config
+                    .minicpm_v46
+                    .max_output_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            );
+            println!(
+                "  pytorch endpoint: {}",
+                config.pytorch_bridge.endpoint.as_deref().unwrap_or("")
+            );
+            println!(
+                "  pytorch python: {}",
+                config.pytorch_bridge.python.as_deref().unwrap_or("")
+            );
+            println!(
+                "  pytorch device: {}",
+                config.pytorch_bridge.device.as_deref().unwrap_or("")
+            );
+            println!(
+                "  pytorch timeout seconds: {}",
+                config
+                    .pytorch_bridge
+                    .timeout_seconds
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            );
+            println!(
+                "  pytorch mock: {}",
+                config
+                    .pytorch_bridge
+                    .mock
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            );
+            println!("config: {}", path.display());
+        }
+        ModelRuntimeCliCommand::Set(options) => {
+            let (mut config, _) = load_model_runtime_config_for_node(&data_dir)?;
+            if let Some(value) = options.native_models_cache_dir {
+                config.native_models_cache_dir = non_empty_option(value);
+            }
+            if let Some(value) = options.minicpm_v46_model_dir {
+                config.minicpm_v46.model_dir = non_empty_option(value);
+            }
+            if options.minicpm_v46_max_input_tokens.is_some() {
+                config.minicpm_v46.max_input_tokens = options.minicpm_v46_max_input_tokens;
+            }
+            if options.minicpm_v46_max_output_tokens.is_some() {
+                config.minicpm_v46.max_output_tokens = options.minicpm_v46_max_output_tokens;
+            }
+            if let Some(value) = options.pytorch_endpoint {
+                config.pytorch_bridge.endpoint = non_empty_option(value);
+            }
+            if let Some(value) = options.pytorch_python {
+                config.pytorch_bridge.python = non_empty_option(value);
+            }
+            if let Some(value) = options.pytorch_device {
+                config.pytorch_bridge.device = non_empty_option(value);
+            }
+            if options.pytorch_timeout_seconds.is_some() {
+                config.pytorch_bridge.timeout_seconds = options.pytorch_timeout_seconds;
+            }
+            if options.pytorch_mock.is_some() {
+                config.pytorch_bridge.mock = options.pytorch_mock;
+            }
+            let path = write_model_runtime_config_for_node(&data_dir, &config)?;
+            println!("model runtime config updated");
+            println!("config: {}", path.display());
+            println!("kv key: {LM_RUNTIME_CONFIG_KV_KEY}");
+        }
+    }
+    Ok(())
+}
+
+fn non_empty_option(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {

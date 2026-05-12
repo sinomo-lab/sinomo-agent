@@ -298,8 +298,13 @@ def task_instruction(
         f"Suite: {task.suite}",
         f"Task id: {task.name}",
         f"Decision cycle: {cycle_index}",
-        "Use the Minecraft video frame stream as the primary observation, and use the compact environment text as low-bandwidth protocol state.",
-        "Choose the next bounded game action that makes visible progress on the task.",
+        "You are controlling Minecraft at about 2 decisions per second: each cycle has one current video frame, then the chosen action is applied for up to 10 ticks before the next frame.",
+        "Use the current Minecraft video frame as the primary observation, and use the compact environment text as low-bandwidth protocol state.",
+        "Choose the next bounded half-second game action that makes visible progress on the task.",
+        "Think in short control primitives: look/turn to align, move to approach, select/equip the tool or item, then use/place/mine/craft/attack.",
+        "A select/equip action only changes the held item; follow it next cycle with use/place/mine/attack if the item is already selected.",
+        "For place/use/mine/attack actions, target the visible object or exact item id and keep duration_ticks between 1 and 10.",
+        "For craft actions, use duration_ticks=1 and target the exact crafted item id.",
         "Prefer concrete manipulation actions over passive looking once the scene is visible.",
         "Empty-target look is only allowed when no concrete inventory/manipulation shortcut is available, and never after cycle 0.",
         "Never use the whole task id as an item target. For compound craft tasks, use a concrete item target such as minecraft:bell, minecraft:cake, or minecraft:diorite.",
@@ -640,7 +645,7 @@ def run_task(
     task_dir = run_dir / f"{task_index:04d}-{task.suite}-{task.name}"
     task_dir.mkdir(parents=True, exist_ok=True)
     record_dir = task_dir / "minestudio-recording"
-    env = MineStudioStreamClient(args.environment_url, args.timeout)
+    env = MineStudioStreamClient(args.environment_url, args.environment_timeout)
     result: dict[str, Any] = {
         "task_index": task_index,
         "task_count": task_count,
@@ -699,7 +704,7 @@ def run_task(
                 instruction,
                 frames,
                 cycle_index,
-                args.timeout,
+                args.model_timeout,
             )
             (task_dir / f"cycle-{cycle_index:04d}-model-output.json").write_text(
                 json.dumps(json_safe(response), indent=2),
@@ -813,10 +818,11 @@ def main() -> int:
     parser.add_argument("--task", action="append", dest="tasks", help="Task ref such as simple/collect_dirt. Repeatable.")
     parser.add_argument("--max-tasks", type=int)
     parser.add_argument("--cycles-per-task", type=int, default=10)
-    parser.add_argument("--frames-per-cycle", type=int, default=4)
+    parser.add_argument("--frames-per-cycle", type=int, default=1)
     parser.add_argument("--frame-stride-ticks", type=int, default=1)
-    parser.add_argument("--action-ticks", type=int, default=20)
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--action-ticks", type=int, default=10)
+    parser.add_argument("--environment-timeout", type=int, default=300)
+    parser.add_argument("--model-timeout", type=int, default=10)
     parser.add_argument("--record-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--record-fps", type=int, default=20)
     parser.add_argument(

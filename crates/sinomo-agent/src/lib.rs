@@ -133,7 +133,7 @@ Operate as a real-time, event-driven agent. Keep live interaction responsive:
 - treat async progress and results as session events;
 - hand cluster maintenance, cleanup, rollout, and diagnostics to the maid agent by default;
 - use SIFS as the default filesystem root;
-- use local MiniCPM-o as the core live model when available, and use stronger models only for deliberate background work.
+- use the local Rust MiniCPM-V 4.6 runtime as the core live model when available, and use stronger models only for deliberate background work.
 
 Return only JSON shaped as:
 {{
@@ -297,6 +297,27 @@ impl<M: InteractionModel> MainAgentLoop<M> {
     }
 
     pub fn decide(&self, input: &AgentLoopInput) -> Result<AgentLoopDecision, AgentError> {
+        self.decide_with_model(input, |model, request| model.complete(request))
+    }
+
+    pub fn decide_streaming(
+        &self,
+        input: &AgentLoopInput,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<AgentLoopDecision, AgentError> {
+        self.decide_with_model(input, |model, request| {
+            model.complete_streaming(request, on_delta)
+        })
+    }
+
+    fn decide_with_model(
+        &self,
+        input: &AgentLoopInput,
+        complete: impl FnOnce(
+            &M,
+            &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError>,
+    ) -> Result<AgentLoopDecision, AgentError> {
         if let Some(update) = &input.async_update
             && !update.needs_user_attention
             && update.next_action_hint == AsyncTaskNextAction::ContinueSilently
@@ -304,7 +325,7 @@ impl<M: InteractionModel> MainAgentLoop<M> {
             return Ok(AgentLoopDecision::silent());
         }
         let request = self.request(input)?;
-        let response = self.model.complete(&request)?;
+        let response = complete(&self.model, &request)?;
         parse_agent_loop_decision(&response.content)
     }
 
@@ -348,6 +369,32 @@ pub fn parse_agent_loop_decision(raw: &str) -> Result<AgentLoopDecision, AgentEr
     match serde_json::from_str(json) {
         Ok(decision) => Ok(decision),
         Err(source) => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json)
+                && let Some(text) = value.get("text").and_then(serde_json::Value::as_str)
+            {
+                return Ok(AgentLoopDecision {
+                    response_mode: value
+                        .get("response_mode")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(parse_agent_loop_response_mode)
+                        .unwrap_or(AgentLoopResponseMode::Answer),
+                    text: text.to_string(),
+                    tool_calls: value
+                        .get("tool_calls")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                    maid_handoff: value
+                        .get("maid_handoff")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok()),
+                    next_state: value
+                        .get("next_state")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(parse_agent_interaction_state)
+                        .unwrap_or(AgentInteractionState::Listening),
+                });
+            }
             if trimmed.is_empty() {
                 Err(AgentError::ModelResponse {
                     detail: format!("{source}: {raw}"),
@@ -362,6 +409,29 @@ pub fn parse_agent_loop_decision(raw: &str) -> Result<AgentLoopDecision, AgentEr
                 })
             }
         }
+    }
+}
+
+fn parse_agent_loop_response_mode(value: &str) -> Option<AgentLoopResponseMode> {
+    match value {
+        "answer" => Some(AgentLoopResponseMode::Answer),
+        "acknowledge" => Some(AgentLoopResponseMode::Acknowledge),
+        "clarify" => Some(AgentLoopResponseMode::Clarify),
+        "defer" => Some(AgentLoopResponseMode::Defer),
+        "silent" => Some(AgentLoopResponseMode::Silent),
+        _ => None,
+    }
+}
+
+fn parse_agent_interaction_state(value: &str) -> Option<AgentInteractionState> {
+    match value {
+        "speaking" => Some(AgentInteractionState::Speaking),
+        "listening" => Some(AgentInteractionState::Listening),
+        "waiting" => Some(AgentInteractionState::Waiting),
+        "delegating" => Some(AgentInteractionState::Delegating),
+        "recovering" => Some(AgentInteractionState::Recovering),
+        "idle" => Some(AgentInteractionState::Idle),
+        _ => None,
     }
 }
 
@@ -416,6 +486,7 @@ pub enum InteractionInputKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InteractionOutput {
+    Chunk(String),
     Line(String),
     Exit,
 }
@@ -425,6 +496,15 @@ pub trait InteractionModel {
         &self,
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError>;
+
+    fn complete_streaming(
+        &self,
+        request: &LanguageModelRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let _ = on_delta;
+        self.complete(request)
+    }
 }
 
 impl<T: LanguageModelProvider> InteractionModel for T {
@@ -1023,6 +1103,19 @@ mod tests {
         assert_eq!(decision.response_mode, AgentLoopResponseMode::Answer);
         assert_eq!(decision.text, "A short plain response.");
         assert!(decision.tool_calls.is_empty());
+        assert_eq!(decision.next_state, AgentInteractionState::Listening);
+    }
+
+    #[test]
+    fn partial_json_model_response_gets_agent_defaults() {
+        let decision =
+            parse_agent_loop_decision(r#"{"response_mode":"answer","text":"Hello from Sinomo."}"#)
+                .expect("decision");
+
+        assert_eq!(decision.response_mode, AgentLoopResponseMode::Answer);
+        assert_eq!(decision.text, "Hello from Sinomo.");
+        assert!(decision.tool_calls.is_empty());
+        assert_eq!(decision.maid_handoff, None);
         assert_eq!(decision.next_state, AgentInteractionState::Listening);
     }
 

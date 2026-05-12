@@ -28,7 +28,6 @@ use sinomo_runtime::events::EventId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleId;
 use sinomo_runtime::node::NodeId;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -4074,13 +4073,11 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                 let credentials_path = self
                     .data_dir
                     .provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
+                let default_config = GitHubCopilotConfig::default();
                 let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
-                    client_id: env::var("SINOMO_COPILOT_CLIENT_ID")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().client_id),
-                    github_host: env::var("SINOMO_COPILOT_GITHUB_HOST")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().github_host),
-                    api_base_url: env::var("SINOMO_COPILOT_API_BASE_URL")
-                        .unwrap_or_else(|_| GitHubCopilotConfig::default().api_base_url),
+                    client_id: default_config.client_id,
+                    github_host: default_config.github_host,
+                    api_base_url: default_config.api_base_url,
                     default_model: model_or_default(
                         &self.model,
                         GitHubCopilotConfig::default().default_model,
@@ -4171,8 +4168,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     .data_dir
                     .provider_credentials_file(NvidiaProvider::PROVIDER_ID);
                 let provider = NvidiaProvider::new(NvidiaConfig {
-                    api_base_url: env::var("SINOMO_NVIDIA_API_BASE_URL")
-                        .unwrap_or_else(|_| NvidiaConfig::default().api_base_url),
+                    api_base_url: NvidiaConfig::default().api_base_url,
                     default_model: model_or_default(
                         &self.model,
                         NvidiaConfig::default().default_model,

@@ -33,13 +33,15 @@ use sinomo_evolution::{
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel, GeminiProvider,
-    GitHubCopilotConfig, GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY, LanguageModelError,
+    GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError,
     LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse, ModelConfig,
-    ModelPaths, NvidiaProvider, OpenAiProvider, codex_provider, collect_provider_model_catalogs,
-    collect_provider_usage, complete_configured_model_request_with_account,
+    ModelPaths, ModelRuntimeConfig, NvidiaProvider, OpenAiProvider, codex_provider,
+    collect_provider_model_catalogs, collect_provider_usage,
+    complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
     github_copilot_provider, load_model_config, model_config_cluster_kv_txn,
-    model_config_from_cluster_kv_snapshot, normalize_model_id_for_provider,
+    model_config_from_cluster_kv_snapshot, model_runtime_config_cluster_kv_txn,
+    model_runtime_config_from_cluster_kv_snapshot, normalize_model_id_for_provider,
     normalize_model_provider, normalize_provider_account_name, provider_account_config,
     provider_api_key_from_env, resolve_default_model, save_model_config, save_provider_api_key,
     save_provider_api_key_in_model_config, subscription_usage_provider_ids,
@@ -368,16 +370,7 @@ struct ConfiguredInteractionModel {
     provider: String,
     model: String,
     account: Option<sinomo_lm::ProviderAccountConfig>,
-}
-
-fn env_var_any(primary: &str, fallback: &str) -> Option<String> {
-    std::env::var(primary)
-        .ok()
-        .or_else(|| std::env::var(fallback).ok())
-}
-
-fn env_var_os_any(primary: &str, fallback: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(primary).or_else(|| std::env::var_os(fallback))
+    runtime_config: ModelRuntimeConfig,
 }
 
 impl InteractionModel for ConfiguredInteractionModel {
@@ -391,17 +384,14 @@ impl InteractionModel for ConfiguredInteractionModel {
             } else {
                 self.model.clone()
             };
-            if let Some(endpoint) =
-                env_var_any("SINOMO_PYTORCH_ENDPOINT", "SINOMO_MINICPM_ENDPOINT")
-            {
+            if let Some(endpoint) = self.runtime_config.pytorch_bridge.endpoint.clone() {
                 let provider = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
                     endpoint,
-                    timeout_seconds: env_var_any(
-                        "SINOMO_PYTORCH_TIMEOUT_SECONDS",
-                        "SINOMO_MINICPM_TIMEOUT_SECONDS",
-                    )
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(300),
+                    timeout_seconds: self
+                        .runtime_config
+                        .pytorch_bridge
+                        .timeout_seconds
+                        .unwrap_or(300),
                 });
                 return sinomo_lm::LanguageModelProvider::complete(
                     &provider,
@@ -413,25 +403,25 @@ impl InteractionModel for ConfiguredInteractionModel {
                 );
             }
             let provider = PythonPytorchRuntime::new(PytorchRuntimeConfig {
-                python: env_var_os_any("SINOMO_PYTORCH_PYTHON", "SINOMO_MINICPM_PYTHON")
+                python: self
+                    .runtime_config
+                    .pytorch_bridge
+                    .python
+                    .as_deref()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from("python3")),
                 model,
-                device: match env_var_any("SINOMO_PYTORCH_DEVICE", "SINOMO_MINICPM_DEVICE")
-                    .as_deref()
-                {
+                device: match self.runtime_config.pytorch_bridge.device.as_deref() {
                     Some("cpu") => PytorchDevice::Cpu,
                     Some("cuda") => PytorchDevice::Cuda,
                     _ => PytorchDevice::Auto,
                 },
-                timeout_seconds: env_var_any(
-                    "SINOMO_PYTORCH_TIMEOUT_SECONDS",
-                    "SINOMO_MINICPM_TIMEOUT_SECONDS",
-                )
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(300),
-                mock: env_var_any("SINOMO_PYTORCH_MOCK", "SINOMO_MINICPM_MOCK").as_deref()
-                    == Some("1"),
+                timeout_seconds: self
+                    .runtime_config
+                    .pytorch_bridge
+                    .timeout_seconds
+                    .unwrap_or(300),
+                mock: self.runtime_config.pytorch_bridge.mock.unwrap_or(false),
                 ..PytorchRuntimeConfig::default()
             });
             return sinomo_lm::LanguageModelProvider::complete(
@@ -451,6 +441,53 @@ impl InteractionModel for ConfiguredInteractionModel {
             None,
             request,
         )
+    }
+
+    fn complete_streaming(
+        &self,
+        request: &LanguageModelRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if self.provider == MINICPM_PROVIDER_ID
+            && let Some(endpoint) = self.runtime_config.pytorch_bridge.endpoint.clone()
+        {
+            let model = if self.model == sinomo_lm::PROVIDER_DEFAULT_MODEL {
+                MINICPM_DEFAULT_MODEL.to_string()
+            } else {
+                self.model.clone()
+            };
+            let provider = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
+                endpoint,
+                timeout_seconds: self
+                    .runtime_config
+                    .pytorch_bridge
+                    .timeout_seconds
+                    .unwrap_or(300),
+            });
+            let response = provider
+                .complete_streaming(
+                    sinomo_pytorch::PytorchRequest::from_language_model_request(
+                        &LanguageModelRequest {
+                            provider: self.provider.clone(),
+                            model,
+                            ..request.clone()
+                        },
+                    ),
+                    on_delta,
+                )
+                .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                    provider: MINICPM_PROVIDER_ID.to_string(),
+                    model: self.model.clone(),
+                    detail: source.to_string(),
+                })?;
+            return Ok(LanguageModelResponse {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: self.model.clone(),
+                content: response.content,
+                usage: response.usage,
+            });
+        }
+        self.complete(request)
     }
 }
 
@@ -486,11 +523,13 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     };
     let provider = options.provider.clone();
     let model = options.model.clone();
+    let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
     let loop_model = ConfiguredInteractionModel {
         data_dir,
         provider: provider.clone(),
         model: model.clone(),
         account,
+        runtime_config,
     };
     let decision = MainAgentLoop::new(loop_model, provider, model).decide(&input)?;
     if decision.text.trim().is_empty() {

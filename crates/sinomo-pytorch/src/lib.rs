@@ -9,7 +9,7 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo,
     LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -302,6 +302,22 @@ impl RemotePytorchRuntime {
         Ok(serde_json::from_slice(&response)?)
     }
 
+    pub fn complete_streaming(
+        &self,
+        mut request: PytorchRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<PytorchResponse, PytorchBridgeError> {
+        request.stream = true;
+        let body = serde_json::to_vec(&request)?;
+        http_post_json_event_stream(
+            &self.config.endpoint,
+            "/complete",
+            &body,
+            Duration::from_secs(self.config.timeout_seconds),
+            on_delta,
+        )
+    }
+
     pub fn probe(&self) -> Result<PytorchRuntimeStatus, PytorchBridgeError> {
         let response = http_get(
             &self.config.endpoint,
@@ -310,6 +326,14 @@ impl RemotePytorchRuntime {
         )?;
         Ok(serde_json::from_slice(&response)?)
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PytorchStreamEvent {
+    #[serde(default)]
+    delta: String,
+    #[serde(default)]
+    done: bool,
 }
 
 impl LanguageModelProvider for RemotePytorchRuntime {
@@ -439,6 +463,109 @@ fn http_request(
             detail: format!("read response: {source}"),
         })?;
     parse_http_response(&response)
+}
+
+fn http_post_json_event_stream(
+    endpoint: &str,
+    path: &str,
+    body: &[u8],
+    timeout: Duration,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<PytorchResponse, PytorchBridgeError> {
+    let (host, port) = parse_http_endpoint(endpoint)?;
+    let mut addrs =
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|source| PytorchBridgeError::Network {
+                detail: format!("resolve {host}:{port}: {source}"),
+            })?;
+    let addr = addrs.next().ok_or_else(|| PytorchBridgeError::Network {
+        detail: format!("no address for {host}:{port}"),
+    })?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|source| {
+        PytorchBridgeError::Network {
+            detail: format!("connect {addr}: {source}"),
+        }
+    })?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|source| PytorchBridgeError::Network {
+            detail: format!("write request: {source}"),
+        })?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    reader
+        .read_line(&mut status)
+        .map_err(|source| PytorchBridgeError::Network {
+            detail: format!("read response status: {source}"),
+        })?;
+    if !status.contains(" 200 ") {
+        return Err(PytorchBridgeError::Network {
+            detail: status.trim().to_string(),
+        });
+    }
+    let mut line = String::new();
+    let mut content_type = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|source| PytorchBridgeError::Network {
+                detail: format!("read response headers: {source}"),
+            })?;
+        if read == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-type")
+        {
+            content_type = value.trim().to_string();
+        }
+    }
+    if !content_type.starts_with("text/event-stream") {
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .map_err(|source| PytorchBridgeError::Network {
+                detail: format!("read json response body: {source}"),
+            })?;
+        return Ok(serde_json::from_slice(&body)?);
+    }
+
+    let mut final_response = None;
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|source| PytorchBridgeError::Network {
+                detail: format!("read event stream: {source}"),
+            })?;
+        if read == 0 {
+            break;
+        }
+        let Some(data) = line.trim_end().strip_prefix("data: ") else {
+            continue;
+        };
+        let event: PytorchStreamEvent = serde_json::from_str(data)?;
+        if !event.delta.is_empty() {
+            on_delta(&event.delta);
+        }
+        if event.done {
+            final_response = Some(serde_json::from_str::<PytorchResponse>(data)?);
+            break;
+        }
+    }
+    final_response.ok_or_else(|| PytorchBridgeError::Network {
+        detail: "stream ended before final model response".to_string(),
+    })
 }
 
 fn parse_http_endpoint(endpoint: &str) -> Result<(String, u16), PytorchBridgeError> {

@@ -4,6 +4,10 @@ services:
       context: ../../../..
       dockerfile: crates/sinomo-benchmarks/minestudio/docker/Dockerfile
     image: sinomo/minestudio-benchmark:local
+    cpus: "${SINOMO_MINESTUDIO_CPUS:-8.0}"
+    mem_limit: "${SINOMO_MINESTUDIO_MEM_LIMIT:-8g}"
+    memswap_limit: "${SINOMO_MINESTUDIO_MEMSWAP_LIMIT:-8g}"
+    pids_limit: "${SINOMO_MINESTUDIO_PIDS_LIMIT:-512}"
     shm_size: "2gb"
     ipc: host
     ports:
@@ -15,6 +19,7 @@ services:
       MINESTUDIO_OBS_HEIGHT: "${MINESTUDIO_OBS_HEIGHT:-128}"
       MINESTUDIO_RENDER_WIDTH: "${MINESTUDIO_RENDER_WIDTH:-640}"
       MINESTUDIO_RENDER_HEIGHT: "${MINESTUDIO_RENDER_HEIGHT:-360}"
+      JAVA_TOOL_OPTIONS: "${JAVA_TOOL_OPTIONS:--Xmx6g}"
       HF_HOME: /cache/huggingface
     volumes:
       - ../../../../benchmark-results:/workspace/benchmark-results

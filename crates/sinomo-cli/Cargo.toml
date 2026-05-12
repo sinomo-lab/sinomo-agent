@@ -13,12 +13,15 @@ ring = "application"
 
 [dependencies]
 base64 = "0.22"
+candle-core = "0.10.2"
 ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-lm = { path = "../sinomo-lm" }
+sinomo-models = { path = "../sinomo-models" }
 sinomo-pytorch = { path = "../sinomo-pytorch" }
 time.workspace = true
 sinomo-runtime = { path = "../sinomo-runtime" }
+tokenizers = "0.22.2"

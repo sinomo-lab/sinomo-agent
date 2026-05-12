@@ -6,7 +6,8 @@ use super::{
     DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
     DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions,
     InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, ModelBackedInteractionHandler, ModelsCliCommand, ProviderCliCommand,
+    InteractionSurfaceKind, MainAgentInteractionHandler, ModelBackedInteractionHandler,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
     ProviderCommandOptions, ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
     SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
     apply_cluster_raft_role, authenticate_daemon_control_request,
@@ -29,18 +30,19 @@ use super::{
     managed_source_status, models_default_with_data_dir, normalize_model_provider,
     parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
     parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_models_list_options, parse_propose_options, parse_provider_command,
-    parse_rollout_command, parse_slash_command, parse_uninstall_options, parse_usage_options,
-    push_unique_introducer, read_cluster_kv_snapshot, read_cluster_members_from_kv,
-    read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
-    refresh_daemon_node_status_in_kv, rollout_cluster_targets, rollout_endpoint_candidates,
-    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
-    rollout_target_endpoint_for_main_with_connectivity, run_cui_with_handler_io,
-    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
-    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
-    sign_daemon_rpc_request_from_data_dir, sort_rollout_endpoints_by_connectivity,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, uninstall_with_layout,
-    write_daemon_status, write_rollout_status,
+    parse_models_list_options, parse_models_runtime_command, parse_propose_options,
+    parse_provider_command, parse_rollout_command, parse_slash_command, parse_uninstall_options,
+    parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
+    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
+    read_cluster_state, refresh_daemon_node_status_in_kv, rollout_cluster_targets,
+    rollout_endpoint_candidates, rollout_target_endpoint_for_main,
+    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
+    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_cui_with_io_and_daemon_probe,
+    run_evolve_command, run_shadow_daemon_with_paths, send_cluster_join_registration_over_iroh,
+    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
+    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, uninstall_with_layout, write_daemon_status,
+    write_model_runtime_config_for_node, write_rollout_status,
 };
 use base64::Engine;
 use sinomo_evolution::EvolutionJobId;
@@ -5011,6 +5013,231 @@ fn interaction_runtime_records_message_input_as_events() {
 }
 
 #[test]
+fn main_agent_handler_routes_plain_input_through_agent_loop() {
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_main_agent_cli_test").expect("session"),
+        NodeId::from_legacy_named("node_main_agent_cli_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        MainAgentInteractionHandler::new(
+            MainAgentFixtureModel,
+            "fixture-provider",
+            "fixture-model",
+        ),
+        session,
+    );
+
+    let outputs = runtime
+        .ingest_user_input("what is the cluster doing?")
+        .expect("input");
+
+    assert_eq!(
+        outputs,
+        vec![super::InteractionOutput::Line(
+            "sinomo: cluster-aware reply".to_string()
+        )]
+    );
+    let events = runtime.store().replay(ReplayQuery::all()).expect("replay");
+    assert_eq!(events.len(), 4);
+    assert_eq!(
+        events[2].event.kind.as_str(),
+        "interaction.main_agent.requested"
+    );
+    assert_eq!(
+        events[3].event.kind.as_str(),
+        "interaction.main_agent.responded"
+    );
+}
+
+#[test]
+fn main_agent_handler_streams_visible_thinking_chunks() {
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_main_agent_streaming_test").expect("session"),
+        NodeId::from_legacy_named("node_main_agent_streaming_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        MainAgentInteractionHandler::new(
+            StreamingMainAgentFixtureModel,
+            "fixture-provider",
+            "fixture-model",
+        ),
+        session,
+    );
+    let mut streamed = Vec::new();
+
+    let outputs = runtime
+        .ingest_user_input_streaming("what is the cluster doing?", &mut |output| {
+            streamed.push(output);
+        })
+        .expect("input");
+
+    assert_eq!(
+        streamed,
+        vec![
+            super::InteractionOutput::Chunk("thinking> ".to_string()),
+            super::InteractionOutput::Chunk("checking quorum".to_string()),
+            super::InteractionOutput::Chunk(" and rollout state\n".to_string()),
+        ]
+    );
+    assert_eq!(
+        outputs,
+        vec![super::InteractionOutput::Line(
+            "sinomo: streamed reply".to_string()
+        )]
+    );
+}
+
+#[test]
+fn thinking_stream_display_reports_progress_and_prompt_seeded_thinking() {
+    let mut display = super::ThinkingStreamDisplay::new(true);
+    assert_eq!(
+        display.push("<sinomo_progress>loading native MiniCPM-V 4.6</sinomo_progress>"),
+        vec!["model> loading native MiniCPM-V 4.6\n".to_string()]
+    );
+    assert_eq!(
+        display.push("first thought"),
+        vec!["thinking> ".to_string(), "first thought".to_string(),]
+    );
+    assert_eq!(
+        display.push(" and then done</think>{\"text\":\"hello\"}"),
+        vec![" and then done".to_string()]
+    );
+}
+
+#[test]
+fn main_agent_handler_toggles_thinking_with_slash_command() {
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_thinking_cli_test").expect("session"),
+        NodeId::from_legacy_named("node_thinking_cli_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        MainAgentInteractionHandler::new(
+            MainAgentFixtureModel,
+            "fixture-provider",
+            "fixture-model",
+        ),
+        session,
+    );
+
+    assert_eq!(
+        runtime
+            .ingest_user_input("/thinking status")
+            .expect("status"),
+        vec![super::InteractionOutput::Line("thinking is on".to_string())]
+    );
+    assert_eq!(
+        runtime.ingest_user_input("/thinking off").expect("off"),
+        vec![super::InteractionOutput::Line(
+            "thinking is off".to_string()
+        )]
+    );
+    assert_eq!(
+        runtime.ingest_user_input("/thinking on").expect("on"),
+        vec![super::InteractionOutput::Line("thinking is on".to_string())]
+    );
+}
+
+#[test]
+fn minicpm_main_agent_prompt_uses_official_chat_template_shape() {
+    let request = LanguageModelRequest {
+        provider: "sinomo-models".to_string(),
+        model: "openbmb/MiniCPM-V-4_6".to_string(),
+        messages: vec![
+            sinomo_lm::LanguageModelMessage {
+                role: sinomo_lm::LanguageModelRole::System,
+                content: "You are Sinomo.".to_string(),
+            },
+            sinomo_lm::LanguageModelMessage {
+                role: sinomo_lm::LanguageModelRole::User,
+                content: serde_json::json!({
+                    "session": {"node_id": "node_test"},
+                    "latest_event": {"payload": {"text": "hello"}},
+                    "context": {"events": [{
+                        "event": {
+                            "kind": "interaction.cluster.context",
+                            "payload": {
+                                "daemon": {
+                                    "address": "127.0.0.1:21353",
+                                    "cluster": {"cluster_id": "cluster_test"}
+                                }
+                            }
+                        }
+                    }]},
+                    "tool_specs": [{"name": "cluster_status", "description": "Summarize cluster health."}]
+                })
+                .to_string(),
+            },
+        ],
+        temperature: None,
+        max_output_tokens: None,
+        response_format: sinomo_lm::LanguageModelResponseFormat::JsonObject,
+        metadata: serde_json::json!({"loop": "main-agent"}),
+    };
+
+    let prompt = super::minicpm_main_agent_prompt(&request, false).expect("prompt");
+
+    assert!(prompt.contains("<|im_start|>system\n# Tools"));
+    assert!(prompt.contains("<tools>"));
+    assert!(prompt.contains("<|im_start|>user\nNode: node_test"));
+    assert!(prompt.contains("Cluster: cluster cluster_test through daemon 127.0.0.1:21353"));
+    assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+
+    let prompt = super::minicpm_main_agent_prompt(&request, true).expect("prompt");
+    assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+}
+
+#[test]
+fn minicpm_response_trimming_removes_thinking_and_prompt_continuations() {
+    assert_eq!(
+        super::trim_generated_chat_turn("<think>\nprivate\n</think>\n\nHello.\nUser: next"),
+        "Hello."
+    );
+    assert_eq!(
+        super::trim_generated_chat_turn("Hello.<|im_end|>\n<|im_start|>user\nnext"),
+        "Hello."
+    );
+    assert_eq!(
+        super::trim_generated_chat_turn("<think>\nprivate unfinished reasoning"),
+        ""
+    );
+}
+
+#[test]
+fn minicpm_tool_call_response_maps_to_agent_decision_json() {
+    let json = super::minicpm_tool_call_to_agent_decision_json(
+        "Checking cluster.\n<tool_call>\n<function=cluster_status>\n<parameter=scope>\nlocal\n</parameter>\n</function>\n</tool_call>",
+    )
+    .expect("tool call json");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+
+    assert_eq!(value["response_mode"], "defer");
+    assert_eq!(value["text"], "Checking cluster.");
+    assert_eq!(value["tool_calls"][0]["tool"], "cluster_status");
+    assert_eq!(value["tool_calls"][0]["input"]["scope"], "local");
+}
+
+#[test]
+fn cui_entry_reports_daemon_requirement_before_loading_chat_model() {
+    let mut output = Vec::new();
+    let error = run_cui_with_io_and_daemon_probe(&mut Cursor::new("/quit\n"), &mut output, None)
+        .expect_err("daemon required");
+
+    match error {
+        CliError::DaemonNotRunning { detail } => {
+            assert!(detail.contains("main-agent chat requires the local daemon"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert!(output.is_empty());
+}
+
+#[test]
 fn cui_loop_starts_and_exits_from_quit_command() {
     let mut output = Vec::new();
 
@@ -5022,7 +5249,7 @@ fn cui_loop_starts_and_exits_from_quit_command() {
     .expect("cui");
 
     let output = String::from_utf8(output).expect("utf8");
-    assert!(output.contains("Sinomo CUI"));
+    assert!(output.contains("Sinomo main agent"));
     assert!(output.contains("ending session"));
 }
 
@@ -5088,6 +5315,85 @@ fn fixture_handler(
 #[derive(Clone, Debug)]
 struct FixtureInteractionModel {
     response: &'static str,
+}
+
+struct MainAgentFixtureModel;
+
+impl InteractionModel for MainAgentFixtureModel {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        assert_eq!(request.provider, "fixture-provider");
+        assert_eq!(request.model, "fixture-model");
+        assert_eq!(
+            request.response_format,
+            sinomo_lm::LanguageModelResponseFormat::JsonObject
+        );
+        assert!(
+            request.messages[0]
+                .content
+                .contains("user-facing main agent")
+        );
+        assert!(
+            request.messages[1]
+                .content
+                .contains("what is the cluster doing?")
+        );
+        Ok(LanguageModelResponse {
+            provider: request.provider.clone(),
+            model: request.model.clone(),
+            content: serde_json::json!({
+                "response_mode": "answer",
+                "text": "cluster-aware reply",
+                "tool_calls": [],
+                "maid_handoff": null,
+                "next_state": "listening"
+            })
+            .to_string(),
+            usage: None,
+        })
+    }
+}
+
+struct StreamingMainAgentFixtureModel;
+
+impl InteractionModel for StreamingMainAgentFixtureModel {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        Ok(main_agent_fixture_response(request, "streamed reply"))
+    }
+
+    fn complete_streaming(
+        &self,
+        request: &LanguageModelRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        on_delta("checking quorum");
+        on_delta(" and rollout state\n</think>\n");
+        Ok(main_agent_fixture_response(request, "streamed reply"))
+    }
+}
+
+fn main_agent_fixture_response(
+    request: &LanguageModelRequest,
+    text: &str,
+) -> LanguageModelResponse {
+    LanguageModelResponse {
+        provider: request.provider.clone(),
+        model: request.model.clone(),
+        content: serde_json::json!({
+            "response_mode": "answer",
+            "text": text,
+            "tool_calls": [],
+            "maid_handoff": null,
+            "next_state": "listening"
+        })
+        .to_string(),
+        usage: None,
+    }
 }
 
 impl InteractionModel for FixtureInteractionModel {
@@ -5248,6 +5554,98 @@ fn models_default_writes_cluster_model_config_to_kv_for_clustered_node() {
     assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
 
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn models_runtime_writes_cluster_runtime_config_to_kv_for_clustered_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-model-runtime-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("lm_runtime").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("lm_runtime_node").expect("node")),
+            name: "lm runtime".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+
+    let config = sinomo_lm::ModelRuntimeConfig {
+        native_models_cache_dir: Some("/cluster/models".to_string()),
+        minicpm_v46: sinomo_lm::MiniCpmV46RuntimeConfig {
+            model_dir: Some("/cluster/models/minicpm-v46".to_string()),
+            max_input_tokens: Some(32_768),
+            max_output_tokens: Some(4096),
+        },
+        pytorch_bridge: sinomo_lm::PytorchBridgeRuntimeConfig {
+            endpoint: Some("https://runtime.example.invalid/api".to_string()),
+            python: Some("/cluster/bin/python".to_string()),
+            device: Some("cuda".to_string()),
+            timeout_seconds: Some(60),
+            mock: Some(false),
+        },
+    };
+    write_model_runtime_config_for_node(&data_dir, &config).expect("write runtime config");
+
+    assert!(!root.join("config").join("models-runtime.json").exists());
+    let store = sinomo_runtime::kv::InProcessKvStore::restore(
+        sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
+    );
+    let entry = store
+        .get(sinomo_lm::LM_RUNTIME_CONFIG_KV_KEY)
+        .expect("lm runtime kv entry");
+    let saved: sinomo_lm::ModelRuntimeConfig = entry.decode().expect("runtime config");
+    assert_eq!(saved, config);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn models_runtime_parser_accepts_cluster_runtime_settings() {
+    let command = parse_models_runtime_command(&[
+        "set".to_string(),
+        "--native-models-cache-dir".to_string(),
+        "/cluster/models".to_string(),
+        "--minicpm-v46-model-dir".to_string(),
+        "/cluster/models/minicpm-v46".to_string(),
+        "--minicpm-v46-max-input-tokens".to_string(),
+        "32768".to_string(),
+        "--minicpm-v46-max-output-tokens".to_string(),
+        "4096".to_string(),
+        "--pytorch-endpoint".to_string(),
+        "https://runtime.example.invalid/api".to_string(),
+        "--pytorch-python".to_string(),
+        "/cluster/bin/python".to_string(),
+        "--pytorch-device".to_string(),
+        "cuda".to_string(),
+        "--pytorch-timeout-seconds".to_string(),
+        "60".to_string(),
+        "--pytorch-mock".to_string(),
+        "false".to_string(),
+    ])
+    .expect("runtime command");
+
+    assert_eq!(
+        command,
+        ModelRuntimeCliCommand::Set(ModelRuntimeSetOptions {
+            native_models_cache_dir: Some("/cluster/models".to_string()),
+            minicpm_v46_model_dir: Some("/cluster/models/minicpm-v46".to_string()),
+            minicpm_v46_max_input_tokens: Some(32_768),
+            minicpm_v46_max_output_tokens: Some(4096),
+            pytorch_endpoint: Some("https://runtime.example.invalid/api".to_string()),
+            pytorch_python: Some("/cluster/bin/python".to_string()),
+            pytorch_device: Some("cuda".to_string()),
+            pytorch_timeout_seconds: Some(60),
+            pytorch_mock: Some(false),
+        })
+    );
 }
 
 #[test]

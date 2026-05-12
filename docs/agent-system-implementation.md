@@ -16,15 +16,16 @@ The checked-in bridge supports:
 - vision requests with an image path or base64 image payload;
 - audio and duplex request modes in the stable schema;
 - a probe mode for dependency diagnostics;
-- `SINOMO_PYTORCH_MOCK=1` for CI and benchmark harness smoke tests without
-  downloading the 9B model.
+- a mock mode for CI and benchmark harness smoke tests without downloading the
+  9B model.
 
 MiniCPM-o remains the first configured backend (`--provider minicpm-o`), but
 the bridge is intentionally named around the implementation boundary: any local
 PyTorch/Transformers model that can satisfy the request schema can be hosted
-behind `sinomo-pytorch-bridge` or `sinomo-pytorch-server`. The old
-`SINOMO_MINICPM_*` environment variables are still accepted as compatibility
-fallbacks; new code should prefer `SINOMO_PYTORCH_*`.
+behind `sinomo-pytorch-bridge` or `sinomo-pytorch-server`. Product runtime
+configuration is cluster-scoped and stored in cluster KV at
+`/config/lm/runtime`; use `sinomo models runtime set` instead of environment
+variables for model paths, bridge endpoints, device choices, and token budgets.
 
 The local model path follows the MiniCPM-o 4.5 PyTorch reference path. Current
 upstream docs recommend a Linux NVIDIA GPU with more than 28 GB VRAM for the
@@ -43,8 +44,8 @@ Local probe status from this implementation pass:
 
 - an isolated Python 3.11 venv at `/tmp/sinomo-pytorch-venv` can import
   `torch`, `transformers`, `PIL`, and `accelerate`;
-- `SINOMO_PYTORCH_PYTHON=/tmp/sinomo-pytorch-venv/bin/python
-  sinomo-pytorch-bridge` reports MiniCPM dependencies are importable;
+- `sinomo-pytorch-bridge --python /tmp/sinomo-pytorch-venv/bin/python` reports
+  MiniCPM dependencies are importable;
 - `torch.cuda.is_available()` is false on the local host, so the full 9B
   PyTorch model was not loaded here.
 - a Windows node with an RTX 3090 was able to load `openbmb/MiniCPM-o-4_5`
@@ -59,7 +60,8 @@ run the local MCP forwarding proxy and point benchmark tools at it:
 SINOMO_WINDOWS_MCP_URL=http://<windows-host>:39999/mcp \
 SINOMO_WINDOWS_MCP_SESSION=<mcp-session-id> \
 python3 crates/sinomo-benchmarks/pytorch_mcp_proxy.py --bind 127.0.0.1 --port 32154
-SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32154 sinomo agent run \
+sinomo models runtime set --pytorch-endpoint http://127.0.0.1:32154
+sinomo agent run \
   --provider minicpm-o \
   --model openbmb/MiniCPM-o-4_5 \
   --prompt "Return a short acknowledgement."
@@ -123,9 +125,10 @@ MineStudio is represented through a vision-path smoke:
 - synthetic request-path smoke:
   `crates/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py`.
 
-The smoke script uses `SINOMO_PYTORCH_MOCK=1` by default so it validates the
-vision request path without requiring the full MiniCPM-o model. Set
-`SINOMO_PYTORCH_ENDPOINT` to run it against a live remote PyTorch model server.
+The smoke script has a local mock mode so it validates the vision request path
+without requiring the full MiniCPM-o model. Benchmark harnesses may still accept
+environment variables because they are local experiment launchers, but Sinomo
+runtime commands should read model runtime settings from cluster KV.
 The Docker runtime in
 `crates/sinomo-benchmarks/minestudio/docker/compose.yml` builds a headless
 Xvfb/Mesa/OpenJDK 8 MineStudio container with an HTTP wrapper for
@@ -145,8 +148,9 @@ MCU-turbo is represented through a MineStudio-compatible task-config runner:
 
 - clone the benchmark configs from `https://github.com/CraftJarvis/MCU` into
   `/tmp/mcu` or set `MCU_ROOT`;
-- run `crates/sinomo-benchmarks/mcu/sinomo_mcu_runner.py` with
-  `SINOMO_PYTORCH_ENDPOINT` pointing at the PyTorch model server or proxy;
+- configure the product runtime with
+  `sinomo models runtime set --pytorch-endpoint <server-or-proxy-url>`, then
+  run `crates/sinomo-benchmarks/mcu/sinomo_mcu_runner.py`;
 - results are written under the gitignored `benchmark-results/` folder as
   per-task JSON, `summary.json`, and `case_studies.md`.
 
@@ -205,11 +209,12 @@ Live smoke status from this implementation pass:
   completed successfully;
 - `docker run python:3.10 ... pip install minestudio && import minestudio`
   completed successfully;
-- `PATH=target/debug:$PATH SINOMO_PYTORCH_MOCK=1 python3
+- `PATH=target/debug:$PATH python3
   crates/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py` completed
   and returned a MiniCPM vision-mode response from the mock bridge;
-- `SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32154 sinomo agent run
-  --provider minicpm-o ...` completed through the Windows RTX 3090 server;
+- `sinomo models runtime set --pytorch-endpoint http://127.0.0.1:32154`
+  followed by `sinomo agent run --provider minicpm-o ...` completed through
+  the Windows RTX 3090 server;
 - `docker run --rm --network host ... python
   /tmp/sinomo_minestudio_smoke.py` completed through the same live MiniCPM
   endpoint and reported about 7.5 estimated output tokens/sec for the short

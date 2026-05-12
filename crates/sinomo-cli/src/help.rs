@@ -27,21 +27,11 @@ pub fn print_usage() {
     println!("Environment:");
     println!("  SINOMO_DATA_DIR             Defaults to ~/.sinomo");
     println!("  SINOMO_CODEX_CREDENTIALS_FILE  Overrides Sinomo's Codex credentials file");
-    println!("  SINOMO_CODEX_AUTH_ISSUER       Overrides the Codex ChatGPT auth issuer");
-    println!("  SINOMO_CODEX_CLIENT_ID         Overrides the Codex ChatGPT OAuth client ID");
-    println!("  SINOMO_CODEX_API_BASE_URL      Overrides the Codex ChatGPT backend API base URL");
     println!("  ANTHROPIC_API_KEY           Used by `providers auth/test anthropic`");
     println!("  OPENAI_API_KEY              Used by `providers auth/test openai`");
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
     println!("  NVIDIA_API_KEY              Used by `providers auth/test nvidia`");
-    println!("  SINOMO_NVIDIA_API_BASE_URL  Overrides the NVIDIA API base URL");
-    println!(
-        "  SINOMO_COPILOT_CLIENT_ID    Defaults to {}",
-        GitHubCopilotConfig::default().client_id
-    );
-    println!(
-        "                               GitHub App client IDs are not accepted by Copilot token exchange"
-    );
+    println!("  Cluster runtime settings live in KV; see `sinomo models runtime`.");
 }
 
 pub(super) fn print_cluster_help() {
@@ -196,6 +186,12 @@ pub(super) fn print_models_help() {
     println!("      List available or known models.");
     println!("  sinomo models default --provider <provider> --model <model>");
     println!("      Set the default model for CUI and model-backed commands.");
+    println!("  sinomo models runtime [show]");
+    println!("      Show cluster-scoped native model runtime settings.");
+    println!(
+        "  sinomo models runtime set [--native-models-cache-dir <path>] [--minicpm-v46-model-dir <path>] [--minicpm-v46-max-input-tokens <n>] [--minicpm-v46-max-output-tokens <n>] [--pytorch-endpoint <url>] [--pytorch-python <path>] [--pytorch-device auto|cpu|cuda] [--pytorch-timeout-seconds <n>] [--pytorch-mock true|false]"
+    );
+    println!("      Update cluster-scoped native model runtime settings.");
     println!();
     println!("Providers:");
     for provider in default_model_provider_ids() {
