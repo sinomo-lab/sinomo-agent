@@ -1,13 +1,17 @@
 use super::*;
+#[cfg(feature = "native-models")]
 use candle_core::{DType, Device, Tensor};
+#[cfg(feature = "native-models")]
 use sinomo_models::minicpm_v46::{
     DEFAULT_MODEL_ID as MINICPM_V46_DEFAULT_MODEL_ID, MiniCpmV46Config,
     MiniCpmV46ForConditionalGeneration, Qwen3_5TextCache,
 };
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "native-models")]
 use tokenizers::Tokenizer;
 
 const RUST_MINICPM_V46_PROVIDER_ID: &str = "sinomo-models";
+#[cfg(feature = "native-models")]
 const DEFAULT_RUST_MINICPM_V46_CACHE_SUBDIR: &str = "openbmb--MiniCPM-V-4_6";
 
 pub fn run_cui() -> Result<(), CliError> {
@@ -209,6 +213,7 @@ pub struct ModelBackedInteractionHandler<M> {
 pub type CliInteractionHandler = ModelBackedInteractionHandler<CliConversationModel>;
 
 pub(crate) enum DefaultMainAgentChatModel {
+    #[cfg(feature = "native-models")]
     RustMiniCpmV46(RustMiniCpmV46ChatModel),
     Configured(ConfiguredInteractionModel),
 }
@@ -228,11 +233,25 @@ impl DefaultMainAgentChatModel {
                 runtime_config,
             });
         }
-        Self::RustMiniCpmV46(RustMiniCpmV46ChatModel::from_runtime_config(
-            data_dir,
-            runtime_config,
-            thinking,
-        ))
+        #[cfg(feature = "native-models")]
+        {
+            Self::RustMiniCpmV46(RustMiniCpmV46ChatModel::from_runtime_config(
+                data_dir,
+                runtime_config,
+                thinking,
+            ))
+        }
+        #[cfg(not(feature = "native-models"))]
+        {
+            let _ = thinking;
+            Self::Configured(ConfiguredInteractionModel {
+                data_dir: data_dir.clone(),
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: MINICPM_DEFAULT_MODEL.to_string(),
+                account: None,
+                runtime_config,
+            })
+        }
     }
 }
 
@@ -242,6 +261,7 @@ impl InteractionModel for DefaultMainAgentChatModel {
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         match self {
+            #[cfg(feature = "native-models")]
             Self::RustMiniCpmV46(model) => model.complete(request),
             Self::Configured(model) => model.complete(request),
         }
@@ -253,6 +273,7 @@ impl InteractionModel for DefaultMainAgentChatModel {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         match self {
+            #[cfg(feature = "native-models")]
             Self::RustMiniCpmV46(model) => model.complete_streaming(request, on_delta),
             Self::Configured(model) => {
                 on_delta("<sinomo_progress>waiting for configured model runtime</sinomo_progress>");
@@ -386,9 +407,20 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
         Ok(Self::with_thinking(
             model,
             RUST_MINICPM_V46_PROVIDER_ID,
-            MINICPM_V46_DEFAULT_MODEL_ID,
+            default_main_agent_chat_model_id(),
             thinking,
         ))
+    }
+}
+
+fn default_main_agent_chat_model_id() -> &'static str {
+    #[cfg(feature = "native-models")]
+    {
+        MINICPM_V46_DEFAULT_MODEL_ID
+    }
+    #[cfg(not(feature = "native-models"))]
+    {
+        MINICPM_DEFAULT_MODEL
     }
 }
 
@@ -691,6 +723,7 @@ impl<M: InteractionModel> InteractionEventHandler for ModelBackedInteractionHand
     }
 }
 
+#[cfg(feature = "native-models")]
 pub struct RustMiniCpmV46ChatModel {
     model_dir: PathBuf,
     max_input_tokens_override: Option<usize>,
@@ -700,6 +733,7 @@ pub struct RustMiniCpmV46ChatModel {
     loaded: Mutex<Option<LoadedRustMiniCpmV46>>,
 }
 
+#[cfg(feature = "native-models")]
 struct LoadedRustMiniCpmV46 {
     model: MiniCpmV46ForConditionalGeneration,
     tokenizer: Tokenizer,
@@ -707,6 +741,7 @@ struct LoadedRustMiniCpmV46 {
     max_position_embeddings: usize,
 }
 
+#[cfg(feature = "native-models")]
 impl RustMiniCpmV46ChatModel {
     pub fn from_runtime_config(
         data_dir: &SinomoDataDir,
@@ -829,6 +864,7 @@ impl RustMiniCpmV46ChatModel {
     }
 }
 
+#[cfg(feature = "native-models")]
 fn configured_rust_minicpm_v46_dir(
     data_dir: &SinomoDataDir,
     runtime_config: &ModelRuntimeConfig,
@@ -1166,6 +1202,7 @@ pub(crate) fn minicpm_tool_call_to_agent_decision_json(content: &str) -> Option<
     .ok()
 }
 
+#[cfg(feature = "native-models")]
 impl InteractionModel for RustMiniCpmV46ChatModel {
     fn complete(
         &self,
@@ -1187,6 +1224,7 @@ impl InteractionModel for RustMiniCpmV46ChatModel {
     }
 }
 
+#[cfg(feature = "native-models")]
 fn load_rust_minicpm_v46(model_dir: &Path) -> Result<LoadedRustMiniCpmV46, LanguageModelError> {
     let config_path = model_dir.join("config.json");
     let safetensors_path = model_dir.join("model.safetensors");
@@ -1240,6 +1278,7 @@ fn load_rust_minicpm_v46(model_dir: &Path) -> Result<LoadedRustMiniCpmV46, Langu
     })
 }
 
+#[cfg(feature = "native-models")]
 fn generate_greedy_tokens(
     loaded: &LoadedRustMiniCpmV46,
     input_ids: &[u32],
@@ -1290,6 +1329,7 @@ fn generate_greedy_tokens(
     Ok(generated)
 }
 
+#[cfg(feature = "native-models")]
 fn next_token_id(logits: &Tensor) -> Result<u32, LanguageModelError> {
     let values = logits.to_vec3::<f32>().map_err(minicpm_inference_error)?;
     let last = values
@@ -1313,6 +1353,7 @@ fn next_token_id(logits: &Tensor) -> Result<u32, LanguageModelError> {
     Ok(index as u32)
 }
 
+#[cfg(feature = "native-models")]
 fn minicpm_load_error(error: impl std::fmt::Display) -> LanguageModelError {
     LanguageModelError::ProviderInvocationFailed {
         provider: RUST_MINICPM_V46_PROVIDER_ID.to_string(),
@@ -1321,6 +1362,7 @@ fn minicpm_load_error(error: impl std::fmt::Display) -> LanguageModelError {
     }
 }
 
+#[cfg(feature = "native-models")]
 fn minicpm_inference_error(error: impl std::fmt::Display) -> LanguageModelError {
     LanguageModelError::ProviderInvocationFailed {
         provider: RUST_MINICPM_V46_PROVIDER_ID.to_string(),

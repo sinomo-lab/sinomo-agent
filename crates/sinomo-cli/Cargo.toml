@@ -11,17 +11,21 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "application"
 
+[features]
+default = []
+native-models = ["dep:candle-core", "dep:sinomo-models", "dep:tokenizers"]
+
 [dependencies]
 base64 = "0.22"
-candle-core = "0.10.2"
+candle-core = { version = "0.10.2", optional = true }
 ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-lm = { path = "../sinomo-lm" }
-sinomo-models = { path = "../sinomo-models" }
+sinomo-models = { path = "../sinomo-models", optional = true }
 sinomo-pytorch = { path = "../sinomo-pytorch" }
 time.workspace = true
 sinomo-runtime = { path = "../sinomo-runtime" }
-tokenizers = "0.22.2"
+tokenizers = { version = "0.22.2", optional = true }
