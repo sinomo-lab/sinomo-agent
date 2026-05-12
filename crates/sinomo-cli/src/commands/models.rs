@@ -494,7 +494,7 @@ pub(crate) fn models_runtime(command: ModelRuntimeCliCommand) -> Result<(), CliE
                     .unwrap_or_default()
             );
             println!(
-                "  pytorch endpoint: {}",
+                "  pytorch loopback endpoint: {}",
                 config.pytorch_bridge.endpoint.as_deref().unwrap_or("")
             );
             println!(
@@ -539,6 +539,17 @@ pub(crate) fn models_runtime(command: ModelRuntimeCliCommand) -> Result<(), CliE
             }
             if let Some(value) = options.pytorch_endpoint {
                 config.pytorch_bridge.endpoint = non_empty_option(value);
+                if let Some(endpoint) = config.pytorch_bridge.endpoint.as_deref()
+                    && !is_loopback_http_endpoint(endpoint).map_err(|source| CliError::Parse {
+                        detail: source.to_string(),
+                    })?
+                {
+                    return Err(CliError::Parse {
+                        detail: format!(
+                            "pytorch endpoint `{endpoint}` is not loopback; cluster model traffic must go through sinomo-network"
+                        ),
+                    });
+                }
             }
             if let Some(value) = options.pytorch_python {
                 config.pytorch_bridge.python = non_empty_option(value);

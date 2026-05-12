@@ -231,6 +231,7 @@ impl DefaultMainAgentChatModel {
                 model: MINICPM_DEFAULT_MODEL.to_string(),
                 account: None,
                 runtime_config,
+                managed_pytorch: std::sync::Mutex::new(None),
             });
         }
         #[cfg(feature = "native-models")]
@@ -250,6 +251,7 @@ impl DefaultMainAgentChatModel {
                 model: MINICPM_DEFAULT_MODEL.to_string(),
                 account: None,
                 runtime_config,
+                managed_pytorch: std::sync::Mutex::new(None),
             })
         }
     }

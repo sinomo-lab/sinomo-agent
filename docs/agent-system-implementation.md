@@ -25,7 +25,7 @@ PyTorch/Transformers model that can satisfy the request schema can be hosted
 behind `sinomo-pytorch-bridge` or `sinomo-pytorch-server`. Product runtime
 configuration is cluster-scoped and stored in cluster KV at
 `/config/lm/runtime`; use `sinomo models runtime set` instead of environment
-variables for model paths, bridge endpoints, device choices, and token budgets.
+variables for model paths, device choices, and token budgets.
 
 The local model path follows the MiniCPM-o 4.5 PyTorch reference path. Current
 upstream docs recommend a Linux NVIDIA GPU with more than 28 GB VRAM for the
@@ -49,27 +49,24 @@ Local probe status from this implementation pass:
 - `torch.cuda.is_available()` is false on the local host, so the full 9B
   PyTorch model was not loaded here.
 - a Windows node with an RTX 3090 was able to load `openbmb/MiniCPM-o-4_5`
-  through the long-running `sinomo-pytorch-server` with CUDA after pinning
+  through the long-running managed PyTorch server with CUDA after pinning
   `transformers==4.53.3`; text and vision smoke requests completed through
-  the remote HTTP runtime.
+  the local loopback runtime.
 
-When the Windows firewall blocks direct inbound traffic to the MiniCPM server,
-run the local MCP forwarding proxy and point benchmark tools at it:
+The PyTorch HTTP server is a private implementation detail of the Sinomo node
+that spawned it. The Rust supervisor binds it to loopback only, adds a
+per-process bearer token, writes stdout and stderr logs under
+`.sinomo/logs/pytorch`, observes readiness through `/health`, and restarts it
+when the process exits or stops answering. It must not be exposed on a LAN or
+used as a cross-node model endpoint.
+
+Cluster model traffic must go through `sinomo-network`. A configured
+`pytorch_bridge.endpoint` is accepted only when it is a loopback endpoint for
+the same node. Clear older LAN endpoints with:
 
 ```sh
-SINOMO_WINDOWS_MCP_URL=http://<windows-host>:39999/mcp \
-SINOMO_WINDOWS_MCP_SESSION=<mcp-session-id> \
-python3 crates/sinomo-benchmarks/pytorch_mcp_proxy.py --bind 127.0.0.1 --port 32154
-sinomo models runtime set --pytorch-endpoint http://127.0.0.1:32154
-sinomo agent run \
-  --provider minicpm-o \
-  --model openbmb/MiniCPM-o-4_5 \
-  --prompt "Return a short acknowledgement."
+sinomo models runtime set --pytorch-endpoint ""
 ```
-
-The proxy forwards `/health` and `/complete` through the Windows MCP
-PowerShell channel to the MiniCPM server's Windows-local endpoint. This keeps
-Docker benchmarks on the Linux host independent of Windows firewall state.
 
 ## Main Agent Loop
 

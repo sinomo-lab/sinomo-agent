@@ -25,13 +25,26 @@ from pytorch_bridge import (
 class PytorchModelHandler(BaseHTTPRequestHandler):
     server: "PytorchModelHttpServer"
 
+    def check_auth(self) -> bool:
+        if not self.server.auth_token:
+            return True
+        expected = f"Bearer {self.server.auth_token}"
+        if self.headers.get("Authorization") == expected:
+            return True
+        self.send_error(403, "forbidden")
+        return False
+
     def do_GET(self) -> None:
+        if not self.check_auth():
+            return
         if self.path != "/health":
             self.send_error(404, "not found")
             return
         self.write_json(self.server.status())
 
     def do_POST(self) -> None:
+        if not self.check_auth():
+            return
         if self.path == "/release":
             self.server.release_model()
             self.write_json(self.server.status())
@@ -149,11 +162,13 @@ class PytorchModelHttpServer(ThreadingHTTPServer):
         device: str,
         mode: str,
         mock: bool,
+        auth_token: str | None,
     ) -> None:
         self.model_id = model_id
         self.device = device
         self.mode = mode
         self.mock = mock
+        self.auth_token = auth_token
         self.model_lock = threading.RLock()
         if mock:
             self.model = None
@@ -211,10 +226,16 @@ def main() -> int:
     parser.add_argument("--model", default=os.environ.get("SINOMO_PYTORCH_MODEL", os.environ.get("SINOMO_MINICPM_MODEL", "openbmb/MiniCPM-o-4_5")))
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=os.environ.get("SINOMO_PYTORCH_DEVICE", os.environ.get("SINOMO_MINICPM_DEVICE", "auto")))
     parser.add_argument("--mode", choices=["text", "vision", "audio", "duplex"], default=os.environ.get("SINOMO_PYTORCH_SERVER_MODE", os.environ.get("SINOMO_MINICPM_SERVER_MODE", "vision")))
+    parser.add_argument("--auth-token", default=None)
+    parser.add_argument("--auth-token-file", default=None)
     parser.add_argument("--mock", action="store_true", default=os.environ.get("SINOMO_PYTORCH_MOCK", os.environ.get("SINOMO_MINICPM_MOCK")) == "1")
     args = parser.parse_args()
+    auth_token = args.auth_token
+    if args.auth_token_file:
+        with open(args.auth_token_file, "r", encoding="utf-8") as token_file:
+            auth_token = token_file.read().strip()
 
-    server = PytorchModelHttpServer((args.bind, args.port), args.model, args.device, args.mode, args.mock)
+    server = PytorchModelHttpServer((args.bind, args.port), args.model, args.device, args.mode, args.mock, auth_token)
     print(
         json.dumps(
             {

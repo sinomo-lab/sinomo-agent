@@ -48,8 +48,9 @@ use sinomo_lm::{
     test_provider_account_credentials, test_provider_credentials, write_default_model_config,
 };
 use sinomo_pytorch::{
-    MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, PythonPytorchRuntime, PytorchDevice,
-    PytorchRuntimeConfig, RemotePytorchRuntime, RemotePytorchRuntimeConfig,
+    MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, ManagedPytorchServer, ManagedPytorchServerConfig,
+    PytorchDevice, PytorchMode, RemotePytorchRuntime, RemotePytorchRuntimeConfig,
+    is_loopback_http_endpoint,
 };
 #[cfg(test)]
 use sinomo_runtime::core::EvolutionJobStatus;
@@ -203,6 +204,7 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -371,6 +373,7 @@ struct ConfiguredInteractionModel {
     model: String,
     account: Option<sinomo_lm::ProviderAccountConfig>,
     runtime_config: ModelRuntimeConfig,
+    managed_pytorch: Mutex<Option<ManagedPytorchServer>>,
 }
 
 impl InteractionModel for ConfiguredInteractionModel {
@@ -385,6 +388,7 @@ impl InteractionModel for ConfiguredInteractionModel {
                 self.model.clone()
             };
             if let Some(endpoint) = self.runtime_config.pytorch_bridge.endpoint.clone() {
+                ensure_local_pytorch_endpoint(&endpoint, &model)?;
                 let provider = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
                     endpoint,
                     timeout_seconds: self
@@ -392,6 +396,7 @@ impl InteractionModel for ConfiguredInteractionModel {
                         .pytorch_bridge
                         .timeout_seconds
                         .unwrap_or(300),
+                    auth_token: None,
                 });
                 return sinomo_lm::LanguageModelProvider::complete(
                     &provider,
@@ -402,36 +407,7 @@ impl InteractionModel for ConfiguredInteractionModel {
                     },
                 );
             }
-            let provider = PythonPytorchRuntime::new(PytorchRuntimeConfig {
-                python: self
-                    .runtime_config
-                    .pytorch_bridge
-                    .python
-                    .as_deref()
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| std::path::PathBuf::from("python3")),
-                model,
-                device: match self.runtime_config.pytorch_bridge.device.as_deref() {
-                    Some("cpu") => PytorchDevice::Cpu,
-                    Some("cuda") => PytorchDevice::Cuda,
-                    _ => PytorchDevice::Auto,
-                },
-                timeout_seconds: self
-                    .runtime_config
-                    .pytorch_bridge
-                    .timeout_seconds
-                    .unwrap_or(300),
-                mock: self.runtime_config.pytorch_bridge.mock.unwrap_or(false),
-                ..PytorchRuntimeConfig::default()
-            });
-            return sinomo_lm::LanguageModelProvider::complete(
-                &provider,
-                &LanguageModelRequest {
-                    provider: self.provider.clone(),
-                    model: self.model.clone(),
-                    ..request.clone()
-                },
-            );
+            return self.complete_with_managed_pytorch(request, &model);
         }
         complete_configured_model_request_with_account(
             &self.data_dir,
@@ -456,6 +432,7 @@ impl InteractionModel for ConfiguredInteractionModel {
             } else {
                 self.model.clone()
             };
+            ensure_local_pytorch_endpoint(&endpoint, &model)?;
             let provider = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
                 endpoint,
                 timeout_seconds: self
@@ -463,6 +440,7 @@ impl InteractionModel for ConfiguredInteractionModel {
                     .pytorch_bridge
                     .timeout_seconds
                     .unwrap_or(300),
+                auth_token: None,
             });
             let response = provider
                 .complete_streaming(
@@ -487,8 +465,130 @@ impl InteractionModel for ConfiguredInteractionModel {
                 usage: response.usage,
             });
         }
+        if self.provider == MINICPM_PROVIDER_ID {
+            let model = if self.model == sinomo_lm::PROVIDER_DEFAULT_MODEL {
+                MINICPM_DEFAULT_MODEL.to_string()
+            } else {
+                self.model.clone()
+            };
+            return self.complete_streaming_with_managed_pytorch(request, &model, on_delta);
+        }
         self.complete(request)
     }
+}
+
+impl ConfiguredInteractionModel {
+    fn complete_with_managed_pytorch(
+        &self,
+        request: &LanguageModelRequest,
+        model: &str,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let mut server = self.managed_pytorch.lock().map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: model.to_string(),
+                detail: format!("managed PyTorch runtime lock failed: {source}"),
+            }
+        })?;
+        let server = server.get_or_insert_with(|| self.managed_pytorch_server(model));
+        let response = server
+            .complete(sinomo_pytorch::PytorchRequest::from_language_model_request(
+                &LanguageModelRequest {
+                    provider: self.provider.clone(),
+                    model: model.to_string(),
+                    ..request.clone()
+                },
+            ))
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: model.to_string(),
+                detail: source.to_string(),
+            })?;
+        Ok(LanguageModelResponse {
+            provider: MINICPM_PROVIDER_ID.to_string(),
+            model: model.to_string(),
+            content: response.content,
+            usage: response.usage,
+        })
+    }
+
+    fn complete_streaming_with_managed_pytorch(
+        &self,
+        request: &LanguageModelRequest,
+        model: &str,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let mut server = self.managed_pytorch.lock().map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: model.to_string(),
+                detail: format!("managed PyTorch runtime lock failed: {source}"),
+            }
+        })?;
+        let server = server.get_or_insert_with(|| self.managed_pytorch_server(model));
+        let response = server
+            .complete_streaming(
+                sinomo_pytorch::PytorchRequest::from_language_model_request(
+                    &LanguageModelRequest {
+                        provider: self.provider.clone(),
+                        model: model.to_string(),
+                        ..request.clone()
+                    },
+                ),
+                on_delta,
+            )
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: model.to_string(),
+                detail: source.to_string(),
+            })?;
+        Ok(LanguageModelResponse {
+            provider: MINICPM_PROVIDER_ID.to_string(),
+            model: model.to_string(),
+            content: response.content,
+            usage: response.usage,
+        })
+    }
+
+    fn managed_pytorch_server(&self, model: &str) -> ManagedPytorchServer {
+        ManagedPytorchServer::new(ManagedPytorchServerConfig {
+            python: self
+                .runtime_config
+                .pytorch_bridge
+                .python
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("python3")),
+            model: model.to_string(),
+            device: match self.runtime_config.pytorch_bridge.device.as_deref() {
+                Some("cpu") => PytorchDevice::Cpu,
+                Some("cuda") => PytorchDevice::Cuda,
+                _ => PytorchDevice::Auto,
+            },
+            mode: PytorchMode::Vision,
+            timeout_seconds: self
+                .runtime_config
+                .pytorch_bridge
+                .timeout_seconds
+                .unwrap_or(300),
+            log_dir: self.data_dir.root().join("logs").join("pytorch"),
+            mock: self.runtime_config.pytorch_bridge.mock.unwrap_or(false),
+            ..ManagedPytorchServerConfig::default()
+        })
+    }
+}
+
+fn ensure_local_pytorch_endpoint(endpoint: &str, model: &str) -> Result<(), LanguageModelError> {
+    if is_loopback_http_endpoint(endpoint).unwrap_or(false) {
+        return Ok(());
+    }
+    Err(LanguageModelError::ProviderInvocationFailed {
+        provider: MINICPM_PROVIDER_ID.to_string(),
+        model: model.to_string(),
+        detail: format!(
+            "configured PyTorch endpoint `{endpoint}` is not local loopback; cluster model traffic must go through sinomo-network, not direct HTTP"
+        ),
+    })
 }
 
 pub(crate) fn run_agent_command(command: AgentCliCommand) -> Result<(), CliError> {
@@ -530,6 +630,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         model: model.clone(),
         account,
         runtime_config,
+        managed_pytorch: Mutex::new(None),
     };
     let decision = MainAgentLoop::new(loop_model, provider, model).decide(&input)?;
     if decision.text.trim().is_empty() {

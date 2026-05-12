@@ -9,17 +9,19 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo,
     LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 pub const MINICPM_PROVIDER_ID: &str = "minicpm-o";
 pub const MINICPM_DEFAULT_MODEL: &str = "openbmb/MiniCPM-o-4_5";
 pub const PYTORCH_DEFAULT_PROVIDER_ID: &str = MINICPM_PROVIDER_ID;
 pub const PYTORCH_DEFAULT_MODEL: &str = MINICPM_DEFAULT_MODEL;
+pub const PYTORCH_DEFAULT_LOCAL_SERVER_PORT: u16 = 32153;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PytorchRuntimeConfig {
@@ -130,6 +132,18 @@ pub enum PytorchMode {
     Audio,
     Duplex,
     Probe,
+}
+
+impl PytorchMode {
+    fn as_arg(&self) -> &'static str {
+        match self {
+            PytorchMode::Text => "text",
+            PytorchMode::Vision => "vision",
+            PytorchMode::Audio => "audio",
+            PytorchMode::Duplex => "duplex",
+            PytorchMode::Probe => "probe",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -270,6 +284,8 @@ impl LanguageModelProvider for PythonPytorchRuntime {
 pub struct RemotePytorchRuntimeConfig {
     pub endpoint: String,
     pub timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
 }
 
 impl Default for RemotePytorchRuntimeConfig {
@@ -277,6 +293,7 @@ impl Default for RemotePytorchRuntimeConfig {
         Self {
             endpoint: "http://127.0.0.1:32153".to_string(),
             timeout_seconds: 300,
+            auth_token: None,
         }
     }
 }
@@ -291,6 +308,10 @@ impl RemotePytorchRuntime {
         Self { config }
     }
 
+    pub fn endpoint(&self) -> &str {
+        &self.config.endpoint
+    }
+
     pub fn complete(&self, request: PytorchRequest) -> Result<PytorchResponse, PytorchBridgeError> {
         let body = serde_json::to_vec(&request)?;
         let response = http_post_json(
@@ -298,6 +319,7 @@ impl RemotePytorchRuntime {
             "/complete",
             &body,
             Duration::from_secs(self.config.timeout_seconds),
+            self.config.auth_token.as_deref(),
         )?;
         Ok(serde_json::from_slice(&response)?)
     }
@@ -314,6 +336,7 @@ impl RemotePytorchRuntime {
             "/complete",
             &body,
             Duration::from_secs(self.config.timeout_seconds),
+            self.config.auth_token.as_deref(),
             on_delta,
         )
     }
@@ -323,8 +346,279 @@ impl RemotePytorchRuntime {
             &self.config.endpoint,
             "/health",
             Duration::from_secs(self.config.timeout_seconds),
+            self.config.auth_token.as_deref(),
         )?;
         Ok(serde_json::from_slice(&response)?)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ManagedPytorchServerConfig {
+    pub python: PathBuf,
+    pub server_script: PathBuf,
+    pub model: String,
+    pub device: PytorchDevice,
+    pub mode: PytorchMode,
+    pub port: u16,
+    pub timeout_seconds: u64,
+    pub log_dir: PathBuf,
+    #[serde(default)]
+    pub mock: bool,
+}
+
+impl Default for ManagedPytorchServerConfig {
+    fn default() -> Self {
+        Self {
+            python: PathBuf::from("python3"),
+            server_script: default_server_script(),
+            model: PYTORCH_DEFAULT_MODEL.to_string(),
+            device: PytorchDevice::Auto,
+            mode: PytorchMode::Vision,
+            port: PYTORCH_DEFAULT_LOCAL_SERVER_PORT,
+            timeout_seconds: 300,
+            log_dir: PathBuf::from(".sinomo-pytorch-logs"),
+            mock: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ManagedPytorchServerStatus {
+    pub endpoint: String,
+    pub pid: Option<u32>,
+    pub ready: bool,
+    pub restart_count: u64,
+    pub stdout_log: PathBuf,
+    pub stderr_log: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ManagedPytorchServer {
+    config: ManagedPytorchServerConfig,
+    child: Option<Child>,
+    restart_count: u64,
+    last_error: Option<String>,
+    auth_token: String,
+}
+
+impl ManagedPytorchServer {
+    pub fn new(config: ManagedPytorchServerConfig) -> Self {
+        Self {
+            config,
+            child: None,
+            restart_count: 0,
+            last_error: None,
+            auth_token: generate_auth_token(),
+        }
+    }
+
+    pub fn endpoint(&self) -> String {
+        format!("http://127.0.0.1:{}", self.config.port)
+    }
+
+    pub fn status(&mut self) -> ManagedPytorchServerStatus {
+        let pid = self.child.as_ref().map(Child::id);
+        let ready = self.probe_loopback().is_ok();
+        ManagedPytorchServerStatus {
+            endpoint: self.endpoint(),
+            pid,
+            ready,
+            restart_count: self.restart_count,
+            stdout_log: self.stdout_log_path(),
+            stderr_log: self.stderr_log_path(),
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    pub fn complete(
+        &mut self,
+        request: PytorchRequest,
+    ) -> Result<PytorchResponse, PytorchBridgeError> {
+        self.ensure_ready()?;
+        let runtime = self.loopback_runtime();
+        match runtime.complete(request.clone()) {
+            Ok(response) => Ok(response),
+            Err(first) => {
+                self.last_error = Some(first.to_string());
+                self.restart()?;
+                self.loopback_runtime().complete(request)
+            }
+        }
+    }
+
+    pub fn complete_streaming(
+        &mut self,
+        request: PytorchRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<PytorchResponse, PytorchBridgeError> {
+        self.ensure_ready()?;
+        let runtime = self.loopback_runtime();
+        match runtime.complete_streaming(request.clone(), on_delta) {
+            Ok(response) => Ok(response),
+            Err(first) => {
+                self.last_error = Some(first.to_string());
+                on_delta(
+                    "<sinomo_progress>managed PyTorch runtime failed; restarting</sinomo_progress>",
+                );
+                self.restart()?;
+                self.loopback_runtime()
+                    .complete_streaming(request, on_delta)
+            }
+        }
+    }
+
+    pub fn release_model(&mut self) -> Result<(), PytorchBridgeError> {
+        if self.child_is_running() {
+            let _ = http_post_json(
+                &self.endpoint(),
+                "/release",
+                b"{}",
+                Duration::from_secs(10),
+                Some(&self.auth_token),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_file(self.auth_token_path());
+    }
+
+    fn restart(&mut self) -> Result<(), PytorchBridgeError> {
+        self.stop();
+        self.restart_count += 1;
+        self.spawn()?;
+        self.wait_until_ready(recommended_startup_budget())
+    }
+
+    fn ensure_ready(&mut self) -> Result<(), PytorchBridgeError> {
+        if self.child_is_running() && self.probe_loopback().is_ok() {
+            return Ok(());
+        }
+        self.restart()
+    }
+
+    fn child_is_running(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(status)) => {
+                    self.last_error = Some(format!("PyTorch server exited with status {status}"));
+                    self.child = None;
+                    false
+                }
+                Err(source) => {
+                    self.last_error = Some(format!("failed to observe PyTorch server: {source}"));
+                    self.child = None;
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    fn spawn(&mut self) -> Result<(), PytorchBridgeError> {
+        ensure_bridge_script(&self.config.server_script)?;
+        fs::create_dir_all(&self.config.log_dir).map_err(|source| PytorchBridgeError::Process {
+            detail: format!(
+                "failed to create PyTorch server log directory {}: {source}",
+                self.config.log_dir.display()
+            ),
+        })?;
+        let token_path = self.auth_token_path();
+        write_private_file(&token_path, self.auth_token.as_bytes())?;
+        let stdout = append_log_file(&self.stdout_log_path())?;
+        let stderr = append_log_file(&self.stderr_log_path())?;
+        let mut command = Command::new(&self.config.python);
+        command
+            .arg(&self.config.server_script)
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(self.config.port.to_string())
+            .arg("--model")
+            .arg(&self.config.model)
+            .arg("--device")
+            .arg(self.config.device.as_arg())
+            .arg("--mode")
+            .arg(self.config.mode.as_arg())
+            .arg("--auth-token-file")
+            .arg(&token_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        if self.config.mock {
+            command.arg("--mock");
+        }
+        self.child = Some(
+            command
+                .spawn()
+                .map_err(|source| PytorchBridgeError::Process {
+                    detail: format!("failed to start managed PyTorch server: {source}"),
+                })?,
+        );
+        self.last_error = None;
+        Ok(())
+    }
+
+    fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), PytorchBridgeError> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if !self.child_is_running() {
+                return Err(PytorchBridgeError::Process {
+                    detail: self.last_error.clone().unwrap_or_else(|| {
+                        "managed PyTorch server exited during startup".to_string()
+                    }),
+                });
+            }
+            if self.probe_loopback().is_ok() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Err(PytorchBridgeError::Process {
+            detail: format!(
+                "managed PyTorch server did not become ready after {} seconds; stderr log: {}",
+                timeout.as_secs(),
+                self.stderr_log_path().display()
+            ),
+        })
+    }
+
+    fn loopback_runtime(&self) -> RemotePytorchRuntime {
+        RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
+            endpoint: self.endpoint(),
+            timeout_seconds: self.config.timeout_seconds,
+            auth_token: Some(self.auth_token.clone()),
+        })
+    }
+
+    fn probe_loopback(&self) -> Result<PytorchRuntimeStatus, PytorchBridgeError> {
+        self.loopback_runtime().probe()
+    }
+
+    fn stdout_log_path(&self) -> PathBuf {
+        self.config.log_dir.join("pytorch-server.stdout.log")
+    }
+
+    fn stderr_log_path(&self) -> PathBuf {
+        self.config.log_dir.join("pytorch-server.stderr.log")
+    }
+
+    fn auth_token_path(&self) -> PathBuf {
+        self.config.log_dir.join("pytorch-server.token")
+    }
+}
+
+impl Drop for ManagedPytorchServer {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -396,6 +690,10 @@ pub fn default_bridge_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/pytorch_bridge.py")
 }
 
+pub fn default_server_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/pytorch_server.py")
+}
+
 pub fn ensure_bridge_script(path: &Path) -> Result<(), PytorchBridgeError> {
     if path.exists() {
         Ok(())
@@ -404,6 +702,82 @@ pub fn ensure_bridge_script(path: &Path) -> Result<(), PytorchBridgeError> {
             path: path.display().to_string(),
         })
     }
+}
+
+fn append_log_file(path: &Path) -> Result<File, PytorchBridgeError> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| PytorchBridgeError::Process {
+            detail: format!(
+                "failed to open PyTorch server log {}: {source}",
+                path.display()
+            ),
+        })
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), PytorchBridgeError> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| PytorchBridgeError::Process {
+            detail: format!("failed to open private file {}: {source}", path.display()),
+        })?;
+    file.write_all(contents)
+        .map_err(|source| PytorchBridgeError::Process {
+            detail: format!("failed to write private file {}: {source}", path.display()),
+        })
+}
+
+fn generate_auth_token() -> String {
+    let mut bytes = [0_u8; 32];
+    if getrandom::fill(&mut bytes).is_err() {
+        let fallback = format!(
+            "{}:{}:{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default(),
+            std::thread::current().id()
+        );
+        return blake3_like_hex(fallback.as_bytes());
+    }
+    hex_encode(&bytes)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn blake3_like_hex(bytes: &[u8]) -> String {
+    let mut state = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        state ^= u64::from(*byte);
+        state = state.wrapping_mul(0x100000001b3);
+    }
+    hex_encode(&state.to_le_bytes())
+}
+
+pub fn is_loopback_http_endpoint(endpoint: &str) -> Result<bool, PytorchBridgeError> {
+    let (host, _) = parse_http_endpoint(endpoint)?;
+    Ok(matches!(
+        host.as_str(),
+        "127.0.0.1" | "localhost" | "[::1]" | "::1"
+    ))
 }
 
 pub fn recommended_startup_budget() -> Duration {
@@ -422,11 +796,18 @@ fn read_line_until_deadline<R: BufRead>(
     line: &mut String,
     deadline: Instant,
     context: &str,
+    mut wait_progress: Option<(&mut Instant, &mut dyn FnMut(&str), &str)>,
 ) -> Result<usize, PytorchBridgeError> {
     loop {
         match reader.read_line(line) {
             Ok(read) => return Ok(read),
             Err(source) if retryable_read_error(&source) && Instant::now() < deadline => {
+                if let Some((last_progress, on_delta, message)) = wait_progress.as_mut()
+                    && last_progress.elapsed() >= Duration::from_secs(5)
+                {
+                    on_delta(message);
+                    **last_progress = Instant::now();
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(source) => {
@@ -443,6 +824,7 @@ fn read_to_end_until_deadline<R: Read>(
     body: &mut Vec<u8>,
     deadline: Instant,
     context: &str,
+    mut wait_progress: Option<(&mut Instant, &mut dyn FnMut(&str), &str)>,
 ) -> Result<(), PytorchBridgeError> {
     let mut buffer = [0_u8; 8192];
     loop {
@@ -450,6 +832,12 @@ fn read_to_end_until_deadline<R: Read>(
             Ok(0) => return Ok(()),
             Ok(read) => body.extend_from_slice(&buffer[..read]),
             Err(source) if retryable_read_error(&source) && Instant::now() < deadline => {
+                if let Some((last_progress, on_delta, message)) = wait_progress.as_mut()
+                    && last_progress.elapsed() >= Duration::from_secs(5)
+                {
+                    on_delta(message);
+                    **last_progress = Instant::now();
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(source) => {
@@ -466,12 +854,18 @@ fn http_post_json(
     path: &str,
     body: &[u8],
     timeout: Duration,
+    auth_token: Option<&str>,
 ) -> Result<Vec<u8>, PytorchBridgeError> {
-    http_request(endpoint, "POST", path, Some(body), timeout)
+    http_request(endpoint, "POST", path, Some(body), timeout, auth_token)
 }
 
-fn http_get(endpoint: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, PytorchBridgeError> {
-    http_request(endpoint, "GET", path, None, timeout)
+fn http_get(
+    endpoint: &str,
+    path: &str,
+    timeout: Duration,
+    auth_token: Option<&str>,
+) -> Result<Vec<u8>, PytorchBridgeError> {
+    http_request(endpoint, "GET", path, None, timeout, auth_token)
 }
 
 fn http_request(
@@ -480,6 +874,7 @@ fn http_request(
     path: &str,
     body: Option<&[u8]>,
     timeout: Duration,
+    auth_token: Option<&str>,
 ) -> Result<Vec<u8>, PytorchBridgeError> {
     let (host, port) = parse_http_endpoint(endpoint)?;
     let mut addrs =
@@ -499,8 +894,11 @@ fn http_request(
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     let body = body.unwrap_or(&[]);
+    let auth_header = auth_token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\n{auth_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream
@@ -523,6 +921,7 @@ fn http_post_json_event_stream(
     path: &str,
     body: &[u8],
     timeout: Duration,
+    auth_token: Option<&str>,
     on_delta: &mut dyn FnMut(&str),
 ) -> Result<PytorchResponse, PytorchBridgeError> {
     let deadline = Instant::now() + timeout;
@@ -543,8 +942,11 @@ fn http_post_json_event_stream(
     })?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
+    let auth_header = auth_token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\n{auth_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream
@@ -555,8 +957,19 @@ fn http_post_json_event_stream(
         })?;
 
     let mut reader = BufReader::new(stream);
+    let mut last_wait_progress = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or_else(Instant::now);
+    let wait_message =
+        "<sinomo_progress>waiting for configured model runtime response</sinomo_progress>";
     let mut status = String::new();
-    read_line_until_deadline(&mut reader, &mut status, deadline, "read response status")?;
+    read_line_until_deadline(
+        &mut reader,
+        &mut status,
+        deadline,
+        "read response status",
+        Some((&mut last_wait_progress, on_delta, wait_message)),
+    )?;
     if !status.contains(" 200 ") {
         return Err(PytorchBridgeError::Network {
             detail: status.trim().to_string(),
@@ -566,8 +979,13 @@ fn http_post_json_event_stream(
     let mut content_type = String::new();
     loop {
         line.clear();
-        let read =
-            read_line_until_deadline(&mut reader, &mut line, deadline, "read response headers")?;
+        let read = read_line_until_deadline(
+            &mut reader,
+            &mut line,
+            deadline,
+            "read response headers",
+            Some((&mut last_wait_progress, on_delta, wait_message)),
+        )?;
         if read == 0 || line == "\r\n" || line == "\n" {
             break;
         }
@@ -579,15 +997,26 @@ fn http_post_json_event_stream(
     }
     if !content_type.starts_with("text/event-stream") {
         let mut body = Vec::new();
-        read_to_end_until_deadline(&mut reader, &mut body, deadline, "read json response body")?;
+        read_to_end_until_deadline(
+            &mut reader,
+            &mut body,
+            deadline,
+            "read json response body",
+            Some((&mut last_wait_progress, on_delta, wait_message)),
+        )?;
         return Ok(serde_json::from_slice(&body)?);
     }
 
     let mut final_response = None;
     loop {
         line.clear();
-        let read =
-            read_line_until_deadline(&mut reader, &mut line, deadline, "read event stream")?;
+        let read = read_line_until_deadline(
+            &mut reader,
+            &mut line,
+            deadline,
+            "read event stream",
+            Some((&mut last_wait_progress, on_delta, wait_message)),
+        )?;
         if read == 0 {
             break;
         }
@@ -751,6 +1180,7 @@ mod tests {
         let runtime = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
             endpoint: format!("http://{addr}"),
             timeout_seconds: 5,
+            auth_token: None,
         });
         let response = runtime
             .complete(PytorchRequest {
@@ -781,7 +1211,8 @@ mod tests {
             let request = String::from_utf8_lossy(&buffer[..size]);
             assert!(request.starts_with("POST /complete HTTP/1.1"));
             assert!(request.contains("\"stream\":true") || request.contains("\"stream\": true"));
-            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).expect("headers");
             stream
                 .write_all(
@@ -816,6 +1247,7 @@ mod tests {
         let runtime = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
             endpoint: format!("http://{addr}"),
             timeout_seconds: 5,
+            auth_token: None,
         });
         let mut deltas = Vec::new();
         let response = runtime
@@ -840,5 +1272,98 @@ mod tests {
         );
         assert_eq!(response.content, "done");
         handle.join().expect("server");
+    }
+
+    #[test]
+    fn remote_runtime_includes_auth_header_when_configured() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let size = stream.read(&mut buffer).expect("read");
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(request.contains("Authorization: Bearer test-token\r\n"));
+            let body = serde_json::to_string(&PytorchRuntimeStatus {
+                model: MINICPM_DEFAULT_MODEL.to_string(),
+                device: PytorchDevice::Cpu,
+                backend: "pytorch-transformers".to_string(),
+                local: true,
+                streaming_supported: true,
+                vision_supported: true,
+                audio_supported: true,
+                tts_supported: true,
+                diagnostic: None,
+            })
+            .expect("json");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+        let runtime = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
+            endpoint: format!("http://{addr}"),
+            timeout_seconds: 5,
+            auth_token: Some("test-token".to_string()),
+        });
+        let status = runtime.probe().expect("probe");
+        assert_eq!(status.device, PytorchDevice::Cpu);
+        handle.join().expect("server");
+    }
+
+    #[test]
+    fn loopback_endpoint_detection_rejects_non_loopback_hosts() {
+        assert!(is_loopback_http_endpoint("http://127.0.0.1:1").expect("loopback"));
+        assert!(is_loopback_http_endpoint("http://localhost:1").expect("loopback"));
+        assert!(!is_loopback_http_endpoint("http://192.0.2.10:1").expect("non-loopback"));
+    }
+
+    #[test]
+    fn managed_mock_server_requires_supervisor_auth_token() {
+        let port = unused_loopback_port();
+        let log_dir = std::env::temp_dir().join(format!(
+            "sinomo-pytorch-test-{}-{}",
+            std::process::id(),
+            port
+        ));
+        let mut server = ManagedPytorchServer::new(ManagedPytorchServerConfig {
+            port,
+            log_dir: log_dir.clone(),
+            mock: true,
+            ..ManagedPytorchServerConfig::default()
+        });
+        let response = server
+            .complete(PytorchRequest {
+                mode: PytorchMode::Text,
+                system_prompt: String::new(),
+                messages: vec![LanguageModelMessage {
+                    role: LanguageModelRole::User,
+                    content: "hello".to_string(),
+                }],
+                image_path: None,
+                image_base64: None,
+                image_name: None,
+                audio_path: None,
+                stream: false,
+                metadata: serde_json::Value::Null,
+            })
+            .expect("managed mock response");
+        assert!(response.content.contains("hello"));
+        let unauthorized = http_get(
+            &format!("http://127.0.0.1:{port}"),
+            "/health",
+            Duration::from_secs(5),
+            None,
+        )
+        .expect_err("missing token is denied");
+        assert!(unauthorized.to_string().contains("403"));
+        server.stop();
+        let _ = std::fs::remove_dir_all(log_dir);
+    }
+
+    fn unused_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        listener.local_addr().expect("addr").port()
     }
 }
