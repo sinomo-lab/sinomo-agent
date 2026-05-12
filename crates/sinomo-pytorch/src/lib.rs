@@ -30,6 +30,18 @@ pub fn register_storage_paths(
     layout.register_escape_path(
         "sinomo-pytorch",
         StorageRing::R2,
+        "minicpm-v46-packages-main",
+        "legacy local Python dependency cache used by MiniCPM-V runtime experiments",
+    )?;
+    layout.register_escape_path(
+        "sinomo-pytorch",
+        StorageRing::R2,
+        "minicpm-v46-venv",
+        "legacy local Python virtual environment used by MiniCPM-V runtime experiments",
+    )?;
+    layout.register_escape_path(
+        "sinomo-pytorch",
+        StorageRing::R2,
         "pytorch_server",
         "legacy PyTorch server staging directory",
     )?;
