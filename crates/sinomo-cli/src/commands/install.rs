@@ -85,20 +85,29 @@ pub(crate) fn parse_port(label: &str, value: &str) -> Result<u16, CliError> {
     })
 }
 
-pub(crate) fn ensure_data_dir_storage_contracts(
+pub(crate) fn data_dir_storage_contract_findings(
     data_dir: impl AsRef<Path>,
-) -> Result<(), CliError> {
+) -> Result<Vec<ClusterDoctorFinding>, CliError> {
     let report = cli_data_dir_layout()?.verify_data_dir(data_dir)?;
     if report.is_complete() {
-        Ok(())
+        Ok(Vec::new())
     } else {
-        Err(
-            sinomo_runtime::storage::StorageContractError::UnregisteredPaths {
-                paths: report.unregistered,
-            }
-            .into(),
-        )
+        Ok(vec![ClusterDoctorFinding {
+            severity: "warning".to_string(),
+            code: "storage-unregistered-paths".to_string(),
+            detail: format!(
+                "local Sinomo data directory contains unregistered paths: {}",
+                report.unregistered.join(", ")
+            ),
+        }])
     }
+}
+
+pub(crate) fn warn_data_dir_storage_contracts(data_dir: impl AsRef<Path>) -> Result<(), CliError> {
+    for finding in data_dir_storage_contract_findings(data_dir)? {
+        eprintln!("warning: {}: {}", finding.code, finding.detail);
+    }
+    Ok(())
 }
 
 fn cli_data_dir_layout()
@@ -145,7 +154,7 @@ pub(crate) fn install_with_layout(
     activate_boot_entries(layout);
     #[cfg(not(test))]
     configure_user_bin_access(layout)?;
-    ensure_data_dir_storage_contracts(&layout.data_dir)?;
+    warn_data_dir_storage_contracts(&layout.data_dir)?;
     println!("installed binary: {}", layout.binary.display());
     println!(
         "installed shadow binary: {}",

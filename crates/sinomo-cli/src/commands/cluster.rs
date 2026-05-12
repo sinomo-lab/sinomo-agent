@@ -930,7 +930,10 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
     let state = read_cluster_state(&paths)?;
     let rows = cluster_health_rows(&paths, &state)?;
     let graph = daemon_read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
-    let findings = cluster_doctor_findings(&state, &graph, &rows);
+    let mut findings = cluster_doctor_findings(&state, &graph, &rows);
+    if let Some(data_dir) = paths.root.parent() {
+        findings.extend(data_dir_storage_contract_findings(data_dir)?);
+    }
     println!(
         "cluster doctor: {}",
         if findings.is_empty() {
