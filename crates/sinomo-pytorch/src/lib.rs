@@ -9,11 +9,11 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo,
     LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub const MINICPM_PROVIDER_ID: &str = "minicpm-o";
@@ -334,6 +334,8 @@ struct PytorchStreamEvent {
     delta: String,
     #[serde(default)]
     done: bool,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 impl LanguageModelProvider for RemotePytorchRuntime {
@@ -408,6 +410,57 @@ pub fn recommended_startup_budget() -> Duration {
     Duration::from_secs(300)
 }
 
+fn retryable_read_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+    )
+}
+
+fn read_line_until_deadline<R: BufRead>(
+    reader: &mut R,
+    line: &mut String,
+    deadline: Instant,
+    context: &str,
+) -> Result<usize, PytorchBridgeError> {
+    loop {
+        match reader.read_line(line) {
+            Ok(read) => return Ok(read),
+            Err(source) if retryable_read_error(&source) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(source) => {
+                return Err(PytorchBridgeError::Network {
+                    detail: format!("{context}: {source}"),
+                });
+            }
+        }
+    }
+}
+
+fn read_to_end_until_deadline<R: Read>(
+    reader: &mut R,
+    body: &mut Vec<u8>,
+    deadline: Instant,
+    context: &str,
+) -> Result<(), PytorchBridgeError> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => body.extend_from_slice(&buffer[..read]),
+            Err(source) if retryable_read_error(&source) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(source) => {
+                return Err(PytorchBridgeError::Network {
+                    detail: format!("{context}: {source}"),
+                });
+            }
+        }
+    }
+}
+
 fn http_post_json(
     endpoint: &str,
     path: &str,
@@ -472,6 +525,7 @@ fn http_post_json_event_stream(
     timeout: Duration,
     on_delta: &mut dyn FnMut(&str),
 ) -> Result<PytorchResponse, PytorchBridgeError> {
+    let deadline = Instant::now() + timeout;
     let (host, port) = parse_http_endpoint(endpoint)?;
     let mut addrs =
         (host.as_str(), port)
@@ -502,11 +556,7 @@ fn http_post_json_event_stream(
 
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
-    reader
-        .read_line(&mut status)
-        .map_err(|source| PytorchBridgeError::Network {
-            detail: format!("read response status: {source}"),
-        })?;
+    read_line_until_deadline(&mut reader, &mut status, deadline, "read response status")?;
     if !status.contains(" 200 ") {
         return Err(PytorchBridgeError::Network {
             detail: status.trim().to_string(),
@@ -516,11 +566,8 @@ fn http_post_json_event_stream(
     let mut content_type = String::new();
     loop {
         line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|source| PytorchBridgeError::Network {
-                detail: format!("read response headers: {source}"),
-            })?;
+        let read =
+            read_line_until_deadline(&mut reader, &mut line, deadline, "read response headers")?;
         if read == 0 || line == "\r\n" || line == "\n" {
             break;
         }
@@ -532,22 +579,15 @@ fn http_post_json_event_stream(
     }
     if !content_type.starts_with("text/event-stream") {
         let mut body = Vec::new();
-        reader
-            .read_to_end(&mut body)
-            .map_err(|source| PytorchBridgeError::Network {
-                detail: format!("read json response body: {source}"),
-            })?;
+        read_to_end_until_deadline(&mut reader, &mut body, deadline, "read json response body")?;
         return Ok(serde_json::from_slice(&body)?);
     }
 
     let mut final_response = None;
     loop {
         line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|source| PytorchBridgeError::Network {
-                detail: format!("read event stream: {source}"),
-            })?;
+        let read =
+            read_line_until_deadline(&mut reader, &mut line, deadline, "read event stream")?;
         if read == 0 {
             break;
         }
@@ -557,6 +597,9 @@ fn http_post_json_event_stream(
         let event: PytorchStreamEvent = serde_json::from_str(data)?;
         if !event.delta.is_empty() {
             on_delta(&event.delta);
+        }
+        if let Some(error) = event.error {
+            return Err(PytorchBridgeError::Process { detail: error });
         }
         if event.done {
             final_response = Some(serde_json::from_str::<PytorchResponse>(data)?);
@@ -724,6 +767,78 @@ mod tests {
             .expect("remote response");
         assert_eq!(response.content, "ok");
         assert_eq!(response.output_tokens_per_second, Some(100.0));
+        handle.join().expect("server");
+    }
+
+    #[test]
+    fn remote_runtime_streams_sse_deltas_before_final_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let size = stream.read(&mut buffer).expect("read");
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(request.starts_with("POST /complete HTTP/1.1"));
+            assert!(request.contains("\"stream\":true") || request.contains("\"stream\": true"));
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            stream.write_all(response.as_bytes()).expect("headers");
+            stream
+                .write_all(
+                    b"data: {\"delta\":\"<sinomo_progress>accepted</sinomo_progress>\",\"done\":false}\n\n",
+                )
+                .expect("delta");
+            let final_response = serde_json::to_string(&PytorchResponse {
+                content: "done".to_string(),
+                runtime: PytorchRuntimeStatus {
+                    model: MINICPM_DEFAULT_MODEL.to_string(),
+                    device: PytorchDevice::Cuda,
+                    backend: "pytorch-transformers".to_string(),
+                    local: false,
+                    streaming_supported: true,
+                    vision_supported: true,
+                    audio_supported: true,
+                    tts_supported: true,
+                    diagnostic: None,
+                },
+                usage: None,
+                elapsed_ms: Some(10),
+                output_tokens_per_second: Some(100.0),
+            })
+            .expect("json");
+            let mut final_value: serde_json::Value =
+                serde_json::from_str(&final_response).expect("json value");
+            final_value["done"] = serde_json::Value::Bool(true);
+            stream
+                .write_all(format!("data: {final_value}\n\n").as_bytes())
+                .expect("final");
+        });
+        let runtime = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
+            endpoint: format!("http://{addr}"),
+            timeout_seconds: 5,
+        });
+        let mut deltas = Vec::new();
+        let response = runtime
+            .complete_streaming(
+                PytorchRequest {
+                    mode: PytorchMode::Text,
+                    system_prompt: String::new(),
+                    messages: vec![],
+                    image_path: None,
+                    image_base64: None,
+                    image_name: None,
+                    audio_path: None,
+                    stream: false,
+                    metadata: serde_json::Value::Null,
+                },
+                &mut |delta| deltas.push(delta.to_string()),
+            )
+            .expect("remote streaming response");
+        assert_eq!(
+            deltas,
+            vec!["<sinomo_progress>accepted</sinomo_progress>".to_string()]
+        );
+        assert_eq!(response.content, "done");
         handle.join().expect("server");
     }
 }
