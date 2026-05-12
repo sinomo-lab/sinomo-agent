@@ -38,6 +38,7 @@ use sinomo_node::{load_or_create_main_node_identity, load_or_create_shadow_node_
 use sinomo_rollout::{SelfRolloutPaths, read_rollout_status};
 use std::collections::BTreeMap;
 use std::env;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -45,7 +46,7 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const DAEMON_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
-pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
+pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_millis(750);
@@ -62,6 +63,7 @@ pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 1;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CLUSTER_RAFT_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInfoRecord>>> =
     OnceLock::new();
 static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusRecord>>> =
@@ -71,6 +73,53 @@ static PUBLISHED_CONNECTIVITY: OnceLock<Mutex<BTreeMap<String, ClusterConnectivi
 
 fn publish_cache_key(paths: &ClusterPaths, node_id: &NodeId) -> String {
     format!("{}:{node_id}", paths.root.display())
+}
+
+fn lock_cluster_raft_operation() -> Result<std::sync::MutexGuard<'static, ()>, DaemonError> {
+    CLUSTER_RAFT_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|error| DaemonError::Parse {
+            detail: format!("cluster raft operation lock poisoned: {error}"),
+        })
+}
+
+fn cluster_raft_command_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let mut direct = Vec::new();
+    let mut iroh = Vec::new();
+    let mut other = Vec::new();
+    for endpoint in sinomo_network::cluster_sync_targets_with_connectivity(paths, state) {
+        match endpoint.transport {
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => direct.push(endpoint),
+            ClusterTransportKind::Iroh => iroh.push(endpoint),
+            _ => other.push(endpoint),
+        }
+    }
+    direct.sort_by_key(|endpoint| {
+        (
+            cluster_raft_direct_address_rank(endpoint),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+    direct.extend(iroh);
+    direct.extend(other);
+    direct
+}
+
+fn cluster_raft_direct_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
+        return 2;
+    };
+    match address.ip() {
+        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
+        IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
+        ip if ip.is_loopback() || ip.is_unspecified() => 3,
+        _ => 1,
+    }
 }
 
 fn cached_network_info_matches(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) -> bool {
@@ -405,6 +454,7 @@ pub fn handle_daemon_cluster_kv_txn_request(
     )?;
     let (snapshot, response) =
         commit_cluster_kv_txn_with_quorum_response(&cluster_paths, &mut state, txn)?;
+    sinomo_network::write_cluster_kv_snapshot_if_changed(&cluster_paths, &snapshot)?;
     Ok(response.unwrap_or(KvTxnResponse {
         succeeded: true,
         revision: snapshot.revision,
@@ -2201,9 +2251,7 @@ pub fn cluster_reachable_voter_count(paths: &ClusterPaths, state: &ClusterBootst
         }
     }
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in sinomo_network::prefer_bounded_daemon_command_targets(
-        sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
-    ) {
+    for endpoint in cluster_raft_command_targets(paths, state) {
         if !sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id) {
             continue;
         }
@@ -2233,11 +2281,14 @@ pub fn commit_cluster_raft_command_with_quorum(
     state: &mut ClusterBootstrapState,
     command: KvCommand,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError> {
-    let entry = sinomo_network::append_cluster_raft_command_uncommitted(
-        paths,
-        &state.local_node_id,
-        command,
-    )?;
+    let entry = {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        sinomo_network::append_cluster_raft_command_uncommitted(
+            paths,
+            &state.local_node_id,
+            command,
+        )?
+    };
     let mut voter_acks = std::collections::BTreeSet::new();
     if sinomo_network::cluster_raft_local_is_voter(state) {
         voter_acks.insert(state.local_node_id.clone());
@@ -2245,9 +2296,7 @@ pub fn commit_cluster_raft_command_with_quorum(
     let quorum_size = sinomo_network::cluster_raft_quorum_size(state);
     let mut failures = Vec::new();
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in sinomo_network::prefer_bounded_daemon_command_targets(
-        sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
-    ) {
+    for endpoint in cluster_raft_command_targets(paths, state) {
         if voter_acks.len() >= quorum_size {
             break;
         }
@@ -2300,8 +2349,10 @@ pub fn commit_cluster_raft_command_with_quorum(
         });
     }
 
-    let (snapshot, txn_response) =
-        sinomo_network::commit_cluster_raft_index(paths, &state.local_node_id, entry.index)?;
+    let (snapshot, txn_response) = {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        sinomo_network::commit_cluster_raft_index(paths, &state.local_node_id, entry.index)?
+    };
     fan_out_committed_cluster_raft_command(paths.clone(), state.clone(), snapshot.clone());
     Ok((snapshot, txn_response))
 }
@@ -2381,17 +2432,10 @@ pub fn commit_cluster_kv_txn_with_quorum_response(
             ),
         });
     }
-    if !cluster_has_local_quorum(paths, state) {
-        if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
-            return response;
-        }
-        return Err(DaemonError::ClusterReadOnly {
-            detail: format!(
-                "quorum unavailable ({} reachable voters, {} required)",
-                cluster_reachable_voter_count(paths, state),
-                sinomo_network::cluster_raft_quorum_size(state)
-            ),
-        });
+    if !sinomo_network::cluster_raft_local_is_leader(paths, state)?
+        && let Some(response) = forward_cluster_kv_txn_to_known_leader(paths, state, &txn)
+    {
+        return response;
     }
     if !sinomo_network::cluster_raft_local_is_leader(paths, state)?
         && !elect_cluster_raft_leader(paths, state)?
@@ -2406,17 +2450,83 @@ pub fn commit_cluster_kv_txn_with_quorum_response(
     commit_cluster_raft_command_with_quorum(paths, state, KvCommand::Txn(txn))
 }
 
+fn forward_cluster_kv_txn_to_known_leader(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    txn: &KvTxn,
+) -> Option<Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError>> {
+    let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state) else {
+        return None;
+    };
+    if leader_id == state.local_node_id || cluster_node_status_is_offline(paths, &leader_id) {
+        return None;
+    }
+    let targets = cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == leader_id)
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return None;
+    }
+    let mut failures = Vec::new();
+    let deadline =
+        Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
+    for endpoint in targets {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        match send_cluster_kv_txn(
+            &endpoint,
+            txn,
+            cluster_endpoint_command_timeout(&endpoint, remaining),
+        ) {
+            Ok(response) => {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    return Some(Err(DaemonError::Network {
+                        address: endpoint.address,
+                        detail: format!(
+                            "leader forwarded cluster KV transaction exhausted {}ms budget before snapshot refresh",
+                            (DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT
+                                + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT)
+                                .as_millis()
+                        ),
+                    }));
+                }
+                return Some(
+                    fetch_cluster_kv_snapshot_from_endpoint(
+                        &endpoint,
+                        cluster_endpoint_command_timeout(&endpoint, remaining),
+                    )
+                    .map(|snapshot| (snapshot, Some(response))),
+                );
+            }
+            Err(error) => failures.push(format!(
+                "{} ({:?}) failed: {}",
+                endpoint.address, endpoint.transport, error
+            )),
+        }
+    }
+    if !failures.is_empty() {
+        let _ = sinomo_network::clear_cluster_raft_leader(paths, &state.local_node_id);
+    }
+    None
+}
+
 fn forward_cluster_kv_txn_to_voter(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     txn: &KvTxn,
 ) -> Option<Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError>> {
-    let mut targets = sinomo_network::prefer_bounded_daemon_command_targets(
-        sinomo_network::cluster_sync_targets_with_connectivity(paths, state),
-    )
-    .into_iter()
-    .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
-    .collect::<Vec<_>>();
+    let mut targets = cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
+        .collect::<Vec<_>>();
     if targets.is_empty() {
         return None;
     }
@@ -2492,6 +2602,7 @@ pub fn elect_cluster_raft_leader(
         return Ok(false);
     }
     let (election_term, last_log_index, last_log_term) = {
+        let _raft_guard = lock_cluster_raft_operation()?;
         let node = sinomo_network::open_cluster_raft_kv_node(paths, &state.local_node_id)?;
         (
             node.hard_state().current_term.saturating_add(1),
@@ -2508,17 +2619,23 @@ pub fn elect_cluster_raft_leader(
             last_log_term,
         },
     };
-    let local_vote = sinomo_network::apply_cluster_raft_vote(
-        paths,
-        &state.local_node_id,
-        vote_request.vote.clone(),
-    )?;
+    let local_vote = {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        sinomo_network::apply_cluster_raft_vote(
+            paths,
+            &state.local_node_id,
+            vote_request.vote.clone(),
+        )?
+    };
     let mut granted = std::collections::BTreeSet::new();
     if local_vote.vote_granted {
         granted.insert(state.local_node_id.clone());
     }
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in sinomo_network::cluster_raft_vote_targets(paths, state) {
+    for endpoint in cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
+    {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -2539,7 +2656,10 @@ pub fn elect_cluster_raft_leader(
     if granted.len() < sinomo_network::cluster_raft_quorum_size(state) {
         return Ok(false);
     }
-    sinomo_network::set_cluster_raft_leader(paths, &state.local_node_id, election_term)?;
+    {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        sinomo_network::set_cluster_raft_leader(paths, &state.local_node_id, election_term)?;
+    }
     Ok(true)
 }
 
@@ -2563,9 +2683,12 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
     timeout: Duration,
 ) -> Result<ClusterRaftAppendResponse, DaemonError> {
     let deadline = Instant::now() + timeout;
-    let mut next_index = sinomo_network::open_cluster_raft_kv_node(paths, &state.local_node_id)?
-        .last_log_index()
-        .saturating_add(1);
+    let mut next_index = {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        sinomo_network::open_cluster_raft_kv_node(paths, &state.local_node_id)?
+            .last_log_index()
+            .saturating_add(1)
+    };
     let mut last_response = None;
     for _ in 0..CLUSTER_RAFT_APPEND_MAX_ATTEMPTS {
         let remaining = deadline
@@ -2574,9 +2697,12 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
         if remaining.is_zero() {
             break;
         }
-        let request = sinomo_network::build_cluster_raft_append_request_from_next_index(
-            paths, state, next_index,
-        )?;
+        let request = {
+            let _raft_guard = lock_cluster_raft_operation()?;
+            sinomo_network::build_cluster_raft_append_request_from_next_index(
+                paths, state, next_index,
+            )?
+        };
         let attempt_timeout = cluster_endpoint_command_timeout(endpoint, remaining);
         let response = send_cluster_raft_append(endpoint, &request, attempt_timeout)?;
         if response.accepted {
@@ -2624,6 +2750,7 @@ pub fn handle_daemon_cluster_raft_append_request(
 ) -> Result<ClusterRaftAppendResponse, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let mut state = sinomo_network::read_cluster_state(&cluster_paths)?;
+    let _raft_guard = lock_cluster_raft_operation()?;
     if request.state.cluster_id != state.cluster_id {
         let node = sinomo_network::open_cluster_raft_kv_node(&cluster_paths, &state.local_node_id)?;
         return Ok(ClusterRaftAppendResponse {
@@ -2702,6 +2829,7 @@ pub fn handle_daemon_cluster_raft_vote_request(
 ) -> Result<ClusterRaftVoteResponse, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let mut state = sinomo_network::read_cluster_state(&cluster_paths)?;
+    let _raft_guard = lock_cluster_raft_operation()?;
     let local_node_id = state.local_node_id.clone();
     if request.state.cluster_id != state.cluster_id {
         let node = sinomo_network::open_cluster_raft_kv_node(&cluster_paths, &local_node_id)?;

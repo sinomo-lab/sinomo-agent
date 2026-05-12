@@ -418,8 +418,7 @@ pub(crate) fn write_model_config_for_node(
         let paths = ClusterPaths::new(data_dir);
         paths.ensure()?;
         let txn = model_config_cluster_kv_txn(config).map_err(CliError::LanguageModel)?;
-        let daemon_paths = DaemonPaths::new(data_dir);
-        daemon_handle_daemon_cluster_kv_txn_request(&daemon_paths, txn)?;
+        commit_model_config_cluster_txn(data_dir, txn)?;
         return Ok(paths.kv_snapshot);
     }
     let paths = ModelPaths::new(data_dir);
@@ -458,9 +457,37 @@ pub(crate) fn write_model_runtime_config_for_node(
     let paths = ClusterPaths::new(data_dir);
     paths.ensure()?;
     let txn = model_runtime_config_cluster_kv_txn(config).map_err(CliError::LanguageModel)?;
+    commit_model_config_cluster_txn(data_dir, txn)?;
+    Ok(paths.kv_snapshot)
+}
+
+#[cfg(test)]
+fn commit_model_config_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
     let daemon_paths = DaemonPaths::new(data_dir);
     daemon_handle_daemon_cluster_kv_txn_request(&daemon_paths, txn)?;
-    Ok(paths.kv_snapshot)
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn commit_model_config_cluster_txn(_data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
+    let Some(status) = default_main_daemon_status()? else {
+        return Err(CliError::DaemonNotRunning {
+            detail: "clustered model config writes require the local daemon".to_string(),
+        });
+    };
+    let request = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_KV_TXN_ROUTE,
+        network::CLUSTER_KV_RPC_CATEGORY,
+        &txn,
+    )
+    .map_err(CliError::from)?;
+    let response = sinomo_runtime::daemon::send_daemon_rpc(
+        &status.address,
+        &request,
+        DAEMON_CLUSTER_KV_TXN_TIMEOUT,
+    )?;
+    let _: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
+    Ok(())
 }
 
 pub(crate) fn models_runtime(command: ModelRuntimeCliCommand) -> Result<(), CliError> {
