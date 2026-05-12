@@ -558,7 +558,7 @@ impl ConfiguredInteractionModel {
                 .python
                 .as_deref()
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("python3")),
+                .unwrap_or_else(|| default_managed_pytorch_python(&self.data_dir)),
             model: model.to_string(),
             device: match self.runtime_config.pytorch_bridge.device.as_deref() {
                 Some("cpu") => PytorchDevice::Cpu,
@@ -575,6 +575,26 @@ impl ConfiguredInteractionModel {
             mock: self.runtime_config.pytorch_bridge.mock.unwrap_or(false),
             ..ManagedPytorchServerConfig::default()
         })
+    }
+}
+
+fn default_managed_pytorch_python(data_dir: &SinomoDataDir) -> PathBuf {
+    let root = data_dir.root();
+    #[cfg(windows)]
+    {
+        let venv_python = root.join("minicpm-venv").join("Scripts").join("python.exe");
+        if venv_python.exists() {
+            return venv_python;
+        }
+        PathBuf::from("python.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        let venv_python = root.join("minicpm-venv").join("bin").join("python");
+        if venv_python.exists() {
+            return venv_python;
+        }
+        PathBuf::from("python3")
     }
 }
 
