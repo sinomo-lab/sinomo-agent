@@ -4488,6 +4488,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-lm",
+ "sinomo-storage",
  "thiserror 2.0.18",
 ]
 

@@ -4,6 +4,53 @@
 //! process lifecycle. The Python side owns model loading because local model
 //! families such as MiniCPM-o depend on PyTorch/Transformers runtime packages.
 
+pub fn register_storage_paths(
+    layout: &mut sinomo_storage::StorageLayout,
+) -> Result<(), sinomo_storage::StorageContractError> {
+    use sinomo_storage::StorageRing;
+
+    layout.register_escape_path(
+        "sinomo-pytorch",
+        StorageRing::R2,
+        "hf-cache",
+        "Hugging Face model cache used by local PyTorch runtimes",
+    )?;
+    layout.register_escape_path(
+        "sinomo-pytorch",
+        StorageRing::R2,
+        "minicpm-venv",
+        "local Python virtual environment for PyTorch model runtimes",
+    )?;
+    layout.register_escape_path(
+        "sinomo-pytorch",
+        StorageRing::R2,
+        "minicpm-v46-packages",
+        "local Python dependency cache used by model runtime experiments",
+    )?;
+    layout.register_escape_path(
+        "sinomo-pytorch",
+        StorageRing::R2,
+        "pytorch_server",
+        "legacy PyTorch server staging directory",
+    )?;
+    layout.register_escape_path(
+        "sinomo-pytorch",
+        StorageRing::R2,
+        "logs/pytorch",
+        "managed PyTorch runtime process logs and supervisor token file",
+    )?;
+    for relative_path in [
+        "minicpm-mock.err.log",
+        "minicpm-mock.log",
+        "minicpm-server.err.log",
+        "minicpm-server.log",
+        "minicpm-server.out.log",
+    ] {
+        layout.register_human_text("sinomo-pytorch", StorageRing::R2, relative_path)?;
+    }
+    Ok(())
+}
+
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo,

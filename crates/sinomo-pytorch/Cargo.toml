@@ -15,5 +15,6 @@ ring = "r2"
 getrandom = "0.3"
 serde.workspace = true
 serde_json.workspace = true
+sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true
 sinomo-lm = { path = "../sinomo-lm" }
