@@ -1,0 +1,12 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxWasiAbi {
+    Preview1,
+    Wasix,
+}
+
+pub fn default_sandbox_wasi_abi() -> SandboxWasiAbi {
+    SandboxWasiAbi::Preview1
+}

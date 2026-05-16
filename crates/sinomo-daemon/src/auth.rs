@@ -326,6 +326,9 @@ pub fn authorize_authenticated_daemon_command(
         command if command == daemon_rpc_command(sinomo_network::DFS_EXPOSE_CONFIG_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }
+        command if is_local_sandbox_rpc_command(command) => {
+            authenticated.signer.can_run_local_command()
+        }
         command if command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE) => {
             matches!(
                 authenticated.signer,
@@ -396,6 +399,31 @@ pub fn authorize_authenticated_daemon_command(
     } else {
         Err(DaemonError::AuthDenied)
     }
+}
+
+fn is_local_sandbox_rpc_command(command: &str) -> bool {
+    command == daemon_rpc_command(sinomo_network::SANDBOX_CREATE_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_STATUS_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_UPDATE_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_CHECKPOINT_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_RESUME_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_REBOOT_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_DESTROY_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_LIST_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_READ_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_WRITE_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_HTTP_FETCH_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_TOOLCHAIN_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_PROCESS_PLAN_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_IMPORT_BUSYBOX_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE)
+        || command
+            == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE)
+        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE)
 }
 
 fn verify_signed_daemon_command(

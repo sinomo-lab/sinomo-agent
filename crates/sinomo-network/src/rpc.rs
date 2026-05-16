@@ -15,6 +15,9 @@ pub type ObjectRpcFuture =
 
 type ObjectRouteHandler = Box<dyn Fn(ObjectRpcRequest) -> ObjectRpcFuture + Send + Sync + 'static>;
 
+pub const OBJECT_RPC_ERROR_METADATA_KEY: &str = "sinomo-error";
+pub const OBJECT_RPC_ERROR_DETAIL_METADATA_KEY: &str = "sinomo-error-detail";
+
 pub const DAEMON_RPC_CATEGORY: &str = "daemon";
 pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
@@ -35,6 +38,29 @@ pub const CLUSTER_JOIN_CHALLENGE_ROUTE: &str = "/cluster/join/challenge";
 pub const CLUSTER_JOIN_REGISTER_ROUTE: &str = "/cluster/join/register";
 pub const DFS_RPC_CATEGORY: &str = "dfs";
 pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
+pub const SANDBOX_RPC_CATEGORY: &str = "sandbox";
+pub const SANDBOX_CREATE_ROUTE: &str = "/sandbox/create";
+pub const SANDBOX_STATUS_ROUTE: &str = "/sandbox/status";
+pub const SANDBOX_UPDATE_ROUTE: &str = "/sandbox/update";
+pub const SANDBOX_CHECKPOINT_ROUTE: &str = "/sandbox/checkpoint";
+pub const SANDBOX_RESUME_ROUTE: &str = "/sandbox/resume";
+pub const SANDBOX_REBOOT_ROUTE: &str = "/sandbox/reboot";
+pub const SANDBOX_DESTROY_ROUTE: &str = "/sandbox/destroy";
+pub const SANDBOX_LIST_ROUTE: &str = "/sandbox/list";
+pub const SANDBOX_READ_ROUTE: &str = "/sandbox/read";
+pub const SANDBOX_WRITE_ROUTE: &str = "/sandbox/write";
+pub const SANDBOX_IMPORT_BUSYBOX_ROUTE: &str = "/sandbox/toolchain/import-busybox";
+pub const SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE: &str = "/sandbox/toolchain/import-package";
+pub const SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE: &str =
+    "/sandbox/toolchain/import-package-from-path";
+pub const SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE: &str = "/sandbox/toolchain/add-command";
+pub const SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE: &str = "/sandbox/toolchain/add-artifact";
+pub const SANDBOX_HTTP_FETCH_ROUTE: &str = "/sandbox/http/fetch";
+pub const SANDBOX_HTTP_FETCH_TO_FILE_ROUTE: &str = "/sandbox/http/fetch-to-file";
+pub const SANDBOX_RUN_TOOLCHAIN_ROUTE: &str = "/sandbox/run/toolchain";
+pub const SANDBOX_RUN_PROCESS_PLAN_ROUTE: &str = "/sandbox/run/process-plan";
+pub const SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE: &str = "/sandbox/run/toolchain/stream";
+pub const SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE: &str = "/sandbox/run/process-plan/stream";
 pub const ROLLOUT_RPC_CATEGORY: &str = "rollout";
 pub const ROLLOUT_DIAGNOSTICS_ROUTE: &str = "/rollout/diagnostics";
 pub const ROLLOUT_BINARY_ROUTE: &str = "/rollout/binary";
@@ -90,7 +116,50 @@ impl ObjectRpcResponse {
     }
 
     pub fn decode_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
+        self.error_detail()?;
         SinomoObjectCodec::default().decode(&self.body)
+    }
+
+    pub fn encode_error(
+        route: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Result<Self, NetworkError> {
+        let detail = detail.into();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            OBJECT_RPC_ERROR_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        metadata.insert(
+            OBJECT_RPC_ERROR_DETAIL_METADATA_KEY.to_string(),
+            detail.clone(),
+        );
+        Ok(Self {
+            route: route.into(),
+            metadata,
+            body: SinomoObjectCodec::default().encode(&detail)?,
+        })
+    }
+
+    pub fn error_detail(&self) -> Result<(), NetworkError> {
+        if self
+            .metadata
+            .get(OBJECT_RPC_ERROR_METADATA_KEY)
+            .is_some_and(|value| value == "true")
+        {
+            let detail = self
+                .metadata
+                .get(OBJECT_RPC_ERROR_DETAIL_METADATA_KEY)
+                .cloned()
+                .unwrap_or_else(|| "daemon returned an RPC error".to_string());
+            if let Some(detail) = detail.strip_prefix("cluster is read-only: ") {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: detail.to_string(),
+                });
+            }
+            return Err(NetworkError::Serialization { detail });
+        }
+        Ok(())
     }
 }
 

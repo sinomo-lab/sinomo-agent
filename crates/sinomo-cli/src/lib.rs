@@ -149,6 +149,27 @@ use sinomo_runtime::daemon::{
     handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
     handle_daemon_cluster_raft_vote_request,
     handle_daemon_rollout_build_request as daemon_handle_daemon_rollout_build_request,
+    handle_daemon_sandbox_checkpoint as daemon_handle_daemon_sandbox_checkpoint,
+    handle_daemon_sandbox_create as daemon_handle_daemon_sandbox_create,
+    handle_daemon_sandbox_destroy as daemon_handle_daemon_sandbox_destroy,
+    handle_daemon_sandbox_http_fetch as daemon_handle_daemon_sandbox_http_fetch,
+    handle_daemon_sandbox_http_fetch_to_file as daemon_handle_daemon_sandbox_http_fetch_to_file,
+    handle_daemon_sandbox_import_busybox as daemon_handle_daemon_sandbox_import_busybox,
+    handle_daemon_sandbox_list as daemon_handle_daemon_sandbox_list,
+    handle_daemon_sandbox_read as daemon_handle_daemon_sandbox_read,
+    handle_daemon_sandbox_reboot as daemon_handle_daemon_sandbox_reboot,
+    handle_daemon_sandbox_resume as daemon_handle_daemon_sandbox_resume,
+    handle_daemon_sandbox_run_process_plan as daemon_handle_daemon_sandbox_run_process_plan,
+    handle_daemon_sandbox_run_process_plan_stream as daemon_handle_daemon_sandbox_run_process_plan_stream,
+    handle_daemon_sandbox_run_toolchain as daemon_handle_daemon_sandbox_run_toolchain,
+    handle_daemon_sandbox_run_toolchain_stream as daemon_handle_daemon_sandbox_run_toolchain_stream,
+    handle_daemon_sandbox_status as daemon_handle_daemon_sandbox_status,
+    handle_daemon_sandbox_toolchain_add_artifact as daemon_handle_daemon_sandbox_toolchain_add_artifact,
+    handle_daemon_sandbox_toolchain_add_command as daemon_handle_daemon_sandbox_toolchain_add_command,
+    handle_daemon_sandbox_toolchain_import_package as daemon_handle_daemon_sandbox_toolchain_import_package,
+    handle_daemon_sandbox_update as daemon_handle_daemon_sandbox_update,
+    handle_daemon_sandbox_write as daemon_handle_daemon_sandbox_write,
+    open_daemon_sandbox_dfs_service as daemon_open_daemon_sandbox_dfs_service,
 };
 #[cfg(not(windows))]
 use sinomo_runtime::daemon::{
@@ -200,7 +221,7 @@ use sinomo_runtime::rollout::{
 };
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
@@ -239,6 +260,7 @@ pub(crate) enum CliCommand {
     Daemon(DaemonCliCommand),
     Rollout(RolloutCliCommand),
     Dfs(DfsCliCommand),
+    Sandbox(SandboxCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
     Agent(AgentCliCommand),
@@ -276,6 +298,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
             Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
         }
         Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
+        Some((command, rest)) if command == "sandbox" => {
+            Ok(CliCommand::Sandbox(parse_sandbox_command(rest)?))
+        }
         Some((command, rest)) if matches!(command.as_str(), "models" | "model") => {
             Ok(CliCommand::Models(parse_models_command(rest)?))
         }
@@ -702,6 +727,7 @@ fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
+        CliCommand::Sandbox(command) => run_sandbox_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
         CliCommand::Agent(command) => run_agent_command(command),

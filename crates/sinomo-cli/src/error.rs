@@ -21,6 +21,9 @@ pub enum CliError {
     ClusterReadOnly {
         detail: String,
     },
+    SandboxPolicyDenied {
+        detail: String,
+    },
     MissingArtifact {
         artifact: String,
     },
@@ -121,6 +124,117 @@ impl From<sinomo_runtime::storage::StorageContractError> for CliError {
             other => Self::Parse {
                 detail: other.to_string(),
             },
+        }
+    }
+}
+
+impl From<sinomo_runtime::sandbox::SandboxStoreError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxStoreError) -> Self {
+        match error {
+            sinomo_runtime::sandbox::SandboxStoreError::Io { path, detail }
+            | sinomo_runtime::sandbox::SandboxStoreError::Object { path, detail } => {
+                Self::Io { path, detail }
+            }
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<sinomo_runtime::sandbox::SandboxFsError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxFsError) -> Self {
+        match error {
+            sinomo_runtime::sandbox::SandboxFsError::Path(error) => Self::Parse {
+                detail: error.to_string(),
+            },
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<sinomo_runtime::sandbox::SandboxPathError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxPathError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_runtime::sandbox::SandboxWasiError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxWasiError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_runtime::sandbox::SandboxToolchainError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxToolchainError) -> Self {
+        match error {
+            sinomo_runtime::sandbox::SandboxToolchainError::Io { path, detail }
+            | sinomo_runtime::sandbox::SandboxToolchainError::Object { path, detail } => {
+                Self::Io { path, detail }
+            }
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<sinomo_runtime::sandbox::SandboxCommandExecutionError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxCommandExecutionError) -> Self {
+        match error {
+            sinomo_runtime::sandbox::SandboxCommandExecutionError::Store(error) => error.into(),
+            sinomo_runtime::sandbox::SandboxCommandExecutionError::Toolchain(error) => error.into(),
+            sinomo_runtime::sandbox::SandboxCommandExecutionError::Fs(error) => error.into(),
+            sinomo_runtime::sandbox::SandboxCommandExecutionError::Wasi(error) => error.into(),
+            sinomo_runtime::sandbox::SandboxCommandExecutionError::Scheduling(error) => {
+                Self::Parse {
+                    detail: error.to_string(),
+                }
+            }
+            sinomo_runtime::sandbox::SandboxCommandExecutionError::PolicyDenied(error) => {
+                Self::SandboxPolicyDenied {
+                    detail: error.to_string(),
+                }
+            }
+        }
+    }
+}
+
+impl From<sinomo_runtime::sandbox::SandboxRecordedHttpFetchError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxRecordedHttpFetchError) -> Self {
+        match error {
+            sinomo_runtime::sandbox::SandboxRecordedHttpFetchError::Network(error) => match error {
+                sinomo_runtime::sandbox::SandboxNetworkError::PolicyDenied(error) => {
+                    Self::SandboxPolicyDenied {
+                        detail: error.to_string(),
+                    }
+                }
+                other => Self::Network {
+                    address: "sandbox mediated http".to_string(),
+                    detail: other.to_string(),
+                },
+            },
+            sinomo_runtime::sandbox::SandboxRecordedHttpFetchError::Store(error) => error.into(),
+            sinomo_runtime::sandbox::SandboxRecordedHttpFetchError::Fs(error) => error.into(),
+            sinomo_runtime::sandbox::SandboxRecordedHttpFetchError::AuditPolicy(error) => {
+                Self::SandboxPolicyDenied {
+                    detail: error.to_string(),
+                }
+            }
+        }
+    }
+}
+
+impl From<sinomo_runtime::sandbox::SandboxPolicyConfigError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxPolicyConfigError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
         }
     }
 }
@@ -318,6 +432,9 @@ impl std::fmt::Display for CliError {
             ),
             Self::ClusterReadOnly { detail } => {
                 write!(formatter, "cluster KV is read-only: {detail}")
+            }
+            Self::SandboxPolicyDenied { detail } => {
+                write!(formatter, "sandbox policy denied command: {detail}")
             }
             Self::MissingArtifact { artifact } => {
                 write!(formatter, "{artifact} has not been written")

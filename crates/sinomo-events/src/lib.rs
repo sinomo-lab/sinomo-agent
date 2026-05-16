@@ -40,7 +40,8 @@ pub fn register_storage_paths(
         StorageRing::R1,
         "events/interactive/screenshots",
         "interactive environment screenshot artifacts",
-    )
+    )?;
+    layout.register_human_text("sinomo-events", StorageRing::R1, "events/event-log.jsonl")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -530,6 +531,10 @@ pub enum EventStoreError {
     Validation(#[from] EventValidationError),
     #[error("event id already exists: {event_id}")]
     DuplicateEventId { event_id: EventId },
+    #[error("event store io error at {path}: {detail}")]
+    Io { path: String, detail: String },
+    #[error("event store serialization error at {path}: {detail}")]
+    Serialization { path: String, detail: String },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -649,6 +654,130 @@ impl EventStore for InMemoryEventStore {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct JsonlEventStore {
+    validator: EventValidator,
+    path: PathBuf,
+}
+
+impl JsonlEventStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            validator: EventValidator,
+            path: path.into(),
+        }
+    }
+
+    pub fn with_validator(path: impl Into<PathBuf>, validator: EventValidator) -> Self {
+        Self {
+            validator,
+            path: path.into(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read_events(&self) -> Result<Vec<StoredEvent>, EventStoreError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = fs::File::open(&self.path).map_err(|source| EventStoreError::Io {
+            path: self.path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let reader = std::io::BufReader::new(file);
+        let mut events = Vec::new();
+        for line in std::io::BufRead::lines(reader) {
+            let line = line.map_err(|source| EventStoreError::Io {
+                path: self.path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let stored: StoredEvent =
+                serde_json::from_str(&line).map_err(|source| EventStoreError::Serialization {
+                    path: self.path.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+            events.push(stored);
+        }
+        Ok(events)
+    }
+}
+
+impl EventStore for JsonlEventStore {
+    fn append(&mut self, event: EventEnvelope) -> Result<AppendReceipt, EventStoreError> {
+        self.validator.validate(&event)?;
+        let events = self.read_events()?;
+        if events
+            .iter()
+            .any(|stored| stored.event.event_id == event.event_id)
+        {
+            return Err(EventStoreError::DuplicateEventId {
+                event_id: event.event_id,
+            });
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|source| EventStoreError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        let sequence =
+            EventSequence(events.last().map(|stored| stored.sequence.0).unwrap_or(0) + 1);
+        let appended_at = OffsetDateTime::now_utc();
+        let event_id = event.event_id.clone();
+        let stored = StoredEvent {
+            sequence,
+            appended_at,
+            event,
+        };
+        let line =
+            serde_json::to_string(&stored).map_err(|source| EventStoreError::Serialization {
+                path: self.path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|source| EventStoreError::Io {
+                path: self.path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        writeln!(file, "{line}").map_err(|source| EventStoreError::Io {
+            path: self.path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        Ok(AppendReceipt {
+            event_id,
+            sequence,
+            appended_at,
+        })
+    }
+
+    fn replay(&self, query: ReplayQuery) -> Result<Vec<StoredEvent>, EventStoreError> {
+        let mut events: Vec<StoredEvent> = self
+            .read_events()?
+            .into_iter()
+            .filter(|stored| InMemoryEventStore::matches_query(stored, &query))
+            .collect();
+
+        if query.direction == ReplayDirection::Reverse {
+            events.reverse();
+        }
+
+        if let Some(limit) = query.limit {
+            events.truncate(limit);
+        }
+
+        Ok(events)
+    }
+}
+
 pub fn kind_has_prefix(kind: &EventKind, prefix: &str) -> bool {
     kind.as_str().starts_with(prefix)
 }
@@ -724,6 +853,44 @@ mod tests {
         let error = store.append(event).expect_err("duplicate append");
 
         assert!(matches!(error, EventStoreError::DuplicateEventId { .. }));
+    }
+
+    #[test]
+    fn jsonl_event_store_persists_and_replays_events() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-events-jsonl-test-{}", EventId::generate()));
+        let path = root.join("events").join("event-log.jsonl");
+        let mut store = JsonlEventStore::new(&path);
+        let event = fixture_event("evt_jsonl", None, "sandbox.instance.created");
+
+        let receipt = store.append(event.clone()).expect("append");
+        assert_eq!(receipt.sequence, EventSequence(1));
+
+        let reopened = JsonlEventStore::new(&path);
+        let events = reopened
+            .replay(ReplayQuery::by_kind_prefix("sandbox.instance"))
+            .expect("replay");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, EventSequence(1));
+        assert_eq!(events[0].event.event_id, event.event_id);
+        assert_eq!(events[0].event.kind.as_str(), "sandbox.instance.created");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn jsonl_event_store_rejects_duplicate_event_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-events-jsonl-duplicate-test-{}",
+            EventId::generate()
+        ));
+        let path = root.join("events").join("event-log.jsonl");
+        let mut store = JsonlEventStore::new(&path);
+        let event = fixture_event("evt_jsonl_duplicate", None, "sandbox.instance.created");
+
+        store.append(event.clone()).expect("first append");
+        let error = store.append(event).expect_err("duplicate append");
+        assert!(matches!(error, EventStoreError::DuplicateEventId { .. }));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -911,5 +1078,6 @@ mod tests {
                 .owner_for("events/interactive/screenshots/shot.png")
                 .is_some()
         );
+        assert!(layout.owner_for("events/event-log.jsonl").is_some());
     }
 }

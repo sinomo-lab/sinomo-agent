@@ -52,6 +52,7 @@ pub mod r1 {
             sinomo_rollout::register_storage_paths(&mut layout)?;
             sinomo_node::register_storage_paths(&mut layout)?;
             sinomo_dfs::register_storage_paths(&mut layout)?;
+            sinomo_sandbox::register_storage_paths(&mut layout)?;
             sinomo_local::register_storage_paths(&mut layout)?;
             sinomo_events::register_storage_paths(&mut layout)?;
             Ok(layout)
@@ -113,6 +114,7 @@ mod tests {
             .verify_relative_paths([
                 "daemon/status.sobj",
                 "dfs/metadata/root/records/filesystems/root/object.sobj",
+                "sandbox/runtime/active.sobj",
                 "bin/sinomo",
                 "startup/sinomo-daemon.service",
             ])
@@ -124,5 +126,8 @@ mod tests {
                 .iter()
                 .any(|path| path.coverage == StorageCoverage::Escape)
         );
+        assert!(report.covered.iter().any(|path| {
+            path.relative_path == "sandbox/runtime/active.sobj" && path.module == "sinomo-sandbox"
+        }));
     }
 }

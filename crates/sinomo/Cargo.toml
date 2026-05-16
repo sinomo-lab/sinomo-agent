@@ -10,8 +10,8 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "application"
 [features]
-
+default = []
+wasix-runtime = ["sinomo-cli/wasix-runtime"]
 
 [dependencies]
 sinomo-cli = { path = "../sinomo-cli" }
-

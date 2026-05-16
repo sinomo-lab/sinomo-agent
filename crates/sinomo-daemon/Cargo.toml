@@ -15,15 +15,18 @@ ring = "r1"
 base64 = "0.22"
 fs2.workspace = true
 ring = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-rollout = { path = "../sinomo-rollout" }
+sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true
 time.workspace = true

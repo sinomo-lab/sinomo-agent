@@ -60,8 +60,12 @@ matches a registered file contract or falls under an explicit escape path.
 The runtime facade exposes the composed runtime layout as
 `sinomo_runtime::storage`, so application-layer commands can verify layouts
 without depending directly on lower-level crate internals. `sinomo install`
-uses this as an install gate: after writing installed binaries, managed source,
-and boot entries, it walks the data directory and fails if any file is not
-covered by the composed contract. Boot entries written under a test or local
-startup directory are covered by the `startup/` escape path because their exact
-format is owned by the local OS integration rather than a Sinomo Object schema.
+uses this as an install diagnostic: after writing installed binaries, managed
+source, and boot entries, it walks the data directory and warns if any file is
+not covered by the composed contract. Storage coverage problems are node health
+issues, not startup blockers. `sinomo cluster doctor` reports the same
+unregistered-path condition as a warning so operators can clean it up without
+preventing an otherwise usable node from running. Boot entries written under a
+test or local startup directory are covered by the `startup/` escape path
+because their exact format is owned by the local OS integration rather than a
+Sinomo Object schema.

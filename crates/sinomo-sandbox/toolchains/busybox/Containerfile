@@ -1,0 +1,26 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        file \
+        gcc \
+        libc6-dev \
+        make \
+        perl \
+        pkg-config \
+        python3 \
+        xz-utils \
+        bzip2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/sinomo-busybox-wasi
+
+COPY build-busybox-wasi.sh ./build-busybox-wasi.sh
+COPY busybox-wasi.fragment ./busybox-wasi.fragment
+COPY wasi-compat ./wasi-compat
+
+ENTRYPOINT ["./build-busybox-wasi.sh"]

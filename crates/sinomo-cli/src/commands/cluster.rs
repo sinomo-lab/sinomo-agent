@@ -1032,15 +1032,11 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     let mut state = read_cluster_state(&paths)?;
     let peer_snapshot = daemon_fetch_cluster_kv_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?;
     let peer_store = InProcessKvStore::restore(peer_snapshot);
-    let existing_nodes = state
-        .members
-        .iter()
-        .map(|member| member.node_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
     let mut imported = Vec::new();
+    let mut endpoint_updates = Vec::new();
     for entry in peer_store.range_prefix("/cluster/members/") {
         let mut member: ClusterMemberRecord = entry.decode()?;
-        if member.cluster_id != state.cluster_id || existing_nodes.contains(&member.node_id) {
+        if member.cluster_id != state.cluster_id {
             continue;
         }
         for endpoint_entry in
@@ -1055,6 +1051,28 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
                 member.endpoints.push(endpoint);
             }
         }
+        if let Some(existing) = state
+            .members
+            .iter_mut()
+            .find(|candidate| candidate.node_id == member.node_id)
+        {
+            let mut merged_endpoints = 0usize;
+            for endpoint in member.endpoints {
+                if !existing
+                    .endpoints
+                    .iter()
+                    .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+                {
+                    existing.endpoints.push(endpoint);
+                    merged_endpoints += 1;
+                }
+            }
+            if merged_endpoints > 0 {
+                existing.updated_at = OffsetDateTime::now_utc();
+                endpoint_updates.push((existing.node_id.clone(), merged_endpoints));
+            }
+            continue;
+        }
         if matches!(member.role, ClusterMemberRole::Voter)
             || matches!(member.state, ClusterMemberState::Voter)
         {
@@ -1064,11 +1082,14 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         member.updated_at = OffsetDateTime::now_utc();
         imported.push(member);
     }
-    if imported.is_empty() {
-        println!(
-            "cluster members already include peer records from {}",
-            options.from
-        );
+    let imported_changed = !imported.is_empty();
+    if !imported_changed {
+        if endpoint_updates.is_empty() {
+            println!(
+                "cluster members already include peer records from {}",
+                options.from
+            );
+        }
     } else {
         for member in &imported {
             println!(
@@ -1079,6 +1100,11 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
             );
         }
         state.members.extend(imported);
+    }
+    for (node_id, count) in &endpoint_updates {
+        println!("merged {count} cluster endpoint(s) for existing member {node_id}");
+    }
+    if !endpoint_updates.is_empty() || imported_changed {
         daemon_sync_cluster_state_to_kv(&paths, &state)?;
     }
 

@@ -1,0 +1,189 @@
+use crate::{SandboxMountMode, SandboxPath, SandboxWasiError, SandboxWasiPreopen};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[derive(Default)]
+pub(super) struct WasixReadOnlyPreopenGuard {
+    entries: Vec<WasixReadOnlyPreopenEntry>,
+}
+
+struct WasixReadOnlyPreopenEntry {
+    path: std::path::PathBuf,
+    permissions: fs::Permissions,
+    is_dir: bool,
+}
+
+impl WasixReadOnlyPreopenGuard {
+    pub(super) fn add_tree(&mut self, root: &Path) -> Result<(), std::io::Error> {
+        self.collect_tree(root)?;
+        for entry in &self.entries {
+            if !entry.is_dir {
+                continue;
+            }
+            let mut permissions = entry.permissions.clone();
+            set_permissions_read_only(&mut permissions);
+            fs::set_permissions(&entry.path, permissions)?;
+        }
+        Ok(())
+    }
+
+    fn collect_tree(&mut self, path: &Path) -> Result<(), std::io::Error> {
+        let metadata = collect_wasix_preopen_entry(path)?;
+        self.entries.push(WasixReadOnlyPreopenEntry {
+            path: path.to_path_buf(),
+            permissions: metadata.permissions(),
+            is_dir: metadata.is_dir(),
+        });
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                self.collect_tree(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WasixReadOnlyPreopenGuard {
+    fn drop(&mut self) {
+        for entry in self.entries.iter().rev() {
+            let _ = fs::set_permissions(&entry.path, entry.permissions.clone());
+        }
+    }
+}
+
+pub(super) fn validate_wasix_current_dir(
+    cwd: &SandboxPath,
+    preopened_dirs: &[SandboxWasiPreopen],
+) -> Result<(), SandboxWasiError> {
+    if preopened_dirs.is_empty() {
+        return Ok(());
+    }
+    let Some((preopen, host_path)) = wasix_host_path_for_guest(cwd, preopened_dirs) else {
+        return Err(SandboxWasiError::InvalidRequest {
+            detail: format!("WASIX cwd `{cwd}` is not mounted"),
+        });
+    };
+    let root = fs::canonicalize(&preopen.host_path).map_err(|error| SandboxWasiError::Runtime {
+        detail: format!("resolve WASIX cwd preopen {}: {error}", preopen.guest_path),
+    })?;
+    let target =
+        fs::canonicalize(&host_path).map_err(|error| SandboxWasiError::InvalidRequest {
+            detail: format!("WASIX cwd `{cwd}` is invalid: {error}"),
+        })?;
+    if !target.starts_with(&root) {
+        return Err(SandboxWasiError::InvalidRequest {
+            detail: format!("WASIX cwd `{cwd}` escapes its sandbox preopen"),
+        });
+    }
+    let metadata = fs::metadata(&target).map_err(|error| SandboxWasiError::InvalidRequest {
+        detail: format!("WASIX cwd `{cwd}` is invalid: {error}"),
+    })?;
+    if !metadata.is_dir() {
+        return Err(SandboxWasiError::InvalidRequest {
+            detail: format!("WASIX cwd `{cwd}` is not a directory"),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn validate_wasix_preopen_tree(
+    preopen: &SandboxWasiPreopen,
+) -> Result<(), SandboxWasiError> {
+    collect_wasix_preopen_tree(&preopen.host_path).map_err(|error| SandboxWasiError::Runtime {
+        detail: format!("validate WASIX preopen {}: {error}", preopen.guest_path),
+    })?;
+    Ok(())
+}
+
+pub(super) fn validate_wasix_pinned_child_exec_preopens(
+    preopened_dirs: &[SandboxWasiPreopen],
+) -> Result<(), SandboxWasiError> {
+    let bin_preopen = preopened_dirs
+        .iter()
+        .find(|preopen| preopen.guest_path.as_str() == "/bin");
+    if bin_preopen.is_some_and(|preopen| preopen.mode != SandboxMountMode::ReadOnly) {
+        return Err(SandboxWasiError::InvalidRequest {
+            detail: "WASIX pinned child exec requires /bin to be a read-only preopen".to_string(),
+        });
+    }
+
+    if preopened_dirs.iter().any(|preopen| {
+        preopen.guest_path.as_str() == "/" && preopen.mode != SandboxMountMode::ReadOnly
+    }) && bin_preopen.is_none()
+    {
+        return Err(SandboxWasiError::InvalidRequest {
+            detail:
+                "WASIX pinned child exec requires a writable root preopen to be shadowed by a read-only /bin preopen"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn collect_wasix_preopen_tree(path: &Path) -> Result<(), std::io::Error> {
+    let metadata = collect_wasix_preopen_entry(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            collect_wasix_preopen_tree(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_wasix_preopen_entry(path: &Path) -> Result<fs::Metadata, std::io::Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("WASIX preopen contains symlink {}", path.display()),
+        ));
+    }
+    Ok(metadata)
+}
+
+fn wasix_host_path_for_guest<'a>(
+    path: &SandboxPath,
+    preopened_dirs: &'a [SandboxWasiPreopen],
+) -> Option<(&'a SandboxWasiPreopen, PathBuf)> {
+    let mut matches: Vec<_> = preopened_dirs
+        .iter()
+        .filter(|preopen| {
+            if preopen.guest_path.as_str() == "/" {
+                true
+            } else {
+                path == &preopen.guest_path
+                    || path
+                        .as_str()
+                        .strip_prefix(preopen.guest_path.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }
+        })
+        .collect();
+    matches.sort_by_key(|preopen| std::cmp::Reverse(preopen.guest_path.as_str().len()));
+    let preopen = matches.into_iter().next()?;
+    let relative = if preopen.guest_path.as_str() == "/" {
+        path.as_str().trim_start_matches('/')
+    } else if path == &preopen.guest_path {
+        ""
+    } else {
+        path.as_str()
+            .strip_prefix(preopen.guest_path.as_str())
+            .and_then(|suffix| suffix.strip_prefix('/'))?
+    };
+    Some((preopen, preopen.host_path.join(relative)))
+}
+
+#[cfg(unix)]
+fn set_permissions_read_only(permissions: &mut fs::Permissions) {
+    permissions.set_mode(permissions.mode() & !0o222);
+}
+
+#[cfg(not(unix))]
+fn set_permissions_read_only(permissions: &mut fs::Permissions) {
+    permissions.set_readonly(true);
+}

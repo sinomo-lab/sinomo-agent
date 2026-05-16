@@ -46,7 +46,8 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const DAEMON_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
-pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_millis(750);
@@ -88,29 +89,114 @@ fn cluster_raft_command_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    let mut direct = Vec::new();
-    let mut iroh = Vec::new();
-    let mut other = Vec::new();
+    let connectivity = sinomo_network::read_cluster_connectivity_graph_from_kv(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| {
+            (
+                (record.source_node_id.clone(), record.endpoint_id.clone()),
+                record,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut endpoints_by_node = BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
     for endpoint in sinomo_network::cluster_sync_targets_with_connectivity(paths, state) {
-        match endpoint.transport {
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => direct.push(endpoint),
-            ClusterTransportKind::Iroh => iroh.push(endpoint),
-            _ => other.push(endpoint),
+        endpoints_by_node
+            .entry(endpoint.node_id.clone())
+            .or_default()
+            .push(endpoint);
+    }
+    for endpoints in endpoints_by_node.values_mut() {
+        endpoints.sort_by_key(|endpoint| {
+            cluster_raft_endpoint_order_key(state, &connectivity, endpoint)
+        });
+        let mut seen = std::collections::BTreeSet::new();
+        endpoints.retain(|endpoint| {
+            seen.insert((
+                format!("{:?}", endpoint.transport),
+                endpoint.address.clone(),
+            ))
+        });
+    }
+    let mut node_order = endpoints_by_node
+        .iter()
+        .filter_map(|(node_id, endpoints)| {
+            endpoints.first().map(|endpoint| {
+                (
+                    cluster_raft_endpoint_order_key(state, &connectivity, endpoint),
+                    node_id.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    node_order.sort_by_key(|(rank, node_id)| (rank.clone(), node_id.clone()));
+    let mut targets = Vec::new();
+    for (_, node_id) in node_order {
+        if let Some(endpoints) = endpoints_by_node.remove(&node_id) {
+            targets.extend(endpoints);
         }
     }
-    direct.sort_by_key(|endpoint| {
-        (
-            cluster_raft_direct_address_rank(endpoint),
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
-    direct.extend(iroh);
-    direct.extend(other);
-    direct
+    targets
+}
+
+fn cluster_raft_endpoint_order_key(
+    state: &ClusterBootstrapState,
+    connectivity: &BTreeMap<(NodeId, sinomo_network::ClusterEndpointId), ClusterConnectivityRecord>,
+    endpoint: &ClusterEndpointRecord,
+) -> (u8, u8, u8, u16, String) {
+    (
+        cluster_raft_endpoint_connectivity_rank(state, connectivity, endpoint),
+        cluster_raft_endpoint_transport_rank(endpoint),
+        cluster_raft_direct_address_rank(endpoint),
+        endpoint.priority,
+        endpoint.address.clone(),
+    )
+}
+
+fn cluster_raft_endpoint_connectivity_rank(
+    state: &ClusterBootstrapState,
+    connectivity: &BTreeMap<(NodeId, sinomo_network::ClusterEndpointId), ClusterConnectivityRecord>,
+    endpoint: &ClusterEndpointRecord,
+) -> u8 {
+    let connectivity_state = connectivity
+        .get(&(state.local_node_id.clone(), endpoint.endpoint_id.clone()))
+        .map(|record| &record.state);
+    match connectivity_state {
+        Some(sinomo_network::ClusterConnectivityState::Healthy) => 0,
+        Some(sinomo_network::ClusterConnectivityState::Degraded) => 1,
+        None if matches!(
+            endpoint.transport,
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+        ) && cluster_raft_direct_address_rank(endpoint) == 0 =>
+        {
+            2
+        }
+        None if endpoint.transport == ClusterTransportKind::Iroh => 3,
+        None => 4,
+        Some(sinomo_network::ClusterConnectivityState::Unreachable)
+            if endpoint.transport == ClusterTransportKind::Iroh =>
+        {
+            5
+        }
+        Some(sinomo_network::ClusterConnectivityState::Unreachable) => 6,
+    }
+}
+
+fn cluster_raft_endpoint_transport_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    match endpoint.transport {
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => 0,
+        ClusterTransportKind::Iroh => 1,
+        _ => 2,
+    }
 }
 
 fn cluster_raft_direct_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    if !matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) {
+        return 0;
+    }
     let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
         return 2;
     };
@@ -443,6 +529,21 @@ pub fn handle_daemon_cluster_kv_txn_request(
     paths: &DaemonPaths,
     txn: KvTxn,
 ) -> Result<KvTxnResponse, DaemonError> {
+    handle_daemon_cluster_kv_txn_request_with_forwarding(paths, txn, true)
+}
+
+pub fn handle_forwarded_daemon_cluster_kv_txn_request(
+    paths: &DaemonPaths,
+    txn: KvTxn,
+) -> Result<KvTxnResponse, DaemonError> {
+    handle_daemon_cluster_kv_txn_request_with_forwarding(paths, txn, false)
+}
+
+fn handle_daemon_cluster_kv_txn_request_with_forwarding(
+    paths: &DaemonPaths,
+    txn: KvTxn,
+    allow_forwarding: bool,
+) -> Result<KvTxnResponse, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let mut state = sinomo_network::read_cluster_state_without_kv(&cluster_paths).map_err(
         |error| match error {
@@ -452,8 +553,12 @@ pub fn handle_daemon_cluster_kv_txn_request(
             other => other.into(),
         },
     )?;
-    let (snapshot, response) =
-        commit_cluster_kv_txn_with_quorum_response(&cluster_paths, &mut state, txn)?;
+    let (snapshot, response) = commit_cluster_kv_txn_with_quorum_response_with_forwarding(
+        &cluster_paths,
+        &mut state,
+        txn,
+        allow_forwarding,
+    )?;
     sinomo_network::write_cluster_kv_snapshot_if_changed(&cluster_paths, &snapshot)?;
     Ok(response.unwrap_or(KvTxnResponse {
         succeeded: true,
@@ -2419,9 +2524,20 @@ pub fn commit_cluster_kv_txn_with_quorum_response(
     state: &mut ClusterBootstrapState,
     txn: KvTxn,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError> {
+    commit_cluster_kv_txn_with_quorum_response_with_forwarding(paths, state, txn, true)
+}
+
+fn commit_cluster_kv_txn_with_quorum_response_with_forwarding(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    txn: KvTxn,
+    allow_forwarding: bool,
+) -> Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError> {
     let _ = current_cluster_kv_store(paths, state);
     if !sinomo_network::cluster_raft_local_is_voter(state) {
-        if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
+        if allow_forwarding
+            && let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn)
+        {
             return response;
         }
         return Err(DaemonError::ClusterReadOnly {
@@ -2433,14 +2549,11 @@ pub fn commit_cluster_kv_txn_with_quorum_response(
         });
     }
     if !sinomo_network::cluster_raft_local_is_leader(paths, state)?
-        && let Some(response) = forward_cluster_kv_txn_to_known_leader(paths, state, &txn)
-    {
-        return response;
-    }
-    if !sinomo_network::cluster_raft_local_is_leader(paths, state)?
         && !elect_cluster_raft_leader(paths, state)?
     {
-        if let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn) {
+        if allow_forwarding
+            && let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn)
+        {
             return response;
         }
         return Err(DaemonError::ClusterReadOnly {
@@ -2448,74 +2561,6 @@ pub fn commit_cluster_kv_txn_with_quorum_response(
         });
     }
     commit_cluster_raft_command_with_quorum(paths, state, KvCommand::Txn(txn))
-}
-
-fn forward_cluster_kv_txn_to_known_leader(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    txn: &KvTxn,
-) -> Option<Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError>> {
-    let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state) else {
-        return None;
-    };
-    if leader_id == state.local_node_id || cluster_node_status_is_offline(paths, &leader_id) {
-        return None;
-    }
-    let targets = cluster_raft_command_targets(paths, state)
-        .into_iter()
-        .filter(|endpoint| endpoint.node_id == leader_id)
-        .collect::<Vec<_>>();
-    if targets.is_empty() {
-        return None;
-    }
-    let mut failures = Vec::new();
-    let deadline =
-        Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in targets {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            break;
-        }
-        match send_cluster_kv_txn(
-            &endpoint,
-            txn,
-            cluster_endpoint_command_timeout(&endpoint, remaining),
-        ) {
-            Ok(response) => {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or_default();
-                if remaining.is_zero() {
-                    return Some(Err(DaemonError::Network {
-                        address: endpoint.address,
-                        detail: format!(
-                            "leader forwarded cluster KV transaction exhausted {}ms budget before snapshot refresh",
-                            (DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT
-                                + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT)
-                                .as_millis()
-                        ),
-                    }));
-                }
-                return Some(
-                    fetch_cluster_kv_snapshot_from_endpoint(
-                        &endpoint,
-                        cluster_endpoint_command_timeout(&endpoint, remaining),
-                    )
-                    .map(|snapshot| (snapshot, Some(response))),
-                );
-            }
-            Err(error) => failures.push(format!(
-                "{} ({:?}) failed: {}",
-                endpoint.address, endpoint.transport, error
-            )),
-        }
-    }
-    if !failures.is_empty() {
-        let _ = sinomo_network::clear_cluster_raft_leader(paths, &state.local_node_id);
-    }
-    None
 }
 
 fn forward_cluster_kv_txn_to_voter(
@@ -2738,7 +2783,7 @@ fn cluster_endpoint_command_timeout(
     remaining: Duration,
 ) -> Duration {
     match endpoint.transport {
-        ClusterTransportKind::Iroh => remaining,
+        ClusterTransportKind::Iroh => remaining.min(DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT),
         _ => remaining.min(DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT),
     }
 }
@@ -3070,5 +3115,232 @@ pub fn handle_daemon_cluster_invite_publish_request(
             state,
             kv_snapshot: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn unique_cluster_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn raft_command_targets_preserve_connectivity_rank_for_voter_paths() {
+        let root = unique_cluster_test_root("sinomo-daemon-raft-connectivity-order");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_raft_connectivity").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_daemon_raft_connectivity_local").expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_daemon_raft_connectivity_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "raft connectivity order",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let tcp =
+            sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.41:21353".to_string(), 10);
+        let iroh = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
+                &remote_node,
+                "iroh_public_key_daemon_raft_connectivity",
+            ),
+            node_id: remote_node.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address:
+                "iroh://iroh_public_key_daemon_raft_connectivity?relay=https://relay.example./"
+                    .to_string(),
+            source: sinomo_core::ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        };
+        let mut remote_member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities = sinomo_node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![tcp.clone(), iroh.clone()];
+        state.members.push(remote_member);
+
+        sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state to raft kv");
+        sinomo_network::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &local_node,
+            vec![
+                sinomo_network::cluster_connectivity_record(
+                    &state,
+                    &tcp,
+                    sinomo_network::ClusterConnectivityState::Unreachable,
+                    None,
+                    4,
+                    None,
+                    Some("timed out".to_string()),
+                    now,
+                    60,
+                ),
+                sinomo_network::cluster_connectivity_record(
+                    &state,
+                    &iroh,
+                    sinomo_network::ClusterConnectivityState::Healthy,
+                    Some(40),
+                    0,
+                    Some("ok".to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+            ],
+        )
+        .expect("connectivity records");
+
+        let targets = cluster_raft_command_targets(&paths, &state);
+
+        assert_eq!(
+            targets.first().map(|endpoint| &endpoint.endpoint_id),
+            Some(&iroh.endpoint_id),
+            "raft/KV forwarding must not spend the command budget on an unreachable TCP endpoint before a healthy Iroh path"
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|endpoint| endpoint.endpoint_id == tcp.endpoint_id)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn raft_command_targets_try_private_tcp_before_iroh_and_public_tcp_fallbacks() {
+        let root = unique_cluster_test_root("sinomo-daemon-raft-unknown-tcp-order");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_raft_unknown_tcp").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_daemon_raft_unknown_tcp_local").expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_daemon_raft_unknown_tcp_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "raft unknown tcp order",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let public_tcp =
+            sinomo_network::daemon_lan_endpoint(&remote_node, "203.0.113.41:21353".to_string(), 10);
+        let private_tcp =
+            sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.41:21353".to_string(), 20);
+        let iroh = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
+                &remote_node,
+                "iroh_public_key_daemon_raft_unknown_tcp",
+            ),
+            node_id: remote_node.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://iroh_public_key_daemon_raft_unknown_tcp?relay=https://relay.example./"
+                .to_string(),
+            source: sinomo_core::ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        };
+        let mut remote_member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities = sinomo_node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![public_tcp.clone(), private_tcp.clone(), iroh.clone()];
+        state.members.push(remote_member);
+
+        sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state to raft kv");
+
+        let targets = cluster_raft_command_targets(&paths, &state);
+
+        assert_eq!(
+            targets.first().map(|endpoint| &endpoint.endpoint_id),
+            Some(&private_tcp.endpoint_id),
+            "raft/KV forwarding should try a private direct endpoint before relay or public TCP fallbacks"
+        );
+        let iroh_position = targets
+            .iter()
+            .position(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
+            .expect("iroh target");
+        let public_position = targets
+            .iter()
+            .position(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
+            .expect("public tcp target");
+        assert!(
+            iroh_position < public_position,
+            "Iroh should stay ahead of unproven public TCP"
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|endpoint| endpoint.endpoint_id == private_tcp.endpoint_id)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn raft_command_timeout_caps_single_iroh_attempt_to_preserve_fallback_budget() {
+        let node_id = NodeId::from_legacy_named("node_daemon_raft_iroh_timeout").expect("node");
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
+                &node_id,
+                "iroh_public_key_daemon_raft_timeout",
+            ),
+            node_id,
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://iroh_public_key_daemon_raft_timeout?relay=https://relay.example./"
+                .to_string(),
+            source: sinomo_core::ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        };
+
+        assert_eq!(
+            cluster_endpoint_command_timeout(&endpoint, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT),
+            DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT
+        );
     }
 }

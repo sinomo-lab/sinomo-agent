@@ -5,9 +5,9 @@
 //! families such as MiniCPM-o depend on PyTorch/Transformers runtime packages.
 
 pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
-    use sinomo_storage::StorageRing;
+    layout: &mut sinomo_runtime::storage::StorageLayout,
+) -> Result<(), sinomo_runtime::storage::StorageContractError> {
+    use sinomo_runtime::storage::StorageRing;
 
     layout.register_escape_path(
         "sinomo-pytorch",

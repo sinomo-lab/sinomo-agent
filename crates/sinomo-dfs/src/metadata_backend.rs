@@ -931,7 +931,18 @@ impl LocalJsonMetadataBackend {
         &self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<()> {
-        for object in &transaction.objects {
+        for object in transaction
+            .objects
+            .iter()
+            .filter(|object| object.kind == DfsObjectKind::Tombstone)
+        {
+            self.materialize_object_indexes(object)?;
+        }
+        for object in transaction
+            .objects
+            .iter()
+            .filter(|object| object.kind != DfsObjectKind::Tombstone)
+        {
             self.materialize_object_indexes(object)?;
         }
         Ok(())
@@ -943,6 +954,11 @@ impl LocalJsonMetadataBackend {
         write_json_atomic(&self.object_path(&object.object_id), object)?;
         write_json_atomic(&self.inode_path(&inode.inode_id), &inode)?;
         if object.kind == DfsObjectKind::Tombstone {
+            let path_record = path_record_for_object(object);
+            write_json_atomic(
+                &self.path_index_path(&object.file_system_id, &path_record.path),
+                &path_record,
+            )?;
             return Ok(());
         }
 
@@ -954,7 +970,7 @@ impl LocalJsonMetadataBackend {
             !dentry_path.exists(),
         )?;
         write_json_atomic(
-            &self.path_index_path(&object.file_system_id, &object.path),
+            &self.path_index_path(&object.file_system_id, &path_record.path),
             &path_record,
         )?;
         write_json_atomic(&dentry_path, &path_record)?;
@@ -969,6 +985,7 @@ impl LocalJsonMetadataBackend {
         if !root.exists() {
             return Ok(());
         }
+        let mut commits = Vec::new();
         for object_dir in read_dir(&root)? {
             let object_dir_path = object_dir.path();
             if !object_dir_path.is_dir() {
@@ -980,8 +997,25 @@ impl LocalJsonMetadataBackend {
                     continue;
                 }
                 let commit: DfsVisibleVersionCommitRecord = read_json(&path)?;
-                self.recover_visible_version_commit(&commit)?;
+                commits.push(commit);
             }
+        }
+        commits.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| {
+                    left.committed_object
+                        .object_id
+                        .cmp(&right.committed_object.object_id)
+                })
+                .then_with(|| {
+                    left.committed_object
+                        .version
+                        .cmp(&right.committed_object.version)
+                })
+        });
+        for commit in commits {
+            self.recover_visible_version_commit(&commit)?;
         }
         Ok(())
     }
@@ -990,6 +1024,15 @@ impl LocalJsonMetadataBackend {
         &mut self,
         commit: &DfsVisibleVersionCommitRecord,
     ) -> Result<()> {
+        if self
+            .get_object_by_path(
+                &commit.committed_object.file_system_id,
+                &commit.committed_object.path,
+            )?
+            .is_some_and(|object| object.kind == DfsObjectKind::Tombstone)
+        {
+            return Ok(());
+        }
         for node_id in &commit.required_replica_node_ids {
             if !self
                 .receipt_path(
@@ -1004,6 +1047,12 @@ impl LocalJsonMetadataBackend {
         }
 
         let current = self.get_object(&commit.committed_object.object_id)?;
+        if current.as_ref().is_some_and(|object| {
+            object.kind == DfsObjectKind::Tombstone
+                && normalize_path(&object.path) == normalize_path(&commit.committed_object.path)
+        }) {
+            return Ok(());
+        }
         if current
             .as_ref()
             .is_some_and(|object| object.version == commit.committed_object.version)
@@ -1016,12 +1065,12 @@ impl LocalJsonMetadataBackend {
         {
             return Ok(());
         }
-        if let Some(current) = current {
-            if current.version != commit.expected_version
-                && current.version != commit.committed_object.version
-            {
-                return Ok(());
-            }
+        if current.as_ref().is_some_and(|object| {
+            object.version != commit.expected_version
+                && object.version != commit.committed_object.version
+                && dfs_version_after(&object.version, &commit.committed_object.version)
+        }) {
+            return Ok(());
         }
 
         self.materialize_visible_version_commit(commit)?;
@@ -1038,20 +1087,13 @@ impl LocalJsonMetadataBackend {
         &self,
         commit: &DfsVisibleVersionCommitRecord,
     ) -> Result<()> {
-        write_json_atomic(
-            &self.object_path(&commit.committed_object.object_id),
-            &commit.committed_object,
-        )?;
+        self.materialize_object_indexes(&commit.committed_object)?;
         write_json_atomic(
             &self.version_path(
                 &commit.visible_version.object_id,
                 &commit.visible_version.version,
             ),
             &commit.visible_version,
-        )?;
-        write_json_atomic(
-            &self.inode_path(&object_inode_id(&commit.committed_object.object_id)),
-            &DfsInodeRecord::from(&commit.committed_object),
         )
     }
 
@@ -1098,6 +1140,19 @@ fn path_record_for_object(object: &DfsObjectMetadata) -> DfsPathRecord {
         name_hash: stable_u64_hash(&name),
         name,
         kind: object.kind.clone(),
+    }
+}
+
+fn dfs_version_after(left: &DfsVersion, right: &DfsVersion) -> bool {
+    match (
+        left.as_str().strip_prefix("version_"),
+        right.as_str().strip_prefix("version_"),
+    ) {
+        (Some(left), Some(right)) => match (left.parse::<u64>(), right.parse::<u64>()) {
+            (Ok(left), Ok(right)) => left > right,
+            _ => left > right,
+        },
+        _ => left.as_str() > right.as_str(),
     }
 }
 
@@ -1573,6 +1628,127 @@ mod tests {
                 .get_version(&committed.object_id, &committed.version)
                 .expect("get version"),
             Some(version_record)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_recovers_latest_visible_version_without_resurrecting_deleted_objects() {
+        let root = temp_root(
+            "local_backend_recovers_latest_visible_version_without_resurrecting_deleted_objects",
+        );
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let initial = object(version("version_1"));
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&initial).expect("object");
+
+        let mut version_2 = initial.clone();
+        version_2.version = version("version_2");
+        version_2.content_hash = Some("blake3:two".to_string());
+        let version_2_record = DfsObjectVersionRecord {
+            file_system_id: version_2.file_system_id.clone(),
+            object_id: version_2.object_id.clone(),
+            version: version_2.version.clone(),
+            content_hash: version_2.content_hash.clone(),
+            locations: version_2.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let version_2_receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: version_2.file_system_id.clone(),
+                object_id: version_2.object_id.clone(),
+                committed_version: version_2.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_commit_two").expect("event"),
+            },
+            replica_node_id: node("node_owner"),
+            content_hash: version_2.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend.put_receipt(&version_2_receipt).expect("receipt");
+        backend
+            .commit_visible_version(
+                &initial.version,
+                &version_2,
+                &version_2_record,
+                std::slice::from_ref(&version_2_receipt.replica_node_id),
+            )
+            .expect("commit version 2");
+
+        let mut version_3 = version_2.clone();
+        version_3.version = version("version_3");
+        version_3.content_hash = Some("blake3:three".to_string());
+        let version_3_record = DfsObjectVersionRecord {
+            file_system_id: version_3.file_system_id.clone(),
+            object_id: version_3.object_id.clone(),
+            version: version_3.version.clone(),
+            content_hash: version_3.content_hash.clone(),
+            locations: version_3.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            visible: true,
+        };
+        let version_3_receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: version_3.file_system_id.clone(),
+                object_id: version_3.object_id.clone(),
+                committed_version: version_3.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_commit_three").expect("event"),
+            },
+            replica_node_id: node("node_owner"),
+            content_hash: version_3.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend.put_receipt(&version_3_receipt).expect("receipt");
+        backend
+            .commit_visible_version(
+                &version_2.version,
+                &version_3,
+                &version_3_record,
+                std::slice::from_ref(&version_3_receipt.replica_node_id),
+            )
+            .expect("commit version 3");
+
+        backend.put_object(&version_2).expect("stale object");
+        drop(backend);
+        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("recovered backend");
+        assert_eq!(
+            recovered
+                .get_object(&version_3.object_id)
+                .expect("get recovered")
+                .expect("object")
+                .version,
+            version_3.version
+        );
+        drop(recovered);
+
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let mut tombstone = version_3.clone();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.version = version("version_4");
+        tombstone.content_hash = None;
+        backend.put_object(&tombstone).expect("tombstone");
+        drop(backend);
+
+        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("recovered backend");
+        assert_eq!(
+            recovered
+                .get_object(&tombstone.object_id)
+                .expect("get tombstone")
+                .expect("object")
+                .kind,
+            DfsObjectKind::Tombstone
         );
 
         cleanup(&root);

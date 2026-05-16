@@ -8,7 +8,7 @@ The foundation is a network of cooperating nodes. Each node may have one or more
 
 The initial architecture favors a Rust workspace with small, focused crates that can run together on one machine first, then distribute across desktops, phones, small servers, and LAN devices as workload, privacy, latency, and hardware needs grow.
 
-The detailed cluster bootstrap, discovery, roaming transport, membership, and distributed KV design lives in [clustering-architecture.md](clustering-architecture.md). The detailed distributed filesystem design lives in [dfs-architecture.md](dfs-architecture.md). The binary communication and serialization format is specified in [sinomo-object-format.md](sinomo-object-format.md). Rollout operator procedures and examples are documented in [rollout-operations.md](rollout-operations.md). The user-facing main agent, local core model, async deliberation, cluster-aware tooling, maid agent, and training-data flow are described in [agent-system-architecture.md](agent-system-architecture.md).
+The detailed cluster bootstrap, discovery, roaming transport, membership, and distributed KV design lives in [clustering-architecture.md](clustering-architecture.md). The detailed distributed filesystem design lives in [dfs-architecture.md](dfs-architecture.md). The SIFS-backed WASM sandbox design and implementation status lives in [plans/sifs-wasm-sandbox-plan.md](plans/sifs-wasm-sandbox-plan.md). The binary communication and serialization format is specified in [sinomo-object-format.md](sinomo-object-format.md). Rollout operator procedures and examples are documented in [rollout-operations.md](rollout-operations.md). The user-facing main agent, local core model, async deliberation, cluster-aware tooling, maid agent, and training-data flow are described in [agent-system-architecture.md](agent-system-architecture.md).
 
 Self-evolution is treated as controlled live mutation: Sinomo should be able to change running behavior autonomously without bringing down the system. The detailed design for sandboxed mutation, evaluation, hot-swap, progressive rollout, and rollback lives in [self-evolution-architecture.md](self-evolution-architecture.md).
 
@@ -731,12 +731,21 @@ Responsibilities:
 
 ### `sinomo-sandbox`
 
-Sandbox host for candidate builds, tests, and R3 modules.
+SIFS-backed WASM sandbox host for agent tool execution, candidate builds,
+tests, and R3 modules.
 
 Responsibilities:
 
-- Run candidate jobs in constrained process/container sandboxes initially.
-- Provide a path toward Wasm Component Model modules for R3 capsules.
+- Maintain sandbox instances and command workspaces under
+  `/services/sandbox`.
+- Run pinned real WASI command toolchains through the sandbox host without
+  ambient host filesystem or network access.
+- Persist stdout, stderr, command records, checkpoints, and changed workspace
+  files through SIFS so work can resume after daemon restart or node handoff.
+- Apply cluster-scoped sandbox policy for mounts, command capabilities,
+  toolchain trust, resource budgets, concurrency, and mediated HTTP fetches.
+- Provide a path toward Wasm Component Model modules for R3 capsules and
+  richer toolchain packages.
 - Enforce CPU, memory, wall-clock, filesystem, network, secret, and device limits.
 - Normalize logs and artifacts before they are reviewed by models or operators.
 

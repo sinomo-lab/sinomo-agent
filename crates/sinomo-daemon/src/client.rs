@@ -16,6 +16,7 @@ use sinomo_network::{
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
 };
+use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,49 @@ pub fn send_daemon_rpc(
         timeout,
     )
     .map_err(DaemonError::from)
+}
+
+pub fn send_daemon_rpc_stream(
+    address: &str,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+    mut on_response: impl FnMut(sinomo_network::ObjectRpcResponse) -> Result<bool, DaemonError>,
+) -> Result<(), DaemonError> {
+    let signed = sign_daemon_rpc_request_for_local_node(request)?;
+    let control_request = DaemonControlRequest::authenticated_rpc(
+        daemon_rpc_command(&request.route),
+        request.clone(),
+        signed,
+    );
+    let mut stream = DaemonControlStream::connect(address).map_err(DaemonError::from)?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(DaemonError::from)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(DaemonError::from)?;
+    sinomo_network::write_object_frame_blocking(&mut stream, &control_request)
+        .map_err(DaemonError::from)?;
+    stream.flush().map_err(|source| DaemonError::Network {
+        address: address.to_string(),
+        detail: source.to_string(),
+    })?;
+    stream.shutdown_write();
+    loop {
+        let response: sinomo_network::DaemonControlResponse =
+            sinomo_network::read_object_frame_blocking(
+                &mut stream,
+                sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+            )
+            .map_err(DaemonError::from)?;
+        let rpc = response.rpc.ok_or_else(|| DaemonError::Network {
+            address: address.to_string(),
+            detail: "daemon returned non-rpc stream frame".to_string(),
+        })?;
+        if !on_response(rpc)? {
+            return Ok(());
+        }
+    }
 }
 
 pub fn send_daemon_rpc_to_endpoint(

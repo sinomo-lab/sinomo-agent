@@ -14,6 +14,7 @@ ring = "application"
 [features]
 default = []
 native-models = ["dep:candle-core", "dep:sinomo-models", "dep:tokenizers"]
+wasix-runtime = ["sinomo-runtime/wasix-runtime"]
 
 [dependencies]
 base64 = "0.22"

@@ -1,0 +1,109 @@
+use sinomo_core::Id;
+
+pub type SandboxId = Id;
+pub type SandboxCommandId = Id;
+pub type SandboxCheckpointId = Id;
+pub type SandboxToolchainId = Id;
+pub type SandboxNetworkRequestId = Id;
+
+pub const SIFS_SANDBOX_ROOT: &str = "/services/sandbox";
+pub const SANDBOX_POLICY_CONFIG_KV_KEY: &str = "/config/sandbox/policy";
+pub const SANDBOX_STORAGE_MODULE: &str = "sinomo-sandbox";
+pub const SANDBOX_MANIFEST_OBJECT_VERSION: u16 = 1;
+pub const SANDBOX_TOOLCHAIN_MANIFEST_OBJECT_VERSION: u16 = 1;
+pub const SANDBOX_HTTP_EXCHANGE_OBJECT_VERSION: u16 = 1;
+pub const BUSYBOX_TOOLCHAIN_LEGACY_ID: &str = "toolchain_busybox";
+pub const QUICKJS_TOOLCHAIN_ID: &str = "01k4z8q5c00000000000000000";
+pub const QUICKJS_TOOLCHAIN_VERSION: &str = "quickjs-2025-09-13-2-wasip1";
+pub const QUICKJS_TOOLCHAIN_COMMAND: &str = "qjs";
+pub const QUICKJS_TOOLCHAIN_RECIPE: &str =
+    "crates/sinomo-sandbox/toolchains/quickjs/build-qjs-wasi.sh";
+pub const QUICKJS_TOOLCHAIN_PACKAGE_MANIFEST: &str =
+    "crates/sinomo-sandbox/toolchains/quickjs/out/package.json";
+pub const BASH_TOOLCHAIN_COMMAND: &str = "bash";
+pub const SH_TOOLCHAIN_COMMAND: &str = "sh";
+pub const BASH_TOOLCHAIN_RECIPE: &str = "crates/sinomo-sandbox/toolchains/bash/build-bash-wasix.sh";
+pub const PYTHON_TOOLCHAIN_COMMAND: &str = "python";
+pub const PIP_TOOLCHAIN_COMMAND: &str = "pip";
+pub const PYTHON_TOOLCHAIN_RECIPE: &str =
+    "crates/sinomo-sandbox/toolchains/python/build-cpython-wasix.sh";
+pub const PYTHON_WASIX_NATIVE_VERIFIER: &str =
+    "crates/sinomo-sandbox/toolchains/python/verify-python-wasix-native.sh";
+pub const BUILD_TOOLS_TOOLCHAIN_PLAN: &str =
+    "crates/sinomo-sandbox/toolchains/build-tools/README.md";
+pub const TCC_TOOLCHAIN_RECIPE: &str =
+    "crates/sinomo-sandbox/toolchains/build-tools/build-tcc-wasix.sh";
+pub const TCC_TOOLCHAIN_COMMAND: &str = "tcc";
+pub const MAKE_TOOLCHAIN_RECIPE: &str =
+    "crates/sinomo-sandbox/toolchains/build-tools/build-make-wasix.sh";
+pub const MAKE_TOOLCHAIN_COMMAND: &str = "make";
+pub const SANDBOX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+pub const SANDBOX_WASIX_MAX_TASKS: usize = 64;
+pub const SANDBOX_NETWORK_HTTP_CAPABILITY: &str = "network.http";
+pub const SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY: &str = "child-process-exec";
+pub const SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY: &str = "wasix.unpinned-child-exec";
+pub const SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY: &str = "pinned-child-exec-containment";
+pub const SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY: &str = "preview1.pinned-subprocess";
+pub const SANDBOX_MVP_VIRTUAL_DEVICES: &[&str] =
+    &["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
+pub const SANDBOX_WASI_ZERO_DEVICE_BYTES: usize = 1024 * 1024;
+pub const SINOMO_SANDBOX_WASI_EXT_MODULE: &str = "sinomo_sandbox_preview1";
+pub const SINOMO_SANDBOX_WASI_PATH_CHMOD: &str = "path_chmod";
+pub const SINOMO_SANDBOX_WASI_PATH_MODE: &str = "path_mode";
+pub const SINOMO_SANDBOX_WASI_PROC_SPAWN_WAIT: &str = "proc_spawn_wait";
+pub const SINOMO_SANDBOX_WASI_PROC_SPAWN_WAIT_AT: &str = "proc_spawn_wait_at";
+pub const SINOMO_SANDBOX_WASI_PROC_SPAWN_WAIT_AT_IO: &str = "proc_spawn_wait_at_io";
+
+pub const SANDBOX_RICH_TOOLCHAIN_TARGETS: &[SandboxRichToolchainTarget] = &[
+    SandboxRichToolchainTarget {
+        command: QUICKJS_TOOLCHAIN_COMMAND,
+        recipe: Some(QUICKJS_TOOLCHAIN_RECIPE),
+        status: SandboxRichToolchainStatus::Implemented,
+        note: "QuickJS is the first maintained language package target and is covered by verify-quickjs plus verify-coding",
+    },
+    SandboxRichToolchainTarget {
+        command: BASH_TOOLCHAIN_COMMAND,
+        recipe: Some(BASH_TOOLCHAIN_RECIPE),
+        status: SandboxRichToolchainStatus::Required,
+        note: "Bash is required for the coding sandbox; the maintained WASIX package passes local and daemon-local SIFS verification when child-process-exec and sandbox-local WASIX child exec are allowed by policy",
+    },
+    SandboxRichToolchainTarget {
+        command: PYTHON_TOOLCHAIN_COMMAND,
+        recipe: Some(PYTHON_TOOLCHAIN_RECIPE),
+        status: SandboxRichToolchainStatus::Required,
+        note: "Python is required for the coding sandbox; the maintained CPython WASIX package has standard library support plus native-extension loading needed by numpy and matplotlib",
+    },
+    SandboxRichToolchainTarget {
+        command: PIP_TOOLCHAIN_COMMAND,
+        recipe: Some(PYTHON_TOOLCHAIN_RECIPE),
+        status: SandboxRichToolchainStatus::Required,
+        note: "pip is required for the coding sandbox; offline wheel installs, local wheelhouse installs, SIFS-backed cache state, and native-extension package installs for numpy and matplotlib are required, while broader resolver edge cases remain pending",
+    },
+    SandboxRichToolchainTarget {
+        command: TCC_TOOLCHAIN_COMMAND,
+        recipe: Some(TCC_TOOLCHAIN_RECIPE),
+        status: SandboxRichToolchainStatus::Implemented,
+        note: "TinyCC has a maintained WASIX build recipe and passes the compiler fidelity suite for version output, preprocessing, object generation in /work, diagnostics, and explicit unsupported execution",
+    },
+    SandboxRichToolchainTarget {
+        command: MAKE_TOOLCHAIN_COMMAND,
+        recipe: Some(MAKE_TOOLCHAIN_RECIPE),
+        status: SandboxRichToolchainStatus::Implemented,
+        note: "GNU Make has a maintained WASIX build recipe and passes the combined local plus daemon-local SIFS verify-build-tools gate for Makefile parsing, dependency ordering, failure status, and recipe execution through pinned sandbox commands",
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxRichToolchainStatus {
+    Implemented,
+    Required,
+    Planned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SandboxRichToolchainTarget {
+    pub command: &'static str,
+    pub recipe: Option<&'static str>,
+    pub status: SandboxRichToolchainStatus,
+    pub note: &'static str,
+}

@@ -925,9 +925,11 @@ pub async fn send_daemon_rpc_raw_async(
         None => crate::DaemonControlRequest::rpc(command, request.clone()),
     };
     let response = send_daemon_control_request_async(address, &control_request, timeout).await?;
-    response.rpc.ok_or_else(|| NetworkError::Serialization {
+    let rpc = response.rpc.ok_or_else(|| NetworkError::Serialization {
         detail: format!("daemon control address {address} returned a non-rpc response"),
-    })
+    })?;
+    rpc.error_detail()?;
+    Ok(rpc)
 }
 
 async fn send_daemon_control_request_async(

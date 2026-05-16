@@ -37,6 +37,7 @@ pub use metadata_backend::{
     DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
     DfsWriteIntentStatus, LocalJsonMetadataBackend, MetadataBackendError,
 };
+use namespace::metadata_path;
 pub use namespace::{
     SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,
     directory_object, distributed_sifs, distributed_sifs_bootstrap_objects, sifs_node_files_path,
@@ -1462,6 +1463,7 @@ impl InProgressBlobTransfer {
 pub struct NetworkedDfsService<T> {
     node_id: NodeId,
     metadata: DfsMetadataStore,
+    tombstones_by_metadata_path: BTreeMap<(DfsFileSystemId, String), DfsObjectMetadata>,
     content: LocalContentStore,
     coordinator: DistributedEventualCoordinator,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
@@ -1483,6 +1485,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Self {
             node_id,
             metadata,
+            tombstones_by_metadata_path: BTreeMap::new(),
             content,
             coordinator: DistributedEventualCoordinator::new(),
             control_plane: None,
@@ -1556,6 +1559,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
 
         self.metadata = DfsMetadataStore::new();
+        self.tombstones_by_metadata_path.clear();
         self.coordinator = DistributedEventualCoordinator::new();
         self.pending_writes.clear();
 
@@ -1577,6 +1581,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 object.object_id.clone(),
                 object.version.clone(),
             );
+            self.track_metadata_tombstone(&object);
             self.metadata.add_object(object)?;
         }
 
@@ -1636,6 +1641,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             object.object_id.clone(),
             object.version.clone(),
         );
+        self.track_metadata_tombstone(&object);
         self.metadata.add_object(object)
     }
 
@@ -1649,6 +1655,27 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             object.version.clone(),
         );
         self.metadata.add_object(object)
+    }
+
+    fn track_metadata_tombstone(&mut self, object: &DfsObjectMetadata) {
+        let key = (object.file_system_id.clone(), metadata_path(&object.path));
+        if object.kind == DfsObjectKind::Tombstone {
+            let replace = self
+                .tombstones_by_metadata_path
+                .get(&key)
+                .is_none_or(|existing| existing.version < object.version);
+            if replace {
+                self.tombstones_by_metadata_path.insert(key, object.clone());
+            }
+            return;
+        }
+        if self
+            .tombstones_by_metadata_path
+            .get(&key)
+            .is_some_and(|existing| existing.object_id == object.object_id)
+        {
+            self.tombstones_by_metadata_path.remove(&key);
+        }
     }
 
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
@@ -1679,6 +1706,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 object.object_id.clone(),
                 object.version.clone(),
             );
+            self.track_metadata_tombstone(&object);
             self.metadata.add_object(object)?;
         }
         Ok(())
@@ -1704,6 +1732,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             object.object_id.clone(),
             object.version.clone(),
         );
+        self.track_metadata_tombstone(&object);
         self.metadata.add_object(object)?;
         Ok(manifest.content_hash)
     }
@@ -1963,6 +1992,61 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             });
         }
         let owner_epoch = self.ensure_file_system_write_authority(&request.file_system_id)?;
+
+        if object.policy == DfsObjectPolicy::ReplicatedEventual
+            && policy.min_commit_replicas == 1
+            && desired_replica_nodes.len() == 1
+            && desired_replica_nodes[0] == self.node_id
+        {
+            if expected_base_version
+                .as_ref()
+                .is_some_and(|expected| expected != &object.version)
+            {
+                let manifest = self.content.put_object_version(
+                    request.object_id.as_str(),
+                    request.target_version.as_str(),
+                    &bytes,
+                )?;
+                let conflict = self.create_write_conflict(
+                    &object,
+                    expected_base_version,
+                    request.target_version.clone(),
+                    request.requesting_node_id.clone(),
+                    Some(manifest.content_hash.clone()),
+                    "base version conflict for local eventual write".to_string(),
+                    None,
+                )?;
+                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
+            }
+
+            let mut committed_object = object.clone();
+            let manifest = self.content.put_object_version(
+                request.object_id.as_str(),
+                request.target_version.as_str(),
+                &bytes,
+            )?;
+            committed_object.version = request.target_version.clone();
+            committed_object.content_hash = Some(manifest.content_hash.clone());
+            committed_object.current_locations = vec![self.node_id.clone()];
+            committed_object.last_modified_by_event_id = Some(EventId::generate());
+            self.put_visible_object_in_metadata_backend(&committed_object)?;
+            self.coordinator.set_committed_version(
+                committed_object.file_system_id.clone(),
+                committed_object.object_id.clone(),
+                committed_object.version.clone(),
+            );
+            self.track_metadata_tombstone(&committed_object);
+            self.metadata.add_object(committed_object)?;
+            return Ok(NetworkedDfsWriteOutcome::Committed {
+                intent_id: format!(
+                    "local-eventual:{}:{}",
+                    request.object_id, request.target_version
+                ),
+                version: request.target_version,
+                content_hash: manifest.content_hash,
+                repair_jobs: Vec::new(),
+            });
+        }
 
         let manifest = self.content.put_object_version(
             request.object_id.as_str(),
@@ -3395,6 +3479,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             object.object_id.clone(),
             object.version.clone(),
         );
+        let object = object.clone();
+        self.track_metadata_tombstone(&object);
         Ok(object.clone())
     }
 
@@ -4184,6 +4270,7 @@ impl From<KvError> for DfsError {
 mod tests {
     use super::*;
     use sinomo_network::InProcessNetwork;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn file_system(owner: NodeId) -> DfsFileSystem {
         DfsFileSystem {
@@ -4208,6 +4295,30 @@ mod tests {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         }
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sinomo-dfs-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn networked_sifs_with_backend(
+        root: &Path,
+        node_id: NodeId,
+    ) -> NetworkedDfsService<sinomo_network::InProcessTransport> {
+        let network = InProcessNetwork::new();
+        let content = LocalContentStore::new(root.join("content")).expect("content");
+        let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+        let mut dfs = NetworkedDfsService::new(network.add_node(node_id), content)
+            .with_metadata_backend(metadata)
+            .expect("metadata backend");
+        dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+        dfs
     }
 
     #[test]
@@ -4252,6 +4363,97 @@ mod tests {
                 owner_node_id: owner
             }
         );
+    }
+
+    #[test]
+    fn sifs_recursive_clear_survives_metadata_backend_reopen() {
+        let root = temp_root("sifs-recursive-clear-reopen");
+        let node_id = NodeId::from_legacy_named("node_sifs_clear").expect("node");
+        let file_path = "/services/sandbox/instances/sandbox_clear/tmp/0/session-cache.txt";
+        let clear_root = "/services/sandbox/instances/sandbox_clear/tmp/0";
+
+        {
+            let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+            dfs.posix_mkdir_all(clear_root).expect("mkdir");
+            dfs.posix_write_file(
+                file_path,
+                b"tmp",
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("write");
+            assert_eq!(dfs.posix_read_file(file_path).expect("read"), b"tmp");
+            dfs.posix_clear_dir_recursive(clear_root)
+                .expect("clear recursive");
+            assert!(matches!(
+                dfs.posix_read_file(file_path),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+        }
+
+        {
+            let dfs = networked_sifs_with_backend(&root, node_id.clone());
+            assert!(matches!(
+                dfs.posix_read_file(file_path),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+        }
+
+        {
+            let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+            dfs.posix_mkdir_all(clear_root)
+                .expect("recreate cleared root");
+            dfs.posix_write_file(
+                file_path,
+                b"fresh",
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect("rewrite after clear");
+            assert_eq!(
+                dfs.posix_read_file(file_path).expect("fresh read"),
+                b"fresh"
+            );
+        }
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_self_only_eventual_write_uses_local_fast_path() {
+        let root = temp_root("sifs-self-only-eventual-fast-path");
+        let node_id = NodeId::from_legacy_named("node_sifs_fast_path").expect("node");
+        let file_path = "/services/sandbox/instances/sandbox_fast/work/site.py";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_fast/work")
+            .expect("mkdir");
+        let stat = dfs
+            .posix_write_file(
+                file_path,
+                b"print('fast path')\n",
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect("write");
+
+        assert_eq!(stat.size_bytes, Some(19));
+        assert_eq!(
+            dfs.posix_read_file(file_path).expect("read"),
+            b"print('fast path')\n"
+        );
+        assert!(
+            dfs.pending_writes.is_empty(),
+            "self-only eventual writes should not leave distributed intents"
+        );
+        assert!(dfs.coordinator.repair_jobs().is_empty());
+
+        let journal_count = std::fs::read_dir(root.join("metadata/journal"))
+            .expect("journal dir")
+            .count();
+        assert!(
+            journal_count < 64,
+            "self-only write should not emit per-file distributed intent/receipt/commit journals"
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

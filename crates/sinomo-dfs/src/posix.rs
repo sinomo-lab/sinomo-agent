@@ -108,8 +108,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     pub fn posix_mkdir(&mut self, path: &str) -> Result<DfsStat> {
         let path = normalize_posix_path(path)?;
-        if self.lookup_sifs_path(&path)?.is_some() {
-            return Err(DfsPosixError::AlreadyExists { path });
+        if let Some(mut object) = self.lookup_sifs_path(&path)? {
+            if object.kind != DfsObjectKind::Tombstone {
+                return Err(DfsPosixError::AlreadyExists { path });
+            }
+            object.kind = DfsObjectKind::Directory;
+            object.content_hash = None;
+            object.current_locations = vec![self.node_id.clone()];
+            object.version = next_version(&object.version);
+            self.add_object_metadata(object.clone())?;
+            return self.stat_object(&object);
         }
         self.ensure_parent_directory(&path)?;
         let object = self.metadata_object_for_new_path(&path, DfsObjectKind::Directory);
@@ -128,6 +136,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             current.push_str(part);
             match self.lookup_sifs_path(&current)? {
                 Some(object) if object.kind == DfsObjectKind::Directory => {}
+                Some(object) if object.kind == DfsObjectKind::Tombstone => {
+                    let mut object = object;
+                    object.kind = DfsObjectKind::Directory;
+                    object.content_hash = None;
+                    object.current_locations = vec![self.node_id.clone()];
+                    object.version = next_version(&object.version);
+                    self.add_object_metadata(object)?;
+                }
                 Some(_) => return Err(DfsPosixError::NotDirectory { path: current }),
                 None => {
                     self.posix_mkdir(&current)?;
@@ -153,7 +169,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
                 let mut object = object;
                 object.kind = DfsObjectKind::File;
-                object.version = initial_version();
                 object.content_hash = None;
                 object.current_locations = vec![self.node_id.clone()];
                 self.add_transient_object_metadata(object.clone())?;
@@ -315,6 +330,71 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         self.stat_object(&object)
     }
 
+    pub fn posix_clear_dir_recursive(&mut self, path: &str) -> Result<()> {
+        let path = normalize_posix_path(path)?;
+        let directory = self
+            .lookup_sifs_path(&path)?
+            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        if directory.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path });
+        }
+        if directory.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory { path });
+        }
+        let prefix = if path == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", path.trim_end_matches('/'))
+        };
+        let mut descendant_paths = self
+            .objects_for_sifs()?
+            .into_iter()
+            .filter_map(|object| {
+                let object_path = normalize_posix_path(&object.path).ok()?;
+                if object.kind == DfsObjectKind::Tombstone {
+                    return None;
+                }
+                if object_path == path || !object_path.starts_with(&prefix) {
+                    return None;
+                }
+                Some(object_path)
+            })
+            .collect::<Vec<_>>();
+        descendant_paths.sort();
+        descendant_paths.dedup();
+        descendant_paths.sort_by(|left_path, right_path| {
+            right_path
+                .len()
+                .cmp(&left_path.len())
+                .then_with(|| right_path.cmp(left_path))
+        });
+        for object_path in descendant_paths {
+            for _ in 0..64 {
+                let Some(object) = self.lookup_sifs_path(&object_path)? else {
+                    break;
+                };
+                if object.kind == DfsObjectKind::Tombstone {
+                    break;
+                }
+                let tombstone = DfsObjectMetadata {
+                    object_id: DfsObjectId::generate(),
+                    file_system_id: object.file_system_id.clone(),
+                    path: object.path.clone(),
+                    kind: DfsObjectKind::Tombstone,
+                    owner_node_id: self.node_id.clone(),
+                    current_locations: vec![self.node_id.clone()],
+                    content_hash: None,
+                    version: next_version(&object.version),
+                    policy: object.policy.clone(),
+                    created_by_event_id: object.created_by_event_id.clone(),
+                    last_modified_by_event_id: object.last_modified_by_event_id.clone(),
+                };
+                self.add_object_metadata(tombstone)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn posix_rename(&mut self, from: &str, to: &str) -> Result<DfsStat> {
         let from = normalize_posix_path(from)?;
         let to = normalize_posix_path(to)?;
@@ -457,6 +537,23 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
+        if self.has_tombstone_ancestor(file_system_id, path)? {
+            return Ok(None);
+        }
+        self.lookup_metadata_path_raw(file_system_id, path)
+    }
+
+    fn lookup_metadata_path_raw(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        if let Some(tombstone) = self
+            .tombstones_by_metadata_path
+            .get(&(file_system_id.clone(), metadata_path(path)))
+        {
+            return Ok(Some(tombstone.clone()));
+        }
         if let Some(backend) = self.metadata_backend.as_ref() {
             return Ok(backend.get_object_by_path(file_system_id, &metadata_path(path))?);
         }
@@ -471,6 +568,34 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         .unwrap_or(false)
             })
             .cloned())
+    }
+
+    fn has_tombstone_ancestor(&self, file_system_id: &DfsFileSystemId, path: &str) -> Result<bool> {
+        let path = normalize_posix_path(path)?;
+        if path == "/" {
+            return Ok(false);
+        }
+        let mut parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("/");
+        if parent.is_empty() {
+            parent = "/";
+        }
+        loop {
+            if let Some(object) = self.lookup_metadata_path_raw(file_system_id, parent)? {
+                if object.kind == DfsObjectKind::Tombstone {
+                    return Ok(true);
+                }
+            }
+            if parent == "/" {
+                return Ok(false);
+            }
+            parent = parent
+                .rsplit_once('/')
+                .map(|(ancestor, _)| if ancestor.is_empty() { "/" } else { ancestor })
+                .unwrap_or("/");
+        }
     }
 
     fn objects_for_sifs(&self) -> Result<Vec<DfsObjectMetadata>> {

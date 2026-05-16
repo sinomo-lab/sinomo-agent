@@ -10,6 +10,7 @@ pub fn print_usage() {
     println!("  sinomo daemon");
     println!("  sinomo rollout");
     println!("  sinomo dfs");
+    println!("  sinomo sandbox");
     println!("  sinomo models");
     println!("  sinomo usage");
     println!("  sinomo providers");
@@ -176,6 +177,144 @@ pub(super) fn print_dfs_help() {
         "  sinomo dfs expose add --source <path> --dfs-path <path> [--id <id>] [--filesystem <file_system_id>] [--node <node_id>] [--read-only] [--follow-symlinks] [--config <path>] [--json]"
     );
     println!("  sinomo dfs expose remove --id <id> [--config <path>] [--json]");
+}
+
+pub(super) fn print_sandbox_help() {
+    println!("Sandbox:");
+    println!("  sinomo sandbox");
+    println!("      Show sandbox commands.");
+    println!("  sinomo sandbox help");
+    println!("      Show sandbox commands.");
+    println!();
+    println!("Implemented local staging commands:");
+    println!(
+        "  sinomo sandbox create [--daemon] [--id <sandbox-id>] [--toolchain <toolchain-id>] [--memory-mb <n>] [--wall-time-ms <n>] [--max-input-bytes <n>] [--max-output-bytes <n>] [--max-workspace-bytes <n>] [--max-written-bytes-per-command <n>] [--max-file-count <n>] [--tmp clear|retain] [--keep-tmp] [--mount <sifs-path>:<mount-path>[:ro|rw]]"
+    );
+    println!(
+        "      Create a sandbox instance; --daemon stores the manifest and workspace in SIFS."
+    );
+    println!("  sinomo sandbox status <sandbox-id> [--daemon]");
+    println!("      Show a sandbox instance manifest.");
+    println!(
+        "  sinomo sandbox config <sandbox-id> [--daemon] [--cwd <path>] [--env NAME=VALUE] [--unset-env NAME]"
+    );
+    println!("      Update persisted sandbox cwd and environment.");
+    println!(
+        "  sinomo sandbox run <sandbox-id> [--daemon] [--stdin] [--timeout-ms <ms>] [--allow-capability <name>] <command> -- [args...]"
+    );
+    println!(
+        "      Run a named command from the sandbox's pinned toolchain; --allow-capability is local-only and --daemon uses the cluster sandbox policy."
+    );
+    println!(
+        "  sinomo sandbox run <sandbox-id> [--timeout-ms <ms>] --wasm <module.wasm> -- [args...]"
+    );
+    println!("      Run an explicit WASI module for runtime verification.");
+    println!(
+        "  sinomo sandbox process-plan <sandbox-id> [--daemon] <plan.json> [--timeout-ms <ms>]"
+    );
+    println!(
+        "      Run a structured process plan of pinned toolchain commands with per-step cwd/env and explicit stdout-to-stdin pipes; --daemon uses SIFS through the local daemon."
+    );
+    println!("  sinomo sandbox shell <sandbox-id> [--daemon] [--timeout-ms <ms>] [-- <script>]");
+    println!(
+        "      Run the pinned real `sh` command with stdin or the provided script; --daemon uses SIFS through the local daemon."
+    );
+    println!(
+        "  sinomo sandbox toolchain add-command [--daemon] [--toolchain <toolchain-id>] [--version <version>] [--target-abi preview1|wasix] [--provenance <text>] [--capability <name>] [--memory-mb <n>] [--wall-time-ms <n>] [--max-input-bytes <n>] [--max-output-bytes <n>] [--max-workspace-bytes <n>] [--max-written-bytes-per-command <n>] [--max-file-count <n>] <command> <module.wasm>"
+    );
+    println!("      Add a real WASI command module to a toolchain; --daemon stores it in SIFS.");
+    println!(
+        "  sinomo sandbox toolchain add-artifact [--daemon] [--toolchain <toolchain-id>] [--version <version>] [--provenance <text>] <lib|share|include|etc/path> <file>"
+    );
+    println!("      Add a support artifact to a toolchain; --daemon stores it in SIFS.");
+    println!(
+        "  sinomo sandbox toolchain import-busybox [--daemon] --version <version> [--provenance <text>] <busybox.wasm>"
+    );
+    println!(
+        "      Import a real Sinomo-maintained BusyBox WASI module as the default toolchain applets; --daemon stores it in SIFS."
+    );
+    println!(
+        "  sinomo sandbox toolchain import-package [--daemon] [--into <toolchain-id>] <package.json>"
+    );
+    println!(
+        "      Import or merge a declared toolchain package containing command modules and support artifacts."
+    );
+    println!("  sinomo sandbox toolchain verify-package <package.json>");
+    println!(
+        "      Validate a package manifest, referenced files, and BLAKE3 hashes without importing it."
+    );
+    println!("  sinomo sandbox toolchain hash <file>");
+    println!("      Print the BLAKE3 content hash used by sandbox package manifests.");
+    println!("  sinomo sandbox toolchain busybox-plan");
+    println!("      Show the default BusyBox applet set and fidelity cases.");
+    println!("  sinomo sandbox toolchain bash-plan");
+    println!("      Show the required Bash WASIX package target and fidelity cases.");
+    println!("  sinomo sandbox toolchain build-tools-plan");
+    println!("      Show real compiler/build-tool package status and gates for tcc and make.");
+    println!("  sinomo sandbox toolchain quickjs-plan");
+    println!("      Show the maintained QuickJS package target and fidelity cases.");
+    println!("  sinomo sandbox toolchain python-plan");
+    println!("      Show the required CPython/pip WASIp1 package target and fidelity cases.");
+    println!("  sinomo sandbox toolchain verify-bash <sandbox-id> [--daemon] [--allow-unsigned]");
+    println!("      Run fidelity cases against the sandbox's pinned Bash toolchain.");
+    println!(
+        "  sinomo sandbox toolchain verify-busybox <sandbox-id> [--daemon] [--allow-unsigned]"
+    );
+    println!("      Run fidelity cases against the sandbox's pinned BusyBox toolchain.");
+    println!(
+        "  sinomo sandbox toolchain verify-quickjs <sandbox-id> [--daemon] [--allow-unsigned]"
+    );
+    println!("      Run fidelity cases against the sandbox's pinned QuickJS toolchain.");
+    println!("  sinomo sandbox toolchain verify-python <sandbox-id> [--daemon] [--allow-unsigned]");
+    println!("      Run fidelity cases against the sandbox's pinned CPython/pip toolchain.");
+    println!("  sinomo sandbox toolchain verify-make <sandbox-id> [--daemon] [--allow-unsigned]");
+    println!("      Run fidelity cases against the sandbox's pinned GNU Make WASIX toolchain.");
+    println!("  sinomo sandbox toolchain verify-tcc <sandbox-id> [--daemon] [--allow-unsigned]");
+    println!("      Run fidelity cases against the sandbox's pinned TinyCC WASIX toolchain.");
+    println!(
+        "  sinomo sandbox toolchain verify-coding <sandbox-id> [--daemon] [--allow-unsigned] [--full]"
+    );
+    println!(
+        "      Run coding fidelity cases against one pinned toolchain; --full expects that same sandbox to also provide Bash, Python/pip, Make, and TCC. The maintained full gate script uses separate WASIp1 and WASIX workspaces."
+    );
+    println!("  sinomo sandbox doctor [<sandbox-id>]");
+    println!("      Inspect local sandbox/toolchain readiness and policy compatibility.");
+    println!("  sinomo sandbox policy show");
+    println!("      Show the cluster-scoped sandbox execution policy.");
+    println!(
+        "  sinomo sandbox policy set [--allow-unsigned-toolchains|--require-signed-toolchains] [--allow-remote-local-owned-mounts|--deny-remote-local-owned-mounts] [--allow-mount-prefix <sifs-prefix>] [--allow-http-host <host>] [--max-memory-mb <n>] [--max-wall-time-ms <n>] [--max-input-bytes <n>] [--max-output-bytes <n>] [--max-workspace-bytes <n>] [--max-written-bytes-per-command <n>] [--max-file-count <n>] [--max-http-timeout-ms <n>] [--max-concurrent-commands-per-sandbox <n>] [--max-concurrent-sandboxes-per-node <n>] [--allow-capability <name>] [--allow-toolchain <toolchain-id>] [--allow-toolchain-provenance-prefix <prefix>] [--allow-package-cache-prefix <sifs-prefix>]"
+    );
+    println!("      Update cluster-scoped sandbox execution policy in cluster KV.");
+    println!("  sinomo sandbox logs <sandbox-id> [<command-id>] [--daemon]");
+    println!("      List command history or print stdout/stderr for one command.");
+    println!("  sinomo sandbox ls <sandbox-id> [path] [--daemon]");
+    println!("      List sandbox files.");
+    println!("  sinomo sandbox cat <sandbox-id> <path> [--range <start:end>] [--daemon]");
+    println!("      Print one sandbox file or byte range.");
+    println!(
+        "  sinomo sandbox write <sandbox-id> <path> [--file <host-path>|--stdin|<literal>] [--daemon]"
+    );
+    println!("      Write bytes to one sandbox file.");
+    println!(
+        "  sinomo sandbox fetch <sandbox-id> <url> <output-path> [--daemon] [--timeout-ms <ms>] [--max-response-bytes <n>] [--header <name:value>]"
+    );
+    println!(
+        "      Fetch an allowlisted HTTP(S) URL through daemon-mediated network transport into a sandbox file."
+    );
+    println!("  sinomo sandbox checkpoint <sandbox-id> [--daemon]");
+    println!("      Create a sandbox checkpoint.");
+    println!("  sinomo sandbox resume <sandbox-id> <checkpoint-id> [--daemon]");
+    println!("      Restore a sandbox checkpoint.");
+    println!("  sinomo sandbox reboot <sandbox-id> [--daemon]");
+    println!(
+        "      Start a new sandbox session; clears /tmp unless the instance policy retains it."
+    );
+    println!("  sinomo sandbox destroy <sandbox-id> [--daemon]");
+    println!("      Delete a sandbox instance and all checkpoints.");
+    println!();
+    println!(
+        "Local commands use the local staging backend. Use --daemon on create, status, config, toolchain imports/adds, toolchain verifiers, run, process-plan, shell, logs, ls, cat, write, fetch, checkpoint, resume, reboot, and destroy for the SIFS-backed daemon path. `sandbox process-plan` executes structured steps, not shell syntax. `sandbox shell` only invokes a pinned real `sh` command when the toolchain provides one; it does not fake shell behavior."
+    );
 }
 
 pub(super) fn print_models_help() {

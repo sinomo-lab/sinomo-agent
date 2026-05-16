@@ -106,6 +106,63 @@ impl From<sinomo_dfs::MetadataBackendError> for DaemonError {
     }
 }
 
+impl From<sinomo_sandbox::SandboxStoreError> for DaemonError {
+    fn from(error: sinomo_sandbox::SandboxStoreError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_sandbox::SandboxFsError> for DaemonError {
+    fn from(error: sinomo_sandbox::SandboxFsError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_sandbox::SandboxToolchainError> for DaemonError {
+    fn from(error: sinomo_sandbox::SandboxToolchainError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_sandbox::SandboxEventEmissionError> for DaemonError {
+    fn from(error: sinomo_sandbox::SandboxEventEmissionError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_sandbox::SandboxRecordedHttpFetchError> for DaemonError {
+    fn from(error: sinomo_sandbox::SandboxRecordedHttpFetchError) -> Self {
+        match error {
+            sinomo_sandbox::SandboxRecordedHttpFetchError::Network(
+                sinomo_sandbox::SandboxNetworkError::Transport { detail },
+            ) => Self::Network {
+                address: "sandbox mediated http".to_string(),
+                detail,
+            },
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<sinomo_events::EventStoreError> for DaemonError {
+    fn from(error: sinomo_events::EventStoreError) -> Self {
+        Self::Io {
+            path: "events/event-log.jsonl".to_string(),
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl From<sinomo_rollout::RolloutError> for DaemonError {
     fn from(error: sinomo_rollout::RolloutError) -> Self {
         Self::Io {
