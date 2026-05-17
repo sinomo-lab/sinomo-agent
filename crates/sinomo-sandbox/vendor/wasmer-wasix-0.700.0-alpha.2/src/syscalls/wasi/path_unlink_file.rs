@@ -82,7 +82,9 @@ pub(crate) fn path_unlink_file_internal(
 
     let st_nlink = {
         let mut guard = removed_inode.stat.write().unwrap();
-        guard.st_nlink -= 1;
+        if guard.st_nlink > 0 {
+            guard.st_nlink -= 1;
+        }
         guard.st_nlink
     };
     if st_nlink == 0 {
@@ -106,7 +108,13 @@ pub(crate) fn path_unlink_file_internal(
                 Kind::Symlink { .. } => {
                     // TODO: actually delete real symlinks and do nothing for virtual symlinks
                 }
-                _ => unimplemented!("wasi::path_unlink_file for Buffer"),
+                Kind::Buffer { .. } => {}
+                Kind::Socket { .. }
+                | Kind::PipeRx { .. }
+                | Kind::PipeTx { .. }
+                | Kind::DuplexPipe { .. }
+                | Kind::EventNotifications { .. }
+                | Kind::Epoll { .. } => return Ok(Errno::Inval),
             }
         }
     }

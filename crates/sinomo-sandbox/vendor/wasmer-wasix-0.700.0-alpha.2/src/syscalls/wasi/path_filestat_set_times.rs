@@ -78,9 +78,8 @@ pub(crate) fn path_filestat_set_times_internal(
     fst_flags: Fstflags,
 ) -> Result<(), Errno> {
     let env = ctx.data();
-    let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
+    let (_memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
     let fd_entry = state.fs.get_fd(fd)?;
-    let fd_inode = fd_entry.inode;
     if !fd_entry
         .inner
         .rights
@@ -98,10 +97,9 @@ pub(crate) fn path_filestat_set_times_internal(
         state
             .fs
             .get_inode_at_path(inodes, fd, path, flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0)?;
-    let stat = {
-        let guard = file_inode.read();
-        state.fs.get_stat_for_kind(guard.deref())?
-    };
+
+    let mut atime = None;
+    let mut mtime = None;
 
     if fst_flags.contains(Fstflags::SET_ATIM) || fst_flags.contains(Fstflags::SET_ATIM_NOW) {
         let time_to_set = if fst_flags.contains(Fstflags::SET_ATIM) {
@@ -109,7 +107,8 @@ pub(crate) fn path_filestat_set_times_internal(
         } else {
             get_current_time_in_nanos()?
         };
-        fd_inode.stat.write().unwrap().st_atim = time_to_set;
+        file_inode.stat.write().unwrap().st_atim = time_to_set;
+        atime = Some(time_to_set);
     }
     if fst_flags.contains(Fstflags::SET_MTIM) || fst_flags.contains(Fstflags::SET_MTIM_NOW) {
         let time_to_set = if fst_flags.contains(Fstflags::SET_MTIM) {
@@ -117,7 +116,17 @@ pub(crate) fn path_filestat_set_times_internal(
         } else {
             get_current_time_in_nanos()?
         };
-        fd_inode.stat.write().unwrap().st_mtim = time_to_set;
+        file_inode.stat.write().unwrap().st_mtim = time_to_set;
+        mtime = Some(time_to_set);
+    }
+
+    if let Kind::File {
+        handle: Some(handle),
+        ..
+    } = file_inode.kind.write().unwrap().deref()
+    {
+        let mut handle = handle.write().unwrap();
+        handle.set_times(atime, mtime);
     }
 
     Ok(())

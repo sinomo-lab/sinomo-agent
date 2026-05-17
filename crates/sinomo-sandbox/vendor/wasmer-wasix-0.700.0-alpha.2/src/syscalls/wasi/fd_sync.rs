@@ -59,9 +59,14 @@ pub fn fd_sync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errno
                     return Ok(Errno::Inval);
                 }
             }
-            Kind::Root { .. } | Kind::Dir { .. } => return Ok(Errno::Isdir),
-            Kind::Buffer { .. }
-            | Kind::Symlink { .. }
+            Kind::Root { .. } | Kind::Dir { .. } => {}
+            Kind::Buffer { buffer } => {
+                let size = buffer.len() as u64;
+                drop(guard);
+                let mut stat = inode.stat.write().unwrap();
+                stat.st_size = size;
+            }
+            Kind::Symlink { .. }
             | Kind::Socket { .. }
             | Kind::PipeTx { .. }
             | Kind::PipeRx { .. }

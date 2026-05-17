@@ -19,6 +19,13 @@ impl JournalSyscallPlayer<'_, '_> {
             echo: tty.echo,
             line_buffered: tty.line_buffered,
             line_feeds,
+            tostop: false,
+            foreground_process_group: self
+                .ctx
+                .data()
+                .runtime
+                .tty()
+                .and_then(|bridge| bridge.foreground_process_group()),
         };
 
         JournalEffector::apply_tty_set(&mut self.ctx, state).map_err(anyhow_err_to_runtime_err)?;

@@ -129,9 +129,13 @@ The WASIX variant keeps the same exposed applet list and exists primarily so
 real Bash can launch compatible external commands such as `/bin/grep` and
 `/bin/cat` through the WASIX process substrate. It adds compatibility shims for
 libc surfaces that are absent from the current WASIX sysroot (`major`, `minor`,
-`mknod`, `getgroups`, `fchdir`, `chroot`, and `settimeofday`), returning
-explicit unsupported or permission errors for operations the sandbox does not
-currently provide instead of pretending they succeeded.
+`mknod`, `chroot`, and `settimeofday`). `getgroups`, process-group/session
+calls, terminal foreground-process-group calls, `fchdir`, path/fd `chmod`,
+path/fd no-op ownership changes for the sandbox identity, and the path/fd
+mode-bit side of `stat` are routed to Sinomo's WASIX runtime imports so the
+WASIX applets apply and report real sandbox process and host-backed filesystem
+state. Unsupported operations return explicit unsupported or permission errors
+instead of pretending they succeeded.
 
 The importer stores one WASI module per applet path in the local cache or SIFS
 toolchain store. The source of truth for cluster use is still SIFS:

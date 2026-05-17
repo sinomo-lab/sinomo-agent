@@ -29,8 +29,8 @@ fn write_value(
         Value::F32(value) => write_value!(memory, *offset, max, strict, value),
         Value::F64(value) => write_value!(memory, *offset, max, strict, value),
         Value::V128(value) => write_value!(memory, *offset, max, strict, value),
-        // ExternRef, FuncRef, and ExceptionRef cannot be represented as byte slices
-        _ => panic!("Cannot write non-scalar value as bytes"),
+        // ExternRef, FuncRef, and ExceptionRef cannot be represented as byte slices.
+        _ => Ok(false),
     }
 }
 
@@ -64,8 +64,8 @@ fn read_value(
         Type::F32 => read_value!(memory, *offset, max, strict, f32, F32, 4),
         Type::F64 => read_value!(memory, *offset, max, strict, f64, F64, 8),
         Type::V128 => read_value!(memory, *offset, max, strict, u128, V128, 16),
-        // ExternRef, FuncRef, and ExceptionRef cannot be represented as byte slices
-        _ => panic!("Cannot read non-scalar value from memory"),
+        // ExternRef, FuncRef, and ExceptionRef cannot be represented as byte slices.
+        _ => Ok(None),
     }
 }
 
@@ -155,13 +155,15 @@ pub fn call_dynamic<M: MemorySize>(
     let mut current_results_offset: u64 = results.offset().into();
     let max_results_offset = current_results_offset + results_len.into();
     for result_value in result_values {
-        wasi_try_mem_ok!(write_value(
+        if !wasi_try_mem_ok!(write_value(
             &memory,
             &mut current_results_offset,
             max_results_offset,
             strict,
             &result_value
-        ));
+        )) {
+            return Ok(Errno::Inval);
+        }
     }
 
     if strict && current_results_offset != max_results_offset {

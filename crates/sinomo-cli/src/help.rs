@@ -222,7 +222,9 @@ pub(super) fn print_sandbox_help() {
     println!(
         "  sinomo sandbox toolchain add-command [--daemon] [--toolchain <toolchain-id>] [--version <version>] [--target-abi preview1|wasix] [--provenance <text>] [--capability <name>] [--memory-mb <n>] [--wall-time-ms <n>] [--max-input-bytes <n>] [--max-output-bytes <n>] [--max-workspace-bytes <n>] [--max-written-bytes-per-command <n>] [--max-file-count <n>] <command> <module.wasm>"
     );
-    println!("      Add a real WASI command module to a toolchain; --daemon stores it in SIFS.");
+    println!(
+        "      Add a real WASI command module to a toolchain; WASIX is the default target ABI; --daemon stores it in SIFS."
+    );
     println!(
         "  sinomo sandbox toolchain add-artifact [--daemon] [--toolchain <toolchain-id>] [--version <version>] [--provenance <text>] <lib|share|include|etc/path> <file>"
     );
@@ -231,7 +233,7 @@ pub(super) fn print_sandbox_help() {
         "  sinomo sandbox toolchain import-busybox [--daemon] --version <version> [--provenance <text>] <busybox.wasm>"
     );
     println!(
-        "      Import a real Sinomo-maintained BusyBox WASI module as the default toolchain applets; --daemon stores it in SIFS."
+        "      Import a real Sinomo-maintained BusyBox WASIX module as the default toolchain applets; --daemon stores it in SIFS."
     );
     println!(
         "  sinomo sandbox toolchain import-package [--daemon] [--into <toolchain-id>] <package.json>"

@@ -564,6 +564,8 @@ pub struct WasiFs {
     // It should not be necessary at all.
     is_wasix: AtomicBool,
 
+    fd_limit: AtomicU64,
+
     // The preopens when this was initialized
     pub(crate) init_preopens: Vec<PreopenedDir>,
     // The virtual file system preopens when this was initialized
@@ -581,6 +583,22 @@ impl WasiFs {
         self.is_wasix.store(is_wasix, Ordering::SeqCst);
     }
 
+    pub fn set_fd_limit(&self, fd_limit: u64) {
+        self.fd_limit.store(fd_limit, Ordering::SeqCst);
+    }
+
+    fn fd_limit(&self) -> WasiFd {
+        self.fd_limit.load(Ordering::SeqCst).min(u64::from(WasiFd::MAX)) as WasiFd
+    }
+
+    pub(crate) fn check_fd_index_within_limit(&self, fd: WasiFd) -> Result<(), Errno> {
+        if fd >= self.fd_limit() {
+            Err(Errno::Mfile)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Forking the WasiState is used when either fork or vfork is called
     pub fn fork(&self) -> Self {
         Self {
@@ -588,6 +606,7 @@ impl WasiFs {
             fd_map: RwLock::new(self.fd_map.read().unwrap().clone()),
             current_dir: Mutex::new(self.current_dir.lock().unwrap().clone()),
             is_wasix: AtomicBool::new(self.is_wasix.load(Ordering::Acquire)),
+            fd_limit: AtomicU64::new(self.fd_limit.load(Ordering::Acquire)),
             root_fs: self.root_fs.clone(),
             root_inode: self.root_inode.clone(),
             has_unioned: Mutex::new(self.has_unioned.lock().unwrap().clone()),
@@ -739,6 +758,7 @@ impl WasiFs {
             fd_map: RwLock::new(FdList::new()),
             current_dir: Mutex::new("/".to_string()),
             is_wasix: AtomicBool::new(false),
+            fd_limit: AtomicU64::new(u64::MAX),
             root_fs: fs_backing,
             root_inode,
             has_unioned: Mutex::new(HashSet::new()),
@@ -1071,7 +1091,7 @@ impl WasiFs {
                 let processing_cur_inode = cur_inode.clone();
                 let mut guard = processing_cur_inode.write();
                 match guard.deref_mut() {
-                    Kind::Buffer { .. } => unimplemented!("state::get_inode_at_path for buffers"),
+                    Kind::Buffer { .. } => return Err(Errno::Notdir),
                     Kind::Dir {
                         entries,
                         path,
@@ -1134,12 +1154,8 @@ impl WasiFs {
                                     self.root_fs.readlink(&file).ok().ok_or(Errno::Noent)?;
                                 debug!("attempting to decompose path {:?}", link_value);
 
-                                let (pre_open_dir_fd, relative_path) = if link_value.is_relative() {
-                                    self.path_into_pre_open_and_relative_path(&file)?
-                                } else {
-                                    tracing::error!("Absolute symlinks are not yet supported");
-                                    return Err(Errno::Notsup);
-                                };
+                                let (pre_open_dir_fd, relative_path) =
+                                    self.path_into_pre_open_and_relative_path(&file)?;
                                 loop_for_symlink = true;
                                 symlink_count += 1;
                                 Kind::Symlink {
@@ -1163,9 +1179,7 @@ impl WasiFs {
                                         // a `SocketDgram`?
                                         Filetype::SocketStream
                                     } else {
-                                        unimplemented!(
-                                            "state::get_inode_at_path unknown file type: not file, directory, symlink, char device, block device, fifo, or socket"
-                                        );
+                                        Filetype::Unknown
                                     };
 
                                     let kind = Kind::File {
@@ -1205,9 +1219,42 @@ impl WasiFs {
                                     return Ok(new_inode);
                                 }
                                 #[cfg(not(unix))]
-                                unimplemented!(
-                                    "state::get_inode_at_path unknown file type: not file, directory, or symlink"
-                                );
+                                {
+                                    let kind = Kind::File {
+                                        handle: None,
+                                        path: file.clone(),
+                                        fd: None,
+                                    };
+                                    drop(guard);
+                                    let new_inode = self.create_inode_with_stat(
+                                        inodes,
+                                        kind,
+                                        false,
+                                        file.to_string_lossy().to_string().into(),
+                                        Filestat {
+                                            st_filetype: Filetype::Unknown,
+                                            st_ino: Inode::from_path(path_str).as_u64(),
+                                            st_size: metadata.len(),
+                                            st_ctim: metadata.created(),
+                                            st_mtim: metadata.modified(),
+                                            st_atim: metadata.accessed(),
+                                            ..Filestat::default()
+                                        },
+                                    );
+
+                                    let mut guard = cur_inode.write();
+                                    if let Kind::Dir { entries, .. } = guard.deref_mut() {
+                                        entries.insert(
+                                            component.as_os_str().to_string_lossy().to_string(),
+                                            new_inode.clone(),
+                                        );
+                                    } else {
+                                        unreachable!(
+                                            "Attempted to insert special device into non-directory"
+                                        );
+                                    }
+                                    return Ok(new_inode);
+                                }
                             };
                             drop(guard);
 
@@ -1269,21 +1316,17 @@ impl WasiFs {
                         path_to_symlink,
                         relative_path,
                     } => {
-                        let new_base_dir = *base_po_dir;
-                        let new_base_inode = self.get_fd_inode(new_base_dir)?;
-
-                        // allocate to reborrow mutabily to recur
-                        let new_path = {
-                            /*if let Kind::Root { .. } = self.inodes[base_po_dir].kind {
-                                assert!(false, "symlinks should never be relative to the root");
-                            }*/
+                        let (new_base_dir, new_path) = if relative_path.is_absolute() {
+                            (VIRTUAL_ROOT_FD, relative_path.to_string_lossy().to_string())
+                        } else {
                             let mut base = path_to_symlink.clone();
                             // remove the symlink file itself from the path, leaving just the path from the base
                             // to the dir containing the symlink
                             base.pop();
                             base.push(relative_path);
-                            base.to_string_lossy().to_string()
+                            (*base_po_dir, base.to_string_lossy().to_string())
                         };
+                        let new_base_inode = self.get_fd_inode(new_base_dir)?;
                         debug!("Following symlink recursively");
                         drop(guard);
                         let symlink_inode = self.get_inode_at_path_inner(
@@ -1492,8 +1535,25 @@ impl WasiFs {
 
     pub fn filestat_fd(&self, fd: WasiFd) -> Result<Filestat, Errno> {
         let inode = self.get_fd_inode(fd)?;
-        let guard = inode.stat.read().unwrap();
-        Ok(*guard.deref())
+        let live_stat = {
+            let guard = inode.read();
+            match guard.deref() {
+                Kind::File { .. } | Kind::Buffer { .. } => {
+                    Some(self.get_stat_for_kind(guard.deref())?)
+                }
+                _ => None,
+            }
+        };
+        if let Some(live_stat) = live_stat {
+            let mut cached_stat = inode.stat.write().unwrap();
+            cached_stat.st_size = live_stat.st_size;
+            cached_stat.st_atim = live_stat.st_atim;
+            cached_stat.st_mtim = live_stat.st_mtim;
+            cached_stat.st_ctim = live_stat.st_ctim;
+            return Ok(*cached_stat.deref());
+        }
+        let cached_stat = inode.stat.read().unwrap();
+        Ok(*cached_stat.deref())
     }
 
     pub fn fdstat(&self, fd: WasiFd) -> Result<Fdstat, Errno> {
@@ -1610,8 +1670,7 @@ impl WasiFs {
                         Kind::File {
                             handle: Some(file), ..
                         } => file.clone(),
-                        // TODO: verify this behavior
-                        Kind::Dir { .. } => return Err(Errno::Isdir),
+                        Kind::Root { .. } | Kind::Dir { .. } => return Ok(()),
                         Kind::Buffer { .. } => return Ok(()),
                         _ => return Err(Errno::Io),
                     }
@@ -1685,6 +1744,12 @@ impl WasiFs {
 
         let st_ino = Inode::from_path(&name);
         stat.st_ino = st_ino.as_u64();
+        if stat.st_filetype == Filetype::Unknown {
+            stat.st_filetype = filetype_for_kind(&kind);
+        }
+        if stat.st_nlink == 0 {
+            stat.st_nlink = 1;
+        }
 
         inodes.add_inode_val(InodeVal {
             stat: RwLock::new(stat),
@@ -1769,16 +1834,20 @@ impl WasiFs {
         };
 
         let mut guard = self.fd_map.write().unwrap();
+        let fd_limit = self.fd_limit();
 
         match idx {
             Some(idx) => {
+                if idx >= fd_limit {
+                    return Err(Errno::Mfile);
+                }
                 if guard.insert(exclusive, idx, fd) {
                     Ok(idx)
                 } else {
                     Err(Errno::Exist)
                 }
             }
-            None => Ok(guard.insert_first_free(fd)),
+            None => guard.insert_first_free_below(fd, fd_limit).ok_or(Errno::Mfile),
         }
     }
 
@@ -1793,7 +1862,11 @@ impl WasiFs {
         cloexec: Option<bool>,
     ) -> Result<WasiFd, Errno> {
         let fd = self.get_fd(fd)?;
-        Ok(self.fd_map.write().unwrap().insert_first_free_after(
+        let fd_limit = self.fd_limit();
+        self.fd_map
+            .write()
+            .unwrap()
+            .insert_first_free_after_below(
             Fd {
                 inner: FdInner {
                     rights: fd.inner.rights,
@@ -1814,7 +1887,9 @@ impl WasiFs {
                 is_stdio: fd.is_stdio,
             },
             min_result_fd,
-        ))
+                fd_limit,
+            )
+            .ok_or(Errno::Mfile)
     }
 
     /// Low level function to remove an inode, that is it deletes the WASI FS's
@@ -2151,41 +2226,35 @@ impl WasiFs {
                     .metadata(path)
                     .map_err(fs_error_into_wasi_err)?,
             },
-            Kind::Dir { path, .. } => self
-                .root_fs
-                .metadata(path)
-                .map_err(fs_error_into_wasi_err)?,
-            Kind::Symlink {
-                base_po_dir,
-                path_to_symlink,
-                ..
-            } => {
-                let guard = self.fd_map.read().unwrap();
-                let base_po_inode = &guard.get(*base_po_dir).unwrap().inode;
-                let guard = base_po_inode.read();
-                match guard.deref() {
-                    Kind::Root { .. } => self
-                        .root_fs
-                        .symlink_metadata(path_to_symlink)
-                        .map_err(fs_error_into_wasi_err)?,
-                    Kind::Dir { path, .. } => {
-                        let mut real_path = path.clone();
-                        // PHASE 1: ignore all possible symlinks in `relative_path`
-                        // TODO: walk the segments of `relative_path` via the entries of the Dir
-                        //       use helper function to avoid duplicating this logic (walking this will require
-                        //       &self to be &mut sel
-                        // TODO: adjust size of symlink, too
-                        //      for all paths adjusted think about this
-                        real_path.push(path_to_symlink);
-                        self.root_fs
-                            .symlink_metadata(&real_path)
-                            .map_err(fs_error_into_wasi_err)?
-                    }
-                    // if this triggers, there's a bug in the symlink code
-                    _ => unreachable!(
-                        "Symlink pointing to something that's not a directory as its base preopened directory"
-                    ),
+            Kind::Dir { path, .. } => match self.root_fs.metadata(path) {
+                Ok(md) => md,
+                Err(FsError::EntryNotFound) => {
+                    return Ok(Filestat {
+                        st_filetype: Filetype::Directory,
+                        ..Filestat::default()
+                    });
                 }
+                Err(err) => return Err(fs_error_into_wasi_err(err)),
+            },
+            Kind::Symlink { relative_path, .. } => {
+                return Ok(Filestat {
+                    st_filetype: Filetype::SymbolicLink,
+                    st_size: relative_path.as_os_str().len() as u64,
+                    ..Filestat::default()
+                });
+            }
+            Kind::Buffer { buffer } => {
+                return Ok(Filestat {
+                    st_filetype: Filetype::RegularFile,
+                    st_size: buffer.len() as u64,
+                    ..Filestat::default()
+                });
+            }
+            Kind::Root { .. } => {
+                return Ok(Filestat {
+                    st_filetype: Filetype::Directory,
+                    ..Filestat::default()
+                });
             }
             _ => return Err(Errno::Io),
         };
@@ -2219,6 +2288,28 @@ impl WasiFs {
             }
         }
         Ok(())
+    }
+}
+
+fn filetype_for_kind(kind: &Kind) -> Filetype {
+    match kind {
+        Kind::File { .. } | Kind::Buffer { .. } => Filetype::RegularFile,
+        Kind::Dir { .. } | Kind::Root { .. } => Filetype::Directory,
+        Kind::Symlink { .. } => Filetype::SymbolicLink,
+        Kind::Socket { socket } => match &socket.inner.protected.read().unwrap().kind {
+            InodeSocketKind::TcpStream { .. } => Filetype::SocketStream,
+            InodeSocketKind::Raw { .. } => Filetype::SocketRaw,
+            InodeSocketKind::PreSocket { props, .. } => match props.ty {
+                Socktype::Stream => Filetype::SocketStream,
+                Socktype::Dgram => Filetype::SocketDgram,
+                Socktype::Raw => Filetype::SocketRaw,
+                Socktype::Seqpacket => Filetype::SocketSeqpacket,
+                _ => Filetype::Unknown,
+            },
+            _ => Filetype::Unknown,
+        },
+        Kind::PipeRx { .. } | Kind::PipeTx { .. } | Kind::DuplexPipe { .. } => Filetype::Unknown,
+        Kind::EventNotifications { .. } | Kind::Epoll { .. } => Filetype::Unknown,
     }
 }
 

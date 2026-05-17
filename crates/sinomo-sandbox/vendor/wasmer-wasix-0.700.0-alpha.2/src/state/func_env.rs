@@ -1,7 +1,7 @@
 use tracing::trace;
 use wasmer::{
     AsStoreMut, AsStoreRef, ExportError, FunctionEnv, FunctionEnvMut, Imports, Instance, Memory,
-    Module, Store,
+    MemoryView, Module, Store,
 };
 use wasmer_wasix_types::{wasi::ExitCode, wasix::WasiMemoryLayout};
 
@@ -18,6 +18,129 @@ use crate::{
 };
 
 use super::Linker;
+
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const ROBUST_LIST_MAX_ENTRIES: usize = 4096;
+
+fn cleanup_robust_futex_list(
+    memory: &MemoryView,
+    state: &crate::state::WasiState,
+    tid: u32,
+    head: u64,
+    len: u64,
+) {
+    if head == 0 {
+        return;
+    }
+
+    let word_size = if len >= 24 { 8 } else { 4 };
+    let Some(futex_offset) = read_guest_signed_word(memory, head.saturating_add(word_size), word_size)
+    else {
+        return;
+    };
+    let Some(list_op_pending) =
+        read_guest_pointer(memory, head.saturating_add(word_size * 2), word_size)
+    else {
+        return;
+    };
+
+    mark_robust_futex_owner_died(memory, state, tid, list_op_pending, futex_offset);
+
+    let mut entry = match read_guest_pointer(memory, head, word_size) {
+        Some(entry) => entry,
+        None => return,
+    };
+    let mut remaining = ROBUST_LIST_MAX_ENTRIES;
+    while entry != 0 && entry != head && remaining > 0 {
+        let next = match read_guest_pointer(memory, entry, word_size) {
+            Some(next) => next,
+            None => break,
+        };
+        mark_robust_futex_owner_died(memory, state, tid, entry, futex_offset);
+        entry = next;
+        remaining -= 1;
+    }
+}
+
+fn mark_robust_futex_owner_died(
+    memory: &MemoryView,
+    state: &crate::state::WasiState,
+    tid: u32,
+    entry: u64,
+    futex_offset: i64,
+) {
+    if entry == 0 {
+        return;
+    }
+    let Some(futex_address) = guest_address_add(entry, futex_offset) else {
+        return;
+    };
+    let Some(owner) = read_guest_u32(memory, futex_address) else {
+        return;
+    };
+    if owner & FUTEX_TID_MASK != tid & FUTEX_TID_MASK {
+        return;
+    }
+    if write_guest_u32(memory, futex_address, owner | FUTEX_OWNER_DIED) {
+        crate::syscalls::wasix::wake_futex_address(state, futex_address, u32::MAX, 1);
+    }
+}
+
+fn read_guest_pointer(memory: &MemoryView, address: u64, word_size: u64) -> Option<u64> {
+    match word_size {
+        4 => read_guest_u32(memory, address).map(u64::from),
+        8 => read_guest_u64(memory, address),
+        _ => None,
+    }
+}
+
+fn read_guest_signed_word(memory: &MemoryView, address: u64, word_size: u64) -> Option<i64> {
+    match word_size {
+        4 => read_guest_u32(memory, address).map(|value| value as i32 as i64),
+        8 => read_guest_u64(memory, address).map(|value| value as i64),
+        _ => None,
+    }
+}
+
+fn read_guest_u32(memory: &MemoryView, address: u64) -> Option<u32> {
+    let start = usize::try_from(address).ok()?;
+    let end = start.checked_add(4)?;
+    let data = unsafe { memory.data_unchecked() };
+    let bytes = data.get(start..end)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_guest_u64(memory: &MemoryView, address: u64) -> Option<u64> {
+    let start = usize::try_from(address).ok()?;
+    let end = start.checked_add(8)?;
+    let data = unsafe { memory.data_unchecked() };
+    let bytes = data.get(start..end)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn write_guest_u32(memory: &MemoryView, address: u64, value: u32) -> bool {
+    let Some(start) = usize::try_from(address).ok() else {
+        return false;
+    };
+    let Some(end) = start.checked_add(4) else {
+        return false;
+    };
+    let data = unsafe { memory.data_unchecked_mut() };
+    let Some(bytes) = data.get_mut(start..end) else {
+        return false;
+    };
+    bytes.copy_from_slice(&value.to_le_bytes());
+    true
+}
+
+fn guest_address_add(base: u64, offset: i64) -> Option<u64> {
+    if offset >= 0 {
+        base.checked_add(offset as u64)
+    } else {
+        base.checked_sub(offset.unsigned_abs())
+    }
+}
 
 /// The default stack size for WASIX - the number itself is the default that compilers
 /// have used in the past when compiling WASM apps.
@@ -335,6 +458,8 @@ impl WasiFunctionEnv {
             self.data(store).tid()
         );
 
+        self.cleanup_thread_exit_user_memory(store);
+
         if let Some(linker) = self.data(store).inner().linker().cloned() {
             // Note: this call will also process pending dl operations, hence unblocking
             // other threads that may be waiting for this one to pick the operation up
@@ -345,6 +470,29 @@ impl WasiFunctionEnv {
 
         // Cleans up all the open files (if this is the main thread)
         self.data(store).blocking_on_exit(process_exit_code);
+    }
+
+    fn cleanup_thread_exit_user_memory(&self, store: &impl AsStoreRef) {
+        let env = self.data(store);
+        let tid = env.tid().raw();
+        let clear_child_tid = env.thread.clear_child_tid();
+        let robust_list = env.thread.robust_list();
+        let Some(memory) = env.try_memory_view(store) else {
+            return;
+        };
+
+        if clear_child_tid != 0 && write_guest_u32(&memory, clear_child_tid, 0) {
+            crate::syscalls::wasix::wake_futex_address(
+                env.state(),
+                clear_child_tid,
+                u32::MAX,
+                1,
+            );
+        }
+
+        if let Some((head, len)) = robust_list {
+            cleanup_robust_futex_list(&memory, env.state(), tid, head, len);
+        }
     }
 
     /// Bootstraps this main thread and context with any journals that

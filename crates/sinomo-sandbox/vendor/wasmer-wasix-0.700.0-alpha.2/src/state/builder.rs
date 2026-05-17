@@ -24,7 +24,7 @@ use crate::{
     syscalls::types::{__WASI_STDERR_FILENO, __WASI_STDIN_FILENO, __WASI_STDOUT_FILENO},
 };
 use wasmer_types::ModuleHash;
-use wasmer_wasix_types::wasi::SignalDisposition;
+use wasmer_wasix_types::wasi::{Disposition, SignalDisposition};
 
 use super::env::WasiEnvInit;
 
@@ -925,7 +925,13 @@ impl WasiEnvBuilder {
             futexs: Default::default(),
             clock_offset: Default::default(),
             envs: std::sync::Mutex::new(conv_env_vars(self.envs)),
-            signals: std::sync::Mutex::new(self.signals.iter().map(|s| (s.sig, s.disp)).collect()),
+            signals: std::sync::Mutex::new(
+                self.signals
+                    .iter()
+                    .filter(|s| !matches!(s.disp, Disposition::Default))
+                    .map(|s| (s.sig, s.disp))
+                    .collect(),
+            ),
         };
 
         let runtime = self.runtime.unwrap_or_else(|| {
@@ -946,6 +952,7 @@ impl WasiEnvBuilder {
                         )
                         .clone()
                 );
+                runtime.set_tty(Arc::new(crate::runtime::DefaultTty::default()));
                 #[cfg(feature = "journal")]
                 for journal in self.read_only_journals.clone() {
                     runtime.add_read_only_journal(journal);

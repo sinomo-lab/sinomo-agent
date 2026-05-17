@@ -41,11 +41,29 @@ pub const SANDBOX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 pub const SANDBOX_WASIX_MAX_TASKS: usize = 64;
 pub const SANDBOX_NETWORK_HTTP_CAPABILITY: &str = "network.http";
 pub const SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY: &str = "child-process-exec";
+pub const SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY: &str = "wasix.asyncified-fork";
 pub const SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY: &str = "wasix.unpinned-child-exec";
 pub const SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY: &str = "pinned-child-exec-containment";
 pub const SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY: &str = "preview1.pinned-subprocess";
-pub const SANDBOX_MVP_VIRTUAL_DEVICES: &[&str] =
-    &["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
+pub const SANDBOX_MVP_VIRTUAL_DEVICES: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/full",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/tty",
+    "/dev/console",
+    "/dev/ptmx",
+    "/dev/fd",
+    "/dev/fd/0",
+    "/dev/fd/1",
+    "/dev/fd/2",
+    "/dev/pts",
+    "/dev/shm",
+];
 pub const SANDBOX_WASI_ZERO_DEVICE_BYTES: usize = 1024 * 1024;
 pub const SINOMO_SANDBOX_WASI_EXT_MODULE: &str = "sinomo_sandbox_preview1";
 pub const SINOMO_SANDBOX_WASI_PATH_CHMOD: &str = "path_chmod";

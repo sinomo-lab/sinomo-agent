@@ -9,10 +9,11 @@ use crate::{
     import_object_for_all_wasi_versions,
     os::task::{
         control_plane::ControlPlaneError,
-        process::{WasiProcess, WasiProcessId},
+        process::{WasiProcess, WasiProcessId, signal_default_stops, signal_default_terminates},
+        TaskStatus,
         thread::{WasiMemoryLayout, WasiThread, WasiThreadHandle, WasiThreadId},
     },
-    syscalls::platform_clock_time_get,
+    syscalls::{platform_clock_time_get, sync_process_metadata},
 };
 use futures::future::BoxFuture;
 use rand::Rng;
@@ -35,7 +36,7 @@ use wasmer_config::package::PackageSource;
 use wasmer_types::ModuleHash;
 use wasmer_wasix_types::{
     types::Signal,
-    wasi::{Errno, ExitCode, Snapshot0Clockid},
+    wasi::{Disposition, Errno, ExitCode, Snapshot0Clockid},
     wasix::ThreadStartType,
 };
 use webc::metadata::annotations::Wasi;
@@ -224,9 +225,17 @@ impl WasiEnv {
         WasiEnvBuilder::new(program_name)
     }
 
+    pub fn sync_process_resource_limits(&self) {
+        self.state
+            .fs
+            .set_fd_limit(self.process.open_file_descriptor_limit());
+    }
+
     /// Forking the WasiState is used when either fork or vfork is called
     pub fn fork(&self) -> Result<(Self, WasiThreadHandle), ControlPlaneError> {
-        let process = self.control_plane.new_process(self.process.module_hash)?;
+        let mut process = self.control_plane.new_process(self.process.module_hash)?;
+        process.set_parent_pid(self.process.pid());
+        process.inherit_job_control_from(&self.process);
         let handle = process.new_thread(self.layout.clone(), ThreadStartType::MainThread)?;
 
         let thread = handle.as_thread();
@@ -257,6 +266,7 @@ impl WasiEnv {
             disable_fs_cleanup: self.disable_fs_cleanup,
             context_switching_environment: None,
         };
+        sync_process_metadata(&new_env);
         Ok((new_env, handle))
     }
 
@@ -320,6 +330,7 @@ impl WasiEnv {
             self.thread.memory_layout().clone(),
             self.thread.thread_start_type(),
         );
+        sync_process_metadata(self);
 
         Ok(())
     }
@@ -403,6 +414,12 @@ impl WasiEnv {
             context_switching_environment: None,
         };
         env.owned_handles.push(thread);
+        if let Some(bridge) = env.runtime.tty()
+            && bridge.foreground_process_group().is_none()
+        {
+            bridge.set_foreground_process_group(env.process.pgid().raw());
+        }
+        sync_process_metadata(&env);
 
         // TODO: should not be here - should be callers responsibility!
         for pkg in &init.webc_dependencies {
@@ -661,29 +678,96 @@ impl WasiEnv {
         if !inner.signal_set {
             let signals = env.thread.pop_signals();
             if !signals.is_empty() {
-                for sig in signals {
-                    if sig == Signal::Sigint
-                        || sig == Signal::Sigquit
-                        || sig == Signal::Sigkill
-                        || sig == Signal::Sigabrt
-                        || sig == Signal::Sigpipe
-                    {
-                        let exit_code = env.thread.set_or_get_exit_code_for_signal(sig);
-                        return Err(WasiError::Exit(exit_code));
-                    } else {
-                        tracing::trace!(pid=%env.pid(), ?sig, "Signal ignored");
-                    }
-                }
-                return Ok(Ok(true));
+                let processed = Self::process_default_signal_batch(ctx, signals)?;
+                Self::suspend_if_stopped(ctx, processed)
+            } else {
+                Self::suspend_if_stopped(ctx, false)
+            }
+        } else {
+            // Check for forced exit
+            if let Some(forced_exit) = env.should_exit() {
+                return Err(WasiError::Exit(forced_exit));
+            }
+
+            let processed = match Self::process_signals(ctx)? {
+                Ok(processed) => processed,
+                Err(err) => return Ok(Err(err)),
+            };
+            Self::suspend_if_stopped(ctx, processed)
+        }
+    }
+
+    fn process_default_signal_batch(
+        ctx: &mut FunctionEnvMut<'_, Self>,
+        signals: Vec<Signal>,
+    ) -> Result<bool, WasiError> {
+        let env = ctx.data();
+        if signals.is_empty() {
+            return Ok(false);
+        }
+        for sig in signals {
+            if sig == Signal::Sigkill {
+                let exit_code = env.thread.set_or_get_exit_code_for_signal(sig);
+                return Err(WasiError::Exit(exit_code));
+            }
+            if sig == Signal::Sigstop {
+                env.thread.set_status_stopped(sig);
+                continue;
+            }
+            if matches!(
+                ctx.data().state.signals.lock().unwrap().get(&sig),
+                Some(Disposition::Ignore)
+            ) {
+                tracing::trace!(pid=%env.pid(), ?sig, "Signal ignored by disposition");
+                continue;
+            }
+            if signal_default_stops(sig) {
+                env.thread.set_status_stopped(sig);
+                env.process.notify_parent_child_status_changed();
+            } else if signal_default_terminates(sig) {
+                let exit_code = env.thread.set_or_get_exit_code_for_signal(sig);
+                return Err(WasiError::Exit(exit_code));
+            } else {
+                tracing::trace!(pid=%env.pid(), ?sig, "Signal ignored");
             }
         }
+        Ok(true)
+    }
 
-        // Check for forced exit
-        if let Some(forced_exit) = env.should_exit() {
-            return Err(WasiError::Exit(forced_exit));
+    fn suspend_if_stopped(
+        ctx: &mut FunctionEnvMut<'_, Self>,
+        mut processed: bool,
+    ) -> WasiResult<bool> {
+        loop {
+            let env = ctx.data();
+            if let Some(forced_exit) = env.should_exit() {
+                return Err(WasiError::Exit(forced_exit));
+            }
+
+            let TaskStatus::Stopped(signal) = env.thread.status() else {
+                return Ok(Ok(processed));
+            };
+            tracing::trace!(pid=%env.pid(), ?signal, "suspending stopped WASIX thread");
+
+            let thread = env.thread.clone();
+            block_on(thread.wait_for_signal());
+            let env = ctx.data();
+            let signals = env.thread.pop_signals();
+            if signals.is_empty() {
+                continue;
+            }
+            processed = true;
+
+            let env_inner = env
+                .try_inner()
+                .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
+            let inner = env_inner.main_module_instance_handles();
+            if !inner.signal_set {
+                Self::process_default_signal_batch(ctx, signals)?;
+            } else {
+                Self::process_signals_internal(ctx, signals)?;
+            }
         }
-
-        Self::process_signals(ctx)
     }
 
     /// Porcesses any signals that are batched up
@@ -727,20 +811,29 @@ impl WasiEnv {
                 let mut has_signal_interval = false;
                 let inner = env.process.inner.0.lock().unwrap();
                 if !inner.signal_intervals.is_empty() {
-                    now = platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000).unwrap()
-                        as u128;
-                    for signal in inner.signal_intervals.values() {
-                        let elapsed = now - signal.last_signal;
-                        if elapsed >= signal.interval.as_nanos() {
-                            has_signal_interval = true;
-                            break;
+                    match platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000) {
+                        Ok(current_time) => {
+                            now = current_time as u128;
+                            for signal in inner.signal_intervals.values() {
+                                let elapsed = now.saturating_sub(signal.last_signal);
+                                if elapsed >= signal.interval.as_nanos() {
+                                    has_signal_interval = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                %err,
+                                "failed to read monotonic clock for signal processing"
+                            );
                         }
                     }
                 }
                 if has_signal_interval {
                     let mut inner = env.process.inner.0.lock().unwrap();
                     for signal in inner.signal_intervals.values_mut() {
-                        let elapsed = now - signal.last_signal;
+                        let elapsed = now.saturating_sub(signal.last_signal);
                         if elapsed >= signal.interval.as_nanos() {
                             signal.last_signal = now;
                             signals.push(signal.signal);
@@ -752,6 +845,28 @@ impl WasiEnv {
             for signal in signals {
                 // Skip over Sigwakeup, which is host-side-only
                 if matches!(signal, Signal::Sigwakeup) {
+                    continue;
+                }
+                if signal == Signal::Sigkill {
+                    let exit_code = ctx.data().thread.set_or_get_exit_code_for_signal(signal);
+                    return Err(WasiError::Exit(exit_code));
+                }
+                if signal == Signal::Sigstop {
+                    ctx.data().thread.set_status_stopped(signal);
+                    ctx.data().process.notify_parent_child_status_changed();
+                    continue;
+                }
+                if !matches!(signal, Signal::Sigkill | Signal::Sigstop)
+                    && matches!(
+                        ctx.data().state.signals.lock().unwrap().get(&signal),
+                        Some(Disposition::Ignore)
+                    )
+                {
+                    tracing::trace!(
+                        pid=%ctx.data().pid(),
+                        ?signal,
+                        "Signal ignored by disposition before handler",
+                    );
                     continue;
                 }
 
@@ -1312,6 +1427,7 @@ impl WasiEnv {
 
                 // Terminate the process
                 process.terminate(process_exit_code);
+                process.notify_parent_child_status_changed();
             })
         } else {
             Box::pin(async {})

@@ -22,6 +22,7 @@ pub(super) fn run_wasix_process_tree(
     program_name: &str,
     module: wasmer::Module,
     module_hash: wasmer_types::ModuleHash,
+    memory_limit_bytes: usize,
     timeout_ms: u64,
     cancellation: crate::SandboxCancellation,
 ) -> Result<Result<ExitCode, Arc<WasiRuntimeError>>, SandboxWasiError> {
@@ -43,6 +44,12 @@ pub(super) fn run_wasix_process_tree(
     let runtime = env.runtime.clone();
     let tasks = runtime.task_manager().clone();
     let process = env.process.clone();
+    process.set_sandbox_resource_limits(
+        memory_limit_bytes as u64,
+        timeout_ms,
+        SANDBOX_WASIX_MAX_TASKS as u64,
+    );
+    env.sync_process_resource_limits();
     let budget_guard = WasixProcessBudgetGuard::start(timeout_ms, cancellation, process);
     let timeout_process = env.process.clone();
 
@@ -96,8 +103,9 @@ pub(super) fn run_wasix_process_tree(
                     detail: format!("wait for WASIX process tree: {error}"),
                 })
         },
-    )??;
+    );
     budget_guard.finish();
+    let wait_result = wait_result??;
     if let Some(error) = budget_guard.termination_error(
         timeout_ms,
         metering_exhausted.load(std::sync::atomic::Ordering::SeqCst),

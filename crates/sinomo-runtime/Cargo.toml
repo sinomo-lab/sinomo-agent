@@ -10,7 +10,7 @@ rust-version.workspace = true
 ring = "r0-r1-boundary"
 
 [features]
-default = []
+default = ["wasix-runtime"]
 wasix-runtime = ["sinomo-sandbox/wasix-runtime"]
 
 [dependencies]

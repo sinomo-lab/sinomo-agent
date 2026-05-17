@@ -1,8 +1,8 @@
-use virtual_fs::Pipe;
+use virtual_fs::{NullFile, Pipe};
 use wasmer_wasix_types::wasi::ProcessHandles;
 
 use super::*;
-use crate::syscalls::*;
+use crate::{fs::Inode, syscalls::*};
 
 /// Spawns a new process within the context of this machine
 ///
@@ -55,13 +55,17 @@ pub fn proc_spawn<M: MemorySize>(
         .record("working_dir", working_dir.as_str());
 
     if chroot == Bool::True {
-        warn!("chroot is not currently supported");
-        return Ok(Errno::Notsup);
+        trace!("spawned process uses the inherited sandbox virtual root");
     }
 
     let args = parse_wasix_line_encoded_strings(&args);
 
     let preopen = parse_wasix_line_encoded_strings(&preopen);
+    let name = if name.starts_with('/') {
+        name
+    } else {
+        ctx.data().state.fs.relative_path_to_absolute(name)
+    };
 
     let (handles, ctx) = match proc_spawn_internal(
         ctx,
@@ -95,7 +99,9 @@ pub fn proc_spawn_internal(
     stdout: WasiStdioMode,
     stderr: WasiStdioMode,
 ) -> WasiResult<(ProcessHandles, FunctionEnvMut<'_, WasiEnv>)> {
-    let env = ctx.data();
+    if ctx.data().process.child_process_limit_reached() {
+        return Ok(Err(Errno::Again));
+    }
 
     // Fork the current environment and set the new arguments
     let (mut child_env, handle) = match ctx.data().fork() {
@@ -106,32 +112,30 @@ pub fn proc_spawn_internal(
         }
     };
     let child_process = child_env.process.clone();
-    if let Some(args) = args {
-        let mut child_state = env.state.fork();
-        child_state.args = std::sync::Mutex::new(args);
-        child_env.state = Arc::new(child_state);
-    }
+    let child_pid = child_env.pid();
+    _prepare_wasi(&mut child_env, args, None, None);
+    child_env.process.set_executable_path(name.clone());
 
-    // Take ownership of this child
-    ctx.data_mut().owned_handles.push(handle);
-    let env = ctx.data();
-
-    // Preopen
+    // The child environment is forked from the parent and already carries the
+    // sandbox VFS plus the current preopen set. Some WASIX libc paths pass the
+    // preopen list through proc_spawn as metadata; accepting it here preserves
+    // real inherited-preopen behavior instead of failing the spawn before the
+    // child process can run.
     if let Some(preopen) = preopen
         && !preopen.is_empty()
     {
         for preopen in preopen {
-            warn!(
-                "preopens are not yet supported for spawned processes [{}]",
-                preopen
-            );
+            trace!("spawned process inherits preopen [{}]", preopen);
         }
-        return Ok(Err(Errno::Notsup));
     }
 
     // Change the current directory
     if let Some(working_dir) = working_dir {
-        child_env.state.fs.set_current_dir(working_dir.as_str());
+        let working_dir = child_env.state.fs.relative_path_to_absolute(working_dir);
+        if let Err(err) = chdir_internal(&child_env, &working_dir) {
+            ctx.data().control_plane.remove_process(child_pid);
+            return Ok(Err(err));
+        }
     }
 
     // Replace the STDIO
@@ -189,10 +193,44 @@ pub fn proc_spawn_internal(
                         fd: pipe,
                     })
                 }
-                WasiStdioMode::Inherit => Ok(OptionFd {
+                WasiStdioMode::Inherit | WasiStdioMode::Log => Ok(OptionFd {
                     tag: OptionTag::None,
                     fd: u32::MAX,
                 }),
+                WasiStdioMode::Null => {
+                    let rights = Rights::FD_DATASYNC
+                        | Rights::FD_READ
+                        | Rights::FD_SYNC
+                        | Rights::FD_WRITE
+                        | Rights::FD_ADVISE
+                        | Rights::FD_FILESTAT_GET
+                        | Rights::FD_FDSTAT_SET_FLAGS
+                        | Rights::POLL_FD_READWRITE;
+                    let name = match fd {
+                        0 => "stdin",
+                        1 => "stdout",
+                        2 => "stderr",
+                        _ => "stdio",
+                    };
+                    let fd_flags = if fd == 0 {
+                        Fdflags::empty()
+                    } else {
+                        Fdflags::APPEND
+                    };
+                    child_state.fs.create_std_dev_inner(
+                        child_inodes,
+                        Box::<NullFile>::default(),
+                        name,
+                        fd,
+                        rights,
+                        fd_flags,
+                        Inode::from_path(&format!("stdio-null-{fd}")),
+                    );
+                    Ok(OptionFd {
+                        tag: OptionTag::None,
+                        fd: u32::MAX,
+                    })
+                }
                 _ => {
                     child_state.fs.close_fd(fd);
                     Ok(OptionFd {
@@ -206,22 +244,30 @@ pub fn proc_spawn_internal(
         // this code, so the implementation isn't tested at all
         let stdin = match conv_stdio_mode(stdin, 0, true) {
             Ok(a) => a,
-            Err(err) => return Ok(Err(err)),
+            Err(err) => {
+                ctx.data().control_plane.remove_process(child_pid);
+                return Ok(Err(err));
+            }
         };
         let stdout = match conv_stdio_mode(stdout, 1, false) {
             Ok(a) => a,
-            Err(err) => return Ok(Err(err)),
+            Err(err) => {
+                ctx.data().control_plane.remove_process(child_pid);
+                return Ok(Err(err));
+            }
         };
         let stderr = match conv_stdio_mode(stderr, 2, false) {
             Ok(a) => a,
-            Err(err) => return Ok(Err(err)),
+            Err(err) => {
+                ctx.data().control_plane.remove_process(child_pid);
+                return Ok(Err(err));
+            }
         };
         (stdin, stdout, stderr)
     };
 
     // Create the new process
     let bin_factory = Box::new(ctx.data().bin_factory.clone());
-    let child_pid = child_env.pid();
 
     let mut builder = Some(child_env);
 
@@ -233,19 +279,31 @@ pub fn proc_spawn_internal(
                 error!("builtin failed - {}", err);
             }
             // Now we actually spawn the process
-            let child_work = bin_factory.spawn(name, builder.take().unwrap());
+            let Some(child_env) = builder.take() else {
+                warn!("failed to spawn as builtin probing consumed child environment");
+                ctx.data().control_plane.remove_process(child_pid);
+                return Ok(Err(Errno::Noexec));
+            };
+            let child_work = bin_factory.spawn(name, child_env);
 
             match __asyncify(&mut ctx, None, async move { Ok(child_work.await) })?
                 .map_err(|err| Errno::Unknown)
             {
                 Ok(Ok(a)) => a,
-                Ok(Err(err)) => return Ok(Err(conv_spawn_err_to_errno(&err))),
-                Err(err) => return Ok(Err(err)),
+                Ok(Err(err)) => {
+                    ctx.data().control_plane.remove_process(child_pid);
+                    return Ok(Err(conv_spawn_err_to_errno(&err)));
+                }
+                Err(err) => {
+                    ctx.data().control_plane.remove_process(child_pid);
+                    return Ok(Err(err));
+                }
             }
         }
     };
 
     // Add the process to the environment state
+    ctx.data_mut().owned_handles.push(handle);
     {
         let mut inner = ctx.data().process.lock();
         inner.children.push(child_process);

@@ -4,6 +4,7 @@ use wasmer_wasix_types::wasi::ProcSpawnFdOpName;
 use super::*;
 use crate::{
     VIRTUAL_ROOT_FD, WasiFs,
+    fs::{Inode, InodeGuard},
     os::task::{OwnedTaskStatus, TaskStatus},
     syscalls::*,
 };
@@ -106,11 +107,15 @@ pub fn proc_spawn2<M: MemorySize>(
             FindExecutableResult::AccessError => return Ok(Errno::Access),
             FindExecutableResult::NotFound => return Ok(Errno::Noexec),
         }
-    } else if name.starts_with("./") {
+    } else if !name.starts_with('/') {
         name = ctx.data().state.fs.relative_path_to_absolute(name);
     }
 
     Span::current().record("full_path", &name);
+
+    if ctx.data().process.child_process_limit_reached() {
+        return Ok(Errno::Again);
+    }
 
     // Fork the environment which will copy all the open file handlers
     // and associate a new context but otherwise shares things like the
@@ -124,24 +129,22 @@ pub fn proc_spawn2<M: MemorySize>(
             return Ok(Errno::Perm);
         }
     };
+    let child_process = child_env.process.clone();
 
-    {
-        let mut inner = ctx.data().process.lock();
-        inner.children.push(child_env.process.clone());
-    }
-
-    // Setup some properties in the child environment
     let pid = child_env.pid();
     let tid = child_env.tid();
-    wasi_try_mem_ok!(ret.write(&memory, pid.raw()));
     Span::current()
         .record("pid", pid.raw())
         .record("tid", tid.raw());
 
     _prepare_wasi(&mut child_env, Some(args), envs, signals);
+    child_env.process.set_executable_path(name.clone());
 
     for fd_op in fd_ops {
-        wasi_try_ok!(apply_fd_op(&mut child_env, &memory, &fd_op));
+        if let Err(err) = apply_fd_op(&mut child_env, &memory, &fd_op) {
+            ctx.data().control_plane.remove_process(pid);
+            return Ok(err);
+        }
     }
 
     // Create the process and drop the context
@@ -156,7 +159,11 @@ pub fn proc_spawn2<M: MemorySize>(
                 error!("builtin failed - {}", err);
             }
 
-            let env = builder.take().unwrap();
+            let Some(env) = builder.take() else {
+                warn!("failed to spawn as builtin probing consumed child environment");
+                ctx.data().control_plane.remove_process(pid);
+                return Ok(Errno::Noexec);
+            };
 
             // Spawn a new process with this current execution environment
             block_on(bin_factory.spawn(name, env))
@@ -166,15 +173,22 @@ pub fn proc_spawn2<M: MemorySize>(
     match process {
         Ok(_) => {
             ctx.data_mut().owned_handles.push(child_handle);
+            {
+                let mut inner = ctx.data().process.lock();
+                inner.children.push(child_process);
+            }
+            let memory = unsafe { ctx.data().memory_view(&ctx) };
+            wasi_try_mem_ok!(ret.write(&memory, pid.raw()));
             trace!(child_pid = %pid, "spawned sub-process");
             Ok(Errno::Success)
         }
         Err(err) => {
-            let err_exit_code = conv_spawn_err_to_exit_code(&err);
+            let errno = conv_spawn_err_to_errno(&err);
 
-            debug!(child_pid = %pid, "process failed with (err={})", err_exit_code);
+            debug!(child_pid = %pid, "process failed with (err={})", errno);
 
-            Ok(Errno::Noexec)
+            ctx.data().control_plane.remove_process(pid);
+            Ok(errno)
         }
     }
 }
@@ -193,9 +207,24 @@ fn apply_fd_op<M: MemorySize>(
                 trace!("Skipping close FD action for pre-opened FD ({})", op.fd);
                 return Ok(());
             }
-            env.state.fs.close_fd(op.fd)
+            match env.state.fs.close_fd(op.fd) {
+                Ok(()) | Err(Errno::Badf) => Ok(()),
+                Err(err) => Err(err),
+            }
         }
         ProcSpawnFdOpName::Dup2 => {
+            if op.src_fd == op.fd {
+                let mut fd_map = env.state.fs.fd_map.write().unwrap();
+                let Some(fd_entry) = fd_map.get_mut(op.src_fd) else {
+                    return Err(Errno::Badf);
+                };
+                let mut fd_flags = fd_entry.fd_flags;
+                fd_flags.set(Fdflagsext::CLOEXEC, false);
+                fd_entry.fd_flags = fd_flags;
+                return Ok(());
+            }
+            env.state.fs.check_fd_index_within_limit(op.fd)?;
+
             if let Ok(fd) = env.state.fs.get_fd(op.fd)
                 && !fd.is_stdio
                 && fd.inode.is_preopened
@@ -221,7 +250,7 @@ fn apply_fd_op<M: MemorySize>(
                 // TODO: verify this is correct
                 inner: FdInner {
                     offset: fd_entry.inner.offset.clone(),
-                    rights: fd_entry.inner.rights_inheriting,
+                    rights: fd_entry.inner.rights,
                     fd_flags: {
                         let mut f = fd_entry.inner.fd_flags;
                         f.set(Fdflagsext::CLOEXEC, false);
@@ -234,7 +263,9 @@ fn apply_fd_op<M: MemorySize>(
             };
 
             // Exclusive insert because we expect `to` to be empty after closing it above
-            fd_map.insert(true, op.fd, new_fd_entry);
+            if !fd_map.insert(true, op.fd, new_fd_entry) {
+                return Err(Errno::Exist);
+            }
             Ok(())
         }
         ProcSpawnFdOpName::Open => {
@@ -286,9 +317,19 @@ fn apply_fd_op<M: MemorySize>(
             let fd = env.state.fs.get_fd(op.fd)?;
             let inode_kind = fd.inode.read();
             match inode_kind.deref() {
-                Kind::Dir { path, .. } => {
-                    let path = path.to_str().ok_or(Errno::Notsup)?;
-                    env.state.fs.set_current_dir(path);
+                Kind::Root { .. } => {
+                    env.state.fs.set_current_dir("/");
+                    Ok(())
+                }
+                Kind::Dir { .. } => {
+                    drop(inode_kind);
+                    let path = virtual_path_for_inode(
+                        &env.state.fs.root_inode,
+                        fd.inode.ino(),
+                        "/",
+                        0,
+                    )?;
+                    env.state.fs.set_current_dir(&path);
                     Ok(())
                 }
                 _ => Err(Errno::Notdir),
@@ -296,4 +337,44 @@ fn apply_fd_op<M: MemorySize>(
         }
         _ => Err(Errno::Inval),
     }
+}
+
+fn virtual_path_for_inode(
+    current: &InodeGuard,
+    target: Inode,
+    path: &str,
+    depth: u32,
+) -> Result<String, Errno> {
+    if current.ino() == target {
+        return Ok(path.to_string());
+    }
+    if depth > 256 {
+        return Err(Errno::Loop);
+    }
+
+    let children = {
+        let guard = current.read();
+        match guard.deref() {
+            Kind::Root { entries } | Kind::Dir { entries, .. } => entries
+                .iter()
+                .map(|(name, inode)| (name.to_string(), inode.clone()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        }
+    };
+
+    for (name, child) in children {
+        let child_path = if path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{path}/{name}")
+        };
+        match virtual_path_for_inode(&child, target, &child_path, depth + 1) {
+            Ok(path) => return Ok(path),
+            Err(Errno::Noent) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(Errno::Noent)
 }

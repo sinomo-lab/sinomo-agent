@@ -184,6 +184,7 @@ fn busybox_toolchain_spec_registers_core_applets_locally() {
     let manifest = install_busybox_toolchain_to_local_store(&store, &spec, b"busybox module")
         .expect("install");
 
+    assert_eq!(manifest.target_abi, SandboxWasiAbi::Wasix);
     assert_eq!(manifest.commands.len(), BUSYBOX_TOOLCHAIN_COMMANDS.len());
     for command in ["cat", "grep", "find", "printf", "sha256sum"] {
         assert_eq!(
@@ -258,26 +259,53 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
         .collect();
     assert_eq!(gap_commands.len(), SANDBOX_MVP_COMMAND_GAPS.len());
     assert!(
-        !sandbox_runtime_supports_child_processes(),
-        "child processes should not be marked supported before forked pipelines are real"
+        sandbox_runtime_supports_child_processes(),
+        "the default WASIX runtime should report child-process execution support"
     );
     let process_capabilities = sandbox_runtime_process_capabilities();
-    assert_eq!(process_capabilities.len(), 2);
+    assert_eq!(process_capabilities.len(), 4);
     assert!(
         process_capabilities.iter().any(|capability| {
+            capability.capability == "child-process-exec"
+                && capability.supported
+                && capability.detail.contains("pinned toolchain")
+        }),
+        "default process capabilities should describe WASIX child-process support"
+    );
+    assert!(
+        process_capabilities.iter().any(|capability| {
+            capability.capability == SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY
+                && capability.supported
+                && capability.detail.contains("pinned /bin")
+        }),
+        "default process capabilities should describe WASIX pinned child-exec containment"
+    );
+    assert!(
+        process_capabilities.iter().any(|capability| {
+            capability.capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY
+                && !capability.supported
+                && capability.detail.contains("asyncify")
+        }),
+        "default process capabilities should describe the current WASIX fork boundary"
+    );
+    let preview1_process_capabilities =
+        sandbox_runtime_process_capabilities_for_abi(&SandboxWasiAbi::Preview1);
+    assert_eq!(preview1_process_capabilities.len(), 2);
+    assert!(
+        preview1_process_capabilities.iter().any(|capability| {
             capability.capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY
                 && capability.supported
                 && capability.detail.contains("pinned /bin")
         }),
-        "preview1 should report the bounded pinned subprocess bridge separately from full POSIX child-process support"
+        "preview1 should still report the bounded pinned subprocess bridge separately"
     );
     assert!(
-        process_capabilities.iter().any(|capability| {
+        preview1_process_capabilities.iter().any(|capability| {
             capability.capability == "child-process-exec"
                 && !capability.supported
                 && capability.detail.contains("lacks POSIX fork")
         }),
-        "full child-process-exec should remain unsupported for preview1"
+        "preview1 should still be honest about lacking POSIX child-process parity"
     );
     let preview1_budget_capabilities =
         sandbox_runtime_budget_capabilities_for_abi(&SandboxWasiAbi::Preview1);
@@ -308,9 +336,14 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
     );
     let wasix_budget_capabilities =
         sandbox_runtime_budget_capabilities_for_abi(&SandboxWasiAbi::Wasix);
+    assert_eq!(
+        sandbox_runtime_budget_capabilities(),
+        wasix_budget_capabilities,
+        "default runtime budget capability facade should describe WASIX"
+    );
     let wasix_process_capabilities =
         sandbox_runtime_process_capabilities_for_abi(&SandboxWasiAbi::Wasix);
-    assert_eq!(wasix_process_capabilities.len(), 3);
+    assert_eq!(wasix_process_capabilities.len(), 4);
     #[cfg(feature = "wasix-runtime")]
     assert!(
         wasix_process_capabilities.iter().any(|capability| {
@@ -338,6 +371,16 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
         }),
         "WASIX runner should report sandbox-local unpinned child exec support separately"
     );
+    #[cfg(feature = "wasix-runtime")]
+    assert!(
+        wasix_process_capabilities.iter().any(|capability| {
+            capability.capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY
+                && !capability.supported
+                && capability.detail.contains("proc_fork")
+                && capability.detail.contains("asyncify")
+        }),
+        "WASIX runner should report the asyncified fork boundary separately from child exec"
+    );
     #[cfg(not(feature = "wasix-runtime"))]
     assert!(
         wasix_process_capabilities.iter().any(|capability| {
@@ -353,6 +396,14 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
                 && !capability.supported
         }),
         "non-WASIX builds should not claim sandbox-local unpinned child exec support"
+    );
+    #[cfg(not(feature = "wasix-runtime"))]
+    assert!(
+        wasix_process_capabilities.iter().any(|capability| {
+            capability.capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY
+                && !capability.supported
+        }),
+        "non-WASIX builds should not claim asyncified fork support"
     );
     assert_eq!(wasix_budget_capabilities.len(), 9);
     #[cfg(feature = "wasix-runtime")]
@@ -495,7 +546,7 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
             .any(|capability| capability.capability == "cancellation"
                 && capability
                     .detail
-                    .contains("cannot yet be cancelled immediately")),
+                    .contains("exact engine-level immediate cancellation")),
         "compiled WASIX runner should report the remaining immediate non-yielding cancellation gap"
     );
     assert_eq!(
@@ -786,6 +837,7 @@ fn busybox_toolchain_spec_registers_core_applets_in_sifs() {
     let manifest = install_busybox_toolchain_to_sifs_store(&mut store, &spec, b"busybox module")
         .expect("install");
 
+    assert_eq!(manifest.target_abi, SandboxWasiAbi::Wasix);
     assert_eq!(manifest.commands.len(), BUSYBOX_TOOLCHAIN_COMMANDS.len());
     for command in ["cat", "grep", "find", "printf", "sha256sum"] {
         assert_eq!(

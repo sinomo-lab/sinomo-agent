@@ -8,7 +8,18 @@ struct FutexPoller {
     state: Arc<WasiState>,
     poller_idx: u64,
     futex_idx: u64,
-    expected: u32,
+    timeout: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>>,
+}
+
+struct FutexWaitAnyRegistration {
+    waiter_index: u32,
+    poller_idx: u64,
+    futex_idx: u64,
+}
+
+struct FutexWaitAnyPoller {
+    state: Arc<WasiState>,
+    registrations: Vec<FutexWaitAnyRegistration>,
     timeout: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>>,
 }
 impl Future for FutexPoller {
@@ -50,6 +61,7 @@ impl Drop for FutexPoller {
 
         let mut should_remove = false;
         if let Some(futex) = guard.futexes.get_mut(&self.futex_idx) {
+            futex.masks.remove(&self.poller_idx);
             if let Some(Some(waker)) = futex.wakers.remove(&self.poller_idx) {
                 waker.wake();
             }
@@ -57,6 +69,61 @@ impl Drop for FutexPoller {
         }
         if should_remove {
             guard.futexes.remove(&self.futex_idx);
+        }
+    }
+}
+
+impl Future for FutexWaitAnyPoller {
+    type Output = Option<u32>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<u32>> {
+        let mut guard = self.state.futexs.lock().unwrap();
+        let mut woken = None;
+        for registration in &self.registrations {
+            let Some(futex) = guard.futexes.get_mut(&registration.futex_idx) else {
+                woken = Some(registration.waiter_index);
+                break;
+            };
+            let Some(waker) = futex.wakers.get_mut(&registration.poller_idx) else {
+                woken = Some(registration.waiter_index);
+                break;
+            };
+            waker.replace(cx.waker().clone());
+        }
+        drop(guard);
+        if woken.is_some() {
+            return Poll::Ready(woken);
+        }
+
+        if let Some(timeout) = self.timeout.as_mut() {
+            let timeout = timeout.as_mut();
+            if timeout.poll(cx).is_ready() {
+                self.timeout.take();
+                return Poll::Ready(None);
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+impl Drop for FutexWaitAnyPoller {
+    fn drop(&mut self) {
+        let mut guard = self.state.futexs.lock().unwrap();
+        let mut empty_futexes = Vec::new();
+        for registration in &self.registrations {
+            if let Some(futex) = guard.futexes.get_mut(&registration.futex_idx) {
+                futex.masks.remove(&registration.poller_idx);
+                if let Some(Some(waker)) = futex.wakers.remove(&registration.poller_idx) {
+                    waker.wake();
+                }
+                if futex.wakers.is_empty() {
+                    empty_futexes.push(registration.futex_idx);
+                }
+            }
+        }
+        for futex_idx in empty_futexes {
+            guard.futexes.remove(&futex_idx);
         }
     }
 }
@@ -83,13 +150,118 @@ pub fn futex_wait<M: MemorySize + 'static>(
     futex_wait_internal(ctx, futex_ptr, expected, timeout, ret_woken)
 }
 
-pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
+pub fn futex_wait_mask<M: MemorySize + 'static>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    futex_ptr: WasmPtr<u32, M>,
+    expected: u32,
+    mask: u32,
+    timeout: WasmPtr<OptionTimestamp, M>,
+    ret_woken: WasmPtr<Bool, M>,
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    futex_wait_mask_internal(ctx, futex_ptr, expected, mask, timeout, ret_woken)
+}
+
+pub fn futex_wait_any<M: MemorySize + 'static>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    waiters: WasmPtr<u8, M>,
+    waiters_len: M::Offset,
+    timeout: WasmPtr<OptionTimestamp, M>,
+    ret_index: WasmPtr<u32, M>,
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
+    ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
+
+    if let Some(result) = unsafe { handle_rewind::<M, Option<u32>>(&mut ctx) } {
+        let env = ctx.data();
+        let memory = unsafe { env.memory_view(&ctx) };
+        let index = result.unwrap_or(u32::MAX);
+        wasi_try_mem_ok!(ret_index.write(&memory, index));
+        return Ok(Errno::Success);
+    }
+
+    let env = ctx.data();
+    let memory = unsafe { env.memory_view(&ctx) };
+    let waiter_count_u64: u64 = waiters_len.into();
+    let waiter_count = usize::try_from(waiter_count_u64).map_err(|_| WasiError::Exit(Errno::Overflow.into()))?;
+    if waiter_count == 0 {
+        return Ok(Errno::Inval);
+    }
+
+    let timeout = wasi_try_mem_ok!(timeout.read(&memory));
+    let timeout = match timeout.tag {
+        OptionTag::Some => Some(Duration::from_nanos(timeout.u)),
+        _ => None,
+    };
+
+    let waiters = read_futex_wait_any_entries::<M>(&memory, waiters, waiter_count)?;
+    let state = env.state.clone();
+    let poller = {
+        let mut guard = env.state.futexs.lock().unwrap();
+        let timeout = timeout.map(|timeout| env.tasks().sleep_now(timeout));
+        let mut registrations = Vec::with_capacity(waiters.len());
+        for waiter in &waiters {
+            guard.poller_seed += 1;
+            let poller_idx = guard.poller_seed;
+            let futex = guard.futexes.entry(waiter.futex_idx).or_default();
+            futex.wakers.insert(poller_idx, Default::default());
+            futex.masks.insert(poller_idx, waiter.mask);
+            registrations.push(FutexWaitAnyRegistration {
+                waiter_index: waiter.waiter_index,
+                poller_idx,
+                futex_idx: waiter.futex_idx,
+            });
+        }
+        FutexWaitAnyPoller {
+            state,
+            registrations,
+            timeout,
+        }
+    };
+
+    for waiter in &waiters {
+        let futex_ptr = WasmPtr::<u32, M>::new(waiter.futex_offset);
+        let val = wasi_try_mem_ok!(futex_ptr.read(&memory));
+        if val != waiter.expected {
+            return Ok(Errno::Inval);
+        }
+    }
+    wasi_try_mem_ok!(ret_index.write(&memory, u32::MAX));
+
+    let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, Box::pin(poller))?;
+    if let AsyncifyAction::Finish(ctx, result) = res {
+        let env = ctx.data();
+        let memory = unsafe { env.memory_view(&ctx) };
+        let index = result.unwrap_or(u32::MAX);
+        wasi_try_mem_ok!(ret_index.write(&memory, index));
+    }
+    Ok(Errno::Success)
+}
+
+pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
     futex_ptr: WasmPtr<u32, M>,
     expected: u32,
     timeout: WasmPtr<OptionTimestamp, M>,
     ret_woken: WasmPtr<Bool, M>,
 ) -> Result<Errno, WasiError> {
+    futex_wait_mask_internal(ctx, futex_ptr, expected, u32::MAX, timeout, ret_woken)
+}
+
+pub(super) fn futex_wait_mask_internal<M: MemorySize + 'static>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    futex_ptr: WasmPtr<u32, M>,
+    expected: u32,
+    mask: u32,
+    timeout: WasmPtr<OptionTimestamp, M>,
+    ret_woken: WasmPtr<Bool, M>,
+) -> Result<Errno, WasiError> {
+    if mask == 0 {
+        return Ok(Errno::Inval);
+    }
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
     ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
 
@@ -136,13 +308,13 @@ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
         // certain race conditions
         let futex = guard.futexes.entry(futex_idx).or_default();
         futex.wakers.insert(poller_idx, Default::default());
+        futex.masks.insert(poller_idx, mask);
 
         Span::current().record("poller_idx", poller_idx);
         FutexPoller {
             state: env.state.clone(),
             poller_idx,
             futex_idx,
-            expected,
             timeout,
         }
     };
@@ -151,9 +323,7 @@ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
     let memory = unsafe { env.memory_view(&ctx) };
     let val = wasi_try_mem_ok!(futex_ptr.read(&memory));
     if val != expected {
-        // We have been triggered so do not go into a wait
-        wasi_try_mem_ok!(ret_woken.write(&memory, Bool::True));
-        return Ok(Errno::Success);
+        return Ok(Errno::Inval);
     }
 
     // We clear the woken flag (so if the poller fails to trigger
@@ -173,4 +343,53 @@ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
         }
     }
     Ok(Errno::Success)
+}
+
+struct FutexWaitAnyEntry<M: MemorySize> {
+    waiter_index: u32,
+    futex_idx: u64,
+    futex_offset: M::Offset,
+    expected: u32,
+    mask: u32,
+}
+
+fn read_futex_wait_any_entries<M: MemorySize>(
+    memory: &MemoryView,
+    waiters: WasmPtr<u8, M>,
+    waiter_count: usize,
+) -> Result<Vec<FutexWaitAnyEntry<M>>, WasiError> {
+    const FUTEX_WAITV_ENTRY_SIZE: usize = 24;
+
+    let start: usize = waiters
+        .offset()
+        .try_into()
+        .map_err(|_| WasiError::Exit(Errno::Inval.into()))?;
+    let byte_len = waiter_count
+        .checked_mul(FUTEX_WAITV_ENTRY_SIZE)
+        .ok_or_else(|| WasiError::Exit(Errno::Overflow.into()))?;
+    let end = start
+        .checked_add(byte_len)
+        .ok_or_else(|| WasiError::Exit(Errno::Overflow.into()))?;
+    let data = unsafe { memory.data_unchecked() };
+    let bytes = data
+        .get(start..end)
+        .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
+
+    let mut entries = Vec::with_capacity(waiter_count);
+    for (index, chunk) in bytes.chunks_exact(FUTEX_WAITV_ENTRY_SIZE).enumerate() {
+        let expected = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let futex_idx = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        let mask = u32::MAX;
+        let futex_offset: M::Offset = futex_idx
+            .try_into()
+            .map_err(|_| WasiError::Exit(Errno::Inval.into()))?;
+        entries.push(FutexWaitAnyEntry {
+            waiter_index: index as u32,
+            futex_idx,
+            futex_offset,
+            expected: expected as u32,
+            mask,
+        });
+    }
+    Ok(entries)
 }

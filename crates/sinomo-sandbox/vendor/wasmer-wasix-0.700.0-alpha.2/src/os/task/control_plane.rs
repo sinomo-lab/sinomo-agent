@@ -167,6 +167,28 @@ impl WasiControlPlane {
             .get(&pid)
             .cloned()
     }
+
+    /// Lists currently registered processes.
+    pub fn processes(&self) -> Vec<WasiProcess> {
+        self.state
+            .mutable
+            .read()
+            .unwrap()
+            .processes
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the number of currently registered processes.
+    pub fn process_count(&self) -> usize {
+        self.state.mutable.read().unwrap().processes.len()
+    }
+
+    /// Removes a process from the control plane once it is no longer waitable.
+    pub fn remove_process(&self, pid: WasiProcessId) -> Option<WasiProcess> {
+        self.state.mutable.write().unwrap().processes.remove(&pid)
+    }
 }
 
 impl MutableState {

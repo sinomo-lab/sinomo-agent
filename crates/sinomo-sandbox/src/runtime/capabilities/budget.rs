@@ -1,5 +1,9 @@
 use super::SandboxRuntimeBudgetCapability;
-use crate::runtime::SandboxWasiAbi;
+use crate::runtime::{SandboxWasiAbi, default_sandbox_wasi_abi};
+
+pub fn sandbox_runtime_budget_capabilities() -> Vec<SandboxRuntimeBudgetCapability> {
+    sandbox_runtime_budget_capabilities_for_abi(&default_sandbox_wasi_abi())
+}
 
 pub fn sandbox_runtime_budget_capabilities_for_abi(
     target_abi: &SandboxWasiAbi,
@@ -71,7 +75,7 @@ fn sandbox_runtime_wasix_budget_capabilities() -> Vec<SandboxRuntimeBudgetCapabi
         SandboxRuntimeBudgetCapability {
             capability: "process-tree-timeout",
             supported: true,
-            detail: "the WASIX runner signals the root process tree with SIGKILL after the requested wall-clock budget and reports the command as timed out",
+            detail: "the WASIX runner installs sandbox-owned POSIX RLIMIT metadata on the root process, children inherit those limits across fork/spawn/exec independent of guest env replacement, and the runner signals the root process tree with SIGKILL after the requested wall-clock budget",
         },
         SandboxRuntimeBudgetCapability {
             capability: "process-tree-cancellation",

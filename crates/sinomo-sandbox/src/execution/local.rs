@@ -107,7 +107,7 @@ impl LocalStagedSandboxCommandRunner {
             limits,
             extra_preopens,
             output_sink,
-            SandboxWasiAbi::Preview1,
+            default_sandbox_wasi_abi(),
             BTreeMap::new(),
             None,
             BTreeMap::new(),
@@ -174,6 +174,51 @@ impl LocalStagedSandboxCommandRunner {
         wasix_instruction_metering: bool,
         wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        self.run_module_with_stdin_limits_preopens_output_sink_abi_env_and_pipes(
+            store,
+            sandbox_id,
+            wasm,
+            argv,
+            stdin,
+            timeout_ms,
+            limits,
+            extra_preopens,
+            output_sink,
+            target_abi,
+            default_env,
+            cwd_override,
+            env_override,
+            allow_preview1_pinned_subprocesses,
+            wasix_pinned_child_exec_only,
+            wasix_instruction_metering,
+            wasix_command_overrides,
+            #[cfg(feature = "wasix-runtime")]
+            SandboxWasixPipeOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_module_with_stdin_limits_preopens_output_sink_abi_env_and_pipes(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        sandbox_id: &SandboxId,
+        wasm: impl AsRef<[u8]>,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        limits: Option<SandboxResourceLimits>,
+        extra_preopens: Vec<SandboxWasiPreopen>,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        target_abi: SandboxWasiAbi,
+        default_env: BTreeMap<String, String>,
+        cwd_override: Option<SandboxPath>,
+        env_override: BTreeMap<String, String>,
+        allow_preview1_pinned_subprocesses: bool,
+        wasix_pinned_child_exec_only: bool,
+        wasix_instruction_metering: bool,
+        wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
+        #[cfg(feature = "wasix-runtime")] wasix_pipes: SandboxWasixPipeOptions,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         let (manifest, layout) = store.load(sandbox_id)?;
         let limits = limits.unwrap_or_else(|| manifest.limits.clone());
         let effective_cwd = cwd_override.unwrap_or_else(|| manifest.cwd.clone());
@@ -194,6 +239,11 @@ impl LocalStagedSandboxCommandRunner {
         wasi_options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
         wasi_options.wasix_instruction_metering = wasix_instruction_metering;
         wasi_options.wasix_command_overrides = wasix_command_overrides;
+        #[cfg(feature = "wasix-runtime")]
+        {
+            wasi_options.wasix_stdin_pipe = wasix_pipes.stdin_pipe;
+            wasi_options.wasix_stdout_pipe = wasix_pipes.stdout_pipe;
+        }
         wasi_options.working_directory_host_path = Some(working_directory_host_path);
         let mut env = default_env;
         env.extend(manifest.env.clone());
@@ -354,7 +404,7 @@ impl LocalStagedSandboxCommandRunner {
         Ok(outcome)
     }
 
-    fn run_module_for_abi(
+    pub(super) fn run_module_for_abi(
         &self,
         target_abi: SandboxWasiAbi,
         wasm: &[u8],
@@ -439,6 +489,41 @@ impl LocalStagedSandboxCommandRunner {
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        self.run_toolchain_command_with_stdin_policy_output_sink_cwd_env_and_pipes(
+            store,
+            toolchain_store,
+            sandbox_id,
+            command_name,
+            argv,
+            stdin,
+            timeout_ms,
+            execution_node_id,
+            policy,
+            output_sink,
+            cwd_override,
+            env_override,
+            #[cfg(feature = "wasix-runtime")]
+            SandboxWasixPipeOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_toolchain_command_with_stdin_policy_output_sink_cwd_env_and_pipes(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        toolchain_store: &LocalSandboxToolchainStore,
+        sandbox_id: &SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        execution_node_id: &NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cwd_override: Option<SandboxPath>,
+        env_override: BTreeMap<String, String>,
+        #[cfg(feature = "wasix-runtime")] wasix_pipes: SandboxWasixPipeOptions,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         validate_sandbox_toolchain_argv(command_name, &argv).map_err(|detail| {
             SandboxCommandExecutionError::Wasi(SandboxWasiError::InvalidRequest { detail })
         })?;
@@ -484,7 +569,7 @@ impl LocalStagedSandboxCommandRunner {
                 exec_name: command.exec_name.clone(),
             })
             .collect::<Vec<_>>();
-        self.run_module_with_stdin_limits_preopens_output_sink_abi_and_env(
+        self.run_module_with_stdin_limits_preopens_output_sink_abi_env_and_pipes(
             store,
             sandbox_id,
             wasm,
@@ -502,6 +587,8 @@ impl LocalStagedSandboxCommandRunner {
             wasix_pinned_child_exec_only,
             wasix_instruction_metering,
             wasix_command_overrides,
+            #[cfg(feature = "wasix-runtime")]
+            wasix_pipes,
         )
     }
 

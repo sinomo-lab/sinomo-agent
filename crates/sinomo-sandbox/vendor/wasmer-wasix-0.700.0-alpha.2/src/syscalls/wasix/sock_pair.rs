@@ -47,12 +47,12 @@ pub fn sock_pair<M: MemorySize>(
     match pt {
         SockProto::Tcp => {
             if ty != Socktype::Stream {
-                return Ok(Errno::Notsup);
+                return Ok(Errno::Inval);
             }
         }
         SockProto::Udp => {
             if ty != Socktype::Dgram {
-                return Ok(Errno::Notsup);
+                return Ok(Errno::Inval);
             }
         }
         _ => {}
@@ -150,5 +150,6 @@ pub(crate) fn sock_pair_internal(
     Span::current().record("end1", fd1);
     Span::current().record("end2", fd2);
 
+    sync_process_metadata(env);
     Ok((fd1, fd2))
 }

@@ -199,7 +199,7 @@ pub(crate) fn sock_send_file_internal(
                             Kind::Dir { .. } | Kind::Root { .. } => {
                                 return Ok(Err(Errno::Isdir));
                             }
-                            Kind::Symlink { .. } => unimplemented!("Symlinks in wasi::fd_read"),
+                            Kind::Symlink { .. } => return Ok(Err(Errno::Inval)),
                             Kind::Buffer { buffer } => {
                                 // TODO: optimize with MaybeUninit
                                 let mut buf = vec![0u8; sub_count as usize];

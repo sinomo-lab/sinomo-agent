@@ -53,5 +53,7 @@ pub(crate) fn fd_fdstat_set_flags_internal(
     let mut fd_map = state.fs.fd_map.write().unwrap();
     let mut fd_entry = wasi_try_ok!(fd_map.get_mut(fd).ok_or(Errno::Badf));
     fd_entry.flags = flags;
+    drop(fd_map);
+    sync_process_metadata(env);
     Ok(Errno::Success)
 }

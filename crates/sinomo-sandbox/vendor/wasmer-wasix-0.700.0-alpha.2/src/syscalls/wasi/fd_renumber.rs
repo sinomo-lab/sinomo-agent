@@ -42,6 +42,7 @@ pub(crate) fn fd_renumber_internal(
     }
     let env = ctx.data();
     let (_, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
+    wasi_try_ok!(state.fs.check_fd_index_within_limit(to));
 
     if let Ok(fd) = state.fs.get_fd(to) {
         if !fd.is_stdio && fd.inode.is_preopened {
@@ -75,7 +76,7 @@ pub(crate) fn fd_renumber_internal(
         // TODO: verify this is correct
         inner: FdInner {
             offset: fd_entry.inner.offset.clone(),
-            rights: fd_entry.inner.rights_inheriting,
+            rights: fd_entry.inner.rights,
             fd_flags: {
                 let mut f = fd_entry.inner.fd_flags;
                 f.set(Fdflagsext::CLOEXEC, false);
@@ -89,8 +90,11 @@ pub(crate) fn fd_renumber_internal(
 
     // Exclusive insert because we expect `to` to be empty after closing it above
     if !fd_map.insert(true, to, new_fd_entry) {
-        panic!("Internal error: expected FD {to} to be free after closing in fd_renumber");
+        error!("expected FD {to} to be free after closing in fd_renumber");
+        return Ok(Errno::Inval);
     }
+    drop(fd_map);
+    sync_process_metadata(env);
 
     Ok(Errno::Success)
 }

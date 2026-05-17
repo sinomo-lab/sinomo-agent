@@ -13,14 +13,16 @@ pub fn thread_signal(
     tid: Tid,
     sig: Signal,
 ) -> Result<Errno, WasiError> {
-    {
+    let ret = {
         let tid: WasiThreadId = tid.into();
-        ctx.data().process.signal_thread(&tid, sig);
-    }
-
-    let env = ctx.data();
+        if ctx.data().process.signal_thread(&tid, sig) {
+            Errno::Success
+        } else {
+            Errno::Badf
+        }
+    };
 
     WasiEnv::do_pending_operations(&mut ctx)?;
 
-    Ok(Errno::Success)
+    Ok(ret)
 }

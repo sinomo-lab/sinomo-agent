@@ -1,5 +1,3 @@
-use std::fs;
-
 use super::*;
 use crate::syscalls::*;
 
@@ -18,6 +16,9 @@ pub fn path_remove_directory<M: MemorySize>(
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
     let base_dir = wasi_try_ok!(state.fs.get_fd(fd));
+    if !base_dir.inner.rights.contains(Rights::PATH_REMOVE_DIRECTORY) {
+        return Ok(Errno::Access);
+    }
     let path_str = unsafe { get_input_str_ok!(&memory, path, path_len) };
     Span::current().record("path", path_str.as_str());
 
@@ -61,7 +62,7 @@ pub(crate) fn path_remove_directory_internal(
                 return Err(Errno::Noent);
             };
 
-            {
+            let child_path = {
                 let Kind::Dir {
                     entries: ref child_entries,
                     path: ref child_path,
@@ -75,10 +76,18 @@ pub(crate) fn path_remove_directory_internal(
                     return Err(Errno::Notempty);
                 }
 
-                if let Err(e) = state.fs_remove_dir(child_path) {
-                    tracing::warn!(path = ?child_path, error = ?e, "failed to remove directory");
-                    return Err(e);
+                child_path.clone()
+            };
+
+            if let Err(e) = state.fs_remove_dir(&child_path) {
+                if e == Errno::Noent {
+                    parent_entries.remove(&dir_name).expect(
+                        "Entry should exist since we checked before and have an exclusive write lock",
+                    );
+                    return Ok(());
                 }
+                tracing::warn!(path = ?child_path, error = ?e, "failed to remove directory");
+                return Err(e);
             }
 
             parent_entries.remove(&dir_name).expect(

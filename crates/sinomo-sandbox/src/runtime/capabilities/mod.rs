@@ -3,7 +3,9 @@ mod process;
 mod types;
 mod virtual_devices;
 
-pub use budget::sandbox_runtime_budget_capabilities_for_abi;
+pub use budget::{
+    sandbox_runtime_budget_capabilities, sandbox_runtime_budget_capabilities_for_abi,
+};
 pub use process::{
     sandbox_runtime_process_capabilities, sandbox_runtime_process_capabilities_for_abi,
     sandbox_runtime_supports_child_processes, sandbox_runtime_supports_child_processes_for_abi,

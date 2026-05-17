@@ -21,20 +21,21 @@ pub fn futex_wake_all<M: MemorySize>(
     let pointer: u64 = futex_ptr.offset().into();
     //Span::current().record("futex_idx", pointer);
 
-    let mut woken = false;
     let woken = {
         let mut guard = state.futexs.lock().unwrap();
         if let Some(futex) = guard.futexes.remove(&pointer) {
+            let mut woke_waiter = false;
             for waker in futex.wakers {
                 if let Some(waker) = waker.1 {
                     waker.wake();
+                    woke_waiter = true;
                 }
             }
             tracing::trace!("wake_all (hit) on {pointer}");
-            true
+            woke_waiter
         } else {
             tracing::trace!("wake_all (miss) on {pointer}");
-            true
+            false
         }
     };
     //Span::current().record("woken", woken);

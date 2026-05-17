@@ -40,6 +40,7 @@ pub fn fd_seek<M: MemorySize>(
     let new_offset_ref = newoffset.deref(&memory);
     let fd_entry = wasi_try_ok!(env.state.fs.get_fd(fd));
     wasi_try_mem_ok!(new_offset_ref.write(new_offset));
+    sync_process_metadata(env);
 
     trace!(
         %new_offset,
@@ -72,17 +73,16 @@ pub(crate) fn fd_seek_internal(
             #[allow(clippy::comparison_chain)]
             if offset > 0 {
                 let offset = offset as u64;
-                fd_entry.offset.fetch_add(offset, Ordering::AcqRel) + offset
+                let old_offset = fd_entry.offset.load(Ordering::Acquire);
+                let new_offset = wasi_try_ok_ok!(old_offset.checked_add(offset).ok_or(Errno::Inval));
+                fd_entry.offset.store(new_offset, Ordering::Release);
+                new_offset
             } else if offset < 0 {
                 let offset = offset.unsigned_abs();
-
-                wasi_try_ok_ok!(
-                    fd_entry
-                        .offset
-                        .fetch_sub(offset, Ordering::AcqRel)
-                        .checked_sub(offset)
-                        .ok_or(Errno::Inval)
-                )
+                let old_offset = fd_entry.offset.load(Ordering::Acquire);
+                let new_offset = wasi_try_ok_ok!(old_offset.checked_sub(offset).ok_or(Errno::Inval));
+                fd_entry.offset.store(new_offset, Ordering::Release);
+                new_offset
             } else {
                 fd_entry.offset.load(Ordering::Acquire)
             }
@@ -91,7 +91,7 @@ pub(crate) fn fd_seek_internal(
             use std::io::SeekFrom;
             let mut guard = fd_entry.inode.write();
             let deref_mut = guard.deref_mut();
-            match deref_mut {
+            let new_offset = match deref_mut {
                 Kind::File { handle, .. } => {
                     // TODO: remove allow once inodes are refactored (see comments on [`WasiState`])
                     #[allow(clippy::await_holding_lock)]
@@ -111,15 +111,13 @@ pub(crate) fn fd_seek_internal(
                             let mut fd_map = state.fs.fd_map.write().unwrap();
                             let fd_entry = fd_map.get_mut(fd).ok_or(Errno::Badf)?;
                             fd_entry.offset.store(end, Ordering::Release);
-                            Ok(())
-                        })?);
+                            Ok(end)
+                        })?)
                     } else {
                         return Ok(Err(Errno::Inval));
                     }
                 }
-                Kind::Symlink { .. } => {
-                    unimplemented!("wasi::fd_seek not implemented for symlinks")
-                }
+                Kind::Symlink { .. } => return Ok(Err(Errno::Inval)),
                 Kind::Dir { .. }
                 | Kind::Root { .. }
                 | Kind::Socket { .. }
@@ -131,13 +129,22 @@ pub(crate) fn fd_seek_internal(
                     // TODO: check this
                     return Ok(Err(Errno::Inval));
                 }
-                Kind::Buffer { .. } => {
-                    // seeking buffers probably makes sense
-                    // FIXME: implement this
-                    return Ok(Err(Errno::Inval));
+                Kind::Buffer { buffer } => {
+                    let new_offset = if offset >= 0 {
+                        (buffer.len() as u64)
+                            .checked_add(offset as u64)
+                            .ok_or(Errno::Inval)
+                    } else {
+                        (buffer.len() as u64).checked_sub(offset.unsigned_abs()).ok_or(Errno::Inval)
+                    };
+                    let new_offset = wasi_try_ok_ok!(new_offset);
+                    let mut fd_map = state.fs.fd_map.write().unwrap();
+                    let fd_entry = wasi_try_ok_ok!(fd_map.get_mut(fd).ok_or(Errno::Badf));
+                    fd_entry.offset.store(new_offset, Ordering::Release);
+                    new_offset
                 }
-            }
-            fd_entry.inner.offset.load(Ordering::Acquire)
+            };
+            new_offset
         }
         Whence::Set => {
             let mut fd_map = state.fs.fd_map.write().unwrap();

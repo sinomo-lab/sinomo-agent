@@ -271,7 +271,12 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
         }
         if matches!(
             sandbox_virtual_device_path(path),
-            Some(SandboxVirtualDevicePath::DevDirectory)
+            Some(
+                SandboxVirtualDevicePath::DevDirectory
+                    | SandboxVirtualDevicePath::FdDirectory
+                    | SandboxVirtualDevicePath::PtsDirectory
+                    | SandboxVirtualDevicePath::ShmDirectory
+            )
         ) {
             return Ok(());
         }
@@ -322,9 +327,13 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
         }
         if matches!(
             sandbox_virtual_device_path(path),
-            Some(SandboxVirtualDevicePath::DevDirectory)
+            Some(
+                SandboxVirtualDevicePath::DevDirectory
+                    | SandboxVirtualDevicePath::FdDirectory
+                    | SandboxVirtualDevicePath::ShmDirectory
+            )
         ) {
-            return Ok(sandbox_virtual_device_dir_entries());
+            return Ok(sandbox_virtual_device_dir_entries(path));
         }
         if sandbox_virtual_device_path(path).is_some() {
             return Err(SandboxFsError::Unavailable {

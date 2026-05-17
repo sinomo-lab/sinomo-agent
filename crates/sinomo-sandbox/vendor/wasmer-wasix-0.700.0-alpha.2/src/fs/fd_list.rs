@@ -83,6 +83,14 @@ impl FdList {
         }
     }
 
+    pub fn insert_first_free_below(&mut self, fd: Fd, limit: WasiFd) -> Option<WasiFd> {
+        let target = self.next_free_fd();
+        if target >= limit {
+            return None;
+        }
+        Some(self.insert_first_free(fd))
+    }
+
     pub fn insert_first_free_after(&mut self, fd: Fd, after_or_equal: WasiFd) -> WasiFd {
         match self.first_free {
             // We're shorter than `after`, need to extend the list regardless of whether we have holes
@@ -125,6 +133,37 @@ impl FdList {
                     }
                 }
             }
+        }
+    }
+
+    pub fn insert_first_free_after_below(
+        &mut self,
+        fd: Fd,
+        after_or_equal: WasiFd,
+        limit: WasiFd,
+    ) -> Option<WasiFd> {
+        let target = self.next_free_fd_after(after_or_equal);
+        if target >= limit {
+            return None;
+        }
+        if !self.insert(true, target, fd) {
+            panic!("Internal error in FdList - calculated target FD {target} was occupied");
+        }
+        Some(target)
+    }
+
+    fn next_free_fd_after(&self, after_or_equal: WasiFd) -> WasiFd {
+        if self.fds.len() < after_or_equal as usize {
+            return after_or_equal;
+        }
+
+        match self.first_free {
+            Some(free) if free >= after_or_equal as usize => free as WasiFd,
+            None => self.fds.len() as WasiFd,
+            Some(_) => self
+                .first_free_after(after_or_equal)
+                .map(|free| free as WasiFd)
+                .unwrap_or(self.fds.len() as WasiFd),
         }
     }
 

@@ -3,7 +3,9 @@
 `sinomo-sandbox` is Sinomo's Rust-native sandbox subsystem for agent tool
 execution. It provides resumable command workspaces backed by SIFS, a WASI
 command runner, pinned toolchain manifests, policy validation, command logs, and
-operator diagnostics.
+operator diagnostics. WASIX is the default runtime target because coding
+sandboxes need real process semantics; WASI Preview1 remains a compatibility
+adapter for simple single-process modules.
 
 The goal is a minimal real POSIX command environment for coding tasks, not a
 POSIX-like imitation. Commands are only exposed when Sinomo can run a genuine
@@ -32,7 +34,7 @@ The crate owns the reusable contracts and implementations:
   lifecycle, checkpoints, reboot, resume, and destroy.
 - `LocalSandboxFileSystem` and `SifsSandboxFileSystem` expose the sandbox
   virtual paths with path and symlink escape protection.
-- `LocalWasiCommandRunner` runs WASI preview1 modules with stdin/stdout/stderr,
+- `LocalWasiCommandRunner` runs WASI Preview1 compatibility modules with stdin/stdout/stderr,
   memory/input/output limits, timeout/cancellation, explicit directory preopens,
   and no ambient TCP, UDP, name lookup, or host filesystem access. Preview1
   extension helpers resolve paths below a root `/` preopen while preserving
@@ -52,7 +54,8 @@ The crate owns the reusable contracts and implementations:
   obeys the same output limit as top-level command output, and child
   file-backed stdin is checked for sandbox containment, symlink escape, and
   size before the host reads it into the child input pipe.
-- The WASIX runner applies the same direct stdin input limit before constructing
+- The WASIX runner is the primary execution path. It applies the same direct
+  stdin input limit before constructing
   its guest stdin file. When preopened directories are present, it preflights
   the requested cwd against those mounts before starting the module and rejects
   unmapped paths, files, and symlink escapes. WASIX mapped preopen trees are
@@ -148,16 +151,16 @@ candidates and fall back to the local node when no cluster view is available.
 
 ## Command Surface
 
-The maintained base userspace target is BusyBox WASIp1. The current profile
-exposes real file-management, search, archive, and text
+The maintained base userspace target is BusyBox WASIX. The current active
+profile exposes real file-management, search, archive, and text
 processing tools such as `awk`, `cat`, `chmod`, `cmp`, `cp`, `diff`, `find`,
 `grep`, `gzip`, `head`, `ls`, `mkdir`, `mv`, `patch`, `rm`, `sed`, `sort`,
 `tail`, `tar`, `test`, `touch`, `uniq`, and `wc`.
 
-The current default BusyBox profile does not expose `sh`. BusyBox ash requires
-descriptor and process behavior that the runtime does not yet provide, and the
-recipe must not patch ash command execution, pipeline, here-doc, or redirection
-semantics to hide that runtime gap.
+Shell workflows should use the maintained WASIX `bash` package, which provides
+real `bash` and `sh`. The older BusyBox WASIp1 profile remains a compatibility
+target and must not be patched to fake ash command execution, pipeline,
+here-doc, or redirection semantics.
 
 BusyBox `awk`, `gzip`, and `chmod` are exposed only for the behavior that
 passes the maintained fidelity suite. `awk` external command features remain
@@ -308,12 +311,13 @@ after the run. Set `SINOMO_VERIFY_DATA_DIR=<path>` to use an operator-owned
 directory, or set `KEEP_SANDBOX=1` to retain generated state for debugging.
 Set `SKIP_BUILD=1` to reuse existing package outputs from the verifier output
 directories. Set `VERIFY_FULL=1` to run the heavier local gate: BusyBox,
-QuickJS, and Python/pip are verified in one WASIp1 coding workspace, then
-BusyBox WASIX, Bash, Make, and TCC are verified in a separate WASIX shell/build
-workspace. Full mode uses `target/` for its automatically-created data
-directories because the Python package is large. With `VERIFY_FULL=1
-SKIP_BUILD=1`, the reused BusyBox WASIX, Bash, Python, Make, and TCC package
-manifests must already exist in their configured output directories.
+QuickJS, and Python/pip compatibility paths are verified in one WASIp1
+workspace, then BusyBox WASIX, Bash, Make, TCC, and native CPython are verified
+in a separate WASIX shell/build workspace. Full mode uses `target/` for its
+automatically-created data directories because the Python package is large. With
+`VERIFY_FULL=1 SKIP_BUILD=1`, the reused BusyBox WASIX, Bash, Python, Make, and
+TCC package manifests must already exist in their configured output
+directories.
 
 Bash is maintained as the real `bash` and `sh` route for shell workflows. It
 is a WASIX package, not a patched BusyBox ash substitute. Local verification
@@ -415,16 +419,16 @@ variable names for the effective invocation.
 
 ## Current Limitations
 
-- Runtime target implementations live under `src/runtime/`. The default
-  preview1 path remains the stable Wasmtime runner; `target_abi = "wasix"`
-  selects the Wasmer/WASIX runner only when the crate is built with the
-  `wasix-runtime` feature. Toolchain package imports and
-  `sinomo sandbox toolchain add-command --target-abi wasix` record that ABI in
-  command metadata. The manifest-level `target_abi` is the default for older
-  and single-ABI toolchains, while merged packages can carry per-command ABI
-  overrides so one composite coding toolchain can contain Preview1 and WASIX
-  commands. Both local and SIFS-backed staged toolchain execution honor the
-  command's effective ABI instead of falling back to preview1.
+- Runtime target implementations live under `src/runtime/`. WASIX is the
+  default runtime and is enabled by the crate's default features. `target_abi =
+  "preview1"` selects the Wasmtime/WASI Preview1 compatibility runner for
+  simple single-process modules. Toolchain package imports and
+  `sinomo sandbox toolchain add-command --target-abi preview1|wasix` record
+  that ABI in command metadata. The manifest-level `target_abi` is the default
+  for older and single-ABI toolchains, while merged packages can carry
+  per-command ABI overrides so one composite coding toolchain can contain
+  Preview1 and WASIX commands. Both local and SIFS-backed staged toolchain
+  execution honor the command's effective ABI.
   In generic `import-package` manifests, a command can set its own
   `target_abi`; if it is omitted, the package-level `target_abi` is used.
 - Staged toolchain execution materializes the pinned command modules from the
@@ -440,10 +444,11 @@ variable names for the effective invocation.
   Runtime staging uses a content-addressed local `toolchain-cache` under the
   sandbox runtime root, so large support trees such as Python are expanded once
   per content hash instead of being deleted and recopied for every command.
-- The current full coding verifier uses separate WASIp1 and WASIX workspaces
-  instead of one merged command namespace. This avoids pretending that one
-  command name can currently refer to both the WASIp1 coding implementation and
-  the WASIX child-process implementation required by Bash and Make.
+- The current full coding verifier still keeps older WASIp1 compatibility
+  checks separate from the active WASIX shell/build/native-Python workspace.
+  This avoids pretending that one command name can simultaneously refer to a
+  compatibility module and the WASIX child-process implementation required by
+  Bash, Python, Make, and TCC.
 - WASIX host filesystem mappings are executed inside the Tokio runtime context
   required by Wasmer's host-fs layer. Read-only WASIX preopens are staged with
   host permissions made read-only for the duration of the command and restored
@@ -469,43 +474,20 @@ variable names for the effective invocation.
   `/dev/random` plus `/dev/urandom` is implemented through a per-run
   Sinomo-owned `/dev` preopen. The runtime does not map host device paths.
 - `sinomo sandbox shell` only works when the pinned toolchain contains a real
-  `sh`; the current default BusyBox WASIp1 profile does not expose `sh` until
-  the runtime has descriptor and process support. Full shell parity still
+  `sh`; the maintained route is the WASIX Bash package. Full shell parity
   depends on the same real process-capable substrate as pipelines, command
   substitution, and arbitrary fork/exec. Command validation is ABI-aware:
   Preview1 still rejects `child-process-exec`, while WASIX permits it only when
   the binary is built with `wasix-runtime` and cluster policy allowlists both
   `child-process-exec` and the explicit `wasix.unpinned-child-exec` gap
   acknowledgement.
-- Bash, Python, and pip are required for coding sandboxes, but they are not
-  claimed as generally available until real packages and fidelity suites cover
-  the expected production paths. Bash has a real WASIX package and passes the
-  maintained local plus daemon-local SIFS verifier when `child-process-exec`
-  and `wasix.unpinned-child-exec` are explicitly allowed by policy. Python has
-  a real CPython WASIp1 package with standard-library/support artifacts, and
-  the verifier covers offline
-  pure-Python `pip wheel` plus `pip install --find-links`, with
-  checkpoint/resume through SIFS.
-  It keeps pip's wheel cache under `/work/pip-cache` and verifies that cache
-  after resume. It also requires local C-extension package installation to
-  fail, keeping the native-extension boundary explicit. The maintained
-  daemon-local verifier also covers mediated HTTP acquisition of PEP 503-style
-  simple-index pages and wheels into `/work/simple` and `/work/packages`, then
-  installs from that fetched index with real pip. That mediated index fixture
-  first verifies sandboxed pip cannot access the HTTP package source directly,
-  even while the source is reachable to the daemon-mediated fetch path. It
-  now includes multiple dependency versions and verifies pip selects the newest
-  compatible wheel from the fetched index, resolves that dependency's own
-  transitive requirement from the same fetched index, resolves a dependency
-  whose declared package name requires PEP 503 normalization, respects an
-  environment marker by ignoring an incompatible dependency, skips a newer
-  wheel excluded by `data-requires-python`, skips a yanked release when a
-  non-yanked compatible wheel exists, applies a constraints file that pins an
-  older compatible dependency, installs with `--require-hashes` from a
-  requirements file that pins all transitive wheels, verifies a mismatched hash
-  is denied,
-  and installs an extra that pulls an optional dependency from the same mediated index. Broader resolver edge cases
-  and successful native-extension support remain planned. TinyCC has a real
+- Bash, Python, and pip are required for coding sandboxes. The active path is
+  WASIX: Bash has a real WASIX package, and CPython WASIX now covers real pip,
+  subprocess behavior, native wheel installation, NumPy execution, and
+  matplotlib Agg rendering in the maintained daemon-local verifier when
+  `child-process-exec` and `wasix.unpinned-child-exec` are explicitly allowed
+  by policy. The older CPython WASIp1 package is kept as a pure-Python
+  compatibility regression path, not the development target. TinyCC has a real
   WASIX build recipe and a `verify-tcc` compiler suite for version output,
   preprocessing, object generation under `/work`, invalid-input diagnostics,
   and explicit unsupported `-run` execution. GNU Make has a real WASIX build

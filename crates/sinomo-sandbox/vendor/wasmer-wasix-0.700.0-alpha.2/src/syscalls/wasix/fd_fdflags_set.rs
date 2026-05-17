@@ -47,5 +47,7 @@ pub(crate) fn fd_fdflags_set_internal(
         return Ok(Errno::Access);
     }
     fd_entry.fd_flags = flags;
+    drop(fd_map);
+    sync_process_metadata(env);
     Ok(Errno::Success)
 }

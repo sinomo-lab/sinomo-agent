@@ -8,5 +8,5 @@ pub enum SandboxWasiAbi {
 }
 
 pub fn default_sandbox_wasi_abi() -> SandboxWasiAbi {
-    SandboxWasiAbi::Preview1
+    SandboxWasiAbi::Wasix
 }

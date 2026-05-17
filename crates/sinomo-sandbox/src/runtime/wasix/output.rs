@@ -17,6 +17,7 @@ pub(super) struct WasixStreamingOutputCapture {
     stream: SandboxOutputStream,
     output_limit_bytes: usize,
     output_sink: Option<Arc<dyn crate::SandboxOutputSink>>,
+    output_pipe: Option<virtual_fs::Pipe>,
 }
 impl WasixStreamingOutputCapture {
     pub(super) fn new(
@@ -25,6 +26,7 @@ impl WasixStreamingOutputCapture {
         stream: SandboxOutputStream,
         output_limit_bytes: usize,
         output_sink: Option<Arc<dyn crate::SandboxOutputSink>>,
+        output_pipe: Option<virtual_fs::Pipe>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(WasixStreamingOutputState::default())),
@@ -33,6 +35,7 @@ impl WasixStreamingOutputCapture {
             stream,
             output_limit_bytes,
             output_sink,
+            output_pipe,
         }
     }
 
@@ -103,6 +106,9 @@ impl WasixStreamingOutputCapture {
             for chunk in chunks {
                 sink.output_chunk(chunk);
             }
+        }
+        if let Some(mut output_pipe) = self.output_pipe.clone() {
+            output_pipe.write_all(bytes)?;
         }
         Ok(())
     }

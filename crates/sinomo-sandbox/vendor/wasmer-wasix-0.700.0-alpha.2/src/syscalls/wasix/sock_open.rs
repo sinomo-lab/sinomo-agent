@@ -34,12 +34,12 @@ pub fn sock_open<M: MemorySize>(
     match pt {
         SockProto::Tcp => {
             if ty != Socktype::Stream {
-                return Ok(Errno::Notsup);
+                return Ok(Errno::Inval);
             }
         }
         SockProto::Udp => {
             if ty != Socktype::Dgram {
-                return Ok(Errno::Notsup);
+                return Ok(Errno::Inval);
             }
         }
         _ => {}
@@ -96,7 +96,7 @@ pub(crate) fn sock_open_internal(
                 addr: None,
             }),
         },
-        _ => return Ok(Err(Errno::Notsup)),
+        _ => return Ok(Err(Errno::Inval)),
     };
 
     let inode =
@@ -129,5 +129,6 @@ pub(crate) fn sock_open_internal(
     });
     Span::current().record("sock", fd);
 
+    sync_process_metadata(env);
     Ok(Ok(fd))
 }

@@ -26,6 +26,7 @@ pub fn fd_dup2<M: MemorySize>(
         cloexec == Bool::True
     ));
     let env = ctx.data();
+    sync_process_metadata(env);
 
     #[cfg(feature = "journal")]
     if env.enable_journal {
@@ -51,35 +52,6 @@ pub(crate) fn fd_dup_internal(
     cloexec: bool,
 ) -> Result<WasiFd, Errno> {
     let env = ctx.data();
-    let (_, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
-    if min_result_fd > 0 {
-        if fd == min_result_fd {
-            return Ok(min_result_fd);
-        }
-        if state.fs.get_fd(min_result_fd).is_ok() {
-            state.fs.close_fd(min_result_fd)?;
-        }
-        let mut fd_map = state.fs.fd_map.write().unwrap();
-        let fd_entry = fd_map.get(fd).ok_or(Errno::Badf)?;
-        let new_fd_entry = Fd {
-            inner: FdInner {
-                offset: fd_entry.inner.offset.clone(),
-                rights: fd_entry.inner.rights_inheriting,
-                fd_flags: {
-                    let mut f = fd_entry.inner.fd_flags;
-                    f.set(Fdflagsext::CLOEXEC, cloexec);
-                    f
-                },
-                ..fd_entry.inner
-            },
-            inode: fd_entry.inode.clone(),
-            ..*fd_entry
-        };
-        if !fd_map.insert(true, min_result_fd, new_fd_entry) {
-            return Err(Errno::Inval);
-        }
-        return Ok(min_result_fd);
-    }
-    let fd = state.fs.clone_fd_ext(fd, min_result_fd, Some(cloexec))?;
-    Ok(fd)
+    let (_, state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
+    state.fs.clone_fd_ext(fd, min_result_fd, Some(cloexec))
 }

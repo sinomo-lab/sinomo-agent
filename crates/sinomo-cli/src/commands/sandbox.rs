@@ -1497,7 +1497,7 @@ pub(crate) fn parse_sandbox_toolchain_add_command_options(
         sinomo_runtime::sandbox::SandboxToolchainId::from_legacy_named("toolchain_busybox")
             .expect("static toolchain id");
     let mut version = "local".to_string();
-    let mut target_abi = sinomo_runtime::sandbox::SandboxWasiAbi::Preview1;
+    let mut target_abi = sinomo_runtime::sandbox::default_sandbox_wasi_abi();
     let mut provenance = "local CLI import".to_string();
     let mut execution = SandboxMetadataExecution::Local;
     let mut required_capabilities = Vec::new();
@@ -2319,8 +2319,8 @@ fn append_sandbox_doctor_runtime_capability_findings(findings: &mut Vec<SandboxD
         ));
     }
     for abi in [
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
         sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
     ] {
         for capability in
             sinomo_runtime::sandbox::sandbox_runtime_process_capabilities_for_abi(&abi)

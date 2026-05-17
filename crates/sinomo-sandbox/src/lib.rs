@@ -36,10 +36,10 @@ pub(crate) use runtime::preview1::{
 pub use runtime::{
     SandboxRuntimeBudgetCapability, SandboxRuntimeProcessCapability,
     SandboxRuntimeVirtualDeviceCapability, SandboxWasiAbi, default_sandbox_wasi_abi,
-    sandbox_runtime_budget_capabilities_for_abi, sandbox_runtime_disables_ambient_network,
-    sandbox_runtime_mvp_virtual_device_capabilities, sandbox_runtime_process_capabilities,
-    sandbox_runtime_process_capabilities_for_abi, sandbox_runtime_supports_child_processes,
-    sandbox_runtime_supports_child_processes_for_abi,
+    sandbox_runtime_budget_capabilities, sandbox_runtime_budget_capabilities_for_abi,
+    sandbox_runtime_disables_ambient_network, sandbox_runtime_mvp_virtual_device_capabilities,
+    sandbox_runtime_process_capabilities, sandbox_runtime_process_capabilities_for_abi,
+    sandbox_runtime_supports_child_processes, sandbox_runtime_supports_child_processes_for_abi,
     sandbox_runtime_supports_command_capability_for_abi,
     sandbox_runtime_supports_mvp_virtual_devices,
 };

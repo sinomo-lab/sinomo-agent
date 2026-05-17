@@ -133,5 +133,6 @@ pub fn fd_pipe_internal(
         )?
     };
 
+    sync_process_metadata(env);
     Ok((read_fd, write_fd))
 }

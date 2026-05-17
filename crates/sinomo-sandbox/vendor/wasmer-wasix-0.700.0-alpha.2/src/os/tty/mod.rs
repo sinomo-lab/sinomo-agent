@@ -182,16 +182,19 @@ impl Tty {
                     // Due to a nasty bug in xterm.js on Android mobile it sends the keys you press
                     // twice in a row with a short interval between - this hack will avoid that bug
                     if self.is_mobile {
-                        let now = platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000)
-                            .unwrap() as u128;
-                        if let Some((what, when)) = self.last.as_ref()
-                            && what.as_str() == data
-                            && now - *when < TTY_MOBILE_PAUSE
+                        if let Ok(now) =
+                            platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000)
                         {
-                            self.last = None;
-                            return self;
+                            let now = now as u128;
+                            if let Some((what, when)) = self.last.as_ref()
+                                && what.as_str() == data
+                                && now.saturating_sub(*when) < TTY_MOBILE_PAUSE
+                            {
+                                self.last = None;
+                                return self;
+                            }
+                            self.last = Some((data.clone(), now))
                         }
-                        self.last = Some((data.clone(), now))
                     }
 
                     self.on_data(data.as_bytes().to_vec().into()).await
@@ -225,10 +228,14 @@ impl Tty {
         })
     }
 
-    fn on_ctrl_c(mut self, _data: Cow<'static, [u8]>) -> BoxFuture<'static, Self> {
+    fn on_terminal_signal(
+        mut self,
+        signal: Signal,
+        echo_bytes: &'static [u8],
+    ) -> BoxFuture<'static, Self> {
         Box::pin(async move {
             if let Some(signaler) = self.signaler.as_ref() {
-                signaler.signal(Signal::Sigint as u8).ok();
+                signaler.signal(signal as u8).ok();
 
                 let (echo, _line_buffering) = {
                     let options = self.options.inner.lock().unwrap();
@@ -237,11 +244,23 @@ impl Tty {
 
                 self.line.clear();
                 if echo {
-                    let _ = self.stdout.write("\n".as_bytes()).await;
+                    let _ = self.stdout.write(echo_bytes).await;
                 }
             }
             self
         })
+    }
+
+    fn on_ctrl_c(self, _data: Cow<'static, [u8]>) -> BoxFuture<'static, Self> {
+        self.on_terminal_signal(Signal::Sigint, b"\n")
+    }
+
+    fn on_ctrl_backslash(self, _data: Cow<'static, [u8]>) -> BoxFuture<'static, Self> {
+        self.on_terminal_signal(Signal::Sigquit, b"^\\\n")
+    }
+
+    fn on_ctrl_z(self, _data: Cow<'static, [u8]>) -> BoxFuture<'static, Self> {
+        self.on_terminal_signal(Signal::Sigtstp, b"^Z\n")
     }
 
     fn on_backspace(mut self, _data: Cow<'static, [u8]>) -> BoxFuture<'static, Self> {
@@ -363,6 +382,8 @@ impl Tty {
             return match String::from_utf8_lossy(data.as_ref()).as_ref() {
                 "\r" | "\u{000A}" => self.on_enter(data),
                 "\u{0003}" => self.on_ctrl_c(data),
+                "\u{001A}" => self.on_ctrl_z(data),
+                "\u{001C}" => self.on_ctrl_backslash(data),
                 "\u{007F}" => self.on_backspace(data),
                 "\u{0009}" => self.on_tab(data),
                 "\u{001B}\u{005B}\u{0044}" => self.on_cursor_left(data),
@@ -423,6 +444,8 @@ pub struct WasiTtyState {
     pub echo: bool,
     pub line_buffered: bool,
     pub line_feeds: bool,
+    pub tostop: bool,
+    pub foreground_process_group: Option<u32>,
 }
 
 impl Default for WasiTtyState {
@@ -438,6 +461,8 @@ impl Default for WasiTtyState {
             echo: false,
             line_buffered: false,
             line_feeds: true,
+            tostop: false,
+            foreground_process_group: None,
         }
     }
 }
@@ -452,4 +477,12 @@ pub trait TtyBridge: std::fmt::Debug {
 
     /// Set the TTY state.
     fn tty_set(&self, _tty_state: WasiTtyState);
+
+    /// Retrieve the foreground process group for this terminal.
+    fn foreground_process_group(&self) -> Option<u32> {
+        None
+    }
+
+    /// Set the foreground process group for this terminal.
+    fn set_foreground_process_group(&self, _pgid: u32) {}
 }

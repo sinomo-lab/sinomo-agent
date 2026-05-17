@@ -177,5 +177,6 @@ pub(crate) fn sock_accept_internal(
     });
     Span::current().record("fd", fd);
 
+    sync_process_metadata(env);
     Ok(Ok((fd, local_addr, peer_addr)))
 }

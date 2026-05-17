@@ -1,12 +1,13 @@
 use super::SandboxRuntimeProcessCapability;
-use crate::runtime::SandboxWasiAbi;
+use crate::runtime::{SandboxWasiAbi, default_sandbox_wasi_abi};
 use crate::{
     SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY, SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY,
-    SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY, SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY,
+    SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY, SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY,
+    SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY,
 };
 
 pub fn sandbox_runtime_process_capabilities() -> Vec<SandboxRuntimeProcessCapability> {
-    sandbox_runtime_preview1_process_capabilities()
+    sandbox_runtime_process_capabilities_for_abi(&default_sandbox_wasi_abi())
 }
 
 fn sandbox_runtime_preview1_process_capabilities() -> Vec<SandboxRuntimeProcessCapability> {
@@ -51,6 +52,11 @@ fn sandbox_runtime_wasix_process_capabilities() -> Vec<SandboxRuntimeProcessCapa
             supported: true,
             detail: "the WASIX runner can opt out of pinned-only child exec so commands may execute WASM modules and scripts from sandbox-mounted paths such as /work; this still runs through the sandbox virtual filesystem, not host binaries",
         },
+        SandboxRuntimeProcessCapability {
+            capability: SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY,
+            supported: true,
+            detail: "the WASIX runner supports proc_fork and proc_fork_env for modules built with the asyncify unwind/rewind hook set; ordinary modules without those hooks must use child exec or posix_spawn paths",
+        },
     ]
 }
 
@@ -71,6 +77,11 @@ fn sandbox_runtime_wasix_process_capabilities() -> Vec<SandboxRuntimeProcessCapa
             capability: SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY,
             supported: false,
             detail: "this binary was built without the `wasix-runtime` feature, so WASIX sandbox-local child exec is unavailable",
+        },
+        SandboxRuntimeProcessCapability {
+            capability: SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY,
+            supported: false,
+            detail: "this binary was built without the `wasix-runtime` feature, so WASIX asyncified fork preflight and execution are unavailable",
         },
     ]
 }
@@ -106,6 +117,9 @@ pub fn sandbox_runtime_supports_command_capability_for_abi(
             matches!(target_abi, SandboxWasiAbi::Wasix) && cfg!(feature = "wasix-runtime")
         }
         SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY => {
+            matches!(target_abi, SandboxWasiAbi::Wasix) && cfg!(feature = "wasix-runtime")
+        }
+        SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY => {
             matches!(target_abi, SandboxWasiAbi::Wasix) && cfg!(feature = "wasix-runtime")
         }
         _ => true,

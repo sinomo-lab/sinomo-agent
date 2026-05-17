@@ -109,8 +109,10 @@ perl -0pi -e 's/size_t sz = sizeof \(\*d\) - sizeof \(d->d_name\) \+ len;/size_t
 MAKE_COMPAT_SOURCE="${WORKDIR}/sinomo-make-wasix-compat.c"
 MAKE_COMPAT_OBJECT="${WORKDIR}/sinomo-make-wasix-compat.o"
 cat > "${MAKE_COMPAT_SOURCE}" <<'COMPAT'
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <wasi/api.h>
 
@@ -121,7 +123,28 @@ extern char **environ;
 extern int main(int argc, char **argv, char **env);
 
 char *getlogin(void) {
-    return NULL;
+    char *name = getenv("LOGNAME");
+    if (name != NULL && *name != 0) {
+        return name;
+    }
+    name = getenv("USER");
+    if (name != NULL && *name != 0) {
+        return name;
+    }
+    return "sinomo";
+}
+
+int getlogin_r(char *buf, size_t bufsize) {
+    const char *name = getlogin();
+    size_t len = strlen(name);
+    if (buf == NULL) {
+        return EFAULT;
+    }
+    if (bufsize <= len) {
+        return ERANGE;
+    }
+    memcpy(buf, name, len + 1);
+    return 0;
 }
 
 int __main_argc_argv(int argc, char **argv) {

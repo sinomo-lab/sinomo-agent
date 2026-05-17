@@ -30,6 +30,8 @@ impl TtyBridge for SysTty {
             echo,
             line_buffered,
             line_feeds,
+            tostop: false,
+            foreground_process_group: None,
         }
     }
 

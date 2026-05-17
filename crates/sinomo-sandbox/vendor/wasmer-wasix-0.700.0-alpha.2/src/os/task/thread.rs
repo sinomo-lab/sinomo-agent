@@ -1,6 +1,6 @@
 use super::{
     control_plane::TaskCountGuard,
-    task_join_handle::{OwnedTaskStatus, TaskJoinHandle},
+    task_join_handle::{OwnedTaskStatus, TaskJoinHandle, TaskStatus},
 };
 use crate::{
     WasiRuntimeError,
@@ -240,6 +240,8 @@ struct WasiThreadState {
     id: WasiThreadId,
     signals: Mutex<(Vec<Signal>, Vec<Waker>)>,
     stack: Mutex<ThreadStack>,
+    clear_child_tid: Mutex<u64>,
+    robust_list: Mutex<Option<(u64, u64)>>,
     status: Arc<OwnedTaskStatus>,
     #[cfg(feature = "journal")]
     check_pointing: AtomicBool,
@@ -270,6 +272,8 @@ impl WasiThread {
                 status,
                 signals: Mutex::new((Vec::new(), Vec::new())),
                 stack: Mutex::new(ThreadStack::default()),
+                clear_child_tid: Mutex::new(0),
+                robust_list: Mutex::new(None),
                 #[cfg(feature = "journal")]
                 check_pointing: AtomicBool::new(false),
                 deep_sleeping: AtomicBool::new(false),
@@ -296,6 +300,22 @@ impl WasiThread {
         self.state.is_main
     }
 
+    pub fn clear_child_tid(&self) -> u64 {
+        *self.state.clear_child_tid.lock().unwrap()
+    }
+
+    pub fn set_clear_child_tid(&self, clear_child_tid: u64) {
+        *self.state.clear_child_tid.lock().unwrap() = clear_child_tid;
+    }
+
+    pub fn robust_list(&self) -> Option<(u64, u64)> {
+        *self.state.robust_list.lock().unwrap()
+    }
+
+    pub fn set_robust_list(&self, head: u64, len: u64) {
+        *self.state.robust_list.lock().unwrap() = Some((head, len));
+    }
+
     /// Get a join handle to watch the task status.
     pub fn join_handle(&self) -> TaskJoinHandle {
         self.state.status.handle()
@@ -320,7 +340,7 @@ impl WasiThread {
             _ => Errno::Intr.into(),
         };
         // This will only set the status code if its not already set
-        self.set_status_finished(Ok(default_exitcode));
+        self.state.status.set_signaled(default_exitcode, sig);
         self.try_join()
             .map(|r| r.unwrap_or(default_exitcode))
             .unwrap_or(default_exitcode)
@@ -330,6 +350,18 @@ impl WasiThread {
     /// joined on it to wake up)
     pub fn set_status_finished(&self, res: Result<ExitCode, WasiRuntimeError>) {
         self.state.status.set_finished(res.map_err(Arc::new));
+    }
+
+    pub fn set_status_stopped(&self, signal: Signal) {
+        self.state.status.set_stopped(signal);
+    }
+
+    pub fn set_status_continued(&self) {
+        self.state.status.set_continued();
+    }
+
+    pub fn status(&self) -> TaskStatus {
+        self.state.status.status()
     }
 
     /// Waits until the thread is finished or the timeout is reached

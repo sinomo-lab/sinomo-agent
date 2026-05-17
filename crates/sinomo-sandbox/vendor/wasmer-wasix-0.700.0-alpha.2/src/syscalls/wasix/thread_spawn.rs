@@ -125,6 +125,7 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
     let mut store = ctx.as_store_mut();
     let env = func_env.as_ref(&store);
     let tasks = env.tasks().clone();
+    let process = env.process.clone();
 
     let env_inner = env.inner();
     let module_handles = env_inner.main_module_instance_handles();
@@ -135,6 +136,7 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
     // We capture some local variables
     let state = env.state.clone();
     let mut thread_env = env.clone();
+    let thread_id = thread_handle.id();
     thread_env.thread = thread_handle.as_thread();
     thread_env.layout = layout;
 
@@ -180,7 +182,10 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
     let mut task_wasm = TaskWasm::new(Box::new(run), thread_env, thread_module, false, false)
         .with_memory(spawn_type);
 
-    tasks.task_wasm(task_wasm).map_err(Into::<Errno>::into)?;
+    if let Err(err) = tasks.task_wasm(task_wasm) {
+        process.remove_thread(&thread_id);
+        return Err(err.into());
+    }
 
     // Success
     Ok(())
@@ -192,22 +197,37 @@ fn call_module_internal<M: MemorySize>(
     mut store: Store,
     start_ptr_offset: M::Offset,
 ) -> (Store, Result<(), DeepSleepWork>) {
-    // Note: we ensure both unwraps can happen before getting to this point
-    let spawn = ctx
+    let Some(spawn) = ctx
         .data(&store)
         .inner()
         .main_module_instance_handles()
         .thread_spawn
         .clone()
-        .unwrap();
+    else {
+        let tid = ctx.data(&store).tid();
+        warn!(%tid, "spawned thread is missing wasi_thread_start export");
+        ctx.on_exit(&mut store, Some(Errno::Noexec.into()));
+        return (store, Ok(()));
+    };
     let tid = ctx.data(&store).tid();
 
     let spawn: Function = spawn.into();
-    let tid_i32 = tid.raw().try_into().map_err(|_| Errno::Overflow).unwrap();
-    let start_pointer_i32 = start_ptr_offset
-        .try_into()
-        .map_err(|_| Errno::Overflow)
-        .unwrap();
+    let tid_i32 = match tid.raw().try_into().map_err(|_| Errno::Overflow) {
+        Ok(tid) => tid,
+        Err(err) => {
+            warn!(%tid, "spawned thread id does not fit callback parameter");
+            ctx.on_exit(&mut store, Some(err.into()));
+            return (store, Ok(()));
+        }
+    };
+    let start_pointer_i32 = match start_ptr_offset.try_into().map_err(|_| Errno::Overflow) {
+        Ok(start_ptr) => start_ptr,
+        Err(err) => {
+            warn!(%tid, "spawned thread start pointer does not fit callback parameter");
+            ctx.on_exit(&mut store, Some(err.into()));
+            return (store, Ok(()));
+        }
+    };
     let (mut store, thread_result) = ContextSwitchingEnvironment::run_main_context(
         ctx,
         store,

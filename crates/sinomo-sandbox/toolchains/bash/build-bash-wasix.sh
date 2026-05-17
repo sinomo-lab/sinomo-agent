@@ -125,6 +125,401 @@ void __env_rm_add(char *old_entry, char *new_entry) {
 }
 ENV_COMPAT
 
+BASH_TERMIOS_COMPAT_SOURCE="${WORKDIR}/sinomo-bash-wasix-termios-compat.c"
+BASH_TERMIOS_COMPAT_OBJECT="${WORKDIR}/sinomo-bash-wasix-termios-compat.o"
+cat > "${BASH_TERMIOS_COMPAT_SOURCE}" <<'TERMIOS_COMPAT'
+#include <termios.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <wasi/api_wasix.h>
+
+extern int __real_tcgetattr(int fd, struct termios *termios_p);
+extern int __real_tcsetattr(int fd, int optional_actions, const struct termios *termios_p);
+extern pid_t __real_waitpid(pid_t pid, int *status, int options);
+extern int __real_waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
+
+__attribute__((import_module("wasix_32v1"), import_name("proc_tty_get_tostop")))
+extern int sinomo_proc_tty_get_tostop(int *tostop);
+__attribute__((import_module("wasix_32v1"), import_name("proc_tty_set_tostop")))
+extern int sinomo_proc_tty_set_tostop(int tostop);
+__attribute__((import_module("wasix_32v1"), import_name("proc_child_continued_status")))
+extern int sinomo_proc_child_continued_status(int pid, int consume, int *continued_pid);
+__attribute__((import_module("wasix_32v1"), import_name("proc_child_continued_status_wait")))
+extern int sinomo_proc_child_continued_status_wait(int pid, int consume, int nonblocking, int *continued_pid);
+__attribute__((import_module("wasix_32v1"), import_name("proc_wait_status")))
+extern int sinomo_proc_wait_status(__wasi_option_pid_t *pid, __wasi_join_flags_t flags, __wasi_join_status_t *status);
+__attribute__((import_module("wasix_32v1"), import_name("proc_wait_status_select")))
+extern int sinomo_proc_wait_status_select(__wasi_option_pid_t *pid, __wasi_join_flags_t flags, uint32_t status_kinds, __wasi_join_status_t *status);
+__attribute__((import_module("wasix_32v1"), import_name("proc_getrusage")))
+extern int sinomo_proc_getrusage(int who, unsigned long long *user_usec, unsigned long long *system_usec, unsigned long long *maxrss_kib);
+
+#define SINOMO_WAIT_STATUS_EXITED (1U << 0)
+#define SINOMO_WAIT_STATUS_STOPPED (1U << 1)
+#define SINOMO_WAIT_STATUS_CONTINUED (1U << 2)
+
+static int sinomo_wait_status(__wasi_join_status_t *status) {
+    switch (status->tag) {
+    case __WASI_JOIN_STATUS_TYPE_NOTHING:
+        return 0;
+    case __WASI_JOIN_STATUS_TYPE_EXIT_NORMAL:
+        return ((int)status->u.exit_normal & 0xff) << 8;
+    case __WASI_JOIN_STATUS_TYPE_EXIT_SIGNAL:
+        return (int)status->u.exit_signal.signal & 0x7f;
+    case __WASI_JOIN_STATUS_TYPE_STOPPED:
+        return (((int)status->u.stopped & 0xff) << 8) | 0x7f;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+static pid_t sinomo_take_continued_child(pid_t pid) {
+#ifdef WCONTINUED
+    int continued_pid = 0;
+    int rc = sinomo_proc_child_continued_status((int)pid, 1, &continued_pid);
+    if (rc != 0) {
+        errno = rc;
+        return (pid_t)-1;
+    }
+    return (pid_t)continued_pid;
+#else
+    (void)pid;
+    return (pid_t)0;
+#endif
+}
+
+static pid_t sinomo_peek_continued_child(pid_t pid) {
+#ifdef WCONTINUED
+    int continued_pid = 0;
+    int rc = sinomo_proc_child_continued_status((int)pid, 0, &continued_pid);
+    if (rc != 0) {
+        errno = rc;
+        return (pid_t)-1;
+    }
+    return (pid_t)continued_pid;
+#else
+    (void)pid;
+    return (pid_t)0;
+#endif
+}
+
+static pid_t sinomo_wait_continued_child(pid_t pid, int consume, int nonblocking) {
+#ifdef WCONTINUED
+    int continued_pid = 0;
+    int rc = sinomo_proc_child_continued_status_wait((int)pid, consume, nonblocking, &continued_pid);
+    if (rc != 0) {
+        errno = rc;
+        return (pid_t)-1;
+    }
+    return (pid_t)continued_pid;
+#else
+    (void)pid;
+    (void)consume;
+    (void)nonblocking;
+    return (pid_t)0;
+#endif
+}
+
+int __wrap_tcgetattr(int fd, struct termios *termios_p) {
+    int rc = __real_tcgetattr(fd, termios_p);
+#ifdef TOSTOP
+    if (rc == 0 && termios_p != 0) {
+        int tostop = 0;
+        if (sinomo_proc_tty_get_tostop(&tostop) == 0) {
+            if (tostop) {
+                termios_p->c_lflag |= TOSTOP;
+            } else {
+                termios_p->c_lflag &= (tcflag_t)~TOSTOP;
+            }
+        }
+    }
+#endif
+    return rc;
+}
+
+int __wrap_tcsetattr(int fd, int optional_actions, const struct termios *termios_p) {
+    int rc = __real_tcsetattr(fd, optional_actions, termios_p);
+#ifdef TOSTOP
+    if (rc == 0 && termios_p != 0) {
+        (void)sinomo_proc_tty_set_tostop((termios_p->c_lflag & TOSTOP) != 0);
+    }
+#endif
+    return rc;
+}
+
+pid_t __wrap_waitpid(pid_t pid, int *status, int options) {
+#ifdef WCONTINUED
+    if ((options & WCONTINUED) != 0) {
+        pid_t continued_pid = sinomo_take_continued_child(pid);
+        if (continued_pid < 0) {
+            return -1;
+        }
+        if (continued_pid > 0) {
+            if (status != 0) {
+                *status = 0xffff;
+            }
+            return continued_pid;
+        }
+    }
+#endif
+
+    __wasi_option_pid_t option_pid = {
+        .tag = 1,
+        .u = {.some = (__wasi_pid_t)pid},
+    };
+    __wasi_join_flags_t flags = 0;
+    if ((options & WNOHANG) != 0) {
+        flags |= __WASI_JOIN_FLAGS_NON_BLOCKING;
+    }
+    if ((options & WUNTRACED) != 0) {
+        flags |= __WASI_JOIN_FLAGS_WAKE_STOPPED;
+    }
+
+    __wasi_join_status_t join_status = {0};
+    __wasi_errno_t rc = __wasi_proc_join(&option_pid, flags, &join_status);
+    if (rc != 0) {
+        errno = (int)rc;
+        return -1;
+    }
+
+    int wait_status = sinomo_wait_status(&join_status);
+    if (wait_status < 0) {
+        return -1;
+    }
+    if (status != 0) {
+        *status = wait_status;
+    }
+    return (pid_t)option_pid.u.some;
+}
+
+pid_t __wrap_wait(int *status) {
+    return __wrap_waitpid(-1, status, 0);
+}
+
+static void sinomo_usec_timeval(unsigned long long value, struct timeval *out) {
+    out->tv_sec = (time_t)(value / 1000000ULL);
+    out->tv_usec = (suseconds_t)(value % 1000000ULL);
+}
+
+static unsigned long long sinomo_timeval_usec(const struct timeval *value) {
+    return ((unsigned long long)value->tv_sec * 1000000ULL) + (unsigned long long)value->tv_usec;
+}
+
+static int sinomo_get_child_rusage(struct rusage *usage) {
+    unsigned long long user_usec = 0;
+    unsigned long long system_usec = 0;
+    unsigned long long maxrss_kib = 0;
+    int rc = sinomo_proc_getrusage(RUSAGE_CHILDREN, &user_usec, &system_usec, &maxrss_kib);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    memset(usage, 0, sizeof(*usage));
+    sinomo_usec_timeval(user_usec, &usage->ru_utime);
+    sinomo_usec_timeval(system_usec, &usage->ru_stime);
+    usage->ru_maxrss = (long)maxrss_kib;
+    return 0;
+}
+
+static void sinomo_child_rusage_delta(
+    struct rusage *usage,
+    const struct rusage *before,
+    const struct rusage *after
+) {
+    unsigned long long before_user = sinomo_timeval_usec(&before->ru_utime);
+    unsigned long long after_user = sinomo_timeval_usec(&after->ru_utime);
+    unsigned long long before_system = sinomo_timeval_usec(&before->ru_stime);
+    unsigned long long after_system = sinomo_timeval_usec(&after->ru_stime);
+
+    memset(usage, 0, sizeof(*usage));
+    sinomo_usec_timeval(after_user > before_user ? after_user - before_user : 0, &usage->ru_utime);
+    sinomo_usec_timeval(after_system > before_system ? after_system - before_system : 0, &usage->ru_stime);
+    usage->ru_maxrss = after->ru_maxrss;
+}
+
+pid_t __wrap_wait3(int *status, int options, struct rusage *usage) {
+    struct rusage before;
+    int have_before = usage != 0 && sinomo_get_child_rusage(&before) == 0;
+    pid_t pid = __wrap_waitpid(-1, status, options);
+    if (pid > 0 && usage != 0) {
+        struct rusage after;
+        if (have_before && sinomo_get_child_rusage(&after) == 0) {
+            sinomo_child_rusage_delta(usage, &before, &after);
+        } else {
+            memset(usage, 0, sizeof(*usage));
+        }
+    }
+    return pid;
+}
+
+pid_t __wrap_wait4(pid_t pid, int *status, int options, struct rusage *usage) {
+    struct rusage before;
+    int have_before = usage != 0 && sinomo_get_child_rusage(&before) == 0;
+    pid_t waited = __wrap_waitpid(pid, status, options);
+    if (waited > 0 && usage != 0) {
+        struct rusage after;
+        if (have_before && sinomo_get_child_rusage(&after) == 0) {
+            sinomo_child_rusage_delta(usage, &before, &after);
+        } else {
+            memset(usage, 0, sizeof(*usage));
+        }
+    }
+    return waited;
+}
+
+int __wrap_waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options) {
+    if (infop == 0) {
+        errno = EFAULT;
+        return -1;
+    }
+#ifdef WCONTINUED
+    if ((options & WCONTINUED) != 0) {
+        pid_t pid = -1;
+        if (idtype == P_ALL) {
+            pid = -1;
+        } else if (idtype == P_PID) {
+            pid = (pid_t)id;
+        } else if (idtype == P_PGID) {
+            pid = id == 0 ? 0 : -((pid_t)id);
+        }
+        int continued_only = (options & (WEXITED | WSTOPPED)) == 0;
+        int continued_nonblocking = (options & WNOHANG) != 0 || !continued_only;
+        pid_t continued_pid = continued_only
+            ? sinomo_wait_continued_child(pid, (options & WNOWAIT) == 0, continued_nonblocking)
+            : ((options & WNOWAIT) != 0
+                ? sinomo_peek_continued_child(pid)
+                : sinomo_take_continued_child(pid));
+        if (continued_pid < 0) {
+            return -1;
+        }
+        if (continued_pid > 0) {
+            memset(infop, 0, sizeof(*infop));
+            infop->si_signo = SIGCHLD;
+            infop->si_pid = continued_pid;
+            infop->si_uid = getuid();
+            infop->si_code = CLD_CONTINUED;
+            infop->si_status = SIGCONT;
+            return 0;
+        }
+        if (continued_only) {
+            memset(infop, 0, sizeof(*infop));
+            return 0;
+        }
+    }
+#endif
+
+    __wasi_option_pid_t option_pid = {
+        .tag = 1,
+        .u = {.some = -1},
+    };
+    if (idtype == P_ALL) {
+        option_pid.u.some = -1;
+    } else if (idtype == P_PID) {
+        option_pid.u.some = (__wasi_pid_t)id;
+    } else if (idtype == P_PGID) {
+        option_pid.u.some = id == 0 ? 0 : -((__wasi_pid_t)id);
+    } else {
+        return __real_waitid(idtype, id, infop, options);
+    }
+
+    __wasi_join_flags_t flags = 0;
+    if ((options & WNOHANG) != 0) {
+        flags |= __WASI_JOIN_FLAGS_NON_BLOCKING;
+    }
+    if ((options & WSTOPPED) != 0) {
+        flags |= __WASI_JOIN_FLAGS_WAKE_STOPPED;
+    }
+
+    __wasi_join_status_t join_status = {0};
+    uint32_t status_kinds = 0;
+    if ((options & WEXITED) != 0) {
+        status_kinds |= SINOMO_WAIT_STATUS_EXITED;
+    }
+    if ((options & WSTOPPED) != 0) {
+        status_kinds |= SINOMO_WAIT_STATUS_STOPPED;
+    }
+    if ((options & WCONTINUED) != 0) {
+        status_kinds |= SINOMO_WAIT_STATUS_CONTINUED;
+    }
+    __wasi_errno_t rc = ((options & WNOWAIT) != 0 || (options & WEXITED) == 0 || (options & WCONTINUED) != 0)
+        ? sinomo_proc_wait_status_select(&option_pid, flags, status_kinds, &join_status)
+        : __wasi_proc_join(&option_pid, flags, &join_status);
+    if (rc != 0) {
+        errno = (int)rc;
+        return -1;
+    }
+
+    memset(infop, 0, sizeof(*infop));
+    if (join_status.tag == __WASI_JOIN_STATUS_TYPE_NOTHING) {
+        if ((options & WCONTINUED) != 0 && option_pid.u.some > 0) {
+            if ((options & WNOWAIT) == 0) {
+                pid_t consumed = sinomo_take_continued_child((pid_t)option_pid.u.some);
+                if (consumed < 0) {
+                    return -1;
+                }
+            }
+            infop->si_signo = SIGCHLD;
+            infop->si_pid = (pid_t)option_pid.u.some;
+            infop->si_uid = getuid();
+            infop->si_code = CLD_CONTINUED;
+            infop->si_status = SIGCONT;
+        }
+        return 0;
+    }
+    if ((options & WCONTINUED) != 0 && (options & WNOWAIT) == 0 && join_status.tag != __WASI_JOIN_STATUS_TYPE_STOPPED) {
+        __wasi_option_pid_t reap_pid = {.tag = 1, .u = {.some = option_pid.u.some}};
+        rc = __wasi_proc_join(&reap_pid, flags, &join_status);
+        if (rc != 0) {
+            errno = (int)rc;
+            return -1;
+        }
+        option_pid.u.some = reap_pid.u.some;
+    }
+    infop->si_signo = SIGCHLD;
+    infop->si_pid = (pid_t)option_pid.u.some;
+    infop->si_uid = getuid();
+    infop->si_utime = 0;
+    infop->si_stime = 0;
+
+    switch (join_status.tag) {
+    case __WASI_JOIN_STATUS_TYPE_EXIT_NORMAL:
+        if ((options & WEXITED) == 0) {
+            memset(infop, 0, sizeof(*infop));
+            return 0;
+        }
+        infop->si_code = CLD_EXITED;
+        infop->si_status = (int)join_status.u.exit_normal;
+        return 0;
+    case __WASI_JOIN_STATUS_TYPE_EXIT_SIGNAL:
+        if ((options & WEXITED) == 0) {
+            memset(infop, 0, sizeof(*infop));
+            return 0;
+        }
+        infop->si_code = CLD_KILLED;
+        infop->si_status = (int)join_status.u.exit_signal.signal;
+        return 0;
+    case __WASI_JOIN_STATUS_TYPE_STOPPED:
+        if ((options & WSTOPPED) == 0) {
+            memset(infop, 0, sizeof(*infop));
+            return 0;
+        }
+        infop->si_code = CLD_STOPPED;
+        infop->si_status = (int)join_status.u.stopped;
+        return 0;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+TERMIOS_COMPAT
+
 BASH_MAIN_COMPAT_SOURCE="${WORKDIR}/sinomo-bash-wasix-main-compat.c"
 BASH_MAIN_COMPAT_OBJECT="${WORKDIR}/sinomo-bash-wasix-main-compat.o"
 cat > "${BASH_MAIN_COMPAT_SOURCE}" <<'MAIN_COMPAT'
@@ -187,6 +582,19 @@ MAIN_COMPAT
     -mthread-model posix \
     -fno-exceptions \
     -ftls-model=local-exec \
+    -c "${BASH_TERMIOS_COMPAT_SOURCE}" \
+    -o "${BASH_TERMIOS_COMPAT_OBJECT}"
+"${WASI_SDK}/bin/clang" \
+    --target=wasm32-wasi \
+    --sysroot="${WASIX_SYSROOT}" \
+    -Os \
+    -matomics \
+    -mbulk-memory \
+    -mmutable-globals \
+    -pthread \
+    -mthread-model posix \
+    -fno-exceptions \
+    -ftls-model=local-exec \
     -c "${BASH_MAIN_COMPAT_SOURCE}" \
     -o "${BASH_MAIN_COMPAT_OBJECT}"
 
@@ -200,10 +608,11 @@ MAIN_COMPAT
 "${WASI_SDK}/bin/llvm-ar" r \
     "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" \
     "${BASH_ENV_COMPAT_OBJECT}" \
+    "${BASH_TERMIOS_COMPAT_OBJECT}" \
     "${BASH_MAIN_COMPAT_OBJECT}"
 
 export CFLAGS="-Os -fwrapv -fno-ident -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -fno-trapping-math -fno-exceptions -ftls-model=local-exec -msimd128 -mrelaxed-simd -mextended-const -include ${BASH_COMPAT_INCLUDE} -ffile-prefix-map=${WORKDIR}=sinomo-bash-build -ffile-prefix-map=${REPO_ROOT}=sinomo -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS"
-export LDFLAGS="-Wl,--export-all -Wl,--export-dynamic -Wl,--shared-memory -Wl,--import-memory -Wl,--extra-features=atomics -Wl,--extra-features=bulk-memory -Wl,--extra-features=mutable-globals -Wl,--export=__wasm_call_ctors -Wl,--export=__wasm_init_tls -Wl,--export=__wasm_signal -Wl,--export=__tls_size -Wl,--export=__tls_align -Wl,--export=__tls_base -Wl,--export-if-defined=__indirect_function_table -Wl,--export-if-defined=__stack_pointer -Wl,--export-if-defined=__heap_base -Wl,--export-if-defined=__data_end -Wl,-z,stack-size=1048576 -Wl,--initial-memory=67108864 -Wl,--max-memory=268435456 -lwasi-emulated-getpid -lwasi-emulated-mman -lwasi-emulated-process-clocks -lresolv -lrt -lm -lpthread -lutil"
+export LDFLAGS="-Wl,--wrap=tcgetattr -Wl,--wrap=tcsetattr -Wl,--wrap=wait -Wl,--wrap=waitpid -Wl,--wrap=wait3 -Wl,--wrap=wait4 -Wl,--wrap=waitid -Wl,--export-all -Wl,--export-dynamic -Wl,--shared-memory -Wl,--import-memory -Wl,--extra-features=atomics -Wl,--extra-features=bulk-memory -Wl,--extra-features=mutable-globals -Wl,--export=__wasm_call_ctors -Wl,--export=__wasm_init_tls -Wl,--export=__wasm_signal -Wl,--export=__tls_size -Wl,--export=__tls_align -Wl,--export=__tls_base -Wl,--export-if-defined=__indirect_function_table -Wl,--export-if-defined=__stack_pointer -Wl,--export-if-defined=__heap_base -Wl,--export-if-defined=__data_end -Wl,-z,stack-size=1048576 -Wl,--initial-memory=67108864 -Wl,--max-memory=268435456 -lwasi-emulated-getpid -lwasi-emulated-mman -lwasi-emulated-process-clocks -lresolv -lrt -lm -lpthread -lutil"
 BUILD_CFLAGS="-g -DCROSS_COMPILING -std=gnu89"
 
 cd "${BASH_SRC}"

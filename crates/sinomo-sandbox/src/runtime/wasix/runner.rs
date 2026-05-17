@@ -75,11 +75,32 @@ pub(crate) fn run_wasix_module(
     let mut runner = wasmer_wasix::runners::wasi::WasiRunner::new();
     runner.with_capabilities(sandbox_wasix_capabilities());
     runner.with_args(request.argv.iter().skip(1).cloned());
-    runner.with_envs(wasix_environment(
+    let mut env = wasix_environment(
         &request,
         options.wasix_pinned_child_exec_only,
         &options.wasix_command_overrides,
+    );
+    env.push((
+        "SINOMO_SANDBOX_MEMORY_LIMIT_BYTES".to_string(),
+        options.memory_limit_bytes.to_string(),
     ));
+    env.push((
+        "SINOMO_SANDBOX_WALL_TIME_LIMIT_MS".to_string(),
+        request.timeout_ms.to_string(),
+    ));
+    env.push((
+        "SINOMO_SANDBOX_OUTPUT_LIMIT_BYTES".to_string(),
+        options.output_limit_bytes.to_string(),
+    ));
+    env.push((
+        "SINOMO_SANDBOX_WORKSPACE_LIMIT_BYTES".to_string(),
+        options.workspace_limit_bytes.to_string(),
+    ));
+    env.push((
+        "SINOMO_SANDBOX_FILE_COUNT_LIMIT".to_string(),
+        options.file_count_limit.to_string(),
+    ));
+    runner.with_envs(env.clone());
     runner.with_current_dir(request.cwd.as_str());
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -91,14 +112,17 @@ pub(crate) fn run_wasix_module(
     let tokio_enter = tokio_runtime.enter();
     let runtime_mounts = configure_wasix_mapped_directories(
         &mut runner,
+        &request.argv,
+        &env,
         &options.preopened_dirs,
         options.wasix_pinned_child_exec_only,
         options.enable_virtual_devices,
         options.zero_device_bytes,
     )?;
-    configure_wasix_stdin(
+    let stdin_input = configure_wasix_stdin(
         &mut runner,
         request.stdin.clone(),
+        options.wasix_stdin_pipe.clone(),
         options.input_limit_bytes,
     )?;
 
@@ -108,6 +132,7 @@ pub(crate) fn run_wasix_module(
         SandboxOutputStream::Stdout,
         options.output_limit_bytes,
         options.output_sink.clone(),
+        options.wasix_stdout_pipe.clone(),
     );
     let stderr_capture = WasixStreamingOutputCapture::new(
         request.sandbox_id.clone(),
@@ -115,6 +140,7 @@ pub(crate) fn run_wasix_module(
         SandboxOutputStream::Stderr,
         options.output_limit_bytes,
         options.output_sink.clone(),
+        None,
     );
     let stdout_file = virtual_fs::ArcFile::new(Box::new(stdout_capture.file()));
     let stderr_file = virtual_fs::ArcFile::new(Box::new(stderr_capture.file()));
@@ -128,6 +154,7 @@ pub(crate) fn run_wasix_module(
         program_name,
         module,
         wasmer_types::ModuleHash::xxhash(wasm),
+        options.memory_limit_bytes,
         request.timeout_ms,
         options.cancellation.clone(),
     );
@@ -139,6 +166,11 @@ pub(crate) fn run_wasix_module(
         return Err(SandboxWasiError::OutputLimitExceeded {
             limit: options.output_limit_bytes,
         });
+    }
+    if let Some(input) = &stdin_input {
+        if let Some(limit) = input.input_limit_exceeded()? {
+            return Err(SandboxWasiError::InputLimitExceeded { limit });
+        }
     }
     if wasix_command_exceeded_requested_timeout(elapsed, request.timeout_ms) {
         return Err(SandboxWasiError::TimedOut {

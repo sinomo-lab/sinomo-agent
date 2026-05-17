@@ -289,52 +289,53 @@ where
             }
             Eventtype::Clock => {
                 let clock_info = unsafe { s.data.clock };
-                if clock_info.clock_id == Clockid::Realtime
-                    || clock_info.clock_id == Clockid::Monotonic
-                {
-                    // Ignore duplicates
-                    if clock_subs
-                        .iter()
-                        .any(|c| c.0.clock_id == clock_info.clock_id && c.1 == s.userdata)
-                    {
+                match clock_info.clock_id {
+                    Clockid::Realtime
+                    | Clockid::Monotonic
+                    | Clockid::ProcessCputimeId
+                    | Clockid::ThreadCputimeId => {
+                        // Ignore duplicates
+                        if clock_subs
+                            .iter()
+                            .any(|c| c.0.clock_id == clock_info.clock_id && c.1 == s.userdata)
+                        {
+                            continue;
+                        }
+
+                        // If the timeout duration is zero then this is an immediate check rather than
+                        // a sleep itself
+                        if clock_info.timeout == 0 {
+                            time_to_sleep = Duration::MAX;
+                        } else if clock_info.timeout == 1 {
+                            time_to_sleep = Duration::ZERO;
+                            clock_subs.push((clock_info, s.userdata));
+                        } else {
+                            // if the timeout is specified as an absolute time in the future,
+                            // we should calculate the duration we need to sleep
+                            time_to_sleep = if clock_info
+                                .flags
+                                .contains(Subclockflags::SUBSCRIPTION_CLOCK_ABSTIME)
+                            {
+                                let now =
+                                    wasi_try_ok!(platform_clock_time_get(clock_info.clock_id.into(), 1))
+                                        as u64;
+
+                                if clock_info.timeout <= now {
+                                    Duration::ZERO
+                                } else {
+                                    Duration::from_nanos(clock_info.timeout)
+                                        - Duration::from_nanos(now)
+                                }
+                            } else {
+                                // if the timeout is not absolute, just use it as duration
+                                Duration::from_nanos(clock_info.timeout)
+                            };
+
+                            clock_subs.push((clock_info, s.userdata));
+                        }
                         continue;
                     }
-
-                    // If the timeout duration is zero then this is an immediate check rather than
-                    // a sleep itself
-                    if clock_info.timeout == 0 {
-                        time_to_sleep = Duration::MAX;
-                    } else if clock_info.timeout == 1 {
-                        time_to_sleep = Duration::ZERO;
-                        clock_subs.push((clock_info, s.userdata));
-                    } else {
-                        // if the timeout is specified as an absolute time in the future,
-                        // we should calculate the duration we need to sleep
-                        time_to_sleep = if clock_info
-                            .flags
-                            .contains(Subclockflags::SUBSCRIPTION_CLOCK_ABSTIME)
-                        {
-                            let now = wasi_try_ok!(platform_clock_time_get(
-                                Snapshot0Clockid::Monotonic,
-                                1
-                            )) as u64;
-
-                            if clock_info.timeout <= now {
-                                Duration::ZERO
-                            } else {
-                                Duration::from_nanos(clock_info.timeout) - Duration::from_nanos(now)
-                            }
-                        } else {
-                            // if the timeout is not absolute, just use it as duration
-                            Duration::from_nanos(clock_info.timeout)
-                        };
-
-                        clock_subs.push((clock_info, s.userdata));
-                    }
-                    continue;
-                } else {
-                    error!("polling not implemented for these clocks yet");
-                    return Ok(Errno::Inval);
+                    _ => return Ok(Errno::Inval),
                 }
             }
             _ => {

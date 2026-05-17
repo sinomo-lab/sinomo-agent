@@ -687,6 +687,25 @@ fn sandbox_toolchain_add_command_parser_accepts_options() {
 }
 
 #[test]
+fn sandbox_toolchain_add_command_parser_defaults_to_wasix() {
+    let command = parse_sandbox_command(&[
+        "toolchain".to_string(),
+        "add-command".to_string(),
+        "cat".to_string(),
+        "/tmp/cat.wasm".to_string(),
+    ])
+    .expect("toolchain add-command");
+
+    let SandboxCliCommand::ToolchainAddCommand(options) = command else {
+        panic!("expected toolchain add-command");
+    };
+    assert_eq!(
+        options.target_abi,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix
+    );
+}
+
+#[test]
 fn sandbox_toolchain_add_command_parser_rejects_invalid_capability_value() {
     let error = parse_sandbox_command(&[
         "toolchain".to_string(),
@@ -1811,9 +1830,7 @@ fn sandbox_doctor_warns_when_policy_allows_wasix_unpinned_child_exec() {
                 && finding
                     .detail
                     .contains(sinomo_runtime::sandbox::SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY)
-                && finding
-                    .detail
-                    .contains("strict pinned child-exec containment")
+                && finding.detail.contains("writable mounts")
         }),
         "doctor should report when policy allows the temporary WASIX child-exec escape hatch"
     );
@@ -2103,19 +2120,30 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
             .iter()
             .any(|finding| finding.code == "process-substrate-missing"
                 && finding.severity == super::SandboxDoctorSeverity::Warning
-                && finding.detail.contains("child-process-exec")
-                && finding.detail.contains("fork/exec"))
+                && finding
+                    .detail
+                    .contains(sinomo_runtime::sandbox::SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY)
+                && finding.detail.contains("asyncify")),
+        "doctor should report the WASIX asyncified fork boundary separately"
     );
     assert!(
         findings
             .iter()
             .any(|finding| finding.code == "process-substrate-missing"
                 && finding.severity == super::SandboxDoctorSeverity::Warning
+                && finding.detail.contains("child-process-exec")
+                && finding.detail.contains("fork/exec"))
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.code == "process-substrate-available"
+                && finding.severity == super::SandboxDoctorSeverity::Info
                 && finding.detail.contains(
                     sinomo_runtime::sandbox::SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY
                 )
-                && finding.detail.contains("child exec containment")),
-        "doctor should report the strict WASIX pinned child-exec containment gap"
+                && finding.detail.contains("pinned /bin")),
+        "doctor should report strict WASIX pinned child-exec containment as available"
     );
     assert!(
         findings
@@ -2357,9 +2385,7 @@ fn sandbox_doctor_warns_when_wasix_shell_uses_unpinned_child_exec_acknowledgemen
                 && finding
                     .detail
                     .contains(sinomo_runtime::sandbox::SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY)
-                && finding
-                    .detail
-                    .contains("strict pinned child-exec containment")
+                && finding.detail.contains("writable mounts")
         }),
         "doctor should identify sandboxes whose WASIX shell relies on the temporary child-exec escape hatch"
     );

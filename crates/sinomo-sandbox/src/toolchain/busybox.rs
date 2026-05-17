@@ -39,7 +39,7 @@ impl SandboxBusyBoxToolchainSpec {
         let mut manifest = SandboxToolchainManifest::new(
             self.toolchain_id.clone(),
             self.version.clone(),
-            SandboxWasiAbi::Preview1,
+            default_sandbox_wasi_abi(),
             self.provenance.clone(),
             self.created_at,
         )?;

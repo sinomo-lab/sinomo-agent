@@ -16,9 +16,27 @@ pub fn fd_datasync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<E
     if !fd_entry.inner.rights.contains(Rights::FD_DATASYNC) {
         return Ok(Errno::Access);
     }
+    let inode = fd_entry.inode.clone();
 
     #[allow(clippy::await_holding_lock)]
-    Ok(wasi_try_ok!(__asyncify(&mut ctx, None, async move {
+    wasi_try_ok!(__asyncify(&mut ctx, None, async move {
         state.fs.flush(fd).await.map(|_| Errno::Success)
-    })?))
+    })?);
+
+    let size = {
+        let guard = inode.read();
+        match guard.deref() {
+            Kind::File {
+                handle: Some(handle),
+                ..
+            } => Some(handle.read().unwrap().size()),
+            Kind::Buffer { buffer } => Some(buffer.len() as u64),
+            _ => None,
+        }
+    };
+    if let Some(size) = size {
+        inode.stat.write().unwrap().st_size = size;
+    }
+
+    Ok(Errno::Success)
 }

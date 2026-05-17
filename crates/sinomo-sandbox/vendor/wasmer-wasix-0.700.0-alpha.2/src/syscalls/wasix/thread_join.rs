@@ -32,6 +32,9 @@ pub(super) fn thread_join_internal<M: MemorySize + 'static>(
 
     let env = ctx.data();
     let tid: WasiThreadId = join_tid.into();
+    if tid == env.tid() {
+        return Ok(Errno::Inval);
+    }
     let other_thread = env.process.get_thread(&tid);
     if let Some(other_thread) = other_thread {
         let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
@@ -44,6 +47,6 @@ pub(super) fn thread_join_internal<M: MemorySize + 'static>(
         })?;
         Ok(Errno::Success)
     } else {
-        Ok(Errno::Success)
+        Ok(Errno::Badf)
     }
 }

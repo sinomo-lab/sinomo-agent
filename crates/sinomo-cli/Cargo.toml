@@ -12,7 +12,7 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "application"
 
 [features]
-default = []
+default = ["wasix-runtime"]
 native-models = ["dep:candle-core", "dep:sinomo-models", "dep:tokenizers"]
 wasix-runtime = ["sinomo-runtime/wasix-runtime"]
 

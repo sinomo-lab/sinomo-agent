@@ -24,9 +24,19 @@ where
     Self: Sized,
 {
     fn from_u8(value: u8) -> Result<Self, Errno>;
-    fn size(&self) -> u64;
-    fn store(&self, sink: &mut InstructionSink<'_>, offset: u64, memory_index: u32);
-    fn load(&self, sink: &mut InstructionSink<'_>, offset: u64, memory_index: u32);
+    fn size(&self) -> Result<u64, Errno>;
+    fn store(
+        &self,
+        sink: &mut InstructionSink<'_>,
+        offset: u64,
+        memory_index: u32,
+    ) -> Result<(), Errno>;
+    fn load(
+        &self,
+        sink: &mut InstructionSink<'_>,
+        offset: u64,
+        memory_index: u32,
+    ) -> Result<(), Errno>;
 }
 impl ValTypeOps for ValType {
     fn from_u8(value: u8) -> Result<Self, Errno> {
@@ -40,18 +50,22 @@ impl ValTypeOps for ValType {
             _ => Err(Errno::Inval),
         }
     }
-    fn size(&self) -> u64 {
-        match self {
+    fn size(&self) -> Result<u64, Errno> {
+        Ok(match self {
             Self::I32 => 4,
             Self::I64 => 8,
             Self::F32 => 4,
             Self::F64 => 8,
             Self::V128 => 16,
-            // Not supported in closures.
-            Self::Ref(_) => panic!("Cannot get size of reference type"),
-        }
+            Self::Ref(_) => return Err(Errno::Inval),
+        })
     }
-    fn store(&self, sink: &mut InstructionSink<'_>, offset: u64, memory_index: u32) {
+    fn store(
+        &self,
+        sink: &mut InstructionSink<'_>,
+        offset: u64,
+        memory_index: u32,
+    ) -> Result<(), Errno> {
         match self {
             Self::I32 => sink.i32_store(MemArg {
                 offset,
@@ -78,11 +92,16 @@ impl ValTypeOps for ValType {
                 align: 0,
                 memory_index,
             }),
-            // Not supported in closures
-            Self::Ref(_) => panic!("Cannot store reference type"),
+            Self::Ref(_) => return Err(Errno::Inval),
         };
+        Ok(())
     }
-    fn load(&self, sink: &mut InstructionSink<'_>, offset: u64, memory_index: u32) {
+    fn load(
+        &self,
+        sink: &mut InstructionSink<'_>,
+        offset: u64,
+        memory_index: u32,
+    ) -> Result<(), Errno> {
         match self {
             Self::I32 => sink.i32_load(MemArg {
                 offset,
@@ -109,9 +128,9 @@ impl ValTypeOps for ValType {
                 align: 0,
                 memory_index,
             }),
-            // Not supported in closures
-            Self::Ref(_) => panic!("Cannot load reference type"),
+            Self::Ref(_) => return Err(Errno::Inval),
         };
+        Ok(())
     }
 }
 
@@ -123,7 +142,7 @@ fn build_closure_wasm_bytes(
     environment_offset: u64,
     argument_types: &[ValType],
     result_types: &[ValType],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Errno> {
     let mut wasm_module = wasm_encoder::Module::new();
 
     // Add dylink section
@@ -233,13 +252,11 @@ fn build_closure_wasm_bytes(
     let mut trampoline_function_instructions = trampoline_function.instructions();
     let values_size = argument_types
         .iter()
-        .map(ValType::size)
-        .sum::<u64>()
+        .try_fold(0u64, |sum, ty| Ok::<_, Errno>(sum + ty.size()?))?
         .next_multiple_of(16);
     let results_size = result_types
         .iter()
-        .map(ValType::size)
-        .sum::<u64>()
+        .try_fold(0u64, |sum, ty| Ok::<_, Errno>(sum + ty.size()?))?
         .next_multiple_of(16);
     trampoline_function_instructions
         .global_get(stack_pointer_index)
@@ -251,34 +268,34 @@ fn build_closure_wasm_bytes(
         .i32_sub()
         .local_tee(arguments_base_local)
         .global_set(stack_pointer_index);
-    argument_types.iter().enumerate().fold(
-        (0, &mut trampoline_function_instructions),
-        |mut acc, (index, ty)| {
-            let size = ty.size();
-            acc.1
-                .local_get(arguments_base_local)
-                .local_get(index as u32);
-            ty.store(acc.1, acc.0, main_memory_index);
-            acc.0 += size;
-            acc
-        },
-    );
+    let mut argument_offset = 0;
+    for (index, ty) in argument_types.iter().enumerate() {
+        trampoline_function_instructions
+            .local_get(arguments_base_local)
+            .local_get(index as u32);
+        ty.store(
+            &mut trampoline_function_instructions,
+            argument_offset,
+            main_memory_index,
+        )?;
+        argument_offset += ty.size()?;
+    }
     trampoline_function_instructions
         .local_get(arguments_base_local)
         .local_get(results_base_local)
         .i32_const(environment_offset as i32)
         .i32_const(backing_function as i32)
         .call_indirect(indirect_function_table_index, backing_function_type_index);
-    result_types.iter().enumerate().fold(
-        (0, &mut trampoline_function_instructions),
-        |mut acc, (index, ty)| {
-            let size = ty.size();
-            acc.1.local_get(results_base_local);
-            ty.load(acc.1, acc.0, main_memory_index);
-            acc.0 += size;
-            acc
-        },
-    );
+    let mut result_offset = 0;
+    for ty in result_types {
+        trampoline_function_instructions.local_get(results_base_local);
+        ty.load(
+            &mut trampoline_function_instructions,
+            result_offset,
+            main_memory_index,
+        )?;
+        result_offset += ty.size()?;
+    }
     trampoline_function_instructions
         .local_get(original_stackpointer_local)
         .global_set(stack_pointer_index)
@@ -286,7 +303,7 @@ fn build_closure_wasm_bytes(
     code.function(&trampoline_function);
     wasm_module.section(&code);
 
-    wasm_module.finish()
+    Ok(wasm_module.finish())
 }
 
 // Monotonically incrementing id for closures
@@ -366,14 +383,14 @@ pub fn closure_prepare<M: MemorySize>(
         CLOSURE_ID.fetch_add(1, Ordering::SeqCst),
     );
 
-    let wasm_bytes = build_closure_wasm_bytes(
+    let wasm_bytes = wasi_try_ok!(build_closure_wasm_bytes(
         &module_name,
         closure,
         backing_function,
         environment.offset().into(),
         &argument_types,
         &result_types,
-    );
+    ));
 
     let ld_library_path: [&Path; 0] = [];
     let wasm_loader = DlModuleSpec::Memory {
@@ -383,10 +400,10 @@ pub fn closure_prepare<M: MemorySize>(
     let module_handle = match linker.load_module(wasm_loader, &mut ctx) {
         Ok(m) => m,
         Err(e) => {
-            // Should never happen
-            panic!("Failed to load newly built in-memory module: {e}");
+            error!("Failed to load newly built in-memory module: {e}");
+            return Ok(Errno::Noexec);
         }
     };
 
-    return Ok(Errno::Success);
+    Ok(Errno::Success)
 }

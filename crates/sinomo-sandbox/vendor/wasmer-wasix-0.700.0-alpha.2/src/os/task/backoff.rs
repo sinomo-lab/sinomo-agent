@@ -170,8 +170,13 @@ impl WasiProcess {
             }
 
             // Check if a cool-off-period has passed
-            let now =
-                platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000).unwrap() as u128;
+            let now = match platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000) {
+                Ok(now) => now as u128,
+                Err(err) => {
+                    tracing::warn!(%err, "failed to read monotonic clock for CPU backoff");
+                    return None;
+                }
+            };
             if inner.backoff.cpu_run_cool_off == 0 {
                 inner.backoff.cpu_run_cool_off =
                     now + (1_000_000 * inner.backoff.max_cpu_cool_off_time.as_millis());

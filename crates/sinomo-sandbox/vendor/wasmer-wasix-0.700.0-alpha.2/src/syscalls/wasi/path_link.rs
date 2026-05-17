@@ -98,6 +98,19 @@ pub(crate) fn path_link_internal(
         old_path,
         old_flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0,
     )?;
+    {
+        let guard = source_inode.read();
+        match guard.deref() {
+            Kind::File { .. } | Kind::Buffer { .. } | Kind::Symlink { .. } => {}
+            Kind::Dir { .. } | Kind::Root { .. } => return Err(Errno::Perm),
+            Kind::Socket { .. }
+            | Kind::PipeTx { .. }
+            | Kind::PipeRx { .. }
+            | Kind::DuplexPipe { .. }
+            | Kind::EventNotifications { .. }
+            | Kind::Epoll { .. } => return Err(Errno::Inval),
+        }
+    }
     let target_path_arg = std::path::PathBuf::from(new_path);
     let (target_parent_inode, new_entry_name) =
         state

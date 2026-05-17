@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use wasmer_wasix_types::wasi::{Errno, ExitCode};
+use wasmer_wasix_types::wasi::{Errno, ExitCode, Signal};
 
 use crate::WasiRuntimeError;
 
@@ -14,7 +14,9 @@ use super::signal::{DynSignalHandlerAbi, default_signal_handler};
 pub enum TaskStatus {
     Pending,
     Running,
+    Stopped(Signal),
     Finished(Result<ExitCode, Arc<WasiRuntimeError>>),
+    Signaled { exit_code: ExitCode, signal: Signal },
 }
 
 impl TaskStatus {
@@ -37,6 +39,21 @@ impl TaskStatus {
     pub fn into_finished(self) -> Option<Result<ExitCode, Arc<WasiRuntimeError>>> {
         match self {
             Self::Finished(res) => Some(res),
+            Self::Signaled { exit_code, .. } => Some(Ok(exit_code)),
+            _ => None,
+        }
+    }
+
+    pub fn stopped_signal(&self) -> Option<Signal> {
+        match self {
+            Self::Stopped(signal) => Some(*signal),
+            _ => None,
+        }
+    }
+
+    pub fn exit_signal(&self) -> Option<(ExitCode, Signal)> {
+        match self {
+            Self::Signaled { exit_code, signal } => Some((*exit_code, *signal)),
             _ => None,
         }
     }
@@ -46,7 +63,7 @@ impl TaskStatus {
     /// [`Finished`]: TaskStatus::Finished
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        matches!(self, Self::Finished(..))
+        matches!(self, Self::Finished(..) | Self::Signaled { .. })
     }
 }
 
@@ -136,6 +153,30 @@ impl OwnedTaskStatus {
         });
     }
 
+    pub(crate) fn set_signaled(&self, exit_code: ExitCode, signal: Signal) {
+        self.watch_tx.send_modify(move |old| {
+            if !old.is_finished() {
+                *old = TaskStatus::Signaled { exit_code, signal };
+            }
+        });
+    }
+
+    pub(crate) fn set_stopped(&self, signal: Signal) {
+        self.watch_tx.send_modify(move |old| {
+            if !old.is_finished() {
+                *old = TaskStatus::Stopped(signal);
+            }
+        });
+    }
+
+    pub(crate) fn set_continued(&self) {
+        self.watch_tx.send_modify(|old| {
+            if matches!(old, TaskStatus::Stopped(_)) {
+                *old = TaskStatus::Running;
+            }
+        });
+    }
+
     pub fn status(&self) -> TaskStatus {
         self.watch_tx.borrow().clone()
     }
@@ -145,12 +186,41 @@ impl OwnedTaskStatus {
         loop {
             let status = receiver.borrow_and_update().clone();
             match status {
-                TaskStatus::Pending | TaskStatus::Running => {}
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Stopped(_) => {}
                 TaskStatus::Finished(res) => {
                     return res;
                 }
+                TaskStatus::Signaled { exit_code, .. } => {
+                    return Ok(exit_code);
+                }
             }
             // NOTE: unwrap() is fine, because &self always holds on to the sender.
+            receiver.changed().await.unwrap();
+        }
+    }
+
+    pub async fn await_stopped_or_terminated(&self) -> TaskStatus {
+        let mut receiver = self.watch_tx.subscribe();
+        loop {
+            let status = receiver.borrow_and_update().clone();
+            match status {
+                TaskStatus::Pending | TaskStatus::Running => {}
+                TaskStatus::Stopped(_) | TaskStatus::Finished(_) | TaskStatus::Signaled { .. } => {
+                    return status;
+                }
+            }
+            // NOTE: unwrap() is fine, because &self always holds on to the sender.
+            receiver.changed().await.unwrap();
+        }
+    }
+
+    pub async fn await_status_change_from(&self, current: TaskStatus) -> TaskStatus {
+        let mut receiver = self.watch_tx.subscribe();
+        loop {
+            let status = receiver.borrow_and_update().clone();
+            if !task_status_same_kind_and_signal(&status, &current) {
+                return status;
+            }
             receiver.changed().await.unwrap();
         }
     }
@@ -164,6 +234,18 @@ impl OwnedTaskStatus {
             signal_handler: self.signal_handler.clone(),
             watch: self.watch_tx.subscribe(),
         }
+    }
+}
+
+fn task_status_same_kind_and_signal(left: &TaskStatus, right: &TaskStatus) -> bool {
+    match (left, right) {
+        (TaskStatus::Pending, TaskStatus::Pending) | (TaskStatus::Running, TaskStatus::Running) => {
+            true
+        }
+        (TaskStatus::Stopped(left), TaskStatus::Stopped(right)) => left == right,
+        (TaskStatus::Finished(_), TaskStatus::Finished(_))
+        | (TaskStatus::Signaled { .. }, TaskStatus::Signaled { .. }) => true,
+        _ => false,
     }
 }
 
@@ -210,9 +292,12 @@ impl TaskJoinHandle {
         loop {
             let status = self.watch.borrow_and_update().clone();
             match status {
-                TaskStatus::Pending | TaskStatus::Running => {}
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Stopped(_) => {}
                 TaskStatus::Finished(res) => {
                     return res;
+                }
+                TaskStatus::Signaled { exit_code, .. } => {
+                    return Ok(exit_code);
                 }
             }
             if self.watch.changed().await.is_err() {

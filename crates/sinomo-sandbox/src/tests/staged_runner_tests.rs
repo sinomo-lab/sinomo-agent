@@ -443,6 +443,91 @@ fn local_staged_runner_executes_process_plan_with_stdout_pipe() {
     fs::remove_dir_all(runtime_root).ok();
 }
 
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn local_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe() {
+    let (_manifest, _layout, runtime_root) =
+        create_test_instance("sandbox_staged_runner_wasix_process_plan");
+    let store = LocalSandboxInstanceStore::new(&runtime_root);
+    let toolchain_store = LocalSandboxToolchainStore::new(runtime_root.join("toolchains"));
+    let toolchain_id =
+        SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
+    let mut toolchain = SandboxToolchainManifest::new(
+        toolchain_id,
+        "wasix-pipeline-1.0",
+        SandboxWasiAbi::Wasix,
+        "test build",
+        OffsetDateTime::now_utc(),
+    )
+    .expect("toolchain");
+    toolchain_store
+        .put_command_module(
+            &mut toolchain,
+            "echo",
+            wasi_stdout_module().as_bytes(),
+            SandboxResourceLimits::default(),
+        )
+        .expect("put echo");
+    toolchain_store
+        .put_command_module(
+            &mut toolchain,
+            "cat",
+            wasi_stdin_to_stdout_module().as_bytes(),
+            SandboxResourceLimits::default(),
+        )
+        .expect("put cat");
+    let runner = LocalStagedSandboxCommandRunner::new().expect("runner");
+    let node_id = NodeId::from_legacy_named("node_wasix_process_plan").expect("node");
+    let mut policy = SandboxPolicy::default();
+    policy.allow_unsigned_toolchains = true;
+
+    let outcome = runner
+        .run_toolchain_process_plan_with_policy(
+            &store,
+            &toolchain_store,
+            &SandboxId::from_legacy_named("sandbox_staged_runner_wasix_process_plan")
+                .expect("sandbox"),
+            &SandboxProcessPlan {
+                steps: vec![
+                    SandboxProcessPlanStep {
+                        command_name: "echo".to_string(),
+                        argv: vec!["echo".to_string()],
+                        stdin: None,
+                        cwd: None,
+                        env: Default::default(),
+                        pipe_stdout_to_next: true,
+                    },
+                    SandboxProcessPlanStep {
+                        command_name: "cat".to_string(),
+                        argv: vec!["cat".to_string()],
+                        stdin: None,
+                        cwd: None,
+                        env: Default::default(),
+                        pipe_stdout_to_next: false,
+                    },
+                ],
+            },
+            1_000,
+            &node_id,
+            &policy,
+        )
+        .expect("wasix process plan");
+
+    assert_eq!(outcome.exit_status, 0);
+    assert_eq!(outcome.stdout, b"hello\n");
+    assert_eq!(outcome.step_outcomes.len(), 2);
+    assert_eq!(outcome.step_outcomes[0].stdout, b"hello\n");
+    assert_eq!(outcome.step_outcomes[1].stdout, b"hello\n");
+    let (manifest, _) = store
+        .load(
+            &SandboxId::from_legacy_named("sandbox_staged_runner_wasix_process_plan")
+                .expect("sandbox"),
+        )
+        .expect("manifest");
+    assert_eq!(manifest.command_history.len(), 2);
+    fs::remove_dir_all(runtime_root).ok();
+}
+
 #[test]
 fn local_staged_runner_preflights_process_plan_policy_before_first_step() {
     let (_manifest, layout, runtime_root) =
@@ -513,11 +598,15 @@ fn local_staged_runner_preflights_process_plan_policy_before_first_step() {
         )
         .expect_err("later process-plan capability denial should preflight");
 
-    assert!(matches!(
-        error,
-        SandboxCommandExecutionError::PolicyDenied(SandboxPolicyDenial { ref code, .. })
-            if code == "command-capability-denied"
-    ));
+    assert!(
+        matches!(
+            error,
+            SandboxCommandExecutionError::PolicyDenied(SandboxPolicyDenial { ref code, .. })
+                if code == "command-capability-denied"
+                    || code == "command-capability-unsupported"
+        ),
+        "unexpected error: {error:?}"
+    );
     let sandbox_fs = LocalSandboxFileSystem::new(layout);
     assert!(matches!(
         sandbox_fs
@@ -2096,6 +2185,234 @@ fn sifs_staged_runner_executes_process_plan_and_syncs_command_history() {
     fs::remove_dir_all(local_root).ok();
 }
 
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe() {
+    let runtime_root = unique_test_dir("sinomo-sandbox-sifs-wasix-process-plan-sifs");
+    let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-process-plan-local");
+    let network = InProcessNetwork::new();
+    let node_id = NodeId::from_legacy_named("node_sifs_wasix_process_plan").expect("node");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node_id.clone()),
+        LocalContentStore::new(runtime_root.join("content")).expect("content"),
+    );
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let sandbox_id =
+        SandboxId::from_legacy_named("sandbox_sifs_wasix_process_plan").expect("sandbox");
+    let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
+    sifs_store
+        .create(
+            sandbox_id.clone(),
+            SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain"),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("create");
+    let mut toolchain_store = SifsSandboxToolchainStore::new(sifs_store.into_inner());
+    let toolchain_id =
+        SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
+    let mut toolchain = SandboxToolchainManifest::new(
+        toolchain_id,
+        "busybox-wasix-1.0",
+        SandboxWasiAbi::Wasix,
+        "test build",
+        OffsetDateTime::now_utc(),
+    )
+    .expect("toolchain");
+    toolchain_store
+        .put_command_module(
+            &mut toolchain,
+            "echo",
+            wasi_stdout_module().as_bytes(),
+            SandboxResourceLimits::default(),
+        )
+        .expect("put echo");
+    toolchain_store
+        .put_command_module(
+            &mut toolchain,
+            "cat",
+            wasi_stdin_to_stdout_module().as_bytes(),
+            SandboxResourceLimits::default(),
+        )
+        .expect("put cat");
+
+    let local_store = LocalSandboxInstanceStore::new(&local_root);
+    let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
+    let mut policy = SandboxPolicy::default();
+    policy.allow_unsigned_toolchains = true;
+    let outcome = runner
+        .run_toolchain_process_plan_with_policy(
+            toolchain_store.into_inner(),
+            &local_store,
+            &sandbox_id,
+            &SandboxProcessPlan {
+                steps: vec![
+                    SandboxProcessPlanStep {
+                        command_name: "echo".to_string(),
+                        argv: vec!["echo".to_string()],
+                        stdin: None,
+                        cwd: None,
+                        env: Default::default(),
+                        pipe_stdout_to_next: true,
+                    },
+                    SandboxProcessPlanStep {
+                        command_name: "cat".to_string(),
+                        argv: vec!["cat".to_string()],
+                        stdin: None,
+                        cwd: None,
+                        env: Default::default(),
+                        pipe_stdout_to_next: false,
+                    },
+                ],
+            },
+            1_000,
+            &policy,
+        )
+        .expect("process plan setup");
+    let process = outcome.process.expect("process plan");
+
+    assert_eq!(process.exit_status, 0);
+    assert_eq!(process.stdout, b"hello\n");
+    assert_eq!(process.step_outcomes.len(), 2);
+    assert_eq!(process.step_outcomes[0].stdout, b"hello\n");
+    assert_eq!(process.step_outcomes[1].stdout, b"hello\n");
+    let sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
+    let manifest = sifs_store.load(&sandbox_id).expect("manifest");
+    assert_eq!(manifest.command_history.len(), 2);
+    let final_command_id = manifest.command_history[1].clone();
+    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(
+        sifs_fs
+            .read(
+                &sandbox_command_stdout_log_path(&final_command_id).expect("stdout"),
+                None,
+            )
+            .expect("stdout"),
+        b"hello\n"
+    );
+    let local_toolchain_layout = LocalSandboxToolchainStore::new(
+        local_store
+            .layout(&sandbox_id)
+            .root
+            .join("sifs-process-plan-toolchain"),
+    )
+    .layout(&manifest.toolchain_id);
+    assert!(
+        local_toolchain_layout.manifest.is_file(),
+        "SIFS WASIX process-plan fast path should materialize the SIFS toolchain locally"
+    );
+    fs::remove_dir_all(runtime_root).ok();
+    fs::remove_dir_all(local_root).ok();
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe_and_mount() {
+    let runtime_root = unique_test_dir("sinomo-sandbox-sifs-wasix-process-plan-mount-sifs");
+    let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-process-plan-mount-local");
+    let network = InProcessNetwork::new();
+    let node_id = NodeId::from_legacy_named("node_sifs_wasix_process_plan_mount").expect("node");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node_id.clone()),
+        LocalContentStore::new(runtime_root.join("content")).expect("content"),
+    );
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    dfs.posix_mkdir_all("/services/sandbox/shared")
+        .expect("mount source");
+    dfs.posix_write_file(
+        "/services/sandbox/shared/input.txt",
+        b"mounted\n",
+        DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+    )
+    .expect("mount input");
+    let sandbox_id =
+        SandboxId::from_legacy_named("sandbox_sifs_wasix_process_plan_mount").expect("sandbox");
+    let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
+    let mut manifest = sifs_store
+        .create(
+            sandbox_id.clone(),
+            SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain"),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("create");
+    manifest.mounts.push(SandboxMount {
+        source_sifs_path: "/services/sandbox/shared".to_string(),
+        mount_path: SandboxPath::new("/shared").expect("mount path"),
+        mode: SandboxMountMode::ReadWrite,
+    });
+    sifs_store.save_manifest(&manifest).expect("save manifest");
+    let mut toolchain_store = SifsSandboxToolchainStore::new(sifs_store.into_inner());
+    let toolchain_id =
+        SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
+    let mut toolchain = SandboxToolchainManifest::new(
+        toolchain_id,
+        "busybox-wasix-mount-1.0",
+        SandboxWasiAbi::Wasix,
+        "test build",
+        OffsetDateTime::now_utc(),
+    )
+    .expect("toolchain");
+    toolchain_store
+        .put_command_module(
+            &mut toolchain,
+            "read",
+            wasi_read_path_from_any_preopen_to_stdout_module("input.txt", 8, 3, 16).as_bytes(),
+            SandboxResourceLimits::default(),
+        )
+        .expect("put read");
+    toolchain_store
+        .put_command_module(
+            &mut toolchain,
+            "cat",
+            wasi_stdin_to_stdout_module().as_bytes(),
+            SandboxResourceLimits::default(),
+        )
+        .expect("put cat");
+
+    let local_store = LocalSandboxInstanceStore::new(&local_root);
+    let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
+    let mut policy = SandboxPolicy::default();
+    policy.allow_unsigned_toolchains = true;
+    let outcome = runner
+        .run_toolchain_process_plan_with_policy(
+            toolchain_store.into_inner(),
+            &local_store,
+            &sandbox_id,
+            &SandboxProcessPlan {
+                steps: vec![
+                    SandboxProcessPlanStep {
+                        command_name: "read".to_string(),
+                        argv: vec!["read".to_string()],
+                        stdin: None,
+                        cwd: Some(SandboxPath::new("/shared").expect("mount cwd")),
+                        env: Default::default(),
+                        pipe_stdout_to_next: true,
+                    },
+                    SandboxProcessPlanStep {
+                        command_name: "cat".to_string(),
+                        argv: vec!["cat".to_string()],
+                        stdin: None,
+                        cwd: None,
+                        env: Default::default(),
+                        pipe_stdout_to_next: false,
+                    },
+                ],
+            },
+            1_000,
+            &policy,
+        )
+        .expect("process plan setup");
+    let process = outcome.process.expect("process plan");
+
+    assert_eq!(process.exit_status, 0);
+    assert_eq!(process.stdout, b"mounted\n");
+    assert_eq!(process.step_outcomes.len(), 2);
+    let sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
+    let manifest = sifs_store.load(&sandbox_id).expect("manifest");
+    assert_eq!(manifest.command_history.len(), 2);
+    fs::remove_dir_all(runtime_root).ok();
+    fs::remove_dir_all(local_root).ok();
+}
+
 #[test]
 fn sifs_staged_runner_preflights_process_plan_policy_before_first_step() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-late-policy-sifs");
@@ -2180,11 +2497,15 @@ fn sifs_staged_runner_preflights_process_plan_policy_before_first_step() {
         Ok(_) => panic!("later process-plan capability denial should preflight"),
         Err(error) => error,
     };
-    assert!(matches!(
-        error,
-        SandboxCommandExecutionError::PolicyDenied(SandboxPolicyDenial { ref code, .. })
-            if code == "command-capability-denied"
-    ));
+    assert!(
+        matches!(
+            error,
+            SandboxCommandExecutionError::PolicyDenied(SandboxPolicyDenial { ref code, .. })
+                if code == "command-capability-denied"
+                    || code == "command-capability-unsupported"
+        ),
+        "unexpected error: {error:?}"
+    );
     assert!(
         !local_store.layout(&sandbox_id).root.exists(),
         "SIFS process-plan policy preflight should happen before local staging starts"

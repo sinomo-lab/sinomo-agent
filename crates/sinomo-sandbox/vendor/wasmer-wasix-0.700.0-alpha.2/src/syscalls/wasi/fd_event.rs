@@ -76,5 +76,6 @@ pub fn fd_event_internal(
         )
     });
 
+    sync_process_metadata(env);
     Ok(Ok(fd))
 }

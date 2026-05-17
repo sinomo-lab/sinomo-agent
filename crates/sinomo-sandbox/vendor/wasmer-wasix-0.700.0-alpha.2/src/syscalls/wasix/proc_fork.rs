@@ -27,16 +27,6 @@ pub fn proc_fork<M: MemorySize>(
 ) -> Result<Errno, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
 
-    let is_dynamic_module = ctx.data().inner().linker().is_some();
-    if is_dynamic_module && copy_memory == Bool::False {
-        warn!("vfork-style process forking is not supported for dynamically linked modules");
-        return Ok(Errno::Notsup);
-    }
-    wasi_try_ok!((!is_dynamic_module || copy_memory == Bool::True).then_some(()).ok_or_else(|| {
-        warn!("process forking not supported for dynamically linked modules");
-        Errno::Notsup
-    }));
-
     if let Some(context_switching_environment) = ctx.data().context_switching_environment.as_ref()
         && context_switching_environment.active_context_id()
             != context_switching_environment.main_context_id()
@@ -66,6 +56,9 @@ pub fn proc_fork<M: MemorySize>(
     if let Some(vfork) = ctx.data().vfork.as_ref() {
         warn!("process forking not supported in an active vfork");
         return Ok(Errno::Notsup);
+    }
+    if ctx.data().process.child_process_limit_reached() {
+        return Ok(Errno::Again);
     }
 
     // Fork the environment which will copy all the open file handlers
@@ -108,9 +101,17 @@ pub fn proc_fork<M: MemorySize>(
         // Perform the unwind action
         return unwind::<M, _>(ctx, move |mut ctx, mut memory_stack, rewind_stack| {
             // Grab all the globals and serialize them
-            let store_data = crate::utils::store::capture_store_snapshot(&mut ctx.as_store_mut())
-                .serialize()
-                .unwrap();
+            let store_data = match crate::utils::store::capture_store_snapshot(
+                &mut ctx.as_store_mut(),
+            )
+            .serialize()
+            {
+                Ok(store_data) => store_data,
+                Err(err) => {
+                    warn!("failed to serialize vfork store snapshot - {}", err);
+                    return OnCalledAction::Trap(Box::new(WasiError::Exit(Errno::Perm.into())));
+                }
+            };
             let store_data = Bytes::from(store_data);
 
             // We first fork the environment and replace the current environment
@@ -169,7 +170,28 @@ pub fn proc_fork<M: MemorySize>(
         let rewind_stack = rewind_stack.freeze();
 
         // Grab all the globals and serialize them
-        let store_data = snapshot.serialize().unwrap();
+        let store_data = match snapshot.serialize() {
+            Ok(store_data) => store_data,
+            Err(err) => {
+                warn!("failed to serialize fork store snapshot - {}", err);
+                match rewind::<M, _>(
+                    ctx,
+                    Some(memory_stack),
+                    rewind_stack,
+                    Bytes::new(),
+                    ForkResult {
+                        pid: 0,
+                        ret: Errno::Perm,
+                    },
+                ) {
+                    Errno::Success => return OnCalledAction::InvokeAgain,
+                    err => {
+                        warn!("failed - could not rewind the stack - errno={}", err);
+                        return OnCalledAction::Trap(Box::new(WasiError::Exit(err.into())));
+                    }
+                }
+            }
+        };
         let store_data = Bytes::from(store_data);
 
         // Now we use the environment and memory references
@@ -197,7 +219,7 @@ pub fn proc_fork<M: MemorySize>(
             let runtime = runtime.clone();
             let tasks = tasks.clone();
             let tasks_outer = tasks.clone();
-            let store_data = store_data.clone();
+            let child_store_data = store_data.clone();
 
             let run = move |mut props: TaskWasmRunProperties| {
                 let ctx = props.ctx;
@@ -212,7 +234,7 @@ pub fn proc_fork<M: MemorySize>(
                         ctx,
                         Some(child_memory_stack),
                         child_rewind_stack,
-                        store_data.clone(),
+                        child_store_data.clone(),
                         ForkResult {
                             pid: 0,
                             ret: Errno::Success,
@@ -233,7 +255,7 @@ pub fn proc_fork<M: MemorySize>(
                 run::<M>(ctx, store, child_handle, None);
             };
 
-            tasks_outer
+            let spawn_result = tasks_outer
                 .task_wasm(
                     TaskWasm::new(Box::new(run), child_env, module, false, false)
                         .with_globals(snapshot)
@@ -245,25 +267,46 @@ pub fn proc_fork<M: MemorySize>(
                         err
                     );
                     err
-                })
-                .ok();
-        };
-
-        // Rewind the stack and carry on
-        match rewind::<M, _>(
-            ctx,
-            Some(memory_stack),
-            rewind_stack,
-            store_data,
-            ForkResult {
-                pid: child_pid.raw() as Pid,
-                ret: Errno::Success,
-            },
-        ) {
-            Errno::Success => OnCalledAction::InvokeAgain,
-            err => {
-                warn!("failed - could not rewind the stack - errno={}", err);
-                OnCalledAction::Trap(Box::new(WasiError::Exit(err.into())))
+                });
+            if spawn_result.is_err() {
+                {
+                    let mut inner = ctx.data().process.lock();
+                    inner.children.retain(|child| child.pid != child_pid);
+                }
+                ctx.data().control_plane.remove_process(child_pid);
+                match rewind::<M, _>(
+                    ctx,
+                    Some(memory_stack),
+                    rewind_stack,
+                    store_data,
+                    ForkResult {
+                        pid: 0,
+                        ret: Errno::Perm,
+                    },
+                ) {
+                    Errno::Success => OnCalledAction::InvokeAgain,
+                    err => {
+                        warn!("failed - could not rewind the stack - errno={}", err);
+                        OnCalledAction::Trap(Box::new(WasiError::Exit(err.into())))
+                    }
+                }
+            } else {
+                match rewind::<M, _>(
+                    ctx,
+                    Some(memory_stack),
+                    rewind_stack,
+                    store_data,
+                    ForkResult {
+                        pid: child_pid.raw() as Pid,
+                        ret: Errno::Success,
+                    },
+                ) {
+                    Errno::Success => OnCalledAction::InvokeAgain,
+                    err => {
+                        warn!("failed - could not rewind the stack - errno={}", err);
+                        OnCalledAction::Trap(Box::new(WasiError::Exit(err.into())))
+                    }
+                }
             }
         }
     })
@@ -298,25 +341,21 @@ fn run<M: MemorySize>(
     let mut ret: ExitCode = Errno::Success.into();
     let (mut store, err) = if ctx.data(&store).thread.is_main() {
         trace!(%pid, %tid, "re-invoking main");
-        let start = ctx
-            .data(&store)
-            .inner()
-            .static_module_instance_handles()
-            .unwrap()
-            .start
-            .clone()
-            .unwrap();
+        let env_inner = ctx.data(&store).inner();
+        let module_handles = env_inner.main_module_instance_handles();
+        let Some(start) = module_handles.start.clone() else {
+            warn!(%pid, %tid, "forked process is missing _start export");
+            return Errno::Noexec.into();
+        };
         ContextSwitchingEnvironment::run_main_context(&ctx, store, start.into(), vec![])
     } else {
         trace!(%pid, %tid, "re-invoking thread_spawn");
-        let start = ctx
-            .data(&store)
-            .inner()
-            .static_module_instance_handles()
-            .unwrap()
-            .thread_spawn
-            .clone()
-            .unwrap();
+        let env_inner = ctx.data(&store).inner();
+        let module_handles = env_inner.main_module_instance_handles();
+        let Some(start) = module_handles.thread_spawn.clone() else {
+            warn!(%pid, %tid, "forked thread is missing wasi_thread_start export");
+            return Errno::Noexec.into();
+        };
         let params = vec![0i32.into(), 0i32.into()];
         ContextSwitchingEnvironment::run_main_context(&ctx, store, start.into(), params)
     };

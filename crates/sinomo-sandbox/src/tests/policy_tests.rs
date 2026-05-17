@@ -360,6 +360,34 @@ fn sandbox_policy_allows_wasix_child_process_capability_when_all_gaps_are_allowl
 }
 
 #[test]
+fn sandbox_policy_denies_wasix_asyncified_fork_capability_even_when_allowlisted() {
+    let toolchain_id = SandboxToolchainId::from_legacy_named("toolchain_wasix").expect("toolchain");
+    let mut command = SandboxToolchainCommand::new(
+        &toolchain_id,
+        "fork-helper",
+        b"wasm bytes",
+        SandboxResourceLimits::default(),
+    )
+    .expect("command");
+    command.required_capabilities = vec![SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY.to_string()];
+    let mut policy = SandboxPolicy::default();
+    policy
+        .allowed_command_capabilities
+        .insert(SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY.to_string());
+
+    let error = policy
+        .validate_command(&command, &SandboxWasiAbi::Wasix)
+        .expect_err("asyncified fork is not a supported runtime capability yet");
+
+    assert_eq!(error.code, "command-capability-unsupported");
+    assert!(
+        error
+            .detail
+            .contains(SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY)
+    );
+}
+
+#[test]
 #[cfg(not(feature = "wasix-runtime"))]
 fn sandbox_policy_denies_wasix_child_process_capability_without_runtime_feature() {
     let toolchain_id = SandboxToolchainId::from_legacy_named("toolchain_wasix").expect("toolchain");

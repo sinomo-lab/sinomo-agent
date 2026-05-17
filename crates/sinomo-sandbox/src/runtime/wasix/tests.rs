@@ -52,6 +52,7 @@ fn wasix_streaming_output_capture_emits_chunks_at_write_time() {
         SandboxOutputStream::Stdout,
         SANDBOX_OUTPUT_CHUNK_BYTES,
         Some(sink),
+        None,
     );
     let mut file = capture.file();
 
@@ -75,6 +76,7 @@ fn wasix_streaming_output_capture_rejects_writes_over_limit() {
         SandboxOutputStream::Stderr,
         4,
         None,
+        None,
     );
     let mut file = capture.file();
 
@@ -95,6 +97,7 @@ fn wasix_streaming_output_capture_rejects_resize_over_limit() {
         SandboxOutputStream::Stdout,
         4,
         None,
+        None,
     );
     let mut file = capture.file();
 
@@ -112,6 +115,7 @@ fn wasix_streaming_output_capture_allows_in_budget_overwrite() {
         SandboxCommandId::generate(),
         SandboxOutputStream::Stdout,
         5,
+        None,
         None,
     );
     let mut file = capture.file();
@@ -136,6 +140,7 @@ fn wasix_streaming_output_capture_reads_past_eof_as_empty() {
         SandboxOutputStream::Stdout,
         8,
         None,
+        None,
     );
     let mut file = capture.file();
 
@@ -158,6 +163,7 @@ fn wasix_streaming_output_capture_rejects_unrepresentable_resize() {
         SandboxCommandId::generate(),
         SandboxOutputStream::Stdout,
         usize::MAX,
+        None,
         None,
     );
     let mut file = capture.file();

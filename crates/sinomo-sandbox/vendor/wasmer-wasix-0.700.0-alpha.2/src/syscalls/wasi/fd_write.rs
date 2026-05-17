@@ -1,6 +1,7 @@
 use std::task::Waker;
 
 use super::*;
+use virtual_fs::DeviceFile;
 #[cfg(feature = "journal")]
 use crate::{
     journal::{JournalEffector, JournalEntry},
@@ -31,15 +32,25 @@ pub fn fd_write<M: MemorySize>(
     nwritten: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
+    if let Some(err) = maybe_stop_background_terminal_write(&mut ctx, fd)? {
+        return Ok(err);
+    }
 
     let env = ctx.data();
     let enable_journal = env.enable_journal;
-    let offset = {
+    let offset: usize = {
         let state = env.state.clone();
         let inodes = state.inodes.clone();
 
         let fd_entry = wasi_try_ok!(state.fs.get_fd(fd));
-        fd_entry.inner.offset.load(Ordering::Acquire) as usize
+        wasi_try_ok!(
+            fd_entry
+                .inner
+                .offset
+                .load(Ordering::Acquire)
+                .try_into()
+                .map_err(|_| Errno::Overflow)
+        )
     };
 
     let bytes_written = wasi_try_ok!(fd_write_internal::<M>(
@@ -59,6 +70,7 @@ pub fn fd_write<M: MemorySize>(
     let bytes_written: M::Offset =
         wasi_try_ok!(bytes_written.try_into().map_err(|_| Errno::Overflow));
     wasi_try_mem_ok!(nwritten_ref.write(bytes_written));
+    sync_process_metadata(env);
 
     Ok(Errno::Success)
 }
@@ -111,6 +123,51 @@ pub fn fd_pwrite<M: MemorySize>(
     Ok(Errno::Success)
 }
 
+fn maybe_stop_background_terminal_write(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    fd: WasiFd,
+) -> Result<Option<Errno>, WasiError> {
+    if fd != DeviceFile::STDOUT && fd != DeviceFile::STDERR {
+        return Ok(None);
+    }
+
+    if !is_background_terminal_writer(ctx, fd) {
+        return Ok(None);
+    }
+
+    ctx.data().process.signal_process_direct(Signal::Sigttou);
+    match WasiEnv::process_signals_and_exit(ctx)? {
+        Ok(_) => {}
+        Err(err) => return Ok(Some(err)),
+    }
+
+    if is_background_terminal_writer(ctx, fd) {
+        Ok(Some(Errno::Io))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_background_terminal_writer(ctx: &FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> bool {
+    let env = ctx.data();
+    let Some(bridge) = env.runtime.tty() else {
+        return false;
+    };
+    let state = bridge.tty_get();
+    if !state.tostop {
+        return false;
+    }
+    if fd == DeviceFile::STDOUT && !state.stdout_tty {
+        return false;
+    }
+    if fd == DeviceFile::STDERR && !state.stderr_tty {
+        return false;
+    }
+    bridge
+        .foreground_process_group()
+        .is_some_and(|fg_pgid| fg_pgid != env.process.pgid().raw())
+}
+
 pub(crate) enum FdWriteSource<'a, M: MemorySize> {
     Iovs {
         iovs: WasmPtr<__wasi_ciovec_t<M>, M>,
@@ -138,6 +195,10 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
     let bytes_written = {
         if !is_stdio && !fd_entry.inner.rights.contains(Rights::FD_WRITE) {
             return Ok(Err(Errno::Access));
+        }
+
+        if is_dev_full(&fd_entry) {
+            return Ok(Err(Errno::Nospc));
         }
 
         let fd_flags = fd_entry.inner.flags;
@@ -175,6 +236,14 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                 }
 
                                 let mut written = 0usize;
+                                let mut file_size_remaining = if is_stdio {
+                                    None
+                                } else {
+                                    Some(file_size_write_remaining(
+                                        env.process.file_size_limit(),
+                                        offset,
+                                    ))
+                                };
 
                                 match &data {
                                     FdWriteSource::Iovs { iovs, iovs_len } => {
@@ -189,8 +258,13 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                                 .map_err(mem_error_to_wasi)?
                                                 .access()
                                                 .map_err(mem_error_to_wasi)?;
+                                            let buf = limit_regular_file_write_buffer(
+                                                buf.as_ref(),
+                                                &mut file_size_remaining,
+                                                written,
+                                            )?;
                                             let local_written =
-                                                match handle.write(buf.as_ref()).await {
+                                                match handle.write(buf).await {
                                                     Ok(s) => s,
                                                     Err(_) if written > 0 => break,
                                                     Err(err) => return Err(map_io_err(err)),
@@ -202,6 +276,11 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                         }
                                     }
                                     FdWriteSource::Buffer(data) => {
+                                        let data = limit_regular_file_write_buffer(
+                                            data,
+                                            &mut file_size_remaining,
+                                            written,
+                                        )?;
                                         handle.write_all(data).await?;
                                         written += data.len();
                                     }
@@ -213,10 +292,18 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                 Ok(written)
                             },
                         );
-                        let written = wasi_try_ok_ok!(res?.map_err(|err| match err {
+                        let written = match res?.map_err(|err| match err {
                             Errno::Timedout => Errno::Again,
                             a => a,
-                        }));
+                        }) {
+                            Ok(written) => written,
+                            Err(Errno::Fbig) => {
+                                env.process.signal_process(Signal::Sigxfsz);
+                                wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
+                                return Ok(Err(Errno::Fbig));
+                            }
+                            Err(err) => return Ok(Err(err)),
+                        };
 
                         (written, true, true)
                     } else {
@@ -405,6 +492,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                     match &data {
                         FdWriteSource::Iovs { iovs, iovs_len } => {
+                            let mut raise_sigxfsz = false;
                             let iovs_arr = wasi_try_ok_ok!(
                                 iovs.slice(&memory, *iovs_len).map_err(mem_error_to_wasi)
                             );
@@ -458,9 +546,20 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                 Kind::Symlink { .. } | Kind::Epoll { .. } => return Ok(Err(Errno::Inval)),
                 Kind::Buffer { buffer } => {
                     let mut written = 0usize;
+                    if fd_flags.contains(Fdflags::APPEND) {
+                        offset = buffer.len() as u64;
+                    }
+                    let mut file_size_remaining =
+                        Some(file_size_write_remaining(env.process.file_size_limit(), offset));
+                    let write_offset: usize =
+                        wasi_try_ok_ok!(offset.try_into().map_err(|_| Errno::Overflow));
+                    if write_offset > buffer.len() {
+                        buffer.resize(write_offset, 0);
+                    }
 
                     match &data {
                         FdWriteSource::Iovs { iovs, iovs_len } => {
+                            let mut raise_sigxfsz = false;
                             let iovs_arr = wasi_try_ok_ok!(
                                 iovs.slice(&memory, *iovs_len).map_err(mem_error_to_wasi)
                             );
@@ -473,24 +572,72 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                         .map_err(mem_error_to_wasi)
                                 );
                                 let buf = wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
-                                let local_written = wasi_try_ok_ok!(
-                                    std::io::Write::write(buffer, buf.as_ref()).map_err(map_io_err)
+                                let buf = match limit_regular_file_write_buffer(
+                                    buf.as_ref(),
+                                    &mut file_size_remaining,
+                                    written,
+                                ) {
+                                    Ok(buf) => buf,
+                                    Err(Errno::Fbig) => {
+                                        raise_sigxfsz = true;
+                                        break;
+                                    }
+                                    Err(err) => return Ok(Err(err)),
+                                };
+                                let end = wasi_try_ok_ok!(
+                                    write_offset
+                                        .checked_add(written)
+                                        .and_then(|start| start.checked_add(buf.len()))
+                                        .ok_or(Errno::Overflow)
                                 );
-                                written += local_written;
+                                if end > buffer.len() {
+                                    buffer.resize(end, 0);
+                                }
+                                let start = write_offset + written;
+                                buffer[start..end].copy_from_slice(buf);
+                                let local_written = buf.len();
+                                written += buf.len();
                                 if local_written != buf.len() {
                                     break;
                                 }
                             }
+                            drop(iovs_arr);
+                            if raise_sigxfsz {
+                                env.process.signal_process(Signal::Sigxfsz);
+                                wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
+                                return Ok(Err(Errno::Fbig));
+                            }
                         }
                         FdWriteSource::Buffer(data) => {
-                            wasi_try_ok_ok!(
-                                std::io::Write::write_all(buffer, data).map_err(map_io_err)
+                            let data = match limit_regular_file_write_buffer(
+                                data,
+                                &mut file_size_remaining,
+                                written,
+                            ) {
+                                Ok(data) => data,
+                                Err(Errno::Fbig) => {
+                                    env.process.signal_process(Signal::Sigxfsz);
+                                    wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
+                                    return Ok(Err(Errno::Fbig));
+                                }
+                                Err(err) => return Ok(Err(err)),
+                            };
+                            let end = wasi_try_ok_ok!(
+                                write_offset
+                                    .checked_add(written)
+                                    .and_then(|start| start.checked_add(data.len()))
+                                    .ok_or(Errno::Overflow)
                             );
+                            if end > buffer.len() {
+                                buffer.resize(end, 0);
+                            }
+                            let start = write_offset + written;
+                            buffer[start..end].copy_from_slice(data);
                             written += data.len();
                         }
                     }
 
-                    (written, false, true)
+                    (written, true, true)
                 }
             }
         };
@@ -552,4 +699,34 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
     };
 
     Ok(Ok(bytes_written))
+}
+
+fn is_dev_full(fd_entry: &Fd) -> bool {
+    let name = fd_entry.inode.name.read().unwrap();
+    name.as_ref() == "/dev/full" || name.as_ref() == "full" || name.as_ref().ends_with("/dev/full")
+}
+
+fn file_size_write_remaining(limit: u64, offset: u64) -> u64 {
+    limit.saturating_sub(offset)
+}
+
+fn limit_regular_file_write_buffer<'a>(
+    buf: &'a [u8],
+    remaining: &mut Option<u64>,
+    already_written: usize,
+) -> Result<&'a [u8], Errno> {
+    let Some(bytes_remaining) = remaining else {
+        return Ok(buf);
+    };
+    if *bytes_remaining == 0 {
+        return if already_written == 0 && !buf.is_empty() {
+            Err(Errno::Fbig)
+        } else {
+            Ok(&buf[..0])
+        };
+    }
+
+    let allowed = (*bytes_remaining).min(buf.len() as u64) as usize;
+    *bytes_remaining -= allowed as u64;
+    Ok(&buf[..allowed])
 }

@@ -33,17 +33,27 @@ pub fn fd_read<M: MemorySize>(
     nread: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
+    if let Some(err) = maybe_stop_background_terminal_read(&mut ctx, fd)? {
+        return Ok(err);
+    }
 
     let pid = ctx.data().pid();
     let tid = ctx.data().tid();
 
-    let offset = {
+    let offset: usize = {
         let mut env = ctx.data();
         let state = env.state.clone();
         let inodes = state.inodes.clone();
 
         let fd_entry = wasi_try_ok!(state.fs.get_fd(fd));
-        fd_entry.inner.offset.load(Ordering::Acquire) as usize
+        wasi_try_ok!(
+            fd_entry
+                .inner
+                .offset
+                .load(Ordering::Acquire)
+                .try_into()
+                .map_err(|_| Errno::Overflow)
+        )
     };
 
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
@@ -52,7 +62,45 @@ pub fn fd_read<M: MemorySize>(
     }
 
     let res = fd_read_internal::<M>(&mut ctx, fd, iovs, iovs_len, offset, nread, true)?;
-    fd_read_internal_handler(ctx, res, nread)
+    fd_read_internal_handler(ctx, res, nread, true)
+}
+
+fn maybe_stop_background_terminal_read(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    fd: WasiFd,
+) -> Result<Option<Errno>, WasiError> {
+    if fd != DeviceFile::STDIN {
+        return Ok(None);
+    }
+
+    if !is_background_terminal_reader(ctx) {
+        return Ok(None);
+    }
+
+    ctx.data().process.signal_process_direct(Signal::Sigttin);
+    match WasiEnv::process_signals_and_exit(ctx)? {
+        Ok(_) => {}
+        Err(err) => return Ok(Some(err)),
+    }
+
+    if is_background_terminal_reader(ctx) {
+        Ok(Some(Errno::Io))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_background_terminal_reader(ctx: &FunctionEnvMut<'_, WasiEnv>) -> bool {
+    let env = ctx.data();
+    let Some(bridge) = env.runtime.tty() else {
+        return false;
+    };
+    if !bridge.tty_get().stdin_tty {
+        return false;
+    }
+    bridge
+        .foreground_process_group()
+        .is_some_and(|fg_pgid| fg_pgid != env.process.pgid().raw())
 }
 
 /// ### `fd_pread()`
@@ -87,14 +135,16 @@ pub fn fd_pread<M: MemorySize>(
         ctx = wasi_try_ok!(maybe_snapshot_once::<M>(ctx, SnapshotTrigger::FirstStdin)?);
     }
 
-    let res = fd_read_internal::<M>(&mut ctx, fd, iovs, iovs_len, offset as usize, nread, false)?;
-    fd_read_internal_handler::<M>(ctx, res, nread)
+    let offset: usize = wasi_try_ok!(offset.try_into().map_err(|_| Errno::Overflow));
+    let res = fd_read_internal::<M>(&mut ctx, fd, iovs, iovs_len, offset, nread, false)?;
+    fd_read_internal_handler::<M>(ctx, res, nread, false)
 }
 
 pub(crate) fn fd_read_internal_handler<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     res: Result<usize, Errno>,
     nread: WasmPtr<M::Offset, M>,
+    sync_fd_metadata: bool,
 ) -> Result<Errno, WasiError> {
     let mut ret = Errno::Success;
     let bytes_read = match res {
@@ -115,6 +165,9 @@ pub(crate) fn fd_read_internal_handler<M: MemorySize>(
     let memory = unsafe { env.memory_view(&ctx) };
     let nread_ref = nread.deref(&memory);
     wasi_try_mem_ok!(nread_ref.write(bytes_read));
+    if ret == Errno::Success && sync_fd_metadata {
+        sync_process_metadata(env);
+    }
 
     Ok(ret)
 }
@@ -436,12 +489,17 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
                     (ret, false)
                 }
                 Kind::Symlink { .. } | Kind::Epoll { .. } => {
-                    return Ok(Err(Errno::Notsup));
+                    return Ok(Err(Errno::Inval));
                 }
                 Kind::Buffer { buffer } => {
                     let memory = unsafe { env.memory_view(ctx) };
                     let iovs_arr = wasi_try_mem_ok_ok!(iovs.slice(&memory, iovs_len));
-                    let read = wasi_try_ok_ok!(read_bytes(&buffer[offset..], &memory, iovs_arr));
+                    let available = if offset <= buffer.len() {
+                        &buffer[offset..]
+                    } else {
+                        &[]
+                    };
+                    let read = wasi_try_ok_ok!(read_bytes(available, &memory, iovs_arr));
                     (read, true)
                 }
             }

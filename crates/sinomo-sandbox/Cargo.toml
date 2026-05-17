@@ -12,7 +12,7 @@ include = ["**/*.rs", "Cargo.toml", "toolchains/**"]
 ring = "r1"
 
 [features]
-default = []
+default = ["wasix-runtime"]
 wasix-runtime = [
     "dep:tokio",
     "dep:virtual-fs",

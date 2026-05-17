@@ -17,6 +17,11 @@ pub fn tty_set<M: MemorySize>(
     let echo = state.echo;
     let line_buffered = state.line_buffered;
     let line_feeds = true;
+    let tostop = env
+        .runtime
+        .tty()
+        .map(|bridge| bridge.tty_get().tostop)
+        .unwrap_or_default();
     debug!(
         %echo,
         %line_buffered,
@@ -34,6 +39,11 @@ pub fn tty_set<M: MemorySize>(
         echo,
         line_buffered,
         line_feeds,
+        tostop,
+        foreground_process_group: env
+            .runtime
+            .tty()
+            .and_then(|bridge| bridge.foreground_process_group()),
     };
 
     wasi_try_ok!({
@@ -58,12 +68,9 @@ pub fn tty_set_internal(
     state: WasiTtyState,
 ) -> Result<(), Errno> {
     let env = ctx.data();
-    let bridge = if let Some(t) = env.runtime.tty() {
-        t
-    } else {
-        return Err(Errno::Notsup);
-    };
-    bridge.tty_set(state);
+    if let Some(bridge) = env.runtime.tty() {
+        bridge.tty_set(state);
+    }
 
     Ok(())
 }

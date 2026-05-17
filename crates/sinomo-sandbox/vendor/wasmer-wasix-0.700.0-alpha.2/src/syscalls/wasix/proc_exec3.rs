@@ -95,7 +95,7 @@ pub fn proc_exec3<M: MemorySize>(
             FindExecutableResult::AccessError => return Ok(Errno::Access),
             FindExecutableResult::NotFound => return Ok(Errno::Noexec),
         }
-    } else if name.starts_with("./") {
+    } else if !name.starts_with('/') {
         name = ctx.data().state.fs.relative_path_to_absolute(name);
     }
 
@@ -141,6 +141,7 @@ pub fn proc_exec3<M: MemorySize>(
         let mut wasi_env = *vfork_env;
         wasi_env.owned_handles.push(vfork.handle.clone());
         _prepare_wasi(&mut wasi_env, Some(args), envs, None);
+        wasi_env.process.set_executable_path(name.clone());
 
         // Record the stack offsets before we give up ownership of the wasi_env
         let stack_lower = wasi_env.layout.stack_lower;
@@ -162,26 +163,36 @@ pub fn proc_exec3<M: MemorySize>(
                         error!("builtin failed - {}", err);
                     }
 
-                    let env = config.take().unwrap();
+                    match config.take() {
+                        Some(env) => {
+                            let name_inner = name.clone();
+                            __asyncify_light(ctx.data(), None, async {
+                                let ret = bin_factory.spawn(name_inner, env).await;
+                                match ret {
+                                    Ok(ret) => {
+                                        trace!(%child_pid, "spawned sub-process");
+                                        Ok(())
+                                    }
+                                    Err(err) => {
+                                        let errno = conv_spawn_err_to_errno(&err);
+                                        err_exit_code = errno.into();
 
-                    let name_inner = name.clone();
-                    __asyncify_light(ctx.data(), None, async {
-                        let ret = bin_factory.spawn(name_inner, env).await;
-                        match ret {
-                            Ok(ret) => {
-                                trace!(%child_pid, "spawned sub-process");
-                                Ok(())
-                            }
-                            Err(err) => {
-                                err_exit_code = conv_spawn_err_to_exit_code(&err);
+                                        debug!(%child_pid, "process failed with (err={})", err_exit_code);
 
-                                debug!(%child_pid, "process failed with (err={})", err_exit_code);
-
-                                Err(Errno::Noexec)
-                            }
+                                        Err(errno)
+                                    }
+                                }
+                            })
+                            .map_err(|err| {
+                                warn!("failed to execve as child spawn asyncify failed - {}", err);
+                                err
+                            })?
                         }
-                    })
-                    .unwrap()
+                        None => {
+                            warn!("failed to execve as builtin probing consumed child environment");
+                            Err(Errno::Noexec)
+                        }
+                    }
                 }
             }
         };
@@ -201,9 +212,6 @@ pub fn proc_exec3<M: MemorySize>(
                 ctx.data_mut().swap_inner(&mut vfork.env);
                 std::mem::swap(ctx.data_mut(), &mut vfork.env);
 
-                assert!(vfork.env.context_switching_environment.is_none());
-                assert!(ctx.data().context_switching_environment.is_some());
-
                 let Some(asyncify_info) = vfork.asyncify else {
                     // vfork without asyncify only forks the WasiEnv, which we have restored
                     // above. Restoring the control flow is done on the guest side.
@@ -211,6 +219,9 @@ pub fn proc_exec3<M: MemorySize>(
 
                     return Ok(Errno::Success);
                 };
+
+                assert!(vfork.env.context_switching_environment.is_none());
+                assert!(ctx.data().context_switching_environment.is_some());
 
                 // Jump back to the vfork point and continue execution
                 // note: fork does not return any values hence passing `()`
@@ -246,6 +257,7 @@ pub fn proc_exec3<M: MemorySize>(
         // Prepare the environment
         let mut wasi_env = ctx.data().clone();
         _prepare_wasi(&mut wasi_env, Some(args), envs, None);
+        wasi_env.process.set_executable_path(name.clone());
 
         // Get a reference to the runtime
         let bin_factory = ctx.data().bin_factory.clone();
@@ -263,7 +275,10 @@ pub fn proc_exec3<M: MemorySize>(
                     error!("builtin failed - {}", err);
                 }
 
-                let env = builder.take().unwrap();
+                let Some(env) = builder.take() else {
+                    warn!("failed to execve as builtin probing consumed child environment");
+                    return Ok(Errno::Noexec);
+                };
 
                 // Spawn a new process with this current execution environment
                 block_on(bin_factory.spawn(name, env))
@@ -301,7 +316,7 @@ pub fn proc_exec3<M: MemorySize>(
                     "failed to execve as the process could not be spawned (fork)[0] - {}",
                     err
                 );
-                Ok(Errno::Noexec)
+                Ok(conv_spawn_err_to_errno(&err))
             }
         }
     }
@@ -321,7 +336,12 @@ pub(crate) fn find_executable_in_path<'a>(
 ) -> FindExecutableResult {
     let mut encountered_eaccess = false;
     for p in path {
-        let full_path = format!("{}/{}", p.trim_end_matches('/'), file_name);
+        let full_path = if p.is_empty() {
+            file_name.to_string()
+        } else {
+            format!("{}/{}", p.trim_end_matches('/'), file_name)
+        };
+        let full_path = fs.relative_path_to_absolute(full_path);
         match fs.get_inode_at_path(inodes, VIRTUAL_ROOT_FD, &full_path, true) {
             Ok(_) => return FindExecutableResult::Found(full_path),
             Err(Errno::Access) => encountered_eaccess = true,

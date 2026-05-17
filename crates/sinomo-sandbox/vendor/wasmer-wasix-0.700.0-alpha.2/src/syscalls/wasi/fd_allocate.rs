@@ -18,6 +18,14 @@ pub fn fd_allocate(
     len: Filesize,
 ) -> Result<Errno, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
+    let new_size = wasi_try_ok!(offset.checked_add(len).ok_or(Errno::Inval));
+    if new_size > ctx.data().process.file_size_limit() {
+        ctx.data().process.signal_process(Signal::Sigxfsz);
+        match WasiEnv::process_signals_and_exit(&mut ctx)? {
+            Ok(_) => return Ok(Errno::Fbig),
+            Err(err) => return Ok(err),
+        }
+    }
 
     wasi_try_ok!(fd_allocate_internal(&mut ctx, fd, offset, len));
     let env = ctx.data();
@@ -60,7 +68,8 @@ pub(crate) fn fd_allocate_internal(
                 }
             }
             Kind::Buffer { buffer } => {
-                buffer.resize(new_size as usize, 0);
+                let new_size: usize = new_size.try_into().map_err(|_| Errno::Overflow)?;
+                buffer.resize(new_size, 0);
             }
             Kind::Socket { .. }
             | Kind::PipeRx { .. }

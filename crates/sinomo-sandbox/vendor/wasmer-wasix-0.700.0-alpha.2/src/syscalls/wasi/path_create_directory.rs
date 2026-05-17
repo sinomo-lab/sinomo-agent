@@ -1,8 +1,3 @@
-use std::{
-    path::{Component, PathBuf},
-    str::FromStr,
-};
-
 use super::*;
 use crate::syscalls::*;
 
@@ -29,9 +24,9 @@ pub fn path_create_directory<M: MemorySize>(
     WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
-    let (memory, state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
+    let (memory, _state, _inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
-    let mut path_string = unsafe { get_input_str_ok!(&memory, path, path_len) };
+    let path_string = unsafe { get_input_str_ok!(&memory, path, path_len) };
     Span::current().record("path", path_string.as_str());
 
     wasi_try_ok!(path_create_directory_internal(&mut ctx, fd, &path_string));
@@ -54,7 +49,7 @@ pub(crate) fn path_create_directory_internal(
     path: &str,
 ) -> Result<(), Errno> {
     let env = ctx.data();
-    let (memory, state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
+    let (_memory, state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
     let working_dir = state.fs.get_fd(fd)?;
 
     if !working_dir
@@ -73,32 +68,33 @@ pub(crate) fn path_create_directory_internal(
 
     let mut guard = parent_inode.write();
     match guard.deref_mut() {
-        Kind::Dir { entries, path, .. } => {
+        Kind::Dir {
+            entries,
+            path: parent_path,
+            ..
+        } => {
             if let Some(child) = entries.get(&dir_name) {
                 return Err(Errno::Exist);
             }
 
-            let mut new_dir_path = path.clone();
+            let mut new_dir_path = parent_path.clone();
             new_dir_path.push(&dir_name);
 
             drop(guard);
 
-            // TODO: This condition should already have been checked by the entries.get check
-            // above, but it was in the code before my refactor and I'm keeping it just in case.
-            if path_filestat_get_internal(
-                &memory,
-                state,
-                inodes,
-                fd,
-                0,
-                &new_dir_path.to_string_lossy(),
-            )
-            .is_ok()
-            {
+            if state.fs.get_inode_at_path(inodes, fd, path, true).is_ok() {
                 return Err(Errno::Exist);
             }
 
-            state.fs_create_dir(&new_dir_path)?;
+            match state.fs_create_dir(&new_dir_path) {
+                Ok(()) | Err(Errno::Noent) => {}
+                Err(err) => return Err(err),
+            }
+            let mode = 0o777 & !env.process.umask();
+            match crate::syscalls::chmod_host_path(&new_dir_path, mode) {
+                Errno::Success | Errno::Noent => {}
+                err => return Err(err),
+            }
 
             let kind = Kind::Dir {
                 parent: parent_inode.downgrade(),

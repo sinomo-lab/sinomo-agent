@@ -54,16 +54,29 @@ pub struct SandboxWasixCommandOverride {
     pub exec_name: Option<String>,
 }
 
+#[cfg(feature = "wasix-runtime")]
+#[derive(Clone, Default)]
+pub(crate) struct SandboxWasixPipeOptions {
+    pub stdin_pipe: Option<virtual_fs::ArcFile<virtual_fs::Pipe>>,
+    pub stdout_pipe: Option<virtual_fs::Pipe>,
+}
+
 #[derive(Clone)]
 pub struct SandboxWasiRunOptions {
     pub preopened_dirs: Vec<SandboxWasiPreopen>,
     pub working_directory_host_path: Option<PathBuf>,
+    #[cfg(feature = "wasix-runtime")]
+    pub wasix_stdin_pipe: Option<virtual_fs::ArcFile<virtual_fs::Pipe>>,
+    #[cfg(feature = "wasix-runtime")]
+    pub wasix_stdout_pipe: Option<virtual_fs::Pipe>,
     pub enable_virtual_devices: bool,
     pub zero_device_bytes: usize,
     pub memory_limit_bytes: usize,
     pub fuel: u64,
     pub input_limit_bytes: usize,
     pub output_limit_bytes: usize,
+    pub workspace_limit_bytes: u64,
+    pub file_count_limit: u64,
     pub cancellation: SandboxCancellation,
     pub output_sink: Option<Arc<dyn SandboxOutputSink>>,
     pub allow_preview1_pinned_subprocesses: bool,
@@ -81,12 +94,28 @@ impl fmt::Debug for SandboxWasiRunOptions {
                 "working_directory_host_path",
                 &self.working_directory_host_path,
             )
+            .field(
+                "wasix_stdin_pipe",
+                #[cfg(feature = "wasix-runtime")]
+                &self.wasix_stdin_pipe.as_ref().map(|_| "<pipe>"),
+                #[cfg(not(feature = "wasix-runtime"))]
+                &Option::<&str>::None,
+            )
+            .field(
+                "wasix_stdout_pipe",
+                #[cfg(feature = "wasix-runtime")]
+                &self.wasix_stdout_pipe.as_ref().map(|_| "<pipe>"),
+                #[cfg(not(feature = "wasix-runtime"))]
+                &Option::<&str>::None,
+            )
             .field("enable_virtual_devices", &self.enable_virtual_devices)
             .field("zero_device_bytes", &self.zero_device_bytes)
             .field("memory_limit_bytes", &self.memory_limit_bytes)
             .field("fuel", &self.fuel)
             .field("input_limit_bytes", &self.input_limit_bytes)
             .field("output_limit_bytes", &self.output_limit_bytes)
+            .field("workspace_limit_bytes", &self.workspace_limit_bytes)
+            .field("file_count_limit", &self.file_count_limit)
             .field("cancellation", &self.cancellation)
             .field("output_sink", &self.output_sink.as_ref().map(|_| "<sink>"))
             .field(
@@ -112,12 +141,18 @@ impl Default for SandboxWasiRunOptions {
         Self {
             preopened_dirs: Vec::new(),
             working_directory_host_path: None,
+            #[cfg(feature = "wasix-runtime")]
+            wasix_stdin_pipe: None,
+            #[cfg(feature = "wasix-runtime")]
+            wasix_stdout_pipe: None,
             enable_virtual_devices: false,
             zero_device_bytes: SANDBOX_WASI_ZERO_DEVICE_BYTES,
             memory_limit_bytes: limits.memory_mb.saturating_mul(1024 * 1024) as usize,
             fuel: u64::MAX,
             input_limit_bytes: limits.max_input_bytes as usize,
             output_limit_bytes: limits.max_output_bytes as usize,
+            workspace_limit_bytes: limits.max_workspace_bytes,
+            file_count_limit: limits.max_file_count,
             cancellation: SandboxCancellation::new(),
             output_sink: None,
             allow_preview1_pinned_subprocesses: false,
@@ -169,6 +204,8 @@ pub fn local_staged_sandbox_wasi_options_with_limits_and_preopens(
         memory_limit_bytes: limits.memory_mb.saturating_mul(1024 * 1024) as usize,
         input_limit_bytes: limits.max_input_bytes as usize,
         output_limit_bytes: limits.max_output_bytes as usize,
+        workspace_limit_bytes: limits.max_workspace_bytes,
+        file_count_limit: limits.max_file_count,
         ..SandboxWasiRunOptions::default()
     }
 }

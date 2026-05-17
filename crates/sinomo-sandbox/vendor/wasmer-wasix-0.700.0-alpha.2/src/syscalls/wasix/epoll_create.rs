@@ -85,5 +85,6 @@ pub fn epoll_create_internal(
         )
     });
 
+    sync_process_metadata(env);
     Ok(Ok(fd))
 }

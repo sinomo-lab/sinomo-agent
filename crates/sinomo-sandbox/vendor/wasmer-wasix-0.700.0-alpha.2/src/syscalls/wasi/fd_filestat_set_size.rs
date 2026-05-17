@@ -15,6 +15,13 @@ pub fn fd_filestat_set_size(
     st_size: Filesize,
 ) -> Result<Errno, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
+    if st_size > ctx.data().process.file_size_limit() {
+        ctx.data().process.signal_process(Signal::Sigxfsz);
+        match WasiEnv::process_signals_and_exit(&mut ctx)? {
+            Ok(_) => return Ok(Errno::Fbig),
+            Err(err) => return Ok(err),
+        }
+    }
 
     wasi_try_ok!(fd_filestat_set_size_internal(&mut ctx, fd, st_size));
     let env = ctx.data();
@@ -56,7 +63,8 @@ pub(crate) fn fd_filestat_set_size_internal(
                 }
             }
             Kind::Buffer { buffer } => {
-                buffer.resize(st_size as usize, 0);
+                let st_size: usize = st_size.try_into().map_err(|_| Errno::Overflow)?;
+                buffer.resize(st_size, 0);
             }
             Kind::Socket { .. }
             | Kind::PipeRx { .. }

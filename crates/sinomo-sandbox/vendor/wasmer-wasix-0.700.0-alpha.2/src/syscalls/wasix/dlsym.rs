@@ -56,7 +56,12 @@ pub fn dlsym<M: MemorySize>(
     match symbol {
         ResolvedExport::Function { func_ptr: addr } | ResolvedExport::Global { data_ptr: addr } => {
             let Ok(addr) = addr.try_into() else {
-                panic!("Failed to convert u64 address to M::Offset");
+                wasi_dl_err!(
+                    "resolved symbol address does not fit the guest pointer width",
+                    memory,
+                    err_buf,
+                    err_buf_len
+                );
             };
             wasi_try_mem_ok!(out_symbol.write(&memory, addr));
         }

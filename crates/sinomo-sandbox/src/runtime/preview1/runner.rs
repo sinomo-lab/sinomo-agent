@@ -60,6 +60,45 @@ impl LocalWasiCommandRunner {
             }
             wasi.env(key, value);
         }
+        if !request.env.iter().any(|(key, _)| key == "PATH") {
+            wasi.env("PATH", "/bin:/usr/bin");
+        }
+        if !request.env.iter().any(|(key, _)| key == "HOME") {
+            wasi.env("HOME", "/home/sinomo");
+        }
+        if !request.env.iter().any(|(key, _)| key == "USER") {
+            wasi.env("USER", "sinomo");
+        }
+        if !request.env.iter().any(|(key, _)| key == "LOGNAME") {
+            wasi.env("LOGNAME", "sinomo");
+        }
+        if !request.env.iter().any(|(key, _)| key == "SHELL") {
+            wasi.env("SHELL", "/bin/sh");
+        }
+        if !request.env.iter().any(|(key, _)| key == "TMPDIR") {
+            wasi.env("TMPDIR", "/tmp");
+        }
+        if !request.env.iter().any(|(key, _)| key == "XDG_CACHE_HOME") {
+            wasi.env("XDG_CACHE_HOME", "/home/sinomo/.cache");
+        }
+        if !request.env.iter().any(|(key, _)| key == "XDG_CONFIG_HOME") {
+            wasi.env("XDG_CONFIG_HOME", "/home/sinomo/.config");
+        }
+        if !request.env.iter().any(|(key, _)| key == "XDG_DATA_HOME") {
+            wasi.env("XDG_DATA_HOME", "/home/sinomo/.local/share");
+        }
+        if !request.env.iter().any(|(key, _)| key == "LANG") {
+            wasi.env("LANG", "C.UTF-8");
+        }
+        if !request.env.iter().any(|(key, _)| key == "LC_CTYPE") {
+            wasi.env("LC_CTYPE", "C.UTF-8");
+        }
+        if !request.env.iter().any(|(key, _)| key == "TZ") {
+            wasi.env("TZ", "UTC");
+        }
+        if !request.env.iter().any(|(key, _)| key == "TERM") {
+            wasi.env("TERM", "dumb");
+        }
         wasi.env("PWD", request.cwd.as_str());
         if let Some(stdin) = &request.stdin
             && stdin.len() > options.input_limit_bytes
@@ -106,7 +145,23 @@ impl LocalWasiCommandRunner {
             .map_err(SandboxWasiError::from_wasmtime)?;
         }
         let virtual_devices = if options.enable_virtual_devices {
-            let devices = LocalWasiVirtualDeviceDir::create(options.zero_device_bytes)?;
+            let mut proc_env = request
+                .env
+                .iter()
+                .filter(|(key, _)| key.as_str() != "PWD")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            proc_env.push(("PWD".to_string(), request.cwd.as_str().to_string()));
+            let devices = LocalWasiVirtualDeviceDir::create(
+                options.zero_device_bytes,
+                &request.argv,
+                &proc_env,
+                &options
+                    .preopened_dirs
+                    .iter()
+                    .map(|preopen| (preopen.guest_path.clone(), preopen.mode.clone()))
+                    .collect::<Vec<_>>(),
+            )?;
             wasi.preopened_dir(
                 devices.path(),
                 "dev",
@@ -114,6 +169,130 @@ impl LocalWasiCommandRunner {
                 wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
             )
             .map_err(SandboxWasiError::from_wasmtime)?;
+            wasi.preopened_dir(
+                devices.proc_path(),
+                "proc",
+                wasmtime_wasi::DirPerms::READ,
+                wasmtime_wasi::FilePerms::READ,
+            )
+            .map_err(SandboxWasiError::from_wasmtime)?;
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/etc")
+            {
+                wasi.preopened_dir(
+                    devices.etc_path(),
+                    "etc",
+                    wasmtime_wasi::DirPerms::READ,
+                    wasmtime_wasi::FilePerms::READ,
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/sys")
+            {
+                wasi.preopened_dir(
+                    devices.sys_path(),
+                    "sys",
+                    wasmtime_wasi::DirPerms::READ,
+                    wasmtime_wasi::FilePerms::READ,
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/run")
+            {
+                wasi.preopened_dir(
+                    devices.run_path(),
+                    "run",
+                    wasmtime_wasi::DirPerms::all(),
+                    wasmtime_wasi::FilePerms::all(),
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/var")
+            {
+                wasi.preopened_dir(
+                    devices.var_path(),
+                    "var",
+                    wasmtime_wasi::DirPerms::all(),
+                    wasmtime_wasi::FilePerms::all(),
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/tmp")
+            {
+                wasi.preopened_dir(
+                    devices.tmp_path(),
+                    "tmp",
+                    wasmtime_wasi::DirPerms::all(),
+                    wasmtime_wasi::FilePerms::all(),
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/home")
+            {
+                wasi.preopened_dir(
+                    devices.home_path(),
+                    "home",
+                    wasmtime_wasi::DirPerms::all(),
+                    wasmtime_wasi::FilePerms::all(),
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/root")
+            {
+                wasi.preopened_dir(
+                    devices.root_home_path(),
+                    "root",
+                    wasmtime_wasi::DirPerms::all(),
+                    wasmtime_wasi::FilePerms::all(),
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/usr")
+            {
+                wasi.preopened_dir(
+                    devices.usr_path(),
+                    "usr",
+                    wasmtime_wasi::DirPerms::READ,
+                    wasmtime_wasi::FilePerms::READ,
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
+            if !options
+                .preopened_dirs
+                .iter()
+                .any(|preopen| preopen.guest_path.as_str() == "/opt")
+            {
+                wasi.preopened_dir(
+                    devices.opt_path(),
+                    "opt",
+                    wasmtime_wasi::DirPerms::READ,
+                    wasmtime_wasi::FilePerms::READ,
+                )
+                .map_err(SandboxWasiError::from_wasmtime)?;
+            }
             Some(devices)
         } else {
             None

@@ -14,8 +14,8 @@ pub struct SifsStagedSandboxProcessPlanOutcome<T> {
 
 #[derive(Clone)]
 pub struct SifsStagedSandboxCommandRunner {
-    local_runner: LocalStagedSandboxCommandRunner,
-    replica_candidates: Vec<NodeId>,
+    pub(super) local_runner: LocalStagedSandboxCommandRunner,
+    pub(super) replica_candidates: Vec<NodeId>,
 }
 
 impl SifsStagedSandboxCommandRunner {
@@ -138,7 +138,7 @@ impl SifsStagedSandboxCommandRunner {
             timeout_ms,
             limits,
             output_sink,
-            SandboxWasiAbi::Preview1,
+            default_sandbox_wasi_abi(),
         )
     }
 

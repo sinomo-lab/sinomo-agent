@@ -1005,6 +1005,87 @@ pub(in crate::tests) fn wasix_spawn_echo_via_path_module() -> &'static str {
         "#
 }
 
+#[cfg(feature = "wasix-runtime")]
+pub(in crate::tests) fn wasix_yielding_loop_module() -> &'static str {
+    r#"
+        (module
+          (import "wasix_32v1" "sched_yield"
+            (func $sched_yield (result i32)))
+          (memory (export "memory") 1 128)
+          (func (export "_start")
+            (loop $again
+              call $sched_yield
+              drop
+              br $again)))
+        "#
+}
+
+#[cfg(feature = "wasix-runtime")]
+pub(in crate::tests) fn wasix_spawn_signal_kill_module() -> &'static str {
+    r#"
+        (module
+          (import "wasix_32v1" "proc_spawn"
+            (func $proc_spawn
+              (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
+              (result i32)))
+          (import "wasix_32v1" "proc_signal"
+            (func $proc_signal (param i32 i32) (result i32)))
+          (import "wasix_32v1" "proc_join"
+            (func $proc_join (param i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $proc_exit (param i32)))
+          (memory (export "memory") 1 128)
+          ;; child name, argv lines, cwd, option pid, join status.
+          (data (i32.const 64) "/bin/loop")
+          (data (i32.const 96) "/bin/loop\0a")
+          (data (i32.const 128) ".")
+          (data (i32.const 144) "/work\0a")
+          (func $exit_if_errno (param $errno i32)
+            local.get $errno
+            i32.eqz
+            if
+            else
+              local.get $errno
+              call $proc_exit
+            end)
+          (func (export "_start")
+            i32.const 64
+            i32.const 9
+            i32.const 0
+            i32.const 96
+            i32.const 10
+            i32.const 144
+            i32.const 6
+            i32.const 2
+            i32.const 1
+            i32.const 1
+            i32.const 128
+            i32.const 1
+            i32.const 160
+            call $proc_spawn
+            call $exit_if_errno
+
+            i32.const 160
+            i32.load
+            i32.const 9
+            call $proc_signal
+            call $exit_if_errno
+
+            i32.const 192
+            i32.const 1
+            i32.store8
+            i32.const 196
+            i32.const 160
+            i32.load
+            i32.store
+            i32.const 192
+            i32.const 0
+            i32.const 224
+            call $proc_join
+            call $exit_if_errno))
+        "#
+}
+
 pub(in crate::tests) fn wasi_write_file_module(path: &str) -> String {
     wasi_write_file_module_on_fd(3, path)
 }

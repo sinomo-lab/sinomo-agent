@@ -9,6 +9,19 @@ pub(super) enum SandboxVirtualDevicePath {
     Zero,
     Random,
     Urandom,
+    Full,
+    Stdin,
+    Stdout,
+    Stderr,
+    Tty,
+    Console,
+    Ptmx,
+    FdDirectory,
+    Fd0,
+    Fd1,
+    Fd2,
+    PtsDirectory,
+    ShmDirectory,
 }
 
 pub(super) fn sandbox_virtual_device_path(path: &SandboxPath) -> Option<SandboxVirtualDevicePath> {
@@ -18,6 +31,19 @@ pub(super) fn sandbox_virtual_device_path(path: &SandboxPath) -> Option<SandboxV
         "/dev/zero" => Some(SandboxVirtualDevicePath::Zero),
         "/dev/random" => Some(SandboxVirtualDevicePath::Random),
         "/dev/urandom" => Some(SandboxVirtualDevicePath::Urandom),
+        "/dev/full" => Some(SandboxVirtualDevicePath::Full),
+        "/dev/stdin" => Some(SandboxVirtualDevicePath::Stdin),
+        "/dev/stdout" => Some(SandboxVirtualDevicePath::Stdout),
+        "/dev/stderr" => Some(SandboxVirtualDevicePath::Stderr),
+        "/dev/tty" => Some(SandboxVirtualDevicePath::Tty),
+        "/dev/console" => Some(SandboxVirtualDevicePath::Console),
+        "/dev/ptmx" => Some(SandboxVirtualDevicePath::Ptmx),
+        "/dev/fd" => Some(SandboxVirtualDevicePath::FdDirectory),
+        "/dev/fd/0" => Some(SandboxVirtualDevicePath::Fd0),
+        "/dev/fd/1" => Some(SandboxVirtualDevicePath::Fd1),
+        "/dev/fd/2" => Some(SandboxVirtualDevicePath::Fd2),
+        "/dev/pts" => Some(SandboxVirtualDevicePath::PtsDirectory),
+        "/dev/shm" => Some(SandboxVirtualDevicePath::ShmDirectory),
         _ => None,
     }
 }
@@ -30,6 +56,14 @@ pub fn sandbox_path_is_virtual_device_sink(path: &SandboxPath) -> bool {
                 | SandboxVirtualDevicePath::Zero
                 | SandboxVirtualDevicePath::Random
                 | SandboxVirtualDevicePath::Urandom
+                | SandboxVirtualDevicePath::Full
+                | SandboxVirtualDevicePath::Stdout
+                | SandboxVirtualDevicePath::Stderr
+                | SandboxVirtualDevicePath::Tty
+                | SandboxVirtualDevicePath::Console
+                | SandboxVirtualDevicePath::Ptmx
+                | SandboxVirtualDevicePath::Fd1
+                | SandboxVirtualDevicePath::Fd2
         )
     )
 }
@@ -41,16 +75,31 @@ pub(super) fn sandbox_path_is_dev_tree(path: &SandboxPath) -> bool {
 pub(super) fn sandbox_virtual_device_metadata(path: &SandboxPath) -> Option<SandboxMetadata> {
     sandbox_virtual_device_path(path).map(|device| SandboxMetadata {
         path: path.clone(),
-        is_dir: matches!(device, SandboxVirtualDevicePath::DevDirectory),
+        is_dir: matches!(
+            device,
+            SandboxVirtualDevicePath::DevDirectory
+                | SandboxVirtualDevicePath::FdDirectory
+                | SandboxVirtualDevicePath::PtsDirectory
+                | SandboxVirtualDevicePath::ShmDirectory
+        ),
         len: 0,
     })
 }
 
-pub(super) fn sandbox_virtual_device_dir_entries() -> Vec<SandboxDirEntry> {
+pub(super) fn sandbox_virtual_device_dir_entries(path: &SandboxPath) -> Vec<SandboxDirEntry> {
+    let prefix = match path.as_str() {
+        "/dev/fd" => "/dev/fd/",
+        "/dev/pts" => "/dev/pts/",
+        "/dev/shm" => "/dev/shm/",
+        _ => "/dev/",
+    };
     SANDBOX_MVP_VIRTUAL_DEVICES
         .iter()
-        .map(|path| {
-            let path = SandboxPath::new(*path).expect("static virtual device path");
+        .copied()
+        .filter(|device| device.starts_with(prefix))
+        .filter(|device| !device[prefix.len()..].contains('/'))
+        .map(|device| {
+            let path = SandboxPath::new(device).expect("static virtual device path");
             SandboxDirEntry {
                 metadata: sandbox_virtual_device_metadata(&path)
                     .expect("static virtual device metadata"),
@@ -75,6 +124,26 @@ pub(super) fn read_sandbox_virtual_device(
             let Some(end) = range.end else {
                 return Err(SandboxFsError::Unsupported {
                     operation: "open-ended read from /dev/zero".to_string(),
+                });
+            };
+            if end <= range.start {
+                return Ok(Vec::new());
+            }
+            let len =
+                usize::try_from(end - range.start).map_err(|_| SandboxFsError::Unavailable {
+                    reason: format!("range too large for {}", path),
+                })?;
+            Ok(vec![0; len])
+        }
+        Some(SandboxVirtualDevicePath::Full) => {
+            let Some(range) = range else {
+                return Err(SandboxFsError::Unsupported {
+                    operation: "unbounded read from /dev/full".to_string(),
+                });
+            };
+            let Some(end) = range.end else {
+                return Err(SandboxFsError::Unsupported {
+                    operation: "open-ended read from /dev/full".to_string(),
                 });
             };
             if end <= range.start {
@@ -113,6 +182,22 @@ pub(super) fn read_sandbox_virtual_device(
         Some(SandboxVirtualDevicePath::DevDirectory) => {
             Err(SandboxFsError::ReadOnly { path: path.clone() })
         }
+        Some(
+            SandboxVirtualDevicePath::Stdin
+            | SandboxVirtualDevicePath::Stdout
+            | SandboxVirtualDevicePath::Stderr
+            | SandboxVirtualDevicePath::Tty
+            | SandboxVirtualDevicePath::Console
+            | SandboxVirtualDevicePath::Ptmx
+            | SandboxVirtualDevicePath::Fd0
+            | SandboxVirtualDevicePath::Fd1
+            | SandboxVirtualDevicePath::Fd2,
+        ) => Ok(Vec::new()),
+        Some(
+            SandboxVirtualDevicePath::FdDirectory
+            | SandboxVirtualDevicePath::PtsDirectory
+            | SandboxVirtualDevicePath::ShmDirectory,
+        ) => Err(SandboxFsError::ReadOnly { path: path.clone() }),
         None => Err(SandboxFsError::NotFound { path: path.clone() }),
     }
 }
@@ -125,9 +210,26 @@ pub(super) fn write_sandbox_virtual_device(path: &SandboxPath) -> Result<(), San
             | SandboxVirtualDevicePath::Random
             | SandboxVirtualDevicePath::Urandom,
         ) => Ok(()),
-        Some(SandboxVirtualDevicePath::DevDirectory) => {
-            Err(SandboxFsError::ReadOnly { path: path.clone() })
-        }
+        Some(SandboxVirtualDevicePath::Full) => Err(SandboxFsError::Unavailable {
+            reason: "/dev/full has no free space".to_string(),
+        }),
+        Some(
+            SandboxVirtualDevicePath::Stdout
+            | SandboxVirtualDevicePath::Stderr
+            | SandboxVirtualDevicePath::Tty
+            | SandboxVirtualDevicePath::Console
+            | SandboxVirtualDevicePath::Ptmx
+            | SandboxVirtualDevicePath::Fd1
+            | SandboxVirtualDevicePath::Fd2,
+        ) => Ok(()),
+        Some(
+            SandboxVirtualDevicePath::DevDirectory
+            | SandboxVirtualDevicePath::FdDirectory
+            | SandboxVirtualDevicePath::PtsDirectory
+            | SandboxVirtualDevicePath::ShmDirectory
+            | SandboxVirtualDevicePath::Stdin
+            | SandboxVirtualDevicePath::Fd0,
+        ) => Err(SandboxFsError::ReadOnly { path: path.clone() }),
         None => Err(SandboxFsError::NotFound { path: path.clone() }),
     }
 }

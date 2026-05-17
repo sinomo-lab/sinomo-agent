@@ -93,7 +93,7 @@ pub use windows::*;
 
 pub(crate) use self::types::{
     wasi::{
-        Addressfamily, Advice, Clockid, Dircookie, Dirent, DlFlags, DlHandle, Errno, Event,
+        Addressfamily, Advice, Clockid, Dircookie, Dirent, Disposition, DlFlags, DlHandle, Errno, Event,
         EventFdReadwrite, Eventrwflags, Eventtype, ExitCode, Fd as WasiFd, Fdflags, Fdflagsext,
         Fdstat, Filesize, Filestat, Filetype, Fstflags, Linkcount, Longsize, OptionFd, Pid,
         Prestat, ProcSpawnFdOp, Rights, SignalDisposition, Snapshot0Clockid, Sockoption,
@@ -393,15 +393,15 @@ where
         if env.thread.has_signals_or_subscribe(cx.waker()) {
             let has_exit = {
                 let signals = env.thread.signals().lock().unwrap();
+                let dispositions = env.state.signals.lock().unwrap();
                 signals
                     .0
                     .iter()
                     .filter_map(|sig| {
-                        if *sig == Signal::Sigint
-                            || *sig == Signal::Sigquit
-                            || *sig == Signal::Sigkill
-                            || *sig == Signal::Sigabrt
-                        {
+                        if matches!(dispositions.get(sig), Some(Disposition::Ignore)) {
+                            return None;
+                        }
+                        if *sig == Signal::Sigkill {
                             Some(env.thread.set_or_get_exit_code_for_signal(*sig))
                         } else {
                             None
@@ -852,7 +852,7 @@ pub(crate) fn write_buffer_array<M: MemorySize>(
 }
 
 pub(crate) fn get_current_time_in_nanos() -> Result<Timestamp, Errno> {
-    let now = platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000).unwrap() as u128;
+    let now = platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000)? as u128;
     Ok(now as Timestamp)
 }
 
@@ -1158,8 +1158,9 @@ where
     let asyncify_data = wasi_try_ok!(unwind_pointer.try_into().map_err(|_| Errno::Overflow));
     if let Some(asyncify_start_unwind) = env
         .inner()
-        .static_module_instance_handles()
-        .and_then(|handles| handles.asyncify_start_unwind.clone())
+        .main_module_instance_handles()
+        .asyncify_start_unwind
+        .clone()
     {
         asyncify_start_unwind.call(&mut ctx, asyncify_data);
     } else {
@@ -1224,8 +1225,9 @@ where
         // Notify asyncify that we are no longer unwinding
         if let Some(asyncify_stop_unwind) = env
             .inner()
-            .static_module_instance_handles()
-            .and_then(|i| i.asyncify_stop_unwind.clone())
+            .main_module_instance_handles()
+            .asyncify_stop_unwind
+            .clone()
         {
             asyncify_stop_unwind.call(&mut ctx);
         } else {
@@ -1340,8 +1342,9 @@ pub fn rewind_ext<M: MemorySize>(
     let asyncify_data = wasi_try!(rewind_pointer.try_into().map_err(|_| Errno::Overflow));
     if let Some(asyncify_start_rewind) = env
         .inner()
-        .static_module_instance_handles()
-        .and_then(|a| a.asyncify_start_rewind.clone())
+        .main_module_instance_handles()
+        .asyncify_start_rewind
+        .clone()
     {
         asyncify_start_rewind.call(ctx, asyncify_data);
     } else {
@@ -1443,8 +1446,9 @@ where
         let env = ctx.data();
         if let Some(asyncify_stop_rewind) = env
             .inner()
-            .static_module_instance_handles()
-            .and_then(|handles| handles.asyncify_stop_unwind.clone())
+            .main_module_instance_handles()
+            .asyncify_stop_rewind
+            .clone()
         {
             asyncify_stop_rewind.call(ctx);
         } else {
@@ -1496,43 +1500,126 @@ pub(crate) fn _prepare_wasi(
 
     // Update the env vars
     if let Some(envs) = envs {
-        let mut guard = wasi_env.state.envs.lock().unwrap();
-
-        let mut existing_envs = guard
-            .iter()
-            .map(|b| {
-                let string = String::from_utf8_lossy(b);
-                let (key, val) = string.split_once('=').expect("env var is malformed");
-
-                (key.to_string(), val.to_string().as_bytes().to_vec())
-            })
-            .collect::<Vec<_>>();
-
-        for (key, val) in envs {
-            let val = val.as_bytes().to_vec();
-            match existing_envs
-                .iter_mut()
-                .find(|(existing_key, _)| existing_key == &key)
-            {
-                Some((_, existing_val)) => *existing_val = val,
-                None => existing_envs.push((key, val)),
-            }
-        }
-
-        let envs = conv_env_vars(existing_envs);
-
-        *guard = envs;
-
-        drop(guard)
+        let envs = conv_env_vars(
+            envs.into_iter()
+                .map(|(key, val)| (key, val.into_bytes()))
+                .collect(),
+        );
+        *wasi_env.state.envs.lock().unwrap() = envs;
     }
 
     if let Some(signals) = signals {
         let mut guard = wasi_env.state.signals.lock().unwrap();
         for signal in signals {
-            guard.insert(signal.sig, signal.disp);
+            match signal.disp {
+                Disposition::Default => {
+                    guard.remove(&signal.sig);
+                }
+                Disposition::Ignore => {
+                    guard.insert(signal.sig, signal.disp);
+                }
+                _ => {
+                    guard.insert(signal.sig, signal.disp);
+                }
+            }
         }
         drop(guard);
     }
+
+    sync_process_metadata(wasi_env);
+}
+
+pub(crate) fn sync_process_metadata(wasi_env: &WasiEnv) {
+    let args = wasi_env.state.args.lock().unwrap().clone();
+    let envs = wasi_env.state.envs.lock().unwrap().clone();
+    let cwd = wasi_env.state.fs.current_dir.lock().unwrap().clone();
+    let mut fd_infos = wasi_env
+        .state
+        .fs
+        .fd_map
+        .read()
+        .unwrap()
+        .iter()
+        .map(|(fd, fd_entry)| {
+            let target = process_fd_target(fd, fd_entry);
+            crate::os::task::process::ProcessFdInfo {
+                fd,
+                pos: fd_entry
+                    .inner
+                    .offset
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                flags: process_fdinfo_flags(fd_entry),
+                target,
+            }
+        })
+        .collect::<Vec<_>>();
+    fd_infos.sort_unstable_by_key(|info| info.fd);
+    wasi_env
+        .process
+        .set_metadata(args, envs, cwd, fd_infos);
+}
+
+fn process_fd_target(fd: WasiFd, fd_entry: &Fd) -> String {
+    let inode_name = fd_entry.inode.name.read().unwrap().clone();
+    let target_kind = match fd_entry.inode.read().deref() {
+        Kind::File { .. } | Kind::Buffer { .. } => {
+            return process_fd_path_target(&inode_name).unwrap_or_else(|| format!("file:[{fd}]"));
+        }
+        Kind::Dir { .. } | Kind::Root { .. } => {
+            return process_fd_path_target(&inode_name).unwrap_or_else(|| format!("dir:[{fd}]"));
+        }
+        Kind::Symlink { .. } => {
+            return process_fd_path_target(&inode_name).unwrap_or_else(|| format!("symlink:[{fd}]"));
+        }
+        Kind::Socket { .. } => "socket",
+        Kind::PipeTx { .. } | Kind::PipeRx { .. } | Kind::DuplexPipe { .. } => "pipe",
+        Kind::Epoll { .. } => "eventpoll",
+        Kind::EventNotifications { .. } => "eventfd",
+    };
+    format!("{target_kind}:[{fd}]")
+}
+
+fn process_fd_path_target(inode_name: &str) -> Option<String> {
+    if inode_name.is_empty() || inode_name == "pipe" || inode_name == "event" || inode_name == "socket" {
+        return None;
+    }
+    if inode_name.starts_with('/') {
+        return Some(inode_name.to_string());
+    }
+    if inode_name == "." || inode_name == ".." || inode_name.starts_with("./") || inode_name.starts_with("../") {
+        return None;
+    }
+    Some(format!("/{inode_name}"))
+}
+
+fn process_fdinfo_flags(fd_entry: &Fd) -> u32 {
+    // Linux /proc/<pid>/fdinfo reports the access mode together with file status
+    // flags in octal. Keep this sandbox-local but recognizable to POSIX tools.
+    let mut flags = if fd_entry.open_flags & Fd::WRITE != 0 {
+        if fd_entry.open_flags & Fd::READ != 0 {
+            0o2
+        } else {
+            0o1
+        }
+    } else {
+        0
+    };
+    if fd_entry.inner.flags.contains(Fdflags::APPEND) {
+        flags |= 0o2000;
+    }
+    if fd_entry.inner.flags.contains(Fdflags::NONBLOCK) {
+        flags |= 0o4000;
+    }
+    if fd_entry.inner.flags.contains(Fdflags::DSYNC) {
+        flags |= 0o10000;
+    }
+    if fd_entry.inner.flags.contains(Fdflags::SYNC) {
+        flags |= 0o4010000;
+    }
+    if fd_entry.inner.fd_flags.contains(Fdflagsext::CLOEXEC) {
+        flags |= 0o2000000;
+    }
+    flags
 }
 
 pub(crate) fn conv_spawn_err_to_errno(err: &SpawnError) -> Errno {

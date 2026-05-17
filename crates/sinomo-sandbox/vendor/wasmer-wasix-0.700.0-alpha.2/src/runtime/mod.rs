@@ -286,7 +286,19 @@ impl TtyBridge for DefaultTty {
 
     fn tty_set(&self, tty_state: WasiTtyState) {
         let mut state = self.state.lock().unwrap();
+        let foreground_process_group = state.foreground_process_group;
         *state = tty_state;
+        if state.foreground_process_group.is_none() {
+            state.foreground_process_group = foreground_process_group;
+        }
+    }
+
+    fn foreground_process_group(&self) -> Option<u32> {
+        self.state.lock().unwrap().foreground_process_group
+    }
+
+    fn set_foreground_process_group(&self, pgid: u32) {
+        self.state.lock().unwrap().foreground_process_group = Some(pgid);
     }
 }
 
@@ -334,7 +346,7 @@ impl PluggableRuntime {
             networking,
             http_client,
             engine: Default::default(),
-            tty: None,
+            tty: Some(Arc::new(DefaultTty::default())),
             source: Arc::new(source),
             package_loader: Arc::new(loader),
             module_cache: Arc::new(module_cache::in_memory()),

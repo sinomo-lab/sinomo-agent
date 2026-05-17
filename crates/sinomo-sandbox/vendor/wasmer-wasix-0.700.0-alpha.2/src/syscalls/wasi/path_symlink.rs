@@ -67,19 +67,6 @@ pub fn path_symlink_internal(
         return Err(Errno::Access);
     }
 
-    // get the depth of the parent + 1 (UNDER INVESTIGATION HMMMMMMMM THINK FISH ^ THINK FISH)
-    let old_path_path = std::path::Path::new(old_path);
-    let (source_inode, _) = state
-        .fs
-        .get_parent_inode_at_path(inodes, fd, old_path_path, true)?;
-    let depth = state.fs.path_depth_from_fd(fd, source_inode);
-
-    // depth == -1 means folder is not relative. See issue #3233.
-    let depth = match depth {
-        Ok(depth) => depth as i32 - 1,
-        Err(_) => -1,
-    };
-
     let new_path_path = std::path::Path::new(new_path);
     let (target_parent_inode, entry_name) =
         state
@@ -108,17 +95,10 @@ pub fn path_symlink_internal(
         }
     }
 
-    let mut source_path = std::path::Path::new(old_path);
-    let mut relative_path = std::path::PathBuf::new();
-    for _ in 0..depth {
-        relative_path.push("..");
-    }
-    relative_path.push(source_path);
-
     let kind = Kind::Symlink {
         base_po_dir: fd,
         path_to_symlink: std::path::PathBuf::from(new_path),
-        relative_path,
+        relative_path: std::path::PathBuf::from(old_path),
     };
     let new_inode =
         state

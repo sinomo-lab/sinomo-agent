@@ -19,9 +19,9 @@ pub fn closure_free(
 
     let free_result = linker.free_closure_index(&mut ctx, closure);
     if let Err(e) = free_result {
-        // Should never happen
-        panic!("Failed to free closure index: {e}");
+        error!("Failed to free closure index: {e}");
+        return Ok(Errno::Inval);
     }
 
-    return Ok(Errno::Success);
+    Ok(Errno::Success)
 }

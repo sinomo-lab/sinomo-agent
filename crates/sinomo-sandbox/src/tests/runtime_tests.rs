@@ -1429,6 +1429,45 @@ fn wasix_runner_allows_unpinned_child_exec_with_instruction_metering() {
 
 #[cfg(feature = "wasix-runtime")]
 #[test]
+fn wasix_runner_allows_guest_to_signal_and_join_child_process() {
+    let bin_dir = unique_test_dir("sinomo-sandbox-wasix-child-signal-bin");
+    let work_dir = unique_test_dir("sinomo-sandbox-wasix-child-signal-work");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    fs::create_dir_all(&work_dir).expect("work dir");
+    fs::write(
+        bin_dir.join("loop"),
+        wat::parse_str(wasix_yielding_loop_module()).expect("child wasm"),
+    )
+    .expect("loop child command");
+
+    let outcome = runtime::run_wasix_module(
+        wasix_spawn_signal_kill_module().as_bytes(),
+        test_wasi_request(5_000),
+        SandboxWasiRunOptions {
+            preopened_dirs: vec![
+                SandboxWasiPreopen {
+                    host_path: bin_dir.clone(),
+                    guest_path: SandboxPath::new("/bin").expect("bin path"),
+                    mode: SandboxMountMode::ReadOnly,
+                },
+                SandboxWasiPreopen {
+                    host_path: work_dir.clone(),
+                    guest_path: SandboxPath::new("/work").expect("work path"),
+                    mode: SandboxMountMode::ReadWrite,
+                },
+            ],
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect("run parent");
+
+    assert_eq!(outcome.response.exit_status, 0);
+    fs::remove_dir_all(bin_dir).ok();
+    fs::remove_dir_all(work_dir).ok();
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
 fn wasix_runner_enforces_input_limit() {
     let mut request = test_wasi_request(1_000);
     request.stdin = Some(b"too much stdin".to_vec());
@@ -1444,6 +1483,151 @@ fn wasix_runner_enforces_input_limit() {
     .expect_err("WASIX input limit");
 
     assert!(matches!(error, SandboxWasiError::InputLimitExceeded { .. }));
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn wasix_runner_passes_buffered_stdin_to_module() {
+    let mut request = test_wasi_request(1_000);
+    request.stdin = Some(b"from buffered stdin\n".to_vec());
+
+    let outcome = runtime::run_wasix_module(
+        wasi_stdin_to_stdout_module().as_bytes(),
+        request,
+        SandboxWasiRunOptions::default(),
+    )
+    .expect("run WASIX buffered stdin");
+
+    assert_eq!(outcome.response.exit_status, 0);
+    assert_eq!(outcome.stdout, b"from buffered stdin\n");
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn wasix_runner_reads_fd_backed_stdin_pipe() {
+    let (mut stdin_writer, stdin_reader) = virtual_fs::Pipe::channel();
+    std::io::Write::write_all(&mut stdin_writer, b"from fd pipe\n").expect("pipe write");
+    let stdin_reader = virtual_fs::ArcFile::new(Box::new(stdin_reader));
+
+    let outcome = runtime::run_wasix_module(
+        wasi_stdin_to_stdout_module().as_bytes(),
+        test_wasi_request(1_000),
+        SandboxWasiRunOptions {
+            wasix_stdin_pipe: Some(stdin_reader),
+            input_limit_bytes: 64,
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect("run WASIX stdin pipe");
+
+    assert_eq!(outcome.response.exit_status, 0);
+    assert_eq!(outcome.stdout, b"from fd pipe\n");
+    stdin_writer.close();
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn wasix_runner_tees_stdout_to_fd_backed_pipe() {
+    let (stdout_writer, mut stdout_reader) = virtual_fs::Pipe::channel();
+
+    let outcome = runtime::run_wasix_module(
+        wasi_stdout_module().as_bytes(),
+        test_wasi_request(1_000),
+        SandboxWasiRunOptions {
+            wasix_stdout_pipe: Some(stdout_writer),
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect("run WASIX stdout pipe");
+
+    let mut piped_stdout = Vec::new();
+    std::io::Read::read_to_end(&mut stdout_reader, &mut piped_stdout).expect("pipe read");
+
+    assert_eq!(outcome.response.exit_status, 0);
+    assert_eq!(outcome.stdout, b"hello\n");
+    assert_eq!(piped_stdout, b"hello\n");
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn wasix_runner_connects_stdout_pipe_to_concurrent_stdin_pipe() {
+    let (stdout_writer, stdin_reader) = virtual_fs::Pipe::channel();
+    let consumer = std::thread::spawn(move || {
+        runtime::run_wasix_module(
+            wasi_stdin_to_stdout_module().as_bytes(),
+            test_wasi_request(5_000),
+            SandboxWasiRunOptions {
+                wasix_stdin_pipe: Some(virtual_fs::ArcFile::new(Box::new(stdin_reader))),
+                input_limit_bytes: 64,
+                ..SandboxWasiRunOptions::default()
+            },
+        )
+    });
+
+    let producer = runtime::run_wasix_module(
+        wasi_stdout_module().as_bytes(),
+        test_wasi_request(5_000),
+        SandboxWasiRunOptions {
+            wasix_stdout_pipe: Some(stdout_writer),
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect("run WASIX stdout producer");
+
+    let consumer = consumer
+        .join()
+        .expect("consumer thread")
+        .expect("run WASIX stdin consumer");
+
+    assert_eq!(producer.response.exit_status, 0);
+    assert_eq!(producer.stdout, b"hello\n");
+    assert_eq!(consumer.response.exit_status, 0);
+    assert_eq!(consumer.stdout, b"hello\n");
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn wasix_runner_enforces_fd_backed_stdin_pipe_input_limit() {
+    let (mut stdin_writer, stdin_reader) = virtual_fs::Pipe::channel();
+    std::io::Write::write_all(&mut stdin_writer, b"too much fd stdin").expect("pipe write");
+
+    let error = runtime::run_wasix_module(
+        wasi_stdin_to_stdout_module().as_bytes(),
+        test_wasi_request(1_000),
+        SandboxWasiRunOptions {
+            wasix_stdin_pipe: Some(virtual_fs::ArcFile::new(Box::new(stdin_reader))),
+            input_limit_bytes: 4,
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect_err("WASIX fd stdin input limit");
+
+    assert!(matches!(
+        error,
+        SandboxWasiError::Runtime { .. } | SandboxWasiError::InputLimitExceeded { .. }
+    ));
+    stdin_writer.close();
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn wasix_runner_rejects_ambiguous_buffered_and_fd_stdin() {
+    let (_stdin_writer, stdin_reader) = virtual_fs::Pipe::channel();
+    let mut request = test_wasi_request(1_000);
+    request.stdin = Some(b"buffered stdin\n".to_vec());
+
+    let error = runtime::run_wasix_module(
+        wasi_stdin_to_stdout_module().as_bytes(),
+        request,
+        SandboxWasiRunOptions {
+            wasix_stdin_pipe: Some(virtual_fs::ArcFile::new(Box::new(stdin_reader))),
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect_err("ambiguous WASIX stdin");
+
+    assert!(matches!(error, SandboxWasiError::InvalidRequest { .. }));
+    assert!(error.to_string().contains("fd-backed pipe"));
 }
 
 #[cfg(feature = "wasix-runtime")]

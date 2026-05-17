@@ -144,38 +144,40 @@ pub fn path_rename_internal(
         }
     };
 
+    let source_nlink = source_entry.stat.read().unwrap().st_nlink;
+
     {
         let mut guard = source_entry.write();
         match guard.deref_mut() {
             Kind::File { path, .. } => {
-                let result = {
-                    let path_clone = path.clone();
-                    drop(guard);
-                    let state = state;
-                    let host_adjusted_target_path = host_adjusted_target_path.clone();
-                    __asyncify_light(env, None, async move {
-                        state
-                            .fs_rename(path_clone, &host_adjusted_target_path)
-                            .await
-                    })?
-                };
-                // if the above operation failed we have to revert the previous change and then fail
-                if let Err(e) = result {
-                    let mut guard = source_parent_inode.write();
-                    if let Kind::Dir { entries, .. } = guard.deref_mut() {
-                        entries.insert(source_entry_name, source_entry);
-                        return Ok(e);
-                    }
-                } else {
-                    let mut guard = source_entry.write();
-                    if let Kind::File { path, .. } = guard.deref_mut() {
-                        *path = host_adjusted_target_path;
+                if source_nlink <= 1 {
+                    let result = {
+                        let path_clone = path.clone();
+                        drop(guard);
+                        let state = state;
+                        let host_adjusted_target_path = host_adjusted_target_path.clone();
+                        __asyncify_light(env, None, async move {
+                            state.fs_rename(path_clone, &host_adjusted_target_path).await
+                        })?
+                    };
+                    // if the above operation failed we have to revert the previous change and then fail
+                    if let Err(e) = result {
+                        let mut guard = source_parent_inode.write();
+                        if let Kind::Dir { entries, .. } = guard.deref_mut() {
+                            entries.insert(source_entry_name, source_entry.clone());
+                            return Ok(e);
+                        }
                     } else {
-                        unreachable!()
+                        let mut guard = source_entry.write();
+                        if let Kind::File { path, .. } = guard.deref_mut() {
+                            *path = host_adjusted_target_path;
+                        } else {
+                            unreachable!()
+                        }
                     }
                 }
             }
-            Kind::Dir { path, .. } => {
+            Kind::Dir { path, parent, .. } => {
                 let cloned_path = path.clone();
                 let res = {
                     let state = state;
@@ -187,16 +189,32 @@ pub fn path_rename_internal(
                     })?
                 };
                 if let Err(e) = res {
-                    return Ok(e);
+                    if e != Errno::Noent {
+                        let mut guard = source_parent_inode.write();
+                        if let Kind::Dir { entries, .. } = guard.deref_mut() {
+                            entries.insert(source_entry_name, source_entry.clone());
+                            return Ok(e);
+                        }
+                    }
                 }
                 {
                     let source_dir_path = path.clone();
+                    *parent = target_parent_inode.downgrade();
                     drop(guard);
                     rename_inode_tree(&source_entry, &source_dir_path, &host_adjusted_target_path);
                 }
             }
+            Kind::Symlink {
+                base_po_dir,
+                path_to_symlink,
+                ..
+            } => {
+                if source_nlink <= 1 {
+                    *base_po_dir = target_fd;
+                    *path_to_symlink = PathBuf::from(target_path);
+                }
+            }
             Kind::Buffer { .. }
-            | Kind::Symlink { .. }
             | Kind::Socket { .. }
             | Kind::PipeTx { .. }
             | Kind::PipeRx { .. }
@@ -209,24 +227,27 @@ pub fn path_rename_internal(
 
     let source_size = source_entry.stat.read().unwrap().st_size;
 
-    if need_create {
+    {
         let mut guard = target_parent_inode.write();
         if let Kind::Dir { entries, .. } = guard.deref_mut() {
-            let result = entries.insert(target_entry_name.clone(), source_entry);
-            assert!(
-                result.is_none(),
-                "fatal error: race condition on filesystem detected or internal logic error"
-            );
+            let previous = entries.insert(target_entry_name.clone(), source_entry.clone());
+            if need_create {
+                assert!(
+                    previous.is_none(),
+                    "fatal error: race condition on filesystem detected or internal logic error"
+                );
+            } else if let Some(previous) = previous {
+                let mut stat = previous.stat.write().unwrap();
+                if stat.st_nlink > 0 {
+                    stat.st_nlink -= 1;
+                }
+            }
         }
     }
 
     // The target entry is created, one way or the other
-    let target_inode = state
-        .fs
-        .get_inode_at_path(inodes, target_fd, target_path, true)
-        .expect("Expected target inode to exist, and it's too late to safely fail");
-    *target_inode.name.write().unwrap() = target_entry_name.into();
-    target_inode.stat.write().unwrap().st_size = source_size;
+    *source_entry.name.write().unwrap() = target_entry_name.into();
+    source_entry.stat.write().unwrap().st_size = source_size;
 
     Ok(Errno::Success)
 }
