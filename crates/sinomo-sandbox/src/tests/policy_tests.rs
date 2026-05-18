@@ -360,7 +360,30 @@ fn sandbox_policy_allows_wasix_child_process_capability_when_all_gaps_are_allowl
 }
 
 #[test]
-fn sandbox_policy_denies_wasix_asyncified_fork_capability_even_when_allowlisted() {
+#[cfg(feature = "wasix-runtime")]
+fn sandbox_policy_allows_wasix_asyncified_fork_capability_when_allowlisted() {
+    let toolchain_id = SandboxToolchainId::from_legacy_named("toolchain_wasix").expect("toolchain");
+    let mut command = SandboxToolchainCommand::new(
+        &toolchain_id,
+        "fork-helper",
+        b"wasm bytes",
+        SandboxResourceLimits::default(),
+    )
+    .expect("command");
+    command.required_capabilities = vec![SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY.to_string()];
+    let mut policy = SandboxPolicy::default();
+    policy
+        .allowed_command_capabilities
+        .insert(SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY.to_string());
+
+    policy
+        .validate_command(&command, &SandboxWasiAbi::Wasix)
+        .expect("WASIX asyncified fork capability is supported when the WASIX runtime is enabled and policy allowlists it");
+}
+
+#[test]
+#[cfg(not(feature = "wasix-runtime"))]
+fn sandbox_policy_denies_wasix_asyncified_fork_capability_without_wasix_runtime() {
     let toolchain_id = SandboxToolchainId::from_legacy_named("toolchain_wasix").expect("toolchain");
     let mut command = SandboxToolchainCommand::new(
         &toolchain_id,
@@ -377,7 +400,7 @@ fn sandbox_policy_denies_wasix_asyncified_fork_capability_even_when_allowlisted(
 
     let error = policy
         .validate_command(&command, &SandboxWasiAbi::Wasix)
-        .expect_err("asyncified fork is not a supported runtime capability yet");
+        .expect_err("asyncified fork requires the WASIX runtime feature");
 
     assert_eq!(error.code, "command-capability-unsupported");
     assert!(
@@ -475,6 +498,17 @@ fn sandbox_policy_allows_wasix_sh_when_child_process_capability_is_allowlisted()
     policy
         .validate_command(&command, &SandboxWasiAbi::Wasix)
         .expect("WASIX sh should be allowed when child-process-exec and pinned child containment are allowlisted");
+}
+
+#[test]
+fn sandbox_default_policy_uses_host_memory_and_unlimited_wall_time() {
+    let policy = SandboxPolicy::default();
+
+    assert!(policy.max_limits.memory_mb > 0);
+    assert_eq!(
+        policy.max_limits.wall_time_ms,
+        SANDBOX_UNLIMITED_WALL_TIME_MS
+    );
 }
 
 #[test]
@@ -742,6 +776,7 @@ fn sandbox_policy_validates_effective_invocation_limits_not_package_defaults() {
     let command = toolchain.command("python").expect("command");
     let node_id = NodeId::from_legacy_named("node_effective_limits").expect("node");
     let mut policy = SandboxPolicy::default();
+    policy.max_limits.wall_time_ms = 60_000;
     policy
         .allowed_command_capabilities
         .insert(SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY.to_string());

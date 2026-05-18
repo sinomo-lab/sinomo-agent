@@ -42,11 +42,13 @@ pub struct SandboxResourceLimits {
     pub max_file_count: u64,
 }
 
+pub const SANDBOX_UNLIMITED_WALL_TIME_MS: u64 = u64::MAX;
+
 impl Default for SandboxResourceLimits {
     fn default() -> Self {
         Self {
-            memory_mb: 512,
-            wall_time_ms: 30_000,
+            memory_mb: host_memory_limit_mb(),
+            wall_time_ms: SANDBOX_UNLIMITED_WALL_TIME_MS,
             max_input_bytes: Self::default_max_input_bytes(),
             max_output_bytes: 16 * 1024 * 1024,
             max_workspace_bytes: 1024 * 1024 * 1024,
@@ -60,6 +62,24 @@ impl SandboxResourceLimits {
     pub fn default_max_input_bytes() -> u64 {
         16 * 1024 * 1024
     }
+}
+
+fn host_memory_limit_mb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+            if let Some(kb) = meminfo.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                match (fields.next(), fields.next()) {
+                    (Some("MemTotal:"), Some(value)) => value.parse::<u64>().ok(),
+                    _ => None,
+                }
+            }) {
+                return kb.saturating_add(1023) / 1024;
+            }
+        }
+    }
+    u64::MAX / (1024 * 1024)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

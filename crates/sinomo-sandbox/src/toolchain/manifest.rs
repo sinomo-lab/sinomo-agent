@@ -204,7 +204,7 @@ impl SandboxToolchainManifest {
     ) -> Result<(), SandboxToolchainError> {
         validate_toolchain_command_name(&command.name)?;
         if let Some(exec_name) = &command.exec_name {
-            validate_toolchain_command_name(exec_name)?;
+            validate_toolchain_command_exec_name(&command.name, exec_name)?;
         }
         validate_toolchain_command_argv_prefix(&command)?;
         validate_toolchain_command_default_env(&command)?;
@@ -311,6 +311,49 @@ fn validate_toolchain_command_argv_prefix(
         }
     }
     Ok(())
+}
+
+fn validate_toolchain_command_exec_name(
+    command_name: &str,
+    exec_name: &str,
+) -> Result<(), SandboxToolchainError> {
+    if exec_name.is_empty() {
+        return Err(SandboxToolchainError::InvalidManifest {
+            detail: format!("toolchain command `{command_name}` exec_name must be non-empty"),
+        });
+    }
+    if exec_name.contains('\0') {
+        return Err(SandboxToolchainError::InvalidManifest {
+            detail: format!(
+                "toolchain command `{command_name}` exec_name contains an embedded NUL byte"
+            ),
+        });
+    }
+    if let Some(path) = exec_name.strip_prefix('/') {
+        let mut parts = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return Err(SandboxToolchainError::InvalidManifest {
+                            detail: format!(
+                                "toolchain command `{command_name}` exec_name escapes the sandbox root"
+                            ),
+                        });
+                    }
+                }
+                part => parts.push(part),
+            }
+        }
+        if parts.is_empty() {
+            return Err(SandboxToolchainError::InvalidManifest {
+                detail: format!("toolchain command `{command_name}` exec_name must name a file"),
+            });
+        }
+        return Ok(());
+    }
+    validate_toolchain_command_name(exec_name)
 }
 
 fn validate_toolchain_command_required_capabilities(

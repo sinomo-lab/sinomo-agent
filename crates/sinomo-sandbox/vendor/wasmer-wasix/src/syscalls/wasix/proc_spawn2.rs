@@ -48,9 +48,22 @@ pub fn proc_spawn2<M: MemorySize>(
     let env = ctx.data();
     let memory = unsafe { ctx.data().memory_view(&ctx) };
     let mut name = unsafe { get_input_str_ok!(&memory, name, name_len) };
+    let reexec_current_executable = name.is_empty();
+    if name.is_empty()
+        && let Some(current_executable) = env.process.executable_path()
+    {
+        name = current_executable;
+    }
     Span::current().record("name", name.as_str());
     let args = unsafe { get_input_str_ok!(&memory, args, args_len) };
-    let args = parse_wasix_line_encoded_strings(&args);
+    let mut args = parse_wasix_line_encoded_strings(&args);
+    if reexec_current_executable
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-cc1" | "-cc1as"))
+    {
+        args.insert(0, name.clone());
+    }
 
     let envs = if !envs.is_null() {
         let envs = unsafe { get_input_str_ok!(&memory, envs, envs_len) };

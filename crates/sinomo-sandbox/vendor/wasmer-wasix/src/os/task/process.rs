@@ -220,7 +220,11 @@ const RLIMIT_NPROC: i32 = 6;
 fn default_resource_limit(resource: i32, envs: &[Vec<u8>]) -> ProcessResourceLimit {
     let memory_limit = process_env_u64(envs, "SINOMO_SANDBOX_MEMORY_LIMIT_BYTES", 512 * 1024 * 1024);
     let wall_time_ms = process_env_u64(envs, "SINOMO_SANDBOX_WALL_TIME_LIMIT_MS", 30_000);
-    let wall_time_seconds = wall_time_ms.saturating_add(999) / 1_000;
+    let wall_time_seconds = if wall_time_ms == RLIM_INFINITY {
+        RLIM_INFINITY
+    } else {
+        wall_time_ms.saturating_add(999) / 1_000
+    };
     let value = match resource {
         RLIMIT_CPU => wall_time_seconds,
         RLIMIT_CORE => 0,
@@ -244,7 +248,11 @@ fn sandbox_resource_limits(
     wall_time_ms: u64,
     task_limit: u64,
 ) -> HashMap<i32, ProcessResourceLimit> {
-    let wall_time_seconds = wall_time_ms.saturating_add(999) / 1_000;
+    let wall_time_seconds = if wall_time_ms == RLIM_INFINITY {
+        RLIM_INFINITY
+    } else {
+        wall_time_ms.saturating_add(999) / 1_000
+    };
     let mut limits = HashMap::new();
     limits.insert(
         RLIMIT_CPU,

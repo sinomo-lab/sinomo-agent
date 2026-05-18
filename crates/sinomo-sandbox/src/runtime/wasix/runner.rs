@@ -32,6 +32,8 @@ use std::time::Instant;
 use wasmer::sys::NativeEngineExt;
 #[cfg(feature = "wasix-runtime")]
 use wasmer_wasix::runners::wasi::RuntimeOrEngine;
+#[cfg(feature = "wasix-runtime")]
+use wasmer_wasix::runtime::Runtime;
 
 #[cfg(not(feature = "wasix-runtime"))]
 pub(crate) fn run_wasix_module(
@@ -68,9 +70,29 @@ pub(crate) fn run_wasix_module(
         engine.as_sys().target(),
         options.memory_limit_bytes,
     ));
-    let module = wasmer::Module::new(&engine, wasm).map_err(|error| SandboxWasiError::Runtime {
-        detail: format!("compile WASIX module: {error}"),
-    })?;
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_time()
+        .build()
+        .map_err(|error| SandboxWasiError::Runtime {
+            detail: format!("create WASIX host-fs runtime: {error}"),
+        })?;
+    let tokio_enter = tokio_runtime.enter();
+    let task_manager = std::sync::Arc::new(
+        wasmer_wasix::runtime::task_manager::tokio::TokioTaskManager::new(
+            tokio_runtime.handle().clone(),
+        ),
+    );
+    let mut runtime = wasmer_wasix::runtime::PluggableRuntime::new(task_manager);
+    runtime.set_engine(engine.clone());
+    let runtime: std::sync::Arc<dyn Runtime + Send + Sync> = std::sync::Arc::new(runtime);
+    let hashed_module = wasmer_wasix::runtime::module_cache::HashedModuleData::new(wasm.to_vec());
+    let module_hash = *hashed_module.hash();
+    let module = tokio_runtime
+        .block_on(runtime.load_hashed_module(hashed_module, Some(&engine)))
+        .map_err(|error| SandboxWasiError::Runtime {
+            detail: format!("compile WASIX module: {error}"),
+        })?;
     validate_wasix_current_dir(&request.cwd, &options.preopened_dirs)?;
     let mut runner = wasmer_wasix::runners::wasi::WasiRunner::new();
     runner.with_capabilities(sandbox_wasix_capabilities());
@@ -102,14 +124,6 @@ pub(crate) fn run_wasix_module(
     ));
     runner.with_envs(env.clone());
     runner.with_current_dir(request.cwd.as_str());
-    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_time()
-        .build()
-        .map_err(|error| SandboxWasiError::Runtime {
-            detail: format!("create WASIX host-fs runtime: {error}"),
-        })?;
-    let tokio_enter = tokio_runtime.enter();
     let runtime_mounts = configure_wasix_mapped_directories(
         &mut runner,
         &request.argv,
@@ -150,10 +164,10 @@ pub(crate) fn run_wasix_module(
 
     let run_result = run_wasix_process_tree(
         &runner,
-        RuntimeOrEngine::Engine(engine),
+        RuntimeOrEngine::Runtime(runtime),
         program_name,
         module,
-        wasmer_types::ModuleHash::xxhash(wasm),
+        module_hash,
         options.memory_limit_bytes,
         request.timeout_ms,
         options.cancellation.clone(),

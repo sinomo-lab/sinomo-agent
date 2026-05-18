@@ -168,7 +168,7 @@ impl BinFactory {
         {
             let cache = self.local.read().unwrap();
             if let Some(data) = cache.get(&name) {
-                data.clone().map(Executable::BinaryPackage);
+                return data.clone().map(Executable::BinaryPackage);
             }
         }
 
@@ -237,6 +237,12 @@ fn apply_sinomo_command_metadata(name: &str, env: &WasiEnv) {
 
     let mut args = env.state.args.lock().unwrap();
     if args.is_empty() {
+        return;
+    }
+    if args
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "-cc1" | "-cc1as"))
+    {
         return;
     }
     if args

@@ -178,11 +178,7 @@ impl LocalStagedSandboxCommandRunner {
             let limits =
                 effective_sandbox_command_limits(&manifest.limits, &command.default_limits);
             sandbox_fs.validate_resource_limits(&limits)?;
-            let timeout_ms = if timeout_ms == 0 {
-                limits.wall_time_ms
-            } else {
-                timeout_ms.min(limits.wall_time_ms)
-            };
+            let timeout_ms = effective_sandbox_timeout_ms(timeout_ms, limits.wall_time_ms);
             let effective_cwd = step.cwd.clone().unwrap_or_else(|| manifest.cwd.clone());
             let working_directory_host_path = host_path_for_process_plan_cwd(
                 &sandbox_fs,
@@ -263,7 +259,7 @@ impl LocalStagedSandboxCommandRunner {
                 wasi_options.allow_preview1_pinned_subprocesses =
                     prepared.allow_preview1_pinned_subprocesses;
                 wasi_options.wasix_pinned_child_exec_only = prepared.wasix_pinned_child_exec_only;
-                wasi_options.wasix_instruction_metering = true;
+                wasi_options.wasix_instruction_metering = false;
                 wasi_options.wasix_command_overrides = wasix_command_overrides;
                 wasi_options.wasix_stdin_pipe = stdin_pipe;
                 wasi_options.wasix_stdout_pipe = stdout_pipe;

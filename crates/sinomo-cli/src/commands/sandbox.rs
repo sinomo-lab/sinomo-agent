@@ -503,13 +503,10 @@ pub(crate) fn parse_sandbox_policy_set_options(
             }
             "--max-memory-mb" => {
                 index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.max_memory_mb =
-                    Some(value.parse::<u64>().map_err(|source| CliError::Parse {
-                        detail: format!("invalid sandbox max memory `{value}`: {source}"),
-                    })?);
+                options.max_memory_mb = Some(parse_sandbox_memory_policy_value(
+                    args.get(index),
+                    "max memory",
+                )?);
             }
             "--max-wall-time-ms" => {
                 index += 1;
@@ -645,9 +642,22 @@ fn parse_u64_sandbox_policy_value(value: Option<&String>, name: &str) -> Result<
     let Some(value) = value else {
         return Err(CliError::Usage);
     };
+    if value == "unlimited" {
+        return Ok(u64::MAX);
+    }
     value.parse::<u64>().map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox {name} `{value}`: {source}"),
     })
+}
+
+fn parse_sandbox_memory_policy_value(value: Option<&String>, name: &str) -> Result<u64, CliError> {
+    let Some(value) = value else {
+        return Err(CliError::Usage);
+    };
+    if matches!(value.as_str(), "host" | "available" | "all") {
+        return Ok(sinomo_runtime::sandbox::SandboxResourceLimits::default().memory_mb);
+    }
+    parse_u64_sandbox_policy_value(Some(value), name)
 }
 
 fn parse_nonzero_u64_sandbox_cli_value(
@@ -2865,7 +2875,10 @@ fn print_sandbox_policy_config(
         println!("  {host}");
     }
     println!("max memory mb: {}", policy.max_limits.memory_mb);
-    println!("max wall time ms: {}", policy.max_limits.wall_time_ms);
+    println!(
+        "max wall time ms: {}",
+        format_sandbox_wall_time_ms(policy.max_limits.wall_time_ms)
+    );
     println!("max input bytes: {}", policy.max_limits.max_input_bytes);
     println!("max output bytes: {}", policy.max_limits.max_output_bytes);
     println!(
@@ -2886,6 +2899,14 @@ fn print_sandbox_policy_config(
         "max concurrent sandboxes per node: {}",
         policy.max_concurrent_sandboxes_per_node
     );
+}
+
+fn format_sandbox_wall_time_ms(value: u64) -> String {
+    if value == sinomo_runtime::sandbox::SANDBOX_UNLIMITED_WALL_TIME_MS {
+        "unlimited".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 pub(crate) fn sandbox_toolchain_add_command(
@@ -4721,12 +4742,7 @@ fn load_sandbox_toolchain_package(
             command.default_limits.clone(),
         )?;
         if let Some(exec_name) = &command.exec_name {
-            sinomo_runtime::sandbox::SandboxToolchainCommand::new(
-                &spec.toolchain_id,
-                exec_name,
-                &module_bytes,
-                command.default_limits.clone(),
-            )?;
+            validate_sandbox_toolchain_package_exec_name(&command.name, exec_name)?;
         }
         for (index, arg) in command.argv_prefix.iter().enumerate() {
             if arg.contains('\0') {
@@ -4807,6 +4823,64 @@ fn load_sandbox_toolchain_package(
         commands,
         artifacts,
     })
+}
+
+fn validate_sandbox_toolchain_package_exec_name(
+    command_name: &str,
+    exec_name: &str,
+) -> Result<(), CliError> {
+    if exec_name.is_empty() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "sandbox toolchain package command `{command_name}` exec_name must be non-empty"
+            ),
+        });
+    }
+    if exec_name.contains('\0') {
+        return Err(CliError::Parse {
+            detail: format!(
+                "sandbox toolchain package command `{command_name}` exec_name contains an embedded NUL byte"
+            ),
+        });
+    }
+    if let Some(path) = exec_name.strip_prefix('/') {
+        let mut parts = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return Err(CliError::Parse {
+                            detail: format!(
+                                "sandbox toolchain package command `{command_name}` exec_name escapes the sandbox root"
+                            ),
+                        });
+                    }
+                }
+                part => parts.push(part),
+            }
+        }
+        if parts.is_empty() {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "sandbox toolchain package command `{command_name}` exec_name must name a file"
+                ),
+            });
+        }
+        return Ok(());
+    }
+    let toolchain_id =
+        sinomo_runtime::sandbox::SandboxToolchainId::from_legacy_named("exec_name_validation")
+            .map_err(|source| CliError::Parse {
+                detail: source.to_string(),
+            })?;
+    sinomo_runtime::sandbox::SandboxToolchainCommand::new(
+        &toolchain_id,
+        exec_name,
+        &[],
+        sinomo_runtime::sandbox::SandboxResourceLimits::default(),
+    )?;
+    Ok(())
 }
 
 fn read_sandbox_toolchain_package_spec(

@@ -535,11 +535,7 @@ impl LocalStagedSandboxCommandRunner {
             .validate_invocation(&manifest, &toolchain, command, execution_node_id)
             .map_err(SandboxCommandExecutionError::PolicyDenied)?;
         let limits = effective_sandbox_command_limits(&manifest.limits, &command.default_limits);
-        let timeout_ms = if timeout_ms == 0 {
-            limits.wall_time_ms
-        } else {
-            timeout_ms.min(limits.wall_time_ms)
-        };
+        let timeout_ms = effective_sandbox_timeout_ms(timeout_ms, limits.wall_time_ms);
         let wasm = toolchain_store.load_command_module(&toolchain, command_name)?;
         let argv = command.effective_argv(argv);
         let allow_preview1_pinned_subprocesses = command
@@ -550,7 +546,7 @@ impl LocalStagedSandboxCommandRunner {
             .required_capabilities
             .iter()
             .any(|capability| capability == SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY);
-        let wasix_instruction_metering = true;
+        let wasix_instruction_metering = false;
         let (_manifest, layout) = store.load(sandbox_id)?;
         let toolchain_artifacts = load_local_toolchain_artifacts(toolchain_store, &toolchain)?;
         let toolchain_commands = load_local_toolchain_commands(toolchain_store, &toolchain)?;

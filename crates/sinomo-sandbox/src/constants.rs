@@ -37,6 +37,9 @@ pub const TCC_TOOLCHAIN_COMMAND: &str = "tcc";
 pub const MAKE_TOOLCHAIN_RECIPE: &str =
     "crates/sinomo-sandbox/toolchains/build-tools/build-make-wasix.sh";
 pub const MAKE_TOOLCHAIN_COMMAND: &str = "make";
+pub const CLANG_TOOLCHAIN_RECIPE: &str =
+    "crates/sinomo-sandbox/toolchains/build-tools/build-clang-wasix.sh";
+pub const CLANG_TOOLCHAIN_COMMAND: &str = "clang";
 pub const SANDBOX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 pub const SANDBOX_WASIX_MAX_TASKS: usize = 64;
 pub const SANDBOX_NETWORK_HTTP_CAPABILITY: &str = "network.http";
@@ -108,6 +111,12 @@ pub const SANDBOX_RICH_TOOLCHAIN_TARGETS: &[SandboxRichToolchainTarget] = &[
         recipe: Some(MAKE_TOOLCHAIN_RECIPE),
         status: SandboxRichToolchainStatus::Implemented,
         note: "GNU Make has a maintained WASIX build recipe and passes the combined local plus daemon-local SIFS verify-build-tools gate for Makefile parsing, dependency ordering, failure status, and recipe execution through pinned sandbox commands",
+    },
+    SandboxRichToolchainTarget {
+        command: CLANG_TOOLCHAIN_COMMAND,
+        recipe: Some(CLANG_TOOLCHAIN_RECIPE),
+        status: SandboxRichToolchainStatus::Required,
+        note: "Clang/LLVM is the maintained compiler target for the coding sandbox. The recipe builds LLVM's Clang, LLD, and binutils-style helpers as WASIX command modules and packages the shared sysroot/resource artifacts; the heavyweight verifier is opt-in with VERIFY_CLANG=1 until the full LLVM build is part of the default gate",
     },
 ];
 

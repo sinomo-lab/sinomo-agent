@@ -1,4 +1,4 @@
-use crate::{SandboxCancellation, SandboxWasiError};
+use crate::{SANDBOX_UNLIMITED_WALL_TIME_MS, SandboxCancellation, SandboxWasiError};
 use std::{
     sync::{
         Arc, Condvar, Mutex,
@@ -31,13 +31,15 @@ impl WasixProcessBudgetGuard {
         let done_signal = Arc::new((Mutex::new(false), Condvar::new()));
         let termination_reason = Arc::new(AtomicU8::new(WASIX_TERMINATION_RUNNING));
 
-        spawn_timeout_guard(
-            timeout_ms,
-            Arc::clone(&done),
-            Arc::clone(&done_signal),
-            Arc::clone(&termination_reason),
-            process.clone(),
-        );
+        if timeout_ms != SANDBOX_UNLIMITED_WALL_TIME_MS {
+            spawn_timeout_guard(
+                timeout_ms,
+                Arc::clone(&done),
+                Arc::clone(&done_signal),
+                Arc::clone(&termination_reason),
+                process.clone(),
+            );
+        }
         spawn_cancellation_guard(
             cancellation,
             Arc::clone(&done),
@@ -220,6 +222,9 @@ where
 }
 
 fn host_wall_deadline(timeout_ms: u64) -> Option<Instant> {
+    if timeout_ms == SANDBOX_UNLIMITED_WALL_TIME_MS {
+        return None;
+    }
     Instant::now().checked_add(Duration::from_millis(timeout_ms))
 }
 

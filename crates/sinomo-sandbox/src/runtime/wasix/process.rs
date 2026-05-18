@@ -41,6 +41,12 @@ pub(super) fn run_wasix_process_tree(
     let env = builder.build().map_err(|error| SandboxWasiError::Runtime {
         detail: format!("build WASIX environment: {error}"),
     })?;
+    env.process
+        .set_executable_path(if program_name.contains('/') {
+            program_name.to_string()
+        } else {
+            format!("/bin/{program_name}")
+        });
     let runtime = env.runtime.clone();
     let tasks = runtime.task_manager().clone();
     let process = env.process.clone();
@@ -137,6 +143,9 @@ pub(super) fn wasix_exit_status(
 }
 
 pub(crate) fn wasix_command_exceeded_requested_timeout(elapsed: Duration, timeout_ms: u64) -> bool {
+    if timeout_ms == crate::SANDBOX_UNLIMITED_WALL_TIME_MS {
+        return false;
+    }
     elapsed >= Duration::from_millis(timeout_ms)
 }
 

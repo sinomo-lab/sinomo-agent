@@ -2,10 +2,11 @@ use super::extensions::add_sinomo_sandbox_wasi_extensions;
 use super::output::spawn_output_watcher;
 use super::state::LocalWasiState;
 use crate::{
-    LocalWasiVirtualDeviceDir, SandboxCommandId, SandboxCommandRequest, SandboxCommandResponse,
-    SandboxLocalCommandOutcome, SandboxMountMode, SandboxOutputStream, SandboxPath,
-    SandboxResourceUsage, SandboxWasiError, SandboxWasiRunOptions, sandbox_command_stderr_path,
-    sandbox_command_stdout_path, sandbox_output_chunks, validate_wasi_request,
+    LocalWasiVirtualDeviceDir, SANDBOX_UNLIMITED_WALL_TIME_MS, SandboxCommandId,
+    SandboxCommandRequest, SandboxCommandResponse, SandboxLocalCommandOutcome, SandboxMountMode,
+    SandboxOutputStream, SandboxPath, SandboxResourceUsage, SandboxWasiError,
+    SandboxWasiRunOptions, sandbox_command_stderr_path, sandbox_command_stdout_path,
+    sandbox_output_chunks, validate_wasi_request,
 };
 use std::sync::{
     Arc,
@@ -483,7 +484,7 @@ fn spawn_epoch_watcher(
                 engine.increment_epoch();
                 return;
             }
-            if started.elapsed() >= timeout {
+            if timeout_ms != SANDBOX_UNLIMITED_WALL_TIME_MS && started.elapsed() >= timeout {
                 timed_out.store(true, Ordering::SeqCst);
                 engine.increment_epoch();
                 return;

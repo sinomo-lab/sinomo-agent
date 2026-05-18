@@ -116,10 +116,7 @@ impl Default for SandboxPolicy {
             max_concurrent_commands_per_sandbox:
                 default_sandbox_max_concurrent_commands_per_sandbox(),
             max_concurrent_sandboxes_per_node: default_sandbox_max_concurrent_sandboxes_per_node(),
-            max_limits: SandboxResourceLimits {
-                memory_mb: 4096,
-                ..SandboxResourceLimits::default()
-            },
+            max_limits: SandboxResourceLimits::default(),
         }
     }
 }
@@ -338,6 +335,7 @@ impl SandboxPolicy {
     ) -> Result<(), SandboxPolicyDenial> {
         if sandbox_command_requires_child_process_substrate(&command.name)
             && !sandbox_runtime_supports_child_processes_for_abi(target_abi)
+            && !command_satisfies_preview1_pinned_subprocess_mode(command, target_abi)
         {
             return Err(SandboxPolicyDenial::new(
                 "command-capability-unsupported",
@@ -652,6 +650,17 @@ impl SandboxPolicy {
     }
 }
 
+fn command_satisfies_preview1_pinned_subprocess_mode(
+    command: &SandboxToolchainCommand,
+    target_abi: &SandboxWasiAbi,
+) -> bool {
+    matches!(target_abi, SandboxWasiAbi::Preview1)
+        && command
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SandboxClusterPolicyConfig {
     pub policy: SandboxPolicy,
@@ -828,6 +837,16 @@ pub fn effective_sandbox_command_limits(
         max_file_count: sandbox_limits
             .max_file_count
             .min(command_limits.max_file_count),
+    }
+}
+
+pub fn effective_sandbox_timeout_ms(requested_timeout_ms: u64, limit_timeout_ms: u64) -> u64 {
+    if requested_timeout_ms == 0 {
+        limit_timeout_ms
+    } else if limit_timeout_ms == SANDBOX_UNLIMITED_WALL_TIME_MS {
+        requested_timeout_ms
+    } else {
+        requested_timeout_ms.min(limit_timeout_ms)
     }
 }
 

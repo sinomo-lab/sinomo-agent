@@ -48,12 +48,25 @@ pub fn proc_exec3<M: MemorySize>(
         warn!("failed to execve as the name could not be read - {}", err);
         WasiError::Exit(Errno::Inval.into())
     })?;
+    let reexec_current_executable = name.is_empty();
+    if name.is_empty()
+        && let Some(current_executable) = ctx.data().process.executable_path()
+    {
+        name = current_executable;
+    }
     Span::current().record("name", name.as_str());
     let args = args.read_utf8_string(&memory, args_len).map_err(|err| {
         warn!("failed to execve as the args could not be read - {}", err);
         WasiError::Exit(Errno::Inval.into())
     })?;
-    let args = parse_wasix_line_encoded_strings(&args);
+    let mut args = parse_wasix_line_encoded_strings(&args);
+    if reexec_current_executable
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-cc1" | "-cc1as"))
+    {
+        args.insert(0, name.clone());
+    }
 
     let envs = if !envs.is_null() {
         let envs = envs.read_utf8_string(&memory, envs_len).map_err(|err| {

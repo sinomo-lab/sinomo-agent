@@ -23,8 +23,8 @@ incremental = false
 opt-level = 2
 
 [patch.crates-io]
-wasmer-compiler = { path = "crates/sinomo-sandbox/vendor/wasmer-compiler-7.0.0-alpha.2" }
-wasmer-wasix = { path = "crates/sinomo-sandbox/vendor/wasmer-wasix-0.700.0-alpha.2" }
+wasmer-compiler = { path = "crates/sinomo-sandbox/vendor/wasmer-compiler" }
+wasmer-wasix = { path = "crates/sinomo-sandbox/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
 blake3 = "1.5"

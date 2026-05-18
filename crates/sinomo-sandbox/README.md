@@ -381,6 +381,13 @@ packages should declare both `max_input_bytes` and `max_output_bytes` in each
 command's `default_limits`; older manifests without `max_input_bytes` load with
 the default input budget for compatibility.
 
+The default sandbox policy allows a sandbox to use the host's physical memory
+budget and does not impose a wall-time limit. Operators can still set explicit
+cluster policy ceilings with `sinomo sandbox policy set --max-memory-mb ...`
+and `--max-wall-time-ms ...`; `--max-memory-mb host` resets memory to the
+current host-memory default and `--max-wall-time-ms unlimited` restores the
+unlimited wall-time default.
+
 The daemon records durable events for lifecycle and config updates, mount
 decisions, policy denials, resource exhaustion, toolchain updates, command
 start/output/completion, and mediated HTTP exchanges. Config update events
@@ -493,6 +500,10 @@ variable names for the effective invocation.
   and explicit unsupported `-run` execution. GNU Make has a real WASIX build
   recipe and a `verify-make` workflow suite for Makefile parsing, dependency
   ordering, failed recipe status, and recipe execution through pinned sandbox
-  commands. The combined build-tools verifier covers both packages, so `make`
-  and `tcc` are implemented richer toolchain targets subject to their
-  documented WASIX limits and cluster policy.
+  commands. Clang/LLVM now has a pinned LLVM 21.1.6 WASIX package recipe that
+  builds the Clang driver, LLD, and LLVM helper tools as sandbox command
+  modules and packages the shared sysroot/resource artifacts; its verifier is
+  opt-in because a full LLVM build is heavyweight. The combined build-tools
+  verifier covers Make and TCC by default and can include Clang with
+  `VERIFY_CLANG=1`, so these build tools are richer toolchain targets subject
+  to their documented WASIX limits and cluster policy.

@@ -13,6 +13,8 @@ MAKE_WORKDIR="${MAKE_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-make-wasi
 MAKE_OUTDIR="${MAKE_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-make-wasix-out"}"
 TCC_WORKDIR="${TCC_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-tcc-wasix-work"}"
 TCC_OUTDIR="${TCC_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-tcc-wasix-out"}"
+CLANG_WORKDIR="${CLANG_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-clang-wasix-work"}"
+CLANG_OUTDIR="${CLANG_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-clang-wasix-out"}"
 if [ -z "${SINOMO_VERIFY_DATA_DIR+x}" ]; then
     SINOMO_VERIFY_DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sinomo-build-tools-wasix-verify.XXXXXX")"
     SINOMO_VERIFY_DATA_DIR_AUTO=1
@@ -24,6 +26,7 @@ TOOLCHAIN_ID="${TOOLCHAIN_ID:-086wdctfpphb26n9k2cg751qqs}"
 VERIFY_BACKEND="${VERIFY_BACKEND:-local}"
 UPDATE_CLUSTER_POLICY="${UPDATE_CLUSTER_POLICY:-0}"
 KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
+VERIFY_CLANG="${VERIFY_CLANG:-0}"
 DAEMON_PORT="${DAEMON_PORT:-21456}"
 DAEMON_STARTED=0
 RUN_ENV=()
@@ -76,6 +79,12 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo "building TinyCC WASIX package"
     WORKDIR="${TCC_WORKDIR}" OUTDIR="${TCC_OUTDIR}" \
         "${ROOT}/build-tcc-wasix.sh"
+
+    if [ "${VERIFY_CLANG}" = "1" ]; then
+        echo "building Clang/LLVM WASIX package"
+        WORKDIR="${CLANG_WORKDIR}" OUTDIR="${CLANG_OUTDIR}" \
+            "${ROOT}/build-clang-wasix.sh"
+    fi
 fi
 
 for manifest in \
@@ -89,12 +98,19 @@ do
         exit 1
     fi
 done
+if [ "${VERIFY_CLANG}" = "1" ] && [ ! -f "${CLANG_OUTDIR}/package.json" ]; then
+    echo "build-tools verifier package manifest missing: ${CLANG_OUTDIR}/package.json; rerun without SKIP_BUILD=1" >&2
+    exit 1
+fi
 
 echo "verifying package manifests"
 "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BUSYBOX_OUTDIR}/package.json"
 "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BASH_OUTDIR}/package.json"
 "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${MAKE_OUTDIR}/package.json"
 "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${TCC_OUTDIR}/package.json"
+if [ "${VERIFY_CLANG}" = "1" ]; then
+    "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${CLANG_OUTDIR}/package.json"
+fi
 
 if [ "${VERIFY_BACKEND}" = "daemon-local" ]; then
     echo "using disposable daemon SINOMO_DATA_DIR=${SINOMO_VERIFY_DATA_DIR} port=${DAEMON_PORT}"
@@ -130,6 +146,7 @@ if [ "${UPDATE_CLUSTER_POLICY}" = "1" ]; then
         --allow-toolchain-provenance-prefix "Sinomo Bash WASIX recipe:" \
         --allow-toolchain-provenance-prefix "Sinomo GNU Make WASIX recipe:" \
         --allow-toolchain-provenance-prefix "Sinomo TinyCC WASIX recipe:" \
+        --allow-toolchain-provenance-prefix "Sinomo Clang/LLVM WASIX recipe:" \
         --allow-package-cache-prefix /services/sandbox/toolchains >/dev/null
 fi
 
@@ -158,6 +175,11 @@ env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${IMPORT_ARGS[@]}" \
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${IMPORT_ARGS[@]}" \
     --into "${TOOLCHAIN_ID}" \
     "${TCC_OUTDIR}/package.json"
+if [ "${VERIFY_CLANG}" = "1" ]; then
+    env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${IMPORT_ARGS[@]}" \
+        --into "${TOOLCHAIN_ID}" \
+        "${CLANG_OUTDIR}/package.json"
+fi
 
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${CREATE_ARGS[@]}"
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${VERIFY_ARGS[@]}"

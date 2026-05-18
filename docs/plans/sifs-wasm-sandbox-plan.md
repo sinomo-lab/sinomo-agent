@@ -2506,9 +2506,15 @@ matplotlib Agg rendering to a PNG under `/work`. The
   parsing, variable expansion, dependency ordering, failed recipe status, and
   recipe command execution through pinned sandbox `sh`/BusyBox commands. The
   combined `verify-build-tools-wasix.sh` gate builds and verifies both
-  build-tool packages. Make is subject to the current WASIX shell/process
-  limits and cluster policy, while TinyCC currently compiles x86_64 object
-  artifacts and does not execute compiled programs inside the sandbox.
+  build-tool packages. Clang/LLVM now has a pinned LLVM 21.1.6 WASIX package
+  recipe that cross-builds Clang, LLD, `llvm-ar`, `llvm-ranlib`, and `llvm-nm`
+  as real sandbox command modules and packages the same WASIX
+  sysroot/resource artifacts used by host-side Sinomo module recipes; the full
+  Clang verifier is opt-in with `VERIFY_CLANG=1` because building LLVM is
+  materially larger than the default build-tools gate. Make is subject to the current WASIX
+  shell/process limits and cluster policy, while TinyCC currently compiles
+  x86_64 object artifacts and does not execute compiled programs inside the
+  sandbox.
   `sandbox doctor` reports implemented targets when missing from the pinned
   toolchain, reports required targets as errors, and reports planned targets as
   readiness information instead of pretending they are available.

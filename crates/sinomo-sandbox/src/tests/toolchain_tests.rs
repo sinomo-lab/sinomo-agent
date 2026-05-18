@@ -682,20 +682,20 @@ fn required_bash_python_pip_and_make_fidelity_cases_are_declared() {
             .iter()
             .any(|case| case.name == "pip-wheel-local-pure-package"
                 && !case.setup_files.is_empty()
-                && case.timeout_ms() > SandboxResourceLimits::default().wall_time_ms)
+                && case.timeout_ms() > 30_000)
     );
     assert!(
         PIP_TOOLCHAIN_FIDELITY_CASES
             .iter()
             .any(|case| case.name == "pip-install-local-pure-package"
                 && case.setup_files.is_empty()
-                && case.timeout_ms() > SandboxResourceLimits::default().wall_time_ms)
+                && case.timeout_ms() > 30_000)
     );
     assert!(PIP_TOOLCHAIN_FIDELITY_CASES.iter().any(|case| case.name
         == "pip-install-local-simple-index"
         && case.command == PIP_TOOLCHAIN_COMMAND
         && !case.setup_files.is_empty()
-        && case.timeout_ms() > SandboxResourceLimits::default().wall_time_ms));
+        && case.timeout_ms() > 30_000));
     assert!(PIP_TOOLCHAIN_FIDELITY_CASES.iter().any(|case| case.name
         == "python-import-simple-index-installed-package"
         && case.expected_stdout == Some("installed package\n")));

@@ -188,6 +188,10 @@ fn wasix_timeout_classifier_marks_late_completion_as_timed_out() {
         Duration::from_millis(9),
         10
     ));
+    assert!(!super::wasix_command_exceeded_requested_timeout(
+        Duration::from_secs(3600),
+        crate::SANDBOX_UNLIMITED_WALL_TIME_MS
+    ));
 }
 
 #[test]
