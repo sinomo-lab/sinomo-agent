@@ -21,6 +21,6 @@ WORKDIR /src/sinomo-busybox-wasi
 
 COPY build-busybox-wasi.sh ./build-busybox-wasi.sh
 COPY busybox-wasi.fragment ./busybox-wasi.fragment
-COPY wasi-compat ./wasi-compat
+COPY patches ./patches
 
 ENTRYPOINT ["./build-busybox-wasi.sh"]

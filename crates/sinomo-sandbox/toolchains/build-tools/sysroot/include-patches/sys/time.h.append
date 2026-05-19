@@ -1,0 +1,8 @@
+#ifndef SINOMO_WASIX_SYS_TIME_EXTENSIONS
+#define SINOMO_WASIX_SYS_TIME_EXTENSIONS 1
+
+struct timezone;
+
+int settimeofday(const struct timeval *tv, const struct timezone *tz);
+
+#endif

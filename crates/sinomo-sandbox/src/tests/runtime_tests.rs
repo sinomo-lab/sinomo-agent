@@ -1427,7 +1427,7 @@ fn wasix_runner_exposes_core_process_and_thread_compat_imports() {
           (import "wasix_32v1" "dup3"
             (func $dup3 (param i32 i32 i32) (result i32)))
           (import "wasix_32v1" "chdir"
-            (func $chdir (param i32) (result i32)))
+            (func $chdir (param i32 i32) (result i32)))
           (import "wasix_32v1" "proc_chdir"
             (func $proc_chdir (param i32 i32) (result i32)))
           (import "wasix_32v1" "fchdir"
@@ -1511,7 +1511,7 @@ fn wasix_runner_exposes_core_process_and_thread_compat_imports() {
           (import "wasix_32v1" "tgkill"
             (func $tgkill (param i32 i32 i32) (result i32)))
           (import "wasix_32v1" "arch_prctl"
-            (func $arch_prctl (param i32 i64) (result i32)))
+            (func $arch_prctl (param i32 i32) (result i32)))
           (import "wasix_32v1" "membarrier"
             (func $membarrier (param i32 i32 i32) (result i32)))
           (import "wasix_32v1" "rseq"
@@ -2037,11 +2037,11 @@ fn wasix_runner_exposes_core_process_and_thread_compat_imports() {
               call $proc_exit
             end
             i32.const 4098
-            i64.const 305419896
+            i32.const 305419896
             call $arch_prctl
             call $exit_if_errno
             i32.const 4099
-            i64.const 368
+            i32.const 368
             call $arch_prctl
             call $exit_if_errno
             i32.const 368
@@ -2053,7 +2053,7 @@ fn wasix_runner_exposes_core_process_and_thread_compat_imports() {
               call $proc_exit
             end
             i32.const 57005
-            i64.const 0
+            i32.const 0
             call $arch_prctl
             i32.const 0
             i32.ge_s
@@ -2623,6 +2623,7 @@ fn wasix_runner_exposes_core_process_and_thread_compat_imports() {
             call $exit_if_errno
 
             i32.const 160
+            i32.const 1
             call $chdir
             call $exit_if_errno
 

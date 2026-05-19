@@ -40,11 +40,12 @@ pub fn proc_chdir<M: MemorySize>(
 pub fn chdir<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     path: WasmPtr<u8, M>,
+    path_len: M::Offset,
 ) -> Result<i32, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
 
     let memory = unsafe { ctx.data().memory_view(&ctx) };
-    let path = match path.read_utf8_string_with_nul(&memory) {
+    let path = match path.read_utf8_string(&memory, path_len) {
         Ok(path) => path,
         Err(err) => {
             warn!("failed to chdir as the path could not be read - {}", err);

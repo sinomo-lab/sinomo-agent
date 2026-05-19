@@ -1,0 +1,9 @@
+#ifndef SINOMO_WASIX_WAIT_EXTENSIONS
+#define SINOMO_WASIX_WAIT_EXTENSIONS 1
+
+#include <signal.h>
+#include <sys/types.h>
+
+int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
+
+#endif

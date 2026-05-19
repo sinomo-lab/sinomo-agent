@@ -173,6 +173,40 @@ The package goal depends on the real POSIX userspace goal. Required behavior inc
 
 Missing behavior should be implemented in the runtime, VFS, compiler, sysroot, or system library layer.
 
+## Makepkg Base Environment Gap
+
+The first `makepkg` target should bring up source-package workflows before trying to support every Arch packaging feature. Excluding compilers, the current sandbox already has a meaningful base: real WASIX Bash/`sh`, BusyBox applets for common file and text operations, GNU Make, Python/pip, and a Clang/LLVM package recipe. The current source declarations and package recipes expose BusyBox commands `awk cat chmod cp cmp date diff dirname echo env false find grep gzip head ln ls mkdir mv patch printf pwd rm rmdir sed sha256sum sort tail tar test touch true tr uname uniq wc`, Bash commands `bash sh`, GNU Make as `make`, Python as `python pip`, and Clang/LLVM commands `clang clang++ cc c++ wasm-ld ld.lld llvm-ar llvm-ranlib llvm-nm`. That is enough to start a smoke target such as a local `PKGBUILD` that uses a local source archive, runs `prepare()`, `build()`, and `package()`, and emits an uncompressed or gzip-compressed package archive.
+
+Upstream `makepkg.sh.in` declares its minimum external program set as `awk`, `bsdtar`/libarchive, `bzip2`, coreutils, `fakeroot`, `file`, findutils, gettext, `gpg`, `grep`, `gzip`, `sed`, `tput`/ncurses, and `xz`. The default `makepkg.conf` also assumes `curl`-based download agents, VCS client mappings, optional signing, optional stripping/debug helpers, multiple compression formats, and `INTEGRITY_CHECK=(ck)`. For Sinomo, those defaults should be narrowed in the first package until the corresponding real packages and policy paths exist.
+
+The remaining base-system gaps for real `makepkg` are:
+
+- `pacman`, `libalpm`, `repo-add`, `vercmp`, package database layout, package query, and dependency resolution under `/var/lib/pacman`;
+- installed `makepkg` support tree under `/usr/share/makepkg`, plus generated `/etc/makepkg.conf`, `/etc/makepkg.conf.d/*.conf`, `/etc/pacman.conf`, and `/etc/pacman.d/`;
+- `bsdtar`/libarchive, because upstream `makepkg` uses archive type detection and extraction through libarchive rather than plain BusyBox `tar`;
+- compression tools beyond the current BusyBox `gzip`: at minimum `bzip2`, `xz`, and `zstd`, with `lz4`, `lzip`, `lzop`, `lrzip`, and legacy `compress` either packaged or disabled through the sandbox makepkg config;
+- checksum commands for configured integrity modes: `cksum`, `md5sum`, `sha1sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum`, and `b2sum`; currently only `sha256sum` is documented as present in the BusyBox profile;
+- `file`, because `makepkg` uses MIME/type detection during source extraction and package tidy steps;
+- `gettext` runtime commands/libraries used by pacman scripts for messages;
+- `fakeroot` or an equivalent in-sandbox ownership virtualization path; even though agents have full permission inside the sandbox, `makepkg` expects fakeroot semantics while creating root-owned package metadata;
+- GnuPG/GPGME for source verification and optional signing, or a first milestone that runs with `--skippgpcheck` and `BUILDENV=(!sign)` while the signature stack is brought in;
+- mediated download commands, primarily `curl`, plus policy integration for `DLAGENTS`; direct ambient network access must remain denied;
+- VCS clients for VCS sources: `git` first, then `svn`, `hg`, `bzr`, and `fossil` as package coverage expands;
+- `strip`, `objcopy`, `readelf`, and `debugedit` if default `OPTIONS=(strip debug ...)` behavior is enabled; an early config can disable `strip`, `debug`, `lto`, and `autodeps` until the binutils/debug toolchain exists;
+- stronger base applet coverage than the current BusyBox profile: `install`, `readlink`, `realpath`, `basename`, `mktemp`, `du`, `stat`, `id`, `whoami`, `groups`, `getent`, `tee`, and `tput` are common enough that they should be packaged as real tools before broad PKGBUILD ingestion;
+- VFS support for package-manager metadata: stable mode bits, ownership/group metadata, symlinks, hardlinks, timestamps, directory iteration, atomic rename, file locking, and mtree-like manifest generation over SIFS-backed state;
+- process support for the shell scripts themselves: process substitution, pipelines, traps, background jobs, signal cleanup, child reaping, descriptor inheritance, and cancellation of subprocess trees.
+
+Recommended preparation order:
+
+1. Add the missing core utilities needed by makepkg scripts to the BusyBox WASIX package or to dedicated real-tool packages.
+2. Package pacman scripts and libmakepkg in a WASIX package with a sandbox-specific config that disables signing, fakeroot-dependent packaging, strip/debug, VCS, non-gzip compression, and download agents except `file::` sources.
+3. Add `libarchive`/`bsdtar`, `file`, `gettext`, `cksum`, and the missing checksum/compression commands.
+4. Implement an in-sandbox fakeroot-compatible ownership layer in the runtime/VFS instead of patching `makepkg` packaging logic.
+5. Add pacman/libalpm local database operations and a tiny SIFS-backed repository containing the base packages.
+6. Enable mediated `curl` downloads through `DLAGENTS`, then add GPG/GPGME and VCS clients.
+7. Re-enable strip/debug/autodeps after binutils and metadata fidelity are strong enough.
+
 ## Implementation Sequence
 
 1. Define the Sinomo package metadata extensions and SIFS repository layout.

@@ -6,25 +6,28 @@ WORKDIR="${WORKDIR:-${ROOT}/target/sinomo-busybox-verify-work}"
 OUTDIR="${OUTDIR:-${ROOT}/target/sinomo-busybox-verify-out}"
 DATA_DIR="${DATA_DIR:-${ROOT}/target/sinomo-busybox-verify-data}"
 VERSION_SUFFIX="${VERSION_SUFFIX:-verify}"
-PROVENANCE="${PROVENANCE:-Sinomo BusyBox WASIp1 recipe verification}"
+PROVENANCE="${PROVENANCE:-Sinomo BusyBox WASIX recipe verification}"
+TOOLCHAIN_ID="${TOOLCHAIN_ID:-086wdctfpphb26n9k2cg751qqs}"
 
 cd "${ROOT}"
 
+chmod -R u+w "${WORKDIR}" "${OUTDIR}" "${DATA_DIR}" 2>/dev/null || true
 rm -rf "${WORKDIR}" "${OUTDIR}" "${DATA_DIR}"
 mkdir -p "${WORKDIR}" "${OUTDIR}" "${DATA_DIR}"
 
 WORKDIR="${WORKDIR}" OUTDIR="${OUTDIR}" "${ROOT}/crates/sinomo-sandbox/toolchains/busybox/build-busybox-wasi.sh"
 
-WASM="${OUTDIR}/busybox-1.36.1-wasip1.wasm"
+PACKAGE="${OUTDIR}/package.json"
 SINOMO_DATA_DIR="${DATA_DIR}" cargo run --quiet --bin sinomo -- \
-    sandbox toolchain import-busybox \
-    --version "busybox-1.36.1-wasip1-${VERSION_SUFFIX}" \
-    --provenance "${PROVENANCE}" \
-    "${WASM}"
+    sandbox toolchain verify-package \
+    "${PACKAGE}"
+SINOMO_DATA_DIR="${DATA_DIR}" cargo run --quiet --bin sinomo -- \
+    sandbox toolchain import-package \
+    "${PACKAGE}"
 
 SANDBOX_ID="$(
     SINOMO_DATA_DIR="${DATA_DIR}" cargo run --quiet --bin sinomo -- \
-        sandbox create --toolchain toolchain_busybox |
+        sandbox create --toolchain "${TOOLCHAIN_ID}" |
     awk '/^sandbox created:/ { print $3 }'
 )"
 

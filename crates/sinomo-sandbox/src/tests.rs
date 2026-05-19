@@ -16,6 +16,7 @@ mod event_tests;
 mod http_tests;
 mod instance_filesystem_tests;
 mod policy_tests;
+mod posixtestsuite_tests;
 mod runtime_tests;
 mod scheduler_tests;
 mod staged_runner_tests;

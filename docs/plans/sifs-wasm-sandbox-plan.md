@@ -51,7 +51,7 @@ Provide the genuine POSIX userspace needed to run package managers, package scri
 
 Status: implementation goal defined.
 
-Use the POSIX foundation to make `pacman` or a pacman-compatible package manager work inside the sandbox:
+Use the POSIX foundation to make `makepkg`, `pacman` or a pacman-compatible package manager work inside the sandbox:
 
 - local package database under the sandbox root;
 - repository sync, package download, dependency resolution, extraction, install/remove/upgrade/query, and script execution routed through Sinomo policy and the sandbox VFS;

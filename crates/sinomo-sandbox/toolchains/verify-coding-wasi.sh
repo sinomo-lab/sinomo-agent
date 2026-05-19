@@ -6,8 +6,6 @@ REPO_ROOT="$(cd "${ROOT}/../../.." && pwd)"
 TARGET_DIR="${TARGET_DIR:-"${REPO_ROOT}/target"}"
 BUSYBOX_WORKDIR="${BUSYBOX_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-busybox-work"}"
 BUSYBOX_OUTDIR="${BUSYBOX_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-busybox-out"}"
-BUSYBOX_WASIX_WORKDIR="${BUSYBOX_WASIX_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-busybox-wasix-work"}"
-BUSYBOX_WASIX_OUTDIR="${BUSYBOX_WASIX_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-busybox-wasix-out"}"
 QUICKJS_WORKDIR="${QUICKJS_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-quickjs-work"}"
 QUICKJS_OUTDIR="${QUICKJS_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-quickjs-out"}"
 BASH_WORKDIR="${BASH_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-bash-wasix-work"}"
@@ -41,7 +39,7 @@ if [ "${VERIFY_FULL}" = "1" ]; then
 fi
 SANDBOX_ID="${SANDBOX_ID:-01k4z8q5c00000000000000001}"
 SHELL_SANDBOX_ID="${SHELL_SANDBOX_ID:-01k4z8q5d00000000000000001}"
-BUSYBOX_VERSION="${BUSYBOX_VERSION:-busybox-1.36.1-wasip1-coding-verify}"
+BUSYBOX_VERSION="${BUSYBOX_VERSION:-busybox-1.36.1-wasix-coding-verify}"
 SHELL_TOOLCHAIN_ID="${SHELL_TOOLCHAIN_ID:-086wdctfpphb26n9k2cg751qqs}"
 KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
 
@@ -70,7 +68,7 @@ else
 fi
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-    echo "building BusyBox WASIp1 toolchain"
+    echo "building BusyBox WASIX package"
     WORKDIR="${BUSYBOX_WORKDIR}" OUTDIR="${BUSYBOX_OUTDIR}" \
         "${ROOT}/busybox/build-busybox-wasi.sh"
 
@@ -79,10 +77,6 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
         "${ROOT}/quickjs/build-qjs-wasi.sh"
 
     if [ "${VERIFY_FULL}" = "1" ]; then
-        echo "building BusyBox WASIX shell support package"
-        BUSYBOX_TARGET_ABI=wasix WORKDIR="${BUSYBOX_WASIX_WORKDIR}" OUTDIR="${BUSYBOX_WASIX_OUTDIR}" \
-            "${ROOT}/busybox/build-busybox-wasi.sh"
-
         echo "building Bash WASIX package"
         WORKDIR="${BASH_WORKDIR}" OUTDIR="${BASH_OUTDIR}" \
             "${ROOT}/bash/build-bash-wasix.sh"
@@ -101,11 +95,10 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     fi
 fi
 
-BUSYBOX_WASM="${BUSYBOX_OUTDIR}/busybox-1.36.1-wasip1.wasm"
-BUSYBOX_WASIX_PACKAGE="${BUSYBOX_WASIX_OUTDIR}/package.json"
+BUSYBOX_PACKAGE="${BUSYBOX_OUTDIR}/package.json"
 QUICKJS_PACKAGE="${QUICKJS_OUTDIR}/package.json"
-if [ ! -f "${BUSYBOX_WASM}" ]; then
-    echo "coding verifier BusyBox module missing: ${BUSYBOX_WASM}; rerun without SKIP_BUILD=1" >&2
+if [ ! -f "${BUSYBOX_PACKAGE}" ]; then
+    echo "coding verifier BusyBox package manifest missing: ${BUSYBOX_PACKAGE}; rerun without SKIP_BUILD=1" >&2
     exit 1
 fi
 if [ ! -f "${QUICKJS_PACKAGE}" ]; then
@@ -115,10 +108,6 @@ fi
 PYTHON_PACKAGE="${PYTHON_OUTDIR}/package.json"
 SHELL_PACKAGES=()
 if [ "${VERIFY_FULL}" = "1" ]; then
-    if [ ! -f "${BUSYBOX_WASIX_PACKAGE}" ]; then
-        echo "coding verifier BusyBox WASIX package manifest missing: ${BUSYBOX_WASIX_PACKAGE}; rerun without SKIP_BUILD=1" >&2
-        exit 1
-    fi
     SHELL_PACKAGES=(
         "${BASH_OUTDIR}/package.json"
         "${MAKE_OUTDIR}/package.json"
@@ -141,18 +130,18 @@ echo "verifying QuickJS package manifest"
 if [ "${VERIFY_FULL}" = "1" ]; then
     echo "verifying full coding package manifests"
     "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${PYTHON_PACKAGE}" >/dev/null
-    "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BUSYBOX_WASIX_PACKAGE}" >/dev/null
     for package in "${SHELL_PACKAGES[@]}"; do
         "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${package}" >/dev/null
     done
 fi
 
+echo "verifying BusyBox package manifest"
+"${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BUSYBOX_PACKAGE}" >/dev/null
+
 echo "using disposable SINOMO_DATA_DIR=${SINOMO_VERIFY_DATA_DIR}"
 SINOMO_DATA_DIR="${SINOMO_VERIFY_DATA_DIR}" "${SINOMO_CMD[@]}" \
-    sandbox toolchain import-busybox \
-    --version "${BUSYBOX_VERSION}" \
-    --provenance "Sinomo coding WASIp1 verifier: BusyBox plus QuickJS" \
-    "${BUSYBOX_WASM}"
+    sandbox toolchain import-package \
+    "${BUSYBOX_PACKAGE}"
 
 SINOMO_DATA_DIR="${SINOMO_VERIFY_DATA_DIR}" "${SINOMO_CMD[@]}" \
     sandbox toolchain import-package \
@@ -182,7 +171,7 @@ if [ "${VERIFY_FULL}" = "1" ]; then
     echo "using disposable shell SINOMO_DATA_DIR=${SINOMO_SHELL_VERIFY_DATA_DIR}"
     SINOMO_DATA_DIR="${SINOMO_SHELL_VERIFY_DATA_DIR}" "${SINOMO_CMD[@]}" \
         sandbox toolchain import-package \
-        "${BUSYBOX_WASIX_PACKAGE}"
+        "${BUSYBOX_PACKAGE}"
     for package in "${SHELL_PACKAGES[@]}"; do
         SINOMO_DATA_DIR="${SINOMO_SHELL_VERIFY_DATA_DIR}" "${SINOMO_CMD[@]}" \
             sandbox toolchain import-package \
