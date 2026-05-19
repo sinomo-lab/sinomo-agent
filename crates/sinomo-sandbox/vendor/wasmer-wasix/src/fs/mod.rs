@@ -1602,6 +1602,33 @@ impl WasiFs {
     }
 
     pub fn fdstat(&self, fd: WasiFd) -> Result<Fdstat, Errno> {
+        if fd != VIRTUAL_ROOT_FD && let Ok(fd_entry) = self.get_fd(fd) {
+            let guard = fd_entry.inode.read();
+            let deref = guard.deref();
+            return Ok(Fdstat {
+                fs_filetype: match deref {
+                    Kind::File { .. } => Filetype::RegularFile,
+                    Kind::Dir { .. } => Filetype::Directory,
+                    Kind::Symlink { .. } => Filetype::SymbolicLink,
+                    Kind::Socket { socket } => match &socket.inner.protected.read().unwrap().kind {
+                        InodeSocketKind::TcpStream { .. } => Filetype::SocketStream,
+                        InodeSocketKind::Raw { .. } => Filetype::SocketRaw,
+                        InodeSocketKind::PreSocket { props, .. } => match props.ty {
+                            Socktype::Stream => Filetype::SocketStream,
+                            Socktype::Dgram => Filetype::SocketDgram,
+                            Socktype::Raw => Filetype::SocketRaw,
+                            Socktype::Seqpacket => Filetype::SocketSeqpacket,
+                            _ => Filetype::Unknown,
+                        },
+                        _ => Filetype::Unknown,
+                    },
+                    _ => Filetype::Unknown,
+                },
+                fs_flags: fd_entry.inner.flags,
+                fs_rights_base: fd_entry.inner.rights,
+                fs_rights_inheriting: fd_entry.inner.rights_inheriting,
+            });
+        }
         match fd {
             __WASI_STDIN_FILENO => {
                 return Ok(Fdstat {
@@ -1638,33 +1665,7 @@ impl WasiFs {
             }
             _ => (),
         }
-        let fd = self.get_fd(fd)?;
-
-        let guard = fd.inode.read();
-        let deref = guard.deref();
-        Ok(Fdstat {
-            fs_filetype: match deref {
-                Kind::File { .. } => Filetype::RegularFile,
-                Kind::Dir { .. } => Filetype::Directory,
-                Kind::Symlink { .. } => Filetype::SymbolicLink,
-                Kind::Socket { socket } => match &socket.inner.protected.read().unwrap().kind {
-                    InodeSocketKind::TcpStream { .. } => Filetype::SocketStream,
-                    InodeSocketKind::Raw { .. } => Filetype::SocketRaw,
-                    InodeSocketKind::PreSocket { props, .. } => match props.ty {
-                        Socktype::Stream => Filetype::SocketStream,
-                        Socktype::Dgram => Filetype::SocketDgram,
-                        Socktype::Raw => Filetype::SocketRaw,
-                        Socktype::Seqpacket => Filetype::SocketSeqpacket,
-                        _ => Filetype::Unknown,
-                    },
-                    _ => Filetype::Unknown,
-                },
-                _ => Filetype::Unknown,
-            },
-            fs_flags: fd.inner.flags,
-            fs_rights_base: fd.inner.rights,
-            fs_rights_inheriting: fd.inner.rights_inheriting, // TODO(lachlan): Is this right?
-        })
+        Err(Errno::Badf)
     }
 
     pub fn prestat_fd(&self, fd: WasiFd) -> Result<Prestat, Errno> {

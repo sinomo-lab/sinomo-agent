@@ -952,7 +952,7 @@ fn sandbox_toolchain_busybox_plan_reports_known_mvp_gaps() {
     assert!(plan.contains("core applets:"));
     assert!(plan.contains("  grep\n"));
     assert!(plan.contains("fidelity cases:"));
-    assert!(plan.contains("awk-system-unsupported: awk"));
+    assert!(plan.contains("awk-system-spawn: awk"));
     assert!(plan.contains("known MVP gaps:"));
     assert!(plan.contains("  sh:"));
 }

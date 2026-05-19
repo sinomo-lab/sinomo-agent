@@ -130,6 +130,11 @@ impl WasiRunner {
         self
     }
 
+    pub fn with_sinomo_metadata_root(&mut self, dir: impl Into<PathBuf>) -> &mut Self {
+        self.wasi.sinomo_metadata_root = Some(dir.into());
+        self
+    }
+
     /// Add a package that should be available to the instance at runtime.
     pub fn with_injected_package(&mut self, pkg: BinaryPackage) -> &mut Self {
         self.wasi.injected_packages.push(pkg);
@@ -306,6 +311,9 @@ impl WasiRunner {
 
         if let Some(current_dir) = &self.wasi.current_dir {
             builder.set_current_dir(current_dir.clone());
+        }
+        if let Some(metadata_root) = &self.wasi.sinomo_metadata_root {
+            builder.set_sinomo_metadata_root(metadata_root.clone());
         }
 
         if let Some(cwd) = &wasi.cwd {

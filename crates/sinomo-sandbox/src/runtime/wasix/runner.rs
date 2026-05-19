@@ -137,6 +137,9 @@ fn run_wasix_module_on_worker_thread(
     }
     validate_wasix_current_dir(&request.cwd, &options.preopened_dirs)?;
     let mut runner = wasmer_wasix::runners::wasi::WasiRunner::new();
+    if let Some(metadata_host_path) = &options.metadata_host_path {
+        runner.with_sinomo_metadata_root(metadata_host_path.clone());
+    }
     runner.with_capabilities(sandbox_wasix_capabilities());
     runner.with_args(request.argv.iter().skip(1).cloned());
     let mut env = wasix_environment(

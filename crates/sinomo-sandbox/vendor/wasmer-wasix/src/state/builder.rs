@@ -70,6 +70,7 @@ pub struct WasiEnvBuilder {
     pub(super) engine: Option<Engine>,
     pub(super) runtime: Option<Arc<dyn crate::Runtime + Send + Sync + 'static>>,
     pub(super) current_dir: Option<PathBuf>,
+    pub(super) sinomo_metadata_root: Option<PathBuf>,
 
     /// List of webc dependencies to be injected.
     pub(super) uses: Vec<BinaryPackage>,
@@ -781,6 +782,11 @@ impl WasiEnvBuilder {
         self.skip_stdio_during_bootstrap = skip;
     }
 
+    pub fn set_sinomo_metadata_root(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+        self.sinomo_metadata_root = Some(path.into());
+        self
+    }
+
     /// Consumes the [`WasiEnvBuilder`] and produces a [`WasiEnvInit`], which
     /// can be used to construct a new [`WasiEnv`].
     ///
@@ -1013,6 +1019,7 @@ impl WasiEnvBuilder {
             #[cfg(feature = "journal")]
             stop_running_after_snapshot: self.stop_running_after_snapshot,
             skip_stdio_during_bootstrap: self.skip_stdio_during_bootstrap,
+            sinomo_metadata_root: self.sinomo_metadata_root,
         };
 
         Ok(init)

@@ -15,6 +15,7 @@ pub struct LocalSandboxInstanceLayout {
     pub logs: PathBuf,
     pub artifacts: PathBuf,
     pub mounts: PathBuf,
+    pub metadata: PathBuf,
 }
 
 impl LocalSandboxInstanceLayout {
@@ -32,11 +33,12 @@ impl LocalSandboxInstanceLayout {
             logs: root.join("logs"),
             artifacts: root.join("artifacts"),
             mounts: root.join("mounts"),
+            metadata: root.join("metadata"),
             root,
         }
     }
 
-    pub fn required_dirs(&self) -> [&PathBuf; 8] {
+    pub fn required_dirs(&self) -> [&PathBuf; 9] {
         [
             &self.root_dir,
             &self.home,
@@ -46,6 +48,7 @@ impl LocalSandboxInstanceLayout {
             &self.logs,
             &self.artifacts,
             &self.mounts,
+            &self.metadata,
         ]
     }
 

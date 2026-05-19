@@ -65,6 +65,7 @@ pub(crate) struct SandboxWasixPipeOptions {
 pub struct SandboxWasiRunOptions {
     pub preopened_dirs: Vec<SandboxWasiPreopen>,
     pub working_directory_host_path: Option<PathBuf>,
+    pub metadata_host_path: Option<PathBuf>,
     #[cfg(feature = "wasix-runtime")]
     pub wasix_stdin_pipe: Option<virtual_fs::ArcFile<virtual_fs::Pipe>>,
     #[cfg(feature = "wasix-runtime")]
@@ -94,6 +95,7 @@ impl fmt::Debug for SandboxWasiRunOptions {
                 "working_directory_host_path",
                 &self.working_directory_host_path,
             )
+            .field("metadata_host_path", &self.metadata_host_path)
             .field(
                 "wasix_stdin_pipe",
                 #[cfg(feature = "wasix-runtime")]
@@ -141,6 +143,7 @@ impl Default for SandboxWasiRunOptions {
         Self {
             preopened_dirs: Vec::new(),
             working_directory_host_path: None,
+            metadata_host_path: None,
             #[cfg(feature = "wasix-runtime")]
             wasix_stdin_pipe: None,
             #[cfg(feature = "wasix-runtime")]
@@ -200,6 +203,7 @@ pub fn local_staged_sandbox_wasi_options_with_limits_and_preopens(
     preopened_dirs.extend(extra_preopens);
     SandboxWasiRunOptions {
         preopened_dirs,
+        metadata_host_path: Some(layout.metadata.clone()),
         enable_virtual_devices: true,
         memory_limit_bytes: limits.memory_mb.saturating_mul(1024 * 1024) as usize,
         input_limit_bytes: limits.max_input_bytes as usize,

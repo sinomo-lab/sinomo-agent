@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -111,12 +112,84 @@ static gid_t sinomo_wasix_rgid = 0;
 static gid_t sinomo_wasix_egid = 0;
 static gid_t sinomo_wasix_sgid = 0;
 
-mode_t __sinomo_wasix_get_umask(void) {
-    return sinomo_wasix_umask;
+static int normalize_absolute_path(const char *path, char **normalized_out) {
+    size_t len = strlen(path);
+    char *normalized = malloc(len + 2);
+    if (normalized == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    size_t out_len = 0;
+    normalized[out_len++] = '/';
+    const char *cursor = path;
+    while (*cursor != '\0') {
+        while (*cursor == '/')
+            cursor++;
+        const char *component = cursor;
+        while (*cursor != '\0' && *cursor != '/')
+            cursor++;
+        size_t component_len = (size_t)(cursor - component);
+        if (component_len == 0 ||
+            (component_len == 1 && component[0] == '.')) {
+            continue;
+        }
+        if (component_len == 2 && component[0] == '.' && component[1] == '.') {
+            if (out_len > 1) {
+                out_len--;
+                while (out_len > 1 && normalized[out_len - 1] != '/')
+                    out_len--;
+            }
+            continue;
+        }
+        if (out_len > 1)
+            normalized[out_len++] = '/';
+        memcpy(normalized + out_len, component, component_len);
+        out_len += component_len;
+    }
+    normalized[out_len] = '\0';
+    *normalized_out = normalized;
+    return 0;
 }
 
-uid_t __sinomo_wasix_geteuid(void);
-gid_t __sinomo_wasix_getegid(void);
+static int absolute_path_from_cwd(const char *path, char **absolute_out) {
+    if (path[0] == '/')
+        return normalize_absolute_path(path, absolute_out);
+
+    size_t cwd_len = 128;
+    char *cwd = NULL;
+    for (;;) {
+        char *grown = realloc(cwd, cwd_len);
+        if (grown == NULL) {
+            free(cwd);
+            errno = ENOMEM;
+            return -1;
+        }
+        cwd = grown;
+        if (getcwd(cwd, cwd_len) != NULL)
+            break;
+        if (errno != ERANGE) {
+            free(cwd);
+            return -1;
+        }
+        cwd_len *= 2;
+    }
+
+    size_t path_len = strlen(path);
+    size_t joined_len = strlen(cwd) + 1 + path_len + 1;
+    char *joined = malloc(joined_len);
+    if (joined == NULL) {
+        free(cwd);
+        errno = ENOMEM;
+        return -1;
+    }
+    snprintf(joined, joined_len, "%s/%s", cwd, path);
+    free(cwd);
+
+    int result = normalize_absolute_path(joined, absolute_out);
+    free(joined);
+    return result;
+}
 
 int __wasilibc_find_relpath_alloc(
     const char *path,
@@ -126,47 +199,51 @@ int __wasilibc_find_relpath_alloc(
     int can_realloc
 ) {
     const char *local_abs = NULL;
+    const char *relative_const = NULL;
+    char *absolute = NULL;
     char *candidate = *relative;
     size_t candidate_len = *relative_len;
-    int fd;
 
     if (abs == NULL)
         abs = &local_abs;
+    if (absolute_path_from_cwd(path, &absolute) != 0)
+        return -1;
 
-    if (candidate_len == 0) {
-        candidate_len = strlen(path) + 1;
-        candidate = malloc(candidate_len);
-        if (candidate == NULL) {
-            errno = ENOMEM;
-            return -1;
-        }
+    int fd = __wasilibc_find_abspath(absolute, abs, &relative_const);
+    if (fd < 0) {
+        free(absolute);
+        return -1;
     }
 
-    for (;;) {
-        fd = __wasilibc_find_relpath(path, abs, &candidate, candidate_len);
-        if (fd >= 0) {
-            *relative = candidate;
-            *relative_len = candidate_len;
-            return fd;
-        }
-        if (errno != ERANGE) {
-            if (*relative == NULL && candidate != NULL)
-                free(candidate);
+    size_t needed = strlen(relative_const) + 1;
+    if (candidate_len < needed) {
+        if (!can_realloc) {
+            free(absolute);
+            errno = ERANGE;
             return -1;
         }
-        if (!can_realloc)
-            return -1;
-        candidate_len *= 2;
-        char *grown = realloc(candidate, candidate_len);
+        char *grown = realloc(candidate, needed);
         if (grown == NULL) {
-            if (*relative == NULL && candidate != NULL)
-                free(candidate);
+            free(absolute);
             errno = ENOMEM;
             return -1;
         }
         candidate = grown;
+        candidate_len = needed;
     }
+    memcpy(candidate, relative_const, needed);
+    free(absolute);
+    *relative = candidate;
+    *relative_len = candidate_len;
+    return fd;
 }
+
+mode_t __sinomo_wasix_get_umask(void) {
+    return sinomo_wasix_umask;
+}
+
+uid_t __sinomo_wasix_geteuid(void);
+gid_t __sinomo_wasix_getegid(void);
 
 static int find_relpath2(const char *path, char **relative, size_t *relative_len) {
     const char *abs;

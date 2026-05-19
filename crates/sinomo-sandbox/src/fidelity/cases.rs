@@ -78,11 +78,11 @@ pub const BUSYBOX_TOOLCHAIN_FIDELITY_CASES: &[SandboxBusyBoxFidelityCase] = &[
         expected_exit_status: 0,
     },
     SandboxBusyBoxFidelityCase {
-        name: "awk-system-unsupported",
+        name: "awk-system-spawn",
         command: "awk",
         argv: &["awk", "BEGIN { print system(\"echo nope\") }"],
         stdin: None,
-        expected_stdout: "-1\n",
+        expected_stdout: "0\n",
         expected_exit_status: 0,
     },
     SandboxBusyBoxFidelityCase {

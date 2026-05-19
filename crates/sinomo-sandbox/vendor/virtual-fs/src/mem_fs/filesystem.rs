@@ -593,7 +593,8 @@ impl crate::FileSystem for FileSystem {
                     let mut from_file = self.new_open_options().read(true).open(from)?;
                     let mut to_file = self
                         .new_open_options()
-                        .create_new(true)
+                        .create(true)
+                        .truncate(true)
                         .write(true)
                         .open(to)?;
                     tokio::io::copy(from_file.as_mut(), to_file.as_mut()).await?;

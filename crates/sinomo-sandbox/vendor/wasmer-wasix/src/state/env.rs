@@ -79,6 +79,7 @@ pub struct WasiEnvInit {
 
     /// Skip writes to stdout and stderr when bootstrapping from a journal
     pub skip_stdio_during_bootstrap: bool,
+    pub sinomo_metadata_root: Option<PathBuf>,
 }
 
 impl WasiEnvInit {
@@ -127,6 +128,7 @@ impl WasiEnvInit {
             #[cfg(feature = "journal")]
             stop_running_after_snapshot: self.stop_running_after_snapshot,
             skip_stdio_during_bootstrap: self.skip_stdio_during_bootstrap,
+            sinomo_metadata_root: self.sinomo_metadata_root.clone(),
         }
     }
 }
@@ -174,6 +176,7 @@ pub struct WasiEnv {
 
     /// Should stdio be skipped when bootstrapping this module from an existing journal?
     pub skip_stdio_during_bootstrap: bool,
+    pub sinomo_metadata_root: Option<PathBuf>,
 
     /// Flag that indicates the cleanup of the environment is to be disabled
     /// (this is normally used so that the instance can be reused later on)
@@ -219,6 +222,7 @@ impl Clone for WasiEnv {
             enable_exponential_cpu_backoff: self.enable_exponential_cpu_backoff,
             replaying_journal: self.replaying_journal,
             skip_stdio_during_bootstrap: self.skip_stdio_during_bootstrap,
+            sinomo_metadata_root: self.sinomo_metadata_root.clone(),
             disable_fs_cleanup: self.disable_fs_cleanup,
             context_switching_environment: None,
         }
@@ -269,6 +273,7 @@ impl WasiEnv {
             enable_exponential_cpu_backoff: self.enable_exponential_cpu_backoff,
             replaying_journal: false,
             skip_stdio_during_bootstrap: self.skip_stdio_during_bootstrap,
+            sinomo_metadata_root: self.sinomo_metadata_root.clone(),
             disable_fs_cleanup: self.disable_fs_cleanup,
             context_switching_environment: None,
         };
@@ -408,6 +413,7 @@ impl WasiEnv {
             enable_journal: false,
             replaying_journal: false,
             skip_stdio_during_bootstrap: init.skip_stdio_during_bootstrap,
+            sinomo_metadata_root: init.sinomo_metadata_root,
             enable_deep_sleep: init.capabilities.threading.enable_asynchronous_threading,
             enable_exponential_cpu_backoff: init
                 .capabilities

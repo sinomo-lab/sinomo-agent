@@ -47,6 +47,7 @@ pub(crate) struct CommonWasiOptions {
     pub(crate) stop_running_after_snapshot: bool,
     pub(crate) skip_stdio_during_bootstrap: bool,
     pub(crate) current_dir: Option<PathBuf>,
+    pub(crate) sinomo_metadata_root: Option<PathBuf>,
 }
 
 impl CommonWasiOptions {

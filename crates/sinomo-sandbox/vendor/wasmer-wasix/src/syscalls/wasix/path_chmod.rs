@@ -2,6 +2,7 @@ use super::*;
 use crate::syscalls::*;
 use crate::VIRTUAL_ROOT_FD;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,11 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::PermissionsExt;
 
 const AT_FDCWD_AS_WASI_FD: WasiFd = (-100i32) as WasiFd;
-const POSIX_MODE_SIDECAR: &str = "/work/.sinomo-posix-modes";
-const POSIX_OWNER_SIDECAR: &str = "/work/.sinomo-posix-owners";
-const POSIX_TIME_SIDECAR: &str = "/work/.sinomo-posix-times";
-const POSIX_SYMLINK_SIDECAR: &str = "/work/.sinomo-posix-symlinks";
-const POSIX_HARDLINK_SIDECAR: &str = "/work/.sinomo-posix-hardlinks";
+const POSIX_METADATA_DIR: &str = "posix";
+const POSIX_MODE_SIDECAR: &str = "modes";
+const POSIX_OWNER_SIDECAR: &str = "owners";
+const POSIX_TIME_SIDECAR: &str = "times";
+const POSIX_SYMLINK_SIDECAR: &str = "symlinks";
+const POSIX_HARDLINK_SIDECAR: &str = "hardlinks";
 const POSIX_ID_UNCHANGED: u32 = u32::MAX;
 static POSIX_MODE_OVERRIDES: LazyLock<Mutex<HashMap<u64, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -739,6 +741,17 @@ pub(crate) fn path_rename_symlink_at(
     let Some(target_key) = key_for_path_at(env, target_fd, target_path) else {
         return Errno::Noent;
     };
+    let Ok(source_metadata) = env
+        .state
+        .fs
+        .root_fs
+        .symlink_metadata(Path::new(&source_key))
+    else {
+        return Errno::Noent;
+    };
+    if !source_metadata.file_type().is_symlink() {
+        return Errno::Noent;
+    }
     if env
         .state
         .fs
@@ -1136,6 +1149,33 @@ fn current_time_ns() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn persistent_metadata_path(env: &WasiEnv, name: &str) -> Option<PathBuf> {
+    Some(env.sinomo_metadata_root.as_ref()?.join(POSIX_METADATA_DIR).join(name))
+}
+
+fn read_persistent_metadata(env: &WasiEnv, name: &str) -> Option<String> {
+    persistent_metadata_path(env, name).and_then(|path| fs::read_to_string(path).ok())
+}
+
+fn write_persistent_metadata(env: &WasiEnv, name: &str, data: &str) {
+    let Some(path) = persistent_metadata_path(env, name) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = fs::write(path, data);
+}
+
+fn remove_persistent_metadata(env: &WasiEnv, name: &str) {
+    let Some(path) = persistent_metadata_path(env, name) else {
+        return;
+    };
+    let _ = fs::remove_file(path);
+}
+
 fn persistent_mode(env: &WasiEnv, key: &str) -> Option<u32> {
     load_persistent_modes(env).get(key).copied()
 }
@@ -1196,22 +1236,9 @@ fn move_metadata_key(env: &WasiEnv, source: &str, target: &str) {
 }
 
 fn load_persistent_modes(env: &WasiEnv) -> HashMap<String, u32> {
-    let mut file = match env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .read(true)
-        .open(POSIX_MODE_SIDECAR)
-    {
-        Ok(file) => file,
-        Err(_) => return HashMap::new(),
-    };
-
-    let mut data = String::new();
-    if block_on(file.read_to_string(&mut data)).is_err() {
+    let Some(data) = read_persistent_metadata(env, POSIX_MODE_SIDECAR) else {
         return HashMap::new();
-    }
+    };
 
     let mut modes = HashMap::new();
     for line in data.lines() {
@@ -1228,7 +1255,7 @@ fn load_persistent_modes(env: &WasiEnv) -> HashMap<String, u32> {
 
 fn save_persistent_modes(env: &WasiEnv, modes: &HashMap<String, u32>) {
     if modes.is_empty() {
-        let _ = env.state.fs.root_fs.remove_file(Path::new(POSIX_MODE_SIDECAR));
+        remove_persistent_metadata(env, POSIX_MODE_SIDECAR);
         return;
     }
     let mut entries = modes.iter().collect::<Vec<_>>();
@@ -1238,19 +1265,7 @@ fn save_persistent_modes(env: &WasiEnv, modes: &HashMap<String, u32>) {
         data.push_str(&format!("{mode:04o}\t{path}\n"));
     }
 
-    let Ok(mut file) = env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(POSIX_MODE_SIDECAR)
-    else {
-        return;
-    };
-    let _ = block_on(file.write_all(data.as_bytes()));
+    write_persistent_metadata(env, POSIX_MODE_SIDECAR, &data);
 }
 
 fn persistent_owner(env: &WasiEnv, key: &str) -> Option<(u32, u32)> {
@@ -1273,22 +1288,9 @@ fn set_persistent_owner_for_key(env: &WasiEnv, key: &str, uid: u32, gid: u32) {
 }
 
 fn load_persistent_owners(env: &WasiEnv) -> HashMap<String, (u32, u32)> {
-    let mut file = match env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .read(true)
-        .open(POSIX_OWNER_SIDECAR)
-    {
-        Ok(file) => file,
-        Err(_) => return HashMap::new(),
-    };
-
-    let mut data = String::new();
-    if block_on(file.read_to_string(&mut data)).is_err() {
+    let Some(data) = read_persistent_metadata(env, POSIX_OWNER_SIDECAR) else {
         return HashMap::new();
-    }
+    };
 
     let mut owners = HashMap::new();
     for line in data.lines() {
@@ -1307,11 +1309,7 @@ fn load_persistent_owners(env: &WasiEnv) -> HashMap<String, (u32, u32)> {
 
 fn save_persistent_owners(env: &WasiEnv, owners: &HashMap<String, (u32, u32)>) {
     if owners.is_empty() {
-        let _ = env
-            .state
-            .fs
-            .root_fs
-            .remove_file(Path::new(POSIX_OWNER_SIDECAR));
+        remove_persistent_metadata(env, POSIX_OWNER_SIDECAR);
         return;
     }
     let mut entries = owners.iter().collect::<Vec<_>>();
@@ -1321,19 +1319,7 @@ fn save_persistent_owners(env: &WasiEnv, owners: &HashMap<String, (u32, u32)>) {
         data.push_str(&format!("{uid}\t{gid}\t{path}\n"));
     }
 
-    let Ok(mut file) = env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(POSIX_OWNER_SIDECAR)
-    else {
-        return;
-    };
-    let _ = block_on(file.write_all(data.as_bytes()));
+    write_persistent_metadata(env, POSIX_OWNER_SIDECAR, &data);
 }
 
 fn persistent_times(env: &WasiEnv, key: &str) -> Option<(u64, u64, u64)> {
@@ -1347,22 +1333,9 @@ fn set_persistent_times(env: &WasiEnv, key: &str, atime: u64, mtime: u64, ctime:
 }
 
 fn load_persistent_times(env: &WasiEnv) -> HashMap<String, (u64, u64, u64)> {
-    let mut file = match env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .read(true)
-        .open(POSIX_TIME_SIDECAR)
-    {
-        Ok(file) => file,
-        Err(_) => return HashMap::new(),
-    };
-
-    let mut data = String::new();
-    if block_on(file.read_to_string(&mut data)).is_err() {
+    let Some(data) = read_persistent_metadata(env, POSIX_TIME_SIDECAR) else {
         return HashMap::new();
-    }
+    };
 
     let mut times = HashMap::new();
     for line in data.lines() {
@@ -1386,7 +1359,7 @@ fn load_persistent_times(env: &WasiEnv) -> HashMap<String, (u64, u64, u64)> {
 
 fn save_persistent_times(env: &WasiEnv, times: &HashMap<String, (u64, u64, u64)>) {
     if times.is_empty() {
-        let _ = env.state.fs.root_fs.remove_file(Path::new(POSIX_TIME_SIDECAR));
+        remove_persistent_metadata(env, POSIX_TIME_SIDECAR);
         return;
     }
     let mut entries = times.iter().collect::<Vec<_>>();
@@ -1396,38 +1369,13 @@ fn save_persistent_times(env: &WasiEnv, times: &HashMap<String, (u64, u64, u64)>
         data.push_str(&format!("{atime}\t{mtime}\t{ctime}\t{path}\n"));
     }
 
-    let Ok(mut file) = env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(POSIX_TIME_SIDECAR)
-    else {
-        return;
-    };
-    let _ = block_on(file.write_all(data.as_bytes()));
+    write_persistent_metadata(env, POSIX_TIME_SIDECAR, &data);
 }
 
 fn load_persistent_symlinks(env: &WasiEnv) -> HashMap<String, String> {
-    let mut file = match env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .read(true)
-        .open(POSIX_SYMLINK_SIDECAR)
-    {
-        Ok(file) => file,
-        Err(_) => return HashMap::new(),
-    };
-
-    let mut data = String::new();
-    if block_on(file.read_to_string(&mut data)).is_err() {
+    let Some(data) = read_persistent_metadata(env, POSIX_SYMLINK_SIDECAR) else {
         return HashMap::new();
-    }
+    };
 
     let mut symlinks = HashMap::new();
     for line in data.lines() {
@@ -1441,11 +1389,7 @@ fn load_persistent_symlinks(env: &WasiEnv) -> HashMap<String, String> {
 
 fn save_persistent_symlinks(env: &WasiEnv, symlinks: &HashMap<String, String>) {
     if symlinks.is_empty() {
-        let _ = env
-            .state
-            .fs
-            .root_fs
-            .remove_file(Path::new(POSIX_SYMLINK_SIDECAR));
+        remove_persistent_metadata(env, POSIX_SYMLINK_SIDECAR);
         return;
     }
     let mut entries = symlinks.iter().collect::<Vec<_>>();
@@ -1458,38 +1402,13 @@ fn save_persistent_symlinks(env: &WasiEnv, symlinks: &HashMap<String, String>) {
         data.push('\n');
     }
 
-    let Ok(mut file) = env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(POSIX_SYMLINK_SIDECAR)
-    else {
-        return;
-    };
-    let _ = block_on(file.write_all(data.as_bytes()));
+    write_persistent_metadata(env, POSIX_SYMLINK_SIDECAR, &data);
 }
 
 fn load_persistent_hardlinks(env: &WasiEnv) -> HashMap<String, String> {
-    let mut file = match env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .read(true)
-        .open(POSIX_HARDLINK_SIDECAR)
-    {
-        Ok(file) => file,
-        Err(_) => return HashMap::new(),
-    };
-
-    let mut data = String::new();
-    if block_on(file.read_to_string(&mut data)).is_err() {
+    let Some(data) = read_persistent_metadata(env, POSIX_HARDLINK_SIDECAR) else {
         return HashMap::new();
-    }
+    };
 
     let mut hardlinks = HashMap::new();
     for line in data.lines() {
@@ -1518,11 +1437,7 @@ fn hardlink_group_keys(env: &WasiEnv, key: &str) -> Vec<String> {
 
 fn save_persistent_hardlinks(env: &WasiEnv, hardlinks: &HashMap<String, String>) {
     if hardlinks.is_empty() {
-        let _ = env
-            .state
-            .fs
-            .root_fs
-            .remove_file(Path::new(POSIX_HARDLINK_SIDECAR));
+        remove_persistent_metadata(env, POSIX_HARDLINK_SIDECAR);
         return;
     }
     let mut entries = hardlinks.iter().collect::<Vec<_>>();
@@ -1535,19 +1450,7 @@ fn save_persistent_hardlinks(env: &WasiEnv, hardlinks: &HashMap<String, String>)
         data.push('\n');
     }
 
-    let Ok(mut file) = env
-        .state
-        .fs
-        .root_fs
-        .new_open_options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(POSIX_HARDLINK_SIDECAR)
-    else {
-        return;
-    };
-    let _ = block_on(file.write_all(data.as_bytes()));
+    write_persistent_metadata(env, POSIX_HARDLINK_SIDECAR, &data);
 }
 
 fn sandbox_fd_relative_host_path(env: &WasiEnv, fd: WasiFd, path: &str) -> Option<PathBuf> {
