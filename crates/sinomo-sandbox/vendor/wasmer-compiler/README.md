@@ -2,9 +2,7 @@
 
 This crate is the base for Compiler implementations.
 
-It performs the translation from a Wasm module into a basic
-`ModuleInfo`, but leaves the Wasm function bytecode translation to the
-compiler implementor.
+It performs the translation from a Wasm module into a basic `ModuleInfo`, but leaves the Wasm function bytecode translation to the compiler implementor.
 
 Here are some of the Compilers provided by Wasmer:
 
@@ -44,13 +42,9 @@ pub trait Compiler {
 
 ## Acknowledgments
 
-This project borrowed some of the code strucutre from the
-[`cranelift-wasm`] crate, however it's been adapted to not depend on
-any specific IR and be abstract of any compiler.
+This project borrowed some of the code strucutre from the [`cranelift-wasm`] crate, however it's been adapted to not depend on any specific IR and be abstract of any compiler.
 
-Please check [Wasmer `ATTRIBUTIONS`] to further see licenses and other
-attributions of the project.
+Please check [Wasmer `ATTRIBUTIONS`] to further see licenses and other attributions of the project.
 
 
-[`cranelift-wasm`]: https://crates.io/crates/cranelift-wasm
-[Wasmer `ATTRIBUTIONS`]: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
+[`cranelift-wasm`]: https://crates.io/crates/cranelift-wasm [Wasmer `ATTRIBUTIONS`]: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md

@@ -1,7 +1,6 @@
 # Sandbox Architecture
 
-`sinomo-sandbox` is layered so the sandbox can start with local development
-storage but eventually run on SIFS without changing the command contract.
+`sinomo-sandbox` is layered so the sandbox can start with local development storage but eventually run on SIFS without changing the command contract.
 
 ```text
 agent or CLI request
@@ -63,16 +62,11 @@ The runtime sees a virtual Unix tree. Typical mounts include:
 /proc       generated process view
 ```
 
-`/tmp` belongs to the sandbox instance, not the agent session. Reboot clears it
-by default, but instance policy can retain it. Destroying the instance deletes
-the whole instance root.
+`/tmp` belongs to the sandbox instance, not the agent session. Reboot clears it by default, but instance policy can retain it. Destroying the instance deletes the whole instance root.
 
 ## Virtual Filesystem Boundary
 
-All sandbox filesystem operations should go through the virtual filesystem
-layer. The local host-backed filesystem is a development backend and staging
-implementation detail. Runtime code should not assume host paths are available
-or stable, because production state is expected to be SIFS-backed.
+All sandbox filesystem operations should go through the virtual filesystem layer. The local host-backed filesystem is a development backend and staging implementation detail. Runtime code should not assume host paths are available or stable, because production state is expected to be SIFS-backed.
 
 The virtual filesystem layer owns:
 
@@ -85,27 +79,19 @@ The virtual filesystem layer owns:
 
 ## Runtime Model
 
-WASIX is the default runtime and primary development target. It is required for
-real shell, Python, compiler, package manager, subprocess, pipe, and threading
-workloads. WASI Preview1 remains as a compatibility adapter for simple
-single-process modules.
+WASIX is the default runtime and primary development target. It is required for real shell, Python, compiler, package manager, subprocess, pipe, and threading workloads. WASI Preview1 remains as a compatibility adapter for simple single-process modules.
 
 Runtime target code is split under `src/runtime/`:
 
-- `src/runtime/wasix/` owns Wasmer/WASIX setup, budget guards, process-tree
-  signaling, virtual preopens, output streaming, memory checks, and metering.
-- `src/runtime/preview1/` owns the Wasmtime/WASI Preview1 runner and bounded
-  compatibility imports.
-- `src/runtime/capabilities/` describes runtime capability reporting used by
-  diagnostics.
+- `src/runtime/wasix/` owns Wasmer/WASIX setup, budget guards, process-tree signaling, virtual preopens, output streaming, memory checks, and metering.
+- `src/runtime/preview1/` owns the Wasmtime/WASI Preview1 runner and bounded compatibility imports.
+- `src/runtime/capabilities/` describes runtime capability reporting used by diagnostics.
 
-WASIX execution denies ambient HTTP imports. Network access should go through
-Sinomo-mediated fetch APIs so policy, audit, and cluster routing stay visible.
+WASIX execution denies ambient HTTP imports. Network access should go through Sinomo-mediated fetch APIs so policy, audit, and cluster routing stay visible.
 
 ## Process And Thread Model
 
-The sandbox is intended to support normal POSIX-style coding workflows. That
-requires:
+The sandbox is intended to support normal POSIX-style coding workflows. That requires:
 
 - subprocess execution through pinned sandbox commands,
 - cwd and environment propagation,
@@ -115,8 +101,7 @@ requires:
 - pthread-style threading over shared imported memory,
 - futex, mutex, condition variable, and TLS behavior.
 
-The implementation currently supports part of this surface. The status doc
-tracks the exact remaining gaps.
+The implementation currently supports part of this surface. The status doc tracks the exact remaining gaps.
 
 ## Policy And Audit
 
@@ -135,30 +120,18 @@ Policy controls:
 - concurrent command and sandbox budgets,
 - HTTP host and byte/timeout budgets.
 
-Daemon-backed state-changing operations validate policy before mutating SIFS.
-Denied operations produce durable policy-denial events.
+Daemon-backed state-changing operations validate policy before mutating SIFS. Denied operations produce durable policy-denial events.
 
-Command records and events capture lifecycle, output chunks, final status,
-resource exhaustion, mediated HTTP exchanges, toolchain updates, and sandbox
-configuration changes. Command logs persist under the instance `logs/`
-directory and can be replayed into the shared event stream.
+Command records and events capture lifecycle, output chunks, final status, resource exhaustion, mediated HTTP exchanges, toolchain updates, and sandbox configuration changes. Command logs persist under the instance `logs/` directory and can be replayed into the shared event stream.
 
 ## Source Layout
 
-- `src/model.rs` defines IDs, manifests, mounts, resource limits, command
-  records, and shared data structures.
+- `src/model.rs` defines IDs, manifests, mounts, resource limits, command records, and shared data structures.
 - `src/runtime/` contains runtime adapters and capability reporting.
-- `src/filesystem/` contains local and SIFS virtual filesystem backends plus
-  path and usage helpers.
-- `src/store/` contains instance stores, command-record persistence, and
-  workspace sync helpers.
-- `src/execution/` contains local and SIFS staged command execution plus
-  structured process-plan execution.
-- `src/toolchain/` contains local/SIFS toolchain stores, manifests, hash
-  verification, package import helpers, and built-in package specs.
-- `src/policy/`, `src/events/`, and `src/http/` own policy validation, event
-  lowering, and mediated HTTP behavior.
+- `src/filesystem/` contains local and SIFS virtual filesystem backends plus path and usage helpers.
+- `src/store/` contains instance stores, command-record persistence, and workspace sync helpers.
+- `src/execution/` contains local and SIFS staged command execution plus structured process-plan execution.
+- `src/toolchain/` contains local/SIFS toolchain stores, manifests, hash verification, package import helpers, and built-in package specs.
+- `src/policy/`, `src/events/`, and `src/http/` own policy validation, event lowering, and mediated HTTP behavior.
 - `toolchains/` contains maintained package recipes and verifiers.
-- `vendor/` contains Sinomo-maintained vendored runtime crates needed for the
-  WASIX path.
-
+- `vendor/` contains Sinomo-maintained vendored runtime crates needed for the WASIX path.

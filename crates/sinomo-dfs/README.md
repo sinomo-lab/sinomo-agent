@@ -1,13 +1,8 @@
 # sinomo-dfs
 
-`sinomo-dfs` is Sinomo's local-first distributed filesystem layer. It provides
-the object, metadata, content, replication, repair, and POSIX-like path APIs
-used to expose SIFS, the cluster root filesystem.
+`sinomo-dfs` is Sinomo's local-first distributed filesystem layer. It provides the object, metadata, content, replication, repair, and POSIX-like path APIs used to expose SIFS, the cluster root filesystem.
 
-The crate is not a replacement for the host filesystem, Git, or the cluster KV.
-It is a policy-aware workspace layer: file bytes stay in node-local content
-stores, high-cardinality filesystem metadata stays in DFS metadata backends, and
-the cluster KV is used only for compact DFS control-plane configuration.
+The crate is not a replacement for the host filesystem, Git, or the cluster KV. It is a policy-aware workspace layer: file bytes stay in node-local content stores, high-cardinality filesystem metadata stays in DFS metadata backends, and the cluster KV is used only for compact DFS control-plane configuration.
 
 See also:
 
@@ -21,8 +16,7 @@ The DFS has four planes.
 
 ### Namespace and Object Metadata
 
-DFS metadata records the stable identity and visible state of filesystem
-objects:
+DFS metadata records the stable identity and visible state of filesystem objects:
 
 - filesystem ID,
 - object ID,
@@ -36,11 +30,9 @@ objects:
 - conflicts,
 - write intents and receipts.
 
-Object identity is stable across path moves. Path operations update namespace
-metadata, not content identity.
+Object identity is stable across path moves. Path operations update namespace metadata, not content identity.
 
-The default filesystem is SIFS. From this crate's perspective SIFS is ordinary
-DFS metadata with a predefined layout:
+The default filesystem is SIFS. From this crate's perspective SIFS is ordinary DFS metadata with a predefined layout:
 
 ```text
 /
@@ -52,23 +44,17 @@ DFS metadata with a predefined layout:
 /services
 ```
 
-`/sinomo/nodes/<node_id>/files` is local-owned. `/users` and `/services` are
-distributed DFS subtrees.
+`/sinomo/nodes/<node_id>/files` is local-owned. `/users` and `/services` are distributed DFS subtrees.
 
 ### Content Store
 
-`LocalContentStore` stores bytes under the local data directory as immutable
-content-addressed blobs plus object-version manifests.
+`LocalContentStore` stores bytes under the local data directory as immutable content-addressed blobs plus object-version manifests.
 
-Object versions are protected by hash. Rewriting the same `(object_id, version)`
-with different bytes is rejected. Storage writes use unique temporary files,
-atomic rename, and fsync of the file and parent directory.
+Object versions are protected by hash. Rewriting the same `(object_id, version)` with different bytes is rejected. Storage writes use unique temporary files, atomic rename, and fsync of the file and parent directory.
 
 ### Metadata Backend
 
-`DfsMetadataBackend` is the durable metadata interface. The current
-`LocalJsonMetadataBackend` stores shard-local records as Sinomo object files and
-provides:
+`DfsMetadataBackend` is the durable metadata interface. The current `LocalJsonMetadataBackend` stores shard-local records as Sinomo object files and provides:
 
 - filesystem records,
 - object and path records,
@@ -79,14 +65,11 @@ provides:
 - namespace transactions,
 - recoverable visible-version commits.
 
-Visible metadata commits and namespace transactions are written as replayable
-records before materialization, so reopening the backend can complete an
-interrupted operation.
+Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation.
 
 ### Networked DFS Service
 
-`NetworkedDfsService<T>` is the distributed object service over a
-`sinomo-network` transport. It combines:
+`NetworkedDfsService<T>` is the distributed object service over a `sinomo-network` transport. It combines:
 
 - local metadata cache,
 - local content store,
@@ -95,34 +78,21 @@ interrupted operation.
 - distributed write coordinator,
 - data-plane DFS network messages.
 
-Distributed writes create a persisted intent, stage content to desired replicas,
-record durable receipts, commit the visible version after the policy threshold,
-and keep repair jobs until the desired replica set converges.
+Distributed writes create a persisted intent, stage content to desired replicas, record durable receipts, commit the visible version after the policy threshold, and keep repair jobs until the desired replica set converges.
 
-Replica-side commands are authorized against object ownership, metadata-shard
-primary state when available, desired replica membership, persisted intent
-records, and content hashes. Rejected replica commands do not create replica
-metadata.
+Replica-side commands are authorized against object ownership, metadata-shard primary state when available, desired replica membership, persisted intent records, and content hashes. Rejected replica commands do not create replica metadata.
 
-Repair is restart-aware. On service hydration, persisted intents and receipts
-rebuild coordinator state and missing-replica jobs. Repair retries have
-backoff-like scheduling, and a recovered coordinator that no longer has local
-blob bytes can fetch the blob from another durable replica before repairing a
-missing node.
+Repair is restart-aware. On service hydration, persisted intents and receipts rebuild coordinator state and missing-replica jobs. Repair retries have backoff-like scheduling, and a recovered coordinator that no longer has local blob bytes can fetch the blob from another durable replica before repairing a missing node.
 
 ## Policies
 
 The main object policies currently used by the crate are:
 
-- `LocalOwned`: one owner node is the write authority. Other nodes route reads
-  and writes to the owner.
-- `ReplicatedEventual`: a write becomes visible once `min_commit_replicas`
-  durable receipts exist, then repair converges toward `desired_replicas`.
-- `ReplicatedConfirmed`: a stricter replicated policy where all desired
-  replicas must confirm before commit.
+- `LocalOwned`: one owner node is the write authority. Other nodes route reads and writes to the owner.
+- `ReplicatedEventual`: a write becomes visible once `min_commit_replicas` durable receipts exist, then repair converges toward `desired_replicas`.
+- `ReplicatedConfirmed`: a stricter replicated policy where all desired replicas must confirm before commit.
 
-The policy is attached to objects and inherited by higher-level path APIs. DFS
-does not hardcode behavior by path except for the SIFS bootstrap defaults.
+The policy is attached to objects and inherited by higher-level path APIs. DFS does not hardcode behavior by path except for the SIFS bootstrap defaults.
 
 ## Storage Layout
 
@@ -140,9 +110,7 @@ dfs/pins
 files
 ```
 
-The exact storage format is intentionally hidden behind crate APIs and metadata
-backend traits. Other crates should use the DFS interfaces instead of reading
-these files directly.
+The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly.
 
 ## Usage Examples
 
@@ -303,9 +271,6 @@ Ok(())
 
 - Do not put large file bytes in `sinomo-kv`; DFS content stores carry bytes.
 - Treat metadata backend records as the source of restart recovery.
-- Use SIFS path APIs for filesystem-like workflows and object/version APIs for
-  replication, repair, audit, and operator tooling.
-- Prefer explicit conflict records over silent overwrite when base versions do
-  not match.
-- Local-owned subtrees remain useful for sensitive or node-specific files even
-  inside the cluster root filesystem.
+- Use SIFS path APIs for filesystem-like workflows and object/version APIs for replication, repair, audit, and operator tooling.
+- Prefer explicit conflict records over silent overwrite when base versions do not match.
+- Local-owned subtrees remain useful for sensitive or node-specific files even inside the cluster root filesystem.

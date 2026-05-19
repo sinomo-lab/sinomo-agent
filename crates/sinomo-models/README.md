@@ -2,16 +2,9 @@
 
 Rust-native model runtimes for Sinomo.
 
-This crate is the home for model implementations that run directly inside the
-Sinomo Rust process. It provides model-specific loaders, preprocessing,
-inference paths, decode state, and validation utilities for native runtimes.
-The goal is to make production Sinomo components able to depend on local model
-execution without going through a Python bridge or an external model server.
+This crate is the home for model implementations that run directly inside the Sinomo Rust process. It provides model-specific loaders, preprocessing, inference paths, decode state, and validation utilities for native runtimes. The goal is to make production Sinomo components able to depend on local model execution without going through a Python bridge or an external model server.
 
-Each model module owns the details of its upstream checkpoint format and exposes
-Rust APIs that higher-level crates can use without knowing those checkpoint
-internals. Benchmark and validation binaries live here as support tooling for
-the native runtimes; they are not the purpose of the crate.
+Each model module owns the details of its upstream checkpoint format and exposes Rust APIs that higher-level crates can use without knowing those checkpoint internals. Benchmark and validation binaries live here as support tooling for the native runtimes; they are not the purpose of the crate.
 
 ## MiniCPM-V 4.6
 
@@ -50,8 +43,7 @@ cargo run -p sinomo-models --bin sinomo-models-minicpm-v46 -- \
 Current limitations:
 
 - The image placeholder replacement helper currently materializes embeddings on CPU.
-- CPU inference is correct but not yet as fast as the PyTorch fallback path for
-  the same model on this server.
+- CPU inference is correct but not yet as fast as the PyTorch fallback path for the same model on this server.
 
 Validation status:
 
@@ -66,13 +58,7 @@ Validation status:
 
 ## Performance Snapshot
 
-The measurements below were captured on this server with a 12th Gen Intel Core
-i9-12900H, CPU-only execution, and `float32` weights. Rust uses the
-`target/release/sinomo-models-minicpm-v46` binary with Candle 0.10.2. PyTorch
-uses `torch 2.11.0+cu130` and `transformers 5.8.0` on CPU; CUDA was not
-available. Transformers reported that the MiniCPM fast path was unavailable
-because `flash-linear-attention` and `causal-conv1d` were not installed, so the
-PyTorch numbers are from its torch fallback implementation.
+The measurements below were captured on this server with a 12th Gen Intel Core i9-12900H, CPU-only execution, and `float32` weights. Rust uses the `target/release/sinomo-models-minicpm-v46` binary with Candle 0.10.2. PyTorch uses `torch 2.11.0+cu130` and `transformers 5.8.0` on CPU; CUDA was not available. Transformers reported that the MiniCPM fast path was unavailable because `flash-linear-attention` and `causal-conv1d` were not installed, so the PyTorch numbers are from its torch fallback implementation.
 
 | Check | Rust Candle | PyTorch/Transformers |
 | --- | ---: | ---: |
@@ -81,14 +67,6 @@ PyTorch numbers are from its torch fallback implementation.
 | Synthetic image forward, one `image_token_id`, zero `1x3x28x28` image, `target_sizes=[[2,2]]`, `downsample_mode=4x` | 418 ms | 266 ms |
 | Cached text decode, token-by-token ids `[0,1,2]` | 1074 ms | 392 ms |
 
-The Rust benchmark also measured preprocessing a synthetic 980x980 RGB image at
-2.88 ms/frame and the small synthetic MiniCPM vision encoder layer at
-0.56 ms/iteration.
+The Rust benchmark also measured preprocessing a synthetic 980x980 RGB image at 2.88 ms/frame and the small synthetic MiniCPM vision encoder layer at 0.56 ms/iteration.
 
-Rust and PyTorch logits match within normal floating-point tolerance for the
-same checkpoint and synthetic inputs. Incremental text decode caches are
-implemented for both Qwen3.5 mixer types: Gated DeltaNet stores the
-depthwise-conv rolling state plus recurrent delta-rule state, and full attention
-stores RoPE-applied key/value tensors. On the real checkpoint, Rust token-by-token
-cached decode for input ids `[0,1,2]` matches full-prefix logits with max absolute
-difference around `2e-5`.
+Rust and PyTorch logits match within normal floating-point tolerance for the same checkpoint and synthetic inputs. Incremental text decode caches are implemented for both Qwen3.5 mixer types: Gated DeltaNet stores the depthwise-conv rolling state plus recurrent delta-rule state, and full attention stores RoPE-applied key/value tensors. On the real checkpoint, Rust token-by-token cached decode for input ids `[0,1,2]` matches full-prefix logits with max absolute difference around `2e-5`.

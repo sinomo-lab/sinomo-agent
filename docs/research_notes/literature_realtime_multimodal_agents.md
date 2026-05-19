@@ -21,26 +21,20 @@ Focused on end-to-end or near-end-to-end agent/system literature for assistants 
 
 ## Cross-paper architectural takeaways
 
-1. **Use a layered reactive/deliberative architecture, not a single monolithic loop.**  
-   ATLANTIS and later embodied systems strongly support a three-speed design:
+1. **Use a layered reactive/deliberative architecture, not a single monolithic loop.** ATLANTIS and later embodied systems strongly support a three-speed design:
    - fast sensor/event loop for interruption handling and safety,
    - mid-level sequencer/executive for dialogue/task state,
    - slow planner/reasoner for longer-horizon inference.
 
-2. **Decouple “should I respond now?” from “what should I say/do?”**  
-   ROMA’s speak head and OmniMMI’s proactive tasks make this explicit. For streaming assistants, response timing is its own prediction problem.
+2. **Decouple “should I respond now?” from “what should I say/do?”** ROMA’s speak head and OmniMMI’s proactive tasks make this explicit. For streaming assistants, response timing is its own prediction problem.
 
-3. **Prefer full-duplex voice over turn-based voice pipelines when natural interaction matters.**  
-   Moshi and GPT-4o-style systems show why: lower latency, overlap handling, interruptions, interjections, and preservation of non-textual vocal cues.
+3. **Prefer full-duplex voice over turn-based voice pipelines when natural interaction matters.** Moshi and GPT-4o-style systems show why: lower latency, overlap handling, interruptions, interjections, and preservation of non-textual vocal cues.
 
-4. **Ground planning with feasibility checks.**  
-   SayCan remains the clearest example. For agentic assistants, planner outputs should be filtered/scored by current-world executability, permissions, or confidence from perception tools.
+4. **Ground planning with feasibility checks.** SayCan remains the clearest example. For agentic assistants, planner outputs should be filtered/scored by current-world executability, permissions, or confidence from perception tools.
 
-5. **A unified token/action space is powerful, but you still need system-level orchestration.**  
-   PaLM-E and RT-2 show the upside of end-to-end multimodal/action modeling, but real assistants still benefit from explicit memory, schedulers, interrupt routing, and tool gating.
+5. **A unified token/action space is powerful, but you still need system-level orchestration.** PaLM-E and RT-2 show the upside of end-to-end multimodal/action modeling, but real assistants still benefit from explicit memory, schedulers, interrupt routing, and tool gating.
 
-6. **Streaming evaluation is different from offline multimodal QA.**  
-   StreamingBench and OmniMMI show that strong offline models can still fail on causal, proactive, long-context interaction.
+6. **Streaming evaluation is different from offline multimodal QA.** StreamingBench and OmniMMI show that strong offline models can still fail on causal, proactive, long-context interaction.
 
 ## Practical design patterns suggested by the literature
 
@@ -55,11 +49,11 @@ Focused on end-to-end or near-end-to-end agent/system literature for assistants 
 
 ## Best “start here” subset if time is short
 
-1. ATLANTIS (1992) — architecture pattern  
-2. SayCan (2022) — grounding planner with executability  
-3. PaLM-E (2023) — unified sensor-language model  
-4. Moshi (2024) — low-latency full-duplex voice  
-5. GPT-4o System Card (2024) — production end-to-end omni reference  
+1. ATLANTIS (1992) — architecture pattern
+2. SayCan (2022) — grounding planner with executability
+3. PaLM-E (2023) — unified sensor-language model
+4. Moshi (2024) — low-latency full-duplex voice
+5. GPT-4o System Card (2024) — production end-to-end omni reference
 6. OmniMMI (2025) + ROMA (2026) — proactive streaming multimodal evaluation/system design
 
 ## Useful adjacent papers/benchmarks not in the core 11

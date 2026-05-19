@@ -124,4 +124,3 @@ Current serde support targets dynamic Sinomo documents. Deserialization from raw
 ## Validation
 
 Readers validate document magic, length mode, document length, UTF-8 strings, object key uniqueness, typed list contents, array sizes, and optional presence bytes. Unsupported extension type ids are rejected unless support is added by a higher-level implementation.
-

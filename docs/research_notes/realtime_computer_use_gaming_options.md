@@ -395,4 +395,3 @@ This gives Sinomo a credible path from normal computer use to realtime game-like
 - Windows.Graphics.Capture overview: https://learn.microsoft.com/en-us/windows/uwp/audio-video-camera/screen-capture-video
 - Win32 SendInput: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput
 - NVIDIA Capture SDK: https://developer.nvidia.com/capture-sdk
-

@@ -655,8 +655,7 @@ Responsibilities:
 
 Peer discovery, transport, and cross-node routing.
 
-See [Sinomo Network](network-architecture.md) for the communication boundary and
-wire-format rules.
+See [Sinomo Network](network-architecture.md) for the communication boundary and wire-format rules.
 
 Responsibilities:
 
@@ -731,21 +730,15 @@ Responsibilities:
 
 ### `sinomo-sandbox`
 
-SIFS-backed WASM sandbox host for agent tool execution, candidate builds,
-tests, and R3 modules.
+SIFS-backed WASM sandbox host for agent tool execution, candidate builds, tests, and R3 modules.
 
 Responsibilities:
 
-- Maintain sandbox instances and command workspaces under
-  `/services/sandbox`.
-- Run pinned real WASI command toolchains through the sandbox host without
-  ambient host filesystem or network access.
-- Persist stdout, stderr, command records, checkpoints, and changed workspace
-  files through SIFS so work can resume after daemon restart or node handoff.
-- Apply cluster-scoped sandbox policy for mounts, command capabilities,
-  toolchain trust, resource budgets, concurrency, and mediated HTTP fetches.
-- Provide a path toward Wasm Component Model modules for R3 capsules and
-  richer toolchain packages.
+- Maintain sandbox instances and command workspaces under `/services/sandbox`.
+- Run pinned real WASI command toolchains through the sandbox host without ambient host filesystem or network access.
+- Persist stdout, stderr, command records, checkpoints, and changed workspace files through SIFS so work can resume after daemon restart or node handoff.
+- Apply cluster-scoped sandbox policy for mounts, command capabilities, toolchain trust, resource budgets, concurrency, and mediated HTTP fetches.
+- Provide a path toward Wasm Component Model modules for R3 capsules and richer toolchain packages.
 - Enforce CPU, memory, wall-clock, filesystem, network, secret, and device limits.
 - Normalize logs and artifacts before they are reviewed by models or operators.
 

@@ -20,8 +20,7 @@ tmp
 
 ## using /dev/stderr
 
-This test ensures that the dev character devices are working properly, there should be two lines with blah as tee will
-send it both to the console and to the file
+This test ensures that the dev character devices are working properly, there should be two lines with blah as tee will send it both to the console and to the file
 
 ```sh
 cd ../../cli
@@ -37,8 +36,7 @@ blah
 
 ## atomic_wait and atomic_wake syscalls
 
-When we convert this from syscalls to native language constructs in WASM this test
-needs to continue to pass.
+When we convert this from syscalls to native language constructs in WASM this test needs to continue to pass.
 
 ```sh
 cd ../../cli
@@ -86,8 +84,7 @@ Expected:
 
 ## polling and event notifications
 
-This test makes sure the event notifications works correctly `fd_event` - this construct is used
-in `tokio` in order to wake up the main IO thread that is blocked on an `poll_oneoff`.
+This test makes sure the event notifications works correctly `fd_event` - this construct is used in `tokio` in order to wake up the main IO thread that is blocked on an `poll_oneoff`.
 
 ```sh
 cd ../../cli
@@ -112,8 +109,7 @@ success read from efd, read 8 bytes(4) at 1669077625s 943956us
 
 ## fork and execve
 
-The ability to fork the current process and run a different image but retain the existing open
-file handles (which is needed for stdin and stdout redirection)
+The ability to fork the current process and run a different image but retain the existing open file handles (which is needed for stdin and stdout redirection)
 
 ```sh
 cd ../../cli
@@ -134,8 +130,7 @@ hi-from-parent
 
 ## longjmp
 
-longjmp is used by C programs that save and restore the stack at specific points - this functionality
-is often used for exception handling
+longjmp is used by C programs that save and restore the stack at specific points - this functionality is often used for exception handling
 
 ```sh
 cd ../../cli
@@ -191,8 +186,7 @@ Child(1) exited with 0
 
 ## fork and longjmp
 
-Performs a longjmp of a stack that was recorded before the fork - this test ensures that the stacks that have
-been recorded are preserved after a fork. The behavior is needed for `dash`
+Performs a longjmp of a stack that was recorded before the fork - this test ensures that the stacks that have been recorded are preserved after a fork. The behavior is needed for `dash`
 
 ```sh
 cd ../../cli
@@ -243,8 +237,7 @@ all done
 
 ## pipes
 
-Uses the `fd_pipe` syscall to create a bidirection pipe with two file descriptors then forks
-the process to write and read to this pipe.
+Uses the `fd_pipe` syscall to create a bidirection pipe with two file descriptors then forks the process to write and read to this pipe.
 
 ```sh
 cd ../../cli
@@ -342,7 +335,7 @@ In order to test this a curl command is needed below asynchronously and then it 
 curl 127.0.0.1:7878
 ```
 
-Expected: 
+Expected:
 
 ```
 Listening on 127.0.0.1:7878
@@ -417,8 +410,7 @@ VAR1 in main after thread join: SecondEnum(998877)
 
 ## vforking
 
-Tests that lightweight forking that does not copy the memory but retains the
-open file descriptors works correctly.
+Tests that lightweight forking that does not copy the memory but retains the open file descriptors works correctly.
 
 ```sh
 cd ../../cli
@@ -434,8 +426,7 @@ Child(1) exited with 10
 
 ## web server
 
-Advanced test case that uses `tokio`, TCP listeners, asynchronous IO, event notifications, multi-threading
-and mapped directories to serve HTTP content.
+Advanced test case that uses `tokio`, TCP listeners, asynchronous IO, event notifications, multi-threading and mapped directories to serve HTTP content.
 
 
 ```sh

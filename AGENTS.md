@@ -1,4 +1,4 @@
-# CLAUDE.md
+# Repository Guidelines
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -27,6 +27,7 @@ cargo test -p sinomo-core --test workspace_ring_boundaries  # single integration
 cargo test -p <crate> <name>        # one test by substring
 cargo fmt --all
 cargo clippy --workspace --all-targets
+cargo check -p sinomo-sandbox --features wasix-runtime      # focused sandbox runtime check.
 ```
 
 Profile note: `[profile.dev]` sets `opt-level = 2` and `incremental = false`, so dev builds are slower than typical Rust crates. Release uses `panic = "abort"`.
@@ -85,6 +86,6 @@ When `sinomo evolve propose` doesn't get an explicit `--repo`, it defaults to th
 ## Conventions
 
 - Workspace dependency versions live in `[workspace.dependencies]` in the root `Cargo.toml`. New crates should use `serde.workspace = true` etc. rather than pinning versions locally.
-- IDs and event kinds are typed in `sinomo-core` (`EventEnvelope`, `EventId`, `NodeId`, `EvolutionJobId`, `TrustRing`, …). Reuse these instead of strings.
 - Events are the cross-service contract; new event families should follow the dotted-namespace convention in `docs/architecture.md` (`evolution.*`, `module.*`, `dfs.*`, `rollout.*`, …) and include node/device provenance and routing metadata.
-- The CLI is plain `Vec<String>` parsing with a single dispatch in `parse_cli_command` — no `clap`. Add new subcommands by extending `CliCommand` and the corresponding `parse_*` / `run_*` pair, and update `print_usage`.
+- Use integration tests for cross-crate behavior such as DFS, KV, networking, and sandbox execution. For sandbox/toolchain work, prefer real-command verifier scripts under `crates/sinomo-sandbox/toolchains/` when behavior depends on actual WASIX tools. Avoid committing generated `target/`, toolchain `work/`, `out/`, or `benchmark-results/` artifacts.
+- Do not bypass Sinomo networking, storage, or policy paths for cluster features. Environment variables are acceptable only for local pre-cluster configuration; distributed settings should use cluster KV. Treat sandbox filesystem access as VFS/SIFS-backed even when using local development backends.
