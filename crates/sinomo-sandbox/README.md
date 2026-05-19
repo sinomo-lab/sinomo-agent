@@ -14,10 +14,12 @@ sandbox commands.
 
 - [Architecture](docs/architecture.md): storage layout, runtime boundaries,
   virtual filesystem model, policy, events, and source layout.
-- [Implementation status](docs/status.md): current runtime, filesystem,
-  toolchain, and operational status.
-- [Remaining gaps](docs/gaps.md): detailed gap register for POSIX, SIFS,
-  toolchains, and operations.
+- [Implementation notes](docs/implementation-notes.md): current runtime,
+  filesystem, toolchain, operational status, remaining gaps, and historical
+  detailed implementation notes extracted from the project plan.
+- [Arch-style package build guide](docs/arch-package-build-investigation.md):
+  package-manager bootstrap, WASIX package repository, and automated Arch
+  PKGBUILD source rebuild goals.
 - [Project plan](../../docs/plans/sifs-wasm-sandbox-plan.md): roadmap and
   plan-level progress for the SIFS-backed WASM sandbox.
 
@@ -137,8 +139,8 @@ When adding sandbox functionality:
 2. Keep filesystem behavior behind the sandbox virtual filesystem layer.
 3. Add the real toolchain package or runtime support needed by the command.
 4. Add verifier coverage that runs the real command path.
-5. Update [docs/status.md](docs/status.md) with implementation status and
-   [docs/gaps.md](docs/gaps.md) with remaining gaps.
+5. Update [docs/implementation-notes.md](docs/implementation-notes.md) with implementation status and
+   remaining gaps.
 
 The project-level plan stays in
 [`docs/plans/sifs-wasm-sandbox-plan.md`](../../docs/plans/sifs-wasm-sandbox-plan.md).
