@@ -5,13 +5,13 @@ use crate::{
 #[cfg(feature = "wasix-runtime")]
 use super::memory::validate_wasix_module_memory_budget;
 #[cfg(feature = "wasix-runtime")]
-use super::metering::wasix_engine;
+use super::metering::{wasix_engine, wasix_module_supports_instruction_metering};
 #[cfg(feature = "wasix-runtime")]
 use super::network::validate_wasix_module_network_imports;
 #[cfg(feature = "wasix-runtime")]
 use super::output::WasixStreamingOutputCapture;
 #[cfg(feature = "wasix-runtime")]
-use super::preopen::validate_wasix_current_dir;
+use super::preopen::{validate_wasix_current_dir, validate_wasix_preopen_tree};
 #[cfg(feature = "wasix-runtime")]
 use super::process::{
     run_wasix_process_tree, sandbox_wasix_capabilities, wasix_command_exceeded_requested_timeout,
@@ -35,6 +35,9 @@ use wasmer_wasix::runners::wasi::RuntimeOrEngine;
 #[cfg(feature = "wasix-runtime")]
 use wasmer_wasix::runtime::Runtime;
 
+#[cfg(feature = "wasix-runtime")]
+const SINOMO_WASIX_STACK_SIZE: usize = 512 * 1024 * 1024;
+
 #[cfg(not(feature = "wasix-runtime"))]
 pub(crate) fn run_wasix_module(
     _wasm: &[u8],
@@ -52,6 +55,36 @@ pub(crate) fn run_wasix_module(
     request: SandboxCommandRequest,
     options: SandboxWasiRunOptions,
 ) -> Result<SandboxLocalCommandOutcome, SandboxWasiError> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("sinomo-wasix-command".to_string())
+            .stack_size(SINOMO_WASIX_STACK_SIZE)
+            .spawn_scoped(scope, move || {
+                run_wasix_module_on_worker_thread(wasm, request, options)
+            })
+            .map_err(|error| SandboxWasiError::Runtime {
+                detail: format!("spawn WASIX host thread: {error}"),
+            })?;
+        handle.join().map_err(|panic| {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            SandboxWasiError::Runtime {
+                detail: format!("WASIX host thread panicked: {detail}"),
+            }
+        })?
+    })
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn run_wasix_module_on_worker_thread(
+    wasm: &[u8],
+    request: SandboxCommandRequest,
+    options: SandboxWasiRunOptions,
+) -> Result<SandboxLocalCommandOutcome, SandboxWasiError> {
+    wasmer_vm::set_stack_size(SINOMO_WASIX_STACK_SIZE);
     validate_wasi_request(&request)?;
     if options.cancellation.is_cancelled() {
         return Err(SandboxWasiError::Cancelled);
@@ -65,13 +98,17 @@ pub(crate) fn run_wasix_module(
     let started = Instant::now();
     validate_wasix_module_memory_budget(wasm, options.memory_limit_bytes)?;
     validate_wasix_module_network_imports(wasm)?;
-    let mut engine = wasix_engine(request.timeout_ms, options.wasix_instruction_metering);
+    let instruction_metering =
+        options.wasix_instruction_metering && wasix_module_supports_instruction_metering(wasm)?;
+    let mut engine = wasix_engine(request.timeout_ms, instruction_metering);
     engine.set_tunables(SandboxWasixTunables::for_target(
         engine.as_sys().target(),
         options.memory_limit_bytes,
+        SINOMO_WASIX_STACK_SIZE,
     ));
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
+        .thread_stack_size(SINOMO_WASIX_STACK_SIZE)
         .enable_time()
         .build()
         .map_err(|error| SandboxWasiError::Runtime {
@@ -79,12 +116,14 @@ pub(crate) fn run_wasix_module(
         })?;
     let tokio_enter = tokio_runtime.enter();
     let task_manager = std::sync::Arc::new(
-        wasmer_wasix::runtime::task_manager::tokio::TokioTaskManager::new(
+        wasmer_wasix::runtime::task_manager::tokio::TokioTaskManager::new_with_wasm_thread_stack_size(
             tokio_runtime.handle().clone(),
+            SINOMO_WASIX_STACK_SIZE,
         ),
     );
     let mut runtime = wasmer_wasix::runtime::PluggableRuntime::new(task_manager);
     runtime.set_engine(engine.clone());
+    runtime.set_dynamic_linker_stack_size(SINOMO_WASIX_STACK_SIZE as u64);
     let runtime: std::sync::Arc<dyn Runtime + Send + Sync> = std::sync::Arc::new(runtime);
     let hashed_module = wasmer_wasix::runtime::module_cache::HashedModuleData::new(wasm.to_vec());
     let module_hash = *hashed_module.hash();
@@ -93,6 +132,9 @@ pub(crate) fn run_wasix_module(
         .map_err(|error| SandboxWasiError::Runtime {
             detail: format!("compile WASIX module: {error}"),
         })?;
+    for preopen in &options.preopened_dirs {
+        validate_wasix_preopen_tree(preopen)?;
+    }
     validate_wasix_current_dir(&request.cwd, &options.preopened_dirs)?;
     let mut runner = wasmer_wasix::runners::wasi::WasiRunner::new();
     runner.with_capabilities(sandbox_wasix_capabilities());

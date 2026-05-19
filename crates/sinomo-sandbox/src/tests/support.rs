@@ -20,7 +20,15 @@ pub(super) fn unique_test_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    let root = std::env::var_os("SINOMO_SANDBOX_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .expect("current dir")
+                .join("target")
+                .join("sinomo-test-tmp")
+        });
+    root.join(format!("{prefix}-{nanos}"))
 }
 
 pub(super) fn busybox_applet_config_symbol(command: &str) -> Option<&'static str> {

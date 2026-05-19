@@ -416,7 +416,7 @@ fn local_sandbox_instance_store_checkpoints_resumes_and_destroys() {
 
 #[cfg(unix)]
 #[test]
-fn local_sandbox_instance_checkpoint_rejects_symlink_escape() {
+fn local_sandbox_instance_checkpoint_preserves_symlinks_without_copying_targets() {
     use std::os::unix::fs::symlink;
 
     let runtime_root = unique_test_dir("sinomo-sandbox-instance-checkpoint-symlink");
@@ -429,12 +429,25 @@ fn local_sandbox_instance_checkpoint_rejects_symlink_escape() {
         .expect("create");
     symlink("/etc/passwd", layout.work.join("escape")).expect("symlink");
 
-    assert!(matches!(
-        store
-            .create_checkpoint(&sandbox_id, OffsetDateTime::now_utc())
-            .expect_err("symlink rejected"),
-        SandboxStoreError::Io { .. }
-    ));
+    let checkpoint = store
+        .create_checkpoint(&sandbox_id, OffsetDateTime::now_utc())
+        .expect("checkpoint");
+    let checkpoint_link = layout
+        .checkpoints
+        .join(checkpoint.checkpoint_id.as_str())
+        .join("work")
+        .join("escape");
+    assert_eq!(
+        fs::symlink_metadata(&checkpoint_link)
+            .expect("checkpoint link metadata")
+            .file_type()
+            .is_symlink(),
+        true
+    );
+    assert_eq!(
+        fs::read_link(checkpoint_link).expect("checkpoint link target"),
+        std::path::PathBuf::from("/etc/passwd")
+    );
     fs::remove_dir_all(&runtime_root).ok();
 }
 
@@ -533,7 +546,15 @@ fn local_sandbox_filesystem_exposes_virtual_devices() {
             .into_iter()
             .map(|entry| entry.path)
             .collect::<Vec<_>>(),
-        vec![null.clone(), zero.clone(), random.clone(), urandom.clone()]
+        SANDBOX_MVP_VIRTUAL_DEVICES
+            .iter()
+            .map(|path| SandboxPath::new(path).expect("static virtual device path"))
+            .filter(|path| {
+                path.as_str()
+                    .strip_prefix("/dev/")
+                    .is_some_and(|suffix| !suffix.contains('/'))
+            })
+            .collect::<Vec<_>>()
     );
     assert!(matches!(
         fs.unlink(&null),
@@ -794,7 +815,15 @@ fn sifs_sandbox_filesystem_exposes_virtual_devices_without_persisting_them() {
             .into_iter()
             .map(|entry| entry.path)
             .collect::<Vec<_>>(),
-        vec![null.clone(), zero.clone(), random.clone(), urandom.clone()]
+        SANDBOX_MVP_VIRTUAL_DEVICES
+            .iter()
+            .map(|path| SandboxPath::new(path).expect("static virtual device path"))
+            .filter(|path| {
+                path.as_str()
+                    .strip_prefix("/dev/")
+                    .is_some_and(|suffix| !suffix.contains('/'))
+            })
+            .collect::<Vec<_>>()
     );
     assert!(matches!(
         fs.unlink(&zero),

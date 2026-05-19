@@ -1,4 +1,4 @@
-use std::ptr::NonNull;
+use std::{ptr::NonNull, sync::Arc};
 
 use wasmer::{
     MemoryError, MemoryStyle, MemoryType, Pages, TableStyle, TableType,
@@ -12,10 +12,15 @@ use wasmer::{
 pub(super) struct SandboxWasixTunables {
     base: BaseTunables,
     memory_limit_pages: Pages,
+    vm_config: Arc<VMConfig>,
 }
 
 impl SandboxWasixTunables {
-    pub(super) fn for_target(target: &Target, memory_limit_bytes: usize) -> Self {
+    pub(super) fn for_target(
+        target: &Target,
+        memory_limit_bytes: usize,
+        wasm_stack_size: usize,
+    ) -> Self {
         let base = BaseTunables::for_target(target);
         let limit_pages = ((memory_limit_bytes as u128).saturating_add(65535) / 65536)
             .min(u128::from(u32::MAX)) as u32;
@@ -23,6 +28,9 @@ impl SandboxWasixTunables {
         Self {
             base,
             memory_limit_pages,
+            vm_config: Arc::new(VMConfig {
+                wasm_stack_size: Some(wasm_stack_size),
+            }),
         }
     }
 
@@ -92,7 +100,7 @@ impl Tunables for SandboxWasixTunables {
     }
 
     fn vmconfig(&self) -> &VMConfig {
-        self.base.vmconfig()
+        &self.vm_config
     }
 }
 
@@ -103,7 +111,7 @@ mod tests {
 
     #[test]
     fn sandbox_wasix_tunables_reject_memory_above_budget() {
-        let tunables = SandboxWasixTunables::for_target(&Target::default(), 64 * 1024);
+        let tunables = SandboxWasixTunables::for_target(&Target::default(), 64 * 1024, 1024 * 1024);
 
         assert!(
             tunables

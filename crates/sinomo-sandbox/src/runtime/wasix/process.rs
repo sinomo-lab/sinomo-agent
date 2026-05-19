@@ -10,7 +10,7 @@ use wasmer_wasix::{
     runners::wasi::{PackageOrHash, RuntimeOrEngine, WasiRunner},
     runtime::task_manager::TaskWasm,
     runtime::task_manager::VirtualTaskManagerExt,
-    wasmer_wasix_types::wasi::ExitCode,
+    wasmer_wasix_types::wasi::{Disposition, ExitCode, Signal, SignalDisposition},
 };
 
 use super::budget::{WasixProcessBudgetGuard, run_with_host_wall_timeout};
@@ -27,7 +27,7 @@ pub(super) fn run_wasix_process_tree(
     cancellation: crate::SandboxCancellation,
 ) -> Result<Result<ExitCode, Arc<WasiRuntimeError>>, SandboxWasiError> {
     let wasi = webc::metadata::annotations::Wasi::new(program_name);
-    let builder = runner
+    let mut builder = runner
         .prepare_webc_env(
             program_name,
             &wasi,
@@ -38,6 +38,7 @@ pub(super) fn run_wasix_process_tree(
         .map_err(|error| SandboxWasiError::Runtime {
             detail: format!("prepare WASIX environment: {error}"),
         })?;
+    configure_default_ignored_signals(&mut builder);
     let env = builder.build().map_err(|error| SandboxWasiError::Runtime {
         detail: format!("build WASIX environment: {error}"),
     })?;
@@ -134,9 +135,27 @@ pub(super) fn wasix_exit_status(
             } else if is_wasix_metering_exhaustion(&error.to_string()) {
                 Err(SandboxWasiError::TimedOut { timeout_ms })
             } else {
-                Err(SandboxWasiError::Runtime {
-                    detail: format!("WASIX runtime error: {error}"),
-                })
+                let mut detail = format!("WASIX runtime error: {error}");
+                if let WasiRuntimeError::Runtime(runtime_error) = error.as_ref() {
+                    if let Some(trap) = runtime_error.clone().to_trap() {
+                        detail.push_str(&format!("; trap: {trap:?}"));
+                    }
+                    let trace = runtime_error.trace();
+                    if !trace.is_empty() {
+                        detail.push_str("; wasm trace:");
+                        for frame in trace.iter().take(24) {
+                            detail.push_str(&format!(
+                                " {}:{}",
+                                frame.module_name(),
+                                frame.function_name().unwrap_or("<unknown>")
+                            ));
+                        }
+                        if trace.len() > 24 {
+                            detail.push_str(&format!(" ... +{} frames", trace.len() - 24));
+                        }
+                    }
+                }
+                Err(SandboxWasiError::Runtime { detail })
             }
         }
     }
@@ -153,4 +172,13 @@ pub(crate) fn sandbox_wasix_capabilities() -> wasmer_wasix::capabilities::Capabi
     let mut capabilities = wasmer_wasix::capabilities::Capabilities::new();
     capabilities.threading.max_threads = Some(SANDBOX_WASIX_MAX_TASKS);
     capabilities
+}
+
+fn configure_default_ignored_signals(builder: &mut wasmer_wasix::WasiEnvBuilder) {
+    for sig in [Signal::Sigchld, Signal::Sigurg, Signal::Sigwinch] {
+        builder.add_signal(SignalDisposition {
+            sig,
+            disp: Disposition::Ignore,
+        });
+    }
 }

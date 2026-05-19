@@ -285,6 +285,13 @@ fn sandbox_resource_limits(
         },
     );
     limits.insert(
+        RLIMIT_FSIZE,
+        ProcessResourceLimit {
+            current: RLIM_INFINITY,
+            maximum: RLIM_INFINITY,
+        },
+    );
+    limits.insert(
         RLIMIT_NOFILE,
         ProcessResourceLimit {
             current: 1024,
@@ -407,6 +414,10 @@ pub struct WasiProcessInner {
     pub current_cpu: u32,
     /// Guest-visible POSIX resource limit overrides.
     pub resource_limits: HashMap<i32, ProcessResourceLimit>,
+    /// Process-global WASIX thread-local storage keys. Values are stored per
+    /// thread on `WasiThread`.
+    pub thread_local_keys: HashMap<u32, u64>,
+    pub next_thread_local_key: u32,
     /// Accumulated elapsed user-time proxy for reaped child processes.
     pub child_user_nanos: u128,
     /// Maximum resident-set proxy reported by reaped child processes.
@@ -743,6 +754,8 @@ impl WasiProcess {
                 cpu_affinity: 1,
                 current_cpu: 0,
                 resource_limits: Default::default(),
+                thread_local_keys: Default::default(),
+                next_thread_local_key: 1,
                 child_user_nanos: 0,
                 child_maxrss_kib: 0,
                 identity: ProcessIdentity::default(),
@@ -1197,8 +1210,73 @@ impl WasiProcess {
         self.inner.0.lock().unwrap().executable_path = Some(path);
     }
 
+    pub fn set_executable_path_option(&self, path: Option<String>) {
+        self.inner.0.lock().unwrap().executable_path = path;
+    }
+
     pub fn executable_path(&self) -> Option<String> {
         self.inner.0.lock().unwrap().executable_path.clone()
+    }
+
+    pub fn create_thread_local_key(&self, destructor: u64) -> Result<u32, Errno> {
+        let mut inner = self.inner.0.lock().unwrap();
+        let start = inner.next_thread_local_key;
+        loop {
+            let key = inner.next_thread_local_key;
+            inner.next_thread_local_key = inner.next_thread_local_key.wrapping_add(1);
+            if inner.next_thread_local_key == 0 {
+                inner.next_thread_local_key = 1;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                inner.thread_local_keys.entry(key)
+            {
+                entry.insert(destructor);
+                return Ok(key);
+            }
+            if inner.next_thread_local_key == start {
+                return Err(Errno::Nomem);
+            }
+        }
+    }
+
+    pub fn destroy_thread_local_key(&self, key: u32) -> bool {
+        let mut inner = self.inner.0.lock().unwrap();
+        if inner.thread_local_keys.remove(&key).is_none() {
+            return false;
+        }
+        for thread in inner.threads.values() {
+            thread.remove_thread_local_value(key);
+        }
+        true
+    }
+
+    pub fn has_thread_local_key(&self, key: u32) -> bool {
+        self.inner
+            .0
+            .lock()
+            .unwrap()
+            .thread_local_keys
+            .contains_key(&key)
+    }
+
+    pub fn thread_local_destructors_for_values(
+        &self,
+        values: std::collections::HashMap<u32, u64>,
+    ) -> Vec<(u32, u64, u64)> {
+        let inner = self.inner.0.lock().unwrap();
+        values
+            .into_iter()
+            .filter_map(|(key, value)| {
+                if value == 0 {
+                    return None;
+                }
+                let destructor = *inner.thread_local_keys.get(&key)?;
+                if destructor == 0 {
+                    return None;
+                }
+                Some((key, destructor, value))
+            })
+            .collect()
     }
 
     pub fn start_time_nanos(&self) -> u128 {
@@ -1814,6 +1892,11 @@ impl WasiProcess {
         self.finished.await_termination().await
     }
 
+    pub async fn join_status(&self) -> TaskStatus {
+        let _guard = WasiProcessWait::new(self);
+        self.finished.await_termination_status().await
+    }
+
     pub async fn join_until_stopped_or_finished(&self) -> TaskStatus {
         let _guard = WasiProcessWait::new(self);
         self.finished.await_stopped_or_terminated().await
@@ -1947,6 +2030,60 @@ impl WasiProcess {
             res.unwrap_or_else(|e| e.as_exit_code().unwrap_or_else(|| Errno::Canceled.into()));
 
         Ok(Some((child.pid, code)))
+    }
+
+    pub async fn join_any_child_matching_status<F>(
+        &mut self,
+        mut matches: F,
+    ) -> Result<Option<(WasiProcess, TaskStatus)>, Errno>
+    where
+        F: FnMut(&WasiProcess) -> bool,
+    {
+        let _guard = WasiProcessWait::new(self);
+        let children: Vec<_> = {
+            let inner = self.inner.0.lock().unwrap();
+            inner.children.clone()
+        };
+        if children.is_empty() {
+            return Err(Errno::Child);
+        }
+
+        let mut waits = Vec::new();
+        let mut saw_matching_child = false;
+        for child in children {
+            if !matches(&child) {
+                continue;
+            }
+            saw_matching_child = true;
+            if let Some(process) = self.compute.must_upgrade().get_process(child.pid) {
+                let parent = self.clone();
+                let inner = self.inner.clone();
+                let control_plane = self.compute.must_upgrade();
+                waits.push(async move {
+                    let status = process.join_status().await;
+                    parent.record_reaped_child_usage(&child);
+                    let mut inner = inner.0.lock().unwrap();
+                    inner.children.retain(|a| a.pid != child.pid);
+                    drop(inner);
+                    control_plane.remove_process(child.pid);
+                    (process, status)
+                })
+            } else {
+                let mut inner = self.inner.0.lock().unwrap();
+                inner.children.retain(|existing| existing.pid != child.pid);
+            }
+        }
+        if !saw_matching_child {
+            return Err(Errno::Child);
+        }
+        if waits.is_empty() {
+            return Err(Errno::Child);
+        }
+        let (process, status) = futures::future::select_all(waits.into_iter().map(Box::pin))
+            .await
+            .0;
+
+        Ok(Some((process, status)))
     }
 
     pub async fn join_any_child_matching_until_stopped_or_finished<F>(

@@ -1,18 +1,29 @@
 use super::*;
 use crate::{
     WasiThreadHandle, WasiVForkAsyncify, capture_store_snapshot,
-    os::task::OwnedTaskStatus,
+    os::task::{OwnedTaskStatus, thread::WasiMemoryLayout},
     runtime::task_manager::{TaskWasm, TaskWasmRunProperties},
     state::context_switching::ContextSwitchingEnvironment,
     syscalls::*,
 };
 use serde::{Deserialize, Serialize};
-use wasmer::Memory;
+use wasmer::{FromToNativeWasmType, Memory};
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ForkResult {
     pub pid: Pid,
     pub ret: Errno,
+}
+
+struct ForkOutcome {
+    pid: Pid,
+    ret: Errno,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CloneThreadResult {
+    tid: Tid,
+    ret: Errno,
 }
 
 /// ### `proc_fork()`
@@ -21,10 +32,381 @@ pub(crate) struct ForkResult {
 /// number then its the current process and the $pid represents the child.
 #[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
 pub fn proc_fork<M: MemorySize>(
-    mut ctx: FunctionEnvMut<'_, WasiEnv>,
-    mut copy_memory: Bool,
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    copy_memory: Bool,
     pid_ptr: WasmPtr<Pid, M>,
 ) -> Result<Errno, WasiError> {
+    let outcome = proc_fork_common(ctx, copy_memory, Some(pid_ptr))?;
+    Ok(outcome.ret)
+}
+
+/// ### `fork()`
+/// POSIX-shaped fork wrapper. Returns 0 in the child, the child pid in the
+/// parent, or a negative errno value on failure.
+#[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
+pub fn fork<M: MemorySize>(ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<i32, WasiError> {
+    let outcome = proc_fork_common::<M>(ctx, Bool::True, None)?;
+    Ok(fork_outcome_to_posix(outcome))
+}
+
+/// ### `vfork()`
+/// POSIX-shaped vfork wrapper over the existing WASIX lightweight fork path.
+#[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
+pub fn vfork<M: MemorySize>(ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<i32, WasiError> {
+    let outcome = proc_fork_common::<M>(ctx, Bool::False, None)?;
+    Ok(fork_outcome_to_posix(outcome))
+}
+
+/// ### `clone_thread()`
+/// POSIX/Linux-shaped same-process clone for `CLONE_THREAD | CLONE_VM`
+/// callers. This uses the runtime's asyncify rewind path: the parent receives
+/// the new TID and the cloned thread resumes from the syscall with return
+/// value zero.
+#[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
+pub fn clone_thread<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    child_stack: u64,
+    parent_tid_ptr: WasmPtr<i32, M>,
+    child_tid_ptr: WasmPtr<i32, M>,
+    tls: u64,
+    set_parent_tid: Bool,
+    set_child_tid: Bool,
+    clear_child_tid: Bool,
+) -> Result<i32, WasiError> {
+    clone_thread_common::<M>(
+        ctx,
+        child_stack,
+        parent_tid_ptr,
+        child_tid_ptr,
+        tls,
+        set_parent_tid == Bool::True,
+        set_child_tid == Bool::True,
+        clear_child_tid == Bool::True,
+    )
+}
+
+fn fork_outcome_to_posix(outcome: ForkOutcome) -> i32 {
+    if outcome.ret == Errno::Success {
+        outcome.pid as i32
+    } else {
+        -outcome.ret.to_native()
+    }
+}
+
+fn clone_thread_result_to_posix(result: CloneThreadResult) -> i32 {
+    if result.ret == Errno::Success {
+        result.tid as i32
+    } else {
+        -result.ret.to_native()
+    }
+}
+
+fn clone_thread_common<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    child_stack: u64,
+    parent_tid_ptr: WasmPtr<i32, M>,
+    child_tid_ptr: WasmPtr<i32, M>,
+    tls: u64,
+    set_parent_tid: bool,
+    set_child_tid: bool,
+    clear_child_tid: bool,
+) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    if let Some(context_switching_environment) = ctx.data().context_switching_environment.as_ref()
+        && context_switching_environment.active_context_id()
+            != context_switching_environment.main_context_id()
+    {
+        warn!(
+            "thread cloning is only supported from the main context when using WASIX context-switching features"
+        );
+        return Ok(-Errno::Notsup.to_native());
+    }
+
+    if let Some(result) = unsafe { handle_rewind::<M, CloneThreadResult>(&mut ctx) } {
+        return Ok(clone_thread_result_to_posix(result));
+    }
+
+    if !supports_asyncified_fork(ctx.data()) {
+        warn!("thread cloning requires asyncify unwind and rewind exports");
+        return Ok(-Errno::Noexec.to_native());
+    }
+
+    let current_layout = ctx.data().thread.memory_layout().clone();
+    let stack_upper = if child_stack == 0 {
+        current_layout.stack_upper
+    } else {
+        child_stack
+    };
+    let stack_size = current_layout.stack_size;
+    let stack_lower = match stack_upper.checked_sub(stack_size) {
+        Some(value) => value,
+        None => return Ok(-Errno::Inval.to_native()),
+    };
+    let layout = WasiMemoryLayout {
+        stack_upper,
+        stack_lower,
+        guard_size: current_layout.guard_size,
+        stack_size,
+        tls_base: if tls == 0 { current_layout.tls_base } else { Some(tls) },
+    };
+
+    let thread_start = ThreadStartType::ThreadSpawn { start_ptr: 0 };
+    let thread_handle = match ctx.data().process.new_thread(layout.clone(), thread_start) {
+        Ok(handle) => handle,
+        Err(err) => {
+            warn!(?err, "failed to create cloned thread");
+            return Ok(-Errno::Again.to_native());
+        }
+    };
+    let tid: Tid = thread_handle.id().into();
+    if clear_child_tid {
+        thread_handle.set_clear_child_tid(child_tid_ptr.offset().into());
+    }
+    let thread_id = thread_handle.id();
+
+    let env = ctx.data();
+    let memory = unsafe { env.memory_view(&ctx) };
+    if set_parent_tid
+        && !parent_tid_ptr.is_null()
+        && let Err(err) = parent_tid_ptr.write(&memory, tid as i32)
+    {
+        env.process.remove_thread(&thread_id);
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+    if set_child_tid
+        && !child_tid_ptr.is_null()
+        && let Err(err) = child_tid_ptr.write(&memory, tid as i32)
+    {
+        env.process.remove_thread(&thread_id);
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+
+    let state = env.state.clone();
+    let snapshot = capture_store_snapshot(&mut ctx.as_store_mut());
+    unwind::<M, _>(ctx, move |mut ctx, memory_stack, rewind_stack| {
+        let env_inner = ctx.data().inner();
+        let instance_handles = env_inner.main_module_instance_handles();
+        let module = instance_handles.module_clone();
+        let dynamic_linker = env_inner.linker().cloned();
+        let mut thread_env = ctx.data().clone();
+        thread_env.state = state;
+        thread_env.thread = thread_handle.as_thread();
+        thread_env.layout = layout;
+        thread_env.enable_deep_sleep = false;
+        let child_handle = thread_handle;
+        let tasks = thread_env.tasks().clone();
+        let spawn_type = if let Some(linker) = dynamic_linker {
+            let func_env = ctx.as_ref();
+            let store = ctx.as_store_mut();
+            SpawnType::NewLinkerInstanceGroup(linker, func_env, store, false)
+        } else {
+            let memory = instance_handles.memory_clone();
+            SpawnType::ShareMemory(memory, ctx.as_store_ref())
+        };
+
+        let memory_stack = memory_stack.freeze();
+        let rewind_stack = rewind_stack.freeze();
+        let store_data = match snapshot.serialize() {
+            Ok(store_data) => Bytes::from(store_data),
+            Err(err) => {
+                warn!("failed to serialize clone-thread store snapshot - {}", err);
+                ctx.data().process.remove_thread(&thread_id);
+                return OnCalledAction::Trap(Box::new(WasiError::Exit(Errno::Perm.into())));
+            }
+        };
+
+        let child_memory_stack = memory_stack.clone();
+        let child_rewind_stack = rewind_stack.clone();
+        let child_store_data = store_data.clone();
+        let spawn_result = tasks.task_wasm(
+            TaskWasm::new(
+                Box::new(move |props: TaskWasmRunProperties| {
+                    run_clone_thread::<M>(
+                        props.ctx,
+                        props.store,
+                        child_handle,
+                        child_memory_stack,
+                        child_rewind_stack,
+                        child_store_data.clone(),
+                    );
+                }),
+                thread_env,
+                module,
+                false,
+                false,
+            )
+            .with_globals(snapshot)
+            .with_memory(spawn_type),
+        );
+
+        if let Err(err) = spawn_result {
+            warn!("failed to spawn cloned thread - {}", err);
+            ctx.data().process.remove_thread(&thread_id);
+            match rewind::<M, _>(
+                ctx,
+                Some(memory_stack),
+                rewind_stack,
+                store_data,
+                CloneThreadResult {
+                    tid: 0,
+                    ret: Errno::Again,
+                },
+            ) {
+                Errno::Success => OnCalledAction::InvokeAgain,
+                err => OnCalledAction::Trap(Box::new(WasiError::Exit(err.into()))),
+            }
+        } else {
+            match rewind::<M, _>(
+                ctx,
+                Some(memory_stack),
+                rewind_stack,
+                store_data,
+                CloneThreadResult {
+                    tid,
+                    ret: Errno::Success,
+                },
+            ) {
+                Errno::Success => OnCalledAction::InvokeAgain,
+                err => OnCalledAction::Trap(Box::new(WasiError::Exit(err.into()))),
+            }
+        }
+    })
+    .map(|err| -err.to_native())
+}
+
+fn clone_thread_rewind_result<M: MemorySize>(result: CloneThreadResult) -> RewindResultType {
+    RewindResultType::RewindWithResult(
+        bincode::serde::encode_to_vec(&result, config::legacy())
+            .unwrap()
+            .into(),
+    )
+}
+
+fn run_clone_thread<M: MemorySize>(
+    ctx: WasiFunctionEnv,
+    store: Store,
+    child_handle: WasiThreadHandle,
+    memory_stack: Bytes,
+    rewind_stack: Bytes,
+    store_data: Bytes,
+) {
+    let layout = ctx.data(&store).layout.clone();
+    let rewind_state = RewindState {
+        memory_stack,
+        rewind_stack,
+        store_data,
+        start: ThreadStartType::ThreadSpawn { start_ptr: 0 },
+        layout,
+        is_64bit: M::is_64bit(),
+    };
+    run_clone_thread_from_rewind::<M>(
+        ctx,
+        store,
+        child_handle,
+        Some((
+            rewind_state,
+            clone_thread_rewind_result::<M>(CloneThreadResult {
+                tid: 0,
+                ret: Errno::Success,
+            }),
+        )),
+    );
+}
+
+fn run_clone_thread_from_rewind<M: MemorySize>(
+    ctx: WasiFunctionEnv,
+    mut store: Store,
+    child_handle: WasiThreadHandle,
+    rewind_state: Option<(RewindState, RewindResultType)>,
+) {
+    let env = ctx.data(&store);
+    let tasks = env.tasks().clone();
+    let pid = env.pid();
+    let tid = env.tid();
+
+    if let Some((rewind_state, rewind_result)) = rewind_state {
+        let mut ctx_mut = ctx.env.clone().into_mut(&mut store);
+        let res = rewind_ext::<M>(
+            &mut ctx_mut,
+            Some(rewind_state.memory_stack),
+            rewind_state.rewind_stack,
+            rewind_state.store_data,
+            rewind_result,
+        );
+        if res != Errno::Success {
+            child_handle.set_status_finished(Ok(res.into()));
+            return;
+        }
+    }
+
+    trace!(%pid, %tid, "re-invoking clone thread continuation");
+    let env_inner = ctx.data(&store).inner();
+    let module_handles = env_inner.main_module_instance_handles();
+    let Some(start) = module_handles.start.clone() else {
+        warn!(%pid, %tid, "cloned thread is missing _start export");
+        child_handle.set_status_finished(Ok(Errno::Noexec.into()));
+        return;
+    };
+
+    let mut ret: ExitCode = Errno::Success.into();
+    let (mut store, err) =
+        ContextSwitchingEnvironment::run_main_context(&ctx, store, start.into(), vec![]);
+    if let Err(err) = err {
+        match err.downcast::<WasiError>() {
+            Ok(WasiError::Exit(exit_code)) => {
+                ret = exit_code;
+            }
+            Ok(WasiError::ThreadExit) => {
+                ret = Errno::Success.into();
+            }
+            Ok(WasiError::DeepSleep(deep)) => {
+                trace!(%pid, %tid, "cloned thread entered a deep sleep");
+                let respawn = {
+                    let tasks = tasks.clone();
+                    let rewind_state = deep.rewind;
+                    move |ctx, store, rewind_result| {
+                        run_clone_thread_from_rewind::<M>(
+                            ctx,
+                            store,
+                            child_handle,
+                            Some((
+                                rewind_state,
+                                RewindResultType::RewindWithResult(rewind_result),
+                            )),
+                        );
+                    }
+                };
+                unsafe {
+                    tasks.resume_wasm_after_poller(Box::new(respawn), ctx, store, deep.trigger)
+                };
+                return;
+            }
+            _ => {
+                ret = Errno::Unknown.into();
+            }
+        }
+    }
+
+    trace!(%pid, %tid, "cloned thread exited (code = {})", ret);
+    ctx.on_exit(&mut store, Some(ret));
+    child_handle.set_status_finished(Ok(ret));
+    drop(child_handle);
+}
+
+fn supports_asyncified_fork(env: &WasiEnv) -> bool {
+    let handles = env.inner().main_module_instance_handles();
+    handles.asyncify_start_unwind.is_some()
+        && handles.asyncify_stop_unwind.is_some()
+        && handles.asyncify_start_rewind.is_some()
+        && handles.asyncify_stop_rewind.is_some()
+}
+
+fn proc_fork_common<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    copy_memory: Bool,
+    pid_ptr: Option<WasmPtr<Pid, M>>,
+) -> Result<ForkOutcome, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
 
     if let Some(context_switching_environment) = ctx.data().context_switching_environment.as_ref()
@@ -34,7 +416,10 @@ pub fn proc_fork<M: MemorySize>(
         warn!(
             "process forking is only supported from the main context when using WASIX context-switching features"
         );
-        return Ok(Errno::Notsup);
+        return Ok(ForkOutcome {
+            pid: 0,
+            ret: Errno::Notsup,
+        });
     }
 
     // If we were just restored then we need to return the value instead
@@ -47,18 +432,42 @@ pub fn proc_fork<M: MemorySize>(
                 result.pid, result.ret
             );
         }
-        let memory = unsafe { ctx.data().memory_view(&ctx) };
-        wasi_try_mem_ok!(pid_ptr.write(&memory, result.pid));
-        return Ok(result.ret);
+        if let Some(pid_ptr) = pid_ptr {
+            let memory = unsafe { ctx.data().memory_view(&ctx) };
+            if let Err(err) = pid_ptr.write(&memory, result.pid) {
+                return Ok(ForkOutcome {
+                    pid: 0,
+                    ret: crate::mem_error_to_wasi(err),
+                });
+            }
+        }
+        return Ok(ForkOutcome {
+            pid: result.pid,
+            ret: result.ret,
+        });
     }
     trace!(%copy_memory, "capturing");
 
     if let Some(vfork) = ctx.data().vfork.as_ref() {
         warn!("process forking not supported in an active vfork");
-        return Ok(Errno::Notsup);
+        return Ok(ForkOutcome {
+            pid: 0,
+            ret: Errno::Notsup,
+        });
     }
     if ctx.data().process.child_process_limit_reached() {
-        return Ok(Errno::Again);
+        return Ok(ForkOutcome {
+            pid: 0,
+            ret: Errno::Again,
+        });
+    }
+
+    if !supports_asyncified_fork(ctx.data()) {
+        warn!("process forking requires asyncify unwind and rewind exports");
+        return Ok(ForkOutcome {
+            pid: 0,
+            ret: Errno::Noexec,
+        });
     }
 
     // Fork the environment which will copy all the open file handlers
@@ -70,7 +479,10 @@ pub fn proc_fork<M: MemorySize>(
         Err(err) => {
             debug!("could not fork process: {err}");
             // TODO: evaluate the appropriate error code, document it in the spec.
-            return Ok(Errno::Perm);
+            return Ok(ForkOutcome {
+                pid: 0,
+                ret: Errno::Perm,
+            });
         }
     };
     let child_pid = child_env.process.pid();
@@ -86,12 +498,16 @@ pub fn proc_fork<M: MemorySize>(
     let memory = unsafe { env.memory_view(&ctx) };
 
     // Setup some properties in the child environment
-    wasi_try_mem_ok!(pid_ptr.write(&memory, 0));
+    if let Some(pid_ptr) = pid_ptr {
+        if let Err(err) = pid_ptr.write(&memory, 0) {
+            return Ok(ForkOutcome {
+                pid: 0,
+                ret: crate::mem_error_to_wasi(err),
+            });
+        }
+    }
     let pid = child_env.pid();
     let tid = child_env.tid();
-
-    // Pass some offsets to the unwind function
-    let pid_offset = pid_ptr.offset();
 
     // If we are not copying the memory then we act like a `vfork`
     // instead which will pretend to be the new process for a period
@@ -149,7 +565,8 @@ pub fn proc_fork<M: MemorySize>(
                     OnCalledAction::Trap(Box::new(WasiError::Exit(err.into())))
                 }
             }
-        });
+        })
+        .map(|ret| ForkOutcome { pid: 0, ret });
     }
 
     // Create the thread that will back this forked process
@@ -310,6 +727,7 @@ pub fn proc_fork<M: MemorySize>(
             }
         }
     })
+    .map(|ret| ForkOutcome { pid: 0, ret })
 }
 
 fn run<M: MemorySize>(

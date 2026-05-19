@@ -52,6 +52,7 @@ pub fn path_filestat_get<M: MemorySize>(
     let processes = env.control_plane.processes();
 
     let stat = wasi_try!(path_filestat_get_internal(
+        env,
         &memory,
         state,
         inodes,
@@ -71,6 +72,7 @@ pub fn path_filestat_get<M: MemorySize>(
 /// ### `path_filestat_get_internal()`
 /// return a Filstat or Errno
 pub(crate) fn path_filestat_get_internal(
+    env: &WasiEnv,
     memory: &MemoryView,
     state: &WasiState,
     inodes: &crate::WasiInodes,
@@ -91,6 +93,7 @@ pub(crate) fn path_filestat_get_internal(
     }
     if let Some(target) = proc_path_alias_target(state, inodes, path_string, process_tids) {
         return path_filestat_get_internal(
+            env,
             memory,
             state,
             inodes,
@@ -104,6 +107,7 @@ pub(crate) fn path_filestat_get_internal(
     }
     if let Some(target) = proc_pid_alias_target(state, inodes, current_pid, processes, path_string) {
         return path_filestat_get_internal(
+            env,
             memory,
             state,
             inodes,
@@ -132,14 +136,18 @@ pub(crate) fn path_filestat_get_internal(
         flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0,
     )?;
 
-    let st_ino = file_inode.ino().as_u64();
     let mut stat = if file_inode.is_preopened {
         *file_inode.stat.read().unwrap().deref()
     } else {
         let guard = file_inode.read();
         state.fs.get_stat_for_kind(guard.deref())?
     };
-    stat.st_ino = st_ino;
+    if let Some((hardlink_ino, hardlink_nlink)) = path_hardlink_stat_at(env, fd, path_string) {
+        stat.st_ino = hardlink_ino;
+        stat.st_nlink = hardlink_nlink;
+    } else if stat.st_ino == 0 {
+        stat.st_ino = file_inode.ino().as_u64();
+    }
     Ok(stat)
 }
 
@@ -660,6 +668,7 @@ pub fn path_filestat_get_old<M: MemorySize>(
     let processes = env.control_plane.processes();
 
     let stat = wasi_try!(path_filestat_get_internal(
+        env,
         &memory,
         state,
         inodes,

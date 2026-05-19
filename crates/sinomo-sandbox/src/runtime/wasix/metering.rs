@@ -1,3 +1,4 @@
+use crate::SandboxWasiError;
 use std::{
     fmt,
     sync::{Arc, Mutex},
@@ -27,6 +28,75 @@ pub(super) fn wasix_engine(timeout_ms: u64, instruction_metering: bool) -> wasme
     EngineBuilder::new(compiler)
         .set_features(Some(features))
         .into()
+}
+
+pub(super) fn wasix_module_supports_instruction_metering(
+    wasm: &[u8],
+) -> Result<bool, SandboxWasiError> {
+    if !wasm.starts_with(b"\0asm") {
+        return Ok(true);
+    }
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|error| SandboxWasiError::Runtime {
+            detail: format!("parse WASIX module metering compatibility: {error}"),
+        })? {
+            wasmparser::Payload::ImportSection(imports) => {
+                for import in imports.into_imports() {
+                    let import = import.map_err(|error| SandboxWasiError::Runtime {
+                        detail: format!("parse WASIX import for metering compatibility: {error}"),
+                    })?;
+                    if wasix_import_is_threading(import.module, import.name) {
+                        return Ok(false);
+                    }
+                    if let wasmparser::TypeRef::Memory(memory) = import.ty
+                        && memory.shared
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            wasmparser::Payload::MemorySection(memories) => {
+                for memory in memories {
+                    if memory
+                        .map_err(|error| SandboxWasiError::Runtime {
+                            detail: format!(
+                                "parse WASIX memory section for metering compatibility: {error}"
+                            ),
+                        })?
+                        .shared
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
+fn wasix_import_is_threading(module: &str, name: &str) -> bool {
+    matches!(
+        module,
+        "wasix_32v1" | "wasix_64v1" | "wasi" | "wasi_unstable" | "wasi_snapshot_preview1"
+    ) && matches!(
+        name,
+        "thread_spawn"
+            | "thread_spawn_v2"
+            | "thread-spawn"
+            | "thread_join"
+            | "thread_exit"
+            | "thread_id"
+            | "thread_sleep"
+            | "sleep"
+            | "usleep"
+            | "nanosleep"
+            | "clock_nanosleep"
+            | "thread_signal"
+            | "thread_parallelism"
+            | "futex_wait"
+            | "futex_wake"
+    )
 }
 
 fn wasix_metering_initial_limit(timeout_ms: u64) -> u64 {

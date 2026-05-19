@@ -6061,6 +6061,7 @@ dependencies = [
  "virtual-mio",
  "wasmer",
  "wasmer-types",
+ "wasmer-vm",
  "wasmer-wasix",
  "wasmparser 0.244.0",
  "wasmtime",
@@ -7079,8 +7080,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "virtual-fs"
 version = "0.700.0-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5379d6b36e66d4e9ada8a455f287335b2d21a7a5c032dedd03ea36bb1177c12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7589,8 +7588,6 @@ dependencies = [
 [[package]]
 name = "wasmer-vm"
 version = "7.0.0-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a85d49250f216d55987a05bddaddb511b136fd38508350102f1cb3d6edd1c4d"
 dependencies = [
  "backtrace",
  "cc",

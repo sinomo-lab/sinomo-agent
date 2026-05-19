@@ -74,6 +74,7 @@ impl std::fmt::Debug for ThreadPool {
 pub struct TokioTaskManager {
     rt: RuntimeOrHandle,
     pool: Arc<ThreadPool>,
+    wasm_thread_stack_size: Option<usize>,
 }
 
 impl TokioTaskManager {
@@ -95,7 +96,17 @@ impl TokioTaskManager {
                     .max_size(max_threads)
                     .build(),
             }),
+            wasm_thread_stack_size: None,
         }
+    }
+
+    pub fn new_with_wasm_thread_stack_size<I>(rt: I, wasm_thread_stack_size: usize) -> Self
+    where
+        I: Into<RuntimeOrHandle>,
+    {
+        let mut manager = Self::new(rt);
+        manager.wasm_thread_stack_size = Some(wasm_thread_stack_size);
+        manager
     }
 
     pub fn runtime_handle(&self) -> tokio::runtime::Handle {
@@ -104,6 +115,26 @@ impl TokioTaskManager {
 
     pub fn pool_handle(&self) -> Arc<ThreadPool> {
         self.pool.clone()
+    }
+
+    fn execute_wasm_blocking<F>(&self, task_name: &str, task: F) -> Result<(), WasiThreadError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if let Some(stack_size) = self.wasm_thread_stack_size {
+            std::thread::Builder::new()
+                .name(task_name.to_string())
+                .stack_size(stack_size)
+                .spawn(task)
+                .map(|_| ())
+                .map_err(|error| {
+                    tracing::error!("failed to spawn WASIX worker thread: {error}");
+                    WasiThreadError::InvalidWasmContext
+                })
+        } else {
+            self.pool.execute(task);
+            Ok(())
+        }
     }
 }
 
@@ -225,7 +256,7 @@ impl VirtualTaskManager for TokioTaskManager {
             let (mut ctx, mut store) = ret?;
 
             let mut trigger = trigger();
-            let pool = self.pool.clone();
+            let wasm_thread_stack_size = self.wasm_thread_stack_size;
             self.rt.handle().spawn(async move {
                 // We wait for either the trigger or for a snapshot to take place
                 let result = loop {
@@ -268,7 +299,11 @@ impl VirtualTaskManager for TokioTaskManager {
                 }
 
                 // Build the task that will go on the callback
-                pool.execute(move || {
+                let mut builder = std::thread::Builder::new().name("wasix-triggered-wasm".to_string());
+                if let Some(stack_size) = wasm_thread_stack_size {
+                    builder = builder.stack_size(stack_size);
+                }
+                let _ = builder.spawn(move || {
                     // Invoke the callback
                     run(TaskWasmRunProperties {
                         ctx,
@@ -284,7 +319,7 @@ impl VirtualTaskManager for TokioTaskManager {
             let (sx, rx) = std::sync::mpsc::channel();
 
             // Run the callback on a dedicated thread
-            self.pool.execute(move || {
+            self.execute_wasm_blocking("wasix-wasm", move || {
                 tracing::trace!("task_wasm started in blocking thread");
                 let (mut ctx, mut store) = match ret {
                     Ok(x) => {
@@ -308,7 +343,7 @@ impl VirtualTaskManager for TokioTaskManager {
                     trigger_result: None,
                     recycle,
                 });
-            });
+            })?;
 
             rx.recv()
                 .map_err(|_| WasiThreadError::InvalidWasmContext)??;
@@ -321,10 +356,9 @@ impl VirtualTaskManager for TokioTaskManager {
         &self,
         task: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), WasiThreadError> {
-        self.pool.execute(move || {
+        self.execute_wasm_blocking("wasix-dedicated", move || {
             task();
-        });
-        Ok(())
+        })
     }
 
     /// See [`VirtualTaskManager::thread_parallelism`].

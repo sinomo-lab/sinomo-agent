@@ -39,6 +39,9 @@ pub fn fd_close(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errn
         }
     }
     wasi_try_ok!(state.fs.close_fd(fd));
+    env.state.pidfds.lock().unwrap().remove(&fd);
+    env.state.timerfds.lock().unwrap().remove(&fd);
+    env.state.signalfds.lock().unwrap().remove(&fd);
     sync_process_metadata(env);
 
     #[cfg(feature = "journal")]

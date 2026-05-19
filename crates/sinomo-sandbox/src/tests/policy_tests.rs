@@ -501,13 +501,33 @@ fn sandbox_policy_allows_wasix_sh_when_child_process_capability_is_allowlisted()
 }
 
 #[test]
-fn sandbox_default_policy_uses_host_memory_and_unlimited_wall_time() {
+fn sandbox_default_policy_uses_host_memory_and_unlimited_size_limits() {
     let policy = SandboxPolicy::default();
 
     assert!(policy.max_limits.memory_mb > 0);
     assert_eq!(
         policy.max_limits.wall_time_ms,
         SANDBOX_UNLIMITED_WALL_TIME_MS
+    );
+    assert_eq!(
+        policy.max_limits.max_input_bytes,
+        SANDBOX_UNLIMITED_SIZE_LIMIT
+    );
+    assert_eq!(
+        policy.max_limits.max_output_bytes,
+        SANDBOX_UNLIMITED_SIZE_LIMIT
+    );
+    assert_eq!(
+        policy.max_limits.max_workspace_bytes,
+        SANDBOX_UNLIMITED_SIZE_LIMIT
+    );
+    assert_eq!(
+        policy.max_limits.max_written_bytes_per_command,
+        SANDBOX_UNLIMITED_SIZE_LIMIT
+    );
+    assert_eq!(
+        policy.max_limits.max_file_count,
+        SANDBOX_UNLIMITED_SIZE_LIMIT
     );
 }
 

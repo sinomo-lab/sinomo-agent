@@ -47,10 +47,17 @@ pub(crate) fn path_remove_directory_internal(
     let (memory, state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
     let working_dir = state.fs.get_fd(fd)?;
 
+    match path_parent_mutation_allowed_at(env, fd, path) {
+        Ok(true) => {}
+        Ok(false) => return Err(Errno::Access),
+        Err(err) => return Err(err),
+    }
+
     let (parent_inode, dir_name) =
         state
             .fs
             .get_parent_inode_at_path(inodes, fd, Path::new(path), true)?;
+    let _ = state.fs.get_inode_at_path(inodes, fd, path, true);
 
     let mut guard = parent_inode.write();
     match guard.deref_mut() {
@@ -84,6 +91,8 @@ pub(crate) fn path_remove_directory_internal(
                     parent_entries.remove(&dir_name).expect(
                         "Entry should exist since we checked before and have an exclusive write lock",
                     );
+                    path_remove_metadata_at(env, fd, path);
+                    path_touch_parent_at(env, fd, path);
                     return Ok(());
                 }
                 tracing::warn!(path = ?child_path, error = ?e, "failed to remove directory");
@@ -93,6 +102,9 @@ pub(crate) fn path_remove_directory_internal(
             parent_entries.remove(&dir_name).expect(
                 "Entry should exist since we checked before and have an exclusive write lock",
             );
+
+            path_remove_metadata_at(env, fd, path);
+            path_touch_parent_at(env, fd, path);
 
             Ok(())
         }

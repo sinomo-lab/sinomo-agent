@@ -1,7 +1,7 @@
 use tracing::trace;
 use wasmer::{
     AsStoreMut, AsStoreRef, ExportError, FunctionEnv, FunctionEnvMut, Imports, Instance, Memory,
-    MemoryView, Module, Store,
+    MemoryView, Module, Store, Type, Value,
 };
 use wasmer_wasix_types::{wasi::ExitCode, wasix::WasiMemoryLayout};
 
@@ -22,6 +22,7 @@ use super::Linker;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 const ROBUST_LIST_MAX_ENTRIES: usize = 4096;
+const TLS_DESTRUCTOR_PASSES: usize = 4;
 
 fn cleanup_robust_futex_list(
     memory: &MemoryView,
@@ -458,6 +459,7 @@ impl WasiFunctionEnv {
             self.data(store).tid()
         );
 
+        self.cleanup_thread_local_destructors(store);
         self.cleanup_thread_exit_user_memory(store);
 
         if let Some(linker) = self.data(store).inner().linker().cloned() {
@@ -470,6 +472,39 @@ impl WasiFunctionEnv {
 
         // Cleans up all the open files (if this is the main thread)
         self.data(store).blocking_on_exit(process_exit_code);
+    }
+
+    fn cleanup_thread_local_destructors(&self, store: &mut impl AsStoreMut) {
+        let pid = self.data(store).pid();
+        let tid = self.data(store).tid();
+        for pass in 0..TLS_DESTRUCTOR_PASSES {
+            let destructors = {
+                let env = self.data(store);
+                let values = env.thread.take_thread_local_values();
+                env.process.thread_local_destructors_for_values(values)
+            };
+
+            if destructors.is_empty() {
+                return;
+            }
+
+            let mut ctx = self.env.clone().into_mut(store);
+            for (key, destructor, value) in destructors {
+                call_thread_local_destructor(&mut ctx, pid.raw(), tid.raw(), key, destructor, value);
+            }
+
+            if pass + 1 == TLS_DESTRUCTOR_PASSES {
+                let remaining = self.data(store).thread.take_thread_local_values();
+                if !remaining.is_empty() {
+                    tracing::warn!(
+                        pid = %pid,
+                        tid = %tid,
+                        remaining_values = remaining.len(),
+                        "thread-local destructor pass limit reached"
+                    );
+                }
+            }
+        }
     }
 
     fn cleanup_thread_exit_user_memory(&self, store: &impl AsStoreRef) {
@@ -603,5 +638,86 @@ impl WasiFunctionEnv {
         tracing::debug!("bootstrap complete");
 
         Ok(rewind_state)
+    }
+}
+
+fn call_thread_local_destructor(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    pid: u32,
+    tid: u32,
+    key: u32,
+    destructor: u64,
+    value: u64,
+) {
+    let Ok(function_id) = u32::try_from(destructor) else {
+        tracing::warn!(
+            pid,
+            tid,
+            key,
+            destructor,
+            "thread-local destructor table index does not fit u32"
+        );
+        return;
+    };
+
+    let (env, mut store) = ctx.data_and_store_mut();
+    let function = match env
+        .inner()
+        .indirect_function_table_lookup(&mut store, function_id)
+    {
+        Ok(function) => function,
+        Err(err) => {
+            tracing::warn!(
+                pid,
+                tid,
+                key,
+                destructor = function_id,
+                ?err,
+                "failed to resolve thread-local destructor"
+            );
+            return;
+        }
+    };
+
+    let function_type = function.ty(&store);
+    let params = function_type.params();
+    let results = function_type.results();
+    if !results.is_empty() {
+        tracing::warn!(
+            pid,
+            tid,
+            key,
+            destructor = function_id,
+            "thread-local destructor must not return values"
+        );
+        return;
+    }
+
+    let args = match params {
+        [Type::I32] => vec![Value::I32(value as u32 as i32)],
+        [Type::I64] => vec![Value::I64(value as i64)],
+        _ => {
+            tracing::warn!(
+                pid,
+                tid,
+                key,
+                destructor = function_id,
+                params = ?params,
+                "thread-local destructor has unsupported signature"
+            );
+            return;
+        }
+    };
+
+    if let Err(err) = function.call(&mut store, &args) {
+        let err = crate::flatten_runtime_error(err);
+        tracing::warn!(
+            pid,
+            tid,
+            key,
+            destructor = function_id,
+            ?err,
+            "thread-local destructor failed"
+        );
     }
 }

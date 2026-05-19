@@ -4,6 +4,7 @@
 #include_next <signal.h>
 
 #include <errno.h>
+#include <sys/types.h>
 
 #ifndef SIG_BLOCK
 #define SIG_BLOCK 0
@@ -73,6 +74,43 @@ static inline int sigsuspend(const sigset_t *mask)
     (void)mask;
     errno = ENOTSUP;
     return -1;
+}
+
+static inline int kill(pid_t pid, int sig)
+{
+#if defined(SINOMO_BUSYBOX_WASIX)
+    __attribute__((import_module("wasix_32v1"), import_name("kill")))
+    extern int __sinomo_wasix_kill(int pid, int sig);
+    int result = __sinomo_wasix_kill((int)pid, sig);
+    if (result == 0) {
+        return 0;
+    }
+    errno = -result;
+    return -1;
+#else
+    (void)pid;
+    (void)sig;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static inline int raise(int sig)
+{
+#if defined(SINOMO_BUSYBOX_WASIX)
+    __attribute__((import_module("wasix_32v1"), import_name("raise")))
+    extern int __sinomo_wasix_raise(int sig);
+    int result = __sinomo_wasix_raise(sig);
+    if (result == 0) {
+        return 0;
+    }
+    errno = -result;
+    return -1;
+#else
+    (void)sig;
+    errno = ENOTSUP;
+    return -1;
+#endif
 }
 
 #endif

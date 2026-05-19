@@ -2879,17 +2879,26 @@ fn print_sandbox_policy_config(
         "max wall time ms: {}",
         format_sandbox_wall_time_ms(policy.max_limits.wall_time_ms)
     );
-    println!("max input bytes: {}", policy.max_limits.max_input_bytes);
-    println!("max output bytes: {}", policy.max_limits.max_output_bytes);
+    println!(
+        "max input bytes: {}",
+        format_sandbox_size_limit(policy.max_limits.max_input_bytes)
+    );
+    println!(
+        "max output bytes: {}",
+        format_sandbox_size_limit(policy.max_limits.max_output_bytes)
+    );
     println!(
         "max workspace bytes: {}",
-        policy.max_limits.max_workspace_bytes
+        format_sandbox_size_limit(policy.max_limits.max_workspace_bytes)
     );
     println!(
         "max written bytes per command: {}",
-        policy.max_limits.max_written_bytes_per_command
+        format_sandbox_size_limit(policy.max_limits.max_written_bytes_per_command)
     );
-    println!("max file count: {}", policy.max_limits.max_file_count);
+    println!(
+        "max file count: {}",
+        format_sandbox_size_limit(policy.max_limits.max_file_count)
+    );
     println!("max http timeout ms: {}", policy.max_http_timeout_ms);
     println!(
         "max concurrent commands per sandbox: {}",
@@ -2903,6 +2912,14 @@ fn print_sandbox_policy_config(
 
 fn format_sandbox_wall_time_ms(value: u64) -> String {
     if value == sinomo_runtime::sandbox::SANDBOX_UNLIMITED_WALL_TIME_MS {
+        "unlimited".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_sandbox_size_limit(value: u64) -> String {
+    if value == sinomo_runtime::sandbox::SANDBOX_UNLIMITED_SIZE_LIMIT {
         "unlimited".to_string()
     } else {
         value.to_string()

@@ -200,8 +200,7 @@ pub fn run_exec(props: TaskWasmRunProperties) {
 
         if let Err(err) = result {
             thread.thread.set_status_finished(Err(err.into()));
-            ctx.data(&store)
-                .blocking_on_exit(Some(Errno::Noexec.into()));
+            ctx.on_exit(&mut store, Some(Errno::Noexec.into()));
             unsafe { run_recycle(recycle, ctx, store) };
             return;
         }
@@ -215,8 +214,7 @@ pub fn run_exec(props: TaskWasmRunProperties) {
         Err(err) => {
             tracing::warn!("failed to bootstrap - {}", err);
             thread.thread.set_status_finished(Err(err));
-            ctx.data(&store)
-                .blocking_on_exit(Some(Errno::Noexec.into()));
+            ctx.on_exit(&mut store, Some(Errno::Noexec.into()));
             unsafe { run_recycle(recycle, ctx, store) };
             return;
         }
@@ -267,8 +265,10 @@ fn call_module(
                 rewind_result,
             );
             if res != Errno::Success {
-                ctx.data().blocking_on_exit(Some(res.into()));
-                unsafe { run_recycle(recycle, WasiFunctionEnv { env: ctx.as_ref() }, store) };
+                let cleanup_ctx = WasiFunctionEnv { env: ctx.as_ref() };
+                drop(ctx);
+                cleanup_ctx.on_exit(&mut store, Some(res.into()));
+                unsafe { run_recycle(recycle, cleanup_ctx, store) };
                 return;
             }
         } else {
@@ -280,8 +280,10 @@ fn call_module(
                 rewind_result,
             );
             if res != Errno::Success {
-                ctx.data().blocking_on_exit(Some(res.into()));
-                unsafe { run_recycle(recycle, WasiFunctionEnv { env: ctx.as_ref() }, store) };
+                let cleanup_ctx = WasiFunctionEnv { env: ctx.as_ref() };
+                drop(ctx);
+                cleanup_ctx.on_exit(&mut store, Some(res.into()));
+                unsafe { run_recycle(recycle, cleanup_ctx, store) };
                 return;
             }
         };
@@ -291,8 +293,7 @@ fn call_module(
     // Call the module
     let Some(start) = get_start(&ctx, &store) else {
         debug!("wasi[{}]::exec-failed: missing _start function", pid);
-        ctx.data(&store)
-            .blocking_on_exit(Some(Errno::Noexec.into()));
+        ctx.on_exit(&mut store, Some(Errno::Noexec.into()));
         unsafe { run_recycle(recycle, ctx, store) };
         return;
     };
@@ -376,8 +377,25 @@ fn call_module(
             Some(s) => s,
             None => {
                 let err_display = err.display(&mut store);
-                error!("{err_display}");
-                eprintln!("{err_display}");
+                let mut detail = err_display.to_string();
+                if let WasiRuntimeError::Runtime(runtime_error) = err {
+                    let trace = runtime_error.trace();
+                    if !trace.is_empty() {
+                        detail.push_str("; wasm trace:");
+                        for frame in trace.iter().take(32) {
+                            detail.push_str(&format!(
+                                " {}:{}",
+                                frame.module_name(),
+                                frame.function_name().unwrap_or("<unknown>")
+                            ));
+                        }
+                        if trace.len() > 32 {
+                            detail.push_str(&format!(" ... +{} frames", trace.len() - 32));
+                        }
+                    }
+                }
+                error!("{detail}");
+                eprintln!("{detail}");
                 Errno::Noexec.into()
             }
         }
@@ -385,12 +403,14 @@ fn call_module(
         Errno::Success.into()
     };
 
-    // Cleanup the environment
-    ctx.data(&store).blocking_on_exit(Some(code));
-    unsafe { run_recycle(recycle, ctx, store) };
-
     debug!("wasi[{pid}]::main() has exited with {code}");
+
+    // Cleanup the environment. Runtime errors must be recorded on the main
+    // thread before process termination, otherwise cleanup overwrites them
+    // with the fallback numeric exit code and hides the actual trap.
+    ctx.on_exit(&mut store, Some(code));
     handle.thread.set_status_finished(ret.map(|a| a.into()));
+    unsafe { run_recycle(recycle, ctx, store) };
 }
 
 #[allow(clippy::type_complexity)]

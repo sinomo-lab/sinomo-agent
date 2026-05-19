@@ -88,6 +88,9 @@ impl Commands {
     ) -> Result<TaskJoinHandle, SpawnError> {
         let path = path.to_string();
         if let Some(cmd) = self.commands.get(&path) {
+            if let Some(env) = builder.as_ref() {
+                block_on(env.state.fs.close_cloexec_fds());
+            }
             cmd.exec(parent_ctx, path.as_str(), builder)
         } else {
             unsafe {

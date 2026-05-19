@@ -19,6 +19,7 @@ wasix-runtime = [
     "dep:virtual-mio",
     "dep:wasmer",
     "dep:wasmer-types",
+    "dep:wasmer-vm",
     "dep:wasmer-wasix",
     "dep:wasmparser",
     "dep:webc",
@@ -48,6 +49,7 @@ virtual-fs = { version = "0.700.0-alpha.2", default-features = false, optional =
 virtual-mio = { version = "0.700.0-alpha.2", default-features = false, optional = true }
 wasmer = { version = "=7.0.0-alpha.2", default-features = false, features = ["sys-default", "cranelift", "experimental-async"], optional = true }
 wasmer-types = { version = "=7.0.0-alpha.2", default-features = false, optional = true }
+wasmer-vm = { version = "=7.0.0-alpha.2", default-features = false, optional = true }
 wasmer-wasix = { version = "0.700.0-alpha.2", default-features = false, features = ["sys-minimal", "host-fs", "host-vnet"], optional = true }
 wasmparser = { version = "0.244.0", default-features = false, optional = true }
 webc = { version = "10.0.1", default-features = false, optional = true }

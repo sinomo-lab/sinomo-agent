@@ -82,6 +82,7 @@ impl JournalEffector {
                 },
                 RewindResultType::RewindRestart,
             )),
+            true,
         )
         .map_err(|err| anyhow::format_err!("failed to spawn thread - {err}"))?;
 

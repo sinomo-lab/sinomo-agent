@@ -34,33 +34,38 @@ pub struct SandboxMount {
 pub struct SandboxResourceLimits {
     pub memory_mb: u64,
     pub wall_time_ms: u64,
-    #[serde(default = "SandboxResourceLimits::default_max_input_bytes")]
+    #[serde(default = "SandboxResourceLimits::default_size_limit")]
     pub max_input_bytes: u64,
+    #[serde(default = "SandboxResourceLimits::default_size_limit")]
     pub max_output_bytes: u64,
+    #[serde(default = "SandboxResourceLimits::default_size_limit")]
     pub max_workspace_bytes: u64,
+    #[serde(default = "SandboxResourceLimits::default_size_limit")]
     pub max_written_bytes_per_command: u64,
+    #[serde(default = "SandboxResourceLimits::default_size_limit")]
     pub max_file_count: u64,
 }
 
 pub const SANDBOX_UNLIMITED_WALL_TIME_MS: u64 = u64::MAX;
+pub const SANDBOX_UNLIMITED_SIZE_LIMIT: u64 = u64::MAX;
 
 impl Default for SandboxResourceLimits {
     fn default() -> Self {
         Self {
             memory_mb: host_memory_limit_mb(),
             wall_time_ms: SANDBOX_UNLIMITED_WALL_TIME_MS,
-            max_input_bytes: Self::default_max_input_bytes(),
-            max_output_bytes: 16 * 1024 * 1024,
-            max_workspace_bytes: 1024 * 1024 * 1024,
-            max_written_bytes_per_command: 128 * 1024 * 1024,
-            max_file_count: 100_000,
+            max_input_bytes: SANDBOX_UNLIMITED_SIZE_LIMIT,
+            max_output_bytes: SANDBOX_UNLIMITED_SIZE_LIMIT,
+            max_workspace_bytes: SANDBOX_UNLIMITED_SIZE_LIMIT,
+            max_written_bytes_per_command: SANDBOX_UNLIMITED_SIZE_LIMIT,
+            max_file_count: SANDBOX_UNLIMITED_SIZE_LIMIT,
         }
     }
 }
 
 impl SandboxResourceLimits {
-    pub fn default_max_input_bytes() -> u64 {
-        16 * 1024 * 1024
+    pub fn default_size_limit() -> u64 {
+        SANDBOX_UNLIMITED_SIZE_LIMIT
     }
 }
 

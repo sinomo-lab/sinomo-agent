@@ -24,11 +24,12 @@ pub fn futex_wake_all<M: MemorySize>(
     let woken = {
         let mut guard = state.futexs.lock().unwrap();
         if let Some(futex) = guard.futexes.remove(&pointer) {
-            let mut woke_waiter = false;
-            for waker in futex.wakers {
-                if let Some(waker) = waker.1 {
+            let woke_waiter = !futex.wakers.is_empty();
+            for (poller_idx, waker) in futex.wakers {
+                guard.poller_futexes.remove(&poller_idx);
+                guard.woken_pollers.insert(poller_idx);
+                if let Some(waker) = waker {
                     waker.wake();
-                    woke_waiter = true;
                 }
             }
             tracing::trace!("wake_all (hit) on {pointer}");

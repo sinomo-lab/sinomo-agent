@@ -1,5 +1,6 @@
 use super::*;
 use crate::{WasiProcess, WasiProcessId, syscalls::*};
+use wasmer::FromToNativeWasmType;
 
 /// ### `proc_getpgid()`
 /// Returns the process group ID for the selected process.
@@ -35,6 +36,28 @@ pub fn proc_getpgrp<M: MemorySize>(
     Errno::Success
 }
 
+/// ### `getpgrp()`
+/// POSIX-shaped process group id wrapper.
+#[instrument(level = "trace", skip_all, fields(pgid = field::Empty), ret)]
+pub fn getpgrp(ctx: FunctionEnvMut<'_, WasiEnv>) -> i32 {
+    let pgid = ctx.data().process.pgid().raw();
+    Span::current().record("pgid", pgid);
+    pgid as i32
+}
+
+/// ### `getpgid()`
+/// POSIX-shaped process group lookup.
+#[instrument(level = "trace", skip_all, fields(%pid, pgid = field::Empty), ret)]
+pub fn getpgid(ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid) -> i32 {
+    let env = ctx.data();
+    let Some(process) = selected_process(env, pid) else {
+        return -Errno::Badf.to_native();
+    };
+    let pgid = process.pgid().raw();
+    Span::current().record("pgid", pgid);
+    pgid as i32
+}
+
 /// ### `proc_getsid()`
 /// Returns the session ID for the selected process.
 #[instrument(level = "trace", skip_all, fields(%pid, sid = field::Empty), ret)]
@@ -52,6 +75,19 @@ pub fn proc_getsid<M: MemorySize>(
     let memory = unsafe { env.memory_view(&ctx) };
     wasi_try_mem!(ret_sid.write(&memory, sid as Pid));
     Errno::Success
+}
+
+/// ### `getsid()`
+/// POSIX-shaped session id lookup.
+#[instrument(level = "trace", skip_all, fields(%pid, sid = field::Empty), ret)]
+pub fn getsid(ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid) -> i32 {
+    let env = ctx.data();
+    let Some(process) = selected_process(env, pid) else {
+        return -Errno::Badf.to_native();
+    };
+    let sid = process.session_id().raw();
+    Span::current().record("sid", sid);
+    sid as i32
 }
 
 /// ### `proc_setpgid()`
@@ -78,6 +114,9 @@ pub fn proc_setpgid(mut ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid, pgid: Pid) -
     if process.pid() != env.process.pid() && process.ppid() != env.process.pid() {
         return Ok(Errno::Perm);
     }
+    if process.session_id() == process.pid() {
+        return Ok(Errno::Perm);
+    }
     if process.session_id() != env.process.session_id() {
         return Ok(Errno::Perm);
     }
@@ -87,6 +126,13 @@ pub fn proc_setpgid(mut ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid, pgid: Pid) -
 
     process.set_process_group_id(target_pgid);
     Ok(Errno::Success)
+}
+
+/// ### `setpgid()`
+/// POSIX-shaped process group setter. Returns 0 on success or a negative errno.
+#[instrument(level = "trace", skip_all, fields(%pid, %pgid), ret)]
+pub fn setpgid(ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid, pgid: Pid) -> Result<i32, WasiError> {
+    Ok(errno_to_posix_unit(proc_setpgid(ctx, pid, pgid)?))
 }
 
 /// ### `proc_setsid()`
@@ -110,6 +156,24 @@ pub fn proc_setsid<M: MemorySize>(
     let memory = unsafe { env.memory_view(&ctx) };
     wasi_try_mem_ok!(ret_sid.write(&memory, sid as Pid));
     Ok(Errno::Success)
+}
+
+/// ### `setsid()`
+/// POSIX-shaped session creator. Returns the new session id or a negative errno.
+#[instrument(level = "trace", skip_all, fields(sid = field::Empty), ret)]
+pub fn setsid(mut ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    if env.process.pgid() == env.process.pid() {
+        return Ok(-Errno::Perm.to_native());
+    }
+
+    let mut process = env.process.clone();
+    process.create_session();
+    let sid = process.session_id().raw();
+    Span::current().record("sid", sid);
+    Ok(sid as i32)
 }
 
 /// ### `proc_tcgetpgrp()`
@@ -158,6 +222,40 @@ pub fn proc_tcgetsid<M: MemorySize>(
     Ok(Errno::Success)
 }
 
+/// ### `tcgetpgrp()`
+/// POSIX-shaped foreground process-group lookup.
+#[instrument(level = "trace", skip_all, fields(%fd, pgid = field::Empty), ret)]
+pub fn tcgetpgrp(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    if let Err(err) = validate_terminal_fd(env, fd) {
+        return Ok(-err.to_native());
+    }
+    let pgid = env
+        .runtime
+        .tty()
+        .and_then(|bridge| bridge.foreground_process_group())
+        .unwrap_or_else(|| env.process.pgid().raw());
+    Span::current().record("pgid", pgid);
+    Ok(pgid as i32)
+}
+
+/// ### `tcgetsid()`
+/// POSIX-shaped terminal session lookup.
+#[instrument(level = "trace", skip_all, fields(%fd, sid = field::Empty), ret)]
+pub fn tcgetsid(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    if let Err(err) = validate_terminal_fd(env, fd) {
+        return Ok(-err.to_native());
+    }
+    let sid = terminal_session_id(env).unwrap_or_else(|| env.process.session_id());
+    Span::current().record("sid", sid.raw());
+    Ok(sid.raw() as i32)
+}
+
 /// ### `proc_tcsetpgrp()`
 /// Sets the foreground process group for the controlling terminal.
 #[instrument(level = "trace", skip_all, fields(%fd, %pgid), ret)]
@@ -196,6 +294,13 @@ pub fn proc_tcsetpgrp(
     }
     bridge.set_foreground_process_group(pgid.raw());
     Ok(Errno::Success)
+}
+
+/// ### `tcsetpgrp()`
+/// POSIX-shaped foreground process-group setter.
+#[instrument(level = "trace", skip_all, fields(%fd, %pgid), ret)]
+pub fn tcsetpgrp(ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd, pgid: Pid) -> Result<i32, WasiError> {
+    Ok(errno_to_posix_unit(proc_tcsetpgrp(ctx, fd, pgid)?))
 }
 
 /// ### `proc_tty_get_tostop()`
@@ -244,6 +349,14 @@ fn selected_process(env: &WasiEnv, pid: Pid) -> Option<WasiProcess> {
         Some(env.process.clone())
     } else {
         env.control_plane.get_process(WasiProcessId::from(pid))
+    }
+}
+
+fn errno_to_posix_unit(errno: Errno) -> i32 {
+    if errno == Errno::Success {
+        0
+    } else {
+        -errno.to_native()
     }
 }
 

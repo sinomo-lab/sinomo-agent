@@ -75,6 +75,21 @@ pub fn path_rename_internal(
             return Ok(Errno::Access);
         }
     }
+    match path_parent_mutation_allowed_at(env, source_fd, source_path) {
+        Ok(true) => {}
+        Ok(false) => return Ok(Errno::Access),
+        Err(err) => return Ok(err),
+    }
+    match path_parent_mutation_allowed_at(env, target_fd, target_path) {
+        Ok(true) => {}
+        Ok(false) => return Ok(Errno::Access),
+        Err(err) => return Ok(err),
+    }
+    match path_rename_symlink_at(env, source_fd, source_path, target_fd, target_path) {
+        Errno::Success => return Ok(Errno::Success),
+        Errno::Noent => {}
+        err => return Ok(err),
+    }
 
     // this is to be sure the source file is fetched from the filesystem if needed
     wasi_try_ok!(
@@ -99,12 +114,14 @@ pub fn path_rename_internal(
         true
     ));
     let mut need_create = true;
+    let mut target_existing_entry = None;
     let host_adjusted_target_path = {
         let guard = target_parent_inode.read();
         match guard.deref() {
             Kind::Dir { entries, path, .. } => {
-                if entries.contains_key(&target_entry_name) {
+                if let Some(entry) = entries.get(&target_entry_name) {
                     need_create = false;
+                    target_existing_entry = Some(entry.clone());
                 }
                 path.join(&target_entry_name)
             }
@@ -145,35 +162,51 @@ pub fn path_rename_internal(
     };
 
     let source_nlink = source_entry.stat.read().unwrap().st_nlink;
+    let target_physical_file_to_replace = target_existing_entry.as_ref().and_then(|entry| {
+        let guard = entry.read();
+        match guard.deref() {
+            Kind::File { path, .. } => Some(path.clone()),
+            _ => None,
+        }
+    });
 
     {
         let mut guard = source_entry.write();
         match guard.deref_mut() {
             Kind::File { path, .. } => {
-                if source_nlink <= 1 {
-                    let result = {
-                        let path_clone = path.clone();
-                        drop(guard);
-                        let state = state;
-                        let host_adjusted_target_path = host_adjusted_target_path.clone();
-                        __asyncify_light(env, None, async move {
-                            state.fs_rename(path_clone, &host_adjusted_target_path).await
-                        })?
-                    };
-                    // if the above operation failed we have to revert the previous change and then fail
-                    if let Err(e) = result {
+                if let Some(target_path) = target_physical_file_to_replace.as_ref() {
+                    if let Err(err) = state.fs_remove_file(target_path)
+                        && err != Errno::Noent
+                    {
                         let mut guard = source_parent_inode.write();
                         if let Kind::Dir { entries, .. } = guard.deref_mut() {
                             entries.insert(source_entry_name, source_entry.clone());
-                            return Ok(e);
                         }
+                        return Ok(err);
+                    }
+                }
+                let result = {
+                    let path_clone = path.clone();
+                    drop(guard);
+                    let state = state;
+                    let host_adjusted_target_path = host_adjusted_target_path.clone();
+                    __asyncify_light(env, None, async move {
+                        state.fs_rename(path_clone, &host_adjusted_target_path).await
+                    })?
+                };
+                // if the above operation failed we have to revert the previous change and then fail
+                if let Err(e) = result {
+                    let mut guard = source_parent_inode.write();
+                    if let Kind::Dir { entries, .. } = guard.deref_mut() {
+                        entries.insert(source_entry_name, source_entry.clone());
+                        return Ok(e);
+                    }
+                } else {
+                    let mut guard = source_entry.write();
+                    if let Kind::File { path, .. } = guard.deref_mut() {
+                        *path = host_adjusted_target_path;
                     } else {
-                        let mut guard = source_entry.write();
-                        if let Kind::File { path, .. } = guard.deref_mut() {
-                            *path = host_adjusted_target_path;
-                        } else {
-                            unreachable!()
-                        }
+                        unreachable!()
                     }
                 }
             }
@@ -248,6 +281,7 @@ pub fn path_rename_internal(
     // The target entry is created, one way or the other
     *source_entry.name.write().unwrap() = target_entry_name.into();
     source_entry.stat.write().unwrap().st_size = source_size;
+    path_rename_metadata_at(env, source_fd, source_path, target_fd, target_path);
 
     Ok(Errno::Success)
 }

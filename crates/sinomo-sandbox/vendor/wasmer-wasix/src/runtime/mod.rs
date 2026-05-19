@@ -81,6 +81,12 @@ where
         Engine::default()
     }
 
+    /// Stack size allocated by the WASIX dynamic linker for dynamically linked
+    /// main modules.
+    fn dynamic_linker_stack_size(&self) -> u64 {
+        8 * 1024 * 1024
+    }
+
     fn engine_with_suggested_opts(
         &self,
         suggested_opts: &SuggestedCompilerOptimizations,
@@ -310,6 +316,7 @@ pub struct PluggableRuntime {
     pub package_loader: Arc<dyn PackageLoader + Send + Sync>,
     pub source: Arc<dyn Source + Send + Sync>,
     pub engine: Engine,
+    pub dynamic_linker_stack_size: u64,
     pub module_cache: Arc<dyn ModuleCache + Send + Sync>,
     pub tty: Option<Arc<dyn TtyBridge + Send + Sync>>,
     #[cfg(feature = "journal")]
@@ -346,6 +353,7 @@ impl PluggableRuntime {
             networking,
             http_client,
             engine: Default::default(),
+            dynamic_linker_stack_size: 8 * 1024 * 1024,
             tty: Some(Arc::new(DefaultTty::default())),
             source: Arc::new(source),
             package_loader: Arc::new(loader),
@@ -367,6 +375,11 @@ impl PluggableRuntime {
 
     pub fn set_engine(&mut self, engine: Engine) -> &mut Self {
         self.engine = engine;
+        self
+    }
+
+    pub fn set_dynamic_linker_stack_size(&mut self, stack_size: u64) -> &mut Self {
+        self.dynamic_linker_stack_size = stack_size;
         self
     }
 
@@ -436,6 +449,10 @@ impl Runtime for PluggableRuntime {
 
     fn engine(&self) -> Engine {
         self.engine.clone()
+    }
+
+    fn dynamic_linker_stack_size(&self) -> u64 {
+        self.dynamic_linker_stack_size
     }
 
     fn new_store(&self) -> wasmer::Store {

@@ -896,6 +896,23 @@ static inline int sinomo_wasi_nice(int increment)\
 #  define setpriority(which, who, priority) sinomo_wasi_setpriority((which), (who), (priority))\
 #  define nice(increment) sinomo_wasi_nice((increment))\
 # endif\
+static inline int sinomo_wasi_chdir(const char *path)\
+{\
+#if defined(SINOMO_BUSYBOX_PREVIEW1_EXTENSIONS)\
+	(void) path;\
+	errno = ENOTSUP;\
+	return -1;\
+#else\
+	__attribute__((import_module("wasix_32v1"), import_name("chdir")))\
+	int sinomo_wasix_chdir_import(const char *path);\
+	int rc = sinomo_wasix_chdir_import(path);\
+	if (rc == 0)\
+		return 0;\
+	errno = -rc;\
+	return -1;\
+#endif\
+}\
+# define chdir(path) sinomo_wasi_chdir((path))\
 static inline int sinomo_wasi_fchdir(int fd)\
 {\
 #if defined(SINOMO_BUSYBOX_PREVIEW1_EXTENSIONS)\
@@ -908,7 +925,7 @@ static inline int sinomo_wasi_fchdir(int fd)\
 	int rc = sinomo_wasix_fchdir_import(fd);\
 	if (rc == 0)\
 		return 0;\
-	errno = rc;\
+	errno = -rc;\
 	return -1;\
 #endif\
 }\
@@ -994,7 +1011,7 @@ if [ "${BUSYBOX_TARGET_ABI}" = "wasix" ]; then
     BUSYBOX_TARGET_SUFFIX="wasix"
     BUSYBOX_SYSROOT="${WASIX_SYSROOT}"
     WASI_CC="${WASI_SDK}/bin/clang --target=${BUSYBOX_TARGET_TRIPLE} --sysroot=${BUSYBOX_SYSROOT}"
-    WASI_CC_FLAGS="-Os -DSINOMO_BUSYBOX_WASI_COMPAT -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -fno-ident -fdebug-prefix-map=${BUSYBOX_SRC}=busybox-${BUSYBOX_VERSION} -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -ftls-model=local-exec -msimd128 -mrelaxed-simd -mextended-const"
+    WASI_CC_FLAGS="-Os -DSINOMO_BUSYBOX_WASI_COMPAT -DSINOMO_BUSYBOX_WASIX -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -fno-ident -fdebug-prefix-map=${BUSYBOX_SRC}=busybox-${BUSYBOX_VERSION} -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -ftls-model=local-exec -msimd128 -mrelaxed-simd -mextended-const"
     WASI_LD_FLAGS="-Wl,--export-all -Wl,--export-dynamic -Wl,--shared-memory -Wl,--import-memory -Wl,--extra-features=atomics -Wl,--extra-features=bulk-memory -Wl,--extra-features=mutable-globals -Wl,--export=__wasm_call_ctors -Wl,--export=__wasm_init_tls -Wl,--export=__wasm_signal -Wl,--export=__tls_size -Wl,--export=__tls_align -Wl,--export=__tls_base -Wl,--export-if-defined=__indirect_function_table -Wl,--export-if-defined=__stack_pointer -Wl,--export-if-defined=__heap_base -Wl,--export-if-defined=__data_end -Wl,-z,stack-size=1048576 -Wl,--initial-memory=67108864 -Wl,--max-memory=268435456"
     WASI_LD_LIBS="-lwasi-emulated-getpid -lwasi-emulated-mman -lwasi-emulated-process-clocks -lresolv -lrt -lm -lpthread -lutil"
     SINOMO_WASIX_ARGV_COMPAT_SOURCE="${WORKDIR}/sinomo-wasix-argv-compat.c"

@@ -79,7 +79,7 @@ pub use unix::*;
 pub use wasm::*;
 
 pub(crate) use virtual_fs::{
-    AsyncSeekExt, AsyncWriteExt, DuplexPipe, FileSystem, FsError, VirtualFile,
+    AsyncReadExt, AsyncSeekExt, AsyncWriteExt, DuplexPipe, FileSystem, FsError, VirtualFile,
 };
 pub(crate) use virtual_net::StreamSecurity;
 pub(crate) use wasmer::{
@@ -507,7 +507,13 @@ where
         // Create the deep sleeper
         // Deep sleep breaks the linker completely, as it expects other modules to catch the
         // signal for DL ops
-        let tasks_for_deep_sleep = if env.enable_deep_sleep && env.inner().linker().is_none() {
+        let is_main_thread = env.tid().raw() == env.pid().raw();
+        let is_only_thread = env.process.all_threads().len() == 1;
+        let tasks_for_deep_sleep = if is_main_thread
+            && is_only_thread
+            && env.enable_deep_sleep
+            && env.inner().linker().is_none()
+        {
             Some(env.tasks().clone())
         } else {
             None

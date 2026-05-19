@@ -120,10 +120,10 @@ impl WasiControlPlane {
     pub(crate) fn register_task(&self) -> Result<TaskCountGuard, ControlPlaneError> {
         let count = self.state.task_count.fetch_add(1, Ordering::SeqCst);
         if let Some(max) = self.state.config.max_task_count
-            && count > max
+            && count >= max
         {
             self.state.task_count.fetch_sub(1, Ordering::SeqCst);
-            return Err(ControlPlaneError::TaskLimitReached { max: count });
+            return Err(ControlPlaneError::TaskLimitReached { max });
         }
         Ok(TaskCountGuard(self.state.task_count.clone()))
     }
@@ -290,5 +290,30 @@ mod tests {
             p.new_process(ModuleHash::random()).unwrap_err(),
             ControlPlaneError::TaskLimitReached { max: 2 }
         );
+    }
+
+    #[test]
+    fn test_control_plane_rejects_task_at_limit() {
+        let p = WasiControlPlane::new(ControlPlaneConfig {
+            max_task_count: Some(2),
+            enable_asynchronous_threading: false,
+            enable_exponential_cpu_backoff: None,
+        });
+
+        let p1 = p.new_process(ModuleHash::random()).unwrap();
+        let _t1 = p1
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+        let _t2 = p1
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+
+        assert_eq!(p.active_task_count(), 2);
+        assert_eq!(
+            p1.new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+                .unwrap_err(),
+            ControlPlaneError::TaskLimitReached { max: 2 }
+        );
+        assert_eq!(p.active_task_count(), 2);
     }
 }

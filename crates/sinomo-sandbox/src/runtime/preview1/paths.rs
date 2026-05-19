@@ -12,8 +12,6 @@ pub(super) const SINOMO_WASI_ERRNO_NOENT: i32 = 2;
 pub(super) const SINOMO_WASI_ERRNO_IO: i32 = 5;
 pub(super) const SINOMO_WASI_ERRNO_INVAL: i32 = 22;
 pub(crate) const SINOMO_WASI_ERRNO_ROFS: i32 = 30;
-#[cfg(test)]
-pub(crate) const SINOMO_WASI_ERRNO_NOTCAPABLE: i32 = 63;
 
 pub(super) fn sandbox_wasi_extension_guest_path(
     path: &str,

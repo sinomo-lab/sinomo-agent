@@ -4,7 +4,6 @@ use wasmer_wasix_types::wasi::ProcSpawnFdOpName;
 use super::*;
 use crate::{
     VIRTUAL_ROOT_FD, WasiFs,
-    fs::{Inode, InodeGuard},
     os::task::{OwnedTaskStatus, TaskStatus},
     syscalls::*,
 };
@@ -155,6 +154,7 @@ pub fn proc_spawn2<M: MemorySize>(
 
     for fd_op in fd_ops {
         if let Err(err) = apply_fd_op(&mut child_env, &memory, &fd_op) {
+            child_env.blocking_on_exit(Some(err.into()));
             ctx.data().control_plane.remove_process(pid);
             return Ok(err);
         }
@@ -174,6 +174,7 @@ pub fn proc_spawn2<M: MemorySize>(
 
             let Some(env) = builder.take() else {
                 warn!("failed to spawn as builtin probing consumed child environment");
+                child_process.terminate(Errno::Noexec.into());
                 ctx.data().control_plane.remove_process(pid);
                 return Ok(Errno::Noexec);
             };
@@ -200,6 +201,7 @@ pub fn proc_spawn2<M: MemorySize>(
 
             debug!(child_pid = %pid, "process failed with (err={})", errno);
 
+            child_process.terminate(errno.into());
             ctx.data().control_plane.remove_process(pid);
             Ok(errno)
         }
@@ -332,17 +334,14 @@ fn apply_fd_op<M: MemorySize>(
             match inode_kind.deref() {
                 Kind::Root { .. } => {
                     env.state.fs.set_current_dir("/");
+                    sync_process_metadata(env);
                     Ok(())
                 }
                 Kind::Dir { .. } => {
                     drop(inode_kind);
-                    let path = virtual_path_for_inode(
-                        &env.state.fs.root_inode,
-                        fd.inode.ino(),
-                        "/",
-                        0,
-                    )?;
+                    let path = directory_virtual_path(&fd.inode)?;
                     env.state.fs.set_current_dir(&path);
+                    sync_process_metadata(env);
                     Ok(())
                 }
                 _ => Err(Errno::Notdir),
@@ -350,44 +349,4 @@ fn apply_fd_op<M: MemorySize>(
         }
         _ => Err(Errno::Inval),
     }
-}
-
-fn virtual_path_for_inode(
-    current: &InodeGuard,
-    target: Inode,
-    path: &str,
-    depth: u32,
-) -> Result<String, Errno> {
-    if current.ino() == target {
-        return Ok(path.to_string());
-    }
-    if depth > 256 {
-        return Err(Errno::Loop);
-    }
-
-    let children = {
-        let guard = current.read();
-        match guard.deref() {
-            Kind::Root { entries } | Kind::Dir { entries, .. } => entries
-                .iter()
-                .map(|(name, inode)| (name.to_string(), inode.clone()))
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
-        }
-    };
-
-    for (name, child) in children {
-        let child_path = if path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{path}/{name}")
-        };
-        match virtual_path_for_inode(&child, target, &child_path, depth + 1) {
-            Ok(path) => return Ok(path),
-            Err(Errno::Noent) => {}
-            Err(err) => return Err(err),
-        }
-    }
-
-    Err(Errno::Noent)
 }

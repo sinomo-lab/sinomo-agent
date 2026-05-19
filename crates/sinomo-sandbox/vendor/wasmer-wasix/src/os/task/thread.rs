@@ -242,6 +242,8 @@ struct WasiThreadState {
     stack: Mutex<ThreadStack>,
     clear_child_tid: Mutex<u64>,
     robust_list: Mutex<Option<(u64, u64)>>,
+    signal_mask: Mutex<(u64, u64)>,
+    thread_local_values: Mutex<HashMap<u32, u64>>,
     status: Arc<OwnedTaskStatus>,
     #[cfg(feature = "journal")]
     check_pointing: AtomicBool,
@@ -274,6 +276,8 @@ impl WasiThread {
                 stack: Mutex::new(ThreadStack::default()),
                 clear_child_tid: Mutex::new(0),
                 robust_list: Mutex::new(None),
+                signal_mask: Mutex::new((0, 0)),
+                thread_local_values: Mutex::new(HashMap::new()),
                 #[cfg(feature = "journal")]
                 check_pointing: AtomicBool::new(false),
                 deep_sleeping: AtomicBool::new(false),
@@ -314,6 +318,44 @@ impl WasiThread {
 
     pub fn set_robust_list(&self, head: u64, len: u64) {
         *self.state.robust_list.lock().unwrap() = Some((head, len));
+    }
+
+    pub fn signal_mask(&self) -> (u64, u64) {
+        *self.state.signal_mask.lock().unwrap()
+    }
+
+    pub fn set_signal_mask(&self, low: u64, high: u64) {
+        *self.state.signal_mask.lock().unwrap() = (low, high);
+    }
+
+    pub fn set_thread_local_value(&self, key: u32, value: u64) {
+        self.state
+            .thread_local_values
+            .lock()
+            .unwrap()
+            .insert(key, value);
+    }
+
+    pub fn thread_local_value(&self, key: u32) -> u64 {
+        self.state
+            .thread_local_values
+            .lock()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn take_thread_local_values(&self) -> HashMap<u32, u64> {
+        std::mem::take(&mut *self.state.thread_local_values.lock().unwrap())
+    }
+
+    pub fn remove_thread_local_value(&self, key: u32) {
+        self.state
+            .thread_local_values
+            .lock()
+            .unwrap()
+            .remove(&key);
     }
 
     /// Get a join handle to watch the task status.
@@ -626,19 +668,10 @@ impl WasiThreadHandle {
 
 impl Drop for WasiThreadHandleProtected {
     fn drop(&mut self) {
-        let id = self.thread.tid();
-        if let Some(inner) = Weak::upgrade(&self.inner) {
-            let mut inner = inner.0.lock().unwrap();
-            if inner
-                .threads
-                .get(&id)
-                .and_then(WasiThread::try_join)
-                .is_some()
-            {
-                inner.threads.remove(&id);
-                inner.thread_count -= 1;
-            }
-        }
+        // Joinable WASIX threads remain in the process table until
+        // `thread_join` reaps them. Dropping the launcher-side handle must not
+        // remove a completed worker before the parent has a chance to join it.
+        let _process = &self.inner;
     }
 }
 

@@ -84,6 +84,7 @@ pub(crate) fn path_filestat_set_times_internal(
         .inner
         .rights
         .contains(Rights::PATH_FILESTAT_SET_TIMES)
+        && !matches!(fd_entry.inode.read().deref(), Kind::Dir { .. } | Kind::Root { .. })
     {
         return Err(Errno::Access);
     }
@@ -128,6 +129,8 @@ pub(crate) fn path_filestat_set_times_internal(
         let mut handle = handle.write().unwrap();
         handle.set_times(atime, mtime);
     }
+    let stat = file_inode.stat.read().unwrap();
+    path_set_times_at(env, fd, path, stat.st_atim, stat.st_mtim);
 
     Ok(())
 }

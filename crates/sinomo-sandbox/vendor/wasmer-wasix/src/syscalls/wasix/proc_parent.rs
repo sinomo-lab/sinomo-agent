@@ -1,6 +1,27 @@
+use std::sync::atomic::{fence, Ordering};
+
 use super::*;
 use crate::WasiProcess;
 use crate::syscalls::*;
+use wasmer::FromToNativeWasmType;
+
+const MEMBARRIER_CMD_QUERY: i32 = 0;
+const MEMBARRIER_CMD_GLOBAL: i32 = 1;
+const MEMBARRIER_CMD_GLOBAL_EXPEDITED: i32 = 2;
+const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: i32 = 4;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 8;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 16;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 32;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 64;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ: i32 = 128;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ: i32 = 256;
+
+const RSEQ_FLAG_UNREGISTER: i32 = 1;
+
+const ARCH_SET_GS: i32 = 0x1001;
+const ARCH_SET_FS: i32 = 0x1002;
+const ARCH_GET_FS: i32 = 0x1003;
+const ARCH_GET_GS: i32 = 0x1004;
 
 /// ### `proc_parent()`
 /// Returns the parent handle of the supplied process
@@ -24,6 +45,52 @@ pub fn proc_parent<M: MemorySize>(
         Errno::Success
     } else {
         Errno::Badf
+    }
+}
+
+/// ### `getppid()`
+/// Returns the parent handle of the current process.
+#[instrument(level = "trace", skip_all, fields(parent = field::Empty), ret)]
+pub fn proc_parent_current<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    ret_parent: WasmPtr<Pid, M>,
+) -> Errno {
+    let env = ctx.data();
+    let parent = env.process.ppid().raw();
+    Span::current().record("parent", parent);
+    let memory = unsafe { env.memory_view(&ctx) };
+    wasi_try_mem!(ret_parent.write(&memory, parent as Pid));
+    Errno::Success
+}
+
+/// ### `getppid()`
+/// POSIX-shaped parent process id wrapper.
+#[instrument(level = "trace", skip_all, fields(parent = field::Empty), ret)]
+pub fn getppid(ctx: FunctionEnvMut<'_, WasiEnv>) -> i32 {
+    let parent = ctx.data().process.ppid().raw();
+    Span::current().record("parent", parent);
+    parent as i32
+}
+
+/// ### `getppid_for()`
+/// POSIX-shaped parent lookup for internal compatibility wrappers.
+#[instrument(level = "trace", skip_all, fields(%pid, parent = field::Empty), ret)]
+pub fn getppid_for(ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid) -> i32 {
+    let env = ctx.data();
+    let pid: WasiProcessId = pid.into();
+    let parent = if pid == env.process.pid() {
+        Some(env.process.ppid().raw())
+    } else {
+        env.control_plane
+            .get_process(pid)
+            .map(|process| process.ppid().raw())
+    };
+    match parent {
+        Some(parent) => {
+            Span::current().record("parent", parent);
+            parent as i32
+        }
+        None => -Errno::Badf.to_native(),
     }
 }
 
@@ -419,6 +486,26 @@ pub fn proc_set_clear_child_tid(
     Ok(Errno::Success)
 }
 
+/// ### `set_tid_address()`
+/// Linux-shaped clear-child-TID registration. Stores the clear-child-TID
+/// address for the calling thread and returns the caller's thread id.
+#[instrument(level = "trace", skip_all, fields(address), ret)]
+pub fn set_tid_address(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    address: u64,
+) -> Result<i32, WasiError> {
+    let tid = ctx.data().thread.tid().raw();
+    let errno = proc_set_clear_child_tid(ctx, address)?;
+    if errno == Errno::Success {
+        match i32::try_from(tid) {
+            Ok(tid) => Ok(tid),
+            Err(_) => Ok(-Errno::Overflow.to_native()),
+        }
+    } else {
+        Ok(-errno.to_native())
+    }
+}
+
 /// ### `proc_get_clear_child_tid()`
 /// Returns the guest clear-child-TID address for the current thread.
 #[instrument(level = "trace", skip_all, ret)]
@@ -435,6 +522,26 @@ pub fn proc_get_clear_child_tid<M: MemorySize>(
     Ok(Errno::Success)
 }
 
+/// ### `get_clear_child_tid()`
+/// Linux-shaped helper for POSIX compatibility layers that need to query the
+/// current thread's clear-child-TID address.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn get_clear_child_tid<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    ret_address: WasmPtr<M::Offset, M>,
+) -> Result<i32, WasiError> {
+    let address = ctx.data().thread.clear_child_tid();
+    let address = match M::Offset::try_from(address) {
+        Ok(address) => address,
+        Err(_) => return Ok(-Errno::Overflow.to_native()),
+    };
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    if let Err(err) = ret_address.write(&memory, address) {
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+    Ok(0)
+}
+
 /// ### `proc_set_robust_list()`
 /// Stores guest robust-futex-list metadata for the current thread.
 #[instrument(level = "trace", skip_all, fields(head, len), ret)]
@@ -448,6 +555,22 @@ pub fn proc_set_robust_list(
     env.thread.set_robust_list(head, len);
     env.process.set_robust_list(head, len);
     Ok(Errno::Success)
+}
+
+/// ### `set_robust_list()`
+/// Linux-shaped robust-futex-list registration. Returns 0 or a negative errno.
+#[instrument(level = "trace", skip_all, fields(head, len), ret)]
+pub fn set_robust_list(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    head: u64,
+    len: u64,
+) -> Result<i32, WasiError> {
+    let errno = proc_set_robust_list(ctx, head, len)?;
+    if errno == Errno::Success {
+        Ok(0)
+    } else {
+        Ok(-errno.to_native())
+    }
 }
 
 /// ### `proc_get_robust_list()`
@@ -478,6 +601,50 @@ pub fn proc_get_robust_list<M: MemorySize>(
     wasi_try_mem_ok!(ret_head.write(&memory, head));
     wasi_try_mem_ok!(ret_len.write(&memory, len));
     Ok(Errno::Success)
+}
+
+/// ### `get_robust_list()`
+/// Linux-shaped robust-futex-list query. Writes the selected thread/process
+/// list head and length in guest pointer-width fields and returns 0 or a
+/// negative errno.
+#[instrument(level = "trace", skip_all, fields(pid), ret)]
+pub fn get_robust_list<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    pid: Pid,
+    ret_head: WasmPtr<M::Offset, M>,
+    ret_len: WasmPtr<M::Offset, M>,
+) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    let (head, len) = if pid == 0 || WasiProcessId::from(pid) == env.process.pid() {
+        env.thread
+            .robust_list()
+            .or_else(|| env.process.robust_list())
+            .unwrap_or((0, 0))
+    } else {
+        let requested = WasiProcessId::from(pid);
+        let Some(process) = env.control_plane.get_process(requested) else {
+            return Ok(-Errno::Srch.to_native());
+        };
+        process.robust_list().unwrap_or((0, 0))
+    };
+    let head = match M::Offset::try_from(head) {
+        Ok(head) => head,
+        Err(_) => return Ok(-Errno::Overflow.to_native()),
+    };
+    let len = match M::Offset::try_from(len) {
+        Ok(len) => len,
+        Err(_) => return Ok(-Errno::Overflow.to_native()),
+    };
+    let memory = unsafe { env.memory_view(&ctx) };
+    if let Err(err) = ret_head.write(&memory, head) {
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+    if let Err(err) = ret_len.write(&memory, len) {
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+    Ok(0)
 }
 
 /// ### `proc_get_capabilities()`
@@ -623,6 +790,68 @@ pub fn proc_unshare_namespaces(
     Ok(Errno::Success)
 }
 
+/// ### `unshare()`
+/// Linux-shaped namespace unshare operation for sandbox-local namespace
+/// metadata. Descriptor-table and filesystem sharing flags are accepted for
+/// compatibility but have no host-global effect.
+#[instrument(level = "trace", skip_all, fields(flags), ret)]
+pub fn unshare(mut ctx: FunctionEnvMut<'_, WasiEnv>, flags: u64) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    if flags & !SUPPORTED_UNSHARE_FLAGS != 0 {
+        return Ok(-Errno::Inval.to_native());
+    }
+    let namespaces = namespaces_for_clone_flags(flags);
+    ctx.data().process.unshare_namespaces(&namespaces);
+    Ok(0)
+}
+
+/// ### `setns()`
+/// Linux-shaped namespace switch operation for sandbox-local namespace
+/// metadata. The fd must exist, and the requested namespace type is recorded as
+/// fresh sandbox namespace metadata because there is no host namespace target.
+#[instrument(level = "trace", skip_all, fields(fd, nstype), ret)]
+pub fn setns(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    fd: WasiFd,
+    nstype: i32,
+) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    if nstype < 0 || nstype as u64 & !SUPPORTED_SETNS_FLAGS != 0 {
+        return Ok(-Errno::Inval.to_native());
+    }
+    {
+        let env = ctx.data();
+        let (_, state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
+        if let Err(err) = state.fs.get_fd(fd) {
+            return Ok(-err.to_native());
+        }
+    }
+    let namespaces = namespaces_for_clone_flags(nstype as u64);
+    ctx.data().process.unshare_namespaces(&namespaces);
+    Ok(0)
+}
+
+const CLONE_FS: u64 = 0x0000_0200;
+const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+const CLONE_NEWNS: u64 = 0x0002_0000;
+const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+const CLONE_NEWUTS: u64 = 0x0400_0000;
+const CLONE_NEWIPC: u64 = 0x0800_0000;
+const CLONE_NEWUSER: u64 = 0x1000_0000;
+const CLONE_NEWPID: u64 = 0x2000_0000;
+const CLONE_NEWNET: u64 = 0x4000_0000;
+
+const SUPPORTED_SETNS_FLAGS: u64 = CLONE_NEWNS
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWNET;
+const SUPPORTED_UNSHARE_FLAGS: u64 =
+    CLONE_FS | CLONE_FILES | CLONE_SYSVSEM | SUPPORTED_SETNS_FLAGS;
+
 fn namespaces_for_clone_flags(flags: u64) -> Vec<&'static str> {
     let mut namespaces = Vec::new();
     if flags & 0x0200_0000 != 0 {
@@ -687,6 +916,70 @@ pub fn proc_get_arch_base<M: MemorySize>(
     Ok(Errno::Success)
 }
 
+/// ### `arch_prctl()`
+/// Linux-shaped architecture control operation for guest TLS-base metadata.
+/// Set operations treat `address` as the new base; get operations treat it as
+/// a guest pointer to an unsigned long result.
+#[instrument(level = "trace", skip_all, fields(code, address), ret)]
+pub fn arch_prctl<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    code: i32,
+    address: M::Offset,
+) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    let address: u64 = address.into();
+
+    match code {
+        ARCH_SET_FS => arch_set_base(ctx, PROC_ARCH_FS_BASE, address),
+        ARCH_SET_GS => arch_set_base(ctx, PROC_ARCH_GS_BASE, address),
+        ARCH_GET_FS => arch_get_base::<M>(ctx, PROC_ARCH_FS_BASE, address),
+        ARCH_GET_GS => arch_get_base::<M>(ctx, PROC_ARCH_GS_BASE, address),
+        _ => Ok(-Errno::Inval.to_native()),
+    }
+}
+
+fn arch_set_base(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    kind: u32,
+    address: u64,
+) -> Result<i32, WasiError> {
+    let errno = proc_set_arch_base(ctx, kind, address)?;
+    if errno == Errno::Success {
+        Ok(0)
+    } else {
+        Ok(-errno.to_native())
+    }
+}
+
+fn arch_get_base<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    kind: u32,
+    address: u64,
+) -> Result<i32, WasiError> {
+    if address == 0 {
+        return Ok(-Errno::Fault.to_native());
+    }
+    let process = &ctx.data().process;
+    let base = match kind {
+        PROC_ARCH_FS_BASE => process.arch_fs_base(),
+        PROC_ARCH_GS_BASE => process.arch_gs_base(),
+        _ => return Ok(-Errno::Inval.to_native()),
+    };
+    let base = match M::Offset::try_from(base) {
+        Ok(base) => base,
+        Err(_) => return Ok(-Errno::Overflow.to_native()),
+    };
+    let ptr = match address.try_into() {
+        Ok(address) => WasmPtr::<M::Offset, M>::new(address),
+        Err(_) => return Ok(-Errno::Overflow.to_native()),
+    };
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    if let Err(err) = ptr.write(&memory, base) {
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+    Ok(0)
+}
+
 /// ### `proc_set_rseq()`
 /// Stores guest-visible restartable-sequence registration metadata.
 #[instrument(level = "trace", skip_all, fields(address, len, signature), ret)]
@@ -714,6 +1007,72 @@ pub fn proc_clear_rseq(
     } else {
         Ok(Errno::Inval)
     }
+}
+
+/// ### `rseq()`
+/// Linux-shaped restartable-sequence registration operation. This records the
+/// guest rseq address, length, and signature as process metadata; it does not
+/// expose host restartable-sequence execution.
+#[instrument(level = "trace", skip_all, fields(address, len, flags, signature), ret)]
+pub fn rseq(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    address: u64,
+    len: u32,
+    flags: i32,
+    signature: u32,
+) -> Result<i32, WasiError> {
+    if flags & !RSEQ_FLAG_UNREGISTER != 0 {
+        return Ok(-Errno::Inval.to_native());
+    }
+    let errno = if flags & RSEQ_FLAG_UNREGISTER != 0 {
+        proc_clear_rseq(ctx, address)?
+    } else if address == 0 || len == 0 {
+        Errno::Inval
+    } else {
+        proc_set_rseq(ctx, address, len, signature)?
+    };
+    if errno == Errno::Success {
+        Ok(0)
+    } else {
+        Ok(-errno.to_native())
+    }
+}
+
+/// ### `membarrier()`
+/// Linux-shaped memory-barrier command. Supported command bits complete with a
+/// host sequentially-consistent fence; unsupported command or flag bits return
+/// `EINVAL`.
+#[instrument(level = "trace", skip_all, fields(command, flags, cpu_id), ret)]
+pub fn membarrier(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    command: i32,
+    flags: u32,
+    cpu_id: i32,
+) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let _ = cpu_id;
+    let supported = membarrier_supported_commands();
+    if command == MEMBARRIER_CMD_QUERY {
+        return Ok(supported);
+    }
+    if flags != 0 || command & !supported != 0 {
+        return Ok(-Errno::Inval.to_native());
+    }
+    fence(Ordering::SeqCst);
+    Ok(0)
+}
+
+fn membarrier_supported_commands() -> i32 {
+    MEMBARRIER_CMD_GLOBAL
+        | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ
 }
 
 /// ### `proc_set_mempolicy()`

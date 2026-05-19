@@ -5,7 +5,7 @@ use super::*;
 use crate::journal::JournalEffector;
 use crate::{
     WasiThreadHandle,
-    os::task::thread::WasiMemoryLayout,
+    os::task::{control_plane::ControlPlaneError, thread::WasiMemoryLayout},
     runtime::{
         TaintReason,
         task_manager::{TaskWasm, TaskWasmRunProperties},
@@ -59,10 +59,7 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
     start_ptr: WasmPtr<ThreadStart<M>, M>,
 ) -> Result<Tid, Errno> {
     // Now we use the environment and memory references
-    let env = ctx.data();
-    let memory = unsafe { env.memory_view(&ctx) };
-    let runtime = env.runtime.clone();
-    let tasks = env.tasks().clone();
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
     let start_ptr_offset = start_ptr.offset();
 
     // Read the properties about the stack which we will use for asyncify
@@ -72,7 +69,7 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
         let stack_size: u64 = start.stack_size.into();
         let guard_size: u64 = start.guard_size.into();
         let tls_base: u64 = start.tls_base.into();
-        let stack_lower = stack_upper - stack_size;
+        let stack_lower = stack_upper.checked_sub(stack_size).ok_or(Errno::Inval)?;
 
         WasiMemoryLayout {
             stack_upper,
@@ -82,6 +79,8 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
             tls_base: Some(tls_base),
         }
     };
+    ensure_thread_memory_bounds::<M>(ctx, &layout, start_ptr_offset.into())?;
+    let env = ctx.data();
     tracing::trace!(
         from_tid = env.thread.id().raw(),
         "thread_spawn with layout {:?}",
@@ -94,6 +93,14 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
     };
     let mut thread_handle = match env.process.new_thread(layout.clone(), thread_start) {
         Ok(h) => Arc::new(h),
+        Err(ControlPlaneError::TaskLimitReached { max }) => {
+            error!(
+                stack_base = layout.stack_lower,
+                max_tasks = max,
+                "failed to create thread handle: task limit reached",
+            );
+            return Err(Errno::Again);
+        }
         Err(err) => {
             error!(
                 stack_base = layout.stack_lower,
@@ -107,10 +114,64 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
     Span::current().record("tid", thread_id);
 
     // Spawn the thread
-    thread_spawn_internal_using_layout::<M>(ctx, thread_handle, layout, start_ptr_offset, None)?;
+    thread_spawn_internal_using_layout::<M>(ctx, thread_handle, layout, start_ptr_offset, None, true)?;
 
     // Success
     Ok(thread_id)
+}
+
+pub(crate) fn ensure_thread_memory_bounds<M: MemorySize>(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    layout: &WasiMemoryLayout,
+    start_ptr_offset: u64,
+) -> Result<(), Errno> {
+    const WASM_PAGE_SIZE: u64 = 65_536;
+    const THREAD_TLS_HEADROOM_BYTES: u64 = 8 * 1_024 * 1_024;
+
+    let handles = ctx.data().inner().main_module_instance_handles();
+    let memory = handles.memory_clone();
+    let instance = handles.instance.clone();
+    let mut store = ctx.as_store_mut();
+    let tls_size = exported_u64_global(&instance, &mut store, "__tls_size").unwrap_or(0);
+    let tls_align = exported_u64_global(&instance, &mut store, "__tls_align").unwrap_or(0);
+    let required_end = layout
+        .stack_upper
+        .max(layout.stack_lower.saturating_add(layout.stack_size))
+        .max(
+            layout
+                .tls_base
+                .unwrap_or(0)
+                .saturating_add(tls_size)
+                .saturating_add(tls_align)
+                .saturating_add(THREAD_TLS_HEADROOM_BYTES),
+        )
+        .max(start_ptr_offset.saturating_add(std::mem::size_of::<ThreadStart<M>>() as u64));
+    let current_bytes = u64::from(memory.size(&store).0).saturating_mul(WASM_PAGE_SIZE);
+    if required_end <= current_bytes {
+        return Ok(());
+    }
+
+    let delta_pages = required_end
+        .saturating_sub(current_bytes)
+        .div_ceil(WASM_PAGE_SIZE)
+        .try_into()
+        .map_err(|_| Errno::Overflow)?;
+    memory
+        .grow(&mut store, Pages(delta_pages))
+        .map_err(|_| Errno::Nomem)?;
+    Ok(())
+}
+
+fn exported_u64_global(
+    instance: &Instance,
+    store: &mut impl AsStoreMut,
+    name: &str,
+) -> Option<u64> {
+    match instance.exports.get_global(name).ok()?.get(store) {
+        Value::I32(value) => Some(value as u64),
+        Value::I64(value) => Some(value as u64),
+        _ => None,
+    }
 }
 
 pub fn thread_spawn_internal_using_layout<M: MemorySize>(
@@ -119,6 +180,7 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
     layout: WasiMemoryLayout,
     start_ptr_offset: M::Offset,
     rewind_state: Option<(RewindState, RewindResultType)>,
+    initialize_layout_globals: bool,
 ) -> Result<(), Errno> {
     // We extract the memory which will be passed to the thread
     let func_env = ctx.as_ref();
@@ -140,14 +202,11 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
     thread_env.thread = thread_handle.as_thread();
     thread_env.layout = layout;
 
-    // TODO: Currently asynchronous threading does not work with multi
-    //       threading in JS but it does work for the main thread. This will
-    //       require more work to find out why.
-    thread_env.enable_deep_sleep = if cfg!(feature = "js") {
-        false
-    } else {
-        unsafe { env.capable_of_deep_sleep() }
-    };
+    // Spawned threads share the process state with the main thread, but their
+    // stack checkpoint/rewind path is not independent enough to safely unload a
+    // blocking syscall through deep sleep. Keep child threads resident and let
+    // their blocking syscalls complete through the host future path.
+    thread_env.enable_deep_sleep = false;
 
     // This next function gets a context for the local thread and then
     // calls into the process
@@ -155,7 +214,14 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
         let thread_handle = thread_handle;
         move |ctx: WasiFunctionEnv, mut store: Store| {
             // Call the thread
-            call_module::<M>(ctx, store, start_ptr_offset, thread_handle, rewind_state)
+            call_module::<M>(
+                ctx,
+                store,
+                start_ptr_offset,
+                thread_handle,
+                rewind_state,
+                initialize_layout_globals,
+            )
         }
     };
 
@@ -163,6 +229,7 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
     // we can't spawn a background thread
     if module_handles.thread_spawn.is_none() {
         warn!("thread failed - the program does not export a `wasi_thread_start` function");
+        process.remove_thread(&thread_id);
         return Err(Errno::Notcapable);
     }
     let thread_module = module_handles.module_clone();
@@ -196,7 +263,15 @@ fn call_module_internal<M: MemorySize>(
     ctx: &WasiFunctionEnv,
     mut store: Store,
     start_ptr_offset: M::Offset,
-) -> (Store, Result<(), DeepSleepWork>) {
+    initialize_layout_globals: bool,
+) -> (Store, Result<Option<ExitCode>, DeepSleepWork>) {
+    if initialize_layout_globals && let Err(err) = initialize_static_thread_globals(ctx, &mut store) {
+        let tid = ctx.data(&store).tid();
+        warn!(%tid, ?err, "failed to initialize static thread globals");
+        let exit_code = Some(err.into());
+        ctx.on_exit(&mut store, exit_code);
+        return (store, Ok(exit_code));
+    }
     let Some(spawn) = ctx
         .data(&store)
         .inner()
@@ -206,8 +281,9 @@ fn call_module_internal<M: MemorySize>(
     else {
         let tid = ctx.data(&store).tid();
         warn!(%tid, "spawned thread is missing wasi_thread_start export");
-        ctx.on_exit(&mut store, Some(Errno::Noexec.into()));
-        return (store, Ok(()));
+        let exit_code = Some(Errno::Noexec.into());
+        ctx.on_exit(&mut store, exit_code);
+        return (store, Ok(exit_code));
     };
     let tid = ctx.data(&store).tid();
 
@@ -216,16 +292,18 @@ fn call_module_internal<M: MemorySize>(
         Ok(tid) => tid,
         Err(err) => {
             warn!(%tid, "spawned thread id does not fit callback parameter");
-            ctx.on_exit(&mut store, Some(err.into()));
-            return (store, Ok(()));
+            let exit_code = Some(err.into());
+            ctx.on_exit(&mut store, exit_code);
+            return (store, Ok(exit_code));
         }
     };
     let start_pointer_i32 = match start_ptr_offset.try_into().map_err(|_| Errno::Overflow) {
         Ok(start_ptr) => start_ptr,
         Err(err) => {
             warn!(%tid, "spawned thread start pointer does not fit callback parameter");
-            ctx.on_exit(&mut store, Some(err.into()));
-            return (store, Ok(()));
+            let exit_code = Some(err.into());
+            ctx.on_exit(&mut store, exit_code);
+            return (store, Ok(exit_code));
         }
     };
     let (mut store, thread_result) = ContextSwitchingEnvironment::run_main_context(
@@ -245,7 +323,44 @@ fn call_module_internal<M: MemorySize>(
 
     // Clean up the environment on exit
     ctx.on_exit(&mut store, exit_code);
-    (store, Ok(()))
+    (store, Ok(exit_code))
+}
+
+fn initialize_static_thread_globals(
+    ctx: &WasiFunctionEnv,
+    store: &mut Store,
+) -> Result<(), Errno> {
+    let (layout, stack_pointer, tls_base_global) = {
+        let env = ctx.data(&store);
+        let handles = env.inner().main_module_instance_handles();
+        (
+            env.layout.clone(),
+            handles.stack_pointer.clone(),
+            handles.tls_base.clone(),
+        )
+    };
+    set_u64_global(store, stack_pointer.as_ref(), layout.stack_upper)?;
+    if let Some(tls_base) = layout.tls_base {
+        set_u64_global(store, tls_base_global.as_ref(), tls_base)?;
+    }
+    Ok(())
+}
+
+fn set_u64_global(
+    store: &mut Store,
+    global: Option<&Global>,
+    value: u64,
+) -> Result<(), Errno> {
+    let Some(global) = global else {
+        return Ok(());
+    };
+    let current = global.get(&mut *store);
+    let value = match current {
+        Value::I32(_) => Value::I32(value.try_into().map_err(|_| Errno::Overflow)?),
+        Value::I64(_) => Value::I64(value.try_into().map_err(|_| Errno::Overflow)?),
+        _ => return Err(Errno::Inval),
+    };
+    global.set(&mut *store, value).map_err(|_| Errno::Perm)
 }
 
 fn handle_thread_result(
@@ -311,6 +426,7 @@ fn call_module<M: MemorySize>(
     start_ptr_offset: M::Offset,
     thread_handle: Arc<WasiThreadHandle>,
     rewind_state: Option<(RewindState, RewindResultType)>,
+    initialize_layout_globals: bool,
 ) {
     let env = ctx.data(&store);
     let tasks = env.tasks().clone();
@@ -331,32 +447,38 @@ fn call_module<M: MemorySize>(
     }
 
     // Now invoke the module
-    let (store, ret) = call_module_internal::<M>(&ctx, store, start_ptr_offset);
+    let (store, ret) =
+        call_module_internal::<M>(&ctx, store, start_ptr_offset, initialize_layout_globals);
 
     // If it went to deep sleep then we need to handle that
-    if let Err(deep) = ret {
-        // Create the callback that will be invoked when the thread respawns after a deep sleep
-        let rewind = deep.rewind;
-        let respawn = {
-            let tasks = tasks.clone();
-            move |ctx, store, trigger_res| {
-                // Call the thread
-                call_module::<M>(
-                    ctx,
-                    store,
-                    start_ptr_offset,
-                    thread_handle,
-                    Some((rewind, RewindResultType::RewindWithResult(trigger_res))),
-                );
-            }
-        };
+    let exit_code = match ret {
+        Ok(exit_code) => exit_code.unwrap_or_else(|| Errno::Success.into()),
+        Err(deep) => {
+            // Create the callback that will be invoked when the thread respawns after a deep sleep
+            let rewind = deep.rewind;
+            let respawn = {
+                let tasks = tasks.clone();
+                move |ctx, store, trigger_res| {
+                    // Call the thread
+                    call_module::<M>(
+                        ctx,
+                        store,
+                        start_ptr_offset,
+                        thread_handle,
+                        Some((rewind, RewindResultType::RewindWithResult(trigger_res))),
+                        initialize_layout_globals,
+                    );
+                }
+            };
 
-        /// Spawns the WASM process after a trigger
-        unsafe {
-            tasks.resume_wasm_after_poller(Box::new(respawn), ctx, store, deep.trigger)
-        };
-        return;
+            /// Spawns the WASM process after a trigger
+            unsafe {
+                tasks.resume_wasm_after_poller(Box::new(respawn), ctx, store, deep.trigger)
+            };
+            return;
+        }
     };
+    thread_handle.set_status_finished(Ok(exit_code));
     // I don't think we need to do this explicitly, but it was done before refactoring so we keep it for now.
     drop(thread_handle);
 }

@@ -102,9 +102,19 @@ impl LocalSandboxFileSystem {
         path: &SandboxPath,
         entries: &mut BTreeMap<SandboxPath, LocalSandboxFileFingerprint>,
     ) -> Result<(), SandboxFsError> {
+        let host_path = self.host_path(path)?;
         let metadata = self.stat(path)?;
         let content_hash = if metadata.is_dir {
             None
+        } else if fs::symlink_metadata(&host_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let target =
+                fs::read_link(&host_path).map_err(|source| SandboxFsError::Unavailable {
+                    reason: format!("read symlink {}: {source}", path),
+                })?;
+            Some(sandbox_module_hash(target.to_string_lossy().as_bytes()))
         } else {
             Some(sandbox_module_hash(&self.read(path, None)?))
         };
@@ -173,8 +183,8 @@ impl LocalSandboxFileSystem {
         path: &SandboxPath,
         host_path: &Path,
     ) -> Result<SandboxMetadata, SandboxFsError> {
-        let metadata =
-            fs::metadata(host_path).map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
+        let metadata = fs::symlink_metadata(host_path)
+            .map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
         Ok(SandboxMetadata {
             path: path.clone(),
             is_dir: metadata.is_dir(),

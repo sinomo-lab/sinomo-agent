@@ -199,6 +199,21 @@ impl OwnedTaskStatus {
         }
     }
 
+    pub async fn await_termination_status(&self) -> TaskStatus {
+        let mut receiver = self.watch_tx.subscribe();
+        loop {
+            let status = receiver.borrow_and_update().clone();
+            match status {
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Stopped(_) => {}
+                TaskStatus::Finished(_) | TaskStatus::Signaled { .. } => {
+                    return status;
+                }
+            }
+            // NOTE: unwrap() is fine, because &self always holds on to the sender.
+            receiver.changed().await.unwrap();
+        }
+    }
+
     pub async fn await_stopped_or_terminated(&self) -> TaskStatus {
         let mut receiver = self.watch_tx.subscribe();
         loop {

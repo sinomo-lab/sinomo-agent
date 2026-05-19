@@ -1321,7 +1321,7 @@ impl Linker {
         );
 
         // Give modules a non-zero memory base, since we don't want
-        // any valid pointers to point to the zero address
+        // any valid pointers to point to the zero address.
         let memory_base = 2u64.pow(dylink_section.mem_info.memory_alignment);
 
         let memory_type = main_module
@@ -1591,16 +1591,25 @@ impl Linker {
             // call its initialization functions separately
             trace!("Calling data relocator function for main module");
             call_initialization_function::<()>(&main_instance, store, "__wasm_apply_data_relocs")?;
+            call_initialization_function::<()>(
+                &main_instance,
+                store,
+                "__wasm_apply_global_tls_relocs",
+            )?;
             call_initialization_function::<()>(&main_instance, store, "__wasm_apply_tls_relocs")?;
 
             linker.initialize_new_modules(group_guard, store, link_state)?;
         }
 
-        trace!("Calling main module's constructors");
-        call_initialization_function::<()>(&main_instance, store, "__wasm_call_ctors")?;
+        if has_exported_function(&main_instance, "_start") {
+            trace!("Skipping main module constructors; command _start initializes them");
+        } else {
+            trace!("Calling main module's constructors");
+            call_initialization_function::<()>(&main_instance, store, "__wasm_call_ctors")?;
 
-        trace!("Calling main module's _initialize function if present");
-        call_initialization_function::<()>(&main_instance, store, "_initialize")?;
+            trace!("Calling main module's _initialize function if present");
+            call_initialization_function::<()>(&main_instance, store, "_initialize")?;
+        }
 
         trace!("Link complete");
 
@@ -2114,6 +2123,7 @@ impl Linker {
         trace!("Calling data relocation functions");
         for instance in &new_instances {
             call_initialization_function::<()>(instance, store, "__wasm_apply_data_relocs")?;
+            call_initialization_function::<()>(instance, store, "__wasm_apply_global_tls_relocs")?;
             call_initialization_function::<()>(instance, store, "__wasm_apply_tls_relocs")?;
         }
 
@@ -5062,6 +5072,10 @@ fn call_initialization_function<Ret: WasmTypeList>(
             Err(LinkError::InitFuncWithInvalidSignature(name.to_string()))
         }
     }
+}
+
+fn has_exported_function(instance: &Instance, name: &str) -> bool {
+    instance.exports.get_function(name).is_ok()
 }
 
 fn get_tls_base_export(

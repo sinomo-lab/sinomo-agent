@@ -1,10 +1,11 @@
 use super::*;
-use wasmer_wasix_types::wasi::Snapshot0Clockid;
 use crate::{
     os::task::process::{ProcessResourceLimit, WasiProcessId},
     syscalls::*,
     WasiProcess,
 };
+use wasmer::FromToNativeWasmType;
+use wasmer_wasix_types::wasi::Snapshot0Clockid;
 
 const RLIM_NLIMITS: i32 = 16;
 const RUSAGE_CHILDREN: i32 = -1;
@@ -39,6 +40,24 @@ pub fn proc_getrlimit<M: MemorySize>(
     Ok(Errno::Success)
 }
 
+/// ### `getrlimit()`
+/// POSIX-shaped current-process resource-limit query. Writes the current and
+/// maximum limit values and returns 0 or a negative errno.
+#[instrument(level = "trace", skip_all, fields(%resource), ret)]
+pub fn getrlimit<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    resource: i32,
+    current_ptr: WasmPtr<u64, M>,
+    maximum_ptr: WasmPtr<u64, M>,
+) -> Result<i32, WasiError> {
+    let errno = proc_getrlimit(ctx, 0, resource, current_ptr, maximum_ptr)?;
+    if errno == Errno::Success {
+        Ok(0)
+    } else {
+        Ok(-errno.to_native())
+    }
+}
+
 /// ### `proc_setrlimit()`
 /// Sets a guest-visible POSIX resource limit for the current or selected process.
 #[instrument(level = "trace", skip_all, fields(%pid, %resource, %current, %maximum), ret)]
@@ -67,6 +86,60 @@ pub fn proc_setrlimit(
         env.sync_process_resource_limits();
     }
     Ok(Errno::Success)
+}
+
+/// ### `setrlimit()`
+/// POSIX-shaped current-process resource-limit update. Returns 0 or a
+/// negative errno.
+#[instrument(level = "trace", skip_all, fields(%resource, %current, %maximum), ret)]
+pub fn setrlimit(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    resource: i32,
+    current: u64,
+    maximum: u64,
+) -> Result<i32, WasiError> {
+    let errno = proc_setrlimit(ctx, 0, resource, current, maximum)?;
+    if errno == Errno::Success {
+        Ok(0)
+    } else {
+        Ok(-errno.to_native())
+    }
+}
+
+/// ### `prlimit()`
+/// Linux-shaped selected-process resource-limit operation. If `set_new` is
+/// non-zero, updates the selected process before optionally returning the
+/// resulting limits through non-null output pointers.
+#[instrument(level = "trace", skip_all, fields(%pid, %resource, %set_new), ret)]
+pub fn prlimit<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    pid: Pid,
+    resource: i32,
+    set_new: i32,
+    new_current: u64,
+    new_maximum: u64,
+    old_current_ptr: WasmPtr<u64, M>,
+    old_maximum_ptr: WasmPtr<u64, M>,
+) -> Result<i32, WasiError> {
+    if set_new != 0 {
+        let errno = proc_setrlimit(ctx.as_mut(), pid, resource, new_current, new_maximum)?;
+        if errno != Errno::Success {
+            return Ok(-errno.to_native());
+        }
+    }
+
+    if old_current_ptr.is_null() && old_maximum_ptr.is_null() {
+        return Ok(0);
+    }
+    if old_current_ptr.is_null() || old_maximum_ptr.is_null() {
+        return Ok(-Errno::Fault.to_native());
+    }
+    let errno = proc_getrlimit(ctx, pid, resource, old_current_ptr, old_maximum_ptr)?;
+    if errno == Errno::Success {
+        Ok(0)
+    } else {
+        Ok(-errno.to_native())
+    }
 }
 
 /// ### `proc_getrusage()`
@@ -106,6 +179,25 @@ pub fn proc_getrusage<M: MemorySize>(
     wasi_try_mem_ok!(system_usec_ptr.write(&memory, 0));
     wasi_try_mem_ok!(maxrss_kib_ptr.write(&memory, maxrss_kib));
     Ok(Errno::Success)
+}
+
+/// ### `getrusage()`
+/// POSIX-shaped resource-usage query. Writes user usec, system usec, and
+/// maxrss KiB into guest-provided fields and returns 0 or a negative errno.
+#[instrument(level = "trace", skip_all, fields(%who), ret)]
+pub fn getrusage<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    who: i32,
+    user_usec_ptr: WasmPtr<u64, M>,
+    system_usec_ptr: WasmPtr<u64, M>,
+    maxrss_kib_ptr: WasmPtr<u64, M>,
+) -> Result<i32, WasiError> {
+    let errno = proc_getrusage(ctx, who, user_usec_ptr, system_usec_ptr, maxrss_kib_ptr)?;
+    if errno == Errno::Success {
+        Ok(0)
+    } else {
+        Ok(-errno.to_native())
+    }
 }
 
 /// ### `proc_times()`

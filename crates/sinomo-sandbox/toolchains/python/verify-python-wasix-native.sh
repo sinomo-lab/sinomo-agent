@@ -245,7 +245,7 @@ PYTHON_PROCESS_OUTPUT="$(
     run_python -c "import os, subprocess, sys; os.makedirs('/work/subprocess-cwd', exist_ok=True); os.chmod('/work/python-child', 0o755); stdin_result = subprocess.run(['/work/python-child', '-c', 'import sys; print(sys.stdin.read().upper())'], input='child-stdin', text=True, capture_output=True, check=True); cwd_result = subprocess.run(['/work/python-child', '-c', 'import os; print(os.getcwd())'], cwd='/work/subprocess-cwd', text=True, capture_output=True, check=True); env_result = subprocess.run(['/work/python-child', '-c', 'import os; print(os.environ[\"SINOMO_CHILD_ENV\"])'], env={**os.environ, 'SINOMO_CHILD_ENV': 'child-env-ok'}, text=True, capture_output=True, check=True); stderr_result = subprocess.run(['/work/python-child', '-c', 'import sys; print(\"child-err\", file=sys.stderr)'], text=True, capture_output=True, check=True); status_result = subprocess.run(['/work/python-child', '-c', 'import sys; sys.exit(7)'], text=True, capture_output=True); print(stdin_result.stdout.strip()); print(cwd_result.stdout.strip()); print(env_result.stdout.strip()); print(stderr_result.stderr.strip()); print(status_result.returncode)"
 )"
 for expected in "CHILD-STDIN" "/work/subprocess-cwd" "child-env-ok" "child-err" "7"; do
-    if ! grep -qx "${expected}" <<<"${PYTHON_PROCESS_OUTPUT}"; then
+    if ! grep -qx -- "${expected}" <<<"${PYTHON_PROCESS_OUTPUT}"; then
         echo "python subprocess process semantics missing expected output: ${expected}" >&2
         echo "${PYTHON_PROCESS_OUTPUT}" >&2
         exit 1
@@ -257,9 +257,21 @@ PYTHON_POPEN_OUTPUT="$(
     run_python -c "import os, subprocess; os.chmod('/work/python-child', 0o755); p = subprocess.Popen(['/work/python-child', '-c', 'import sys; data=sys.stdin.read(); print(data.upper()); print(\"child-err\", file=sys.stderr)'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True); out, err = p.communicate('abc'); print(p.returncode); print(out.strip()); print(err.strip())"
 )"
 for expected in "0" "ABC" "child-err"; do
-    if ! grep -qx "${expected}" <<<"${PYTHON_POPEN_OUTPUT}"; then
+    if ! grep -qx -- "${expected}" <<<"${PYTHON_POPEN_OUTPUT}"; then
         echo "python Popen communicate missing expected output: ${expected}" >&2
         echo "${PYTHON_POPEN_OUTPUT}" >&2
+        exit 1
+    fi
+done
+
+echo "verifying python waitpid signal status encoding"
+PYTHON_WAITPID_SIGNAL_OUTPUT="$(
+    run_python -c "import os, signal, subprocess; os.chmod('/work/python-child', 0o755); p = subprocess.Popen(['/work/python-child', '-c', 'while True: pass']); p.kill(); pid, status = os.waitpid(p.pid, 0); print(pid == p.pid); print(os.WIFSIGNALED(status)); print(os.WTERMSIG(status)); print(os.waitstatus_to_exitcode(status))"
+)"
+for expected in "True" "True" "9" "-9"; do
+    if ! grep -qx -- "${expected}" <<<"${PYTHON_WAITPID_SIGNAL_OUTPUT}"; then
+        echo "python waitpid signal status missing expected output: ${expected}" >&2
+        echo "${PYTHON_WAITPID_SIGNAL_OUTPUT}" >&2
         exit 1
     fi
 done
@@ -301,7 +313,7 @@ for kwargs in cases:
         print('timeout-missing', bool(kwargs))"
 )"
 for expected in "timeout-ok False" "timeout-ok True"; do
-    if ! grep -qx "${expected}" <<<"${PYTHON_SUBPROCESS_TIMEOUT_OUTPUT}"; then
+    if ! grep -qx -- "${expected}" <<<"${PYTHON_SUBPROCESS_TIMEOUT_OUTPUT}"; then
         echo "python subprocess timeout missing expected output: ${expected}" >&2
         echo "${PYTHON_SUBPROCESS_TIMEOUT_OUTPUT}" >&2
         exit 1

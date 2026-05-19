@@ -240,7 +240,8 @@ pub(crate) fn path_open_internal(
 
     let target_rights = match maybe_inode {
         Ok(_) => {
-            let write_permission = adjusted_rights.contains(Rights::FD_WRITE);
+            let write_permission =
+                adjusted_rights.contains(Rights::FD_WRITE) && fs_rights_base.contains(Rights::FD_WRITE);
 
             // append, truncate, and create all require the permission to write
             let (append_permission, truncate_permission, create_permission) = if write_permission {
@@ -284,6 +285,16 @@ pub(crate) fn path_open_internal(
     };
 
     let minimum_rights = target_rights.minimum_rights(&parent_rights);
+
+    if maybe_inode.is_ok()
+        && (minimum_rights.write || minimum_rights.append || minimum_rights.truncate)
+    {
+        match path_write_allowed_at(env, dirfd, path) {
+            Ok(true) => {}
+            Ok(false) => return Ok(Err(Errno::Access)),
+            Err(err) => return Ok(Err(err)),
+        }
+    }
 
     open_options.options(minimum_rights.clone());
 
@@ -455,7 +466,9 @@ pub(crate) fn path_open_internal(
                 let open_options = open_options
                     .read(minimum_rights.read)
                     .append(minimum_rights.append)
-                    .write(minimum_rights.write)
+                    .write(
+                        minimum_rights.write || minimum_rights.create || minimum_rights.create_new,
+                    )
                     .create_new(true);
 
                 if minimum_rights.read {
@@ -536,11 +549,12 @@ pub(crate) fn path_open_internal(
 
     // TODO: check and reduce these
     // TODO: ensure a mutable fd to root can never be opened
+    let fd_rights = adjusted_rights & fs_rights_base;
     let out_fd = wasi_try_ok_ok!(if let Some(fd) = with_fd {
         state
             .fs
             .with_fd(
-                adjusted_rights,
+                fd_rights,
                 fs_rights_inheriting,
                 fs_flags,
                 fd_flags,
@@ -551,7 +565,7 @@ pub(crate) fn path_open_internal(
             .map(|_| fd)
     } else {
         state.fs.create_fd(
-            adjusted_rights,
+            fd_rights,
             fs_rights_inheriting,
             fs_flags,
             fd_flags,

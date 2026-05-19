@@ -1,6 +1,7 @@
 use super::*;
 use crate::WasiProcess;
 use crate::syscalls::*;
+use wasmer::FromToNativeWasmType;
 
 const PRIO_PROCESS: i32 = 0;
 const PRIO_PGRP: i32 = 1;
@@ -32,6 +33,28 @@ pub fn proc_getpriority<M: MemorySize>(
     Ok(Errno::Success)
 }
 
+/// ### `getpriority()`
+/// POSIX-shaped nice-value query. Returns the selected nice value or a
+/// negative errno.
+#[instrument(level = "trace", skip_all, fields(%which, %who), ret)]
+pub fn getpriority(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    which: i32,
+    who: i32,
+) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    let priorities = match matching_priorities(env, which, who) {
+        Ok(priorities) => priorities,
+        Err(err) => return Ok(-err.to_native()),
+    };
+    let Some(priority) = priorities.into_iter().min() else {
+        return Ok(-Errno::Srch.to_native());
+    };
+    Ok(priority)
+}
+
 /// ### `proc_setpriority()`
 /// Sets the guest-visible POSIX nice value for a process, process group, or user.
 #[instrument(level = "trace", skip_all, fields(%which, %who, %priority), ret)]
@@ -59,6 +82,40 @@ pub fn proc_setpriority(
         process.set_nice(priority);
     }
     Ok(Errno::Success)
+}
+
+/// ### `setpriority()`
+/// POSIX-shaped nice-value update. Returns 0 or a negative errno.
+#[instrument(level = "trace", skip_all, fields(%which, %who, %priority), ret)]
+pub fn setpriority(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    which: i32,
+    who: i32,
+    priority: i32,
+) -> Result<i32, WasiError> {
+    let errno = proc_setpriority(ctx, which, who, priority)?;
+    if errno == Errno::Success {
+        Ok(0)
+    } else {
+        Ok(-errno.to_native())
+    }
+}
+
+/// ### `nice()`
+/// Adjusts the calling process nice value and returns the new value or a
+/// negative errno.
+#[instrument(level = "trace", skip_all, fields(%increment), ret)]
+pub fn nice(mut ctx: FunctionEnvMut<'_, WasiEnv>, increment: i32) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let current = ctx.data().process.nice();
+    let next = current.saturating_add(increment).clamp(PRIO_MIN, PRIO_MAX);
+    let errno = proc_setpriority(ctx, PRIO_PROCESS, 0, next)?;
+    if errno == Errno::Success {
+        Ok(next)
+    } else {
+        Ok(-errno.to_native())
+    }
 }
 
 fn matching_priorities(env: &WasiEnv, which: i32, who: i32) -> Result<Vec<i32>, Errno> {

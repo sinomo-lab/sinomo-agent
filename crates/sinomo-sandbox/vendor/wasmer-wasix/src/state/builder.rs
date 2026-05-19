@@ -923,6 +923,12 @@ impl WasiEnvBuilder {
             args: std::sync::Mutex::new(self.args.clone()),
             preopen: self.vfs_preopens.clone(),
             futexs: Default::default(),
+            pidfds: Default::default(),
+            timerfds: Default::default(),
+            signalfds: Default::default(),
+            posix_timers: Default::default(),
+            interval_timers: Default::default(),
+            signal_stack: Default::default(),
             clock_offset: Default::default(),
             envs: std::sync::Mutex::new(conv_env_vars(self.envs)),
             signals: std::sync::Mutex::new(

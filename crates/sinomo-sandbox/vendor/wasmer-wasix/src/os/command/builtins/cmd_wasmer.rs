@@ -59,6 +59,13 @@ enum Executable {
 }
 
 impl CmdWasmer {
+    fn finished_builtin_handle(env: Option<WasiEnv>, exit_code: Errno) -> TaskJoinHandle {
+        if let Some(env) = env {
+            env.blocking_on_exit(Some(exit_code.into()));
+        }
+        OwnedTaskStatus::new_finished_with_code(exit_code.into()).handle()
+    }
+
     async fn run(
         &self,
         parent_ctx: &FunctionEnvMut<'_, WasiEnv>,
@@ -111,9 +118,7 @@ impl CmdWasmer {
                 Executable::BinaryPackage(Box::new(pkg))
             } else {
                 let _ = unsafe { stderr_write(parent_ctx, HELP_RUN.as_bytes()) }.await;
-                let handle =
-                    OwnedTaskStatus::new_finished_with_code(Errno::Success.into()).handle();
-                return Ok(handle);
+                return Ok(Self::finished_builtin_handle(Some(env), Errno::Success));
             };
 
             match executable {
@@ -151,8 +156,7 @@ impl CmdWasmer {
             }
         } else {
             let _ = unsafe { stderr_write(parent_ctx, HELP_RUN.as_bytes()) }.await;
-            let handle = OwnedTaskStatus::new_finished_with_code(Errno::Success.into()).handle();
-            Ok(handle)
+            Ok(Self::finished_builtin_handle(config.take(), Errno::Success))
         }
     }
 
@@ -207,9 +211,7 @@ impl VirtualCommand for CmdWasmer {
                     unsafe { stderr_write(parent_ctx, HELP.as_bytes()) }
                         .await
                         .ok();
-                    let handle =
-                        OwnedTaskStatus::new_finished_with_code(Errno::Success.into()).handle();
-                    Ok(handle)
+                    Ok(Self::finished_builtin_handle(env.take(), Errno::Success))
                 }
                 Some(what) => {
                     let what = Some(what.to_string());

@@ -1,8 +1,5 @@
-// TODO: currently, hard links are broken in the presence or renames.
-// It is impossible to fix them with the current setup, since a hard
-// link must point to the actual file rather than its path, but the
-// only way we can get to a file on a FileSystem instance is by going
-// through its repective FileOpener and giving it a path as input.
+// TODO: special-file hard links are still incomplete. Host-backed regular-file
+// hard links use the host filesystem so they survive process boundaries.
 // TODO: refactor away the InodeVal type
 
 mod fd;
@@ -458,6 +455,22 @@ impl FileSystem for WasiFsRoot {
         }
     }
 
+    fn symlink(&self, target: &Path, link_path: &Path) -> virtual_fs::Result<()> {
+        match self {
+            Self::Sandbox(fs) => fs.symlink(target, link_path),
+            Self::Overlay(overlay) => overlay.symlink(target, link_path),
+            Self::Backing(fs) => fs.symlink(target, link_path),
+        }
+    }
+
+    fn hard_link(&self, old_path: &Path, new_path: &Path) -> virtual_fs::Result<()> {
+        match self {
+            Self::Sandbox(fs) => fs.hard_link(old_path, new_path),
+            Self::Overlay(overlay) => overlay.hard_link(old_path, new_path),
+            Self::Backing(fs) => fs.hard_link(old_path, new_path),
+        }
+    }
+
     fn new_open_options(&self) -> OpenOptions<'_> {
         match self {
             Self::Sandbox(fs) => fs.new_open_options(),
@@ -572,6 +585,14 @@ pub struct WasiFs {
     pub(crate) init_vfs_preopens: Vec<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct WasiFsProcessSnapshot {
+    preopen_fds: Vec<u32>,
+    fd_map: FdList,
+    current_dir: String,
+    has_unioned: HashSet<PackageId>,
+}
+
 impl WasiFs {
     pub fn is_wasix(&self) -> bool {
         // NOTE: this will only be set once very early in the instance lifetime,
@@ -613,6 +634,22 @@ impl WasiFs {
             init_preopens: self.init_preopens.clone(),
             init_vfs_preopens: self.init_vfs_preopens.clone(),
         }
+    }
+
+    pub(crate) fn capture_process_snapshot(&self) -> WasiFsProcessSnapshot {
+        WasiFsProcessSnapshot {
+            preopen_fds: self.preopen_fds.read().unwrap().clone(),
+            fd_map: self.fd_map.read().unwrap().clone(),
+            current_dir: self.current_dir.lock().unwrap().clone(),
+            has_unioned: self.has_unioned.lock().unwrap().clone(),
+        }
+    }
+
+    pub(crate) fn restore_process_snapshot(&self, snapshot: &WasiFsProcessSnapshot) {
+        *self.preopen_fds.write().unwrap() = snapshot.preopen_fds.clone();
+        *self.fd_map.write().unwrap() = snapshot.fd_map.clone();
+        *self.current_dir.lock().unwrap() = snapshot.current_dir.clone();
+        *self.has_unioned.lock().unwrap() = snapshot.has_unioned.clone();
     }
 
     /// Closes all the file handles.
@@ -1292,7 +1329,15 @@ impl WasiFs {
 
                         let component = component.as_os_str().to_string_lossy();
 
-                        if let Some(entry) = entries.get(component.as_ref()) {
+                        let absolute_component;
+                        let entry = if let Some(entry) = entries.get(component.as_ref()) {
+                            Some(entry)
+                        } else {
+                            absolute_component = format!("/{component}");
+                            entries.get(absolute_component.as_str())
+                        };
+
+                        if let Some(entry) = entry {
                             cur_inode = entry.clone();
                         } else if let Some(root) = entries.get(&"/".to_string()) {
                             cur_inode = root.clone();
@@ -2210,7 +2255,7 @@ impl WasiFs {
             Kind::File { handle, path, .. } => match handle {
                 Some(wf) => {
                     let wf = wf.read().unwrap();
-                    return Ok(Filestat {
+                    let mut stat = Filestat {
                         st_filetype: Filetype::RegularFile,
                         st_ino: Inode::from_path(path.to_string_lossy().as_ref()).as_u64(),
                         st_size: wf.size(),
@@ -2219,7 +2264,9 @@ impl WasiFs {
                         st_ctim: wf.created_time(),
 
                         ..Filestat::default()
-                    });
+                    };
+                    fill_virtual_filestat(&self.root_fs, path, &mut stat);
+                    return Ok(stat);
                 }
                 None => self
                     .root_fs
@@ -2258,14 +2305,18 @@ impl WasiFs {
             }
             _ => return Err(Errno::Io),
         };
-        Ok(Filestat {
+        let stat = Filestat {
             st_filetype: virtual_file_type_to_wasi_file_type(md.file_type()),
+            st_dev: md.dev(),
+            st_ino: md.ino(),
+            st_nlink: md.nlink(),
             st_size: md.len(),
             st_atim: md.accessed(),
             st_mtim: md.modified(),
             st_ctim: md.created(),
             ..Filestat::default()
-        })
+        };
+        Ok(stat)
     }
 
     /// Closes an open FD, handling all details such as FD being preopen
@@ -2311,6 +2362,18 @@ fn filetype_for_kind(kind: &Kind) -> Filetype {
         Kind::PipeRx { .. } | Kind::PipeTx { .. } | Kind::DuplexPipe { .. } => Filetype::Unknown,
         Kind::EventNotifications { .. } | Kind::Epoll { .. } => Filetype::Unknown,
     }
+}
+
+fn fill_virtual_filestat(root_fs: &WasiFsRoot, path: &Path, stat: &mut Filestat) {
+    let Ok(metadata) = root_fs.metadata(path) else {
+        return;
+    };
+    stat.st_dev = metadata.dev();
+    stat.st_ino = metadata.ino();
+    stat.st_nlink = metadata.nlink();
+    stat.st_atim = metadata.accessed();
+    stat.st_mtim = metadata.modified();
+    stat.st_ctim = metadata.created();
 }
 
 impl std::fmt::Debug for WasiFs {

@@ -104,6 +104,7 @@ rm -rf \
     "${WORKDIR}"/wasi-sdk-${WASI_SDK_VERSION_FULL}* \
     "${WORKDIR}"/binaryen-version_${BINARYEN_VERSION} \
     "${WORKDIR}/wasix-sysroot" \
+    "${WORKDIR}/wasixcc-sysroot-prefix" \
     "${PACKAGE_ROOT}"
 tar -C "${WORKDIR}" -xJf "${WORKDIR}/downloads/${CPYTHON_TARBALL}"
 tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${ZLIB_TARBALL}"
@@ -142,420 +143,218 @@ if [ -z "${WASIXCC_BIN}" ] || [ -z "${WASIXCXX_BIN}" ] || [ -z "${WASIXAR_BIN}" 
     exit 1
 fi
 
-perl -0pi -e 's/defined\(HAVE_NETPACKET_PACKET_H\)/defined(HAVE_NETPACKET_PACKET_H) \&\& defined(AF_PACKET)/g; s/#ifdef HAVE_NETPACKET_PACKET_H/#if defined(HAVE_NETPACKET_PACKET_H) \&\& defined(AF_PACKET)/g' \
-    "${CPYTHON_SRC}/Modules/socketmodule.c"
-perl -0pi -e 's/\n\s*\[mmap\],(\n\s*\[termios\],)/$1/' \
-    "${CPYTHON_SRC}/configure" \
-    "${CPYTHON_SRC}/configure.ac"
-perl -0pi -e 's/\n\s*py_cv_module_mmap=n\/a(\n\s*py_cv_module_termios=n\/a)/$1/' \
-    "${CPYTHON_SRC}/configure"
-perl -0pi -e 's/\n\s*\[fcntl\],(\n\s*\[termios\],)/$1/' \
-    "${CPYTHON_SRC}/configure.ac"
-perl -0pi -e 's/\n\s*py_cv_module_fcntl=n\/a(\n\s*py_cv_module_termios=n\/a)/$1/' \
-    "${CPYTHON_SRC}/configure"
-perl -0pi -e 's/#define my_getpagesize getpagesize/#define my_getpagesize getpagesize\n#define my_getallocationgranularity my_getpagesize/' \
-    "${CPYTHON_SRC}/Modules/mmapmodule.c"
-python3 - "${CPYTHON_SRC}/Modules/fcntlmodule.c" <<'PY'
+WASIXCC_ENV_BIN="${WASIXCCENV_BIN:-$(command -v wasixccenv || true)}"
+if [ -z "${WASIXCC_ENV_BIN}" ]; then
+    echo "wasixccenv not found; install it with: cargo install wasixcc --locked" >&2
+    exit 1
+fi
+WASIXCC_DEFAULT_SYSROOT="$("${WASIXCC_ENV_BIN}" print-sysroot)"
+if [ -z "${WASIXCC_DEFAULT_SYSROOT}" ] || [ ! -d "${WASIXCC_DEFAULT_SYSROOT}" ]; then
+    echo "wasixcc default sysroot not found" >&2
+    exit 1
+fi
+WASIXCC_DEFAULT_SYSROOT_PREFIX="$(dirname "${WASIXCC_DEFAULT_SYSROOT}")"
+WASIXCC_SYSROOT_PREFIX="${WORKDIR}/wasixcc-sysroot-prefix"
+cp -a "${WASIXCC_DEFAULT_SYSROOT_PREFIX}" "${WASIXCC_SYSROOT_PREFIX}"
+
+patch_wasix_sysroot() {
+    local sysroot="$1"
+    local stem
+    local posix_object
+    local at_fdcwd_object
+
+    if [ ! -f "${sysroot}/include/unistd.h" ] || [ ! -f "${sysroot}/lib/wasm32-wasi/libc.a" ]; then
+        echo "WASIX sysroot is missing required files: ${sysroot}" >&2
+        exit 1
+    fi
+
+    stem="$(basename "${sysroot}")"
+    posix_object="${WORKDIR}/sinomo-${stem}-wasix-posix.o"
+    at_fdcwd_object="${WORKDIR}/sinomo-${stem}-wasix-at-fdcwd.o"
+    if [ -f "${sysroot}/include/__header_sys_socket.h" ]; then
+        python3 - "${sysroot}/include/__header_sys_socket.h" <<'PY'
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
-needle = '''#include "clinic/fcntlmodule.c.h"\n'''
-replacement = '''#include "clinic/fcntlmodule.c.h"
+if "#define AF_PACKET" not in text:
+    marker = "#define SOMAXCONN"
+    additions = """#ifndef PF_PACKET
+#define PF_PACKET 17
+#endif
+#ifndef AF_PACKET
+#define AF_PACKET PF_PACKET
+#endif
 
-#ifndef F_RDLCK
-#define F_RDLCK 0
-#endif
-#ifndef F_WRLCK
-#define F_WRLCK 1
-#endif
-#ifndef F_UNLCK
-#define F_UNLCK 2
-#endif
-#ifndef F_SETLK
-#define F_SETLK 7
-#endif
-#ifndef F_SETLKW
-#define F_SETLKW 8
-#endif
-#ifndef F_DUPFD_CLOEXEC
-#define F_DUPFD_CLOEXEC 1030
-#endif
-#ifndef F_SETPIPE_SZ
-#define F_SETPIPE_SZ 1031
-#endif
-#ifndef F_GETPIPE_SZ
-#define F_GETPIPE_SZ 1032
-#endif
-#ifndef F_ADD_SEALS
-#define F_ADD_SEALS 1033
-#endif
-#ifndef F_GET_SEALS
-#define F_GET_SEALS 1034
-#endif
-#ifndef F_OFD_GETLK
-#define F_OFD_GETLK 36
-#endif
-#ifndef F_OFD_SETLK
-#define F_OFD_SETLK 37
-#endif
-#ifndef F_OFD_SETLKW
-#define F_OFD_SETLKW 38
-#endif
-#ifndef F_SEAL_SEAL
-#define F_SEAL_SEAL 0x0001
-#endif
-#ifndef F_SEAL_SHRINK
-#define F_SEAL_SHRINK 0x0002
-#endif
-#ifndef F_SEAL_GROW
-#define F_SEAL_GROW 0x0004
-#endif
-#ifndef F_SEAL_WRITE
-#define F_SEAL_WRITE 0x0008
-#endif
-#ifndef F_SEAL_FUTURE_WRITE
-#define F_SEAL_FUTURE_WRITE 0x0010
-#endif
-'''
-if needle not in text:
-    raise SystemExit("fcntl WASIX lock constant patch target not found")
-path.write_text(text.replace(needle, replacement, 1))
+"""
+    if marker not in text:
+        raise SystemExit(f"{marker} not found in {path}")
+    text = text.replace(marker, additions + marker, 1)
+    path.write_text(text)
 PY
-perl -0pi -e 's/ -lwasi-emulated-signal//g' \
-    "${CPYTHON_SRC}/configure" \
-    "${CPYTHON_SRC}/configure.ac"
-python3 - "${CPYTHON_SRC}/Lib/subprocess.py" <<'PY'
-import pathlib
-import sys
+    fi
+    "${WASI_SDK}/bin/clang" \
+        --target=wasm32-wasi \
+        --sysroot="${sysroot}" \
+        -matomics \
+        -mbulk-memory \
+        -mmutable-globals \
+        -pthread \
+        -mthread-model posix \
+        -fPIC \
+        -Os \
+        -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/wasix-posix-patch.c" \
+        -o "${posix_object}"
+    "${WASI_SDK}/bin/clang" \
+        --target=wasm32-wasi \
+        --sysroot="${sysroot}" \
+        -matomics \
+        -mbulk-memory \
+        -mmutable-globals \
+        -pthread \
+        -mthread-model posix \
+        -fPIC \
+        -Os \
+        -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/wasix-at-fdcwd-patch.c" \
+        -o "${at_fdcwd_object}"
+    "${WASI_SDK}/bin/llvm-ar" d "${sysroot}/lib/wasm32-wasi/libc.a" \
+        posix.o at_fdcwd.o chdir.o fchdir.o chown.o fchown.o fchownat.o lchown.o \
+        ftruncate.o truncate.o getegid.o geteuid.o getgid.o getuid.o setegid.o seteuid.o setgid.o setgroups.o setuid.o >/dev/null 2>&1 || true
+    "${WASI_SDK}/bin/llvm-ar" r "${sysroot}/lib/wasm32-wasi/libc.a" \
+        "${posix_object}" \
+        "${at_fdcwd_object}"
+    "${WASI_SDK}/bin/llvm-ranlib" "${sysroot}/lib/wasm32-wasi/libc.a"
+}
 
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-replacements = [
-    (
-        '_can_fork_exec = sys.platform not in {"emscripten", "wasi", "ios", "tvos", "watchos"}',
-        '_can_fork_exec = sys.platform not in {"emscripten", "ios", "tvos", "watchos"} and (sys.platform != "wasi" or hasattr(os, "posix_spawn"))',
-    ),
-    (
-        '''else:
-    if _can_fork_exec:
-        from _posixsubprocess import fork_exec as _fork_exec
-        # used in methods that are called by __del__
-        class _del_safe:''',
-        '''else:
-    if _can_fork_exec and sys.platform != "wasi":
-        from _posixsubprocess import fork_exec as _fork_exec
-    if _can_fork_exec:
-        # used in methods that are called by __del__
-        class _del_safe:''',
-    ),
-    (
-        '''    # By default, assume that posix_spawn() does not properly report errors.
-    return False''',
-        '''    if sys.platform == "wasi":
-        return True
-
-    # By default, assume that posix_spawn() does not properly report errors.
-    return False''',
-    ),
-]
-for needle, replacement in replacements:
-    if needle not in text:
-        raise SystemExit(f"subprocess WASIX patch target not found: {needle!r}")
-    text = text.replace(needle, replacement, 1)
-path.write_text(text)
-PY
-perl -0pi -e 's/and \(not close_fds or _HAVE_POSIX_SPAWN_CLOSEFROM\)/and (not close_fds or _HAVE_POSIX_SPAWN_CLOSEFROM or sys.platform == "wasi")/' \
-    "${CPYTHON_SRC}/Lib/subprocess.py"
-perl -0pi -e 's/and os\.path\.dirname\(executable\)/and (os.path.dirname(executable) or sys.platform == "wasi")/' \
-    "${CPYTHON_SRC}/Lib/subprocess.py"
-perl -0pi -e 's/            if close_fds:\n                file_actions\.append\(\(os\.POSIX_SPAWN_CLOSEFROM, 3\)\)/            if close_fds and _HAVE_POSIX_SPAWN_CLOSEFROM:\n                file_actions.append((os.POSIX_SPAWN_CLOSEFROM, 3))/' \
-    "${CPYTHON_SRC}/Lib/subprocess.py"
-python3 - "${CPYTHON_SRC}/Lib/subprocess.py" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-needle = '''            self.pid = os.posix_spawn(executable, args, env, **kwargs)
-            self._child_created = True'''
-replacement = '''            spawn_func = os.posix_spawn
-            if sys.platform == "wasi" and not os.path.dirname(executable) and hasattr(os, "posix_spawnp"):
-                spawn_func = os.posix_spawnp
-            try:
-                self.pid = spawn_func(executable, args, env, **kwargs)
-            except OSError as error:
-                if sys.platform != "wasi" or error.errno != errno.ENOEXEC:
-                    raise
-                shell_args = ["/bin/sh", executable, *args[1:]]
-                self.pid = os.posix_spawn("/bin/sh", shell_args, env, **kwargs)
-            self._child_created = True'''
-if needle not in text:
-    raise SystemExit("subprocess WASIX ENOEXEC patch target not found")
-path.write_text(text.replace(needle, replacement))
-PY
-python3 - "${CPYTHON_SRC}/Modules/posixmodule.c" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-replacements = [
-    (
-        '''enum posix_spawn_file_actions_identifier {
-    POSIX_SPAWN_OPEN,
-    POSIX_SPAWN_CLOSE,
-    POSIX_SPAWN_DUP2
-#ifdef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
-    ,POSIX_SPAWN_CLOSEFROM
-#endif
-};''',
-        '''enum posix_spawn_file_actions_identifier {
-    POSIX_SPAWN_OPEN,
-    POSIX_SPAWN_CLOSE,
-    POSIX_SPAWN_DUP2,
-    POSIX_SPAWN_CHDIR
-#ifdef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
-    ,POSIX_SPAWN_CLOSEFROM
-#endif
-};''',
-    ),
-    (
-        '''#ifdef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
-            case POSIX_SPAWN_CLOSEFROM: {
-                int fd;
-                if (!PyArg_ParseTuple(file_action, "Oi"
-                        ";A closefrom file_action tuple must have 2 elements",
-                        &tag_obj, &fd))
-                {
-                    goto fail;
-                }
-                errno = posix_spawn_file_actions_addclosefrom_np(file_actionsp,
-                                                                 fd);
-                if (errno) {
-                    posix_error();
-                    goto fail;
-                }
-                break;
-            }
-#endif
-            default: {''',
-        '''            case POSIX_SPAWN_CHDIR: {
-                PyObject *path;
-                if (!PyArg_ParseTuple(file_action, "OO&"
-                        ";A chdir file_action tuple must have 2 elements",
-                        &tag_obj, PyUnicode_FSConverter, &path))
-                {
-                    goto fail;
-                }
-                if (PyList_Append(temp_buffer, path)) {
-                    Py_DECREF(path);
-                    goto fail;
-                }
-                errno = posix_spawn_file_actions_addchdir_np(file_actionsp,
-                                                             PyBytes_AS_STRING(path));
-                if (errno) {
-                    posix_error();
-                    Py_DECREF(path);
-                    goto fail;
-                }
-                Py_DECREF(path);
-                break;
-            }
-#ifdef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
-            case POSIX_SPAWN_CLOSEFROM: {
-                int fd;
-                if (!PyArg_ParseTuple(file_action, "Oi"
-                        ";A closefrom file_action tuple must have 2 elements",
-                        &tag_obj, &fd))
-                {
-                    goto fail;
-                }
-                errno = posix_spawn_file_actions_addclosefrom_np(file_actionsp,
-                                                                 fd);
-                if (errno) {
-                    posix_error();
-                    goto fail;
-                }
-                break;
-            }
-#endif
-            default: {''',
-    ),
-    (
-        '''    if (PyModule_AddIntConstant(m, "POSIX_SPAWN_DUP2", POSIX_SPAWN_DUP2)) return -1;
-#ifdef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP''',
-        '''    if (PyModule_AddIntConstant(m, "POSIX_SPAWN_DUP2", POSIX_SPAWN_DUP2)) return -1;
-    if (PyModule_AddIntConstant(m, "POSIX_SPAWN_CHDIR", POSIX_SPAWN_CHDIR)) return -1;
-#ifdef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP''',
-    ),
-]
-for needle, replacement in replacements:
-    if needle not in text:
-        raise SystemExit(f"posix_spawn chdir patch target not found: {needle!r}")
-    text = text.replace(needle, replacement, 1)
-path.write_text(text)
-PY
-python3 - "${CPYTHON_SRC}/Objects/obmalloc.c" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-replacements = [
-    (
-        '''    return _PyMem_Raw.malloc(_PyMem_Raw.ctx, size);''',
-        '''#ifdef __wasi__
-    return _PyMem_RawMalloc(NULL, size);
-#else
-    return _PyMem_Raw.malloc(_PyMem_Raw.ctx, size);
-#endif''',
-    ),
-    (
-        '''    return _PyMem_Raw.calloc(_PyMem_Raw.ctx, nelem, elsize);''',
-        '''#ifdef __wasi__
-    return _PyMem_RawCalloc(NULL, nelem, elsize);
-#else
-    return _PyMem_Raw.calloc(_PyMem_Raw.ctx, nelem, elsize);
-#endif''',
-    ),
-    (
-        '''    return _PyMem_Raw.realloc(_PyMem_Raw.ctx, ptr, new_size);''',
-        '''#ifdef __wasi__
-    return _PyMem_RawRealloc(NULL, ptr, new_size);
-#else
-    return _PyMem_Raw.realloc(_PyMem_Raw.ctx, ptr, new_size);
-#endif''',
-    ),
-    (
-        '''    _PyMem_Raw.free(_PyMem_Raw.ctx, ptr);''',
-        '''#ifdef __wasi__
-    _PyMem_RawFree(NULL, ptr);
-#else
-    _PyMem_Raw.free(_PyMem_Raw.ctx, ptr);
-#endif''',
-    ),
-]
-for needle, replacement in replacements:
-    if needle not in text:
-        raise SystemExit(f"obmalloc WASIX raw allocator patch target not found: {needle!r}")
-    text = text.replace(needle, replacement, 1)
-path.write_text(text)
-PY
-python3 - "${CPYTHON_SRC}/Lib/subprocess.py" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-needle = '''            if executable is None:
-                executable = args[0]
-
-            sys.audit("subprocess.Popen", executable, args, cwd, env)'''
-replacement = '''            if executable is None:
-                executable = args[0]
-            if sys.platform == "wasi" and not executable:
-                executable = "/bin/python"
-                if args and not args[0]:
-                    args[0] = executable
-
-            sys.audit("subprocess.Popen", executable, args, cwd, env)'''
-if needle not in text:
-    raise SystemExit("subprocess WASIX executable patch target not found")
-path.write_text(text.replace(needle, replacement))
-PY
-python3 - "${CPYTHON_SRC}/Lib/subprocess.py" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-replacements = [
-    (
-        '''_HAVE_POSIX_SPAWN_CLOSEFROM = hasattr(os, 'POSIX_SPAWN_CLOSEFROM')''',
-        '''_HAVE_POSIX_SPAWN_CLOSEFROM = hasattr(os, 'POSIX_SPAWN_CLOSEFROM')
-_HAVE_POSIX_SPAWN_CHDIR = hasattr(os, 'POSIX_SPAWN_CHDIR')
-
-def _sinomo_spawn_close_actions(first_fd):
-    try:
-        fds = sorted(
-            int(name) for name in os.listdir("/proc/self/fd")
-            if name.isdecimal() and int(name) >= first_fd
-        )
-        return [(os.POSIX_SPAWN_CLOSE, fd) for fd in fds]
-    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
-        pass
-    try:
-        import resource
-        limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-        if limit == resource.RLIM_INFINITY:
-            raise ValueError
-    except (ImportError, OSError, ValueError):
-        try:
-            limit = os.sysconf("SC_OPEN_MAX")
-        except (AttributeError, OSError, ValueError):
-            limit = 1024
-    return [(os.POSIX_SPAWN_CLOSE, fd) for fd in range(first_fd, int(limit))]''',
-    ),
-    (
-        '''        def _posix_spawn(self, args, executable, env, restore_signals, close_fds,
-                         p2cread, p2cwrite,
-                         c2pread, c2pwrite,
-                         errread, errwrite):''',
-        '''        def _posix_spawn(self, args, executable, env, restore_signals, close_fds, cwd,
-                         p2cread, p2cwrite,
-                         c2pread, c2pwrite,
-                         errread, errwrite):''',
-    ),
-    (
-        '''            if close_fds and _HAVE_POSIX_SPAWN_CLOSEFROM:
-                file_actions.append((os.POSIX_SPAWN_CLOSEFROM, 3))
-
-            if file_actions:''',
-        '''            if cwd is not None:
-                file_actions.append((os.POSIX_SPAWN_CHDIR, cwd))
-            elif sys.platform == "wasi" and _HAVE_POSIX_SPAWN_CHDIR:
-                file_actions.append((os.POSIX_SPAWN_CHDIR, os.getcwd()))
-
-            if close_fds and _HAVE_POSIX_SPAWN_CLOSEFROM:
-                file_actions.append((os.POSIX_SPAWN_CLOSEFROM, 3))
-            elif close_fds and sys.platform == "wasi":
-                file_actions.extend(_sinomo_spawn_close_actions(3))
-
-            if file_actions:''',
-    ),
-    (
-        '''                    and cwd is None
-                    and (p2cread == -1 or p2cread > 2)''',
-        '''                    and (cwd is None or _HAVE_POSIX_SPAWN_CHDIR)
-                    and (p2cread == -1 or p2cread > 2)''',
-    ),
-    (
-        '''                self._posix_spawn(args, executable, env, restore_signals, close_fds,
-                                  p2cread, p2cwrite,''',
-        '''                self._posix_spawn(args, executable, env, restore_signals, close_fds, cwd,
-                                  p2cread, p2cwrite,''',
-    ),
-]
-for needle, replacement in replacements:
-    if needle not in text:
-        raise SystemExit(f"subprocess WASIX posix_spawn cwd patch target not found: {needle!r}")
-    text = text.replace(needle, replacement, 1)
-path.write_text(text)
-PY
+patch_wasix_sysroot "${WASIX_SYSROOT}"
+while IFS= read -r sysroot; do
+    patch_wasix_sysroot "${sysroot}"
+done < <(find "${WASIXCC_SYSROOT_PREFIX}" -mindepth 1 -maxdepth 1 -type d | sort)
 
 WASIXCC_SETTINGS=(
+    "-sSYSROOT_PREFIX=${WASIXCC_SYSROOT_PREFIX}"
     "-sMODULE_KIND=dynamic-main"
     "-sPIC=yes"
     "-sEMULATE_FUNCTION_POINTER_CASTS=1"
+    "-sINITIAL_MEMORY=268435456"
     "-sRUN_WASM_OPT=no"
 )
-WASIX_CFLAGS="-Os -fPIC -D_WASI_EMULATED_MMAN -fno-ident -ffile-prefix-map=${WORKDIR}=sinomo-python-wasix-build -ffile-prefix-map=${REPO_ROOT}=sinomo"
+SINOMO_WASIX_POSIX_DECLS_HEADER="${WORKDIR}/sinomo-wasix-posix-decls.h"
+cat > "${SINOMO_WASIX_POSIX_DECLS_HEADER}" <<'POSIX_DECLS'
+#ifndef SINOMO_WASIX_POSIX_DECLS_H
+#define SINOMO_WASIX_POSIX_DECLS_H
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <poll.h>
+#include <pwd.h>
+#include <sched.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/resource.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/time.h>
+#include <sys/times.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+#include <utime.h>
+
+struct iovec;
+
+int chroot(const char *path);
+int close_range(unsigned int first, unsigned int last, int flags);
+void closefrom(int lowfd);
+ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out, size_t len, unsigned int flags);
+char *ctermid_r(char *buf);
+int dup3(int oldfd, int newfd, int flags);
+int execv(const char *path, char *const argv[]);
+int execve(const char *path, char *const argv[], char *const envp[]);
+int execveat(int dirfd, const char *path, char *const argv[], char *const envp[], int flags);
+int execvp(const char *file, char *const argv[]);
+int execvpe(const char *file, char *const argv[], char *const envp[]);
+int fchdir(int fd);
+int fexecve(int fd, char *const argv[], char *const envp[]);
+int fork(void);
+pid_t forkpty(int *amaster, char *name, const struct termios *termp, const struct winsize *winp);
+int fstatvfs(int fd, struct statvfs *buf);
+int futimes(int fd, const struct timeval times[2]);
+int futimesat(int dirfd, const char *path, const struct timeval times[2]);
+int getgrouplist(const char *user, gid_t group, gid_t *groups, int *ngroups);
+int getgroups(int size, gid_t list[]);
+int getloadavg(double loadavg[], int nelem);
+int getpriority(int which, id_t who);
+int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid);
+int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid);
+pid_t gettid(void);
+int initgroups(const char *user, gid_t group);
+int lockf(int fd, int cmd, off_t len);
+int lutimes(const char *path, const struct timeval times[2]);
+int nice(int inc);
+int openpty(int *amaster, int *aslave, char *name, const struct termios *termp, const struct winsize *winp);
+int pause(void);
+int pipe2(int fds[2], int flags);
+char *ptsname(int fd);
+int ptsname_r(int fd, char *buf, size_t buflen);
+ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset);
+ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset);
+int sched_get_priority_max(int policy);
+int sched_get_priority_min(int policy);
+int sched_getcpu(void);
+int sched_getparam(pid_t pid, struct sched_param *param);
+int sched_getscheduler(pid_t pid);
+int sched_rr_get_interval(pid_t pid, struct timespec *interval);
+int sched_setparam(pid_t pid, const struct sched_param *param);
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param);
+int setegid(gid_t egid);
+int seteuid(uid_t euid);
+int setgid(gid_t gid);
+int setgroups(size_t size, const gid_t *groups);
+int setpriority(int which, id_t who, int priority);
+int setregid(gid_t rgid, gid_t egid);
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid);
+int setresuid(uid_t ruid, uid_t euid, uid_t suid);
+int setreuid(uid_t ruid, uid_t euid);
+int setuid(uid_t uid);
+int sigignore(int sig);
+int siginterrupt(int sig, int flag);
+int sigpause(int sig);
+int sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flags);
+void sync(void);
+int unlockpt(int fd);
+int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
+
+#endif
+POSIX_DECLS
+
+WASIX_CFLAGS="-Os -fPIC -D_WASI_EMULATED_MMAN -include ${SINOMO_WASIX_POSIX_DECLS_HEADER} -fno-ident -ffile-prefix-map=${WORKDIR}=sinomo-python-wasix-build -ffile-prefix-map=${REPO_ROOT}=sinomo"
 WASIX_LDFLAGS="-L${ZLIB_OUT}/lib -L${OPENSSL_OUT}/lib -lwasi-emulated-mman -lcrypt"
 SINOMO_WASIX_ARGV_COMPAT_SOURCE="${WORKDIR}/sinomo-wasix-argv-compat.c"
 SINOMO_WASIX_ARGV_COMPAT_OBJECT="${WORKDIR}/sinomo-wasix-argv-compat.o"
 cat > "${SINOMO_WASIX_ARGV_COMPAT_SOURCE}" <<'COMPAT'
+/*
+ * Deprecated compatibility layer.
+ *
+ * This file is retained only while the WASIX POSIX ABI is still catching up.
+ * New POSIX behavior must be implemented in the compiler/sysroot/runtime ABI
+ * layer instead of adding program-specific CPython shims here.
+ */
 #include <errno.h>
 #include <err.h>
 #include <dirent.h>
@@ -622,6 +421,13 @@ extern int __real_close(int fd);
 extern int __real_fcntl(int fd, int cmd, ...);
 extern int __real_munmap(void *addr, size_t len);
 extern int __real_utimensat(int dirfd, const char *path, const struct timespec times[2], int flags);
+extern int __real_mkdir(const char *path, mode_t mode);
+extern int __real_rmdir(const char *path);
+extern int __real_unlink(const char *path);
+extern ssize_t __real_readlink(const char *path, char *buf, size_t bufsiz);
+extern int __real_symlink(const char *target, const char *linkpath);
+extern int __real_link(const char *oldpath, const char *newpath);
+extern int __real_rename(const char *oldpath, const char *newpath);
 int fchdir(int fd);
 ssize_t __wrap_read(int fd, void *buf, size_t count);
 ssize_t __wrap_write(int fd, const void *buf, size_t count);
@@ -668,6 +474,8 @@ int __wrap_openpty(int *amaster, int *aslave, char *name, const struct termios *
 int __wrap_login_tty(int fd);
 pid_t __wrap_forkpty(int *amaster, char *name, const struct termios *termp, const struct winsize *winp);
 int __wrap_clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remain);
+int __wrap_clock_gettime(clockid_t clock_id, struct timespec *timespec);
+int __wrap_clock_getres(clockid_t clock_id, struct timespec *timespec);
 int __wrap_timer_create(clockid_t clock_id, struct sigevent *event, timer_t *timer_id);
 int __wrap_timer_settime(timer_t timer_id, int flags, const struct itimerspec *new_value, struct itimerspec *old_value);
 int __wrap_timer_gettime(timer_t timer_id, struct itimerspec *value);
@@ -696,7 +504,6 @@ pid_t __wrap_vfork(void);
 int __wrap_prctl(int option, ...);
 int __wrap_kill(pid_t pid, int signum);
 int __wrap_sigaltstack(const stack_t *stack, stack_t *old_stack);
-int __wrap_chdir(const char *path);
 int __wrap_mknod(const char *path, mode_t mode, dev_t dev);
 int __wrap_mknodat(int dirfd, const char *path, mode_t mode, dev_t dev);
 int __wrap_flock(int fd, int operation);
@@ -749,8 +556,11 @@ int __wrap_getsockopt(int fd, int level, int option, void *value, socklen_t *val
 int __wrap_socketpair(int domain, int type, int protocol, int sv[2]);
 pid_t __wrap_wait4(pid_t pid, int *status_ptr, int options, struct rusage *usage);
 int __wrap_waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
+int __wrap_execv(const char *path, char *const argv[]);
 int __wrap_execve(const char *path, char *const argv[], char *const envp[]);
 int __wrap_execveat(int dirfd, const char *path, char *const argv[], char *const envp[], int flags);
+int __wrap_execvp(const char *file, char *const argv[]);
+int __wrap_execvpe(const char *file, char *const argv[], char *const envp[]);
 int fexecve(int fd, char *const argv[], char *const envp[]);
 static int sinomo_apply_fd_flags(int fd, int flags);
 static int sinomo_signal_valid(int signum);
@@ -772,6 +582,7 @@ static int sinomo_memfd_get_seals(int fd);
 static void sinomo_memfd_forget(int fd);
 static void sinomo_pipe_forget(int fd);
 static void sinomo_landlock_forget(int fd);
+static void sinomo_futex_fd_forget(int fd);
 
 __attribute__((import_module("wasix_32v1"), import_name("proc_getgroups")))
 extern int sinomo_proc_getgroups(unsigned int *groups, unsigned int max_groups, unsigned int *count);
@@ -869,6 +680,10 @@ __attribute__((import_module("wasix_32v1"), import_name("proc_get_process_contro
 extern int sinomo_proc_get_process_control(unsigned int key, unsigned long long *value);
 __attribute__((import_module("wasix_32v1"), import_name("proc_unshare_namespaces")))
 extern int sinomo_proc_unshare_namespaces(unsigned long long flags);
+__attribute__((import_module("wasix_32v1"), import_name("unshare")))
+extern int sinomo_unshare_runtime(unsigned long long flags);
+__attribute__((import_module("wasix_32v1"), import_name("setns")))
+extern int sinomo_setns_runtime(int fd, int nstype);
 __attribute__((import_module("wasix_32v1"), import_name("proc_set_arch_base")))
 extern int sinomo_proc_set_arch_base(unsigned int kind, unsigned long long address);
 __attribute__((import_module("wasix_32v1"), import_name("proc_get_arch_base")))
@@ -877,6 +692,12 @@ __attribute__((import_module("wasix_32v1"), import_name("proc_set_rseq")))
 extern int sinomo_proc_set_rseq(unsigned long long address, unsigned int len, unsigned int signature);
 __attribute__((import_module("wasix_32v1"), import_name("proc_clear_rseq")))
 extern int sinomo_proc_clear_rseq(unsigned long long address);
+__attribute__((import_module("wasix_32v1"), import_name("arch_prctl")))
+extern int sinomo_arch_prctl_runtime(int code, unsigned long address);
+__attribute__((import_module("wasix_32v1"), import_name("rseq")))
+extern int sinomo_rseq_runtime(unsigned long long address, unsigned int len, int flags, unsigned int signature);
+__attribute__((import_module("wasix_32v1"), import_name("membarrier")))
+extern int sinomo_membarrier_runtime(int command, unsigned int flags, int cpu_id);
 __attribute__((import_module("wasix_32v1"), import_name("proc_set_mempolicy")))
 extern int sinomo_proc_set_mempolicy(int mode, unsigned long long nodes);
 __attribute__((import_module("wasix_32v1"), import_name("proc_get_mempolicy")))
@@ -889,6 +710,20 @@ __attribute__((import_module("wasix_32v1"), import_name("proc_get_ioprio")))
 extern int sinomo_proc_get_ioprio(int *ioprio);
 __attribute__((import_module("wasix_32v1"), import_name("thread_id")))
 extern int sinomo_thread_id(unsigned int *tid);
+__attribute__((import_module("wasix_32v1"), import_name("tkill")))
+extern int sinomo_tkill_runtime(int tid, int signal);
+__attribute__((import_module("wasix_32v1"), import_name("tgkill")))
+extern int sinomo_tgkill_runtime(int tgid, int tid, int signal);
+__attribute__((import_module("wasix_32v1"), import_name("pidfd_open")))
+extern int sinomo_pidfd_open_runtime(int pid, int flags);
+__attribute__((import_module("wasix_32v1"), import_name("pidfd_send_signal")))
+extern int sinomo_pidfd_send_signal_runtime(int pidfd, int signal, unsigned int flags);
+__attribute__((import_module("wasix_32v1"), import_name("pidfd_getfd")))
+extern int sinomo_pidfd_getfd_runtime(int pidfd, int targetfd, unsigned int flags);
+__attribute__((import_module("wasix_32v1"), import_name("pidfd_status")))
+extern int sinomo_pidfd_status_runtime(int pidfd);
+__attribute__((import_module("wasix_32v1"), import_name("pidfd_pid")))
+extern int sinomo_pidfd_pid_runtime(int pidfd);
 __attribute__((import_module("wasix_32v1"), import_name("proc_getpgid")))
 extern int sinomo_proc_getpgid(int pid, int *pgid);
 __attribute__((import_module("wasix_32v1"), import_name("proc_getpgrp")))
@@ -913,6 +748,8 @@ __attribute__((import_module("wasix_32v1"), import_name("proc_wait_status")))
 extern int sinomo_proc_wait_status(__wasi_option_pid_t *pid, __wasi_join_flags_t flags, __wasi_join_status_t *status);
 __attribute__((import_module("wasix_32v1"), import_name("proc_wait_status_select")))
 extern int sinomo_proc_wait_status_select(__wasi_option_pid_t *pid, __wasi_join_flags_t flags, uint32_t status_kinds, __wasi_join_status_t *status);
+__attribute__((import_module("wasix_32v1"), import_name("waitid")))
+extern int sinomo_waitid_runtime(int pid, unsigned int options, int *ret_pid, int *ret_signo, int *ret_code, int *ret_status);
 __attribute__((import_module("wasix_32v1"), import_name("proc_child_continued_status")))
 extern int sinomo_proc_child_continued_status(int pid, int consume, int *continued_pid);
 __attribute__((import_module("wasix_32v1"), import_name("proc_child_continued_status_wait")))
@@ -929,19 +766,92 @@ __attribute__((import_module("wasix_32v1"), import_name("proc_getrusage")))
 extern int sinomo_proc_getrusage(int who, unsigned long long *user_usec, unsigned long long *system_usec, unsigned long long *maxrss_kib);
 __attribute__((import_module("wasix_32v1"), import_name("proc_times")))
 extern int sinomo_proc_times(unsigned long long *elapsed_ticks, unsigned long long *user_ticks, unsigned long long *system_ticks, unsigned long long *child_user_ticks, unsigned long long *child_system_ticks);
+__attribute__((import_module("wasix_32v1"), import_name("sched_yield")))
+extern int sinomo_sched_yield_runtime(void);
+__attribute__((import_module("wasix_32v1"), import_name("sched_get_priority_max")))
+extern int sinomo_sched_get_priority_max_runtime(int policy);
+__attribute__((import_module("wasix_32v1"), import_name("sched_get_priority_min")))
+extern int sinomo_sched_get_priority_min_runtime(int policy);
 __attribute__((import_module("wasix_32v1"), import_name("proc_getscheduler")))
 extern int sinomo_proc_getscheduler(int pid, int *policy, int *priority);
 __attribute__((import_module("wasix_32v1"), import_name("proc_setscheduler")))
 extern int sinomo_proc_setscheduler(int pid, int policy, int priority);
+__attribute__((import_module("wasix_32v1"), import_name("sched_rr_get_interval")))
+extern int sinomo_sched_rr_get_interval(int pid, struct timespec *interval);
+__attribute__((import_module("wasix_32v1"), import_name("pipe2")))
+extern int sinomo_pipe2_runtime(int pipefd[2], int flags);
+__attribute__((import_module("wasix_32v1"), import_name("dup3")))
+extern int sinomo_dup3_runtime(int oldfd, int newfd, int flags);
+__attribute__((import_module("wasix_32v1"), import_name("eventfd")))
+extern int sinomo_eventfd_runtime(unsigned int initval, int flags);
+__attribute__((import_module("wasix_32v1"), import_name("timerfd_create")))
+extern int sinomo_timerfd_create_runtime(int clock_id, int flags);
+__attribute__((import_module("wasix_32v1"), import_name("timerfd_settime")))
+extern int sinomo_timerfd_settime_runtime(int fd, int flags, long long value_sec, long long value_nsec, long long interval_sec, long long interval_nsec, long long *old_value_sec, long long *old_value_nsec, long long *old_interval_sec, long long *old_interval_nsec);
+__attribute__((import_module("wasix_32v1"), import_name("timerfd_gettime")))
+extern int sinomo_timerfd_gettime_runtime(int fd, long long *value_sec, long long *value_nsec, long long *interval_sec, long long *interval_nsec);
+__attribute__((import_module("wasix_32v1"), import_name("timerfd_read")))
+extern long long sinomo_timerfd_read_runtime(int fd);
+__attribute__((import_module("wasix_32v1"), import_name("timerfd_ready")))
+extern int sinomo_timerfd_ready_runtime(int fd);
+__attribute__((import_module("wasix_32v1"), import_name("timerfd_remaining_ms")))
+extern int sinomo_timerfd_remaining_ms_runtime(int fd);
+__attribute__((import_module("wasix_32v1"), import_name("timerfd_known")))
+extern int sinomo_timerfd_known_runtime(int fd);
+__attribute__((import_module("wasix_32v1"), import_name("posix_timer_create")))
+extern int sinomo_posix_timer_create_runtime(int clock_id);
+__attribute__((import_module("wasix_32v1"), import_name("posix_timer_settime")))
+extern int sinomo_posix_timer_settime_runtime(int timer_id, int flags, long long value_sec, long long value_nsec, long long interval_sec, long long interval_nsec, long long *old_value_sec, long long *old_value_nsec, long long *old_interval_sec, long long *old_interval_nsec);
+__attribute__((import_module("wasix_32v1"), import_name("posix_timer_gettime")))
+extern int sinomo_posix_timer_gettime_runtime(int timer_id, long long *value_sec, long long *value_nsec, long long *interval_sec, long long *interval_nsec);
+__attribute__((import_module("wasix_32v1"), import_name("posix_timer_getoverrun")))
+extern int sinomo_posix_timer_getoverrun_runtime(int timer_id);
+__attribute__((import_module("wasix_32v1"), import_name("posix_timer_delete")))
+extern int sinomo_posix_timer_delete_runtime(int timer_id);
+__attribute__((import_module("wasix_32v1"), import_name("itimer_settime")))
+extern int sinomo_itimer_settime_runtime(int which, long long value_sec, long long value_usec, long long interval_sec, long long interval_usec, long long *old_value_sec, long long *old_value_usec, long long *old_interval_sec, long long *old_interval_usec);
+__attribute__((import_module("wasix_32v1"), import_name("itimer_gettime")))
+extern int sinomo_itimer_gettime_runtime(int which, long long *value_sec, long long *value_usec, long long *interval_sec, long long *interval_usec);
+__attribute__((import_module("wasix_32v1"), import_name("sigaltstack_set")))
+extern int sinomo_sigaltstack_set_runtime(unsigned long long sp, int flags, unsigned long long size, long long *old_sp, int *old_flags, long long *old_size);
+__attribute__((import_module("wasix_32v1"), import_name("sigaltstack_get")))
+extern int sinomo_sigaltstack_get_runtime(long long *old_sp, int *old_flags, long long *old_size);
+__attribute__((import_module("wasix_32v1"), import_name("signal_mask_set")))
+extern int sinomo_signal_mask_set_runtime(unsigned long long low, unsigned long long high);
+__attribute__((import_module("wasix_32v1"), import_name("signal_mask_get")))
+extern int sinomo_signal_mask_get_runtime(long long *low, long long *high);
+__attribute__((import_module("wasix_32v1"), import_name("signalfd")))
+extern int sinomo_signalfd_runtime(int fd, unsigned long long mask_low, unsigned long long mask_high, int flags);
+__attribute__((import_module("wasix_32v1"), import_name("signalfd_known")))
+extern int sinomo_signalfd_known_runtime(int fd);
+__attribute__((import_module("wasix_32v1"), import_name("signalfd_mask_low")))
+extern long long sinomo_signalfd_mask_low_runtime(int fd);
+__attribute__((import_module("wasix_32v1"), import_name("signalfd_mask_high")))
+extern long long sinomo_signalfd_mask_high_runtime(int fd);
 __attribute__((import_module("wasix_32v1"), import_name("proc_getaffinity")))
 extern int sinomo_proc_getaffinity(int pid, unsigned long long *mask_low, unsigned long long *mask_high);
 __attribute__((import_module("wasix_32v1"), import_name("proc_setaffinity")))
 extern int sinomo_proc_setaffinity(int pid, unsigned long long mask_low, unsigned long long mask_high);
 __attribute__((import_module("wasix_32v1"), import_name("proc_getcpu")))
 extern int sinomo_proc_getcpu(unsigned int *cpu);
-__attribute__((import_module("wasix_32v1"), import_name("fchdir")))
-extern int sinomo_fchdir(int fd);
-
+__attribute__((import_module("wasix_32v1"), import_name("nanosleep")))
+extern int sinomo_nanosleep(const struct timespec *request, struct timespec *remain);
+__attribute__((import_module("wasix_32v1"), import_name("clock_nanosleep")))
+extern int sinomo_clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remain);
+__attribute__((import_module("wasix_32v1"), import_name("clock_gettime")))
+extern int sinomo_clock_gettime(clockid_t clock_id, struct timespec *timespec);
+__attribute__((import_module("wasix_32v1"), import_name("clock_getres")))
+extern int sinomo_clock_getres(clockid_t clock_id, struct timespec *timespec);
+__attribute__((import_module("wasix_32v1"), import_name("sleep")))
+extern unsigned int sinomo_sleep(unsigned int seconds);
+__attribute__((import_module("wasix_32v1"), import_name("usleep")))
+extern int sinomo_usleep(unsigned long long microseconds);
+__attribute__((import_module("wasix_32v1"), import_name("fork")))
+extern int sinomo_fork(void);
+__attribute__((import_module("wasix_32v1"), import_name("vfork")))
+extern int sinomo_vfork(void);
+__attribute__((import_module("wasix_32v1"), import_name("clone_thread")))
+extern int sinomo_clone_thread(unsigned long long child_stack, int *parent_tid, int *child_tid, unsigned long long tls, int set_parent_tid, int set_child_tid, int clear_child_tid);
 #ifndef F_RDLCK
 #define F_RDLCK 0
 #endif
@@ -6831,20 +6741,9 @@ int __wrap_pipe2(int pipefd[2], int flags) {
         errno = EINVAL;
         return -1;
     }
-    __wasi_fd_t read_fd = 0;
-    __wasi_fd_t write_fd = 0;
-    __wasi_errno_t rc = __wasi_fd_pipe(&read_fd, &write_fd);
-    if (rc != 0) {
-        errno = (int)rc;
-        return -1;
-    }
-    pipefd[0] = (int)read_fd;
-    pipefd[1] = (int)write_fd;
-    if (sinomo_apply_fd_flags(pipefd[0], flags) != 0 || sinomo_apply_fd_flags(pipefd[1], flags) != 0) {
-        int saved_errno = errno;
-        close(pipefd[0]);
-        close(pipefd[1]);
-        errno = saved_errno;
+    int rc = sinomo_pipe2_runtime(pipefd, flags);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
     sinomo_pipe_remember(pipefd[0], 65536);
@@ -6872,19 +6771,12 @@ int __wrap_eventfd(unsigned int initval, int flags) {
         return -1;
     }
 
-    __wasi_fd_t fd = 0;
-    __wasi_errno_t rc = __wasi_fd_event((uint64_t)initval, (__wasi_eventfdflags_t)flags, &fd);
-    if (rc != 0) {
-        errno = (int)rc;
+    int fd = sinomo_eventfd_runtime(initval, flags);
+    if (fd < 0) {
+        errno = -fd;
         return -1;
     }
-    if (sinomo_apply_fd_flags((int)fd, flags) != 0) {
-        int saved_errno = errno;
-        close((int)fd);
-        errno = saved_errno;
-        return -1;
-    }
-    return (int)fd;
+    return fd;
 }
 
 int __wrap_eventfd_read(int fd, eventfd_t *value) {
@@ -7554,16 +7446,23 @@ int __wrap_dup3(int oldfd, int newfd, int flags) {
         errno = EINVAL;
         return -1;
     }
-    int fd = __wrap_dup2(oldfd, newfd);
+    struct sinomo_pty_fd *old_pty = sinomo_pty_fd_entry(oldfd);
+    int pty_id = old_pty == NULL ? -1 : old_pty->id;
+    int pty_master = old_pty == NULL ? 0 : old_pty->master;
+    int fd = sinomo_dup3_runtime(oldfd, newfd, flags);
     if (fd < 0) {
+        errno = -fd;
         return -1;
     }
-    if (sinomo_apply_fd_flags(fd, flags) != 0) {
+    sinomo_pty_forget_fd(fd);
+    sinomo_socket_forget(fd);
+    if (pty_id >= 0 && sinomo_pty_remember_fd(fd, pty_id, pty_master) != 0) {
         int saved_errno = errno;
         close(fd);
         errno = saved_errno;
         return -1;
     }
+    sinomo_socket_duplicate_metadata(oldfd, fd);
     return fd;
 }
 
@@ -9362,34 +9261,30 @@ int __wrap_pselect(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfd
 }
 
 int __wrap_sched_yield(void) {
-    __wasi_errno_t rc = __wasi_sched_yield();
+    int rc = sinomo_sched_yield_runtime();
     if (rc != 0) {
-        errno = (int)rc;
+        errno = rc < 0 ? -rc : rc;
         return -1;
     }
     return 0;
 }
 
 int __wrap_sched_get_priority_max(int policy) {
-    switch (policy) {
-        case SCHED_OTHER:
-        case SCHED_FIFO:
-        case SCHED_RR:
-#ifdef SCHED_BATCH
-        case SCHED_BATCH:
-#endif
-#ifdef SCHED_IDLE
-        case SCHED_IDLE:
-#endif
-            return 0;
-        default:
-            errno = EINVAL;
-            return -1;
+    int rc = sinomo_sched_get_priority_max_runtime(policy);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
     }
+    return rc;
 }
 
 int __wrap_sched_get_priority_min(int policy) {
-    return __wrap_sched_get_priority_max(policy);
+    int rc = sinomo_sched_get_priority_min_runtime(policy);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+    return rc;
 }
 
 int __wrap_sched_getscheduler(pid_t pid) {
@@ -9493,6 +9388,22 @@ int __wrap_sched_setaffinity(pid_t pid, size_t cpusetsize, const void *mask) {
     return -1;
 }
 
+int __sched_cpucount(size_t cpusetsize, const cpu_set_t *mask) {
+    if (mask == NULL) {
+        return 0;
+    }
+    const unsigned char *bytes = (const unsigned char *)mask;
+    int count = 0;
+    for (size_t i = 0; i < cpusetsize; i++) {
+        unsigned char byte = bytes[i];
+        while (byte != 0) {
+            count += byte & 1;
+            byte >>= 1;
+        }
+    }
+    return count;
+}
+
 int __wrap_sched_getcpu(void) {
     unsigned int cpu = 0;
     int rc = sinomo_proc_getcpu(&cpu);
@@ -9508,23 +9419,17 @@ int __wrap_sched_rr_get_interval(pid_t pid, struct timespec *interval) {
         errno = EFAULT;
         return -1;
     }
-    if (__wrap_sched_getscheduler(pid) < 0) {
+    int rc = sinomo_sched_rr_get_interval((int)pid, interval);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    interval->tv_sec = 0;
-    interval->tv_nsec = 10000000L;
     return 0;
 }
 
 static struct sigaction sinomo_signal_actions[_NSIG];
-static sigset_t sinomo_signal_mask;
 static sigset_t sinomo_pending_signals;
 static siginfo_t sinomo_pending_signal_info[_NSIG];
-static stack_t sinomo_signal_stack = {
-    .ss_sp = NULL,
-    .ss_flags = SS_DISABLE,
-    .ss_size = 0,
-};
 
 static int sinomo_signal_valid(int signum) {
     return signum > 0 && signum < _NSIG;
@@ -9619,6 +9524,37 @@ static void sinomo_sigset_remove_unblockable(sigset_t *set) {
     sinomo_sigset_del(set, SIGSTOP);
 }
 
+static void sinomo_sigset_to_words(const sigset_t *mask, unsigned long long *low, unsigned long long *high);
+static sigset_t sinomo_words_to_sigset(unsigned long long low, unsigned long long high);
+
+static sigset_t sinomo_signal_current_mask(void) {
+    long long low = 0;
+    long long high = 0;
+    int rc = sinomo_signal_mask_get_runtime(&low, &high);
+    if (rc < 0) {
+        return sinomo_words_to_sigset(0, 0);
+    }
+    return sinomo_words_to_sigset((unsigned long long)low, (unsigned long long)high);
+}
+
+static int sinomo_signal_set_current_mask(const sigset_t *mask) {
+    if (mask == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    sigset_t normalized = *mask;
+    sinomo_sigset_remove_unblockable(&normalized);
+    unsigned long long low = 0;
+    unsigned long long high = 0;
+    sinomo_sigset_to_words(&normalized, &low, &high);
+    int rc = sinomo_signal_mask_set_runtime(low, high);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+    return 0;
+}
+
 static void sinomo_queue_pending_signal(int signum, const siginfo_t *info) {
     if (!sinomo_signal_valid(signum)) {
         return;
@@ -9698,8 +9634,9 @@ int __wrap_sigismember(const sigset_t *set, int signum) {
 }
 
 int __wrap_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
+    sigset_t current = sinomo_signal_current_mask();
     if (oldset != NULL) {
-        *oldset = sinomo_signal_mask;
+        *oldset = current;
     }
     if (set == NULL) {
         return 0;
@@ -9708,21 +9645,19 @@ int __wrap_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
         case SIG_BLOCK:
             for (int signum = 1; signum < _NSIG; signum++) {
                 if (sinomo_sigset_contains(set, signum) && !sinomo_signal_noncatchable(signum)) {
-                    sinomo_sigset_add(&sinomo_signal_mask, signum);
+                    sinomo_sigset_add(&current, signum);
                 }
             }
-            return 0;
+            return sinomo_signal_set_current_mask(&current);
         case SIG_UNBLOCK:
             for (int signum = 1; signum < _NSIG; signum++) {
                 if (sinomo_sigset_contains(set, signum)) {
-                    sinomo_sigset_del(&sinomo_signal_mask, signum);
+                    sinomo_sigset_del(&current, signum);
                 }
             }
-            return 0;
+            return sinomo_signal_set_current_mask(&current);
         case SIG_SETMASK:
-            sinomo_signal_mask = *set;
-            sinomo_sigset_remove_unblockable(&sinomo_signal_mask);
-            return 0;
+            return sinomo_signal_set_current_mask(set);
         default:
             errno = EINVAL;
             return -1;
@@ -9761,16 +9696,29 @@ int __wrap_sigaction(int signum, const struct sigaction *act, struct sigaction *
 }
 
 int __wrap_sigaltstack(const stack_t *stack, stack_t *old_stack) {
-    if (old_stack != NULL) {
-        *old_stack = sinomo_signal_stack;
-    }
-    if (stack == NULL) {
-        return 0;
-    }
+    long long old_sp = 0;
+    int old_flags = 0;
+    long long old_size = 0;
+    long long *old_sp_ptr = old_stack != NULL ? &old_sp : NULL;
+    int *old_flags_ptr = old_stack != NULL ? &old_flags : NULL;
+    long long *old_size_ptr = old_stack != NULL ? &old_size : NULL;
     int allowed_flags = SS_DISABLE;
 #ifdef SS_AUTODISARM
     allowed_flags |= SS_AUTODISARM;
 #endif
+    if (stack == NULL) {
+        int rc = sinomo_sigaltstack_get_runtime(old_sp_ptr, old_flags_ptr, old_size_ptr);
+        if (rc < 0) {
+            errno = -rc;
+            return -1;
+        }
+        if (old_stack != NULL) {
+            old_stack->ss_sp = (void *)(uintptr_t)old_sp;
+            old_stack->ss_flags = old_flags;
+            old_stack->ss_size = (size_t)old_size;
+        }
+        return 0;
+    }
     if ((stack->ss_flags & ~allowed_flags) != 0) {
         errno = EINVAL;
         return -1;
@@ -9779,10 +9727,29 @@ int __wrap_sigaltstack(const stack_t *stack, stack_t *old_stack) {
         errno = ENOMEM;
         return -1;
     }
-    sinomo_signal_stack = *stack;
-    if ((sinomo_signal_stack.ss_flags & SS_DISABLE) != 0) {
-        sinomo_signal_stack.ss_sp = NULL;
-        sinomo_signal_stack.ss_size = 0;
+    unsigned long long new_sp = (unsigned long long)(uintptr_t)stack->ss_sp;
+    unsigned long long new_size = (unsigned long long)stack->ss_size;
+    int new_flags = stack->ss_flags;
+    if ((new_flags & SS_DISABLE) != 0) {
+        new_sp = 0;
+        new_size = 0;
+    }
+    int rc = sinomo_sigaltstack_set_runtime(
+        new_sp,
+        new_flags,
+        new_size,
+        old_sp_ptr,
+        old_flags_ptr,
+        old_size_ptr
+    );
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+    if (old_stack != NULL) {
+        old_stack->ss_sp = (void *)(uintptr_t)old_sp;
+        old_stack->ss_flags = old_flags;
+        old_stack->ss_size = (size_t)old_size;
     }
     return 0;
 }
@@ -9816,14 +9783,18 @@ static int sinomo_deliver_signal_now(int signum, const siginfo_t *queued_info) {
             return 0;
         }
         struct sigaction delivered_action = *action;
-        sigset_t old_mask = sinomo_signal_mask;
+        sigset_t old_mask = sinomo_signal_current_mask();
+        sigset_t delivery_mask = old_mask;
         for (int masked = 1; masked < _NSIG; masked++) {
             if (sinomo_sigset_contains(&delivered_action.sa_mask, masked) && !sinomo_signal_noncatchable(masked)) {
-                sinomo_sigset_add(&sinomo_signal_mask, masked);
+                sinomo_sigset_add(&delivery_mask, masked);
             }
         }
         if ((delivered_action.sa_flags & SA_NODEFER) == 0) {
-            sinomo_sigset_add(&sinomo_signal_mask, signum);
+            sinomo_sigset_add(&delivery_mask, signum);
+        }
+        if (sinomo_signal_set_current_mask(&delivery_mask) != 0) {
+            return -1;
         }
         if ((delivered_action.sa_flags & SA_RESETHAND) != 0) {
             memset(action, 0, sizeof(*action));
@@ -9850,7 +9821,6 @@ static int sinomo_deliver_signal_now(int signum, const siginfo_t *queued_info) {
         } else {
             delivered_action.sa_handler(signum);
         }
-        sinomo_signal_mask = old_mask;
         return 0;
     }
     __wasi_errno_t rc = __wasi_proc_raise((__wasi_signal_t)signum);
@@ -9866,7 +9836,8 @@ int __wrap_raise(int signum) {
         errno = EINVAL;
         return -1;
     }
-    if (sinomo_sigset_contains(&sinomo_signal_mask, signum)) {
+    sigset_t current_mask = sinomo_signal_current_mask();
+    if (sinomo_sigset_contains(&current_mask, signum)) {
         siginfo_t info;
         memset(&info, 0, sizeof(info));
         info.si_signo = signum;
@@ -9971,14 +9942,17 @@ int __wrap_sigsuspend(const sigset_t *mask) {
         errno = EFAULT;
         return -1;
     }
-    sigset_t old_mask = sinomo_signal_mask;
-    sinomo_signal_mask = *mask;
-    sinomo_sigset_remove_unblockable(&sinomo_signal_mask);
+    sigset_t old_mask = sinomo_signal_current_mask();
+    sigset_t suspend_mask = *mask;
+    if (sinomo_signal_set_current_mask(&suspend_mask) != 0) {
+        return -1;
+    }
     for (;;) {
+        sigset_t current_mask = sinomo_signal_current_mask();
         for (int signum = 1; signum < _NSIG; signum++) {
             if (
                 sinomo_sigset_contains(&sinomo_pending_signals, signum)
-                && !sinomo_sigset_contains(&sinomo_signal_mask, signum)
+                && !sinomo_sigset_contains(&current_mask, signum)
             ) {
                 sigset_t selected;
                 siginfo_t info;
@@ -9989,7 +9963,7 @@ int __wrap_sigsuspend(const sigset_t *mask) {
                     continue;
                 }
                 int deliver_rc = sinomo_deliver_signal_now(signum, &info);
-                sinomo_signal_mask = old_mask;
+                (void)sinomo_signal_set_current_mask(&old_mask);
                 if (deliver_rc != 0) {
                     return -1;
                 }
@@ -10045,7 +10019,7 @@ int __wrap_siginterrupt(int signum, int flag) {
 }
 
 int __wrap_sigpause(int signum) {
-    sigset_t mask = sinomo_signal_mask;
+    sigset_t mask = sinomo_signal_current_mask();
     if (!sinomo_signal_valid(signum)) {
         errno = EINVAL;
         return -1;
@@ -10059,7 +10033,8 @@ int __wrap_sigqueue(pid_t pid, int signum, union sigval value) {
         errno = EINVAL;
         return -1;
     }
-    if (pid == __wrap_getpid() && sinomo_sigset_contains(&sinomo_signal_mask, signum)) {
+    sigset_t current_mask = sinomo_signal_current_mask();
+    if (pid == __wrap_getpid() && sinomo_sigset_contains(&current_mask, signum)) {
         siginfo_t info;
         memset(&info, 0, sizeof(info));
         info.si_signo = signum;
@@ -10085,14 +10060,7 @@ int __wrap_pthread_kill(pthread_t thread, int signum) {
     return __wrap_raise(signum) == 0 ? 0 : errno;
 }
 
-#define SINOMO_SIGNALFD_SLOTS 64
 #define SINOMO_SIGNALFD_RECORD_SIZE 128
-
-struct sinomo_signalfd {
-    int active;
-    int fd;
-    sigset_t mask;
-};
 
 struct sinomo_signalfd_siginfo {
     uint32_t ssi_signo;
@@ -10115,79 +10083,51 @@ struct sinomo_signalfd_siginfo {
     uint8_t pad[SINOMO_SIGNALFD_RECORD_SIZE - 82];
 };
 
-static struct sinomo_signalfd sinomo_signalfds[SINOMO_SIGNALFD_SLOTS];
+static void sinomo_sigset_to_words(const sigset_t *mask, unsigned long long *low, unsigned long long *high) {
+    unsigned long long words[2] = {0, 0};
+    if (mask != NULL) {
+        size_t copy_len = sizeof(sigset_t) < sizeof(words) ? sizeof(sigset_t) : sizeof(words);
+        memcpy(words, mask, copy_len);
+    }
+    *low = words[0];
+    *high = words[1];
+}
+
+static sigset_t sinomo_words_to_sigset(unsigned long long low, unsigned long long high) {
+    sigset_t mask;
+    unsigned long long words[2] = {low, high};
+    memset(&mask, 0, sizeof(mask));
+    size_t copy_len = sizeof(mask) < sizeof(words) ? sizeof(mask) : sizeof(words);
+    memcpy(&mask, words, copy_len);
+    return mask;
+}
 
 static int sinomo_signalfd_index(int fd) {
-    for (int index = 0; index < SINOMO_SIGNALFD_SLOTS; index++) {
-        if (sinomo_signalfds[index].active && sinomo_signalfds[index].fd == fd) {
-            return index;
-        }
-    }
-    return -1;
+    return sinomo_signalfd_known_runtime(fd) > 0 ? 0 : -1;
 }
 
 static void sinomo_signalfd_forget(int fd) {
-    int index = sinomo_signalfd_index(fd);
-    if (index >= 0) {
-        memset(&sinomo_signalfds[index], 0, sizeof(sinomo_signalfds[index]));
-    }
+    (void)fd;
 }
 
 int __wrap_signalfd(int fd, const sigset_t *mask, int flags) {
-    int supported = SFD_CLOEXEC | SFD_NONBLOCK;
     if (mask == NULL) {
         errno = EFAULT;
         return -1;
     }
-    if ((flags & ~supported) != 0) {
-        errno = EINVAL;
-        return -1;
+    unsigned long long low = 0;
+    unsigned long long high = 0;
+    sinomo_sigset_to_words(mask, &low, &high);
+    int rc = sinomo_signalfd_runtime(fd, low, high, flags);
+    if (rc >= 0) {
+        return rc;
     }
-    int index = -1;
-    if (fd >= 0) {
-        index = sinomo_signalfd_index(fd);
-        if (index < 0) {
-            errno = EINVAL;
-            return -1;
-        }
-        sinomo_signalfds[index].mask = *mask;
-        return fd;
-    }
-    for (int candidate = 0; candidate < SINOMO_SIGNALFD_SLOTS; candidate++) {
-        if (!sinomo_signalfds[candidate].active) {
-            index = candidate;
-            break;
-        }
-    }
-    if (index < 0) {
-        errno = EMFILE;
-        return -1;
-    }
-    int event_flags = 0;
-#ifdef EFD_CLOEXEC
-    if ((flags & SFD_CLOEXEC) != 0) {
-        event_flags |= EFD_CLOEXEC;
-    }
-#endif
-#ifdef EFD_NONBLOCK
-    if ((flags & SFD_NONBLOCK) != 0) {
-        event_flags |= EFD_NONBLOCK;
-    }
-#endif
-    int new_fd = __wrap_eventfd(0, event_flags);
-    if (new_fd < 0) {
-        return -1;
-    }
-    memset(&sinomo_signalfds[index], 0, sizeof(sinomo_signalfds[index]));
-    sinomo_signalfds[index].active = 1;
-    sinomo_signalfds[index].fd = new_fd;
-    sinomo_signalfds[index].mask = *mask;
-    return new_fd;
+    errno = -rc;
+    return -1;
 }
 
 static ssize_t sinomo_signalfd_read(int fd, void *buf, size_t count) {
-    int index = sinomo_signalfd_index(fd);
-    if (index < 0) {
+    if (sinomo_signalfd_index(fd) < 0) {
         return -2;
     }
     if (buf == NULL) {
@@ -10198,10 +10138,16 @@ static ssize_t sinomo_signalfd_read(int fd, void *buf, size_t count) {
         errno = EINVAL;
         return -1;
     }
-    struct sinomo_signalfd *descriptor = &sinomo_signalfds[index];
     for (;;) {
+        long long low = sinomo_signalfd_mask_low_runtime(fd);
+        long long high = sinomo_signalfd_mask_high_runtime(fd);
+        if (low < 0 || high < 0) {
+            errno = EBADF;
+            return -1;
+        }
+        sigset_t mask = sinomo_words_to_sigset((unsigned long long)low, (unsigned long long)high);
         siginfo_t pending_info;
-        int signum = sinomo_take_pending_signal(&descriptor->mask, &pending_info);
+        int signum = sinomo_take_pending_signal(&mask, &pending_info);
         if (signum != 0) {
             struct sinomo_signalfd_siginfo info;
             memset(&info, 0, sizeof(info));
@@ -10227,8 +10173,6 @@ static ssize_t sinomo_signalfd_read(int fd, void *buf, size_t count) {
     }
 }
 
-static struct itimerval sinomo_itimers[3];
-
 static int sinomo_itimer_signal(int which) {
     switch (which) {
         case ITIMER_REAL:
@@ -10249,11 +10193,6 @@ static int sinomo_timeval_valid(const struct timeval *value) {
         && value->tv_usec < 1000000L;
 }
 
-static __wasi_timestamp_t sinomo_timeval_ns(const struct timeval *value) {
-    return (__wasi_timestamp_t)value->tv_sec * 1000000000ULL
-        + (__wasi_timestamp_t)value->tv_usec * 1000ULL;
-}
-
 int __wrap_getitimer(int which, struct itimerval *curr_value) {
     if (curr_value == NULL) {
         errno = EFAULT;
@@ -10263,7 +10202,25 @@ int __wrap_getitimer(int which, struct itimerval *curr_value) {
         errno = EINVAL;
         return -1;
     }
-    *curr_value = sinomo_itimers[which];
+    long long value_sec = 0;
+    long long value_usec = 0;
+    long long interval_sec = 0;
+    long long interval_usec = 0;
+    int rc = sinomo_itimer_gettime_runtime(
+        which,
+        &value_sec,
+        &value_usec,
+        &interval_sec,
+        &interval_usec
+    );
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+    curr_value->it_value.tv_sec = (time_t)value_sec;
+    curr_value->it_value.tv_usec = (suseconds_t)value_usec;
+    curr_value->it_interval.tv_sec = (time_t)interval_sec;
+    curr_value->it_interval.tv_usec = (suseconds_t)interval_usec;
     return 0;
 }
 
@@ -10280,22 +10237,34 @@ int __wrap_setitimer(int which, const struct itimerval *new_value, struct itimer
         errno = EINVAL;
         return -1;
     }
-    if (old_value != NULL) {
-        *old_value = sinomo_itimers[which];
-    }
-    sinomo_itimers[which] = *new_value;
-
-    __wasi_timestamp_t first_ns = sinomo_timeval_ns(&new_value->it_value);
-    __wasi_timestamp_t interval_ns = sinomo_timeval_ns(&new_value->it_interval);
-    __wasi_timestamp_t scheduled_ns = first_ns != 0 ? first_ns : interval_ns;
-    __wasi_errno_t rc = __wasi_proc_raise_interval(
-        (__wasi_signal_t)sinomo_itimer_signal(which),
-        scheduled_ns,
-        interval_ns != 0
+    long long old_value_sec = 0;
+    long long old_value_usec = 0;
+    long long old_interval_sec = 0;
+    long long old_interval_usec = 0;
+    long long *old_value_sec_ptr = old_value != NULL ? &old_value_sec : NULL;
+    long long *old_value_usec_ptr = old_value != NULL ? &old_value_usec : NULL;
+    long long *old_interval_sec_ptr = old_value != NULL ? &old_interval_sec : NULL;
+    long long *old_interval_usec_ptr = old_value != NULL ? &old_interval_usec : NULL;
+    int rc = sinomo_itimer_settime_runtime(
+        which,
+        (long long)new_value->it_value.tv_sec,
+        (long long)new_value->it_value.tv_usec,
+        (long long)new_value->it_interval.tv_sec,
+        (long long)new_value->it_interval.tv_usec,
+        old_value_sec_ptr,
+        old_value_usec_ptr,
+        old_interval_sec_ptr,
+        old_interval_usec_ptr
     );
-    if (rc != 0) {
-        errno = (int)rc;
+    if (rc < 0) {
+        errno = -rc;
         return -1;
+    }
+    if (old_value != NULL) {
+        old_value->it_value.tv_sec = (time_t)old_value_sec;
+        old_value->it_value.tv_usec = (suseconds_t)old_value_usec;
+        old_value->it_interval.tv_sec = (time_t)old_interval_sec;
+        old_value->it_interval.tv_usec = (suseconds_t)old_interval_usec;
     }
     return 0;
 }
@@ -10328,6 +10297,23 @@ unsigned __wrap_ualarm(unsigned useconds, unsigned interval) {
     return old_us > UINT_MAX ? UINT_MAX : (unsigned)old_us;
 }
 
+static int sinomo_sleep_relative_timespec(const struct timespec *request, struct timespec *remain) {
+    if (request == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (request->tv_sec < 0 || request->tv_nsec < 0 || request->tv_nsec >= 1000000000L) {
+        errno = EINVAL;
+        return -1;
+    }
+    int rc = sinomo_nanosleep(request, remain);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+    return 0;
+}
+
 int __wrap_clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remain) {
     if (request == NULL) {
         return EFAULT;
@@ -10338,41 +10324,31 @@ int __wrap_clock_nanosleep(clockid_t clock_id, int flags, const struct timespec 
     if (flags != 0 && flags != TIMER_ABSTIME) {
         return EINVAL;
     }
-    if (flags == TIMER_ABSTIME) {
-        struct timespec now;
-        if (clock_gettime(clock_id, &now) != 0) {
-            return errno;
-        }
-        time_t sec = request->tv_sec - now.tv_sec;
-        long nsec = request->tv_nsec - now.tv_nsec;
-        if (nsec < 0) {
-            sec--;
-            nsec += 1000000000L;
-        }
-        if (sec < 0) {
-            return 0;
-        }
-        struct timespec relative = {
-            .tv_sec = sec,
-            .tv_nsec = nsec,
-        };
-        return nanosleep(&relative, remain) == 0 ? 0 : errno;
+    int rc = sinomo_clock_nanosleep(clock_id, flags, request, remain);
+    return rc == 0 ? 0 : -rc;
+}
+
+int __wrap_clock_gettime(clockid_t clock_id, struct timespec *timespec) {
+    int rc = sinomo_clock_gettime(clock_id, timespec);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
     }
-    return nanosleep(request, remain) == 0 ? 0 : errno;
+    return 0;
+}
+
+int __wrap_clock_getres(clockid_t clock_id, struct timespec *timespec) {
+    int rc = sinomo_clock_getres(clock_id, timespec);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+    return 0;
 }
 
 #ifndef TIMER_ABSTIME
 #define TIMER_ABSTIME 1
 #endif
-
-struct sinomo_posix_timer {
-    int active;
-    clockid_t clock_id;
-    struct itimerspec spec;
-    struct timespec armed_at;
-};
-
-static struct sinomo_posix_timer sinomo_posix_timers[64];
 
 static int sinomo_timespec_valid(const struct timespec *value) {
     return value != NULL && value->tv_sec >= 0 && value->tv_nsec >= 0 && value->tv_nsec < 1000000000L;
@@ -10382,66 +10358,19 @@ static int sinomo_itimerspec_valid(const struct itimerspec *value) {
     return value != NULL && sinomo_timespec_valid(&value->it_value) && sinomo_timespec_valid(&value->it_interval);
 }
 
-static long long sinomo_timespec_to_ns(struct timespec value) {
-    if (value.tv_sec > LLONG_MAX / 1000000000LL) {
-        return LLONG_MAX;
-    }
-    long long sec = (long long)value.tv_sec;
-    long long nsec = (long long)value.tv_nsec;
-    if (sec > (LLONG_MAX - nsec) / 1000000000LL) {
-        return LLONG_MAX;
-    }
-    return sec * 1000000000LL + nsec;
-}
-
-static struct timespec sinomo_ns_to_timespec(long long ns) {
-    struct timespec value;
-    if (ns <= 0) {
-        value.tv_sec = 0;
-        value.tv_nsec = 0;
-        return value;
-    }
-    value.tv_sec = (time_t)(ns / 1000000000LL);
-    value.tv_nsec = (long)(ns % 1000000000LL);
-    return value;
-}
-
-static int sinomo_timer_index(timer_t timer_id) {
-    uintptr_t raw = (uintptr_t)timer_id;
-    if (raw == 0 || raw > sizeof(sinomo_posix_timers) / sizeof(sinomo_posix_timers[0])) {
-        errno = EINVAL;
-        return -1;
-    }
-    int index = (int)(raw - 1);
-    if (!sinomo_posix_timers[index].active) {
-        errno = EINVAL;
-        return -1;
-    }
-    return index;
-}
-
 int __wrap_timer_create(clockid_t clock_id, struct sigevent *event, timer_t *timer_id) {
     (void)event;
     if (timer_id == NULL) {
         errno = EFAULT;
         return -1;
     }
-    struct timespec now;
-    if (clock_gettime(clock_id, &now) != 0) {
+    int rc = sinomo_posix_timer_create_runtime((int)clock_id);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    for (size_t index = 0; index < sizeof(sinomo_posix_timers) / sizeof(sinomo_posix_timers[0]); index++) {
-        if (!sinomo_posix_timers[index].active) {
-            memset(&sinomo_posix_timers[index], 0, sizeof(sinomo_posix_timers[index]));
-            sinomo_posix_timers[index].active = 1;
-            sinomo_posix_timers[index].clock_id = clock_id;
-            sinomo_posix_timers[index].armed_at = now;
-            *timer_id = (timer_t)(uintptr_t)(index + 1);
-            return 0;
-        }
-    }
-    errno = EAGAIN;
-    return -1;
+    *timer_id = (timer_t)(uintptr_t)rc;
+    return 0;
 }
 
 int __wrap_timer_gettime(timer_t timer_id, struct itimerspec *value) {
@@ -10449,35 +10378,25 @@ int __wrap_timer_gettime(timer_t timer_id, struct itimerspec *value) {
         errno = EFAULT;
         return -1;
     }
-    int index = sinomo_timer_index(timer_id);
-    if (index < 0) {
+    long long value_sec = 0;
+    long long value_nsec = 0;
+    long long interval_sec = 0;
+    long long interval_nsec = 0;
+    int rc = sinomo_posix_timer_gettime_runtime(
+        (int)(uintptr_t)timer_id,
+        &value_sec,
+        &value_nsec,
+        &interval_sec,
+        &interval_nsec
+    );
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    struct sinomo_posix_timer *timer = &sinomo_posix_timers[index];
-    *value = timer->spec;
-    long long initial_ns = sinomo_timespec_to_ns(timer->spec.it_value);
-    if (initial_ns == 0) {
-        return 0;
-    }
-    struct timespec now;
-    if (clock_gettime(timer->clock_id, &now) != 0) {
-        return -1;
-    }
-    long long elapsed_ns = sinomo_timespec_to_ns(now) - sinomo_timespec_to_ns(timer->armed_at);
-    if (elapsed_ns < 0) {
-        elapsed_ns = 0;
-    }
-    long long interval_ns = sinomo_timespec_to_ns(timer->spec.it_interval);
-    if (elapsed_ns >= initial_ns) {
-        if (interval_ns == 0) {
-            value->it_value = sinomo_ns_to_timespec(0);
-        } else {
-            long long into_period = (elapsed_ns - initial_ns) % interval_ns;
-            value->it_value = sinomo_ns_to_timespec(interval_ns - into_period);
-        }
-    } else {
-        value->it_value = sinomo_ns_to_timespec(initial_ns - elapsed_ns);
-    }
+    value->it_value.tv_sec = (time_t)value_sec;
+    value->it_value.tv_nsec = (long)value_nsec;
+    value->it_interval.tv_sec = (time_t)interval_sec;
+    value->it_interval.tv_nsec = (long)interval_nsec;
     return 0;
 }
 
@@ -10486,195 +10405,109 @@ int __wrap_timer_settime(timer_t timer_id, int flags, const struct itimerspec *n
         errno = EINVAL;
         return -1;
     }
-    int index = sinomo_timer_index(timer_id);
-    if (index < 0) {
+    long long old_value_sec = 0;
+    long long old_value_nsec = 0;
+    long long old_interval_sec = 0;
+    long long old_interval_nsec = 0;
+    long long *old_value_sec_ptr = old_value != NULL ? &old_value_sec : NULL;
+    long long *old_value_nsec_ptr = old_value != NULL ? &old_value_nsec : NULL;
+    long long *old_interval_sec_ptr = old_value != NULL ? &old_interval_sec : NULL;
+    long long *old_interval_nsec_ptr = old_value != NULL ? &old_interval_nsec : NULL;
+    int rc = sinomo_posix_timer_settime_runtime(
+        (int)(uintptr_t)timer_id,
+        flags,
+        (long long)new_value->it_value.tv_sec,
+        (long long)new_value->it_value.tv_nsec,
+        (long long)new_value->it_interval.tv_sec,
+        (long long)new_value->it_interval.tv_nsec,
+        old_value_sec_ptr,
+        old_value_nsec_ptr,
+        old_interval_sec_ptr,
+        old_interval_nsec_ptr
+    );
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    if (old_value != NULL && __wrap_timer_gettime(timer_id, old_value) != 0) {
-        return -1;
+    if (old_value != NULL) {
+        old_value->it_value.tv_sec = (time_t)old_value_sec;
+        old_value->it_value.tv_nsec = (long)old_value_nsec;
+        old_value->it_interval.tv_sec = (time_t)old_interval_sec;
+        old_value->it_interval.tv_nsec = (long)old_interval_nsec;
     }
-    struct sinomo_posix_timer *timer = &sinomo_posix_timers[index];
-    struct timespec now;
-    if (clock_gettime(timer->clock_id, &now) != 0) {
-        return -1;
-    }
-    timer->spec = *new_value;
-    if ((flags & TIMER_ABSTIME) != 0) {
-        long long target_ns = sinomo_timespec_to_ns(new_value->it_value);
-        long long now_ns = sinomo_timespec_to_ns(now);
-        timer->spec.it_value = sinomo_ns_to_timespec(target_ns > now_ns ? target_ns - now_ns : 0);
-    }
-    timer->armed_at = now;
     return 0;
 }
 
 int __wrap_timer_getoverrun(timer_t timer_id) {
-    int index = sinomo_timer_index(timer_id);
-    if (index < 0) {
+    int rc = sinomo_posix_timer_getoverrun_runtime((int)(uintptr_t)timer_id);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    struct sinomo_posix_timer *timer = &sinomo_posix_timers[index];
-    long long initial_ns = sinomo_timespec_to_ns(timer->spec.it_value);
-    long long interval_ns = sinomo_timespec_to_ns(timer->spec.it_interval);
-    if (initial_ns == 0 || interval_ns == 0) {
-        return 0;
-    }
-    struct timespec now;
-    if (clock_gettime(timer->clock_id, &now) != 0) {
-        return -1;
-    }
-    long long elapsed_ns = sinomo_timespec_to_ns(now) - sinomo_timespec_to_ns(timer->armed_at);
-    if (elapsed_ns <= initial_ns) {
-        return 0;
-    }
-    long long overrun = (elapsed_ns - initial_ns) / interval_ns;
-    return overrun > INT_MAX ? INT_MAX : (int)overrun;
+    return rc;
 }
 
 int __wrap_timer_delete(timer_t timer_id) {
-    int index = sinomo_timer_index(timer_id);
-    if (index < 0) {
+    int rc = sinomo_posix_timer_delete_runtime((int)(uintptr_t)timer_id);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    memset(&sinomo_posix_timers[index], 0, sizeof(sinomo_posix_timers[index]));
     return 0;
 }
 
-#define SINOMO_TIMERFD_SLOTS 64
-struct sinomo_timerfd {
-    int active;
-    int fd;
-    clockid_t clock_id;
-    struct itimerspec spec;
-    struct timespec armed_at;
-    unsigned long long consumed;
-};
-
-static struct sinomo_timerfd sinomo_timerfds[SINOMO_TIMERFD_SLOTS];
-
 static int sinomo_timerfd_index(int fd) {
-    for (int index = 0; index < SINOMO_TIMERFD_SLOTS; index++) {
-        if (sinomo_timerfds[index].active && sinomo_timerfds[index].fd == fd) {
-            return index;
-        }
-    }
-    return -1;
+    return sinomo_timerfd_known_runtime(fd) > 0 ? 0 : -1;
 }
 
 static void sinomo_timerfd_forget(int fd) {
-    int index = sinomo_timerfd_index(fd);
-    if (index >= 0) {
-        memset(&sinomo_timerfds[index], 0, sizeof(sinomo_timerfds[index]));
-    }
-}
-
-static unsigned long long sinomo_timerfd_expirations(const struct sinomo_timerfd *timer, struct timespec now) {
-    long long initial_ns = sinomo_timespec_to_ns(timer->spec.it_value);
-    if (initial_ns == 0) {
-        return 0;
-    }
-    long long elapsed_ns = sinomo_timespec_to_ns(now) - sinomo_timespec_to_ns(timer->armed_at);
-    if (elapsed_ns < initial_ns) {
-        return 0;
-    }
-    long long interval_ns = sinomo_timespec_to_ns(timer->spec.it_interval);
-    if (interval_ns == 0) {
-        return 1;
-    }
-    unsigned long long extra = (unsigned long long)((elapsed_ns - initial_ns) / interval_ns);
-    return extra == ULLONG_MAX ? ULLONG_MAX : extra + 1ULL;
-}
-
-static struct timespec sinomo_timerfd_remaining(const struct sinomo_timerfd *timer, struct timespec now) {
-    long long initial_ns = sinomo_timespec_to_ns(timer->spec.it_value);
-    if (initial_ns == 0) {
-        return sinomo_ns_to_timespec(0);
-    }
-    long long elapsed_ns = sinomo_timespec_to_ns(now) - sinomo_timespec_to_ns(timer->armed_at);
-    if (elapsed_ns < 0) {
-        elapsed_ns = 0;
-    }
-    long long interval_ns = sinomo_timespec_to_ns(timer->spec.it_interval);
-    if (elapsed_ns < initial_ns) {
-        return sinomo_ns_to_timespec(initial_ns - elapsed_ns);
-    }
-    if (interval_ns == 0) {
-        return sinomo_ns_to_timespec(0);
-    }
-    long long into_period = (elapsed_ns - initial_ns) % interval_ns;
-    return sinomo_ns_to_timespec(interval_ns - into_period);
+    (void)fd;
 }
 
 int __wrap_timerfd_create(clockid_t clock_id, int flags) {
-    int supported = TFD_CLOEXEC | TFD_NONBLOCK;
-    if ((flags & ~supported) != 0) {
-        errno = EINVAL;
-        return -1;
+    int rc = sinomo_timerfd_create_runtime((int)clock_id, flags);
+    if (rc >= 0) {
+        return rc;
     }
-    struct timespec now;
-    if (clock_gettime(clock_id, &now) != 0) {
-        return -1;
-    }
-    int slot = -1;
-    for (int index = 0; index < SINOMO_TIMERFD_SLOTS; index++) {
-        if (!sinomo_timerfds[index].active) {
-            slot = index;
-            break;
-        }
-    }
-    if (slot < 0) {
-        errno = EMFILE;
-        return -1;
-    }
-    int event_flags = 0;
-#ifdef EFD_CLOEXEC
-    if ((flags & TFD_CLOEXEC) != 0) {
-        event_flags |= EFD_CLOEXEC;
-    }
-#endif
-#ifdef EFD_NONBLOCK
-    if ((flags & TFD_NONBLOCK) != 0) {
-        event_flags |= EFD_NONBLOCK;
-    }
-#endif
-    int fd = __wrap_eventfd(0, event_flags);
-    if (fd < 0) {
-        return -1;
-    }
-    memset(&sinomo_timerfds[slot], 0, sizeof(sinomo_timerfds[slot]));
-    sinomo_timerfds[slot].active = 1;
-    sinomo_timerfds[slot].fd = fd;
-    sinomo_timerfds[slot].clock_id = clock_id;
-    sinomo_timerfds[slot].armed_at = now;
-    return fd;
+    errno = -rc;
+    return -1;
 }
 
 int __wrap_timerfd_settime(int fd, int flags, const struct itimerspec *new_value, struct itimerspec *old_value) {
-    if ((flags & ~(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET)) != 0 || !sinomo_itimerspec_valid(new_value)) {
+    if (!sinomo_itimerspec_valid(new_value)) {
         errno = EINVAL;
         return -1;
     }
-    int index = sinomo_timerfd_index(fd);
-    if (index < 0) {
-        errno = EBADF;
+    long long old_value_sec = 0;
+    long long old_value_nsec = 0;
+    long long old_interval_sec = 0;
+    long long old_interval_nsec = 0;
+    long long *old_value_sec_ptr = old_value != NULL ? &old_value_sec : NULL;
+    long long *old_value_nsec_ptr = old_value != NULL ? &old_value_nsec : NULL;
+    long long *old_interval_sec_ptr = old_value != NULL ? &old_interval_sec : NULL;
+    long long *old_interval_nsec_ptr = old_value != NULL ? &old_interval_nsec : NULL;
+    int rc = sinomo_timerfd_settime_runtime(
+        fd,
+        flags,
+        (long long)new_value->it_value.tv_sec,
+        (long long)new_value->it_value.tv_nsec,
+        (long long)new_value->it_interval.tv_sec,
+        (long long)new_value->it_interval.tv_nsec,
+        old_value_sec_ptr,
+        old_value_nsec_ptr,
+        old_interval_sec_ptr,
+        old_interval_nsec_ptr
+    );
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    struct sinomo_timerfd *timer = &sinomo_timerfds[index];
-    if (old_value != NULL && __wrap_timerfd_gettime(fd, old_value) != 0) {
-        return -1;
+    if (old_value != NULL) {
+        old_value->it_value.tv_sec = (time_t)old_value_sec;
+        old_value->it_value.tv_nsec = (long)old_value_nsec;
+        old_value->it_interval.tv_sec = (time_t)old_interval_sec;
+        old_value->it_interval.tv_nsec = (long)old_interval_nsec;
     }
-    struct timespec now;
-    if (clock_gettime(timer->clock_id, &now) != 0) {
-        return -1;
-    }
-    timer->spec = *new_value;
-    if ((flags & TFD_TIMER_ABSTIME) != 0) {
-        long long target_ns = sinomo_timespec_to_ns(new_value->it_value);
-        long long now_ns = sinomo_timespec_to_ns(now);
-        timer->spec.it_value = sinomo_ns_to_timespec(target_ns > now_ns ? target_ns - now_ns : 0);
-    }
-    timer->armed_at = now;
-    timer->consumed = 0;
     return 0;
 }
 
@@ -10683,18 +10516,19 @@ int __wrap_timerfd_gettime(int fd, struct itimerspec *value) {
         errno = EFAULT;
         return -1;
     }
-    int index = sinomo_timerfd_index(fd);
-    if (index < 0) {
-        errno = EBADF;
+    long long value_sec = 0;
+    long long value_nsec = 0;
+    long long interval_sec = 0;
+    long long interval_nsec = 0;
+    int rc = sinomo_timerfd_gettime_runtime(fd, &value_sec, &value_nsec, &interval_sec, &interval_nsec);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    struct sinomo_timerfd *timer = &sinomo_timerfds[index];
-    *value = timer->spec;
-    struct timespec now;
-    if (clock_gettime(timer->clock_id, &now) != 0) {
-        return -1;
-    }
-    value->it_value = sinomo_timerfd_remaining(timer, now);
+    value->it_value.tv_sec = (time_t)value_sec;
+    value->it_value.tv_nsec = (long)value_nsec;
+    value->it_interval.tv_sec = (time_t)interval_sec;
+    value->it_interval.tv_nsec = (long)interval_nsec;
     return 0;
 }
 
@@ -10708,10 +10542,16 @@ static int sinomo_special_fd_readable(int fd) {
     }
     int signal_index = sinomo_signalfd_index(fd);
     if (signal_index >= 0) {
-        struct sinomo_signalfd *descriptor = &sinomo_signalfds[signal_index];
+        (void)signal_index;
+        long long low = sinomo_signalfd_mask_low_runtime(fd);
+        long long high = sinomo_signalfd_mask_high_runtime(fd);
+        if (low < 0 || high < 0) {
+            return 0;
+        }
+        sigset_t mask = sinomo_words_to_sigset((unsigned long long)low, (unsigned long long)high);
         for (int signum = 1; signum < _NSIG; signum++) {
             if (
-                sinomo_sigset_contains(&descriptor->mask, signum)
+                sinomo_sigset_contains(&mask, signum)
                 && sinomo_sigset_contains(&sinomo_pending_signals, signum)
             ) {
                 return 1;
@@ -10729,32 +10569,14 @@ static int sinomo_special_fd_readable(int fd) {
     }
     int timer_index = sinomo_timerfd_index(fd);
     if (timer_index >= 0) {
-        struct timespec now;
-        if (clock_gettime(sinomo_timerfds[timer_index].clock_id, &now) != 0) {
-            return 0;
-        }
-        return sinomo_timerfd_expirations(&sinomo_timerfds[timer_index], now) > sinomo_timerfds[timer_index].consumed;
+        int ready = sinomo_timerfd_ready_runtime(fd);
+        return ready > 0;
     }
     return 0;
 }
 
 static int sinomo_special_fd_next_timeout_ms(int fd) {
-    int timer_index = sinomo_timerfd_index(fd);
-    if (timer_index < 0) {
-        return -1;
-    }
-    struct sinomo_timerfd *timer = &sinomo_timerfds[timer_index];
-    struct timespec now;
-    if (clock_gettime(timer->clock_id, &now) != 0) {
-        return -1;
-    }
-    struct timespec remaining = sinomo_timerfd_remaining(timer, now);
-    if (remaining.tv_sec == 0 && remaining.tv_nsec == 0) {
-        return 0;
-    }
-    unsigned long long ms = (unsigned long long)remaining.tv_sec * 1000ULL;
-    ms += ((unsigned long long)remaining.tv_nsec + 999999ULL) / 1000000ULL;
-    return ms > (unsigned long long)INT_MAX ? INT_MAX : (int)ms;
+    return sinomo_timerfd_remaining_ms_runtime(fd);
 }
 
 ssize_t __wrap_read(int fd, void *buf, size_t count) {
@@ -10782,17 +10604,15 @@ ssize_t __wrap_read(int fd, void *buf, size_t count) {
         errno = EINVAL;
         return -1;
     }
-    struct sinomo_timerfd *timer = &sinomo_timerfds[index];
     for (;;) {
-        struct timespec now;
-        if (clock_gettime(timer->clock_id, &now) != 0) {
+        long long ready = sinomo_timerfd_read_runtime(fd);
+        if (ready < 0) {
+            errno = (int)-ready;
             return -1;
         }
-        unsigned long long total = sinomo_timerfd_expirations(timer, now);
-        if (total > timer->consumed) {
-            uint64_t ready = (uint64_t)(total - timer->consumed);
-            timer->consumed = total;
-            memcpy(buf, &ready, sizeof(ready));
+        if (ready > 0) {
+            uint64_t ready_u64 = (uint64_t)ready;
+            memcpy(buf, &ready_u64, sizeof(ready_u64));
             return (ssize_t)sizeof(ready);
         }
         int fd_flags = __real_fcntl(fd, F_GETFL, 0);
@@ -10800,7 +10620,14 @@ ssize_t __wrap_read(int fd, void *buf, size_t count) {
             errno = EAGAIN;
             return -1;
         }
-        struct timespec delay = sinomo_timerfd_remaining(timer, now);
+        int delay_ms = sinomo_timerfd_remaining_ms_runtime(fd);
+        if (delay_ms < 0) {
+            errno = EBADF;
+            return -1;
+        }
+        struct timespec delay;
+        delay.tv_sec = delay_ms / 1000;
+        delay.tv_nsec = (long)(delay_ms % 1000) * 1000000L;
         if (delay.tv_sec == 0 && delay.tv_nsec == 0) {
             delay.tv_nsec = 1000000L;
         }
@@ -10833,27 +10660,21 @@ int __wrap_close(int fd) {
     sinomo_pipe_forget(fd);
     sinomo_landlock_forget(fd);
     sinomo_pty_forget_fd(fd);
+    sinomo_futex_fd_forget(fd);
     return __real_close(fd);
 }
 
 unsigned __wrap_sleep(unsigned seconds) {
-    struct timespec request = {
-        .tv_sec = (time_t)seconds,
-        .tv_nsec = 0,
-    };
-    struct timespec remain;
-    if (nanosleep(&request, &remain) == 0) {
-        return 0;
-    }
-    return remain.tv_sec > (time_t)UINT_MAX ? UINT_MAX : (unsigned)remain.tv_sec;
+    return sinomo_sleep(seconds);
 }
 
 int __wrap_usleep(unsigned useconds) {
-    struct timespec request = {
-        .tv_sec = (time_t)(useconds / 1000000U),
-        .tv_nsec = (long)(useconds % 1000000U) * 1000L,
-    };
-    return nanosleep(&request, NULL);
+    int rc = sinomo_usleep((unsigned long long)useconds);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+    return 0;
 }
 
 static void sinomo_timeval_pair_to_timespec_pair(const struct timeval tv[2], struct timespec ts[2]) {
@@ -12229,7 +12050,7 @@ struct sinomo_mkdirat_data {
 
 static int sinomo_mkdirat_operation(void *raw) {
     struct sinomo_mkdirat_data *data = raw;
-    return mkdir(data->path, data->mode);
+    return __real_mkdir(data->path, data->mode);
 }
 
 int __wrap_mkdirat(int dirfd, const char *path, mode_t mode) {
@@ -12238,7 +12059,7 @@ int __wrap_mkdirat(int dirfd, const char *path, mode_t mode) {
         return -1;
     }
     if (path[0] == '/') {
-        int rc = mkdir(path, mode);
+        int rc = __real_mkdir(path, mode);
         if (rc == 0) {
             sinomo_inotify_emit_path(path, IN_CREATE | IN_ISDIR);
         }
@@ -12289,9 +12110,9 @@ struct sinomo_unlinkat_data {
 static int sinomo_unlinkat_operation(void *raw) {
     struct sinomo_unlinkat_data *data = raw;
     if ((data->flags & AT_REMOVEDIR) != 0) {
-        return rmdir(data->path);
+        return __real_rmdir(data->path);
     }
-    return unlink(data->path);
+    return __real_unlink(data->path);
 }
 
 int __wrap_unlinkat(int dirfd, const char *path, int flags) {
@@ -12305,13 +12126,13 @@ int __wrap_unlinkat(int dirfd, const char *path, int flags) {
     }
     if (path[0] == '/') {
         if ((flags & AT_REMOVEDIR) != 0) {
-            int rc = rmdir(path);
+            int rc = __real_rmdir(path);
             if (rc == 0) {
                 sinomo_inotify_emit_path(path, IN_DELETE | IN_DELETE_SELF | IN_ISDIR);
             }
             return rc;
         }
-        int rc = unlink(path);
+        int rc = __real_unlink(path);
         if (rc == 0) {
             sinomo_inotify_emit_path(path, IN_DELETE | IN_DELETE_SELF);
         }
@@ -12336,7 +12157,7 @@ struct sinomo_readlinkat_data {
 
 static int sinomo_readlinkat_operation(void *raw) {
     struct sinomo_readlinkat_data *data = raw;
-    return (int)readlink(data->path, data->buf, data->bufsiz);
+    return (int)__real_readlink(data->path, data->buf, data->bufsiz);
 }
 
 ssize_t __wrap_readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
@@ -12345,7 +12166,7 @@ ssize_t __wrap_readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
         return -1;
     }
     if (path[0] == '/') {
-        return readlink(path, buf, bufsiz);
+        return __real_readlink(path, buf, bufsiz);
     }
     struct sinomo_readlinkat_data data = {
         .path = path,
@@ -12362,7 +12183,7 @@ struct sinomo_symlinkat_data {
 
 static int sinomo_symlinkat_operation(void *raw) {
     struct sinomo_symlinkat_data *data = raw;
-    return symlink(data->target, data->linkpath);
+    return __real_symlink(data->target, data->linkpath);
 }
 
 int __wrap_symlinkat(const char *target, int newdirfd, const char *linkpath) {
@@ -12371,7 +12192,7 @@ int __wrap_symlinkat(const char *target, int newdirfd, const char *linkpath) {
         return -1;
     }
     if (linkpath[0] == '/') {
-        int rc = symlink(target, linkpath);
+        int rc = __real_symlink(target, linkpath);
         if (rc == 0) {
             sinomo_inotify_emit_path(linkpath, IN_CREATE);
         }
@@ -12401,9 +12222,9 @@ static int sinomo_linkat_operation(void *raw) {
         if (realpath(data->oldpath, resolved_oldpath) == NULL) {
             return -1;
         }
-        return link(resolved_oldpath, data->newpath);
+        return __real_link(resolved_oldpath, data->newpath);
     }
-    return link(data->oldpath, data->newpath);
+    return __real_link(data->oldpath, data->newpath);
 }
 
 int __wrap_linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags) {
@@ -12460,7 +12281,14 @@ struct sinomo_renameat_data {
 
 static int sinomo_renameat_operation(void *raw) {
     struct sinomo_renameat_data *data = raw;
-    return rename(data->oldpath, data->newpath);
+    int rc = __real_rename(data->oldpath, data->newpath);
+    if (rc != 0 && errno == EEXIST) {
+        if (__real_unlink(data->newpath) != 0 && errno != ENOENT) {
+            return -1;
+        }
+        rc = __real_rename(data->oldpath, data->newpath);
+    }
+    return rc;
 }
 
 int __wrap_renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
@@ -12660,7 +12488,7 @@ static char *sinomo_realpath_alloc(const char *path) {
             if (saved_cwd < 0) {
                 return NULL;
             }
-            if (__wrap_chdir(current) != 0) {
+            if (chdir(current) != 0) {
                 int saved_errno = errno;
                 close(saved_cwd);
                 errno = saved_errno;
@@ -12682,7 +12510,7 @@ static char *sinomo_realpath_alloc(const char *path) {
         if (saved_cwd < 0) {
             return NULL;
         }
-        if (__wrap_chdir(dir) != 0) {
+        if (chdir(dir) != 0) {
             int saved_errno = errno;
             close(saved_cwd);
             errno = saved_errno;
@@ -12727,19 +12555,6 @@ char *__wrap_realpath(const char *path, char *resolved_path) {
     snprintf(resolved_path, 4096, "%s", resolved);
     free(resolved);
     return resolved_path;
-}
-
-int __wrap_chdir(const char *path) {
-    if (path == NULL) {
-        errno = EFAULT;
-        return -1;
-    }
-    __wasi_errno_t rc = __wasi_chdir(path);
-    if (rc != 0) {
-        errno = (int)rc;
-        return -1;
-    }
-    return 0;
 }
 
 int __wrap_chroot(const char *path) {
@@ -13698,7 +13513,7 @@ int setfsgid(gid_t gid) {
     return __wrap_setfsgid(gid);
 }
 
-int setgroups(size_t size, const gid_t *list) {
+int __wrap_setgroups(size_t size, const gid_t *list) {
     if (sinomo_init_identity() != 0) {
         return -1;
     }
@@ -13717,7 +13532,7 @@ int setgroups(size_t size, const gid_t *list) {
     return sinomo_commit_identity();
 }
 
-int initgroups(const char *user, gid_t group) {
+int __wrap_initgroups(const char *user, gid_t group) {
     (void)user;
     if (sinomo_init_identity() != 0) {
         return -1;
@@ -14623,15 +14438,6 @@ pid_t gettid(void) {
     return -1;
 }
 
-int fchdir(int fd) {
-    int rc = sinomo_fchdir(fd);
-    if (rc == 0) {
-        return 0;
-    }
-    errno = rc;
-    return -1;
-}
-
 pid_t __wrap_getpgid(pid_t pid) {
     int pgid = 0;
     int rc = sinomo_proc_getpgid((int)pid, &pgid);
@@ -14695,16 +14501,6 @@ pid_t __wrap_tcgetpgrp(int fd) {
     return -1;
 }
 
-pid_t tcgetsid(int fd) {
-    int sid = 0;
-    int rc = sinomo_proc_tcgetsid(fd, &sid);
-    if (rc == 0) {
-        return (pid_t)sid;
-    }
-    errno = rc;
-    return -1;
-}
-
 int __wrap_tcsetpgrp(int fd, pid_t pgid) {
     int rc = sinomo_proc_tcsetpgrp(fd, (int)pgid);
     if (rc == 0) {
@@ -14736,11 +14532,15 @@ static int sinomo_tkill(pid_t tid, int signal) {
         errno = EINVAL;
         return -1;
     }
-    if (tid != gettid()) {
-        errno = ESRCH;
-        return -1;
+    int rc = sinomo_tkill_runtime((int)tid, signal);
+    if (rc == 0) {
+        return 0;
     }
-    return __wrap_kill(__wrap_getpid(), signal);
+    errno = -rc;
+    if (errno == EBADF) {
+        errno = ESRCH;
+    }
+    return -1;
 }
 
 static int sinomo_tgkill(pid_t tgid, pid_t tid, int signal) {
@@ -14748,15 +14548,20 @@ static int sinomo_tgkill(pid_t tgid, pid_t tid, int signal) {
         errno = EINVAL;
         return -1;
     }
-    if (tgid != __wrap_getpid() || tid != gettid()) {
-        errno = ESRCH;
-        return -1;
+    int rc = sinomo_tgkill_runtime((int)tgid, (int)tid, signal);
+    if (rc == 0) {
+        return 0;
     }
-    return __wrap_kill(tgid, signal);
+    errno = -rc;
+    if (errno == EBADF) {
+        errno = ESRCH;
+    }
+    return -1;
 }
 
 static int sinomo_rt_tgsigqueueinfo(pid_t tgid, pid_t tid, int signal, siginfo_t *info) {
-    if (tgid == __wrap_getpid() && tid == gettid() && sinomo_signal_valid(signal) && sinomo_sigset_contains(&sinomo_signal_mask, signal)) {
+    sigset_t current_mask = sinomo_signal_current_mask();
+    if (tgid == __wrap_getpid() && tid == gettid() && sinomo_signal_valid(signal) && sinomo_sigset_contains(&current_mask, signal)) {
         siginfo_t queued;
         if (info != NULL) {
             queued = *info;
@@ -14787,22 +14592,20 @@ int __wrap_killpg(pid_t pgrp, int signal) {
 static int sinomo_pidfd_open(pid_t pid, unsigned int flags);
 static void sinomo_signal_reset_handlers_for_clone(void);
 
-static pid_t sinomo_proc_fork_with_mode(__wasi_bool_t copy_memory) {
-    __wasi_pid_t pid = 0;
-    __wasi_errno_t rc = __wasi_proc_fork(copy_memory, &pid);
-    if (rc == 0) {
-        return (pid_t)pid;
+static pid_t sinomo_posix_fork_result(int result) {
+    if (result >= 0) {
+        return (pid_t)result;
     }
-    errno = (int)rc;
+    errno = -result;
     return -1;
 }
 
 pid_t __wrap_fork(void) {
-    return sinomo_proc_fork_with_mode(1);
+    return sinomo_posix_fork_result(sinomo_fork());
 }
 
 pid_t __wrap_vfork(void) {
-    return sinomo_proc_fork_with_mode(0);
+    return sinomo_posix_fork_result(sinomo_vfork());
 }
 
 #ifndef CLONE_VM
@@ -14900,7 +14703,6 @@ pid_t __wrap_vfork(void) {
 #endif
 
 static pid_t sinomo_syscall_clone(uint64_t flags, void *child_stack, int *parent_tid, int *child_tid, unsigned long tls) {
-    (void)child_stack;
     uint64_t supported_flags =
         (uint64_t)CSIGNAL | CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
         CLONE_PIDFD | CLONE_VFORK | CLONE_PARENT | CLONE_THREAD | CLONE_NEWNS |
@@ -14912,6 +14714,46 @@ static pid_t sinomo_syscall_clone(uint64_t flags, void *child_stack, int *parent
         errno = ENOSYS;
         return -1;
     }
+    if ((flags & CLONE_THREAD) != 0) {
+        if ((flags & CLONE_VM) == 0 || (flags & CLONE_SIGHAND) == 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (((flags & CLONE_SETTLS) == 0 && tls != 0) || child_stack == NULL) {
+            errno = EINVAL;
+            return -1;
+        }
+        uint64_t thread_invalid_flags =
+            CLONE_PIDFD | CLONE_VFORK | CLONE_PARENT | CLONE_NEWNS |
+            CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER |
+            CLONE_NEWPID | CLONE_NEWNET | CLONE_CLEAR_SIGHAND;
+        if ((flags & thread_invalid_flags) != 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        if ((flags & CLONE_PARENT_SETTID) != 0 && parent_tid == NULL) {
+            errno = EFAULT;
+            return -1;
+        }
+        if (((flags & CLONE_CHILD_SETTID) != 0 || (flags & CLONE_CHILD_CLEARTID) != 0) && child_tid == NULL) {
+            errno = EFAULT;
+            return -1;
+        }
+        int tid = sinomo_clone_thread(
+            (unsigned long long)(uintptr_t)child_stack,
+            parent_tid,
+            child_tid,
+            (unsigned long long)tls,
+            (flags & CLONE_PARENT_SETTID) != 0,
+            (flags & CLONE_CHILD_SETTID) != 0,
+            (flags & CLONE_CHILD_CLEARTID) != 0);
+        if (tid < 0) {
+            errno = -tid;
+            return -1;
+        }
+        return (pid_t)tid;
+    }
+    (void)child_stack;
     uint64_t unsupported_sharing = CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
     if ((flags & CLONE_VFORK) == 0) {
         unsupported_sharing |= CLONE_VM;
@@ -14998,147 +14840,66 @@ struct sinomo_clone_args {
     uint64_t cgroup;
 };
 
-#define SINOMO_PIDFD_SLOTS 128
-struct sinomo_pidfd_entry {
-    int fd;
-    pid_t pid;
-};
-static struct sinomo_pidfd_entry sinomo_pidfds[SINOMO_PIDFD_SLOTS];
-
-static void sinomo_pidfd_remember(int fd, pid_t pid) {
-    if (fd < 0 || pid <= 0) {
-        return;
-    }
-    int empty = -1;
-    for (int index = 0; index < SINOMO_PIDFD_SLOTS; index++) {
-        if (sinomo_pidfds[index].fd == fd) {
-            sinomo_pidfds[index].pid = pid;
-            return;
-        }
-        if (empty < 0 && sinomo_pidfds[index].fd == 0) {
-            empty = index;
-        }
-    }
-    if (empty >= 0) {
-        sinomo_pidfds[empty].fd = fd;
-        sinomo_pidfds[empty].pid = pid;
-    }
-}
-
 static pid_t sinomo_pidfd_lookup(int fd) {
-    for (int index = 0; index < SINOMO_PIDFD_SLOTS; index++) {
-        if (sinomo_pidfds[index].fd == fd) {
-            return sinomo_pidfds[index].pid;
-        }
+    int rc = sinomo_pidfd_pid_runtime(fd);
+    if (rc >= 0) {
+        return (pid_t)rc;
     }
-    errno = EBADF;
-    return -1;
+    errno = -rc;
+    return (pid_t)-1;
 }
 
 static int sinomo_pidfd_index(int fd) {
-    for (int index = 0; index < SINOMO_PIDFD_SLOTS; index++) {
-        if (sinomo_pidfds[index].fd == fd) {
-            return index;
-        }
-    }
-    return -1;
+    return sinomo_pidfd_pid_runtime(fd) >= 0 ? 0 : -1;
 }
 
 static int sinomo_pidfd_readable(int fd) {
-    int index = sinomo_pidfd_index(fd);
-    if (index < 0) {
+    int rc = sinomo_pidfd_status_runtime(fd);
+    if (rc < 0) {
         return 0;
     }
-    pid_t pid = sinomo_pidfds[index].pid;
-    __wasi_option_pid_t option_pid = {
-        .tag = __WASI_OPTION_SOME,
-        .u = {.some = (__wasi_pid_t)pid},
-    };
-    __wasi_join_status_t status = {0};
-    int rc = sinomo_proc_wait_status(&option_pid, __WASI_JOIN_FLAGS_NON_BLOCKING, &status);
-    if (rc == 0) {
-        return status.tag != __WASI_JOIN_STATUS_TYPE_NOTHING;
-    }
-    int saved_errno = errno;
-    int missing = __wrap_kill(pid, 0) != 0;
-    errno = saved_errno;
-    return missing;
+    return rc != 0;
 }
 
 static void sinomo_pidfd_forget(int fd) {
-    for (int index = 0; index < SINOMO_PIDFD_SLOTS; index++) {
-        if (sinomo_pidfds[index].fd == fd) {
-            memset(&sinomo_pidfds[index], 0, sizeof(sinomo_pidfds[index]));
-            return;
-        }
-    }
+    (void)fd;
 }
 
 static int sinomo_pidfd_open(pid_t pid, unsigned int flags) {
-    if (pid <= 0) {
-        errno = EINVAL;
-        return -1;
+    int rc = sinomo_pidfd_open_runtime((int)pid, (int)flags);
+    if (rc >= 0) {
+        return rc;
     }
-    unsigned int supported = 0;
-#ifdef O_NONBLOCK
-    supported |= O_NONBLOCK;
-#endif
-#ifdef O_CLOEXEC
-    supported |= O_CLOEXEC;
-#endif
-    if ((flags & ~supported) != 0) {
-        errno = EINVAL;
-        return -1;
+    errno = -rc;
+    if (errno == EBADF) {
+        errno = ESRCH;
     }
-    if (pid != __wrap_getpid() && __wrap_kill(pid, 0) != 0) {
-        return -1;
-    }
-    int event_flags = 0;
-#ifdef EFD_NONBLOCK
-    if ((flags & O_NONBLOCK) != 0) {
-        event_flags |= EFD_NONBLOCK;
-    }
-#endif
-#ifdef EFD_CLOEXEC
-    if ((flags & O_CLOEXEC) != 0) {
-        event_flags |= EFD_CLOEXEC;
-    }
-#endif
-    int fd = __wrap_eventfd(0, event_flags);
-    if (fd < 0) {
-        return -1;
-    }
-    sinomo_pidfd_remember(fd, pid);
-    return fd;
+    return -1;
 }
 
 static int sinomo_pidfd_send_signal(int pidfd, int signum, const siginfo_t *info, unsigned int flags) {
     (void)info;
-    if (flags != 0) {
-        errno = EINVAL;
-        return -1;
+    int rc = sinomo_pidfd_send_signal_runtime(pidfd, signum, flags);
+    if (rc == 0) {
+        return 0;
     }
-    pid_t pid = sinomo_pidfd_lookup(pidfd);
-    if (pid < 0) {
-        return -1;
+    errno = -rc;
+    if (errno == EBADF) {
+        errno = ESRCH;
     }
-    return __wrap_kill(pid, signum);
+    return -1;
 }
 
 static int sinomo_pidfd_getfd(int pidfd, int targetfd, unsigned int flags) {
-    if (flags != 0) {
-        errno = EINVAL;
-        return -1;
+    int rc = sinomo_pidfd_getfd_runtime(pidfd, targetfd, flags);
+    if (rc >= 0) {
+        return rc;
     }
-    pid_t pid = sinomo_pidfd_lookup(pidfd);
-    if (pid < 0) {
-        return -1;
+    errno = -rc;
+    if (errno == EBADF) {
+        errno = ESRCH;
     }
-    if (pid != __wrap_getpid()) {
-        errno = EPERM;
-        return -1;
-    }
-    return __wrap_dup(targetfd);
+    return -1;
 }
 
 static int sinomo_process_mrelease(int pidfd, unsigned int flags) {
@@ -15204,19 +14965,15 @@ static long sinomo_unshare(unsigned long flags) {
         errno = EINVAL;
         return -1;
     }
-    int rc = sinomo_proc_unshare_namespaces((unsigned long long)flags);
-    if (rc != 0) {
-        errno = rc;
+    int rc = sinomo_unshare_runtime((unsigned long long)flags);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
     return 0;
 }
 
 static long sinomo_setns(int fd, int nstype) {
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        return -1;
-    }
     unsigned long supported =
         CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |
         CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
@@ -15224,9 +14981,9 @@ static long sinomo_setns(int fd, int nstype) {
         errno = EINVAL;
         return -1;
     }
-    int rc = sinomo_proc_unshare_namespaces((unsigned long long)nstype);
-    if (rc != 0) {
-        errno = rc;
+    int rc = sinomo_setns_runtime(fd, nstype);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
     return 0;
@@ -15679,26 +15436,12 @@ static int sinomo_sched_setattr(pid_t pid, const struct sinomo_sched_attr *attr,
 #endif
 
 static int sinomo_membarrier(int command, unsigned int flags, int cpu_id) {
-    (void)cpu_id;
-    int supported =
-        MEMBARRIER_CMD_GLOBAL |
-        MEMBARRIER_CMD_GLOBAL_EXPEDITED |
-        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED |
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED |
-        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED |
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE |
-        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE |
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ |
-        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ;
-    if (command == MEMBARRIER_CMD_QUERY) {
-        return supported;
-    }
-    if (flags != 0 || (command & ~supported) != 0) {
-        errno = EINVAL;
+    int rc = sinomo_membarrier_runtime(command, flags, cpu_id);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
-    __sync_synchronize();
-    return 0;
+    return rc;
 }
 
 #ifndef RSEQ_FLAG_UNREGISTER
@@ -15706,25 +15449,9 @@ static int sinomo_membarrier(int command, unsigned int flags, int cpu_id) {
 #endif
 
 static int sinomo_rseq(void *rseq, uint32_t rseq_len, int flags, uint32_t signature) {
-    if ((flags & ~RSEQ_FLAG_UNREGISTER) != 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    if ((flags & RSEQ_FLAG_UNREGISTER) != 0) {
-        int rc = sinomo_proc_clear_rseq((unsigned long long)(uintptr_t)rseq);
-        if (rc != 0) {
-            errno = EINVAL;
-            return -1;
-        }
-        return 0;
-    }
-    if (rseq == NULL || rseq_len == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    int rc = sinomo_proc_set_rseq((unsigned long long)(uintptr_t)rseq, rseq_len, signature);
-    if (rc != 0) {
-        errno = rc;
+    int rc = sinomo_rseq_runtime((unsigned long long)(uintptr_t)rseq, rseq_len, flags, signature);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
     return 0;
@@ -15744,55 +15471,12 @@ static int sinomo_rseq(void *rseq, uint32_t rseq_len, int flags, uint32_t signat
 #endif
 
 static int sinomo_arch_prctl(int code, unsigned long addr) {
-    switch (code) {
-        case ARCH_SET_FS: {
-            int rc = sinomo_proc_set_arch_base(SINOMO_PROC_ARCH_FS_BASE, (unsigned long long)addr);
-            if (rc != 0) {
-                errno = rc;
-                return -1;
-            }
-            return 0;
-        }
-        case ARCH_SET_GS: {
-            int rc = sinomo_proc_set_arch_base(SINOMO_PROC_ARCH_GS_BASE, (unsigned long long)addr);
-            if (rc != 0) {
-                errno = rc;
-                return -1;
-            }
-            return 0;
-        }
-        case ARCH_GET_FS: {
-            if ((unsigned long *)addr == NULL) {
-                errno = EFAULT;
-                return -1;
-            }
-            unsigned long long base = 0;
-            int rc = sinomo_proc_get_arch_base(SINOMO_PROC_ARCH_FS_BASE, &base);
-            if (rc != 0) {
-                errno = rc;
-                return -1;
-            }
-            *(unsigned long *)addr = (unsigned long)base;
-            return 0;
-        }
-        case ARCH_GET_GS: {
-            if ((unsigned long *)addr == NULL) {
-                errno = EFAULT;
-                return -1;
-            }
-            unsigned long long base = 0;
-            int rc = sinomo_proc_get_arch_base(SINOMO_PROC_ARCH_GS_BASE, &base);
-            if (rc != 0) {
-                errno = rc;
-                return -1;
-            }
-            *(unsigned long *)addr = (unsigned long)base;
-            return 0;
-        }
-        default:
-            errno = EINVAL;
-            return -1;
+    int rc = sinomo_arch_prctl_runtime(code, addr);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
     }
+    return 0;
 }
 
 #ifndef MPOL_DEFAULT
@@ -16725,23 +16409,100 @@ static int sinomo_futex_wait_masked(uint32_t *uaddr, uint32_t value, uint32_t ma
     if (sinomo_futex_timeout_option(absolute, realtime, timeout, &timeout_option, &timeout_ptr) != 0) {
         return -1;
     }
-    __wasi_bool_t woken = 0;
-    __wasi_errno_t rc = mask == FUTEX_BITSET_MATCH_ANY
-        ? __wasi_futex_wait(uaddr, value, timeout_ptr, &woken)
-        : sinomo_futex_wait_mask(uaddr, value, mask, timeout_ptr, &woken);
-    if (rc != 0) {
-        errno = (int)rc;
+    long long timeout_ns = -1;
+    if (timeout_ptr != NULL) {
+        timeout_ns = timeout_option.u.some > (unsigned long long)LLONG_MAX
+            ? LLONG_MAX
+            : (long long)timeout_option.u.some;
+    }
+    int wait_result = __builtin_wasm_memory_atomic_wait32((int *)uaddr, (int)value, timeout_ns);
+    if (wait_result == 0) {
+        return 0;
+    }
+    if (wait_result == 1) {
+        errno = EAGAIN;
         return -1;
     }
-    if (!woken) {
+    if (wait_result == 2) {
         errno = ETIMEDOUT;
         return -1;
     }
-    return 0;
+    errno = EINVAL;
+    return -1;
 }
 
 static int sinomo_futex_wait(uint32_t *uaddr, uint32_t value, const struct timespec *timeout, int absolute, int realtime) {
     return sinomo_futex_wait_masked(uaddr, value, FUTEX_BITSET_MATCH_ANY, timeout, absolute, realtime);
+}
+
+#define SINOMO_FUTEX_FD_SLOTS 128
+struct sinomo_futex_fd_entry {
+    uint32_t *uaddr;
+    int fd;
+};
+static struct sinomo_futex_fd_entry sinomo_futex_fds[SINOMO_FUTEX_FD_SLOTS];
+
+static void sinomo_futex_fd_forget(int fd) {
+    for (size_t index = 0; index < SINOMO_FUTEX_FD_SLOTS; index++) {
+        if (sinomo_futex_fds[index].fd == fd) {
+            memset(&sinomo_futex_fds[index], 0, sizeof(sinomo_futex_fds[index]));
+        }
+    }
+}
+
+static int sinomo_futex_fd_create(uint32_t *uaddr) {
+    if (uaddr == NULL || (((uintptr_t)uaddr) & 3U) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = __wrap_eventfd(0, EFD_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    for (size_t index = 0; index < SINOMO_FUTEX_FD_SLOTS; index++) {
+        if (sinomo_futex_fds[index].fd == 0) {
+            sinomo_futex_fds[index].uaddr = uaddr;
+            sinomo_futex_fds[index].fd = fd;
+            return fd;
+        }
+    }
+    int saved_errno = EMFILE;
+    (void)__wrap_close(fd);
+    errno = saved_errno;
+    return -1;
+}
+
+static void sinomo_futex_fd_notify(uint32_t *uaddr, int wake_count) {
+    if (uaddr == NULL || wake_count <= 0) {
+        return;
+    }
+    for (size_t index = 0; index < SINOMO_FUTEX_FD_SLOTS; index++) {
+        if (sinomo_futex_fds[index].fd > 0 && sinomo_futex_fds[index].uaddr == uaddr) {
+            (void)__wrap_eventfd_write(sinomo_futex_fds[index].fd, 1);
+        }
+    }
+}
+
+int __wrap___wasilibc_futex_wait_wasix(volatile void *addr, int op, int expected, int64_t max_wait_ns) {
+    (void)op;
+    if ((((uintptr_t)addr) & 3U) != 0) {
+        return -EINVAL;
+    }
+    if (*(volatile int *)addr != expected) {
+        return -EAGAIN;
+    }
+    int64_t timeout_ns = max_wait_ns > 0 ? max_wait_ns : -1;
+    int wait_result = __builtin_wasm_memory_atomic_wait32((int *)addr, expected, timeout_ns);
+    if (wait_result == 0) {
+        return 0;
+    }
+    if (wait_result == 1) {
+        return -EAGAIN;
+    }
+    if (wait_result == 2) {
+        return -ETIMEDOUT;
+    }
+    return -EINVAL;
 }
 
 static int sinomo_futex_wake_masked(uint32_t *uaddr, int requested, uint32_t mask) {
@@ -16752,26 +16513,20 @@ static int sinomo_futex_wake_masked(uint32_t *uaddr, int requested, uint32_t mas
     if (requested <= 0) {
         return 0;
     }
-    int woken_count = 0;
-    for (int index = 0; index < requested; index++) {
-        __wasi_bool_t woken = 0;
-        __wasi_errno_t rc = mask == FUTEX_BITSET_MATCH_ANY
-            ? __wasi_futex_wake(uaddr, &woken)
-            : sinomo_futex_wake_mask(uaddr, mask, &woken);
-        if (rc != 0) {
-            errno = (int)rc;
-            return -1;
-        }
-        if (!woken) {
-            break;
-        }
-        woken_count++;
-    }
-    return woken_count;
+    int woken = __builtin_wasm_memory_atomic_notify((int *)uaddr, requested);
+    sinomo_futex_fd_notify(uaddr, woken);
+    return woken;
 }
 
 static int sinomo_futex_wake(uint32_t *uaddr, int requested) {
     return sinomo_futex_wake_masked(uaddr, requested, FUTEX_BITSET_MATCH_ANY);
+}
+
+int __wrap___wasilibc_futex_wake_wasix(int *futex, int cnt) {
+    if (futex == NULL || (((uintptr_t)futex) & 3U) != 0 || cnt < 0) {
+        return -EINVAL;
+    }
+    return __builtin_wasm_memory_atomic_notify(futex, cnt);
 }
 
 static int sinomo_futex_requeue_waiters(uint32_t *uaddr, int wake_count, uint32_t *uaddr2, int requeue_count, uint32_t mask) {
@@ -16795,6 +16550,9 @@ static int sinomo_futex_requeue_waiters(uint32_t *uaddr, int wake_count, uint32_
     if (rc != 0) {
         errno = (int)rc;
         return -1;
+    }
+    if (affected > 0 && wake_count > 0) {
+        sinomo_futex_fd_notify(uaddr, wake_count);
     }
     return affected > (uint32_t)INT_MAX ? INT_MAX : (int)affected;
 }
@@ -17490,8 +17248,7 @@ static int sinomo_syscall_futex(uint32_t *uaddr, int op, uint32_t value, const s
         return sinomo_futex_wake_masked(uaddr, (int)value, value3);
     }
     if (command == FUTEX_FD) {
-        errno = ENOSYS;
-        return -1;
+        return sinomo_futex_fd_create(uaddr);
     }
     if (command == FUTEX_REQUEUE) {
         return sinomo_futex_requeue_waiters(uaddr, (int)value, uaddr2, (int)(uintptr_t)timeout, FUTEX_BITSET_MATCH_ANY);
@@ -18637,7 +18394,7 @@ long syscall(long number, ...) {
         }
         case SYS_chdir: {
             const char *path = va_arg(ap, const char *);
-            result = (long)__wrap_chdir(path);
+            result = (long)chdir(path);
             break;
         }
         case SYS_fchdir: {
@@ -19106,7 +18863,8 @@ long syscall(long number, ...) {
                 result = -1;
                 break;
             }
-            if (pid == __wrap_getpid() && sinomo_sigset_contains(&sinomo_signal_mask, signum)) {
+            sigset_t current_mask = sinomo_signal_current_mask();
+            if (pid == __wrap_getpid() && sinomo_sigset_contains(&current_mask, signum)) {
                 siginfo_t queued;
                 if (info != NULL) {
                     queued = *info;
@@ -19163,8 +18921,7 @@ long syscall(long number, ...) {
             break;
         }
         case SYS_rt_sigreturn:
-            errno = ENOSYS;
-            result = -1;
+            result = 0;
             break;
         case SYS_pause:
             result = (long)__wrap_pause();
@@ -19432,7 +19189,7 @@ long syscall(long number, ...) {
         case SYS_setgroups: {
             size_t size = (size_t)va_arg(ap, unsigned long);
             const gid_t *list = va_arg(ap, const gid_t *);
-            result = (long)setgroups(size, list);
+            result = (long)__wrap_setgroups(size, list);
             break;
         }
         case SYS_getresuid: {
@@ -19751,26 +19508,23 @@ int __wrap_waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options) {
         errno = EINVAL;
         return -1;
     }
-    __wasi_option_pid_t option_pid = {
-        .tag = 1,
-        .u = {.some = -1},
-    };
+    int wait_pid = -1;
     switch (idtype) {
     case P_ALL:
-        option_pid.u.some = -1;
+        wait_pid = -1;
         break;
     case P_PID:
-        option_pid.u.some = (__wasi_pid_t)id;
+        wait_pid = (int)id;
         break;
     case P_PGID:
-        option_pid.u.some = id == 0 ? 0 : -((__wasi_pid_t)id);
+        wait_pid = id == 0 ? 0 : -((int)id);
         break;
     case P_PIDFD: {
         pid_t pid = sinomo_pidfd_lookup((int)id);
         if (pid < 0) {
             return -1;
         }
-        option_pid.u.some = (__wasi_pid_t)pid;
+        wait_pid = (int)pid;
         break;
     }
     default:
@@ -19778,127 +19532,36 @@ int __wrap_waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options) {
         return -1;
     }
 
-#ifdef WCONTINUED
-    if ((options & WCONTINUED) != 0) {
-        int continued_only = (options & (WEXITED | WSTOPPED)) == 0;
-        int continued_nonblocking = (options & WNOHANG) != 0 || !continued_only;
-        pid_t continued_pid = continued_only
-            ? sinomo_wait_continued_child(
-                (pid_t)option_pid.u.some,
-                (options & WNOWAIT) == 0,
-                continued_nonblocking
-            )
-            : ((options & WNOWAIT) != 0
-                ? sinomo_peek_continued_child((pid_t)option_pid.u.some)
-                : sinomo_take_continued_child((pid_t)option_pid.u.some));
-        if (continued_pid < 0) {
-            return -1;
-        }
-        if (continued_pid > 0) {
-            memset(infop, 0, sizeof(*infop));
-            infop->si_signo = SIGCHLD;
-            infop->si_pid = continued_pid;
-            infop->si_uid = __wrap_getuid();
-            infop->si_code = CLD_CONTINUED;
-            infop->si_status = SIGCONT;
-            return 0;
-        }
-        if (continued_only) {
-            memset(infop, 0, sizeof(*infop));
-            return 0;
-        }
-    }
-#endif
-
-    __wasi_join_flags_t flags = 0;
-    if ((options & WNOHANG) != 0) {
-        flags |= __WASI_JOIN_FLAGS_NON_BLOCKING;
-    }
-    if ((options & WSTOPPED) != 0) {
-        flags |= __WASI_JOIN_FLAGS_WAKE_STOPPED;
-    }
-
-    __wasi_join_status_t status = {0};
-    uint32_t status_kinds = 0;
-    if ((options & WEXITED) != 0) {
-        status_kinds |= SINOMO_WAIT_STATUS_EXITED;
-    }
-    if ((options & WSTOPPED) != 0) {
-        status_kinds |= SINOMO_WAIT_STATUS_STOPPED;
-    }
-    if ((options & WCONTINUED) != 0) {
-        status_kinds |= SINOMO_WAIT_STATUS_CONTINUED;
-    }
-    __wasi_errno_t rc = ((options & WNOWAIT) != 0 || (options & WEXITED) == 0 || (options & WCONTINUED) != 0)
-        ? sinomo_proc_wait_status_select(&option_pid, flags, status_kinds, &status)
-        : __wasi_proc_join(&option_pid, flags, &status);
-    if (rc != 0) {
-        errno = (int)rc;
+    int ret_pid = 0;
+    int ret_signo = 0;
+    int ret_code = 0;
+    int ret_status = 0;
+    int rc = sinomo_waitid_runtime(wait_pid, (unsigned int)options, &ret_pid, &ret_signo, &ret_code, &ret_status);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
 
     memset(infop, 0, sizeof(*infop));
-    if (status.tag == __WASI_JOIN_STATUS_TYPE_NOTHING) {
-        if ((options & WCONTINUED) != 0 && option_pid.u.some > 0) {
-            if ((options & WNOWAIT) == 0) {
-                pid_t consumed = sinomo_take_continued_child((pid_t)option_pid.u.some);
-                if (consumed < 0) {
-                    return -1;
-                }
-            }
-            infop->si_signo = SIGCHLD;
-            infop->si_pid = (pid_t)option_pid.u.some;
-            infop->si_uid = __wrap_getuid();
-            infop->si_code = CLD_CONTINUED;
-            infop->si_status = SIGCONT;
-        }
+    if (ret_pid == 0) {
         return 0;
     }
-    if ((options & WCONTINUED) != 0 && (options & WNOWAIT) == 0 && status.tag != __WASI_JOIN_STATUS_TYPE_STOPPED) {
-        __wasi_option_pid_t reap_pid = {.tag = 1, .u = {.some = option_pid.u.some}};
-        rc = __wasi_proc_join(&reap_pid, flags, &status);
-        if (rc != 0) {
-            errno = (int)rc;
+    if ((options & WNOWAIT) == 0 && (ret_code == CLD_EXITED || ret_code == CLD_KILLED)) {
+        int reap_status = 0;
+        pid_t reaped = __wrap_waitpid((pid_t)ret_pid, &reap_status, WNOHANG);
+        if (reaped < 0) {
             return -1;
         }
-        option_pid.u.some = reap_pid.u.some;
     }
 
-    infop->si_signo = SIGCHLD;
-    infop->si_pid = (pid_t)option_pid.u.some;
+    infop->si_signo = ret_signo;
+    infop->si_pid = (pid_t)ret_pid;
     infop->si_uid = __wrap_getuid();
     infop->si_utime = 0;
     infop->si_stime = 0;
-
-    switch (status.tag) {
-    case __WASI_JOIN_STATUS_TYPE_EXIT_NORMAL:
-        if ((options & WEXITED) == 0) {
-            memset(infop, 0, sizeof(*infop));
-            return 0;
-        }
-        infop->si_code = CLD_EXITED;
-        infop->si_status = (int)status.u.exit_normal;
-        return 0;
-    case __WASI_JOIN_STATUS_TYPE_EXIT_SIGNAL:
-        if ((options & WEXITED) == 0) {
-            memset(infop, 0, sizeof(*infop));
-            return 0;
-        }
-        infop->si_code = CLD_KILLED;
-        infop->si_status = (int)status.u.exit_signal.signal;
-        return 0;
-    case __WASI_JOIN_STATUS_TYPE_STOPPED:
-        if ((options & WSTOPPED) == 0) {
-            memset(infop, 0, sizeof(*infop));
-            return 0;
-        }
-        infop->si_code = CLD_STOPPED;
-        infop->si_status = (int)status.u.stopped;
-        return 0;
-    default:
-        errno = EINVAL;
-        return -1;
-    }
+    infop->si_code = ret_code;
+    infop->si_status = ret_status;
+    return 0;
 }
 
 static int sinomo_lock_path(int fd, char *buffer, size_t len) {
@@ -20386,10 +20049,13 @@ char *__wrap___wasilibc_exec_combine_strings(char *const strings[]) {
     return combined;
 }
 
-int __wrap_execve(const char *path, char *const argv[], char *const envp[]) {
+static int sinomo_execve_common(const char *path, char *const argv[], char *const envp[], int search_path_enabled) {
     char *combined_argv = __wrap___wasilibc_exec_combine_strings(argv);
     char *combined_env = __wrap___wasilibc_exec_combine_strings(envp ? envp : environ);
-    const char *search_path = getenv("PATH");
+    const char *search_path = "";
+    if (search_path_enabled && path != NULL && strchr(path, '/') == NULL) {
+        search_path = getenv("PATH");
+    }
     if (search_path == NULL) {
         search_path = "";
     }
@@ -20399,6 +20065,22 @@ int __wrap_execve(const char *path, char *const argv[], char *const envp[]) {
     free(combined_env);
     errno = (int)error;
     return -1;
+}
+
+int __wrap_execv(const char *path, char *const argv[]) {
+    return sinomo_execve_common(path, argv, environ, 0);
+}
+
+int __wrap_execve(const char *path, char *const argv[], char *const envp[]) {
+    return sinomo_execve_common(path, argv, envp, 0);
+}
+
+int __wrap_execvp(const char *file, char *const argv[]) {
+    return sinomo_execve_common(file, argv, environ, 1);
+}
+
+int __wrap_execvpe(const char *file, char *const argv[], char *const envp[]) {
+    return sinomo_execve_common(file, argv, envp, 1);
 }
 
 struct sinomo_execveat_data {
@@ -20438,7 +20120,7 @@ int __wrap_execveat(int dirfd, const char *path, char *const argv[], char *const
     return sinomo_with_dirfd_cwd(dirfd, sinomo_execveat_operation, &data);
 }
 
-int fexecve(int fd, char *const argv[], char *const envp[]) {
+int __wrap_fexecve(int fd, char *const argv[], char *const envp[]) {
     return __wrap_execveat(fd, "", argv, envp, AT_EMPTY_PATH);
 }
 
@@ -20457,6 +20139,7 @@ mkdir -p "${ZLIB_OUT}/lib" "${ZLIB_OUT}/include"
         gzwrite.c infback.c inffast.c inflate.c inftrees.c trees.c uncompr.c zutil.c
     do
         "${WASIXCC_BIN}" \
+            "-sSYSROOT_PREFIX=${WASIXCC_SYSROOT_PREFIX}" \
             -sPIC=yes \
             -sRUN_WASM_OPT=no \
             -O2 \
@@ -20472,7 +20155,7 @@ mkdir -p "${ZLIB_OUT}/lib" "${ZLIB_OUT}/include"
 mkdir -p "${OPENSSL_OUT}"
 (
     cd "${OPENSSL_SRC}"
-    CC="${WASIXCC_BIN} -sPIC=yes -sRUN_WASM_OPT=no" \
+    CC="${WASIXCC_BIN} -sSYSROOT_PREFIX=${WASIXCC_SYSROOT_PREFIX} -sPIC=yes -sRUN_WASM_OPT=no" \
     AR="${WASIXAR_BIN}" \
     RANLIB="${WASIXRANLIB_BIN}" \
     ./Configure \
@@ -20516,7 +20199,11 @@ ac_cv_func_atanh=yes
 ac_cv_func_basename=yes
 ac_cv_func_erf=yes
 ac_cv_func_erfc=yes
+ac_cv_func_execv=yes
+ac_cv_func_execve=yes
 ac_cv_func_execveat=yes
+ac_cv_func_execvp=yes
+ac_cv_func_execvpe=yes
 ac_cv_func_expm1=yes
 ac_cv_func_log1p=yes
 ac_cv_func_log2=yes
@@ -20692,6 +20379,8 @@ ac_cv_func_isatty=yes
 ac_cv_func_initstate=yes
 ac_cv_func_insque=yes
 ac_cv_func_jrand48=yes
+ac_cv_func_kill=yes
+ac_cv_func_killpg=yes
 ac_cv_func_l64a=yes
 ac_cv_func_linkat=yes
 ac_cv_func_link=yes
@@ -20815,9 +20504,9 @@ ac_cv_func_timer_delete=yes
 ac_cv_func_timer_getoverrun=yes
 ac_cv_func_timer_gettime=yes
 ac_cv_func_timer_settime=yes
-ac_cv_func_timerfd_create=yes
-ac_cv_func_timerfd_gettime=yes
-ac_cv_func_timerfd_settime=yes
+ac_cv_func_timerfd_create=no
+ac_cv_func_timerfd_gettime=no
+ac_cv_func_timerfd_settime=no
 ac_cv_func_umask=yes
 ac_cv_func_uname=yes
 ac_cv_func_ungetwc=yes
@@ -20985,7 +20674,11 @@ ac_cv_func_vwarn=yes
 ac_cv_func_vwarnx=yes
 ac_cv_func_vfork=yes
 ac_cv_func_vsyslog=yes
+ac_cv_func_wait=yes
+ac_cv_func_wait3=yes
+ac_cv_func_wait4=yes
 ac_cv_func_waitid=yes
+ac_cv_func_waitpid=yes
 ac_cv_func_warn=yes
 ac_cv_func_warnx=yes
 ac_cv_func_writev=yes
@@ -21017,7 +20710,7 @@ ac_cv_header_sys_file_h=yes
 ac_cv_header_sys_eventfd_h=yes
 ac_cv_header_sys_inotify_h=yes
 ac_cv_header_sys_signalfd_h=yes
-ac_cv_header_sys_timerfd_h=yes
+ac_cv_header_sys_timerfd_h=no
 ac_cv_header_syslog_h=yes
 ac_cv_header_sys_epoll_h=yes
 ac_cv_header_sys_poll_h=yes
@@ -21073,6 +20766,7 @@ mkdir -p "${WASIX_BUILD_DIR}"
         --disable-test-modules
     python3 - Makefile "${SINOMO_WASIX_ARGV_COMPAT_OBJECT}" <<'PY'
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
@@ -21080,12 +20774,26 @@ object_path = sys.argv[2]
 text = path.read_text()
 text = text.replace(
     "LIBS=\t\t",
-    f"LIBS=\t\t{object_path} -lc++ -lc++abi -lunwind ",
+    f"LIBS=\t\t{object_path} ",
     1,
 )
+text, initial_memory_replacements = re.subn(
+    r"-Wl,--initial-memory=\d+",
+    "-Wl,--initial-memory=268435456",
+    text,
+)
+if initial_memory_replacements == 0:
+    raise SystemExit("CPython WASIX Makefile initial-memory flag not found")
+text, stack_size_replacements = re.subn(
+    r"-z stack-size=\d+",
+    "-z stack-size=67108864",
+    text,
+)
+if stack_size_replacements == 0:
+    raise SystemExit("CPython WASIX Makefile stack-size flag not found")
 text = text.replace(
     "LDFLAGS=\t",
-    "LDFLAGS=\t-Wl,--wrap=__wasilibc_exec_combine_strings -Wl,--wrap=execve -Wl,--wrap=fcntl "
+    "LDFLAGS=\t-Wl,--export-dynamic -Wl,--wrap=__wasilibc_exec_combine_strings -Wl,--wrap=__wasilibc_futex_wait_wasix -Wl,--wrap=__wasilibc_futex_wake_wasix -Wl,--wrap=execv -Wl,--wrap=execve -Wl,--wrap=execvp -Wl,--wrap=execvpe -Wl,--wrap=fcntl "
     "-Wl,--wrap=uname -Wl,--wrap=gethostname -Wl,--wrap=sethostname -Wl,--wrap=getdomainname -Wl,--wrap=setdomainname -Wl,--wrap=getrlimit -Wl,--wrap=setrlimit "
     "-Wl,--wrap=prlimit -Wl,--wrap=getpagesize -Wl,--wrap=get_phys_pages -Wl,--wrap=get_avphys_pages "
     "-Wl,--wrap=get_nprocs_conf -Wl,--wrap=get_nprocs -Wl,--wrap=getloadavg -Wl,--wrap=sysinfo "
@@ -21181,7 +20889,8 @@ text = text.replace(
     "-Wl,--wrap=timer_create -Wl,--wrap=timer_settime -Wl,--wrap=timer_gettime "
     "-Wl,--wrap=timer_getoverrun -Wl,--wrap=timer_delete "
     "-Wl,--wrap=timerfd_create -Wl,--wrap=timerfd_settime -Wl,--wrap=timerfd_gettime "
-    "-Wl,--wrap=clock_nanosleep -Wl,--wrap=sleep -Wl,--wrap=usleep "
+    "-Wl,--wrap=clock_gettime -Wl,--wrap=clock_getres -Wl,--wrap=clock_nanosleep "
+    "-Wl,--wrap=sleep -Wl,--wrap=usleep "
     "-Wl,--wrap=futimesat -Wl,--wrap=lutimes -Wl,--wrap=utime -Wl,--wrap=utimensat "
     "-Wl,--wrap=isatty -Wl,--wrap=ttyname -Wl,--wrap=ttyname_r -Wl,--wrap=ctermid -Wl,--wrap=ctermid_r "
     "-Wl,--wrap=getlogin -Wl,--wrap=getlogin_r -Wl,--wrap=getpass "
@@ -21190,7 +20899,7 @@ text = text.replace(
     "-Wl,--wrap=mkdtemp -Wl,--wrap=mktemp "
     "-Wl,--wrap=statvfs -Wl,--wrap=fstatvfs "
     "-Wl,--wrap=pathconf -Wl,--wrap=fpathconf -Wl,--wrap=sysconf -Wl,--wrap=confstr "
-    "-Wl,--wrap=getcwd -Wl,--wrap=get_current_dir_name -Wl,--wrap=getwd -Wl,--wrap=realpath -Wl,--wrap=chdir -Wl,--wrap=chroot "
+    "-Wl,--wrap=getcwd -Wl,--wrap=get_current_dir_name -Wl,--wrap=getwd -Wl,--wrap=realpath -Wl,--wrap=chroot "
     "-Wl,--wrap=access -Wl,--wrap=faccessat -Wl,--wrap=openat -Wl,--wrap=mkdirat -Wl,--wrap=mknod -Wl,--wrap=mknodat "
     "-Wl,--wrap=unlinkat -Wl,--wrap=readlinkat -Wl,--wrap=symlinkat "
     "-Wl,--wrap=linkat -Wl,--wrap=renameat "
@@ -21210,6 +20919,7 @@ text = text.replace(
     "-Wl,--wrap=lckpwdf -Wl,--wrap=ulckpwdf "
     "-Wl,--wrap=setuid -Wl,--wrap=seteuid -Wl,--wrap=setfsuid "
     "-Wl,--wrap=setgid -Wl,--wrap=setegid -Wl,--wrap=setfsgid "
+    "-Wl,--wrap=setgroups -Wl,--wrap=initgroups "
     "-Wl,--wrap=getpid -Wl,--wrap=getppid "
     "-Wl,--wrap=umask -Wl,--wrap=chmod -Wl,--wrap=fchmod "
     "-Wl,--wrap=fchmodat "
@@ -21220,168 +20930,8 @@ text = text.replace(
     "-Wl,--wrap=tcgetpgrp -Wl,--wrap=tcsetpgrp "
     "-Wl,--wrap=kill -Wl,--wrap=killpg "
     "-Wl,--wrap=fork -Wl,--wrap=vfork "
-    "-Wl,--wrap=execve -Wl,--wrap=execveat "
-    "-Wl,--wrap=wait -Wl,--wrap=waitpid -Wl,--wrap=wait3 -Wl,--wrap=wait4 -Wl,--wrap=waitid "
-    + " ".join(
-        f"-Wl,--undefined={symbol} -Wl,--export-if-defined={symbol}"
-        for symbol in [
-            "__wasm_lpad_context",
-            "__gxx_personality_wasm0",
-            "__cxa_allocate_exception",
-            "__cxa_free_exception",
-            "__cxa_throw",
-            "__cxa_begin_catch",
-            "__cxa_end_catch",
-            "__cxa_rethrow",
-            "__cxa_demangle",
-            "__cxa_guard_acquire",
-            "__cxa_guard_abort",
-            "__cxa_guard_release",
-            "__cxa_atexit",
-            "_ZSt9terminatev",
-            "_ZSt17current_exceptionv",
-            "_ZSt17rethrow_exceptionSt13exception_ptr",
-            "_ZNSt13exception_ptrC1ERKS_",
-            "_ZNSt13exception_ptrD1Ev",
-            "_ZNSt13exception_ptraSERKS_",
-            "_ZNSt11logic_errorC2EPKc",
-            "_ZNSt11logic_errorC2ERKNSt3__212basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE",
-            "_ZNSt9exceptionD1Ev",
-            "_ZNSt9exceptionD2Ev",
-            "_ZNKSt9exception4whatEv",
-            "_ZTVSt9exception",
-            "_ZTISt9exception",
-            "_ZTSSt9exception",
-            "_ZNSt9bad_allocC1Ev",
-            "_ZNSt9bad_allocD1Ev",
-            "_ZNSt9bad_allocD2Ev",
-            "_ZNKSt9bad_alloc4whatEv",
-            "_ZTVSt9bad_alloc",
-            "_ZTISt9bad_alloc",
-            "_ZTSSt9bad_alloc",
-            "_ZNSt20bad_array_new_lengthC1Ev",
-            "_ZNSt20bad_array_new_lengthD1Ev",
-            "_ZNSt20bad_array_new_lengthD2Ev",
-            "_ZTVSt20bad_array_new_length",
-            "_ZTISt20bad_array_new_length",
-            "_ZTSSt20bad_array_new_length",
-            "_ZNSt13runtime_errorC1EPKc",
-            "_ZNSt13runtime_errorC1ERKNSt3__212basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE",
-            "_ZNSt13runtime_errorC2EPKc",
-            "_ZNSt13runtime_errorC2ERKNSt3__212basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE",
-            "_ZNSt13runtime_errorD1Ev",
-            "_ZNSt13runtime_errorD2Ev",
-            "_ZNKSt13runtime_error4whatEv",
-            "_ZTVSt13runtime_error",
-            "_ZTISt13runtime_error",
-            "_ZTSSt13runtime_error",
-            "_ZTVSt12domain_error",
-            "_ZTISt12domain_error",
-            "_ZTSSt12domain_error",
-            "_ZNSt12length_errorD1Ev",
-            "_ZNSt12length_errorD2Ev",
-            "_ZTVSt12length_error",
-            "_ZTISt12length_error",
-            "_ZTSSt12length_error",
-            "_ZTVSt12out_of_range",
-            "_ZTISt12out_of_range",
-            "_ZTSSt12out_of_range",
-            "_ZTVSt16invalid_argument",
-            "_ZTISt16invalid_argument",
-            "_ZTSSt16invalid_argument",
-            "_ZTVSt11range_error",
-            "_ZTISt11range_error",
-            "_ZTSSt11range_error",
-            "_ZTVSt14overflow_error",
-            "_ZTISt14overflow_error",
-            "_ZTSSt14overflow_error",
-            "_ZTISt16nested_exception",
-            "_ZTSSt16nested_exception",
-            "_ZTVN10__cxxabiv117__class_type_infoE",
-            "_ZTVN10__cxxabiv119__pointer_type_infoE",
-            "_ZTVN10__cxxabiv120__function_type_infoE",
-            "_ZTVN10__cxxabiv120__si_class_type_infoE",
-            "_ZTVN10__cxxabiv121__vmi_class_type_infoE",
-            "_ZNKSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE17__assign_externalEPKc",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE17__assign_externalEPKcm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE17__assign_no_aliasILb0EEERS5_PKcm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE17__assign_no_aliasILb1EEERS5_PKcm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE25__init_copy_ctor_externalEPKcm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE26__erase_external_with_moveEmm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendERKS5_mm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm",
-            "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc",
-            "_ZNKSt3__215basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv",
-            "_ZNSt3__215basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strERKNS_12basic_stringIcS2_S4_EE",
-            "_ZNSt3__218basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEE3putEc",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEE5flushEv",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEED2Ev",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEElsEd",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEElsEi",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEElsEj",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEElsEl",
-            "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEElsEy",
-            "_ZNSt3__214basic_iostreamIcNS_11char_traitsIcEEED2Ev",
-            "_ZNKSt3__26locale9use_facetERNS0_2idE",
-            "_ZNSt3__26localeC1Ev",
-            "_ZNSt3__26localeD1Ev",
-            "_ZNSt3__25ctypeIcE2idE",
-            "_ZNKSt3__28ios_base6getlocEv",
-            "_ZNSt3__28ios_base33__set_badbit_and_consider_rethrowEv",
-            "_ZNSt3__28ios_base4initEPv",
-            "_ZNSt3__28ios_base5clearEj",
-            "_ZNSt3__29basic_iosIcNS_11char_traitsIcEEED2Ev",
-            "_ZNSt3__24coutE",
-            "_ZNSt3__25mutex4lockEv",
-            "_ZNSt3__25mutex6unlockEv",
-            "_ZNSt3__25mutexD1Ev",
-            "_ZNSt3__215recursive_mutexC1Ev",
-            "_ZNSt3__215recursive_mutexD1Ev",
-            "_ZNSt3__218condition_variable10notify_allEv",
-            "_ZNSt3__218condition_variable4waitERNS_11unique_lockINS_5mutexEEE",
-            "_ZNSt3__218condition_variableD1Ev",
-            "_ZNSt3__215__thread_structC1Ev",
-            "_ZNSt3__215__thread_structD1Ev",
-            "_ZNSt3__219__thread_local_dataEv",
-            "_ZNSt3__26thread20hardware_concurrencyEv",
-            "_ZNSt3__26thread4joinEv",
-            "_ZNSt3__26threadD1Ev",
-            "_ZNSt3__211__call_onceERVmPvPFvS2_E",
-            "_ZNSt3__220__throw_system_errorEiPKc",
-            "_ZNSt3__222__libcpp_verbose_abortEPKcz",
-            "_ZNSt3__29to_stringEi",
-            "_ZNSt3__29to_stringEj",
-            "_ZNSt3__29to_stringEl",
-            "_ZNSt3__29to_stringEm",
-            "_ZNSt3__212__next_primeEm",
-            "_ZNSt3__219piecewise_constructE",
-            "_ZTVNSt3__217bad_function_callE",
-            "_ZTINSt3__217bad_function_callE",
-            "_ZTSNSt3__217bad_function_callE",
-            "_ZNSt3__217bad_function_callD1Ev",
-            "_ZTINSt3__219__shared_weak_countE",
-            "_ZNKSt3__219__shared_weak_count13__get_deleterERKSt9type_info",
-            "_ZNSt3__219__shared_weak_count14__release_weakEv",
-            "_ZNSt3__219__shared_weak_countD2Ev",
-            "_ZTH5errno",
-            "_Znwm",
-            "_ZnwmSt11align_val_t",
-            "_ZdlPv",
-            "_ZdlPvm",
-            "_ZdlPvSt11align_val_t",
-            "_ZdlPvmSt11align_val_t",
-        ]
-    )
-    + " ",
+    "-Wl,--wrap=execv -Wl,--wrap=execve -Wl,--wrap=execveat -Wl,--wrap=execvp -Wl,--wrap=execvpe -Wl,--wrap=fexecve "
+    "-Wl,--wrap=wait -Wl,--wrap=waitpid -Wl,--wrap=wait3 -Wl,--wrap=wait4 -Wl,--wrap=waitid ",
     1,
 )
 text = text.replace(
@@ -21465,43 +21015,6 @@ target.mkdir(parents=True, exist_ok=True)
 with zipfile.ZipFile(sys.argv[1]) as archive:
     archive.extractall(target)
 PY
-python3 - "${PACKAGE_ROOT}/Lib/site-packages/pip/_internal/build_env.py" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-needle = '''            # The prefix specified two lines above, thus
-            # target from config file or env var should be ignored
-            "--target",
-            "",
-'''
-replacement = '''            # Sinomo/WASIX does not set PIP_TARGET in the default environment;
-            # an empty --target conflicts with --prefix in this runtime.
-'''
-if needle not in text:
-    raise SystemExit("pip build environment target patch target not found")
-path.write_text(text.replace(needle, replacement))
-PY
-python3 - "${PACKAGE_ROOT}/Lib/site-packages/pip/_vendor/packaging/tags.py" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-needle = '''def _generic_platforms() -> Iterator[str]:
-    yield _normalize_string(sysconfig.get_platform())
-'''
-replacement = '''def _generic_platforms() -> Iterator[str]:
-    platform = _normalize_string(sysconfig.get_platform())
-    yield platform
-    if platform == "wasi_0_0_0_wasm32":
-        yield "wasix_wasm32"
-'''
-if needle not in text:
-    raise SystemExit("pip WASIX platform tag patch target not found")
-path.write_text(text.replace(needle, replacement))
-PY
 
 mkdir -p \
     "${PACKAGE_ROOT}/include/python3.13" \
@@ -21516,60 +21029,6 @@ if [ -d "${WASIX_BUILD_DIR}/build/lib.wasi-wasm32-3.13" ]; then
     cp -a "${WASIX_BUILD_DIR}/build/lib.wasi-wasm32-3.13" \
         "${PACKAGE_ROOT}/cross-build/wasm32-wasix/build/"
 fi
-
-cat > "${PACKAGE_ROOT}/Lib/sitecustomize.py" <<'PY'
-import importlib._bootstrap_external
-import importlib.machinery
-import os
-import sys
-
-if not sys.executable:
-    sys.executable = "/bin/python"
-
-for _path in (
-    "/work/.python-packages",
-    "/cross-build/wasm32-wasix/build/lib.wasi-wasm32-3.13",
-    "/Lib/site-packages",
-):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
-
-os.environ.setdefault("HOME", "/home")
-os.environ.setdefault("MPLBACKEND", "Agg")
-os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-os.environ.setdefault("PIP_FIND_LINKS", "/Lib/sinomo-wheels")
-os.environ.setdefault("PYTHONHOME", "/")
-os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
-os.environ.setdefault("TMPDIR", "/work/.tmp")
-try:
-    os.makedirs(os.environ["TMPDIR"], exist_ok=True)
-except OSError:
-    pass
-
-for _suffix in (".cpython-313-wasm32-wasi.so",):
-    if _suffix not in importlib._bootstrap_external.EXTENSION_SUFFIXES:
-        importlib._bootstrap_external.EXTENSION_SUFFIXES.append(_suffix)
-    if _suffix not in importlib.machinery.EXTENSION_SUFFIXES:
-        importlib.machinery.EXTENSION_SUFFIXES.append(_suffix)
-
-sys.path_hooks[:] = [
-    _hook for _hook in sys.path_hooks if "FileFinder" not in repr(_hook)
-]
-sys.path_hooks.append(
-    importlib.machinery.FileFinder.path_hook(
-        (
-            importlib.machinery.ExtensionFileLoader,
-            importlib.machinery.EXTENSION_SUFFIXES,
-        ),
-        (importlib.machinery.SourceFileLoader, importlib.machinery.SOURCE_SUFFIXES),
-        (
-            importlib.machinery.SourcelessFileLoader,
-            importlib.machinery.BYTECODE_SUFFIXES,
-        ),
-    )
-)
-sys.path_importer_cache.clear()
-PY
 
 SYSCONFIG_DATA_DIR="${PACKAGE_ROOT}/cross-build/wasm32-wasix/build/lib.wasi-wasm32-3.13"
 SYSCONFIG_DATA_FILES=("${SYSCONFIG_DATA_DIR}"/_sysconfigdata_*.py)

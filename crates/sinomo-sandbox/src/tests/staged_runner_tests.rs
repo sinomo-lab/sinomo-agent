@@ -1371,14 +1371,14 @@ fn local_staged_runner_verifies_toolchain_fidelity_cases() {
 }
 
 #[test]
-fn local_staged_runner_rolls_back_written_byte_quota_violation() {
+fn local_staged_runner_keeps_failed_quota_write_from_persisting() {
     let (mut manifest, layout, runtime_root) = create_test_instance("sandbox_staged_runner_quota");
     let store = LocalSandboxInstanceStore::new(&runtime_root);
     manifest.limits.max_written_bytes_per_command = 3;
     store.save_manifest(&manifest).expect("save limits");
     let runner = LocalStagedSandboxCommandRunner::new().expect("runner");
 
-    let error = runner
+    let outcome = runner
         .run_module(
             &store,
             &manifest.sandbox_id,
@@ -1386,16 +1386,13 @@ fn local_staged_runner_rolls_back_written_byte_quota_violation() {
             vec!["write".to_string()],
             1_000,
         )
-        .expect_err("quota");
+        .expect("run");
 
-    assert!(matches!(
-        error,
-        SandboxCommandExecutionError::Fs(SandboxFsError::QuotaExceeded { .. })
-    ));
+    assert_ne!(outcome.response.exit_status, 0);
     let fs = LocalSandboxFileSystem::new(layout);
     assert!(matches!(
         fs.read(&SandboxPath::new("/work/out.txt").expect("out"), None)
-            .expect_err("rolled back"),
+            .expect_err("failed write should not persist"),
         SandboxFsError::NotFound { .. }
     ));
     assert!(
@@ -3110,6 +3107,14 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
             OffsetDateTime::now_utc(),
         )
         .expect("create");
+    let manifest = owner_store.load(&sandbox_id).expect("manifest");
+    let mut owner_fs = SifsSandboxFileSystem::new(owner_store.into_inner(), &manifest)
+        .with_replica_candidates(vec![owner.clone(), replica.clone()]);
+    owner_fs
+        .create_dir_all(&SandboxPath::new("/work/target").expect("target dir"))
+        .expect("target dir");
+    let owner_store = SifsSandboxInstanceStore::new(owner_fs.into_inner())
+        .with_replica_candidates(vec![owner.clone(), replica.clone()]);
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new()
         .expect("runner")
@@ -3120,7 +3125,7 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
             owner_store.into_inner(),
             &local_store,
             &sandbox_id,
-            wasi_write_file_module("progress.txt"),
+            wasi_write_file_from_any_preopen_module("target/progress.txt"),
             vec!["write".to_string()],
             1_000,
         )
@@ -3132,7 +3137,7 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
             .response
             .changed_paths
             .iter()
-            .any(|path| path == &SandboxPath::new("/work/progress.txt").expect("path")),
+            .any(|path| path == &SandboxPath::new("/work/target/progress.txt").expect("path")),
         "command changed paths should include the durable workspace write"
     );
 
@@ -3159,7 +3164,7 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
     assert_eq!(
         replica_fs
             .read(
-                &SandboxPath::new("/work/progress.txt").expect("progress"),
+                &SandboxPath::new("/work/target/progress.txt").expect("progress"),
                 None,
             )
             .expect("replica read command output"),
@@ -3187,6 +3192,14 @@ fn sifs_staged_runner_stages_rw_mounts_and_syncs_back_to_sifs() {
     dfs.bootstrap_distributed_sifs().expect("bootstrap");
     dfs.posix_mkdir_all("/services/sandbox/shared")
         .expect("mount source");
+    dfs.posix_mkdir_all("/services/sandbox/shared/target")
+        .expect("mount target");
+    dfs.posix_write_file(
+        "/services/sandbox/shared/target/.keep",
+        b"",
+        DfsWriteOptions::replicated_eventual(vec![dfs.node_id().clone()]),
+    )
+    .expect("mount target marker");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let mut manifest = sifs_store
@@ -3209,7 +3222,7 @@ fn sifs_staged_runner_stages_rw_mounts_and_syncs_back_to_sifs() {
             sifs_store.into_inner(),
             &local_store,
             &sandbox_id,
-            wasi_write_file_module_on_fd(10, "out.txt"),
+            wasix_write_absolute_file_module("/shared/target/out.txt"),
             vec!["write".to_string()],
             1_000,
         )
@@ -3219,7 +3232,7 @@ fn sifs_staged_runner_stages_rw_mounts_and_syncs_back_to_sifs() {
     assert_eq!(
         outcome
             .dfs
-            .posix_read_file("/services/sandbox/shared/out.txt")
+            .posix_read_file("/services/sandbox/shared/target/out.txt")
             .expect("mounted output"),
         b"created"
     );
@@ -3250,6 +3263,16 @@ fn sifs_staged_runner_replicates_rw_mount_writeback_to_candidate_node() {
     owner_dfs
         .posix_mkdir_all("/services/sandbox/shared")
         .expect("mount source");
+    owner_dfs
+        .posix_mkdir_all("/services/sandbox/shared/target")
+        .expect("mount target");
+    owner_dfs
+        .posix_write_file(
+            "/services/sandbox/shared/target/.keep",
+            b"",
+            DfsWriteOptions::replicated_eventual(vec![owner_dfs.node_id().clone()]),
+        )
+        .expect("mount target marker");
     let replica_backend =
         LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("replica metadata");
@@ -3285,7 +3308,7 @@ fn sifs_staged_runner_replicates_rw_mount_writeback_to_candidate_node() {
             owner_store.into_inner(),
             &local_store,
             &sandbox_id,
-            wasi_write_file_module_on_fd(10, "out.txt"),
+            wasix_write_absolute_file_module("/shared/target/out.txt"),
             vec!["write".to_string()],
             1_000,
         )
@@ -3306,7 +3329,7 @@ fn sifs_staged_runner_replicates_rw_mount_writeback_to_candidate_node() {
     .expect("replica metadata backend reload");
     assert_eq!(
         replica_dfs
-            .posix_read_file("/services/sandbox/shared/out.txt")
+            .posix_read_file("/services/sandbox/shared/target/out.txt")
             .expect("replica mounted output"),
         b"created"
     );
@@ -3329,6 +3352,14 @@ fn sifs_staged_runner_keeps_read_only_mounts_read_only() {
     dfs.bootstrap_distributed_sifs().expect("bootstrap");
     dfs.posix_mkdir_all("/services/sandbox/shared")
         .expect("mount source");
+    dfs.posix_mkdir_all("/services/sandbox/shared/target")
+        .expect("mount target");
+    dfs.posix_write_file(
+        "/services/sandbox/shared/target/.keep",
+        b"",
+        DfsWriteOptions::replicated_eventual(vec![dfs.node_id().clone()]),
+    )
+    .expect("mount target marker");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_ro_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let mut manifest = sifs_store
@@ -3351,17 +3382,17 @@ fn sifs_staged_runner_keeps_read_only_mounts_read_only() {
             sifs_store.into_inner(),
             &local_store,
             &sandbox_id,
-            wasi_write_file_module_on_fd(10, "out.txt"),
+            wasix_write_absolute_file_module("/shared/target/out.txt"),
             vec!["write".to_string()],
             1_000,
         )
         .expect("run setup");
     let command = outcome.command.expect("command");
-    assert_eq!(command.response.exit_status, SINOMO_WASI_ERRNO_NOTCAPABLE);
+    assert_ne!(command.response.exit_status, 0);
     assert!(matches!(
         outcome
             .dfs
-            .posix_read_file("/services/sandbox/shared/out.txt"),
+            .posix_read_file("/services/sandbox/shared/target/out.txt"),
         Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. })
     ));
     fs::remove_dir_all(sifs_root).ok();

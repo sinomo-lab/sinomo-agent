@@ -1,8 +1,9 @@
-use wasmer::FromToNativeWasmType;
+use wasmer::{FromToNativeWasmType, MemoryAccessError, MemoryView};
 
 use super::*;
 use crate::{
     VIRTUAL_ROOT_FD, WasiFs,
+    fs::WasiFsProcessSnapshot,
     os::task::{OwnedTaskStatus, TaskStatus},
     syscalls::*,
 };
@@ -44,10 +45,214 @@ pub fn proc_exec3<M: MemorySize>(
     }
 
     let memory = unsafe { ctx.data().memory_view(&ctx) };
-    let mut name = name.read_utf8_string(&memory, name_len).map_err(|err| {
+    let name = name.read_utf8_string(&memory, name_len).map_err(|err| {
         warn!("failed to execve as the name could not be read - {}", err);
         WasiError::Exit(Errno::Inval.into())
     })?;
+    let args = args.read_utf8_string(&memory, args_len).map_err(|err| {
+        warn!("failed to execve as the args could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+    let args = parse_wasix_line_encoded_strings(&args);
+    let envs = if envs.is_null() {
+        None
+    } else {
+        let envs = envs.read_utf8_string(&memory, envs_len).map_err(|err| {
+            warn!("failed to execve as the envs could not be read - {}", err);
+            WasiError::Exit(Errno::Inval.into())
+        })?;
+        Some(parse_wasix_line_encoded_strings(&envs))
+    };
+    let path = if path.is_null() {
+        None
+    } else {
+        Some(path.read_utf8_string(&memory, path_len).map_err(|err| {
+            warn!("failed to execve as the path could not be read - {}", err);
+            WasiError::Exit(Errno::Inval.into())
+        })?)
+    };
+
+    proc_exec3_prepared::<M>(ctx, name, args, envs, search_path, path)
+}
+
+/// ### `execv()`
+/// POSIX-shaped exec wrapper that reads a null-terminated argv vector and
+/// inherits the current sandbox environment.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn execv<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    path: WasmPtr<u8, M>,
+    argv: WasmPtr<WasmPtr<u8, M>, M>,
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    handle_exec_rewind::<M>(&mut ctx)?;
+
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    let path = read_guest_c_string::<M>(&memory, path).map_err(|err| {
+        warn!("failed to execv as the path could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+    let args = read_guest_c_string_array::<M>(&memory, argv).map_err(|err| {
+        warn!("failed to execv as argv could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+
+    proc_exec3_prepared::<M>(ctx, path, args, None, Bool::False, None)
+}
+
+/// ### `execve()`
+/// POSIX-shaped exec wrapper that reads null-terminated argv and envp vectors.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn execve<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    path: WasmPtr<u8, M>,
+    argv: WasmPtr<WasmPtr<u8, M>, M>,
+    envp: WasmPtr<WasmPtr<u8, M>, M>,
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    handle_exec_rewind::<M>(&mut ctx)?;
+
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    let path = read_guest_c_string::<M>(&memory, path).map_err(|err| {
+        warn!("failed to execve as the path could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+    let args = read_guest_c_string_array::<M>(&memory, argv).map_err(|err| {
+        warn!("failed to execve as argv could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+    let envs = if envp.is_null() {
+        None
+    } else {
+        Some(read_guest_c_string_array::<M>(&memory, envp).map_err(|err| {
+            warn!("failed to execve as envp could not be read - {}", err);
+            WasiError::Exit(Errno::Inval.into())
+        })?)
+    };
+
+    proc_exec3_prepared::<M>(ctx, path, args, envs, Bool::False, None)
+}
+
+/// ### `execvp()`
+/// POSIX-shaped exec wrapper that searches PATH and inherits the environment.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn execvp<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    file: WasmPtr<u8, M>,
+    argv: WasmPtr<WasmPtr<u8, M>, M>,
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    handle_exec_rewind::<M>(&mut ctx)?;
+
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    let file = read_guest_c_string::<M>(&memory, file).map_err(|err| {
+        warn!("failed to execvp as the file could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+    let args = read_guest_c_string_array::<M>(&memory, argv).map_err(|err| {
+        warn!("failed to execvp as argv could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+    let path = current_env_path(ctx.data());
+
+    proc_exec3_prepared::<M>(ctx, file, args, None, Bool::True, path)
+}
+
+/// ### `execvpe()`
+/// POSIX-shaped exec wrapper that searches PATH and uses an explicit envp.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn execvpe<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    file: WasmPtr<u8, M>,
+    argv: WasmPtr<WasmPtr<u8, M>, M>,
+    envp: WasmPtr<WasmPtr<u8, M>, M>,
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    handle_exec_rewind::<M>(&mut ctx)?;
+
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    let file = read_guest_c_string::<M>(&memory, file).map_err(|err| {
+        warn!("failed to execvpe as the file could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+    let args = read_guest_c_string_array::<M>(&memory, argv).map_err(|err| {
+        warn!("failed to execvpe as argv could not be read - {}", err);
+        WasiError::Exit(Errno::Inval.into())
+    })?;
+    let envs = if envp.is_null() {
+        None
+    } else {
+        Some(read_guest_c_string_array::<M>(&memory, envp).map_err(|err| {
+            warn!("failed to execvpe as envp could not be read - {}", err);
+            WasiError::Exit(Errno::Inval.into())
+        })?)
+    };
+    let path = envs
+        .as_ref()
+        .and_then(|envs| envs.iter().find_map(|env| env.strip_prefix("PATH=").map(str::to_string)))
+        .or_else(|| current_env_path(ctx.data()));
+
+    proc_exec3_prepared::<M>(ctx, file, args, envs, Bool::True, path)
+}
+
+fn handle_exec_rewind<M: MemorySize>(ctx: &mut FunctionEnvMut<'_, WasiEnv>) -> Result<(), WasiError> {
+    if let Some(exit_code) = unsafe { handle_rewind::<M, i32>(ctx) } {
+        let exit_code = ExitCode::from_native(exit_code);
+        ctx.data().process.terminate(exit_code);
+        return Err(WasiError::Exit(exit_code));
+    }
+    Ok(())
+}
+
+fn read_guest_c_string<M: MemorySize>(
+    memory: &MemoryView,
+    ptr: WasmPtr<u8, M>,
+) -> Result<String, MemoryAccessError> {
+    ptr.read_utf8_string_with_nul(memory)
+}
+
+fn read_guest_c_string_array<M: MemorySize>(
+    memory: &MemoryView,
+    ptrs: WasmPtr<WasmPtr<u8, M>, M>,
+) -> Result<Vec<String>, MemoryAccessError> {
+    if ptrs.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let mut values = Vec::new();
+    for index in 0usize.. {
+        let ptr = ptrs
+            .add_offset(to_offset::<M>(index).map_err(|_| MemoryAccessError::Overflow)?)?
+            .read(memory)?;
+        if ptr.is_null() {
+            break;
+        }
+        values.push(read_guest_c_string::<M>(memory, ptr)?);
+    }
+    Ok(values)
+}
+
+fn current_env_path(env: &WasiEnv) -> Option<String> {
+    env.state
+        .envs
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|entry| {
+            std::str::from_utf8(entry)
+                .ok()
+                .and_then(|entry| entry.strip_prefix("PATH=").map(str::to_string))
+        })
+}
+
+fn proc_exec3_prepared<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    mut name: String,
+    mut args: Vec<String>,
+    envs: Option<Vec<String>>,
+    search_path: Bool,
+    path: Option<String>,
+) -> Result<Errno, WasiError> {
     let reexec_current_executable = name.is_empty();
     if name.is_empty()
         && let Some(current_executable) = ctx.data().process.executable_path()
@@ -55,11 +260,6 @@ pub fn proc_exec3<M: MemorySize>(
         name = current_executable;
     }
     Span::current().record("name", name.as_str());
-    let args = args.read_utf8_string(&memory, args_len).map_err(|err| {
-        warn!("failed to execve as the args could not be read - {}", err);
-        WasiError::Exit(Errno::Inval.into())
-    })?;
-    let mut args = parse_wasix_line_encoded_strings(&args);
     if reexec_current_executable
         && args
             .first()
@@ -68,38 +268,24 @@ pub fn proc_exec3<M: MemorySize>(
         args.insert(0, name.clone());
     }
 
-    let envs = if !envs.is_null() {
-        let envs = envs.read_utf8_string(&memory, envs_len).map_err(|err| {
-            warn!("failed to execve as the envs could not be read - {}", err);
-            WasiError::Exit(Errno::Inval.into())
-        })?;
+    let envs = match envs {
+        Some(envs) => {
+            let mut vec = vec![];
+            for env in envs {
+                let (key, value) = wasi_try_ok!(env.split_once('=').ok_or(Errno::Inval));
 
-        let envs = parse_wasix_line_encoded_strings(&envs);
-
-        let mut vec = vec![];
-        for env in envs {
-            let (key, value) = wasi_try_ok!(env.split_once('=').ok_or(Errno::Inval));
-
-            vec.push((key.to_string(), value.to_string()));
+                vec.push((key.to_string(), value.to_string()));
+            }
+            Some(vec)
         }
-
-        Some(vec)
-    } else {
-        None
+        None => None,
     };
 
     // Convert relative paths into absolute paths
     if search_path == Bool::True && !name.contains('/') {
-        let path_str;
-
-        let path = if path.is_null() {
-            vec!["/usr/local/bin", "/bin", "/usr/bin"]
-        } else {
-            path_str = path.read_utf8_string(&memory, path_len).map_err(|err| {
-                warn!("failed to execve as the path could not be read - {}", err);
-                WasiError::Exit(Errno::Inval.into())
-            })?;
-            path_str.split(':').collect()
+        let path = match path.as_deref() {
+            Some(path) => path.split(':').collect(),
+            None => vec!["/usr/local/bin", "/bin", "/usr/bin"],
         };
         let (_, state, inodes) =
             unsafe { ctx.data().get_memory_and_wasi_state_and_inodes(&ctx, 0) };
@@ -267,6 +453,8 @@ pub fn proc_exec3<M: MemorySize>(
     // callstack, steal the memory/WasiEnv and switch it over to a new thread
     // on the new module
     else {
+        let restore_on_exec_failure = ExecFailureRestore::capture(ctx.data());
+
         // Prepare the environment
         let mut wasi_env = ctx.data().clone();
         _prepare_wasi(&mut wasi_env, Some(args), envs, None);
@@ -290,6 +478,7 @@ pub fn proc_exec3<M: MemorySize>(
 
                 let Some(env) = builder.take() else {
                     warn!("failed to execve as builtin probing consumed child environment");
+                    restore_on_exec_failure.restore(ctx.data());
                     return Ok(Errno::Noexec);
                 };
 
@@ -329,9 +518,37 @@ pub fn proc_exec3<M: MemorySize>(
                     "failed to execve as the process could not be spawned (fork)[0] - {}",
                     err
                 );
+                restore_on_exec_failure.restore(ctx.data());
                 Ok(conv_spawn_err_to_errno(&err))
             }
         }
+    }
+}
+
+struct ExecFailureRestore {
+    args: Vec<String>,
+    envs: Vec<Vec<u8>>,
+    executable_path: Option<String>,
+    fs: WasiFsProcessSnapshot,
+}
+
+impl ExecFailureRestore {
+    fn capture(env: &WasiEnv) -> Self {
+        Self {
+            args: env.state.args.lock().unwrap().clone(),
+            envs: env.state.envs.lock().unwrap().clone(),
+            executable_path: env.process.executable_path(),
+            fs: env.state.fs.capture_process_snapshot(),
+        }
+    }
+
+    fn restore(&self, env: &WasiEnv) {
+        *env.state.args.lock().unwrap() = self.args.clone();
+        *env.state.envs.lock().unwrap() = self.envs.clone();
+        env.process
+            .set_executable_path_option(self.executable_path.clone());
+        env.state.fs.restore_process_snapshot(&self.fs);
+        sync_process_metadata(env);
     }
 }
 

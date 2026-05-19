@@ -4,6 +4,10 @@ use virtual_fs::Pipe;
 
 use super::*;
 use crate::syscalls::*;
+use wasmer::FromToNativeWasmType;
+
+const LINUX_O_CLOEXEC: i32 = 0o2000000;
+const LINUX_O_NONBLOCK: i32 = 0o4000;
 
 // Used to make pipe end names unique. This is necessary since we use
 // a hash of the name to calculate inode numbers. The actual number
@@ -47,6 +51,151 @@ pub fn fd_pipe<M: MemorySize>(
     wasi_try_mem_ok!(ro_write_fd.write(&memory, write_fd));
 
     Ok(Errno::Success)
+}
+
+/// ### `pipe()`
+/// POSIX-shaped pipe wrapper. Writes read/write fds into `fds[0]` and `fds[1]`
+/// and returns 0 on success or a negative errno value on failure.
+#[instrument(level = "trace", skip_all, fields(read_fd = field::Empty, write_fd = field::Empty), ret)]
+pub fn pipe<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    fds: WasmPtr<WasiFd, M>,
+) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let (read_fd, write_fd) = match fd_pipe_internal(&mut ctx, None, None) {
+        Ok(fds) => fds,
+        Err(err) => return Ok(-err.to_native()),
+    };
+    let env = ctx.data();
+
+    #[cfg(feature = "journal")]
+    if env.enable_journal {
+        JournalEffector::save_fd_pipe(&mut ctx, read_fd, write_fd).map_err(|err| {
+            tracing::error!("failed to save create pipe event - {}", err);
+            WasiError::Exit(ExitCode::from(Errno::Fault))
+        })?;
+    }
+
+    let env = ctx.data();
+    let memory = unsafe { env.memory_view(&ctx) };
+
+    Span::current()
+        .record("read_fd", read_fd)
+        .record("write_fd", write_fd);
+
+    if let Err(err) = fds.write(&memory, read_fd) {
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+    let write_ptr = match fds.add_offset(match to_offset::<M>(1) {
+        Ok(offset) => offset,
+        Err(err) => return Ok(-err.to_native()),
+    }) {
+        Ok(ptr) => ptr,
+        Err(err) => return Ok(-crate::mem_error_to_wasi(err).to_native()),
+    };
+    if let Err(err) = write_ptr.write(&memory, write_fd) {
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+
+    Ok(0)
+}
+
+/// ### `pipe2()`
+/// Linux-shaped pipe creation with descriptor/file flags.
+#[instrument(level = "trace", skip_all, fields(read_fd = field::Empty, write_fd = field::Empty, %flags), ret)]
+pub fn pipe2<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    fds: WasmPtr<WasiFd, M>,
+    flags: i32,
+) -> Result<i32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    if flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK) != 0 {
+        return Ok(-Errno::Inval.to_native());
+    }
+
+    let (read_fd, write_fd) = match fd_pipe_internal(&mut ctx, None, None) {
+        Ok(fds) => fds,
+        Err(err) => return Ok(-err.to_native()),
+    };
+    let env = ctx.data();
+
+    #[cfg(feature = "journal")]
+    if env.enable_journal {
+        JournalEffector::save_fd_pipe(&mut ctx, read_fd, write_fd).map_err(|err| {
+            tracing::error!("failed to save create pipe event - {}", err);
+            WasiError::Exit(ExitCode::from(Errno::Fault))
+        })?;
+    }
+
+    if let Err(err) = apply_linux_pipe_flags(&mut ctx, read_fd, write_fd, flags) {
+        let _ = ctx.data().state.fs.close_fd(read_fd);
+        let _ = ctx.data().state.fs.close_fd(write_fd);
+        return Ok(-err.to_native());
+    }
+
+    let env = ctx.data();
+    let memory = unsafe { env.memory_view(&ctx) };
+
+    Span::current()
+        .record("read_fd", read_fd)
+        .record("write_fd", write_fd);
+
+    if let Err(err) = fds.write(&memory, read_fd) {
+        let _ = ctx.data().state.fs.close_fd(read_fd);
+        let _ = ctx.data().state.fs.close_fd(write_fd);
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+    let write_ptr = match fds.add_offset(match to_offset::<M>(1) {
+        Ok(offset) => offset,
+        Err(err) => {
+            let _ = ctx.data().state.fs.close_fd(read_fd);
+            let _ = ctx.data().state.fs.close_fd(write_fd);
+            return Ok(-err.to_native());
+        }
+    }) {
+        Ok(ptr) => ptr,
+        Err(err) => {
+            let _ = ctx.data().state.fs.close_fd(read_fd);
+            let _ = ctx.data().state.fs.close_fd(write_fd);
+            return Ok(-crate::mem_error_to_wasi(err).to_native());
+        }
+    };
+    if let Err(err) = write_ptr.write(&memory, write_fd) {
+        let _ = ctx.data().state.fs.close_fd(read_fd);
+        let _ = ctx.data().state.fs.close_fd(write_fd);
+        return Ok(-crate::mem_error_to_wasi(err).to_native());
+    }
+
+    Ok(0)
+}
+
+fn apply_linux_pipe_flags(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    read_fd: WasiFd,
+    write_fd: WasiFd,
+    flags: i32,
+) -> Result<(), Errno> {
+    if flags & LINUX_O_NONBLOCK != 0 {
+        for fd in [read_fd, write_fd] {
+            let ret = fd_fdstat_set_flags_internal(ctx, fd, Fdflags::NONBLOCK)
+                .map_err(|_| Errno::Fault)?;
+            if ret != Errno::Success {
+                return Err(ret);
+            }
+        }
+    }
+    if flags & LINUX_O_CLOEXEC != 0 {
+        for fd in [read_fd, write_fd] {
+            let ret = fd_fdflags_set_internal(ctx, fd, Fdflagsext::CLOEXEC)
+                .map_err(|_| Errno::Fault)?;
+            if ret != Errno::Success {
+                return Err(ret);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn fd_pipe_internal(

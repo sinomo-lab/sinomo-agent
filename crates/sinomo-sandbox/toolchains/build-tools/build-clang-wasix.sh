@@ -240,6 +240,378 @@ cp -a "${WORKDIR}/llvm-wasix-build/lib/clang" "${OUTDIR}/artifacts/lib/"
 find "${OUTDIR}/artifacts" -type f \
 	    \( -name '*.a' -o -name '*.so' -o -name '*.dylib' \) -delete
 rsync -a --delete "${WASIX_SYSROOT}/" "${OUTDIR}/artifacts/sysroot/"
+cat > "${WORKDIR}/sinomo-wasix-openat.c" <<'OPENAT_EOF'
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <wasi/api.h>
+#include <wasi/libc.h>
+
+static_assert(O_APPEND == __WASI_FDFLAGS_APPEND, "Value mismatch");
+static_assert(O_DSYNC == __WASI_FDFLAGS_DSYNC, "Value mismatch");
+static_assert(O_NONBLOCK == __WASI_FDFLAGS_NONBLOCK, "Value mismatch");
+static_assert(O_RSYNC == __WASI_FDFLAGS_RSYNC, "Value mismatch");
+static_assert(O_SYNC == __WASI_FDFLAGS_SYNC, "Value mismatch");
+
+static_assert(O_CREAT >> 12 == __WASI_OFLAGS_CREAT, "Value mismatch");
+static_assert(O_DIRECTORY >> 12 == __WASI_OFLAGS_DIRECTORY, "Value mismatch");
+static_assert(O_EXCL >> 12 == __WASI_OFLAGS_EXCL, "Value mismatch");
+static_assert(O_TRUNC >> 12 == __WASI_OFLAGS_TRUNC, "Value mismatch");
+
+static_assert(O_CLOEXEC >> 30 == __WASI_FDFLAGSEXT_CLOEXEC, "Value mismatch");
+
+int __wasilibc_nocwd_openat_nomode(int fd, const char *path, int oflag) {
+  int access_mode = oflag & O_ACCMODE;
+  if (access_mode == 0)
+    access_mode = O_RDONLY;
+
+  __wasi_rights_t max =
+      __WASI_RIGHTS_FD_ADVISE |
+      __WASI_RIGHTS_FD_FDSTAT_SET_FLAGS |
+      __WASI_RIGHTS_FD_FILESTAT_GET |
+      __WASI_RIGHTS_FD_SEEK |
+      __WASI_RIGHTS_FD_TELL |
+      __WASI_RIGHTS_POLL_FD_READWRITE;
+  switch (access_mode) {
+    case O_RDONLY:
+      max |= __WASI_RIGHTS_FD_READ | __WASI_RIGHTS_FD_READDIR;
+      break;
+    case O_WRONLY:
+      max |= __WASI_RIGHTS_FD_DATASYNC | __WASI_RIGHTS_FD_WRITE |
+             __WASI_RIGHTS_FD_ALLOCATE |
+             __WASI_RIGHTS_FD_FILESTAT_SET_SIZE;
+      break;
+    case O_RDWR:
+      max |= __WASI_RIGHTS_FD_READ | __WASI_RIGHTS_FD_READDIR |
+             __WASI_RIGHTS_FD_DATASYNC | __WASI_RIGHTS_FD_WRITE |
+             __WASI_RIGHTS_FD_ALLOCATE |
+             __WASI_RIGHTS_FD_FILESTAT_SET_SIZE;
+      break;
+    case O_EXEC:
+      break;
+    case O_SEARCH:
+      break;
+    default:
+      errno = EINVAL;
+      return -1;
+  }
+
+  __wasi_fdstat_t fsb_cur;
+  __wasi_errno_t error = __wasi_fd_fdstat_get(fd, &fsb_cur);
+  if (error != 0) {
+    errno = error;
+    return -1;
+  }
+
+  __wasi_lookupflags_t lookup_flags = 0;
+  if ((oflag & O_NOFOLLOW) == 0)
+    lookup_flags |= __WASI_LOOKUPFLAGS_SYMLINK_FOLLOW;
+
+  __wasi_fdflags_t fs_flags = oflag & 0xfff;
+  __wasi_fdflagsext_t fd_flags = (oflag >> 30) & 0x03;
+  __wasi_rights_t fs_rights_base = max & fsb_cur.fs_rights_inheriting;
+  __wasi_rights_t fs_rights_inheriting = fsb_cur.fs_rights_inheriting;
+  __wasi_fd_t newfd;
+  error = __wasi_path_open2(fd, lookup_flags, path,
+                                 (oflag >> 12) & 0xfff,
+                                 fs_rights_base, fs_rights_inheriting, fs_flags,
+                                 fd_flags, &newfd);
+  if (error != 0) {
+    errno = error;
+    return -1;
+  }
+  return newfd;
+}
+OPENAT_EOF
+"${WASI_SDK}/bin/clang" \
+    --target=wasm32-wasi \
+    --sysroot="${OUTDIR}/artifacts/sysroot" \
+    -matomics \
+    -mbulk-memory \
+    -mmutable-globals \
+    -pthread \
+    -mthread-model posix \
+    -fPIC \
+    -Os \
+    -c "${WORKDIR}/sinomo-wasix-openat.c" \
+    -o "${WORKDIR}/sinomo-wasix-openat.o"
+"${WASI_SDK}/bin/llvm-ar" d "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a" openat.o
+"${WASI_SDK}/bin/llvm-ar" r "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a" "${WORKDIR}/sinomo-wasix-openat.o"
+"${WASI_SDK}/bin/llvm-ranlib" "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a"
+cat > "${WORKDIR}/sinomo-wasix-stat.c" <<'STAT_EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <wasi/api.h>
+
+int32_t __imported_wasix_fd_mode(int32_t fd, uint32_t *mode) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("fd_mode")
+));
+
+int32_t __imported_wasix_path_mode_at(int32_t fd, const char *path, int32_t path_len, uint32_t *mode) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("path_mode_at")
+));
+
+int32_t __imported_wasix_fd_owner(int32_t fd, uint32_t *uid, uint32_t *gid) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("fd_owner")
+));
+
+int32_t __imported_wasix_path_owner_at(int32_t fd, const char *path, int32_t path_len, uint32_t *uid, uint32_t *gid) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("path_owner_at")
+));
+
+int32_t __imported_wasix_path_times_at(int32_t fd, const char *path, int32_t path_len, uint64_t *atime, uint64_t *mtime, uint64_t *ctime) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("path_times_at")
+));
+
+int32_t __imported_wasix_path_is_symlink_at(int32_t fd, const char *path, int32_t path_len) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("path_is_symlink_at")
+));
+
+int32_t __imported_wasix_path_read_symlink_at(int32_t fd, const char *path, int32_t path_len, char *buf, int32_t buf_len, uint32_t *used) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("path_read_symlink_at")
+));
+
+static mode_t sinomo_wasix_type_mode(__wasi_filetype_t filetype) {
+  switch (filetype) {
+    case __WASI_FILETYPE_BLOCK_DEVICE:
+      return S_IFBLK;
+    case __WASI_FILETYPE_CHARACTER_DEVICE:
+      return S_IFCHR;
+    case __WASI_FILETYPE_DIRECTORY:
+      return S_IFDIR;
+    case __WASI_FILETYPE_REGULAR_FILE:
+      return S_IFREG;
+    case __WASI_FILETYPE_SOCKET_DGRAM:
+    case __WASI_FILETYPE_SOCKET_STREAM:
+    case __WASI_FILETYPE_SOCKET_SEQPACKET:
+    case __WASI_FILETYPE_SOCKET_RAW:
+      return S_IFSOCK;
+    case __WASI_FILETYPE_SYMBOLIC_LINK:
+      return S_IFLNK;
+    default:
+      return 0;
+  }
+}
+
+static mode_t sinomo_wasix_default_permissions(__wasi_filetype_t filetype) {
+  switch (filetype) {
+    case __WASI_FILETYPE_DIRECTORY:
+      return 0777;
+    case __WASI_FILETYPE_SYMBOLIC_LINK:
+      return 0777;
+    default:
+      return 0666;
+  }
+}
+
+static void sinomo_wasix_to_public_stat(const __wasi_filestat_t *in,
+                                        struct stat *out,
+                                        uint32_t permissions,
+                                        uint32_t uid,
+                                        uint32_t gid) {
+  *out = (struct stat){
+      .st_dev = in->dev,
+      .st_ino = in->ino,
+      .st_nlink = in->nlink,
+      .st_size = in->size,
+      .st_uid = uid,
+      .st_gid = gid,
+      .st_atim = (struct timespec){
+          .tv_sec = in->atim / 1000000000,
+          .tv_nsec = in->atim % 1000000000,
+      },
+      .st_mtim = (struct timespec){
+          .tv_sec = in->mtim / 1000000000,
+          .tv_nsec = in->mtim % 1000000000,
+      },
+      .st_ctim = (struct timespec){
+          .tv_sec = in->ctim / 1000000000,
+          .tv_nsec = in->ctim % 1000000000,
+      },
+  };
+  if ((permissions & 07777) == 0)
+    permissions = sinomo_wasix_default_permissions(in->filetype);
+  out->st_mode = sinomo_wasix_type_mode(in->filetype) | (permissions & 07777);
+}
+
+static int sinomo_wasix_read_symlink_target(int fd, const char *path, char *buf, size_t bufsize) {
+  uint32_t used = 0;
+  int32_t error = __imported_wasix_path_read_symlink_at(
+      fd, path, strlen(path), buf, bufsize - 1, &used);
+  if (error != 0)
+    return -1;
+  buf[used] = '\0';
+  return (int)used;
+}
+
+static int sinomo_wasix_resolve_symlink_path(const char *link_path,
+                                             const char *target,
+                                             char *out,
+                                             size_t out_size) {
+  if (target[0] == '/') {
+    if (strlen(target) + 1 > out_size)
+      return -1;
+    strcpy(out, target);
+    return 0;
+  }
+
+  const char *slash = strrchr(link_path, '/');
+  if (slash == NULL) {
+    if (strlen(target) + 1 > out_size)
+      return -1;
+    strcpy(out, target);
+    return 0;
+  }
+
+  size_t parent_len = (size_t)(slash - link_path);
+  size_t target_len = strlen(target);
+  if (parent_len + 1 + target_len + 1 > out_size)
+    return -1;
+  memcpy(out, link_path, parent_len);
+  out[parent_len] = '/';
+  memcpy(out + parent_len + 1, target, target_len + 1);
+  return 0;
+}
+
+int fstat(int fildes, struct stat *buf) {
+  __wasi_filestat_t internal_stat;
+  __wasi_errno_t error = __wasi_fd_filestat_get(fildes, &internal_stat);
+  if (error != 0) {
+    errno = error;
+    return -1;
+  }
+
+  uint32_t mode = 0;
+  uint32_t uid = 0;
+  uint32_t gid = 0;
+  (void)__imported_wasix_fd_mode(fildes, &mode);
+  (void)__imported_wasix_fd_owner(fildes, &uid, &gid);
+  sinomo_wasix_to_public_stat(&internal_stat, buf, mode, uid, gid);
+  return 0;
+}
+
+int __wasilibc_nocwd_fstatat(int fd, const char *restrict path, struct stat *restrict buf,
+                             int flag) {
+  char target[4096];
+  char resolved_path[8192];
+  const char *stat_path = path;
+
+  if (__imported_wasix_path_is_symlink_at(fd, path, strlen(path)) == 0) {
+    int target_len = sinomo_wasix_read_symlink_target(fd, path, target, sizeof(target));
+    if (target_len < 0) {
+      errno = EINVAL;
+      return -1;
+    }
+    if ((flag & AT_SYMLINK_NOFOLLOW) != 0) {
+      __wasi_filestat_t symlink_stat = {
+          .dev = 0,
+          .ino = 0,
+          .filetype = __WASI_FILETYPE_SYMBOLIC_LINK,
+          .nlink = 1,
+          .size = (uint64_t)target_len,
+      };
+      uint64_t atime = 0;
+      uint64_t mtime = 0;
+      uint64_t ctime = 0;
+      if (__imported_wasix_path_times_at(fd, path, strlen(path), &atime, &mtime, &ctime) == 0) {
+        symlink_stat.atim = atime;
+        symlink_stat.mtim = mtime;
+        symlink_stat.ctim = ctime;
+      }
+      sinomo_wasix_to_public_stat(&symlink_stat, buf, 0777, 0, 0);
+      return 0;
+    }
+    if (sinomo_wasix_resolve_symlink_path(path, target, resolved_path, sizeof(resolved_path)) != 0) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+    stat_path = resolved_path;
+  }
+
+  __wasi_lookupflags_t lookup_flags = 0;
+  if ((flag & AT_SYMLINK_NOFOLLOW) == 0)
+    lookup_flags |= __WASI_LOOKUPFLAGS_SYMLINK_FOLLOW;
+
+  __wasi_filestat_t internal_stat;
+  __wasi_errno_t error =
+      __wasi_path_filestat_get(fd, lookup_flags, stat_path, &internal_stat);
+  if (error != 0) {
+    errno = error;
+    return -1;
+  }
+
+  uint32_t mode = 0;
+  uint32_t uid = 0;
+  uint32_t gid = 0;
+  uint64_t atime = 0;
+  uint64_t mtime = 0;
+  uint64_t ctime = 0;
+  (void)__imported_wasix_path_mode_at(fd, stat_path, strlen(stat_path), &mode);
+  (void)__imported_wasix_path_owner_at(fd, stat_path, strlen(stat_path), &uid, &gid);
+  if (__imported_wasix_path_times_at(fd, stat_path, strlen(stat_path), &atime, &mtime, &ctime) == 0) {
+    internal_stat.atim = atime;
+    internal_stat.mtim = mtime;
+    internal_stat.ctim = ctime;
+  }
+  sinomo_wasix_to_public_stat(&internal_stat, buf, mode, uid, gid);
+  return 0;
+}
+STAT_EOF
+"${WASI_SDK}/bin/clang" \
+    --target=wasm32-wasi \
+    --sysroot="${OUTDIR}/artifacts/sysroot" \
+    -matomics \
+    -mbulk-memory \
+    -mmutable-globals \
+    -pthread \
+    -mthread-model posix \
+    -fPIC \
+    -Os \
+    -c "${WORKDIR}/sinomo-wasix-stat.c" \
+    -o "${WORKDIR}/sinomo-wasix-stat.o"
+"${WASI_SDK}/bin/llvm-ar" d "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a" fstat.o fstatat.o
+"${WASI_SDK}/bin/llvm-ar" r "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a" "${WORKDIR}/sinomo-wasix-stat.o"
+"${WASI_SDK}/bin/llvm-ranlib" "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a"
+"${WASI_SDK}/bin/clang" \
+    --target=wasm32-wasi \
+    --sysroot="${OUTDIR}/artifacts/sysroot" \
+    -matomics \
+    -mbulk-memory \
+    -mmutable-globals \
+    -pthread \
+    -mthread-model posix \
+    -Os \
+    -c "${ROOT}/wasix-posix-patch.c" \
+    -o "${WORKDIR}/sinomo-wasix-posix.o"
+"${WASI_SDK}/bin/clang" \
+    --target=wasm32-wasi \
+    --sysroot="${OUTDIR}/artifacts/sysroot" \
+    -matomics \
+    -mbulk-memory \
+    -mmutable-globals \
+    -pthread \
+    -mthread-model posix \
+    -Os \
+    -c "${ROOT}/wasix-at-fdcwd-patch.c" \
+    -o "${WORKDIR}/sinomo-wasix-at-fdcwd.o"
+"${WASI_SDK}/bin/llvm-ar" d "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a" \
+    posix.o at_fdcwd.o chdir.o fchdir.o chown.o fchown.o fchownat.o lchown.o \
+    ftruncate.o truncate.o getegid.o geteuid.o getgid.o getuid.o setegid.o seteuid.o setgid.o setgroups.o setuid.o
+"${WASI_SDK}/bin/llvm-ar" r "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a" \
+    "${WORKDIR}/sinomo-wasix-posix.o" \
+    "${WORKDIR}/sinomo-wasix-at-fdcwd.o"
+"${WASI_SDK}/bin/llvm-ranlib" "${OUTDIR}/artifacts/sysroot/lib/wasm32-wasi/libc.a"
 mkdir -p "${OUTDIR}/artifacts/lib/clang/${LLVM_VERSION%%.*}/lib/wasm32-unknown-wasi"
 cp "${WASIX_SYSROOT}/lib/wasm32-wasi/libclang_rt.builtins-wasm32.a" \
     "${OUTDIR}/artifacts/lib/clang/${LLVM_VERSION%%.*}/lib/wasm32-unknown-wasi/libclang_rt.builtins.a"
@@ -287,11 +659,11 @@ def host_memory_mb():
 limits = {
     "memory_mb": int(os.environ.get("CLANG_SANDBOX_MAX_MEMORY_MB", str(host_memory_mb()))),
     "wall_time_ms": int(os.environ.get("CLANG_SANDBOX_MAX_WALL_TIME_MS", str(2**64 - 1))),
-    "max_input_bytes": int(os.environ.get("CLANG_SANDBOX_MAX_INPUT_BYTES", "10485760")),
-    "max_output_bytes": int(os.environ.get("CLANG_SANDBOX_MAX_OUTPUT_BYTES", "10485760")),
-    "max_workspace_bytes": int(os.environ.get("CLANG_SANDBOX_MAX_WORKSPACE_BYTES", "1073741824")),
-    "max_written_bytes_per_command": int(os.environ.get("CLANG_SANDBOX_MAX_WRITTEN_BYTES_PER_COMMAND", "1073741824")),
-    "max_file_count": int(os.environ.get("CLANG_SANDBOX_MAX_FILE_COUNT", "200000")),
+    "max_input_bytes": int(os.environ.get("CLANG_SANDBOX_MAX_INPUT_BYTES", str(2**64 - 1))),
+    "max_output_bytes": int(os.environ.get("CLANG_SANDBOX_MAX_OUTPUT_BYTES", str(2**64 - 1))),
+    "max_workspace_bytes": int(os.environ.get("CLANG_SANDBOX_MAX_WORKSPACE_BYTES", str(2**64 - 1))),
+    "max_written_bytes_per_command": int(os.environ.get("CLANG_SANDBOX_MAX_WRITTEN_BYTES_PER_COMMAND", str(2**64 - 1))),
+    "max_file_count": int(os.environ.get("CLANG_SANDBOX_MAX_FILE_COUNT", str(2**64 - 1))),
 }
 caps = ["child-process-exec", "wasix.unpinned-child-exec"]
 
@@ -307,6 +679,14 @@ clang_argv_prefix = [
     "-pthread",
     "-mthread-model",
     "posix",
+    "-Wl,--shared-memory",
+    "-Wl,--import-memory",
+    "-Wl,--extra-features=atomics",
+    "-Wl,--extra-features=bulk-memory",
+    "-Wl,--extra-features=mutable-globals",
+    "-Wl,-z,stack-size=1048576",
+    "-Wl,--initial-memory=67108864",
+    "-Wl,--max-memory=2147483648",
 ]
 
 def command(name, module, exec_name=None, default_env=None, argv_prefix=None):

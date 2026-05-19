@@ -30,9 +30,7 @@ pub use paths::*;
 pub use policy::*;
 pub use runtime::LocalWasiCommandRunner;
 #[cfg(test)]
-pub(crate) use runtime::preview1::{
-    SINOMO_WASI_ERRNO_NOTCAPABLE, SINOMO_WASI_ERRNO_ROFS, sandbox_wasi_extension_read_host_path,
-};
+pub(crate) use runtime::preview1::{SINOMO_WASI_ERRNO_ROFS, sandbox_wasi_extension_read_host_path};
 pub use runtime::{
     SandboxRuntimeBudgetCapability, SandboxRuntimeProcessCapability,
     SandboxRuntimeVirtualDeviceCapability, SandboxWasiAbi, default_sandbox_wasi_abi,

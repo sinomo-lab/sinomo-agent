@@ -283,10 +283,10 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
     assert!(
         process_capabilities.iter().any(|capability| {
             capability.capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY
-                && !capability.supported
+                && capability.supported
                 && capability.detail.contains("asyncify")
         }),
-        "default process capabilities should describe the current WASIX fork boundary"
+        "default process capabilities should describe WASIX asyncified fork support"
     );
     let preview1_process_capabilities =
         sandbox_runtime_process_capabilities_for_abi(&SandboxWasiAbi::Preview1);
@@ -375,11 +375,11 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
     assert!(
         wasix_process_capabilities.iter().any(|capability| {
             capability.capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY
-                && !capability.supported
+                && capability.supported
                 && capability.detail.contains("proc_fork")
                 && capability.detail.contains("asyncify")
         }),
-        "WASIX runner should report the asyncified fork boundary separately from child exec"
+        "WASIX runner should report asyncified fork support separately from child exec"
     );
     #[cfg(not(feature = "wasix-runtime"))]
     assert!(
@@ -549,10 +549,11 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
                     .contains("exact engine-level immediate cancellation")),
         "compiled WASIX runner should report the remaining immediate non-yielding cancellation gap"
     );
-    assert_eq!(
-        SANDBOX_MVP_VIRTUAL_DEVICES,
-        ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"]
-    );
+    assert!(SANDBOX_MVP_VIRTUAL_DEVICES.contains(&"/dev/null"));
+    assert!(SANDBOX_MVP_VIRTUAL_DEVICES.contains(&"/dev/zero"));
+    assert!(SANDBOX_MVP_VIRTUAL_DEVICES.contains(&"/dev/random"));
+    assert!(SANDBOX_MVP_VIRTUAL_DEVICES.contains(&"/dev/urandom"));
+    assert!(SANDBOX_MVP_VIRTUAL_DEVICES.contains(&"/dev/fd"));
     assert!(
         sandbox_runtime_supports_mvp_virtual_devices(),
         "the WASI runner should expose the planned virtual devices without host /dev"

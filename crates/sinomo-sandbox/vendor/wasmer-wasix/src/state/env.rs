@@ -96,6 +96,12 @@ impl WasiEnvInit {
                 inodes,
                 fs,
                 futexs: Default::default(),
+                pidfds: Default::default(),
+                timerfds: Default::default(),
+                signalfds: Default::default(),
+                posix_timers: Default::default(),
+                interval_timers: Default::default(),
+                signal_stack: Default::default(),
                 clock_offset: std::sync::Mutex::new(
                     self.state.clock_offset.lock().unwrap().clone(),
                 ),
@@ -447,6 +453,7 @@ impl WasiEnv {
 
         let mut store = store.as_store_mut();
         let engine = self.runtime().engine();
+        let dynamic_linker_stack_size = self.runtime().dynamic_linker_stack_size();
         let mut func_env = WasiFunctionEnv::new(&mut store, self);
 
         let is_dl = super::linker::is_dynamically_linked(&module);
@@ -477,14 +484,13 @@ impl WasiEnv {
                             .collect::<Vec<_>>()
                     };
 
-                    // TODO: make stack size configurable
                     Linker::new(
                         engine,
                         &module,
                         &mut store,
                         memory,
                         &mut func_env,
-                        8 * 1024 * 1024,
+                        dynamic_linker_stack_size,
                         &ld_library_path,
                     )
                 }
@@ -585,19 +591,21 @@ impl WasiEnv {
             return Err(WasiThreadError::ExportError(err));
         }
 
-        for init_name in [
-            "__wasm_apply_data_relocs",
-            "__wasm_apply_tls_relocs",
-            "__wasm_call_ctors",
-        ] {
-            if let Ok(init) = instance.exports.get_function(init_name) {
-                if let Err(err) = init.call(&mut store, &[]) {
-                    func_env
-                        .data(&store)
-                        .blocking_on_exit(Some(Errno::Noexec.into()));
-                    return Err(WasiThreadError::InitFailed(Arc::new(anyhow::Error::from(
-                        err,
-                    ))));
+        if call_initialize {
+            for init_name in [
+                "__wasm_apply_data_relocs",
+                "__wasm_apply_tls_relocs",
+                "__wasm_call_ctors",
+            ] {
+                if let Ok(init) = instance.exports.get_function(init_name) {
+                    if let Err(err) = init.call(&mut store, &[]) {
+                        func_env
+                            .data(&store)
+                            .blocking_on_exit(Some(Errno::Noexec.into()));
+                        return Err(WasiThreadError::InitFailed(Arc::new(anyhow::Error::from(
+                            err,
+                        ))));
+                    }
                 }
             }
         }
@@ -1408,6 +1416,14 @@ impl WasiEnv {
             let timeout = self.tasks().sleep_now(CLEANUP_TIMEOUT);
             let state = self.state.clone();
             Box::pin(async move {
+                // Wake and mark the process terminated before closing shared
+                // descriptors. Threaded modules can otherwise leave cleanup
+                // waiting for process activity that only terminates after the
+                // close path completes.
+                process.signal_process(Signal::Sigquit);
+                process.terminate(process_exit_code);
+                process.notify_parent_child_status_changed();
+
                 if !disable_fs_cleanup {
                     tracing::trace!(pid = %pid, "cleaning up open file handles");
 
@@ -1420,14 +1436,7 @@ impl WasiEnv {
                         },
                         _ = state.fs.close_all() => { }
                     }
-
-                    // Now send a signal that the thread is terminated
-                    process.signal_process(Signal::Sigquit);
                 }
-
-                // Terminate the process
-                process.terminate(process_exit_code);
-                process.notify_parent_child_status_changed();
             })
         } else {
             Box::pin(async {})

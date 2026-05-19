@@ -55,6 +55,12 @@ pub(crate) fn path_unlink_file_internal(
     let env = ctx.data();
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
+    match path_parent_mutation_allowed_at(env, fd, path) {
+        Ok(true) => {}
+        Ok(false) => return Ok(Errno::Access),
+        Err(err) => return Ok(err),
+    }
+
     let inode = wasi_try_ok!(state.fs.get_inode_at_path(inodes, fd, path, false));
     let (parent_inode, childs_name) = wasi_try_ok!(state.fs.get_parent_inode_at_path(
         inodes,
@@ -80,44 +86,41 @@ pub(crate) fn path_unlink_file_internal(
         }
     };
 
-    let st_nlink = {
+    {
+        let guard = removed_inode.read();
+        match guard.deref() {
+            Kind::File { handle, path, .. } => {
+                if let Some(h) = handle {
+                    let mut h = h.write().unwrap();
+                    wasi_try_ok!(h.unlink().map_err(fs_error_into_wasi_err));
+                } else {
+                    let path = path.clone();
+                    drop(guard);
+                    wasi_try_ok!(state.fs_remove_file(path));
+                }
+            }
+            Kind::Dir { .. } | Kind::Root { .. } => return Ok(Errno::Isdir),
+            Kind::Symlink { .. } => {
+                // TODO: actually delete real symlinks and do nothing for virtual symlinks
+            }
+            Kind::Buffer { .. } => {}
+            Kind::Socket { .. }
+            | Kind::PipeRx { .. }
+            | Kind::PipeTx { .. }
+            | Kind::DuplexPipe { .. }
+            | Kind::EventNotifications { .. }
+            | Kind::Epoll { .. } => return Ok(Errno::Inval),
+        }
+    }
+    {
         let mut guard = removed_inode.stat.write().unwrap();
         if guard.st_nlink > 0 {
             guard.st_nlink -= 1;
         }
-        guard.st_nlink
-    };
-    if st_nlink == 0 {
-        {
-            let mut guard = removed_inode.read();
-            match guard.deref() {
-                Kind::File { handle, path, .. } => {
-                    if let Some(h) = handle {
-                        let mut h = h.write().unwrap();
-                        wasi_try_ok!(h.unlink().map_err(fs_error_into_wasi_err));
-                    } else {
-                        // File is closed
-                        // problem with the abstraction, we can't call unlink because there's no handle
-                        // drop mutable borrow on `path`
-                        let path = path.clone();
-                        drop(guard);
-                        wasi_try_ok!(state.fs_remove_file(path));
-                    }
-                }
-                Kind::Dir { .. } | Kind::Root { .. } => return Ok(Errno::Isdir),
-                Kind::Symlink { .. } => {
-                    // TODO: actually delete real symlinks and do nothing for virtual symlinks
-                }
-                Kind::Buffer { .. } => {}
-                Kind::Socket { .. }
-                | Kind::PipeRx { .. }
-                | Kind::PipeTx { .. }
-                | Kind::DuplexPipe { .. }
-                | Kind::EventNotifications { .. }
-                | Kind::Epoll { .. } => return Ok(Errno::Inval),
-            }
-        }
     }
+
+    path_remove_metadata_at(env, fd, path);
+    path_touch_parent_at(env, fd, path);
 
     Ok(Errno::Success)
 }

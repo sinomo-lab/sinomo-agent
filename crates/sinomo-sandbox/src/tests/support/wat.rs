@@ -1090,6 +1090,157 @@ pub(in crate::tests) fn wasi_write_file_module(path: &str) -> String {
     wasi_write_file_module_on_fd(3, path)
 }
 
+pub(in crate::tests) fn wasi_write_file_from_any_preopen_module(path: &str) -> String {
+    let escaped_path = wat_bytes(path.as_bytes());
+    let path_len = path.len();
+    let mut attempts = String::new();
+    for fd in 3..=32 {
+        attempts.push_str(&format!(
+            r#"
+                i32.const {fd}
+                call $try_write
+                if
+                  return
+                end
+                "#
+        ));
+    }
+    format!(
+        r#"
+            (module
+              (import "wasi_snapshot_preview1" "path_open"
+                (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "fd_close"
+                (func $fd_close (param i32) (result i32)))
+              (import "wasi_snapshot_preview1" "proc_exit"
+                (func $proc_exit (param i32)))
+              (memory (export "memory") 1 128)
+              ;; ciovec at 0: data ptr 128, data len 7
+              (data (i32.const 0) "\80\00\00\00\07\00\00\00")
+              (data (i32.const 96) "{escaped_path}")
+              (data (i32.const 128) "created")
+              (func $exit_if_errno (param $errno i32)
+                local.get $errno
+                i32.eqz
+                if
+                else
+                  local.get $errno
+                  call $proc_exit
+                end)
+              (func $try_write (param $fd i32) (result i32)
+                (local $errno i32)
+                (local $opened_fd i32)
+                local.get $fd
+                i32.const 0
+                i32.const 96
+                i32.const {path_len}
+                i32.const 9
+                i64.const 64
+                i64.const 0
+                i32.const 0
+                i32.const 64
+                call $path_open
+                local.set $errno
+                local.get $errno
+                i32.eqz
+                if
+                else
+                  local.get $errno
+                  i32.const 44
+                  i32.eq
+                  local.get $errno
+                  i32.const 8
+                  i32.eq
+                  i32.or
+                  if
+                    i32.const 0
+                    return
+                  end
+                  local.get $errno
+                  call $proc_exit
+                end
+
+                i32.const 64
+                i32.load
+                local.set $opened_fd
+                local.get $opened_fd
+                i32.const 0
+                i32.const 1
+                i32.const 72
+                call $fd_write
+                call $exit_if_errno
+
+                local.get $opened_fd
+                call $fd_close
+                call $exit_if_errno
+                i32.const 1)
+              (func (export "_start")
+                {attempts}
+                i32.const 44
+                call $proc_exit))
+            "#
+    )
+}
+
+pub(in crate::tests) fn wasix_write_absolute_file_module(path: &str) -> String {
+    let escaped_path = wat_bytes(path.as_bytes());
+    let path_len = path.len();
+    format!(
+        r#"
+            (module
+              (import "wasix_32v1" "path_open2"
+                (func $path_open2 (param i32 i32 i32 i32 i32 i64 i64 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "fd_close"
+                (func $fd_close (param i32) (result i32)))
+              (import "wasi_snapshot_preview1" "proc_exit"
+                (func $proc_exit (param i32)))
+              (memory (export "memory") 1 128)
+              ;; ciovec at 0: data ptr 128, data len 7
+              (data (i32.const 0) "\80\00\00\00\07\00\00\00")
+              (data (i32.const 96) "{escaped_path}")
+              (data (i32.const 128) "created")
+              (func $exit_if_errno (param $errno i32)
+                local.get $errno
+                i32.eqz
+                if
+                else
+                  local.get $errno
+                  call $proc_exit
+                end)
+              (func (export "_start")
+                i32.const 3
+                i32.const 0
+                i32.const 96
+                i32.const {path_len}
+                i32.const 9
+                i64.const 64
+                i64.const 0
+                i32.const 0
+                i32.const 0
+                i32.const 64
+                call $path_open2
+                call $exit_if_errno
+
+                i32.const 64
+                i32.load
+                i32.const 0
+                i32.const 1
+                i32.const 72
+                call $fd_write
+                call $exit_if_errno
+
+                i32.const 64
+                i32.load
+                call $fd_close
+                call $exit_if_errno))
+            "#
+    )
+}
+
 pub(in crate::tests) fn wasi_write_file_module_on_fd(fd: i32, path: &str) -> String {
     let escaped_path = wat_bytes(path.as_bytes());
     let path_len = path.len();

@@ -127,6 +127,12 @@ pub(super) fn validate_wasix_pinned_child_exec_preopens(
 
 fn collect_wasix_preopen_tree(path: &Path) -> Result<(), std::io::Error> {
     let metadata = collect_wasix_preopen_entry(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "WASIX preopen contains symlink: {}",
+            path.display()
+        )));
+    }
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
             collect_wasix_preopen_tree(&entry?.path())?;
@@ -136,14 +142,7 @@ fn collect_wasix_preopen_tree(path: &Path) -> Result<(), std::io::Error> {
 }
 
 fn collect_wasix_preopen_entry(path: &Path) -> Result<fs::Metadata, std::io::Error> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("WASIX preopen contains symlink {}", path.display()),
-        ));
-    }
-    Ok(metadata)
+    fs::symlink_metadata(path)
 }
 
 fn wasix_host_path_for_guest<'a>(

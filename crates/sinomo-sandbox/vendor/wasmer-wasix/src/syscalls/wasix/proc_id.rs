@@ -14,3 +14,12 @@ pub fn proc_id<M: MemorySize>(ctx: FunctionEnvMut<'_, WasiEnv>, ret_pid: WasmPtr
     wasi_try_mem!(ret_pid.write(&memory, pid.raw() as Pid));
     Errno::Success
 }
+
+/// ### `getpid()`
+/// POSIX-shaped process id wrapper.
+#[instrument(level = "trace", skip_all, fields(pid = field::Empty), ret)]
+pub fn getpid(ctx: FunctionEnvMut<'_, WasiEnv>) -> i32 {
+    let pid = ctx.data().process.pid().raw();
+    Span::current().record("pid", pid);
+    pid as i32
+}

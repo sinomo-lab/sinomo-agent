@@ -133,6 +133,7 @@ pub fn proc_spawn_internal(
     if let Some(working_dir) = working_dir {
         let working_dir = child_env.state.fs.relative_path_to_absolute(working_dir);
         if let Err(err) = chdir_internal(&child_env, &working_dir) {
+            child_env.blocking_on_exit(Some(err.into()));
             ctx.data().control_plane.remove_process(child_pid);
             return Ok(Err(err));
         }
@@ -245,6 +246,7 @@ pub fn proc_spawn_internal(
         let stdin = match conv_stdio_mode(stdin, 0, true) {
             Ok(a) => a,
             Err(err) => {
+                child_env.blocking_on_exit(Some(err.into()));
                 ctx.data().control_plane.remove_process(child_pid);
                 return Ok(Err(err));
             }
@@ -252,6 +254,7 @@ pub fn proc_spawn_internal(
         let stdout = match conv_stdio_mode(stdout, 1, false) {
             Ok(a) => a,
             Err(err) => {
+                child_env.blocking_on_exit(Some(err.into()));
                 ctx.data().control_plane.remove_process(child_pid);
                 return Ok(Err(err));
             }
@@ -259,6 +262,7 @@ pub fn proc_spawn_internal(
         let stderr = match conv_stdio_mode(stderr, 2, false) {
             Ok(a) => a,
             Err(err) => {
+                child_env.blocking_on_exit(Some(err.into()));
                 ctx.data().control_plane.remove_process(child_pid);
                 return Ok(Err(err));
             }
@@ -281,6 +285,7 @@ pub fn proc_spawn_internal(
             // Now we actually spawn the process
             let Some(child_env) = builder.take() else {
                 warn!("failed to spawn as builtin probing consumed child environment");
+                child_process.terminate(Errno::Noexec.into());
                 ctx.data().control_plane.remove_process(child_pid);
                 return Ok(Err(Errno::Noexec));
             };
@@ -291,10 +296,13 @@ pub fn proc_spawn_internal(
             {
                 Ok(Ok(a)) => a,
                 Ok(Err(err)) => {
+                    let errno = conv_spawn_err_to_errno(&err);
+                    child_process.terminate(errno.into());
                     ctx.data().control_plane.remove_process(child_pid);
-                    return Ok(Err(conv_spawn_err_to_errno(&err)));
+                    return Ok(Err(errno));
                 }
                 Err(err) => {
+                    child_process.terminate(err.into());
                     ctx.data().control_plane.remove_process(child_pid);
                     return Ok(Err(err));
                 }

@@ -66,12 +66,33 @@ pub fn path_symlink_internal(
     if !base_fd.inner.rights.contains(Rights::PATH_SYMLINK) {
         return Err(Errno::Access);
     }
+    match path_parent_mutation_allowed_at(env, fd, new_path) {
+        Ok(true) => {}
+        Ok(false) => return Err(Errno::Access),
+        Err(err) => return Err(err),
+    }
 
     let new_path_path = std::path::Path::new(new_path);
     let (target_parent_inode, entry_name) =
         state
             .fs
             .get_parent_inode_at_path(inodes, fd, new_path_path, true)?;
+    let host_link_path = {
+        let guard = target_parent_inode.read();
+        match guard.deref() {
+            Kind::Dir { path, .. } => path.join(&entry_name),
+            Kind::Root { .. } => return Err(Errno::Notcapable),
+            Kind::Socket { .. }
+            | Kind::PipeRx { .. }
+            | Kind::PipeTx { .. }
+            | Kind::DuplexPipe { .. }
+            | Kind::EventNotifications { .. }
+            | Kind::Epoll { .. } => return Err(Errno::Inval),
+            Kind::File { .. } | Kind::Symlink { .. } | Kind::Buffer { .. } => {
+                unreachable!("get_parent_inode_at_path returned something other than a Dir or Root")
+            }
+        }
+    };
 
     // short circuit if anything is wrong, before we create an inode
     {
@@ -94,6 +115,15 @@ pub fn path_symlink_internal(
             }
         }
     }
+
+    state
+        .fs
+        .root_fs
+        .symlink(
+            std::path::Path::new(old_path),
+            std::path::Path::new(&host_link_path),
+        )
+        .map_err(|error| super::path_link::io_error_into_wasi_err(error.into()))?;
 
     let kind = Kind::Symlink {
         base_po_dir: fd,

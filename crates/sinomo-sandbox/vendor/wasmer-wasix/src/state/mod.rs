@@ -24,7 +24,7 @@ mod linker;
 mod types;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::Mutex,
     task::Waker,
@@ -81,6 +81,58 @@ pub struct WasiFutex {
     pub(crate) masks: BTreeMap<u64, u32>,
 }
 
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub(crate) struct WasiTimerFd {
+    pub clock_id: Snapshot0Clockid,
+    pub value_ns: u64,
+    pub interval_ns: u64,
+    pub armed_at_ns: u64,
+    pub consumed: u64,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub(crate) struct WasiSignalFd {
+    pub mask_low: u64,
+    pub mask_high: u64,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub(crate) struct WasiPosixTimer {
+    pub clock_id: Snapshot0Clockid,
+    pub value_ns: u64,
+    pub interval_ns: u64,
+    pub armed_at_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub(crate) struct WasiIntervalTimer {
+    pub value_ns: u64,
+    pub interval_ns: u64,
+    pub armed_at_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub(crate) struct WasiSignalStack {
+    pub sp: u64,
+    pub flags: i32,
+    pub size: u64,
+}
+
+impl Default for WasiSignalStack {
+    fn default() -> Self {
+        Self {
+            sp: 0,
+            flags: 2,
+            size: 0,
+        }
+    }
+}
+
 /// Structure that holds the state of BUS calls to this process and from
 /// this process. BUS calls are the equivalent of RPC's with support
 /// for all the major serializers
@@ -120,6 +172,8 @@ impl WasiBusState {
 pub(crate) struct WasiFutexState {
     pub poller_seed: u64,
     pub futexes: HashMap<u64, WasiFutex>,
+    pub poller_futexes: BTreeMap<u64, u64>,
+    pub woken_pollers: BTreeSet<u64>,
 }
 
 /// Top level data type containing all* the state with which WASI can
@@ -136,6 +190,12 @@ pub(crate) struct WasiState {
     pub fs: WasiFs,
     pub inodes: WasiInodes,
     pub futexs: Mutex<WasiFutexState>,
+    pub pidfds: Mutex<HashMap<WasiFd, u32>>,
+    pub timerfds: Mutex<HashMap<WasiFd, WasiTimerFd>>,
+    pub signalfds: Mutex<HashMap<WasiFd, WasiSignalFd>>,
+    pub posix_timers: Mutex<HashMap<u32, WasiPosixTimer>>,
+    pub interval_timers: Mutex<HashMap<i32, WasiIntervalTimer>>,
+    pub signal_stack: Mutex<WasiSignalStack>,
     pub clock_offset: Mutex<HashMap<Snapshot0Clockid, i64>>,
     pub args: Mutex<Vec<String>>,
     pub envs: Mutex<Vec<Vec<u8>>>,
@@ -259,6 +319,12 @@ impl WasiState {
             secret: self.secret,
             inodes: self.inodes.clone(),
             futexs: Default::default(),
+            pidfds: Mutex::new(self.pidfds.lock().unwrap().clone()),
+            timerfds: Mutex::new(self.timerfds.lock().unwrap().clone()),
+            signalfds: Mutex::new(self.signalfds.lock().unwrap().clone()),
+            posix_timers: Mutex::new(self.posix_timers.lock().unwrap().clone()),
+            interval_timers: Mutex::new(self.interval_timers.lock().unwrap().clone()),
+            signal_stack: Mutex::new(self.signal_stack.lock().unwrap().clone()),
             clock_offset: Mutex::new(self.clock_offset.lock().unwrap().clone()),
             args: Mutex::new(self.args.lock().unwrap().clone()),
             envs: Mutex::new(self.envs.lock().unwrap().clone()),

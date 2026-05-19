@@ -18,6 +18,24 @@ pub fn proc_getuid<M: MemorySize>(
     Ok(Errno::Success)
 }
 
+/// ### `getuid()`
+/// Returns the sandbox real user id using the POSIX import shape.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn getuid(mut ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<u32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    Ok(ctx.data().process.identity().real_uid)
+}
+
+/// ### `geteuid()`
+/// Returns the sandbox effective user id using the POSIX import shape.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn geteuid(mut ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<u32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    Ok(ctx.data().process.identity().effective_uid)
+}
+
 /// ### `proc_getresuid()`
 /// Returns the sandbox real, effective, and saved user ids.
 #[instrument(level = "trace", skip_all, ret)]
@@ -38,6 +56,34 @@ pub fn proc_getresuid<M: MemorySize>(
     Ok(Errno::Success)
 }
 
+/// ### `setuid()`
+/// Updates all sandbox user ids using the POSIX import shape.
+#[instrument(level = "trace", skip_all, fields(%uid), ret)]
+pub fn setuid(mut ctx: FunctionEnvMut<'_, WasiEnv>, uid: u32) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    let mut identity = env.process.identity();
+    identity.real_uid = uid;
+    identity.effective_uid = uid;
+    identity.saved_uid = uid;
+    env.process.set_identity(identity);
+    Ok(Errno::Success)
+}
+
+/// ### `seteuid()`
+/// Updates the sandbox effective user id using the POSIX import shape.
+#[instrument(level = "trace", skip_all, fields(%uid), ret)]
+pub fn seteuid(mut ctx: FunctionEnvMut<'_, WasiEnv>, uid: u32) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    let mut identity = env.process.identity();
+    identity.effective_uid = uid;
+    env.process.set_identity(identity);
+    Ok(Errno::Success)
+}
+
 /// ### `proc_getgid()`
 /// Returns the sandbox group id.
 #[instrument(level = "trace", skip_all, ret)]
@@ -51,6 +97,24 @@ pub fn proc_getgid<M: MemorySize>(
     let memory = unsafe { env.memory_view(&ctx) };
     wasi_try_mem_ok!(gid_ptr.write(&memory, env.process.identity().real_gid));
     Ok(Errno::Success)
+}
+
+/// ### `getgid()`
+/// Returns the sandbox real group id using the POSIX import shape.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn getgid(mut ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<u32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    Ok(ctx.data().process.identity().real_gid)
+}
+
+/// ### `getegid()`
+/// Returns the sandbox effective group id using the POSIX import shape.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn getegid(mut ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<u32, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    Ok(ctx.data().process.identity().effective_gid)
 }
 
 /// ### `proc_getresgid()`
@@ -70,6 +134,34 @@ pub fn proc_getresgid<M: MemorySize>(
     wasi_try_mem_ok!(rgid_ptr.write(&memory, identity.real_gid));
     wasi_try_mem_ok!(egid_ptr.write(&memory, identity.effective_gid));
     wasi_try_mem_ok!(sgid_ptr.write(&memory, identity.saved_gid));
+    Ok(Errno::Success)
+}
+
+/// ### `setgid()`
+/// Updates all sandbox group ids using the POSIX import shape.
+#[instrument(level = "trace", skip_all, fields(%gid), ret)]
+pub fn setgid(mut ctx: FunctionEnvMut<'_, WasiEnv>, gid: u32) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    let mut identity = env.process.identity();
+    identity.real_gid = gid;
+    identity.effective_gid = gid;
+    identity.saved_gid = gid;
+    env.process.set_identity(identity);
+    Ok(Errno::Success)
+}
+
+/// ### `setegid()`
+/// Updates the sandbox effective group id using the POSIX import shape.
+#[instrument(level = "trace", skip_all, fields(%gid), ret)]
+pub fn setegid(mut ctx: FunctionEnvMut<'_, WasiEnv>, gid: u32) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let env = ctx.data();
+    let mut identity = env.process.identity();
+    identity.effective_gid = gid;
+    env.process.set_identity(identity);
     Ok(Errno::Success)
 }
 

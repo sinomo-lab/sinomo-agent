@@ -37,6 +37,11 @@ pub(super) fn thread_join_internal<M: MemorySize + 'static>(
     }
     let other_thread = env.process.get_thread(&tid);
     if let Some(other_thread) = other_thread {
+        let reaped_thread_id = if other_thread.is_main() {
+            None
+        } else {
+            Some(tid)
+        };
         let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
             other_thread
                 .join()
@@ -45,6 +50,11 @@ pub(super) fn thread_join_internal<M: MemorySize + 'static>(
                 .unwrap_or_else(|a| a)
                 .raw()
         })?;
+        if let AsyncifyAction::Finish(ctx, _) = res
+            && let Some(tid) = reaped_thread_id
+        {
+            ctx.data().process.remove_thread(&tid);
+        }
         Ok(Errno::Success)
     } else {
         Ok(Errno::Badf)

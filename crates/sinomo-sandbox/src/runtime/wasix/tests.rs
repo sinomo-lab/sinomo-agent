@@ -389,6 +389,34 @@ fn wasix_runner_cancels_non_yielding_process_after_metered_shutdown() {
 }
 
 #[test]
+fn wasix_runner_cancels_thread_blocked_in_futex_wait() {
+    let cancellation = SandboxCancellation::new();
+    let canceller = cancellation.clone();
+    let join = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        canceller.cancel();
+    });
+    let started = std::time::Instant::now();
+
+    let error = super::run_wasix_module(
+        wasix_futex_wait_forever_module().as_slice(),
+        wasix_test_request(30_000),
+        SandboxWasiRunOptions {
+            cancellation,
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect_err("WASIX futex wait should be cancelled");
+    join.join().expect("canceller");
+
+    assert!(matches!(error, SandboxWasiError::Cancelled));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "blocked WASIX futex wait should be woken by cancellation"
+    );
+}
+
+#[test]
 fn wasix_runner_rejects_unmapped_cwd_when_preopens_exist() {
     let host_dir = wasix_unique_test_dir("sinomo-sandbox-wasix-cwd-unmapped");
     fs::create_dir_all(&host_dir).expect("host dir");
@@ -462,7 +490,7 @@ fn wasix_runner_rejects_symlink_escape_cwd() {
     )
     .expect_err("symlink escape cwd should be rejected before WASIX starts");
 
-    assert!(format!("{error}").contains("escapes its sandbox preopen"));
+    assert!(format!("{error}").contains("WASIX preopen contains symlink"));
     fs::remove_dir_all(host_dir).ok();
     fs::remove_dir_all(outside_dir).ok();
 }
@@ -660,6 +688,41 @@ fn wasix_non_yielding_loop_with_sched_yield_import_module() -> Vec<u8> {
             "#,
     )
     .expect("non-yielding wasix module with sched_yield import")
+}
+
+fn wasix_futex_wait_forever_module() -> Vec<u8> {
+    wat::parse_str(
+        r#"
+            (module
+              (import "wasix_32v1" "futex_wait"
+                (func $futex_wait (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "proc_exit"
+                (func $proc_exit (param i32)))
+              (memory (export "memory") 1 128)
+              (func $exit_if_errno (param $errno i32)
+                local.get $errno
+                i32.eqz
+                if
+                else
+                  local.get $errno
+                  call $proc_exit
+                end)
+              (func (export "_start")
+                i32.const 200
+                i32.const 0
+                i32.store
+                i32.const 208
+                i32.const 0
+                i32.store
+                i32.const 200
+                i32.const 0
+                i32.const 208
+                i32.const 204
+                call $futex_wait
+                call $exit_if_errno))
+            "#,
+    )
+    .expect("futex wait wasix module")
 }
 
 fn wasix_unreachable_module() -> Vec<u8> {

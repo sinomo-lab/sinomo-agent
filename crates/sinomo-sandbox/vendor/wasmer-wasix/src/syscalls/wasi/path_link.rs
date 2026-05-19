@@ -88,6 +88,11 @@ pub(crate) fn path_link_internal(
     {
         return Err(Errno::Access);
     }
+    match path_parent_mutation_allowed_at(env, new_fd, new_path) {
+        Ok(true) => {}
+        Ok(false) => return Err(Errno::Access),
+        Err(err) => return Err(err),
+    }
 
     Span::current().record("old_path", old_path);
     Span::current().record("new_path", new_path);
@@ -116,9 +121,44 @@ pub(crate) fn path_link_internal(
         state
             .fs
             .get_parent_inode_at_path(inodes, new_fd, &target_path_arg, false)?;
+    let host_target_path = {
+        let guard = target_parent_inode.read();
+        match guard.deref() {
+            Kind::Dir { path, entries, .. } => {
+                if entries.contains_key(&new_entry_name) {
+                    return Err(Errno::Exist);
+                }
+                path.join(&new_entry_name)
+            }
+            Kind::Root { .. } => return Err(Errno::Inval),
+            Kind::File { .. }
+            | Kind::Symlink { .. }
+            | Kind::Buffer { .. }
+            | Kind::Socket { .. }
+            | Kind::PipeTx { .. }
+            | Kind::PipeRx { .. }
+            | Kind::DuplexPipe { .. }
+            | Kind::EventNotifications { .. }
+            | Kind::Epoll { .. } => return Err(Errno::Notdir),
+        }
+    };
 
     if source_inode.stat.write().unwrap().st_nlink == Linkcount::MAX {
         return Err(Errno::Mlink);
+    }
+    {
+        let guard = source_inode.read();
+        if matches!(guard.deref(), Kind::File { .. }) {
+            let source_path = sandbox_host_path_at(env, old_fd, old_path)?;
+            let target_path = host_target_path.clone();
+            let root_fs = state.fs.root_fs.clone();
+            __asyncify_light(env, None, async move {
+                root_fs
+                    .hard_link(&source_path, &target_path)
+                    .map_err(|error| io_error_into_wasi_err(error.into()))
+            })
+            .map_err(|_| Errno::Io)??;
+        }
     }
     {
         let mut guard = target_parent_inode.write();
@@ -142,6 +182,20 @@ pub(crate) fn path_link_internal(
         }
     }
     source_inode.stat.write().unwrap().st_nlink += 1;
+    path_register_hardlink_at(env, old_fd, old_path, new_fd, new_path);
+    path_touch_parent_at(env, new_fd, new_path);
 
     Ok(())
+}
+
+pub(crate) fn io_error_into_wasi_err(error: std::io::Error) -> Errno {
+    match error.kind() {
+        std::io::ErrorKind::AlreadyExists => Errno::Exist,
+        std::io::ErrorKind::NotFound => Errno::Noent,
+        std::io::ErrorKind::PermissionDenied => Errno::Perm,
+        std::io::ErrorKind::InvalidInput => Errno::Inval,
+        std::io::ErrorKind::NotADirectory => Errno::Notdir,
+        std::io::ErrorKind::IsADirectory => Errno::Isdir,
+        _ => Errno::Io,
+    }
 }
