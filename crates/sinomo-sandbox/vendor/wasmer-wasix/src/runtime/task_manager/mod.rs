@@ -4,7 +4,7 @@ pub mod tokio;
 
 use std::ops::Deref;
 use std::task::{Context, Poll};
-use std::{pin::Pin, time::Duration};
+use std::{pin::Pin, time::Duration, time::Instant};
 
 use bytes::Bytes;
 use derive_more::Debug;
@@ -27,6 +27,7 @@ pub enum SpawnType<'a> {
     CreateMemoryOfType(MemoryType),
     // TODO: is there a way to get rid of the memory reference
     ShareMemory(Memory, StoreRef<'a>),
+    StoreAndMemory(Store, Option<Memory>),
     // TODO: is there a way to get rid of the memory reference
     // Note: The message sender is triggered once the memory
     // has been copied, this makes sure its not modified until
@@ -47,6 +48,14 @@ pub enum SpawnMemoryTypeOrStore {
     New,
     Type(wasmer::MemoryType),
     StoreAndMemory(wasmer::Store, Option<wasmer::Memory>),
+}
+
+macro_rules! sinomo_debug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
 }
 
 pub type WasmResumeTask = dyn FnOnce(WasiFunctionEnv, Store, Bytes) + Send + 'static;
@@ -220,6 +229,13 @@ pub trait VirtualTaskManager: std::fmt::Debug + Send + Sync + 'static {
                 Ok(Some(mem))
             }
             SpawnType::CopyMemory(mem, old_store) => {
+                let before = Instant::now();
+                let old_pages = mem.size(&old_store);
+                sinomo_debug!(
+                    "sinomo-debug task_wasm copy-memory-start pages={} bytes={}",
+                    old_pages.0,
+                    old_pages.bytes().0
+                );
                 let mem = mem.copy_to_store(&old_store, store).map_err(|err| {
                     tracing::warn!(
                         error = &err as &dyn std::error::Error,
@@ -227,9 +243,16 @@ pub trait VirtualTaskManager: std::fmt::Debug + Send + Sync + 'static {
                     );
                     WasiThreadError::MemoryCreateFailed(err)
                 })?;
+                sinomo_debug!(
+                    "sinomo-debug task_wasm copy-memory-done pages={} elapsed_ms={}",
+                    old_pages.0,
+                    before.elapsed().as_millis()
+                );
                 Ok(Some(mem))
             }
-            SpawnType::CreateMemory | SpawnType::NewLinkerInstanceGroup(..) => Ok(None),
+            SpawnType::StoreAndMemory(..)
+            | SpawnType::CreateMemory
+            | SpawnType::NewLinkerInstanceGroup(..) => Ok(None),
         }
     }
 

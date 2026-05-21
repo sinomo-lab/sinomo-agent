@@ -364,8 +364,18 @@ impl Mmap {
 
         let mut new =
             Self::accessible_reserved(copy_size, self.total_size, None, MmapType::Private)?;
-        new.as_mut_slice_arbitary(copy_size)
-            .copy_from_slice(self.as_slice_arbitary(copy_size));
+        let src = self.as_slice_arbitary(copy_size);
+        let dst = new.as_mut_slice_arbitary(copy_size);
+        let page_size = region::page::size();
+        let mut offset = 0usize;
+        while offset < copy_size {
+            let end = usize::min(offset.saturating_add(page_size), copy_size);
+            let src_page = &src[offset..end];
+            if src_page.iter().any(|byte| *byte != 0) {
+                dst[offset..end].copy_from_slice(src_page);
+            }
+            offset = end;
+        }
         Ok(new)
     }
 }

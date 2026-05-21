@@ -84,7 +84,10 @@ pub(crate) fn path_filestat_set_times_internal(
         .inner
         .rights
         .contains(Rights::PATH_FILESTAT_SET_TIMES)
-        && !matches!(fd_entry.inode.read().deref(), Kind::Dir { .. } | Kind::Root { .. })
+        && !matches!(
+            fd_entry.inode.read().deref(),
+            Kind::Dir { .. } | Kind::Root { .. }
+        )
     {
         return Err(Errno::Access);
     }

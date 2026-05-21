@@ -133,8 +133,7 @@ pub fn fd_readdir<M: MemorySize>(
                 if let Some((pid, tids)) = proc_pid_task_dir(path, &processes) {
                     for tid in &tids {
                         if seen.insert(tid.clone()) {
-                            let ino = Inode::from_path(&format!("/proc/{pid}/task/{tid}"))
-                                .as_u64();
+                            let ino = Inode::from_path(&format!("/proc/{pid}/task/{tid}")).as_u64();
                             entry_vec.push((tid.clone(), Filetype::Directory, ino));
                         }
                     }
@@ -166,12 +165,15 @@ pub fn fd_readdir<M: MemorySize>(
                         entry_vec.push((current_pid.clone(), Filetype::Directory, ino));
                     }
                 }
-                entry_vec.extend(entries.iter().filter(|(name, _)| seen.insert((*name).clone())).map(
-                    |(name, inode)| {
-                        let stat = inode.stat.read().unwrap();
-                        (name.clone(), stat.st_filetype, stat.st_ino)
-                    },
-                ));
+                entry_vec.extend(
+                    entries
+                        .iter()
+                        .filter(|(name, _)| seen.insert((*name).clone()))
+                        .map(|(name, inode)| {
+                            let stat = inode.stat.read().unwrap();
+                            (name.clone(), stat.st_filetype, stat.st_ino)
+                        }),
+                );
                 // adding . and .. special folders
                 entry_vec.push((".".to_string(), Filetype::Directory, current_ino));
                 entry_vec.push(("..".to_string(), Filetype::Directory, parent_ino));
@@ -306,13 +308,15 @@ fn proc_pid_fd_dir(
         })
         .collect::<Vec<_>>();
     let (pid, dir_name) = match components.as_slice() {
-        ["proc", pid, dir_name] if *dir_name == "fd" || *dir_name == "fdinfo" => {
-            (*pid, *dir_name)
-        }
+        ["proc", pid, dir_name] if *dir_name == "fd" || *dir_name == "fdinfo" => (*pid, *dir_name),
         ["proc", pid, "task", tid, dir_name] if *dir_name == "fd" || *dir_name == "fdinfo" => {
             let tid = tid.parse::<u32>().ok()?;
             let process = find_process_by_pid(processes, pid)?;
-            if !process.all_threads().iter().any(|thread| thread.raw() == tid) {
+            if !process
+                .all_threads()
+                .iter()
+                .any(|thread| thread.raw() == tid)
+            {
                 return None;
             }
             (*pid, *dir_name)

@@ -249,9 +249,10 @@ struct WasiThreadState {
     check_pointing: AtomicBool,
     deep_sleeping: AtomicBool,
 
-    // Registers the task termination with the ControlPlane on drop.
-    // Never accessed, since it's a drop guard.
-    _task_count_guard: TaskCountGuard,
+    // Counts this thread against the control plane while it is runnable. POSIX
+    // joinable threads can remain waitable after exit, so this guard is
+    // released when the thread finishes rather than when metadata is dropped.
+    task_count_guard: Mutex<Option<TaskCountGuard>>,
 }
 
 static NO_MORE_BYTES: [u8; 0] = [0u8; 0];
@@ -281,7 +282,7 @@ impl WasiThread {
                 #[cfg(feature = "journal")]
                 check_pointing: AtomicBool::new(false),
                 deep_sleeping: AtomicBool::new(false),
-                _task_count_guard: guard,
+                task_count_guard: Mutex::new(Some(guard)),
             }),
             layout,
             start,
@@ -351,11 +352,7 @@ impl WasiThread {
     }
 
     pub fn remove_thread_local_value(&self, key: u32) {
-        self.state
-            .thread_local_values
-            .lock()
-            .unwrap()
-            .remove(&key);
+        self.state.thread_local_values.lock().unwrap().remove(&key);
     }
 
     /// Get a join handle to watch the task status.
@@ -392,6 +389,11 @@ impl WasiThread {
     /// joined on it to wake up)
     pub fn set_status_finished(&self, res: Result<ExitCode, WasiRuntimeError>) {
         self.state.status.set_finished(res.map_err(Arc::new));
+        self.release_task_count_guard();
+    }
+
+    fn release_task_count_guard(&self) {
+        self.state.task_count_guard.lock().unwrap().take();
     }
 
     pub fn set_status_stopped(&self, signal: Signal) {

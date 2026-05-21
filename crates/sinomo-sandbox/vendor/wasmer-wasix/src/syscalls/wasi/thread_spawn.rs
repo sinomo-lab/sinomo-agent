@@ -2,9 +2,7 @@ use super::*;
 use crate::syscalls::*;
 
 use crate::{
-    WasiThreadHandle,
-    os::task::thread::WasiMemoryLayout,
-    runtime::task_manager::TaskWasm,
+    WasiThreadHandle, os::task::thread::WasiMemoryLayout, runtime::task_manager::TaskWasm,
     state::context_switching::ContextSwitchingEnvironment,
 };
 use std::sync::Arc;
@@ -44,6 +42,9 @@ fn thread_spawn_legacy_internal_from_wasi<M: MemorySize>(
     let layout = legacy_thread_layout_from_start_arg::<M>(ctx, start_arg)?;
     ensure_thread_memory_bounds::<M>(ctx, &layout, start_arg.into())?;
     let env = ctx.data();
+    if env.process.task_limit_reached() {
+        return Err(Errno::Again);
+    }
     let thread_start = ThreadStartType::ThreadSpawn {
         start_ptr: start_arg.into(),
     };
@@ -52,16 +53,11 @@ fn thread_spawn_legacy_internal_from_wasi<M: MemorySize>(
             .new_thread(layout.clone(), thread_start)
             .map_err(|_| Errno::Access)?,
     );
+    let (signal_mask_low, signal_mask_high) = env.thread.signal_mask();
+    thread_handle.set_signal_mask(signal_mask_low, signal_mask_high);
     let thread_id: Tid = thread_handle.id().into();
 
-    thread_spawn_internal_using_layout::<M>(
-        ctx,
-        thread_handle,
-        layout,
-        start_arg,
-        None,
-        false,
-    )?;
+    thread_spawn_internal_using_layout::<M>(ctx, thread_handle, layout, start_arg, None, false)?;
 
     Ok(thread_id)
 }

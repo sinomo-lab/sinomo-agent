@@ -57,11 +57,8 @@ pub(crate) fn fd_renumber_internal(
             );
         }
         match __asyncify_light(env, None, state.fs.flush(to))? {
-            Ok(_)
-            | Err(Errno::Isdir)
-            | Err(Errno::Io)
-            | Err(Errno::Access)
-            | Err(Errno::Inval) => {}
+            Ok(_) | Err(Errno::Isdir) | Err(Errno::Io) | Err(Errno::Access) | Err(Errno::Inval) => {
+            }
             Err(e) => {
                 return Ok(e);
             }

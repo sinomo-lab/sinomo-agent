@@ -53,9 +53,13 @@ impl SandboxWasixTunables {
 
 impl Tunables for SandboxWasixTunables {
     fn memory_style(&self, memory: &MemoryType) -> MemoryStyle {
-        let mut style = self.base.memory_style(memory);
-        if let MemoryStyle::Static { bound, .. } = &mut style {
-            *bound = (*bound).min(self.memory_limit_pages);
+        let style = self.base.memory_style(memory);
+        if let MemoryStyle::Static { bound, .. } = style
+            && bound > memory.minimum
+        {
+            return MemoryStyle::Dynamic {
+                offset_guard_size: self.base.dynamic_memory_offset_guard_size,
+            };
         }
         style
     }
@@ -113,14 +117,11 @@ mod tests {
     fn sandbox_wasix_tunables_reject_memory_above_budget() {
         let tunables = SandboxWasixTunables::for_target(&Target::default(), 64 * 1024, 1024 * 1024);
 
-        assert!(
-            tunables
-                .create_host_memory(
-                    &MemoryType::new(1_u32, Some(1_u32), false),
-                    &tunables.memory_style(&MemoryType::new(1_u32, Some(1_u32), false)),
-                )
-                .is_ok()
-        );
+        let memory = MemoryType::new(1_u32, Some(1_u32), false);
+        let created = tunables
+            .create_host_memory(&memory, &tunables.memory_style(&memory))
+            .unwrap();
+        assert_eq!(created.size(), Pages(1));
         assert!(
             tunables
                 .create_host_memory(

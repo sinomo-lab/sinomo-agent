@@ -27,7 +27,11 @@ use crate::{
     sandbox_command_stdout_path, validate_wasi_request,
 };
 #[cfg(feature = "wasix-runtime")]
-use std::time::Instant;
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::Instant,
+};
 #[cfg(feature = "wasix-runtime")]
 use wasmer::sys::NativeEngineExt;
 #[cfg(feature = "wasix-runtime")]
@@ -36,7 +40,163 @@ use wasmer_wasix::runners::wasi::RuntimeOrEngine;
 use wasmer_wasix::runtime::Runtime;
 
 #[cfg(feature = "wasix-runtime")]
-const SINOMO_WASIX_STACK_SIZE: usize = 512 * 1024 * 1024;
+const SINOMO_WASIX_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+#[cfg(feature = "wasix-runtime")]
+fn bundled_wasm_opt_path() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("toolchains")
+        .join("python")
+        .join("work-wasix")
+        .join("binaryen-version_124")
+        .join("bin")
+        .join("wasm-opt");
+    path.is_file().then_some(path)
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn looks_like_threaded_wasm(wasm: &[u8]) -> bool {
+    wasm.starts_with(b"\0asm")
+        && wasm
+            .windows(b"wasi_thread_start".len())
+            .any(|window| window == b"wasi_thread_start")
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn module_has_export(wasm: &[u8], export_name: &str) -> bool {
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let Ok(payload) = payload else {
+            return false;
+        };
+        if let wasmparser::Payload::ExportSection(exports) = payload {
+            for export in exports {
+                let Ok(export) = export else {
+                    return false;
+                };
+                if export.name == export_name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn module_imports_any(wasm: &[u8], module_name: &str, names: &[&str]) -> bool {
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let Ok(payload) = payload else {
+            return false;
+        };
+        if let wasmparser::Payload::ImportSection(imports) = payload {
+            for import in imports.into_imports() {
+                let Ok(import) = import else {
+                    return false;
+                };
+                if import.module == module_name && names.contains(&import.name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn needs_asyncify_transform(wasm: &[u8]) -> bool {
+    wasm.starts_with(b"\0asm")
+        && !module_has_export(wasm, "asyncify_start_unwind")
+        && module_imports_any(
+            wasm,
+            "wasix_32v1",
+            &[
+                "fork",
+                "vfork",
+                "proc_fork",
+                "proc_fork_env",
+                "clone_thread",
+            ],
+        )
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn transform_wasix_wasm(
+    wasm: &[u8],
+    auto_asyncify: bool,
+    fpcast_emu: bool,
+) -> Result<Option<Vec<u8>>, SandboxWasiError> {
+    let apply_fpcast = fpcast_emu && looks_like_threaded_wasm(wasm);
+    let apply_asyncify = auto_asyncify && needs_asyncify_transform(wasm);
+    if !apply_fpcast && !apply_asyncify {
+        return Ok(None);
+    }
+    let Some(wasm_opt) = bundled_wasm_opt_path() else {
+        if apply_asyncify {
+            return Err(SandboxWasiError::Runtime {
+                detail: "WASIX module imports fork/clone APIs but is not asyncified, and bundled Binaryen wasm-opt is missing".to_string(),
+            });
+        }
+        return Ok(None);
+    };
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sinomo-wasix-transform-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&temp_dir).map_err(|error| SandboxWasiError::Runtime {
+        detail: format!("create WASIX transform temp dir: {error}"),
+    })?;
+    let cleanup = |path: &Path| {
+        let _ = std::fs::remove_dir_all(path);
+    };
+    let input_path = temp_dir.join("input.wasm");
+    let output_path = temp_dir.join("output.wasm");
+    if let Err(error) = std::fs::write(&input_path, wasm) {
+        cleanup(&temp_dir);
+        return Err(SandboxWasiError::Runtime {
+            detail: format!("write WASIX transform input: {error}"),
+        });
+    }
+    let mut command = Command::new(&wasm_opt);
+    if apply_asyncify {
+        command.arg("--asyncify");
+    }
+    if apply_fpcast {
+        command.arg("--fpcast-emu");
+    }
+    let output = command
+        .arg("--pass-arg=max-func-params@64")
+        .arg("--no-validation")
+        .arg("--enable-bulk-memory")
+        .arg("--enable-mutable-globals")
+        .arg("--enable-threads")
+        .arg("--enable-exception-handling")
+        .arg("--enable-simd")
+        .arg("--enable-relaxed-simd")
+        .arg("--enable-extended-const")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&output_path)
+        .output()
+        .map_err(|error| SandboxWasiError::Runtime {
+            detail: format!("run {}: {error}", wasm_opt.display()),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        cleanup(&temp_dir);
+        return Err(SandboxWasiError::Runtime {
+            detail: format!("WASIX wasm-opt transform failed: {}", stderr.trim()),
+        });
+    }
+    let transformed = std::fs::read(&output_path).map_err(|error| SandboxWasiError::Runtime {
+        detail: format!("read WASIX transform output: {error}"),
+    })?;
+    cleanup(&temp_dir);
+    Ok(Some(transformed))
+}
 
 #[cfg(not(feature = "wasix-runtime"))]
 pub(crate) fn run_wasix_module(
@@ -96,6 +256,9 @@ fn run_wasix_module_on_worker_thread(
     };
     let command_id = SandboxCommandId::generate();
     let started = Instant::now();
+    let transformed_wasm =
+        transform_wasix_wasm(wasm, options.wasix_auto_asyncify, options.wasix_fpcast_emu)?;
+    let wasm = transformed_wasm.as_deref().unwrap_or(wasm);
     validate_wasix_module_memory_budget(wasm, options.memory_limit_bytes)?;
     validate_wasix_module_network_imports(wasm)?;
     let instruction_metering =

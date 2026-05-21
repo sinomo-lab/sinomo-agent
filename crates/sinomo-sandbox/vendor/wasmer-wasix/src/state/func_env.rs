@@ -36,7 +36,8 @@ fn cleanup_robust_futex_list(
     }
 
     let word_size = if len >= 24 { 8 } else { 4 };
-    let Some(futex_offset) = read_guest_signed_word(memory, head.saturating_add(word_size), word_size)
+    let Some(futex_offset) =
+        read_guest_signed_word(memory, head.saturating_add(word_size), word_size)
     else {
         return;
     };
@@ -490,7 +491,14 @@ impl WasiFunctionEnv {
 
             let mut ctx = self.env.clone().into_mut(store);
             for (key, destructor, value) in destructors {
-                call_thread_local_destructor(&mut ctx, pid.raw(), tid.raw(), key, destructor, value);
+                call_thread_local_destructor(
+                    &mut ctx,
+                    pid.raw(),
+                    tid.raw(),
+                    key,
+                    destructor,
+                    value,
+                );
             }
 
             if pass + 1 == TLS_DESTRUCTOR_PASSES {
@@ -517,12 +525,7 @@ impl WasiFunctionEnv {
         };
 
         if clear_child_tid != 0 && write_guest_u32(&memory, clear_child_tid, 0) {
-            crate::syscalls::wasix::wake_futex_address(
-                env.state(),
-                clear_child_tid,
-                u32::MAX,
-                1,
-            );
+            crate::syscalls::wasix::wake_futex_address(env.state(), clear_child_tid, u32::MAX, 1);
         }
 
         if let Some((head, len)) = robust_list {

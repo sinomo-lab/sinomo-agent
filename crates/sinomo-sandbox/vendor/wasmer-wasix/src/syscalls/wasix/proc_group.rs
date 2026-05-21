@@ -93,7 +93,11 @@ pub fn getsid(ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid) -> i32 {
 /// ### `proc_setpgid()`
 /// Sets the process group ID for the current process or one of its children.
 #[instrument(level = "trace", skip_all, fields(%pid, %pgid), ret)]
-pub fn proc_setpgid(mut ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid, pgid: Pid) -> Result<Errno, WasiError> {
+pub fn proc_setpgid(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    pid: Pid,
+    pgid: Pid,
+) -> Result<Errno, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
@@ -120,7 +124,9 @@ pub fn proc_setpgid(mut ctx: FunctionEnvMut<'_, WasiEnv>, pid: Pid, pgid: Pid) -
     if process.session_id() != env.process.session_id() {
         return Ok(Errno::Perm);
     }
-    if target_pgid != target_pid && !process_group_exists_in_session(env, target_pgid, process.session_id()) {
+    if target_pgid != target_pid
+        && !process_group_exists_in_session(env, target_pgid, process.session_id())
+    {
         return Ok(Errno::Perm);
     }
 
@@ -299,7 +305,11 @@ pub fn proc_tcsetpgrp(
 /// ### `tcsetpgrp()`
 /// POSIX-shaped foreground process-group setter.
 #[instrument(level = "trace", skip_all, fields(%fd, %pgid), ret)]
-pub fn tcsetpgrp(ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd, pgid: Pid) -> Result<i32, WasiError> {
+pub fn tcsetpgrp(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    fd: WasiFd,
+    pgid: Pid,
+) -> Result<i32, WasiError> {
     Ok(errno_to_posix_unit(proc_tcsetpgrp(ctx, fd, pgid)?))
 }
 

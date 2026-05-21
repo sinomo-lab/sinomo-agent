@@ -416,6 +416,10 @@ version = "=7.0.0-alpha.2"
 features = ["experimental-async"]
 default-features = false
 
+[dependencies.wasmer-vm]
+version = "=7.0.0-alpha.2"
+default-features = false
+
 [dependencies.wasmer-config]
 version = "0.700.0-alpha.2"
 

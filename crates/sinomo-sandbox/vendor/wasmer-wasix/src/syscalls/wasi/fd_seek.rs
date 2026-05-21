@@ -74,13 +74,15 @@ pub(crate) fn fd_seek_internal(
             if offset > 0 {
                 let offset = offset as u64;
                 let old_offset = fd_entry.offset.load(Ordering::Acquire);
-                let new_offset = wasi_try_ok_ok!(old_offset.checked_add(offset).ok_or(Errno::Inval));
+                let new_offset =
+                    wasi_try_ok_ok!(old_offset.checked_add(offset).ok_or(Errno::Inval));
                 fd_entry.offset.store(new_offset, Ordering::Release);
                 new_offset
             } else if offset < 0 {
                 let offset = offset.unsigned_abs();
                 let old_offset = fd_entry.offset.load(Ordering::Acquire);
-                let new_offset = wasi_try_ok_ok!(old_offset.checked_sub(offset).ok_or(Errno::Inval));
+                let new_offset =
+                    wasi_try_ok_ok!(old_offset.checked_sub(offset).ok_or(Errno::Inval));
                 fd_entry.offset.store(new_offset, Ordering::Release);
                 new_offset
             } else {
@@ -135,7 +137,9 @@ pub(crate) fn fd_seek_internal(
                             .checked_add(offset as u64)
                             .ok_or(Errno::Inval)
                     } else {
-                        (buffer.len() as u64).checked_sub(offset.unsigned_abs()).ok_or(Errno::Inval)
+                        (buffer.len() as u64)
+                            .checked_sub(offset.unsigned_abs())
+                            .ok_or(Errno::Inval)
                     };
                     let new_offset = wasi_try_ok_ok!(new_offset);
                     let mut fd_map = state.fs.fd_map.write().unwrap();

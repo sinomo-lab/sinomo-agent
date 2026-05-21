@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
+    WasiProcess,
     os::task::process::{ProcessResourceLimit, WasiProcessId},
     syscalls::*,
-    WasiProcess,
 };
 use wasmer::FromToNativeWasmType;
 use wasmer_wasix_types::wasi::Snapshot0Clockid;
@@ -162,7 +162,8 @@ pub fn proc_getrusage<M: MemorySize>(
     let (user_usec, maxrss_kib) = if who == RUSAGE_CHILDREN {
         env.process.child_resource_usage()
     } else {
-        let now = platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000).unwrap_or(0) as u128;
+        let now =
+            platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000).unwrap_or(0) as u128;
         let elapsed_nanos = now.saturating_sub(env.process.start_time_nanos());
         let user_usec = (elapsed_nanos / 1_000).min(u128::from(u64::MAX)) as u64;
         let address_space = env.process.resource_limit(RLIMIT_AS).current;
@@ -231,7 +232,8 @@ fn selected_process(env: &WasiEnv, pid: Pid) -> Option<WasiProcess> {
     if pid == 0 || pid == env.process.pid().raw() as Pid {
         return Some(env.process.clone());
     }
-    env.control_plane.get_process(WasiProcessId::from(pid as u32))
+    env.control_plane
+        .get_process(WasiProcessId::from(pid as u32))
 }
 
 fn valid_resource(resource: i32) -> bool {

@@ -9,6 +9,14 @@ use wasmer_wasix_types::wasi::{
 use super::*;
 use crate::{WasiProcess, os::task::TaskStatus, syscalls::*};
 
+macro_rules! sinomo_debug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 const WAIT_STATUS_EXITED: u32 = 1 << 0;
 const WAIT_STATUS_STOPPED: u32 = 1 << 1;
 const WAIT_STATUS_CONTINUED: u32 = 1 << 2;
@@ -147,14 +155,30 @@ pub fn waitpid<M: MemorySize + 'static>(
             let (ret_pid, wait_status) = match status {
                 JoinStatusResult::Nothing | JoinStatusResult::NoStatus => (0, None),
                 JoinStatusResult::ExitNormal(pid, exit_code) => {
-                    (pid.raw() as i32, Some(((exit_code.raw() as i32) & 0xff) << 8))
+                    sinomo_debug!(
+                        "sinomo-debug waitpid_result parent={} child={} exit_code={}",
+                        ctx.data().pid().raw(),
+                        pid.raw(),
+                        exit_code.raw()
+                    );
+                    (
+                        pid.raw() as i32,
+                        Some(((exit_code.raw() as i32) & 0xff) << 8),
+                    )
                 }
                 JoinStatusResult::ExitSignal(pid, _exit_code, signal) => {
+                    sinomo_debug!(
+                        "sinomo-debug waitpid_result parent={} child={} signal={}",
+                        ctx.data().pid().raw(),
+                        pid.raw(),
+                        signal.to_native()
+                    );
                     (pid.raw() as i32, Some(signal.to_native() & 0x7f))
                 }
-                JoinStatusResult::Stopped(pid, signal) => {
-                    (pid.raw() as i32, Some(((signal.to_native() & 0xff) << 8) | 0x7f))
-                }
+                JoinStatusResult::Stopped(pid, signal) => (
+                    pid.raw() as i32,
+                    Some(((signal.to_native() & 0xff) << 8) | 0x7f),
+                ),
                 JoinStatusResult::Continued(pid) => (pid.raw() as i32, Some(0xffff)),
                 JoinStatusResult::Err(err) => return Ok(-err.to_native()),
             };
@@ -181,6 +205,7 @@ pub fn waitpid<M: MemorySize + 'static>(
                 true,
                 observe_stopped,
                 observe_continued,
+                true,
                 |_| true,
                 ret_result,
             )
@@ -195,6 +220,7 @@ pub fn waitpid<M: MemorySize + 'static>(
                 true,
                 observe_stopped,
                 observe_continued,
+                true,
                 move |child| child.pgid() == pgid,
                 ret_result,
             )
@@ -212,6 +238,7 @@ pub fn waitpid<M: MemorySize + 'static>(
                 true,
                 observe_stopped,
                 observe_continued,
+                true,
                 move |child| child.pgid() == pgid,
                 ret_result,
             )
@@ -236,6 +263,7 @@ pub fn waitpid<M: MemorySize + 'static>(
                 true,
                 observe_stopped,
                 observe_continued,
+                true,
                 ret_result,
             )
         }
@@ -304,11 +332,8 @@ pub fn waitid<M: MemorySize + 'static>(
                 ),
                 JoinStatusResult::Continued(pid) => {
                     if consume_continued {
-                        let _ = continued_matching_child(
-                            &ctx.data().process,
-                            pid.raw() as Pid,
-                            true,
-                        );
+                        let _ =
+                            continued_matching_child(&ctx.data().process, pid.raw() as Pid, true);
                     }
                     (
                         pid.raw() as i32,
@@ -348,6 +373,7 @@ pub fn waitid<M: MemorySize + 'static>(
                 observe_exited,
                 observe_stopped,
                 observe_continued,
+                options & POSIX_WNOWAIT == 0,
                 |_| true,
                 ret_result,
             )
@@ -362,6 +388,7 @@ pub fn waitid<M: MemorySize + 'static>(
                 observe_exited,
                 observe_stopped,
                 observe_continued,
+                options & POSIX_WNOWAIT == 0,
                 move |child| child.pgid() == pgid,
                 ret_result,
             )
@@ -379,6 +406,7 @@ pub fn waitid<M: MemorySize + 'static>(
                 observe_exited,
                 observe_stopped,
                 observe_continued,
+                options & POSIX_WNOWAIT == 0,
                 move |child| child.pgid() == pgid,
                 ret_result,
             )
@@ -403,6 +431,7 @@ pub fn waitid<M: MemorySize + 'static>(
                 observe_exited,
                 observe_stopped,
                 observe_continued,
+                options & POSIX_WNOWAIT == 0,
                 ret_result,
             )
         }
@@ -517,6 +546,9 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
             let mut ret = Errno::Success;
 
             let view = unsafe { ctx.data().memory_view(&ctx) };
+            if let Err(err) = sync_shared_memory_to_guest::<M>(ctx.data(), &view) {
+                return Ok(err);
+            }
             let status = match status {
                 JoinStatusResult::Nothing => JoinStatus {
                     tag: JoinStatusType::Nothing,
@@ -535,6 +567,12 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
                     }
                 }
                 JoinStatusResult::ExitNormal(pid, exit_code) => {
+                    sinomo_debug!(
+                        "sinomo-debug proc_join_result parent={} child={} exit_code={}",
+                        ctx.data().pid().raw(),
+                        pid.raw(),
+                        exit_code.raw()
+                    );
                     let option_pid = OptionPid {
                         tag: OptionTag::Some,
                         pid: pid.raw() as Pid,
@@ -549,6 +587,13 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
                     }
                 }
                 JoinStatusResult::ExitSignal(pid, exit_code, signal) => {
+                    sinomo_debug!(
+                        "sinomo-debug proc_join_result parent={} child={} signal={} exit_code={}",
+                        ctx.data().pid().raw(),
+                        pid.raw(),
+                        signal.to_native(),
+                        exit_code.raw()
+                    );
                     let option_pid = OptionPid {
                         tag: OptionTag::Some,
                         pid: pid.raw() as Pid,
@@ -612,6 +657,9 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
 
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
+    if let Err(err) = sync_shared_memory_to_guest::<M>(env, &memory) {
+        return Ok(err);
+    }
     let option_pid = wasi_try_mem_ok!(pid_ptr.read(&memory));
     let option_pid = match option_pid.tag {
         OptionTag::None => None,
@@ -649,7 +697,9 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
 
             if flags.contains(JoinFlags::NON_BLOCKING) {
                 return match process.try_join_any_child_status() {
-                    Ok(Some((child, status))) => ret_result(ctx, child_status_join_result(Ok(Some((child, status))))),
+                    Ok(Some((child, status))) => {
+                        ret_result(ctx, child_status_join_result(Ok(Some((child, status)))))
+                    }
                     Ok(None) => ret_result(ctx, JoinStatusResult::NoStatus),
                     Err(err) => ret_result(ctx, JoinStatusResult::Err(err)),
                 };
@@ -659,7 +709,11 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
             // then we go into a deep sleep)
             let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
                 if flags.contains(JoinFlags::WAKE_STOPPED) {
-                    child_status_join_result(process.join_any_child_until_unreported_stopped_or_finished().await)
+                    child_status_join_result(
+                        process
+                            .join_any_child_until_unreported_stopped_or_finished()
+                            .await,
+                    )
                 } else {
                     child_status_join_result(process.join_any_child_matching_status(|_| true).await)
                 }
@@ -698,7 +752,9 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
             return match process.try_join_any_child_matching_status(|child| {
                 group_filter.is_none_or(|pgid| child.pgid() == pgid)
             }) {
-                Ok(Some((child, status))) => ret_result(ctx, child_status_join_result(Ok(Some((child, status))))),
+                Ok(Some((child, status))) => {
+                    ret_result(ctx, child_status_join_result(Ok(Some((child, status)))))
+                }
                 Ok(None) => ret_result(ctx, JoinStatusResult::NoStatus),
                 Err(err) => ret_result(ctx, JoinStatusResult::Err(err)),
             };
@@ -716,10 +772,10 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
             } else {
                 child_status_join_result(
                     process
-                    .join_any_child_matching_status(|child| {
-                        group_filter.is_none_or(|pgid| child.pgid() == pgid)
-                    })
-                    .await,
+                        .join_any_child_matching_status(|child| {
+                            group_filter.is_none_or(|pgid| child.pgid() == pgid)
+                        })
+                        .await,
                 )
             }
         })?;
@@ -808,7 +864,9 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
                         tracing::trace!(%exit_code, "triggered child join");
                         JoinStatusResult::ExitNormal(pid, exit_code)
                     }
-                    TaskStatus::Pending | TaskStatus::Running => JoinStatusResult::Err(Errno::Child),
+                    TaskStatus::Pending | TaskStatus::Running => {
+                        JoinStatusResult::Err(Errno::Child)
+                    }
                 }
             })?;
             match res {
@@ -964,6 +1022,7 @@ fn proc_wait_status_select_internal<M: MemorySize + 'static>(
                 observe_exited,
                 observe_stopped,
                 observe_continued,
+                true,
                 |_| true,
                 ret_result,
             )
@@ -987,6 +1046,7 @@ fn proc_wait_status_select_internal<M: MemorySize + 'static>(
                     observe_exited,
                     observe_stopped,
                     observe_continued,
+                    true,
                     move |child| group_filter.is_none_or(|pgid| child.pgid() == pgid),
                     ret_result,
                 )
@@ -1010,6 +1070,7 @@ fn proc_wait_status_select_internal<M: MemorySize + 'static>(
                     observe_exited,
                     observe_stopped,
                     observe_continued,
+                    true,
                     ret_result,
                 )
             }
@@ -1024,13 +1085,16 @@ fn wait_status_for_matching_child<M, F, R, T>(
     observe_exited: bool,
     observe_stopped: bool,
     observe_continued: bool,
+    consume_exited: bool,
     mut matches: F,
     ret_result: R,
 ) -> Result<T, WasiError>
 where
     M: MemorySize + 'static,
     F: FnMut(&WasiProcess) -> bool + Send + 'static,
-    R: FnOnce(FunctionEnvMut<'_, WasiEnv>, JoinStatusResult) -> Result<T, WasiError> + Send + 'static,
+    R: FnOnce(FunctionEnvMut<'_, WasiEnv>, JoinStatusResult) -> Result<T, WasiError>
+        + Send
+        + 'static,
     T: WaitReturn,
 {
     let children = {
@@ -1061,6 +1125,9 @@ where
             continue;
         };
         if observe_exited && let Some(status) = child.try_join_status() {
+            if consume_exited {
+                reap_child_process(&process, &child);
+            }
             return ret_result(ctx, child_status_join_result(Ok(Some((child, status)))));
         }
         live_children.push(child);
@@ -1091,6 +1158,9 @@ where
                         return Poll::Ready(JoinStatusResult::Stopped(child.pid(), signal));
                     }
                     if observe_exited && let Some(status) = child.try_join_status() {
+                        if consume_exited {
+                            reap_child_process(&process, child);
+                        }
                         return Poll::Ready(child_status_join_result(Ok(Some((
                             child.clone(),
                             status,
@@ -1116,6 +1186,9 @@ where
                         return Poll::Ready(JoinStatusResult::Stopped(child.pid(), signal));
                     }
                     if observe_exited && let Some(status) = child.try_join_status() {
+                        if consume_exited {
+                            reap_child_process(&process, child);
+                        }
                         return Poll::Ready(child_status_join_result(Ok(Some((
                             child.clone(),
                             status,
@@ -1154,6 +1227,9 @@ where
                     return child_status_join_result(Ok(Some((child, status))));
                 }
                 TaskStatus::Finished(_) | TaskStatus::Signaled { .. } if observe_exited => {
+                    if consume_exited {
+                        reap_child_process(&process, &child);
+                    }
                     return child_status_join_result(Ok(Some((child, status))));
                 }
                 _ => {
@@ -1177,11 +1253,14 @@ fn wait_status_for_process<M, R, T>(
     observe_exited: bool,
     observe_stopped: bool,
     observe_continued: bool,
+    consume_exited: bool,
     ret_result: R,
 ) -> Result<T, WasiError>
 where
     M: MemorySize + 'static,
-    R: FnOnce(FunctionEnvMut<'_, WasiEnv>, JoinStatusResult) -> Result<T, WasiError> + Send + 'static,
+    R: FnOnce(FunctionEnvMut<'_, WasiEnv>, JoinStatusResult) -> Result<T, WasiError>
+        + Send
+        + 'static,
     T: WaitReturn,
 {
     if observe_continued && process.peek_unreported_continued() {
@@ -1193,7 +1272,11 @@ where
     {
         return ret_result(ctx, JoinStatusResult::Stopped(process.pid(), signal));
     }
+    let parent_process = ctx.data().process.clone();
     if observe_exited && let Some(status) = process.try_join_status() {
+        if consume_exited {
+            reap_child_process(&parent_process, &process);
+        }
         return ret_result(ctx, child_status_join_result(Ok(Some((process, status)))));
     }
     if flags.contains(JoinFlags::NON_BLOCKING) {
@@ -1213,6 +1296,9 @@ where
                     return Poll::Ready(JoinStatusResult::Stopped(process.pid(), signal));
                 }
                 if observe_exited && let Some(status) = process.try_join_status() {
+                    if consume_exited {
+                        reap_child_process(&parent_process, &process);
+                    }
                     return Poll::Ready(child_status_join_result(Ok(Some((
                         process.clone(),
                         status,
@@ -1229,6 +1315,9 @@ where
                     return Poll::Ready(JoinStatusResult::Stopped(process.pid(), signal));
                 }
                 if observe_exited && let Some(status) = process.try_join_status() {
+                    if consume_exited {
+                        reap_child_process(&parent_process, &process);
+                    }
                     return Poll::Ready(child_status_join_result(Ok(Some((
                         process.clone(),
                         status,
@@ -1255,6 +1344,9 @@ where
                 child_status_join_result(Ok(Some((process, status))))
             }
             TaskStatus::Finished(_) | TaskStatus::Signaled { .. } if observe_exited => {
+                if consume_exited {
+                    reap_child_process(&parent_process, &process);
+                }
                 child_status_join_result(Ok(Some((process, status))))
             }
             _ => JoinStatusResult::NoStatus,
@@ -1400,4 +1492,20 @@ fn child_status_join_result(
             JoinStatusResult::Err(err)
         }
     }
+}
+
+fn reap_child_process(parent: &WasiProcess, child: &WasiProcess) {
+    let pid = child.pid();
+    let is_child = {
+        let inner = parent.lock();
+        inner.children.iter().any(|existing| existing.pid() == pid)
+    };
+    if !is_child {
+        return;
+    }
+    parent.record_reaped_child_usage(child);
+    let mut inner = parent.lock();
+    inner.children.retain(|existing| existing.pid() != pid);
+    drop(inner);
+    child.compute.must_upgrade().remove_process(pid);
 }

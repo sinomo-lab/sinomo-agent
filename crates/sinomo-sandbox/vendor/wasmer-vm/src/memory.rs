@@ -18,9 +18,8 @@ use more_asserts::assert_ge;
 use std::cell::UnsafeCell;
 use std::convert::TryInto;
 use std::ptr::NonNull;
-use std::rc::Rc;
 use std::slice;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use wasmer_types::{Bytes, MemoryError, MemoryStyle, MemoryType, Pages, WASM_PAGE_SIZE};
 
@@ -329,8 +328,16 @@ impl VMOwnedMemory {
                     *bound
                 }
             };
-            let minimum_bytes = minimum_pages.bytes().0;
-            let request_bytes = minimum_bytes.checked_add(offset_guard_bytes).unwrap();
+            let reserved_pages = if memory.shared {
+                memory.maximum.unwrap_or(minimum_pages)
+            } else {
+                minimum_pages
+            };
+            let request_bytes = reserved_pages
+                .bytes()
+                .0
+                .checked_add(offset_guard_bytes)
+                .unwrap();
             let mapped_pages = memory.minimum;
             let mapped_bytes = mapped_pages.bytes();
 
@@ -378,7 +385,7 @@ impl VMOwnedMemory {
     /// Converts this owned memory into shared memory
     pub fn to_shared(self) -> VMSharedMemory {
         VMSharedMemory {
-            mmap: Rc::new(RwLock::new(self.mmap)),
+            mmap: Arc::new(RwLock::new(self.mmap)),
             config: self.config,
             conditions: ThreadConditions::new(),
         }
@@ -451,7 +458,7 @@ impl LinearMemory for VMOwnedMemory {
 #[derive(Debug, Clone)]
 pub struct VMSharedMemory {
     // The underlying allocation.
-    mmap: Rc<RwLock<WasmMmap>>,
+    mmap: Arc<RwLock<WasmMmap>>,
     // Configuration of this memory
     config: VMMemoryConfig,
     // waiters list for this memory
@@ -534,7 +541,7 @@ impl VMSharedMemory {
     pub fn copy(&mut self) -> Result<Self, MemoryError> {
         let mut guard = self.mmap.write().unwrap();
         Ok(Self {
-            mmap: Rc::new(RwLock::new(guard.copy()?)),
+            mmap: Arc::new(RwLock::new(guard.copy()?)),
             config: self.config.clone(),
             conditions: ThreadConditions::new(),
         })

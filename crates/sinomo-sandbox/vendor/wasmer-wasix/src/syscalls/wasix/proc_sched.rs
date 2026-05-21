@@ -1,5 +1,5 @@
 use super::*;
-use crate::{os::task::process::WasiProcessId, syscalls::*, WasiProcess};
+use crate::{WasiProcess, os::task::process::WasiProcessId, syscalls::*};
 use wasmer::FromToNativeWasmType;
 
 const SCHED_OTHER: i32 = 0;
@@ -9,6 +9,8 @@ const SCHED_BATCH: i32 = 3;
 const SCHED_IDLE: i32 = 5;
 const SCHED_RESET_ON_FORK: i32 = 0x40000000;
 const ROUND_ROBIN_INTERVAL_NANOS: i64 = 10_000_000;
+const REALTIME_PRIORITY_MIN: i32 = 0;
+const REALTIME_PRIORITY_MAX: i32 = 99;
 
 /// ### `proc_getscheduler()`
 /// Returns guest-visible POSIX scheduler metadata for a process.
@@ -88,7 +90,7 @@ pub fn proc_setscheduler(
         return Ok(Errno::Srch);
     };
     let base_policy = policy & !SCHED_RESET_ON_FORK;
-    if !valid_policy(base_policy) || priority != 0 {
+    if !valid_policy(base_policy) || !valid_priority(base_policy, priority) {
         return Ok(Errno::Inval);
     }
     process.set_scheduler(base_policy, priority);
@@ -270,38 +272,60 @@ fn selected_process(env: &WasiEnv, pid: Pid) -> Option<WasiProcess> {
     if pid == 0 || pid == env.process.pid().raw() as Pid {
         return Some(env.process.clone());
     }
-    env.control_plane.get_process(WasiProcessId::from(pid as u32))
+    env.control_plane
+        .get_process(WasiProcessId::from(pid as u32))
 }
 
 fn valid_policy(policy: i32) -> bool {
-    matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE)
+    matches!(
+        policy,
+        SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE
+    )
+}
+
+fn priority_bounds(policy: i32) -> Option<(i32, i32)> {
+    match policy {
+        SCHED_FIFO | SCHED_RR => Some((REALTIME_PRIORITY_MIN, REALTIME_PRIORITY_MAX)),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => Some((0, 0)),
+        _ => None,
+    }
+}
+
+fn valid_priority(policy: i32, priority: i32) -> bool {
+    let Some((min, max)) = priority_bounds(policy) else {
+        return false;
+    };
+    priority >= min && priority <= max
 }
 
 /// ### `sched_get_priority_max()`
-/// POSIX-shaped scheduler priority bound query. The sandbox currently models
-/// all supported policies as priority-0 only.
+/// POSIX-shaped scheduler priority bound query.
 #[instrument(level = "trace", skip_all, fields(%policy), ret)]
 pub fn sched_get_priority_max(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     policy: i32,
 ) -> Result<i32, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
-    if valid_policy(policy) {
-        Ok(0)
+    if let Some((_, max)) = priority_bounds(policy) {
+        Ok(max)
     } else {
         Ok(-Errno::Inval.to_native())
     }
 }
 
 /// ### `sched_get_priority_min()`
-/// POSIX-shaped scheduler priority bound query. The sandbox currently models
-/// all supported policies as priority-0 only.
+/// POSIX-shaped scheduler priority bound query.
 #[instrument(level = "trace", skip_all, fields(%policy), ret)]
 pub fn sched_get_priority_min(
-    ctx: FunctionEnvMut<'_, WasiEnv>,
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
     policy: i32,
 ) -> Result<i32, WasiError> {
-    sched_get_priority_max(ctx, policy)
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    if let Some((min, _)) = priority_bounds(policy) {
+        Ok(min)
+    } else {
+        Ok(-Errno::Inval.to_native())
+    }
 }
 
 fn write_timespec<M: MemorySize>(

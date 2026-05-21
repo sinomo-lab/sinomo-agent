@@ -191,7 +191,9 @@ pub fn path_rename_internal(
                     let state = state;
                     let host_adjusted_target_path = host_adjusted_target_path.clone();
                     __asyncify_light(env, None, async move {
-                        state.fs_rename(path_clone, &host_adjusted_target_path).await
+                        state
+                            .fs_rename(path_clone, &host_adjusted_target_path)
+                            .await
                     })?
                 };
                 // if the above operation failed we have to revert the previous change and then fail

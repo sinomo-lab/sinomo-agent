@@ -119,7 +119,12 @@ pub fn nice(mut ctx: FunctionEnvMut<'_, WasiEnv>, increment: i32) -> Result<i32,
 }
 
 fn matching_priorities(env: &WasiEnv, which: i32, who: i32) -> Result<Vec<i32>, Errno> {
-    matching_processes(env, which, who).map(|processes| processes.into_iter().map(|process| process.nice()).collect())
+    matching_processes(env, which, who).map(|processes| {
+        processes
+            .into_iter()
+            .map(|process| process.nice())
+            .collect()
+    })
 }
 
 fn matching_processes(env: &WasiEnv, which: i32, who: i32) -> Result<Vec<WasiProcess>, Errno> {

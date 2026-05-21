@@ -180,7 +180,8 @@ pub fn proc_getgroups<M: MemorySize>(
     let memory = unsafe { env.memory_view(&ctx) };
     let identity = env.process.identity();
     let count = identity.groups.len();
-    let max_groups_usize = wasi_try_ok!(usize::try_from(max_groups.into()).map_err(|_| Errno::Overflow));
+    let max_groups_usize =
+        wasi_try_ok!(usize::try_from(max_groups.into()).map_err(|_| Errno::Overflow));
     if max_groups_usize > 0 {
         if max_groups_usize < count {
             return Ok(Errno::Inval);

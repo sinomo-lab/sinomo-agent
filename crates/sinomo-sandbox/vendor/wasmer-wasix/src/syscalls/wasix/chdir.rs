@@ -1,7 +1,7 @@
 use super::*;
+use crate::VIRTUAL_ROOT_FD;
 use crate::fs::InodeGuard;
 use crate::syscalls::*;
-use crate::VIRTUAL_ROOT_FD;
 use std::path::{Component, Path, PathBuf};
 use wasmer::FromToNativeWasmType;
 
@@ -76,7 +76,8 @@ pub fn chdir_internal(env: &WasiEnv, path: &str) -> Result<(), Errno> {
     }
 
     let state = &env.state;
-    let path = normalize_absolute_virtual_path(&state.fs.relative_path_to_absolute(path.to_string()));
+    let path =
+        normalize_absolute_virtual_path(&state.fs.relative_path_to_absolute(path.to_string()));
 
     let inode = state
         .fs

@@ -105,7 +105,8 @@ pub(crate) fn path_filestat_get_internal(
             &target,
         );
     }
-    if let Some(target) = proc_pid_alias_target(state, inodes, current_pid, processes, path_string) {
+    if let Some(target) = proc_pid_alias_target(state, inodes, current_pid, processes, path_string)
+    {
         return path_filestat_get_internal(
             env,
             memory,
@@ -403,9 +404,7 @@ fn proc_namespace_target(
 
 fn proc_namespace_link_target(process: &WasiProcess, namespace: &str) -> Option<String> {
     let target_namespace = match namespace {
-        "cgroup" | "ipc" | "mnt" | "net" | "pid" | "pid_for_children" | "time" | "uts" => {
-            namespace
-        }
+        "cgroup" | "ipc" | "mnt" | "net" | "pid" | "pid_for_children" | "time" | "uts" => namespace,
         _ => return None,
     };
     let display_namespace = if target_namespace == "pid_for_children" {
@@ -444,7 +443,8 @@ fn proc_path_alias_target(
 }
 
 fn proc_thread_self_alias_target(path: &str) -> Option<String> {
-    proc_path_alias_tail(path, "/proc/thread-self").map(|tail| join_virtual_path("/proc/self", tail))
+    proc_path_alias_tail(path, "/proc/thread-self")
+        .map(|tail| join_virtual_path("/proc/self", tail))
 }
 
 fn proc_task_alias_target(process_tids: &[u32], path: &str) -> Option<String> {
@@ -482,18 +482,18 @@ fn proc_pid_alias_target(
     } else {
         let rest = proc_process_file_tail(process, rest)?;
         if rest == "cwd" {
-        Some(process.cwd())
-    } else if let Some(tail) = rest.strip_prefix("cwd/") {
-        Some(join_virtual_path(&process.cwd(), tail))
-    } else {
-        match rest.as_str() {
-            "" => Some("/proc/self".to_string()),
-            "root" => Some("/proc/self/root".to_string()),
-            "exe" => proc_process_exe_target(state, inodes, process),
-            _ => Some(join_virtual_path("/proc/self", &rest)),
+            Some(process.cwd())
+        } else if let Some(tail) = rest.strip_prefix("cwd/") {
+            Some(join_virtual_path(&process.cwd(), tail))
+        } else {
+            match rest.as_str() {
+                "" => Some("/proc/self".to_string()),
+                "root" => Some("/proc/self/root".to_string()),
+                "exe" => proc_process_exe_target(state, inodes, process),
+                _ => Some(join_virtual_path("/proc/self", &rest)),
+            }
         }
     }
-}
 }
 
 fn proc_path_alias_tail<'a>(path: &'a str, alias: &str) -> Option<&'a str> {

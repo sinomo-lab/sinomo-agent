@@ -29,26 +29,53 @@ pub(crate) fn thread_sleep_internal<M: MemorySize + 'static>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     duration: Timestamp,
 ) -> Result<Errno, WasiError> {
-    if let Some(()) = unsafe { handle_rewind::<M, _>(&mut ctx) } {
-        return Ok(Errno::Success);
+    if let Some(interrupted) = unsafe { handle_rewind::<M, bool>(&mut ctx) } {
+        let env = ctx.data();
+        let memory = unsafe { env.memory_view(&ctx) };
+        sync_shared_memory_to_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+        return if interrupted {
+            Ok(Errno::Intr)
+        } else {
+            Ok(Errno::Success)
+        };
     }
 
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
     ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
 
     let env = ctx.data();
+    let memory = unsafe { env.memory_view(&ctx) };
 
     #[cfg(feature = "sys-thread")]
     if duration == 0 {
         std::thread::yield_now();
+        sync_shared_memory_to_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
     }
 
     if duration > 0 {
         let duration = Duration::from_nanos(duration);
         let tasks = env.tasks().clone();
+        let thread = env.thread.clone();
         let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
-            tasks.sleep_now(duration).await;
+            tokio::select! {
+                _ = tasks.sleep_now(duration) => false,
+                _ = thread.wait_for_signal() => true,
+            }
         })?;
+        if let AsyncifyAction::Finish(mut ctx, interrupted) = res {
+            let env = ctx.data();
+            if has_live_cross_process_shared_memory(env) {
+                let memory = unsafe { env.memory_view(&ctx) };
+                sync_shared_memory_to_guest::<M>(env, &memory)
+                    .map_err(|err| WasiError::Exit(err.into()))?;
+            }
+            if interrupted {
+                WasiEnv::do_pending_operations(&mut ctx)?;
+                return Ok(Errno::Intr);
+            }
+        }
     }
     Ok(Errno::Success)
 }
@@ -160,28 +187,22 @@ fn read_timespec_nanos<M: MemorySize>(
     }
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
-    let seconds = ptr
-        .read(&memory)
-        .map_err(crate::mem_error_to_wasi)?;
+    let seconds = ptr.read(&memory).map_err(crate::mem_error_to_wasi)?;
     let nanos = if M::is_64bit() {
         let nanos_ptr = ptr_at_byte_offset::<i64, M>(ptr, 8)?;
-        nanos_ptr
-            .read(&memory)
-            .map_err(crate::mem_error_to_wasi)?
+        nanos_ptr.read(&memory).map_err(crate::mem_error_to_wasi)?
     } else {
         let nanos_ptr = ptr_at_byte_offset::<i32, M>(ptr, 8)?;
-        i64::from(
-            nanos_ptr
-                .read(&memory)
-                .map_err(crate::mem_error_to_wasi)?,
-        )
+        i64::from(nanos_ptr.read(&memory).map_err(crate::mem_error_to_wasi)?)
     };
     if seconds < 0 || !(0..NANOS_PER_SECOND as i64).contains(&nanos) {
         return Err(Errno::Inval);
     }
     let seconds = seconds as u64;
     let nanos = nanos as u64;
-    Ok(seconds.saturating_mul(NANOS_PER_SECOND).saturating_add(nanos))
+    Ok(seconds
+        .saturating_mul(NANOS_PER_SECOND)
+        .saturating_add(nanos))
 }
 
 fn write_timespec<M: MemorySize>(

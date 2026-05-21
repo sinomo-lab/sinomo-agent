@@ -1,6 +1,14 @@
 use super::*;
 use crate::syscalls::*;
 
+macro_rules! sinomo_debug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// Wake up one thread that's blocked on futex_wait on this futex.
 /// Returns true if this actually woke up such a thread,
 /// or false if no thread was waiting on this futex.
@@ -50,6 +58,12 @@ pub fn futex_requeue<M: MemorySize>(
     let state = env.state.deref();
     let from = from_futex.offset().into();
     let to = to_futex.offset().into();
+    let sync_shared =
+        is_registered_shared_futex_offset(env, from) || is_registered_shared_futex_offset(env, to);
+    if sync_shared {
+        sync_shared_memory_from_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    }
 
     let mut guard = state.futexs.lock().unwrap();
     let wake_ids = collect_matching_waiters(&guard, from, mask, wake_count as usize);
@@ -134,9 +148,14 @@ fn futex_wake_mask_internal<M: MemorySize>(
     }
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
+    let pointer: u64 = futex_ptr.offset().into();
+    let sync_shared = is_registered_shared_futex_offset(env, pointer);
+    if sync_shared {
+        sync_shared_memory_range_from_guest::<M>(env, &memory, pointer, 4)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    }
     let state = env.state.deref();
 
-    let pointer: u64 = futex_ptr.offset().into();
     Span::current().record("futex_idx", pointer);
 
     let woken = wake_futex_address(state, pointer, mask, 1) > 0;
@@ -163,6 +182,13 @@ pub(crate) fn wake_futex_address(state: &WasiState, pointer: u64, mask: u32, max
     } else {
         tracing::trace!("wake(miss) on {pointer}");
     }
+    sinomo_debug!(
+        "sinomo-debug futex_wake pointer={:#x} mask={:#x} max={} woken={}",
+        pointer,
+        mask,
+        max_wake,
+        woken
+    );
     woken
 }
 
@@ -262,11 +288,21 @@ mod tests {
         futex.masks.insert(1, u32::MAX);
         state.poller_futexes.insert(1, 64);
 
-        assert_eq!(requeue_futex_address_locked(&mut state, 64, 96, Vec::new(), vec![1]), 1);
+        assert_eq!(
+            requeue_futex_address_locked(&mut state, 64, 96, Vec::new(), vec![1]),
+            1
+        );
         assert!(!state.woken_pollers.contains(&1));
         assert_eq!(state.poller_futexes.get(&1), Some(&96));
         assert!(!state.futexes.contains_key(&64));
-        assert!(state.futexes.get(&96).expect("target futex").wakers.contains_key(&1));
+        assert!(
+            state
+                .futexes
+                .get(&96)
+                .expect("target futex")
+                .wakers
+                .contains_key(&1)
+        );
 
         assert_eq!(wake_futex_address_locked(&mut state, 96, u32::MAX, 1), 1);
         assert!(state.woken_pollers.contains(&1));

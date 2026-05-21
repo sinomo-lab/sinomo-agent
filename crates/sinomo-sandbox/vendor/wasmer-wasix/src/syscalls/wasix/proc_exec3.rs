@@ -124,10 +124,12 @@ pub fn execve<M: MemorySize>(
     let envs = if envp.is_null() {
         None
     } else {
-        Some(read_guest_c_string_array::<M>(&memory, envp).map_err(|err| {
-            warn!("failed to execve as envp could not be read - {}", err);
-            WasiError::Exit(Errno::Inval.into())
-        })?)
+        Some(
+            read_guest_c_string_array::<M>(&memory, envp).map_err(|err| {
+                warn!("failed to execve as envp could not be read - {}", err);
+                WasiError::Exit(Errno::Inval.into())
+            })?,
+        )
     };
 
     proc_exec3_prepared::<M>(ctx, path, args, envs, Bool::False, None)
@@ -182,20 +184,27 @@ pub fn execvpe<M: MemorySize>(
     let envs = if envp.is_null() {
         None
     } else {
-        Some(read_guest_c_string_array::<M>(&memory, envp).map_err(|err| {
-            warn!("failed to execvpe as envp could not be read - {}", err);
-            WasiError::Exit(Errno::Inval.into())
-        })?)
+        Some(
+            read_guest_c_string_array::<M>(&memory, envp).map_err(|err| {
+                warn!("failed to execvpe as envp could not be read - {}", err);
+                WasiError::Exit(Errno::Inval.into())
+            })?,
+        )
     };
     let path = envs
         .as_ref()
-        .and_then(|envs| envs.iter().find_map(|env| env.strip_prefix("PATH=").map(str::to_string)))
+        .and_then(|envs| {
+            envs.iter()
+                .find_map(|env| env.strip_prefix("PATH=").map(str::to_string))
+        })
         .or_else(|| current_env_path(ctx.data()));
 
     proc_exec3_prepared::<M>(ctx, file, args, envs, Bool::True, path)
 }
 
-fn handle_exec_rewind<M: MemorySize>(ctx: &mut FunctionEnvMut<'_, WasiEnv>) -> Result<(), WasiError> {
+fn handle_exec_rewind<M: MemorySize>(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+) -> Result<(), WasiError> {
     if let Some(exit_code) = unsafe { handle_rewind::<M, i32>(ctx) } {
         let exit_code = ExitCode::from_native(exit_code);
         ctx.data().process.terminate(exit_code);
@@ -233,16 +242,11 @@ fn read_guest_c_string_array<M: MemorySize>(
 }
 
 fn current_env_path(env: &WasiEnv) -> Option<String> {
-    env.state
-        .envs
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|entry| {
-            std::str::from_utf8(entry)
-                .ok()
-                .and_then(|entry| entry.strip_prefix("PATH=").map(str::to_string))
-        })
+    env.state.envs.lock().unwrap().iter().find_map(|entry| {
+        std::str::from_utf8(entry)
+            .ok()
+            .and_then(|entry| entry.strip_prefix("PATH=").map(str::to_string))
+    })
 }
 
 fn proc_exec3_prepared<M: MemorySize>(

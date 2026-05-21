@@ -17,6 +17,14 @@ use crate::{
 use wasmer::Memory;
 use wasmer_wasix_types::wasi::ThreadStart;
 
+macro_rules! sinomo_debug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// ### `thread_spawn()`
 /// Creates a new thread by spawning that shares the same
 /// memory address space, file handles and main event loops.
@@ -86,6 +94,9 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
         "thread_spawn with layout {:?}",
         layout
     );
+    if env.process.task_limit_reached() {
+        return Err(Errno::Again);
+    }
 
     // Create the handle that represents this thread
     let thread_start = ThreadStartType::ThreadSpawn {
@@ -110,11 +121,20 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
             return Err(Errno::Access);
         }
     };
+    let (signal_mask_low, signal_mask_high) = env.thread.signal_mask();
+    thread_handle.set_signal_mask(signal_mask_low, signal_mask_high);
     let thread_id: Tid = thread_handle.id().into();
     Span::current().record("tid", thread_id);
 
     // Spawn the thread
-    thread_spawn_internal_using_layout::<M>(ctx, thread_handle, layout, start_ptr_offset, None, true)?;
+    thread_spawn_internal_using_layout::<M>(
+        ctx,
+        thread_handle,
+        layout,
+        start_ptr_offset,
+        None,
+        true,
+    )?;
 
     // Success
     Ok(thread_id)
@@ -126,7 +146,6 @@ pub(crate) fn ensure_thread_memory_bounds<M: MemorySize>(
     start_ptr_offset: u64,
 ) -> Result<(), Errno> {
     const WASM_PAGE_SIZE: u64 = 65_536;
-    const THREAD_TLS_HEADROOM_BYTES: u64 = 8 * 1_024 * 1_024;
 
     let handles = ctx.data().inner().main_module_instance_handles();
     let memory = handles.memory_clone();
@@ -142,8 +161,7 @@ pub(crate) fn ensure_thread_memory_bounds<M: MemorySize>(
                 .tls_base
                 .unwrap_or(0)
                 .saturating_add(tls_size)
-                .saturating_add(tls_align)
-                .saturating_add(THREAD_TLS_HEADROOM_BYTES),
+                .saturating_add(tls_align),
         )
         .max(start_ptr_offset.saturating_add(std::mem::size_of::<ThreadStart<M>>() as u64));
     let current_bytes = u64::from(memory.size(&store).0).saturating_mul(WASM_PAGE_SIZE);
@@ -237,7 +255,19 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
         Some(linker) => {
             crate::runtime::SpawnType::NewLinkerInstanceGroup(linker, func_env, store, false)
         }
-        None => crate::runtime::SpawnType::ShareMemory(thread_memory, store.as_store_ref()),
+        None => {
+            let mut child_store = env.runtime().new_store();
+            let child_memory = thread_memory
+                .share_in_store(&store.as_store_ref(), &mut child_store.as_store_mut())
+                .map_err(|err| {
+                    warn!(
+                        error = &err as &dyn std::error::Error,
+                        "failed to share process memory with new thread",
+                    );
+                    Errno::Nomem
+                })?;
+            crate::runtime::SpawnType::StoreAndMemory(child_store, Some(child_memory))
+        }
     };
 
     // Now spawn a thread
@@ -265,11 +295,12 @@ fn call_module_internal<M: MemorySize>(
     start_ptr_offset: M::Offset,
     initialize_layout_globals: bool,
 ) -> (Store, Result<Option<ExitCode>, DeepSleepWork>) {
-    if initialize_layout_globals && let Err(err) = initialize_static_thread_globals(ctx, &mut store) {
+    if initialize_layout_globals && let Err(err) = initialize_static_thread_globals(ctx, &mut store)
+    {
         let tid = ctx.data(&store).tid();
         warn!(%tid, ?err, "failed to initialize static thread globals");
         let exit_code = Some(err.into());
-        ctx.on_exit(&mut store, exit_code);
+        ctx.on_exit(&mut store, None);
         return (store, Ok(exit_code));
     }
     let Some(spawn) = ctx
@@ -282,10 +313,17 @@ fn call_module_internal<M: MemorySize>(
         let tid = ctx.data(&store).tid();
         warn!(%tid, "spawned thread is missing wasi_thread_start export");
         let exit_code = Some(Errno::Noexec.into());
-        ctx.on_exit(&mut store, exit_code);
+        ctx.on_exit(&mut store, None);
         return (store, Ok(exit_code));
     };
     let tid = ctx.data(&store).tid();
+    if tid.raw() >= 240 {
+        sinomo_debug!(
+            "sinomo-debug thread_start pid={} tid={}",
+            ctx.data(&store).pid().raw(),
+            tid.raw()
+        );
+    }
 
     let spawn: Function = spawn.into();
     let tid_i32 = match tid.raw().try_into().map_err(|_| Errno::Overflow) {
@@ -293,7 +331,7 @@ fn call_module_internal<M: MemorySize>(
         Err(err) => {
             warn!(%tid, "spawned thread id does not fit callback parameter");
             let exit_code = Some(err.into());
-            ctx.on_exit(&mut store, exit_code);
+            ctx.on_exit(&mut store, None);
             return (store, Ok(exit_code));
         }
     };
@@ -302,7 +340,7 @@ fn call_module_internal<M: MemorySize>(
         Err(err) => {
             warn!(%tid, "spawned thread start pointer does not fit callback parameter");
             let exit_code = Some(err.into());
-            ctx.on_exit(&mut store, exit_code);
+            ctx.on_exit(&mut store, None);
             return (store, Ok(exit_code));
         }
     };
@@ -320,16 +358,21 @@ fn call_module_internal<M: MemorySize>(
         Ok(code) => code,
         Err(deep_sleep) => return (store, Err(deep_sleep)),
     };
+    if tid.raw() >= 240 {
+        sinomo_debug!(
+            "sinomo-debug thread_exit_callback pid={} tid={} exit={:?}",
+            ctx.data(&store).pid().raw(),
+            tid.raw(),
+            exit_code
+        );
+    }
 
     // Clean up the environment on exit
-    ctx.on_exit(&mut store, exit_code);
+    ctx.on_exit(&mut store, None);
     (store, Ok(exit_code))
 }
 
-fn initialize_static_thread_globals(
-    ctx: &WasiFunctionEnv,
-    store: &mut Store,
-) -> Result<(), Errno> {
+fn initialize_static_thread_globals(ctx: &WasiFunctionEnv, store: &mut Store) -> Result<(), Errno> {
     let (layout, stack_pointer, tls_base_global) = {
         let env = ctx.data(&store);
         let handles = env.inner().main_module_instance_handles();
@@ -346,11 +389,7 @@ fn initialize_static_thread_globals(
     Ok(())
 }
 
-fn set_u64_global(
-    store: &mut Store,
-    global: Option<&Global>,
-    value: u64,
-) -> Result<(), Errno> {
+fn set_u64_global(store: &mut Store, global: Option<&Global>, value: u64) -> Result<(), Errno> {
     let Some(global) = global else {
         return Ok(());
     };
@@ -387,6 +426,7 @@ fn handle_thread_result(
                     .runtime
                     .on_taint(TaintReason::NonZeroExitCode(code));
             };
+            env.data(&store).process.terminate(code);
             Ok(Some(code))
         }
         Ok(WasiError::DeepSleep(deep)) => {
@@ -394,7 +434,7 @@ fn handle_thread_result(
             Err(deep)
         }
         Ok(WasiError::UnknownWasiVersion) => {
-            eprintln!(
+            sinomo_debug!(
                 "Thread {tid} of process {pid} failed because it has an unknown wasix version"
             );
             env.data(&store)
@@ -403,14 +443,14 @@ fn handle_thread_result(
             Ok(Some(ExitCode::from(129)))
         }
         Ok(WasiError::DlSymbolResolutionFailed(symbol)) => {
-            eprintln!("Thread {tid} of process {pid} failed to find required symbol: {symbol}");
+            sinomo_debug!("Thread {tid} of process {pid} failed to find required symbol: {symbol}");
             env.data(&store)
                 .runtime
                 .on_taint(TaintReason::DlSymbolResolutionFailed(symbol.clone()));
             Ok(Some(ExitCode::from(129)))
         }
         Err(err) => {
-            eprintln!("Thread {tid} of process {pid} failed with runtime error: {err}");
+            sinomo_debug!("Thread {tid} of process {pid} failed with runtime error: {err}");
             env.data(&store)
                 .runtime
                 .on_taint(TaintReason::RuntimeError(err));
@@ -479,6 +519,5 @@ fn call_module<M: MemorySize>(
         }
     };
     thread_handle.set_status_finished(Ok(exit_code));
-    // I don't think we need to do this explicitly, but it was done before refactoring so we keep it for now.
     drop(thread_handle);
 }

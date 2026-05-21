@@ -83,6 +83,8 @@ pub struct SandboxWasiRunOptions {
     pub allow_preview1_pinned_subprocesses: bool,
     pub wasix_pinned_child_exec_only: bool,
     pub wasix_instruction_metering: bool,
+    pub wasix_auto_asyncify: bool,
+    pub wasix_fpcast_emu: bool,
     pub wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
 }
 
@@ -132,6 +134,8 @@ impl fmt::Debug for SandboxWasiRunOptions {
                 "wasix_instruction_metering",
                 &self.wasix_instruction_metering,
             )
+            .field("wasix_auto_asyncify", &self.wasix_auto_asyncify)
+            .field("wasix_fpcast_emu", &self.wasix_fpcast_emu)
             .field("wasix_command_overrides", &self.wasix_command_overrides)
             .finish()
     }
@@ -161,6 +165,8 @@ impl Default for SandboxWasiRunOptions {
             allow_preview1_pinned_subprocesses: false,
             wasix_pinned_child_exec_only: true,
             wasix_instruction_metering: true,
+            wasix_auto_asyncify: true,
+            wasix_fpcast_emu: false,
             wasix_command_overrides: Vec::new(),
         }
     }

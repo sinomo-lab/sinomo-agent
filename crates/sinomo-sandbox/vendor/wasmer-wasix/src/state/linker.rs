@@ -335,9 +335,7 @@ fn module_fpcast_universal_abi(module: &Module) -> Option<FunctionType> {
 }
 
 fn bundled_wasm_opt_path() -> Option<PathBuf> {
-    let sandbox_crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .parent()?;
+    let sandbox_crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?;
     let path = sandbox_crate_dir
         .join("toolchains")
         .join("python")
@@ -377,11 +375,11 @@ fn fpcast_emulate_dynamic_module(
             .map(|duration| duration.as_nanos())
             .unwrap_or_default()
     ));
-    std::fs::create_dir_all(&temp_dir).map_err(|error| LinkError::SpawnError(
-        SpawnError::ModuleLoad {
+    std::fs::create_dir_all(&temp_dir).map_err(|error| {
+        LinkError::SpawnError(SpawnError::ModuleLoad {
             message: format!("create fpcast transform temp dir: {error}"),
-        },
-    ))?;
+        })
+    })?;
     let input_path = temp_dir.join("input.wasm");
     let output_path = temp_dir.join("output.wasm");
     let cleanup_temp_dir = |path: &Path| {
@@ -406,9 +404,11 @@ fn fpcast_emulate_dynamic_module(
         .arg("-o")
         .arg(&output_path)
         .output()
-        .map_err(|error| LinkError::SpawnError(SpawnError::ModuleLoad {
-            message: format!("run {}: {error}", wasm_opt.display()),
-        }))?;
+        .map_err(|error| {
+            LinkError::SpawnError(SpawnError::ModuleLoad {
+                message: format!("run {}: {error}", wasm_opt.display()),
+            })
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         cleanup_temp_dir(&temp_dir);
@@ -1571,7 +1571,8 @@ impl Linker {
                 store,
                 &link_state.unresolved_globals,
             )?;
-            if let Some(main_universal_type) = module_fpcast_universal_abi(&linker_state.main_module)
+            if let Some(main_universal_type) =
+                module_fpcast_universal_abi(&linker_state.main_module)
             {
                 let table_size = group_state.indirect_function_table.size(store);
                 group_state
@@ -1649,7 +1650,9 @@ impl Linker {
 
         let main_module = linker_state.main_module.clone();
         let memory = if copy_memory {
-            parent_group_state.memory.copy_to_store(&parent_store, store)?
+            parent_group_state
+                .memory
+                .copy_to_store(&parent_store, store)?
         } else {
             parent_group_state
                 .memory
@@ -1760,7 +1763,19 @@ impl Linker {
             &mut pending_resolutions,
         )?;
 
-        let main_instance = Instance::new(store, &main_module, &imports)?;
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!(
+                "sinomo-debug linker create_instance_group copy_memory={} skip_shared_data={}",
+                copy_memory, !copy_memory
+            );
+        }
+        let main_instance = if copy_memory {
+            Instance::new(store, &main_module, &imports)?
+        } else {
+            wasmer_vm::with_skipped_shared_memory_data_initializers(|| {
+                Instance::new(store, &main_module, &imports)
+            })?
+        };
 
         instance_group.main_instance = Some(main_instance.clone());
 
@@ -3025,8 +3040,7 @@ impl InstanceGroupState {
         let mut originals = self.function_table_originals.lock().unwrap();
         let mut param_counts = self.function_table_param_counts.lock().unwrap();
         for index in table_base as u32..table_base as u32 + table_size {
-            let Some(Value::FuncRef(Some(func))) = table.get(store, index)
-            else {
+            let Some(Value::FuncRef(Some(func))) = table.get(store, index) else {
                 continue;
             };
             param_counts.insert(index, func.ty(&store.as_store_ref()).params().len() as u32);
@@ -3075,11 +3089,7 @@ impl InstanceGroupState {
         let table = Table::new(store, table_type, Value::FuncRef(None))?;
         let source_size = self.indirect_function_table.size(store);
         if table.size(store) < source_size {
-            table.grow(
-                store,
-                source_size - table.size(store),
-                Value::FuncRef(None),
-            )?;
+            table.grow(store, source_size - table.size(store), Value::FuncRef(None))?;
         }
         copy_function_table_range_for_fpcast(
             &self.indirect_function_table,
@@ -3093,16 +3103,15 @@ impl InstanceGroupState {
         Ok(table)
     }
 
-    fn original_abi_table_for_module(&self, store: &mut impl AsStoreMut) -> Result<Table, RuntimeError> {
+    fn original_abi_table_for_module(
+        &self,
+        store: &mut impl AsStoreMut,
+    ) -> Result<Table, RuntimeError> {
         let table_type = self.indirect_function_table.ty(&store.as_store_ref());
         let table = Table::new(store, table_type, Value::FuncRef(None))?;
         let source_size = self.indirect_function_table.size(store);
         if table.size(store) < source_size {
-            table.grow(
-                store,
-                source_size - table.size(store),
-                Value::FuncRef(None),
-            )?;
+            table.grow(store, source_size - table.size(store), Value::FuncRef(None))?;
         }
         for (index, func) in self.function_table_originals.lock().unwrap().iter() {
             if *index < source_size {
@@ -3254,21 +3263,20 @@ impl InstanceGroupState {
         let function_table_size = pending_module.dylink_info.mem_info.table_size;
         let module_universal_type = module_fpcast_universal_abi(&module);
 
-        let module_indirect_function_table = if let Some(universal_type) =
-            module_universal_type.clone()
-        {
-            Some(
-                self.fpcast_table_for_module(store, universal_type)
-                    .map_err(LinkError::TableAllocationError)?,
-            )
-        } else if self.main_fpcast_universal_type.is_some() {
-            Some(
-                self.original_abi_table_for_module(store)
-                    .map_err(LinkError::TableAllocationError)?,
-            )
-        } else {
-            None
-        };
+        let module_indirect_function_table =
+            if let Some(universal_type) = module_universal_type.clone() {
+                Some(
+                    self.fpcast_table_for_module(store, universal_type)
+                        .map_err(LinkError::TableAllocationError)?,
+                )
+            } else if self.main_fpcast_universal_type.is_some() {
+                Some(
+                    self.original_abi_table_for_module(store)
+                        .map_err(LinkError::TableAllocationError)?,
+                )
+            } else {
+                None
+            };
 
         trace!(?module_handle, "Resolving symbols");
         linker_state.resolve_symbols(
@@ -3319,7 +3327,6 @@ impl InstanceGroupState {
                 Some(&self.function_table_param_counts),
             )
             .map_err(LinkError::TableAllocationError)?;
-
         }
 
         let instance_handles = WasiModuleInstanceHandles::new(
@@ -3431,21 +3438,20 @@ impl InstanceGroupState {
         ];
 
         let module_universal_type = module_fpcast_universal_abi(&dl_module.module);
-        let module_indirect_function_table = if let Some(universal_type) =
-            module_universal_type.clone()
-        {
-            Some(
-                self.fpcast_table_for_module(store, universal_type)
-                    .map_err(LinkError::TableAllocationError)?,
-            )
-        } else if self.main_fpcast_universal_type.is_some() {
-            Some(
-                self.original_abi_table_for_module(store)
-                    .map_err(LinkError::TableAllocationError)?,
-            )
-        } else {
-            None
-        };
+        let module_indirect_function_table =
+            if let Some(universal_type) = module_universal_type.clone() {
+                Some(
+                    self.fpcast_table_for_module(store, universal_type)
+                        .map_err(LinkError::TableAllocationError)?,
+                )
+            } else if self.main_fpcast_universal_type.is_some() {
+                Some(
+                    self.original_abi_table_for_module(store)
+                        .map_err(LinkError::TableAllocationError)?,
+                )
+            } else {
+                None
+            };
 
         trace!(?module_handle, "Populating imports object");
         self.populate_imports_from_linker(
@@ -3970,13 +3976,13 @@ impl InstanceGroupState {
                                 )
                                 .map_err(LinkError::TableAllocationError)?;
                         }
-                        let table_func =
-                            if let Some(universal_type) = module_fpcast_universal_type {
-                                fpcast_adapt_function(store, func.clone(), universal_type)
-                                    .map_err(LinkError::TableAllocationError)?
-                            } else {
-                                func.clone()
-                            };
+                        let table_func = if let Some(universal_type) = module_fpcast_universal_type
+                        {
+                            fpcast_adapt_function(store, func.clone(), universal_type)
+                                .map_err(LinkError::TableAllocationError)?
+                        } else {
+                            func.clone()
+                        };
                         table
                             .set(store, func_handle, Value::FuncRef(Some(table_func)))
                             .map_err(LinkError::TableAllocationError)?;

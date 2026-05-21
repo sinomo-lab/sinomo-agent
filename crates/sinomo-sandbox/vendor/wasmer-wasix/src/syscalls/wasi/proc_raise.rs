@@ -105,7 +105,9 @@ pub fn signal_mask_set(
     low: u64,
     high: u64,
 ) -> Result<i32, WasiError> {
-    ctx.data().thread.set_signal_mask(low, high);
+    let env = ctx.data();
+    env.thread.set_signal_mask(low, high);
+    env.process.deliver_process_pending_to_thread(&env.thread);
     Ok(0)
 }
 

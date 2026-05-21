@@ -16,10 +16,25 @@ POSIXTESTSUITE_SCOPE="${POSIXTESTSUITE_SCOPE:-all}"
 POSIXTESTSUITE_OFFSET="${POSIXTESTSUITE_OFFSET:-0}"
 POSIXTESTSUITE_LIMIT="${POSIXTESTSUITE_LIMIT:-0}"
 POSIXTESTSUITE_RUN_SHELL="${POSIXTESTSUITE_RUN_SHELL:-1}"
+POSIXTESTSUITE_COMPILE_MODE="${POSIXTESTSUITE_COMPILE_MODE:-host}"
+POSIXTESTSUITE_HOST_SYSROOT="${POSIXTESTSUITE_HOST_SYSROOT:-"${CLANG_OUTDIR}/artifacts/sysroot"}"
+POSIXTESTSUITE_HOST_CC_BIN="${POSIXTESTSUITE_HOST_CC_BIN:-}"
 COMPILE_TIMEOUT_MS="${COMPILE_TIMEOUT_MS:-30000}"
 LINK_TIMEOUT_MS="${LINK_TIMEOUT_MS:-30000}"
 RUN_TIMEOUT_MS="${RUN_TIMEOUT_MS:-30000}"
 SH_TIMEOUT_MS="${SH_TIMEOUT_MS:-30000}"
+read -r -a POSIXTESTSUITE_EXTRA_CFLAGS <<<"${POSIXTESTSUITE_CFLAGS:-}"
+read -r -a POSIXTESTSUITE_SANDBOX_ENV <<<"${POSIXTESTSUITE_SANDBOX_ENV:-}"
+SANDBOX_MEMORY_MB="${SANDBOX_MEMORY_MB:-2048}"
+SANDBOX_MAX_WALL_TIME_MS="${SANDBOX_MAX_WALL_TIME_MS:-300000}"
+SANDBOX_MAX_INPUT_BYTES="${SANDBOX_MAX_INPUT_BYTES:-67108864}"
+SANDBOX_MAX_OUTPUT_BYTES="${SANDBOX_MAX_OUTPUT_BYTES:-67108864}"
+SANDBOX_MAX_WORKSPACE_BYTES="${SANDBOX_MAX_WORKSPACE_BYTES:-1073741824}"
+SANDBOX_MAX_WRITTEN_BYTES_PER_COMMAND="${SANDBOX_MAX_WRITTEN_BYTES_PER_COMMAND:-268435456}"
+SANDBOX_MAX_FILE_COUNT="${SANDBOX_MAX_FILE_COUNT:-100000}"
+SINOMO_HOST_MEMORY_MAX="${SINOMO_HOST_MEMORY_MAX:-12G}"
+SINOMO_HOST_TASKS_MAX="${SINOMO_HOST_TASKS_MAX:-2048}"
+SINOMO_HOST_AS_LIMIT_BYTES="${SINOMO_HOST_AS_LIMIT_BYTES:-unlimited}"
 RESULT_SCOPE_NAME="${POSIXTESTSUITE_SCOPE//[^A-Za-z0-9_.-]/_}"
 RESULT_BASENAME="posixtestsuite-wasix-${RESULT_SCOPE_NAME}-offset-${POSIXTESTSUITE_OFFSET}-limit-${POSIXTESTSUITE_LIMIT}"
 RESULTS_FILE="${RESULTS_FILE:-"${RESULTS_DIR}/${RESULT_BASENAME}.tsv"}"
@@ -54,6 +69,20 @@ if [ -z "${SINOMO_BIN:-}" ]; then
 fi
 export SINOMO_BIN
 SINOMO_CMD=("${SINOMO_BIN}")
+if [ "${SINOMO_HOST_MEMORY_MAX}" != "unlimited" ] && [ "${SINOMO_HOST_MEMORY_MAX}" != "0" ]; then
+    if command -v systemd-run >/dev/null 2>&1; then
+        SINOMO_CMD=(systemd-run --user --scope --quiet -p "MemoryMax=${SINOMO_HOST_MEMORY_MAX}" -p "TasksMax=${SINOMO_HOST_TASKS_MAX}" -- "${SINOMO_BIN}")
+    else
+        echo "warning: systemd-run unavailable; host cgroup memory limit is not enforced" >&2
+    fi
+fi
+if [ "${SINOMO_HOST_AS_LIMIT_BYTES}" != "unlimited" ] && [ "${SINOMO_HOST_AS_LIMIT_BYTES}" != "0" ]; then
+    if command -v prlimit >/dev/null 2>&1; then
+        SINOMO_CMD=(prlimit "--as=${SINOMO_HOST_AS_LIMIT_BYTES}" -- "${SINOMO_BIN}")
+    else
+        echo "warning: prlimit unavailable; host address-space limit is not enforced" >&2
+    fi
+fi
 
 cleanup() {
     if [ "${KEEP_SANDBOX}" != "1" ]; then
@@ -66,10 +95,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ "${POSIXTESTSUITE_COMPILE_MODE}" != "host" ] && [ "${POSIXTESTSUITE_COMPILE_MODE}" != "sandbox" ]; then
+    echo "POSIXTESTSUITE_COMPILE_MODE must be 'host' or 'sandbox'" >&2
+    exit 1
+fi
+
 if [ ! -f "${CLANG_OUTDIR}/package.json" ]; then
     echo "Clang package manifest missing: ${CLANG_OUTDIR}/package.json" >&2
     echo "Run crates/sinomo-sandbox/toolchains/build-tools/verify-clang-wasix.sh first, or set CLANG_OUTDIR." >&2
     exit 1
+fi
+
+if [ "${POSIXTESTSUITE_COMPILE_MODE}" = "host" ]; then
+    HOST_ENV_CANDIDATE="${POSIXTESTSUITE_HOST_ENV:-"${TARGET_DIR}/sinomo-build-tools-verify-wasix-sysroot-work/package/host-env.sh"}"
+    if [ -f "${HOST_ENV_CANDIDATE}" ]; then
+        # shellcheck disable=SC1090
+        source "${HOST_ENV_CANDIDATE}"
+        POSIXTESTSUITE_HOST_CC_BIN="${POSIXTESTSUITE_HOST_CC_BIN:-"${SINOMO_WASI_SDK}/bin/clang"}"
+        POSIXTESTSUITE_HOST_SYSROOT="${POSIXTESTSUITE_HOST_SYSROOT:-"${SINOMO_WASIX_SYSROOT}"}"
+    fi
+    if [ -z "${POSIXTESTSUITE_HOST_CC_BIN}" ] && [ -n "${WASI_SDK:-}" ]; then
+        POSIXTESTSUITE_HOST_CC_BIN="${WASI_SDK}/bin/clang"
+    fi
+    if [ -z "${POSIXTESTSUITE_HOST_CC_BIN}" ]; then
+        POSIXTESTSUITE_HOST_CC_BIN="$(find "${TARGET_DIR}" -maxdepth 4 \( -type f -o -type l \) -path '*/wasi-sdk-*/bin/clang' -executable 2>/dev/null | sort | head -n 1 || true)"
+    fi
+    if [ -z "${POSIXTESTSUITE_HOST_CC_BIN}" ] || [ ! -x "${POSIXTESTSUITE_HOST_CC_BIN}" ]; then
+        echo "host compile mode requires POSIXTESTSUITE_HOST_CC_BIN or WASI_SDK/bin/clang" >&2
+        exit 1
+    fi
+    if [ ! -f "${POSIXTESTSUITE_HOST_SYSROOT}/include/unistd.h" ] ||
+        [ ! -f "${POSIXTESTSUITE_HOST_SYSROOT}/lib/wasm32-wasi/libc.a" ]; then
+        echo "host compile mode requires a prepared WASIX sysroot: ${POSIXTESTSUITE_HOST_SYSROOT}" >&2
+        exit 1
+    fi
 fi
 
 fetch_posixtestsuite() {
@@ -155,6 +214,20 @@ sanitize_test_name() {
     printf '%s' "${name}"
 }
 
+stage_c_test_companions() {
+    local test_path="$1"
+    local test_dir="${test_path%/*}"
+    local file
+    while IFS= read -r file; do
+        env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox write "${SANDBOX_ID}" \
+            "/work/posixtestsuite/${file}" \
+            --file "${POSIXTESTSUITE_WORKDIR}/${file}" >/dev/null
+    done < <(
+        git -C "${POSIXTESTSUITE_WORKDIR}" ls-tree -r --name-only HEAD "${test_dir}" |
+            rg "\.(c|h)$"
+    )
+}
+
 fetch_posixtestsuite
 mkdir -p "${RESULTS_DIR}" "${SINOMO_VERIFY_TMPDIR}/posixtestsuite-logs"
 printf 'path\tphase\tresult\tdetail\n' >"${RESULTS_FILE}"
@@ -162,6 +235,7 @@ printf 'path\tphase\tresult\tdetail\n' >"${RESULTS_FILE}"
 mapfile -t C_TESTS < <(
     git -C "${POSIXTESTSUITE_WORKDIR}" ls-tree -r --name-only HEAD |
         rg '^(conformance|functional|stress)/.*\.c$' |
+        rg -v '/(testfrmw|threads_scenarii)\.c$' |
         sort
 )
 mapfile -t SH_TESTS < <(
@@ -209,7 +283,12 @@ if [ "${POSIXTESTSUITE_LIMIT}" != "0" ]; then
 fi
 
 echo "verifying Clang package manifest"
-"${SINOMO_CMD[@]}" sandbox toolchain verify-package "${CLANG_OUTDIR}/package.json" >/dev/null
+if [ "${POSIXTESTSUITE_COMPILE_MODE}" = "sandbox" ]; then
+    "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${CLANG_OUTDIR}/package.json" >/dev/null
+else
+    echo "using host WASIX compiler: ${POSIXTESTSUITE_HOST_CC_BIN}"
+    echo "using host WASIX sysroot: ${POSIXTESTSUITE_HOST_SYSROOT}"
+fi
 if [ "${POSIXTESTSUITE_RUN_SHELL}" = "1" ] &&
     [ "${#SH_TESTS[@]}" -gt 0 ] &&
     [ -f "${BUSYBOX_OUTDIR}/package.json" ] &&
@@ -222,17 +301,24 @@ else
 fi
 
 echo "using disposable SINOMO_DATA_DIR=${SINOMO_VERIFY_DATA_DIR}"
+echo "sandbox limits: memory=${SANDBOX_MEMORY_MB}MiB wall=${SANDBOX_MAX_WALL_TIME_MS}ms input=${SANDBOX_MAX_INPUT_BYTES}B output=${SANDBOX_MAX_OUTPUT_BYTES}B workspace=${SANDBOX_MAX_WORKSPACE_BYTES}B written-per-command=${SANDBOX_MAX_WRITTEN_BYTES_PER_COMMAND}B files=${SANDBOX_MAX_FILE_COUNT}"
+echo "host limits: cgroup-memory=${SINOMO_HOST_MEMORY_MAX} cgroup-tasks=${SINOMO_HOST_TASKS_MAX} address-space=${SINOMO_HOST_AS_LIMIT_BYTES}"
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox policy set \
     --allow-unsigned-toolchains \
-    --max-memory-mb 2048 \
-    --max-wall-time-ms unlimited \
-    --max-workspace-bytes unlimited \
-    --max-written-bytes-per-command unlimited \
+    --max-memory-mb "${SANDBOX_MEMORY_MB}" \
+    --max-wall-time-ms "${SANDBOX_MAX_WALL_TIME_MS}" \
+    --max-input-bytes "${SANDBOX_MAX_INPUT_BYTES}" \
+    --max-output-bytes "${SANDBOX_MAX_OUTPUT_BYTES}" \
+    --max-workspace-bytes "${SANDBOX_MAX_WORKSPACE_BYTES}" \
+    --max-written-bytes-per-command "${SANDBOX_MAX_WRITTEN_BYTES_PER_COMMAND}" \
+    --max-file-count "${SANDBOX_MAX_FILE_COUNT}" \
     --allow-capability child-process-exec \
     --allow-capability wasix.unpinned-child-exec \
     --allow-toolchain "${TOOLCHAIN_ID}" >/dev/null 2>&1 || true
 
-env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox toolchain import-package --into "${TOOLCHAIN_ID}" "${CLANG_OUTDIR}/package.json" >/dev/null
+if [ "${POSIXTESTSUITE_COMPILE_MODE}" = "sandbox" ]; then
+    env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox toolchain import-package --into "${TOOLCHAIN_ID}" "${CLANG_OUTDIR}/package.json" >/dev/null
+fi
 if [ "${HAVE_SHELL_TOOLCHAIN}" = "1" ]; then
     env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox toolchain import-package --into "${TOOLCHAIN_ID}" "${BUSYBOX_OUTDIR}/package.json" >/dev/null
     env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox toolchain import-package --into "${TOOLCHAIN_ID}" "${BASH_OUTDIR}/package.json" >/dev/null
@@ -240,10 +326,17 @@ fi
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox create \
     --id "${SANDBOX_ID}" \
     --toolchain "${TOOLCHAIN_ID}" \
-    --memory-mb 2048 \
-    --max-workspace-bytes unlimited \
-    --max-written-bytes-per-command unlimited \
-    --max-file-count unlimited >/dev/null
+    --memory-mb "${SANDBOX_MEMORY_MB}" \
+    --wall-time-ms "${SANDBOX_MAX_WALL_TIME_MS}" \
+    --max-input-bytes "${SANDBOX_MAX_INPUT_BYTES}" \
+    --max-output-bytes "${SANDBOX_MAX_OUTPUT_BYTES}" \
+    --max-workspace-bytes "${SANDBOX_MAX_WORKSPACE_BYTES}" \
+    --max-written-bytes-per-command "${SANDBOX_MAX_WRITTEN_BYTES_PER_COMMAND}" \
+    --max-file-count "${SANDBOX_MAX_FILE_COUNT}" >/dev/null
+
+for sandbox_env in "${POSIXTESTSUITE_SANDBOX_ENV[@]}"; do
+    env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox config "${SANDBOX_ID}" --env "${sandbox_env}" >/dev/null
+done
 
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox write "${SANDBOX_ID}" /work/posixtestsuite/include/posixtest.h \
     --file "${POSIXTESTSUITE_WORKDIR}/include/posixtest.h" >/dev/null
@@ -264,12 +357,56 @@ for test_path in "${C_TESTS[@]}"; do
     log_prefix="${SINOMO_VERIFY_TMPDIR}/posixtestsuite-logs/${test_name}"
 
     env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox write "${SANDBOX_ID}" "${guest_source}" --file "${source_path}" >/dev/null
-    if rg -q '\bmain[[:space:]]*\(' "${source_path}"; then
-        if run_sandbox_capture "${log_prefix}.build" sandbox run "${SANDBOX_ID}" \
+    stage_c_test_companions "${test_path}"
+    if rg -q '\bmain[[:space:]]*\(|^[[:space:]]*#[[:space:]]+define[[:space:]]+STD_MAIN\b' "${source_path}"; then
+        if [ "${POSIXTESTSUITE_COMPILE_MODE}" = "host" ]; then
+            if "${POSIXTESTSUITE_HOST_CC_BIN}" \
+                --target=wasm32-wasi \
+                --sysroot="${POSIXTESTSUITE_HOST_SYSROOT}" \
+                -matomics \
+                -mbulk-memory \
+                -mmutable-globals \
+                -pthread \
+                -mthread-model posix \
+                -D_WASI_EMULATED_MMAN \
+                "${source_path}" \
+                "${POSIXTESTSUITE_EXTRA_CFLAGS[@]}" \
+                -I"${POSIXTESTSUITE_WORKDIR}/include" \
+                -I"${POSIXTESTSUITE_WORKDIR}/${test_path%/*}" \
+                -lwasi-emulated-mman \
+                -Wl,--export-all \
+                -Wl,--export-dynamic \
+                -Wl,--shared-memory \
+                -Wl,--import-memory \
+                -Wl,--extra-features=atomics \
+                -Wl,--extra-features=bulk-memory \
+                -Wl,--extra-features=mutable-globals \
+                -Wl,--export=__wasm_call_ctors \
+                -Wl,--export=__wasm_init_tls \
+                -Wl,--export=__wasm_signal \
+                -Wl,--export-if-defined=__indirect_function_table \
+                -Wl,--export-if-defined=__stack_pointer \
+                -Wl,--export-if-defined=__heap_base \
+                -Wl,--export-if-defined=__data_end \
+                -Wl,-z,stack-size=1048576 \
+                -Wl,--initial-memory=67108864 \
+                -Wl,--max-memory=268435456 \
+                -o "${host_wasm}" \
+                >"${log_prefix}.build.stdout" \
+                2>"${log_prefix}.build.stderr"; then
+                write_result "${test_path}" "compile" "PASS"
+                write_result "${test_path}" "link" "PASS"
+            else
+                detail="$(last_detail "${log_prefix}.build.stderr")"
+                write_result "${test_path}" "compile" "FAIL" "${detail}"
+                write_result "${test_path}" "link" "FAIL" "${detail}"
+                continue
+            fi
+        elif run_sandbox_capture "${log_prefix}.build" sandbox run "${SANDBOX_ID}" \
             --timeout-ms "${LINK_TIMEOUT_MS}" \
             --allow-capability child-process-exec \
             --allow-capability wasix.unpinned-child-exec \
-            clang -- "${guest_source}" -I/work/posixtestsuite/include -o "${guest_wasm}"; then
+            clang -- "${guest_source}" "${POSIXTESTSUITE_EXTRA_CFLAGS[@]}" -I/work/posixtestsuite/include -I"/work/posixtestsuite/${test_path%/*}" -o "${guest_wasm}"; then
             write_result "${test_path}" "compile" "PASS"
             write_result "${test_path}" "link" "PASS"
         else
@@ -279,7 +416,9 @@ for test_path in "${C_TESTS[@]}"; do
             continue
         fi
 
-        env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox cat "${SANDBOX_ID}" "${guest_wasm}" >"${host_wasm}"
+        if [ "${POSIXTESTSUITE_COMPILE_MODE}" = "sandbox" ]; then
+            env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox cat "${SANDBOX_ID}" "${guest_wasm}" >"${host_wasm}"
+        fi
         if run_sandbox_capture "${log_prefix}.run" sandbox run "${SANDBOX_ID}" \
             --timeout-ms "${RUN_TIMEOUT_MS}" \
             --wasm "${host_wasm}"; then
@@ -298,11 +437,54 @@ for test_path in "${C_TESTS[@]}"; do
         cp "${source_path}" "${host_wrapper}"
         printf '\nint main(void) { return 0; }\n' >>"${host_wrapper}"
         env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox write "${SANDBOX_ID}" "${guest_wrapper}" --file "${host_wrapper}" >/dev/null
-        if run_sandbox_capture "${log_prefix}.build" sandbox run "${SANDBOX_ID}" \
+        if [ "${POSIXTESTSUITE_COMPILE_MODE}" = "host" ]; then
+            if "${POSIXTESTSUITE_HOST_CC_BIN}" \
+                --target=wasm32-wasi \
+                --sysroot="${POSIXTESTSUITE_HOST_SYSROOT}" \
+                -matomics \
+                -mbulk-memory \
+                -mmutable-globals \
+                -pthread \
+                -mthread-model posix \
+                -D_WASI_EMULATED_MMAN \
+                "${host_wrapper}" \
+                "${POSIXTESTSUITE_EXTRA_CFLAGS[@]}" \
+                -I"${POSIXTESTSUITE_WORKDIR}/include" \
+                -I"${POSIXTESTSUITE_WORKDIR}/${test_path%/*}" \
+                -lwasi-emulated-mman \
+                -Wl,--export-all \
+                -Wl,--export-dynamic \
+                -Wl,--shared-memory \
+                -Wl,--import-memory \
+                -Wl,--extra-features=atomics \
+                -Wl,--extra-features=bulk-memory \
+                -Wl,--extra-features=mutable-globals \
+                -Wl,--export=__wasm_call_ctors \
+                -Wl,--export=__wasm_init_tls \
+                -Wl,--export=__wasm_signal \
+                -Wl,--export-if-defined=__indirect_function_table \
+                -Wl,--export-if-defined=__stack_pointer \
+                -Wl,--export-if-defined=__heap_base \
+                -Wl,--export-if-defined=__data_end \
+                -Wl,-z,stack-size=1048576 \
+                -Wl,--initial-memory=67108864 \
+                -Wl,--max-memory=268435456 \
+                -o "${host_wasm}" \
+                >"${log_prefix}.build.stdout" \
+                2>"${log_prefix}.build.stderr"; then
+                write_result "${test_path}" "compile" "PASS"
+                write_result "${test_path}" "link" "PASS"
+            else
+                detail="$(last_detail "${log_prefix}.build.stderr")"
+                write_result "${test_path}" "compile" "FAIL" "${detail}"
+                write_result "${test_path}" "link" "FAIL" "${detail}"
+                continue
+            fi
+        elif run_sandbox_capture "${log_prefix}.build" sandbox run "${SANDBOX_ID}" \
             --timeout-ms "${LINK_TIMEOUT_MS}" \
             --allow-capability child-process-exec \
             --allow-capability wasix.unpinned-child-exec \
-            clang -- "${guest_wrapper}" -I/work/posixtestsuite/include -o "${guest_wasm}"; then
+            clang -- "${guest_wrapper}" "${POSIXTESTSUITE_EXTRA_CFLAGS[@]}" -I/work/posixtestsuite/include -I"/work/posixtestsuite/${test_path%/*}" -o "${guest_wasm}"; then
             write_result "${test_path}" "compile" "PASS"
             write_result "${test_path}" "link" "PASS"
         else

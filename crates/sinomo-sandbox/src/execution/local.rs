@@ -114,6 +114,8 @@ impl LocalStagedSandboxCommandRunner {
             false,
             true,
             true,
+            true,
+            true,
             Vec::new(),
         )
     }
@@ -149,6 +151,8 @@ impl LocalStagedSandboxCommandRunner {
             false,
             true,
             true,
+            true,
+            true,
             Vec::new(),
         )
     }
@@ -172,6 +176,8 @@ impl LocalStagedSandboxCommandRunner {
         allow_preview1_pinned_subprocesses: bool,
         wasix_pinned_child_exec_only: bool,
         wasix_instruction_metering: bool,
+        wasix_auto_asyncify: bool,
+        wasix_fpcast_emu: bool,
         wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         self.run_module_with_stdin_limits_preopens_output_sink_abi_env_and_pipes(
@@ -191,6 +197,8 @@ impl LocalStagedSandboxCommandRunner {
             allow_preview1_pinned_subprocesses,
             wasix_pinned_child_exec_only,
             wasix_instruction_metering,
+            wasix_auto_asyncify,
+            wasix_fpcast_emu,
             wasix_command_overrides,
             #[cfg(feature = "wasix-runtime")]
             SandboxWasixPipeOptions::default(),
@@ -216,6 +224,8 @@ impl LocalStagedSandboxCommandRunner {
         allow_preview1_pinned_subprocesses: bool,
         wasix_pinned_child_exec_only: bool,
         wasix_instruction_metering: bool,
+        wasix_auto_asyncify: bool,
+        wasix_fpcast_emu: bool,
         wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
         #[cfg(feature = "wasix-runtime")] wasix_pipes: SandboxWasixPipeOptions,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
@@ -238,6 +248,9 @@ impl LocalStagedSandboxCommandRunner {
         wasi_options.allow_preview1_pinned_subprocesses = allow_preview1_pinned_subprocesses;
         wasi_options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
         wasi_options.wasix_instruction_metering = wasix_instruction_metering;
+        wasi_options.wasix_auto_asyncify =
+            target_abi == SandboxWasiAbi::Wasix && wasix_auto_asyncify;
+        wasi_options.wasix_fpcast_emu = target_abi == SandboxWasiAbi::Wasix && wasix_fpcast_emu;
         wasi_options.wasix_command_overrides = wasix_command_overrides;
         #[cfg(feature = "wasix-runtime")]
         {
@@ -547,6 +560,10 @@ impl LocalStagedSandboxCommandRunner {
             .iter()
             .any(|capability| capability == SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY);
         let wasix_instruction_metering = false;
+        let wasix_auto_asyncify = command
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY);
         let (_manifest, layout) = store.load(sandbox_id)?;
         let toolchain_artifacts = load_local_toolchain_artifacts(toolchain_store, &toolchain)?;
         let toolchain_commands = load_local_toolchain_commands(toolchain_store, &toolchain)?;
@@ -582,6 +599,8 @@ impl LocalStagedSandboxCommandRunner {
             allow_preview1_pinned_subprocesses,
             wasix_pinned_child_exec_only,
             wasix_instruction_metering,
+            wasix_auto_asyncify,
+            false,
             wasix_command_overrides,
             #[cfg(feature = "wasix-runtime")]
             wasix_pipes,

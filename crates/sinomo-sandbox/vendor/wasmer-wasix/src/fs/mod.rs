@@ -609,7 +609,9 @@ impl WasiFs {
     }
 
     fn fd_limit(&self) -> WasiFd {
-        self.fd_limit.load(Ordering::SeqCst).min(u64::from(WasiFd::MAX)) as WasiFd
+        self.fd_limit
+            .load(Ordering::SeqCst)
+            .min(u64::from(WasiFd::MAX)) as WasiFd
     }
 
     pub(crate) fn check_fd_index_within_limit(&self, fd: WasiFd) -> Result<(), Errno> {
@@ -1602,7 +1604,9 @@ impl WasiFs {
     }
 
     pub fn fdstat(&self, fd: WasiFd) -> Result<Fdstat, Errno> {
-        if fd != VIRTUAL_ROOT_FD && let Ok(fd_entry) = self.get_fd(fd) {
+        if fd != VIRTUAL_ROOT_FD
+            && let Ok(fd_entry) = self.get_fd(fd)
+        {
             let guard = fd_entry.inode.read();
             let deref = guard.deref();
             return Ok(Fdstat {
@@ -1893,7 +1897,9 @@ impl WasiFs {
                     Err(Errno::Exist)
                 }
             }
-            None => guard.insert_first_free_below(fd, fd_limit).ok_or(Errno::Mfile),
+            None => guard
+                .insert_first_free_below(fd, fd_limit)
+                .ok_or(Errno::Mfile),
         }
     }
 
@@ -1913,26 +1919,26 @@ impl WasiFs {
             .write()
             .unwrap()
             .insert_first_free_after_below(
-            Fd {
-                inner: FdInner {
-                    rights: fd.inner.rights,
-                    rights_inheriting: fd.inner.rights_inheriting,
-                    flags: fd.inner.flags,
-                    offset: fd.inner.offset.clone(),
-                    fd_flags: match cloexec {
-                        None => fd.inner.fd_flags,
-                        Some(cloexec) => {
-                            let mut f = fd.inner.fd_flags;
-                            f.set(Fdflagsext::CLOEXEC, cloexec);
-                            f
-                        }
+                Fd {
+                    inner: FdInner {
+                        rights: fd.inner.rights,
+                        rights_inheriting: fd.inner.rights_inheriting,
+                        flags: fd.inner.flags,
+                        offset: fd.inner.offset.clone(),
+                        fd_flags: match cloexec {
+                            None => fd.inner.fd_flags,
+                            Some(cloexec) => {
+                                let mut f = fd.inner.fd_flags;
+                                f.set(Fdflagsext::CLOEXEC, cloexec);
+                                f
+                            }
+                        },
                     },
+                    open_flags: fd.open_flags,
+                    inode: fd.inode,
+                    is_stdio: fd.is_stdio,
                 },
-                open_flags: fd.open_flags,
-                inode: fd.inode,
-                is_stdio: fd.is_stdio,
-            },
-            min_result_fd,
+                min_result_fd,
                 fd_limit,
             )
             .ok_or(Errno::Mfile)

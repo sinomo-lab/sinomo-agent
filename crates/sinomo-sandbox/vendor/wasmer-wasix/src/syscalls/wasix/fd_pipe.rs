@@ -188,8 +188,8 @@ fn apply_linux_pipe_flags(
     }
     if flags & LINUX_O_CLOEXEC != 0 {
         for fd in [read_fd, write_fd] {
-            let ret = fd_fdflags_set_internal(ctx, fd, Fdflagsext::CLOEXEC)
-                .map_err(|_| Errno::Fault)?;
+            let ret =
+                fd_fdflags_set_internal(ctx, fd, Fdflagsext::CLOEXEC).map_err(|_| Errno::Fault)?;
             if ret != Errno::Success {
                 return Err(ret);
             }

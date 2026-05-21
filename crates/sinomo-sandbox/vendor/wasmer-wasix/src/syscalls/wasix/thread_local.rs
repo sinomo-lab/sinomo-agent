@@ -28,7 +28,10 @@ pub fn thread_local_create<M: MemorySize>(
 /// Destroys a process-global thread-local storage key and clears values for all
 /// live threads in the process.
 #[instrument(level = "trace", skip_all, fields(key), ret)]
-pub fn thread_local_destroy(mut ctx: FunctionEnvMut<'_, WasiEnv>, key: u32) -> Result<Errno, WasiError> {
+pub fn thread_local_destroy(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    key: u32,
+) -> Result<Errno, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
 
     if ctx.data().process.destroy_thread_local_key(key) {

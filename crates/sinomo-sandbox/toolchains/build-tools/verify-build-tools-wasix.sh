@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLCHAINS_ROOT="$(cd "${ROOT}/.." && pwd)"
 REPO_ROOT="$(cd "${ROOT}/../../../.." && pwd)"
+LLVM_VERSION="${LLVM_VERSION:-21.1.6}"
 TARGET_DIR="${TARGET_DIR:-"${REPO_ROOT}/target"}"
 BUSYBOX_WORKDIR="${BUSYBOX_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-busybox-wasix-work"}"
 BUSYBOX_OUTDIR="${BUSYBOX_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-busybox-wasix-out"}"
@@ -15,6 +16,9 @@ TCC_WORKDIR="${TCC_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-tcc-wasix-w
 TCC_OUTDIR="${TCC_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-tcc-wasix-out"}"
 CLANG_WORKDIR="${CLANG_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-clang-wasix-work"}"
 CLANG_OUTDIR="${CLANG_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-clang-wasix-out"}"
+WASIX_SYSROOT_WORKDIR="${WASIX_SYSROOT_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-wasix-sysroot-work"}"
+WASIX_BUILD_SYSROOT="${WASIX_BUILD_SYSROOT:-"${WASIX_SYSROOT_WORKDIR}/build/sysroot"}"
+WASIX_PACKAGE_SYSROOT="${WASIX_PACKAGE_SYSROOT:-"${WASIX_SYSROOT_WORKDIR}/package/sysroot"}"
 if [ -z "${SINOMO_VERIFY_DATA_DIR+x}" ]; then
     SINOMO_VERIFY_DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sinomo-build-tools-wasix-verify.XXXXXX")"
     SINOMO_VERIFY_DATA_DIR_AUTO=1
@@ -81,9 +85,23 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
         "${ROOT}/build-tcc-wasix.sh"
 
     if [ "${VERIFY_CLANG}" = "1" ]; then
-        echo "building Clang/LLVM WASIX package"
-        WORKDIR="${CLANG_WORKDIR}" OUTDIR="${CLANG_OUTDIR}" \
+        echo "preparing Clang build sysroot"
+        WORKDIR="${WASIX_SYSROOT_WORKDIR}/build" \
+            SYSROOT_OUTDIR="${WASIX_BUILD_SYSROOT}" \
+            "${ROOT}/prepare-wasix-sysroot.sh"
+
+        echo "building Clang/LLVM WASIX modules"
+        WORKDIR="${CLANG_WORKDIR}" OUTDIR="${CLANG_OUTDIR}" WASIX_SYSROOT="${WASIX_BUILD_SYSROOT}" \
             "${ROOT}/build-clang-wasix.sh"
+
+        echo "preparing Clang package sysroot"
+        WORKDIR="${WASIX_SYSROOT_WORKDIR}/package" \
+            SYSROOT_OUTDIR="${WASIX_PACKAGE_SYSROOT}" \
+            HOST_ENV_OUT="${WASIX_SYSROOT_WORKDIR}/package/host-env.sh" \
+            "${ROOT}/prepare-wasix-sysroot.sh"
+
+        OUTDIR="${CLANG_OUTDIR}" WASIX_SYSROOT="${WASIX_PACKAGE_SYSROOT}" LLVM_VERSION="${LLVM_VERSION}" \
+            "${ROOT}/package-clang-wasix.sh"
     fi
 fi
 

@@ -1,8 +1,8 @@
 use super::*;
 use crate::os::task::TaskStatus;
-use crate::{VIRTUAL_ROOT_FD, WasiProcess};
-use crate::syscalls::*;
 use crate::syscalls::wasix::default_process_name;
+use crate::syscalls::*;
+use crate::{VIRTUAL_ROOT_FD, WasiProcess};
 
 /// ### `path_open()`
 /// Open file located at the given path
@@ -240,8 +240,8 @@ pub(crate) fn path_open_internal(
 
     let target_rights = match maybe_inode {
         Ok(_) => {
-            let write_permission =
-                adjusted_rights.contains(Rights::FD_WRITE) && fs_rights_base.contains(Rights::FD_WRITE);
+            let write_permission = adjusted_rights.contains(Rights::FD_WRITE)
+                && fs_rights_base.contains(Rights::FD_WRITE);
 
             // append, truncate, and create all require the permission to write
             let (append_permission, truncate_permission, create_permission) = if write_permission {
@@ -395,10 +395,7 @@ pub(crate) fn path_open_internal(
                 relative_path,
             } => {
                 let (base_po_dir, target_path) = if relative_path.is_absolute() {
-                    (
-                        VIRTUAL_ROOT_FD,
-                        relative_path.to_string_lossy().to_string(),
-                    )
+                    (VIRTUAL_ROOT_FD, relative_path.to_string_lossy().to_string())
                 } else {
                     let mut target_path = path_to_symlink.clone();
                     target_path.pop();
@@ -509,12 +506,7 @@ pub(crate) fn path_open_internal(
                         }
 
                         if err == FsError::EntryNotFound {
-                            (
-                                Kind::Buffer {
-                                    buffer: Vec::new(),
-                                },
-                                true,
-                            )
+                            (Kind::Buffer { buffer: Vec::new() }, true)
                         } else {
                             return Ok(Err(fs_error_into_wasi_err(err)));
                         }
@@ -581,7 +573,9 @@ pub(crate) fn path_open_internal(
 fn proc_generated_file(env: &WasiEnv, path: &str) -> Option<Vec<u8>> {
     match path {
         "/proc/sys/kernel/hostname" => Some(format!("{}\n", env.process.hostname()).into_bytes()),
-        "/proc/sys/kernel/domainname" => Some(format!("{}\n", env.process.domainname()).into_bytes()),
+        "/proc/sys/kernel/domainname" => {
+            Some(format!("{}\n", env.process.domainname()).into_bytes())
+        }
         "/proc/self/comm" => Some(format!("{}\n", proc_self_name(env)).into_bytes()),
         "/proc/self/cmdline" => Some(proc_process_cmdline(&env.process)),
         "/proc/self/environ" => Some(proc_process_environ(&env.process)),
@@ -1037,7 +1031,8 @@ fn proc_path_alias_target(
 }
 
 fn proc_thread_self_alias_target(path: &str) -> Option<String> {
-    proc_path_alias_tail(path, "/proc/thread-self").map(|tail| join_virtual_path("/proc/self", tail))
+    proc_path_alias_tail(path, "/proc/thread-self")
+        .map(|tail| join_virtual_path("/proc/self", tail))
 }
 
 fn proc_task_alias_target(process_tids: &[u32], path: &str) -> Option<String> {

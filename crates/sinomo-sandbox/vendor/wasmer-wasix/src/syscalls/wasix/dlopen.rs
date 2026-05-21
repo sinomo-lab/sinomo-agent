@@ -87,8 +87,8 @@ pub(crate) fn write_dl_error<M: MemorySize>(
     let mut buf = vec![0; err_len + 1];
     buf[0..err_len].copy_from_slice(err.as_bytes());
 
-    let err_len_offset = M::Offset::try_from(err_len + 1)
-        .map_err(|_| MemoryAccessError::HeapOutOfBounds)?;
+    let err_len_offset =
+        M::Offset::try_from(err_len + 1).map_err(|_| MemoryAccessError::HeapOutOfBounds)?;
     let mut err_buf = err_buf.slice(memory, err_len_offset)?.access()?;
     err_buf.copy_from_slice(&buf[..]);
 

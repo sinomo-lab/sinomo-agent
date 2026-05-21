@@ -36,6 +36,14 @@ use super::{
     thread::WasiMemoryLayout,
 };
 
+macro_rules! sinomo_debug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// Represents the ID of a sub-process
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WasiProcessId(u32);
@@ -216,9 +224,11 @@ const RLIMIT_MEMLOCK: i32 = 8;
 const RLIMIT_STACK: i32 = 3;
 const RLIMIT_NOFILE: i32 = 7;
 const RLIMIT_NPROC: i32 = 6;
+const DEFAULT_SOFT_TASK_LIMIT: u64 = 64;
 
 fn default_resource_limit(resource: i32, envs: &[Vec<u8>]) -> ProcessResourceLimit {
-    let memory_limit = process_env_u64(envs, "SINOMO_SANDBOX_MEMORY_LIMIT_BYTES", 512 * 1024 * 1024);
+    let memory_limit =
+        process_env_u64(envs, "SINOMO_SANDBOX_MEMORY_LIMIT_BYTES", 512 * 1024 * 1024);
     let wall_time_ms = process_env_u64(envs, "SINOMO_SANDBOX_WALL_TIME_LIMIT_MS", 30_000);
     let wall_time_seconds = if wall_time_ms == RLIM_INFINITY {
         RLIM_INFINITY
@@ -230,7 +240,8 @@ fn default_resource_limit(resource: i32, envs: &[Vec<u8>]) -> ProcessResourceLim
         RLIMIT_CORE => 0,
         RLIMIT_DATA | RLIMIT_RSS | RLIMIT_AS | RLIMIT_MEMLOCK => memory_limit,
         RLIMIT_STACK => 8 * 1024 * 1024,
-        RLIMIT_NOFILE | RLIMIT_NPROC => 1024,
+        RLIMIT_NOFILE => 1024,
+        RLIMIT_NPROC => DEFAULT_SOFT_TASK_LIMIT,
         _ => RLIM_INFINITY,
     };
     let maximum = match resource {
@@ -301,7 +312,7 @@ fn sandbox_resource_limits(
     limits.insert(
         RLIMIT_NPROC,
         ProcessResourceLimit {
-            current: task_limit,
+            current: task_limit.min(DEFAULT_SOFT_TASK_LIMIT),
             maximum: task_limit,
         },
     );
@@ -433,6 +444,9 @@ pub struct WasiProcessInner {
     pub thread_count: u32,
     /// Signals that will be triggered at specific intervals
     pub signal_intervals: HashMap<Signal, WasiSignalInterval>,
+    /// Process-directed signals that could not be delivered because every
+    /// thread had the signal masked when the signal arrived.
+    pub pending_process_signals: Vec<Signal>,
     /// List of all the children spawned from this thread
     pub children: Vec<WasiProcess>,
     /// Guest argument vector for procfs and process introspection.
@@ -762,6 +776,7 @@ impl WasiProcess {
                 threads: Default::default(),
                 thread_count: Default::default(),
                 signal_intervals: Default::default(),
+                pending_process_signals: Default::default(),
                 children: Default::default(),
                 args: Default::default(),
                 envs: Default::default(),
@@ -833,7 +848,11 @@ impl WasiProcess {
 
     pub(crate) fn add_child(&self, child: WasiProcess) {
         let mut inner = self.inner.0.lock().unwrap();
-        if !inner.children.iter().any(|existing| existing.pid == child.pid) {
+        if !inner
+            .children
+            .iter()
+            .any(|existing| existing.pid == child.pid)
+        {
             inner.children.push(child);
         }
     }
@@ -935,7 +954,12 @@ impl WasiProcess {
 
     /// Gets the process ID of the parent process
     pub fn ppid(&self) -> WasiProcessId {
-        self.inner.0.lock().unwrap().parent_pid.unwrap_or(WasiProcessId(0))
+        self.inner
+            .0
+            .lock()
+            .unwrap()
+            .parent_pid
+            .unwrap_or(WasiProcessId(0))
     }
 
     /// Gets the process group ID.
@@ -1017,7 +1041,12 @@ impl WasiProcess {
 
     /// Sets a guest-visible POSIX resource limit override.
     pub fn set_resource_limit(&self, resource: i32, limit: ProcessResourceLimit) {
-        self.inner.0.lock().unwrap().resource_limits.insert(resource, limit);
+        self.inner
+            .0
+            .lock()
+            .unwrap()
+            .resource_limits
+            .insert(resource, limit);
     }
 
     pub fn open_file_descriptor_limit(&self) -> u64 {
@@ -1033,6 +1062,12 @@ impl WasiProcess {
             return false;
         };
         (control_plane.process_count() as u64) >= self.resource_limit(RLIMIT_NPROC).current
+    }
+
+    pub fn task_limit_reached(&self) -> bool {
+        let limit = self.resource_limit(RLIMIT_NPROC).current;
+        let inner = self.inner.0.lock().unwrap();
+        (inner.thread_count as u64).saturating_add(inner.children.len() as u64) >= limit
     }
 
     pub fn record_reaped_child_usage(&self, child: &WasiProcess) {
@@ -1613,7 +1648,9 @@ impl WasiProcess {
                     if self.take_unreported_stopped_signal().is_some() {
                         return TaskStatus::Stopped(signal);
                     }
-                    self.finished.await_status_change_from(TaskStatus::Stopped(signal)).await;
+                    self.finished
+                        .await_status_change_from(TaskStatus::Stopped(signal))
+                        .await;
                 }
                 TaskStatus::Finished(_) | TaskStatus::Signaled { .. } => return current,
                 TaskStatus::Pending | TaskStatus::Running => {
@@ -1682,6 +1719,26 @@ impl WasiProcess {
         signal_process_threads(self, signal);
     }
 
+    pub(crate) fn deliver_process_pending_to_thread(&self, thread: &WasiThread) {
+        let signals = {
+            let mut guard = self.inner.0.lock().unwrap();
+            let mut deliver = Vec::new();
+            guard.pending_process_signals.retain(|signal| {
+                if thread_blocks_signal(thread, *signal) {
+                    true
+                } else {
+                    deliver.push(*signal);
+                    false
+                }
+            });
+            deliver
+        };
+
+        for signal in signals {
+            thread.signal(signal);
+        }
+    }
+
     pub(crate) fn notify_parent_child_status_changed(&self) {
         let Some(parent_pid) = self.inner.0.lock().unwrap().parent_pid else {
             return;
@@ -1706,7 +1763,11 @@ impl WasiProcess {
 
     pub(crate) fn subscribe_status_change(&self, waker: &Waker) {
         let mut guard = self.inner.0.lock().unwrap();
-        if !guard.wakers.iter().any(|existing| existing.will_wake(waker)) {
+        if !guard
+            .wakers
+            .iter()
+            .any(|existing| existing.will_wake(waker))
+        {
             guard.wakers.push(waker.clone());
         }
     }
@@ -2115,7 +2176,10 @@ impl WasiProcess {
                 let inner = self.inner.clone();
                 waits.push(async move {
                     let status = process.join_until_stopped_or_finished().await;
-                    if matches!(status, TaskStatus::Finished(_) | TaskStatus::Signaled { .. }) {
+                    if matches!(
+                        status,
+                        TaskStatus::Finished(_) | TaskStatus::Signaled { .. }
+                    ) {
                         parent.record_reaped_child_usage(&child);
                         let mut inner = inner.0.lock().unwrap();
                         inner.children.retain(|a| a.pid != child.pid);
@@ -2171,7 +2235,10 @@ impl WasiProcess {
                 let inner = self.inner.clone();
                 waits.push(async move {
                     let status = process.join_until_unreported_stopped_or_finished().await;
-                    if matches!(status, TaskStatus::Finished(_) | TaskStatus::Signaled { .. }) {
+                    if matches!(
+                        status,
+                        TaskStatus::Finished(_) | TaskStatus::Signaled { .. }
+                    ) {
                         parent.record_reaped_child_usage(&child);
                         let mut inner = inner.0.lock().unwrap();
                         inner.children.retain(|a| a.pid != child.pid);
@@ -2203,7 +2270,9 @@ impl WasiProcess {
         self.try_join_any_child_matching(|_| true)
     }
 
-    pub fn try_join_any_child_status(&mut self) -> Result<Option<(WasiProcess, TaskStatus)>, Errno> {
+    pub fn try_join_any_child_status(
+        &mut self,
+    ) -> Result<Option<(WasiProcess, TaskStatus)>, Errno> {
         self.try_join_any_child_matching_status(|_| true)
     }
 
@@ -2243,8 +2312,8 @@ impl WasiProcess {
                 inner.children.retain(|existing| existing.pid != child.pid);
                 drop(inner);
                 control_plane.remove_process(child.pid);
-                let code =
-                    join.unwrap_or_else(|e| e.as_exit_code().unwrap_or_else(|| Errno::Canceled.into()));
+                let code = join
+                    .unwrap_or_else(|e| e.as_exit_code().unwrap_or_else(|| Errno::Canceled.into()));
                 return Ok(Some((child.pid, code)));
             }
         }
@@ -2311,8 +2380,14 @@ impl WasiProcess {
 
     /// Terminate the process and all its threads
     pub fn terminate(&self, exit_code: ExitCode) {
+        sinomo_debug!(
+            "sinomo-debug process_terminate pid={} exit_code={}",
+            self.pid().raw(),
+            exit_code.raw()
+        );
         let orphaned_stopped_groups = orphaned_stopped_process_groups_after_exit(self);
         let reparented_children = reparent_live_children_after_exit(self);
+        self.finished.set_finished(Ok(exit_code));
         // FIXME: this is wrong, threads might still be running!
         // Need special logic for the main thread.
         let guard = self.inner.0.lock().unwrap();
@@ -2543,7 +2618,7 @@ fn signal_process_internal(process: &WasiProcess, signal: Signal) {
         }
         guard.reported_stopped_signal = None;
     }
-    signal_process_threads_with_guard(&guard, signal);
+    signal_process_threads_with_mut_guard(&mut guard, signal);
     drop(guard);
     notify_parent_for_signal(process, signal);
 }
@@ -2558,7 +2633,7 @@ fn signal_process_threads(process: &WasiProcess, signal: Signal) {
         }
         guard.reported_stopped_signal = None;
     }
-    signal_process_threads_with_guard(&guard, signal);
+    signal_process_threads_with_mut_guard(&mut guard, signal);
     drop(guard);
     notify_parent_for_signal(process, signal);
 }
@@ -2604,7 +2679,7 @@ fn signal_process_threads_for_inner(process: &LockableWasiProcessInner, signal: 
         }
         guard.reported_stopped_signal = None;
     }
-    signal_process_threads_with_guard(&guard, signal);
+    signal_process_threads_with_mut_guard(&mut guard, signal);
 }
 
 fn notify_parent_for_signal(process: &WasiProcess, signal: Signal) {
@@ -2613,8 +2688,8 @@ fn notify_parent_for_signal(process: &WasiProcess, signal: Signal) {
     }
 }
 
-fn signal_process_threads_with_guard(
-    guard: &MutexGuard<'_, WasiProcessInner>,
+fn signal_process_threads_with_mut_guard(
+    guard: &mut MutexGuard<'_, WasiProcessInner>,
     signal: Signal,
 ) {
     if signal == Signal::Sigkill {
@@ -2631,9 +2706,42 @@ fn signal_process_threads_with_guard(
         }
     }
 
-    for thread in guard.threads.values() {
-        thread.signal(signal);
+    if matches!(signal, Signal::Sigkill | Signal::Sigstop | Signal::Sigcont) {
+        for thread in guard.threads.values() {
+            thread.signal(signal);
+        }
+        return;
     }
+
+    if let Some(thread) = guard
+        .threads
+        .values()
+        .find(|thread| !thread_blocks_signal(thread, signal))
+    {
+        thread.signal(signal);
+    } else if !guard.pending_process_signals.contains(&signal) {
+        guard.pending_process_signals.push(signal);
+    }
+}
+
+fn signal_mask_bit(signal: Signal) -> Option<(u64, u64)> {
+    let sig = signal as u8;
+    if sig == 0 || sig > 128 {
+        return None;
+    }
+    if sig <= 64 {
+        Some((1u64 << (sig - 1), 0))
+    } else {
+        Some((0, 1u64 << (sig - 65)))
+    }
+}
+
+fn thread_blocks_signal(thread: &WasiThread, signal: Signal) -> bool {
+    let Some((low_bit, high_bit)) = signal_mask_bit(signal) else {
+        return false;
+    };
+    let (low, high) = thread.signal_mask();
+    (low & low_bit) != 0 || (high & high_bit) != 0
 }
 
 pub(crate) fn signal_default_terminates(signal: Signal) -> bool {

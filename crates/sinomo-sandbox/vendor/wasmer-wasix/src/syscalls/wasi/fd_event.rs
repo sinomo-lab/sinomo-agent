@@ -80,11 +80,12 @@ pub fn eventfd(
     {
         let env = ctx.data();
         if env.enable_journal {
-            JournalEffector::save_fd_event(&mut ctx, initial_val as u64, event_flags, fd)
-                .map_err(|err| {
+            JournalEffector::save_fd_event(&mut ctx, initial_val as u64, event_flags, fd).map_err(
+                |err| {
                     tracing::error!("failed to save fd_event event - {}", err);
                     WasiError::Exit(ExitCode::from(Errno::Fault))
-                })?;
+                },
+            )?;
         }
     }
 
@@ -745,7 +746,10 @@ fn linux_clock_id(clock_id: i32) -> Option<Snapshot0Clockid> {
     }
 }
 
-fn timerfd_now(ctx: &FunctionEnvMut<'_, WasiEnv>, clock_id: Snapshot0Clockid) -> Result<u64, Errno> {
+fn timerfd_now(
+    ctx: &FunctionEnvMut<'_, WasiEnv>,
+    clock_id: Snapshot0Clockid,
+) -> Result<u64, Errno> {
     let mut now = platform_clock_time_get(clock_id, 1)?;
     {
         let guard = ctx.data().state.clock_offset.lock().unwrap();
@@ -883,13 +887,19 @@ fn write_timer_values<M: MemorySize>(
     }
     let memory = unsafe { ctx.data().memory_view(ctx) };
     value_sec
-        .write(&memory, (value_ns / NANOS_PER_SEC).min(i64::MAX as u64) as i64)
+        .write(
+            &memory,
+            (value_ns / NANOS_PER_SEC).min(i64::MAX as u64) as i64,
+        )
         .map_err(mem_error_to_wasi)?;
     value_nsec
         .write(&memory, (value_ns % NANOS_PER_SEC) as i64)
         .map_err(mem_error_to_wasi)?;
     interval_sec
-        .write(&memory, (interval_ns / NANOS_PER_SEC).min(i64::MAX as u64) as i64)
+        .write(
+            &memory,
+            (interval_ns / NANOS_PER_SEC).min(i64::MAX as u64) as i64,
+        )
         .map_err(mem_error_to_wasi)?;
     interval_nsec
         .write(&memory, (interval_ns % NANOS_PER_SEC) as i64)
@@ -922,13 +932,22 @@ fn write_timeval_values<M: MemorySize>(
     }
     let memory = unsafe { ctx.data().memory_view(ctx) };
     value_sec
-        .write(&memory, (value_ns / NANOS_PER_SEC).min(i64::MAX as u64) as i64)
+        .write(
+            &memory,
+            (value_ns / NANOS_PER_SEC).min(i64::MAX as u64) as i64,
+        )
         .map_err(mem_error_to_wasi)?;
     value_usec
-        .write(&memory, ((value_ns % NANOS_PER_SEC) / NANOS_PER_USEC) as i64)
+        .write(
+            &memory,
+            ((value_ns % NANOS_PER_SEC) / NANOS_PER_USEC) as i64,
+        )
         .map_err(mem_error_to_wasi)?;
     interval_sec
-        .write(&memory, (interval_ns / NANOS_PER_SEC).min(i64::MAX as u64) as i64)
+        .write(
+            &memory,
+            (interval_ns / NANOS_PER_SEC).min(i64::MAX as u64) as i64,
+        )
         .map_err(mem_error_to_wasi)?;
     interval_usec
         .write(

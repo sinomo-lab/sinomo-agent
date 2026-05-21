@@ -1198,6 +1198,7 @@ impl VMInstance {
         data_initializers: &[DataInitializer<'_>],
     ) -> Result<(), Trap> {
         let instance = self.instance_mut();
+        let skip_process_initializers = crate::skip_shared_memory_data_initializers();
 
         // Apply the initializers.
         initialize_tables(instance)?;
@@ -1205,7 +1206,9 @@ impl VMInstance {
 
         // The WebAssembly spec specifies that the start function is
         // invoked automatically at instantiation time.
-        instance.invoke_start_function(config, trap_handler)?;
+        if !skip_process_initializers {
+            instance.invoke_start_function(config, trap_handler)?;
+        }
         Ok(())
     }
 
@@ -1513,6 +1516,10 @@ fn initialize_memories(
 ) -> Result<(), Trap> {
     for init in data_initializers {
         let memory = instance.get_vmmemory(init.location.memory_index);
+        let skip_shared = crate::skip_shared_memory_data_initializers();
+        if skip_shared && memory.ty().shared {
+            continue;
+        }
 
         let start = get_memory_init_start(init, instance);
         unsafe {

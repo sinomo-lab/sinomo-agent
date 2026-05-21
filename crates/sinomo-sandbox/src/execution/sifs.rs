@@ -175,6 +175,8 @@ impl SifsStagedSandboxCommandRunner {
             false,
             true,
             true,
+            true,
+            true,
             Vec::new(),
         )
     }
@@ -200,6 +202,8 @@ impl SifsStagedSandboxCommandRunner {
         allow_preview1_pinned_subprocesses: bool,
         wasix_pinned_child_exec_only: bool,
         wasix_instruction_metering: bool,
+        wasix_auto_asyncify: bool,
+        wasix_fpcast_emu: bool,
         wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
     ) -> Result<SifsStagedSandboxCommandOutcome<T>, SandboxCommandExecutionError> {
         let mut sifs_store = self.sifs_instance_store(dfs);
@@ -247,6 +251,8 @@ impl SifsStagedSandboxCommandRunner {
                 allow_preview1_pinned_subprocesses,
                 wasix_pinned_child_exec_only,
                 wasix_instruction_metering,
+                wasix_auto_asyncify,
+                wasix_fpcast_emu,
                 wasix_command_overrides,
             );
         sync_rw_sifs_mounts_from_local(
@@ -394,6 +400,10 @@ impl SifsStagedSandboxCommandRunner {
             .iter()
             .any(|capability| capability == SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY);
         let wasix_instruction_metering = false;
+        let wasix_auto_asyncify = command
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY);
         let wasix_command_overrides = toolchain
             .commands
             .values()
@@ -429,6 +439,8 @@ impl SifsStagedSandboxCommandRunner {
                 .any(|capability| capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY),
             wasix_pinned_child_exec_only,
             wasix_instruction_metering,
+            wasix_auto_asyncify,
+            false,
             wasix_command_overrides,
         )
     }

@@ -1,7 +1,20 @@
-use std::task::Waker;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    task::Waker,
+};
 
 use super::*;
 use crate::syscalls::*;
+
+macro_rules! sinomo_debug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+static FUTEX_TIMEOUT_DEBUG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Poller returns true if its triggered and false if it times out
 struct FutexPoller {
@@ -28,6 +41,11 @@ impl Future for FutexPoller {
         let mut guard = self.state.futexs.lock().unwrap();
         if guard.woken_pollers.remove(&self.poller_idx) {
             guard.poller_futexes.remove(&self.poller_idx);
+            sinomo_debug!(
+                "sinomo-debug futex_wait wake poller={} futex={:#x}",
+                self.poller_idx,
+                self.futex_idx
+            );
             return Poll::Ready(true);
         }
 
@@ -41,11 +59,25 @@ impl Future for FutexPoller {
         // woken by a wake call
         let futex = match guard.futexes.get_mut(&futex_idx) {
             Some(f) => f,
-            None => return Poll::Ready(true),
+            None => {
+                sinomo_debug!(
+                    "sinomo-debug futex_wait missing-futex poller={} futex={:#x}",
+                    self.poller_idx,
+                    futex_idx
+                );
+                return Poll::Ready(true);
+            }
         };
         let waker = match futex.wakers.get_mut(&self.poller_idx) {
             Some(w) => w,
-            None => return Poll::Ready(true),
+            None => {
+                sinomo_debug!(
+                    "sinomo-debug futex_wait missing-waker poller={} futex={:#x}",
+                    self.poller_idx,
+                    futex_idx
+                );
+                return Poll::Ready(true);
+            }
         };
 
         // Register the waker
@@ -57,6 +89,15 @@ impl Future for FutexPoller {
             let timeout = timeout.as_mut();
             if timeout.poll(cx).is_ready() {
                 self.timeout.take();
+                let timeout_count = FUTEX_TIMEOUT_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if timeout_count <= 32 || timeout_count % 1000 == 0 {
+                    sinomo_debug!(
+                        "sinomo-debug futex_wait timeout poller={} futex={:#x} count={}",
+                        self.poller_idx,
+                        futex_idx,
+                        timeout_count
+                    );
+                }
                 return Poll::Ready(false);
             }
         }
@@ -217,7 +258,8 @@ pub fn futex_wait_any<M: MemorySize + 'static>(
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let waiter_count_u64: u64 = waiters_len.into();
-    let waiter_count = usize::try_from(waiter_count_u64).map_err(|_| WasiError::Exit(Errno::Overflow.into()))?;
+    let waiter_count =
+        usize::try_from(waiter_count_u64).map_err(|_| WasiError::Exit(Errno::Overflow.into()))?;
     if waiter_count == 0 {
         return Ok(Errno::Inval);
     }
@@ -225,6 +267,9 @@ pub fn futex_wait_any<M: MemorySize + 'static>(
     let timeout = read_optional_timeout::<M>(&memory, timeout)?;
 
     let waiters = read_futex_wait_any_entries::<M>(&memory, waiters, waiter_count)?;
+    let sync_shared = waiters
+        .iter()
+        .any(|waiter| is_registered_shared_futex_offset(env, waiter.futex_idx));
     let state = env.state.clone();
     let poller = {
         let mut guard = env.state.futexs.lock().unwrap();
@@ -250,11 +295,15 @@ pub fn futex_wait_any<M: MemorySize + 'static>(
         }
     };
 
+    if sync_shared {
+        sync_shared_memory_to_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    }
     for waiter in &waiters {
         let futex_ptr = WasmPtr::<u32, M>::new(waiter.futex_offset);
         let val = wasi_try_mem_ok!(futex_ptr.read(&memory));
         if val != waiter.expected {
-            return Ok(Errno::Inval);
+            return Ok(Errno::Again);
         }
     }
     wasi_try_mem_ok!(ret_index.write(&memory, u32::MAX));
@@ -263,6 +312,10 @@ pub fn futex_wait_any<M: MemorySize + 'static>(
     if let AsyncifyAction::Finish(ctx, result) = res {
         let env = ctx.data();
         let memory = unsafe { env.memory_view(&ctx) };
+        if sync_shared {
+            sync_shared_memory_to_guest::<M>(env, &memory)
+                .map_err(|err| WasiError::Exit(err.into()))?;
+        }
         let index = result.unwrap_or(u32::MAX);
         wasi_try_mem_ok!(ret_index.write(&memory, index));
     }
@@ -298,6 +351,12 @@ pub(super) fn futex_wait_mask_internal<M: MemorySize + 'static>(
     // exit here as it could be the case that we were woken but the
     // expected value does not match
     if let Some(_woken) = unsafe { handle_rewind::<M, bool>(&mut ctx) } {
+        let env = ctx.data();
+        let memory = unsafe { env.memory_view(&ctx) };
+        if is_registered_shared_futex_offset(env, futex_ptr.offset().into()) {
+            sync_shared_memory_to_guest::<M>(env, &memory)
+                .map_err(|err| WasiError::Exit(err.into()))?;
+        }
         // fall through so the normal checks kick in, this will
         // ensure that the expected value has changed before
         // this syscall returns even if it was woken
@@ -313,6 +372,7 @@ pub(super) fn futex_wait_mask_internal<M: MemorySize + 'static>(
 
     let state = env.state.clone();
     let futex_idx: u64 = futex_ptr.offset().into();
+    let sync_shared = is_registered_shared_futex_offset(env, futex_idx);
     Span::current().record("futex_idx", futex_idx);
 
     // We generate a new poller which also registers in the
@@ -344,11 +404,17 @@ pub(super) fn futex_wait_mask_internal<M: MemorySize + 'static>(
         }
     };
 
-    // We check if the expected value has changed
+    // We check if the expected value has changed. POSIX/Linux-shaped futex
+    // waiters use EAGAIN for this race: the caller registered interest, but
+    // the futex became available before the wait actually slept.
     let memory = unsafe { env.memory_view(&ctx) };
+    if sync_shared {
+        sync_shared_memory_to_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    }
     let val = wasi_try_mem_ok!(futex_ptr.read(&memory));
     if val != expected {
-        return Ok(Errno::Inval);
+        return Ok(Errno::Again);
     }
 
     // We clear the woken flag (so if the poller fails to trigger
@@ -356,9 +422,13 @@ pub(super) fn futex_wait_mask_internal<M: MemorySize + 'static>(
     wasi_try_mem_ok!(ret_woken.write(&memory, Bool::False));
 
     tracing::trace!("wait on {futex_idx}");
-    let res = blocking_wait_futex(poller, timeout);
+    let res = wasi_try_ok!(__asyncify(&mut ctx, None, async move { Ok(poller.await) })?);
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
+    if sync_shared {
+        sync_shared_memory_to_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    }
     if res {
         wasi_try_mem_ok!(ret_woken.write(&memory, Bool::True));
     } else {
@@ -430,28 +500,4 @@ fn read_optional_timeout<M: MemorySize>(
         OptionTag::Some => Some(Duration::from_nanos(timeout.u)),
         _ => None,
     })
-}
-
-fn blocking_wait_futex(poller: FutexPoller, timeout: Option<Duration>) -> bool {
-    let parking = crate::utils::WasiParkingLot::new(false);
-    {
-        let mut guard = poller.state.futexs.lock().unwrap();
-        if guard.woken_pollers.remove(&poller.poller_idx) {
-            guard.poller_futexes.remove(&poller.poller_idx);
-            return true;
-        }
-        let futex_idx = guard
-            .poller_futexes
-            .get(&poller.poller_idx)
-            .copied()
-            .unwrap_or(poller.futex_idx);
-        let Some(futex) = guard.futexes.get_mut(&futex_idx) else {
-            return true;
-        };
-        let Some(waker) = futex.wakers.get_mut(&poller.poller_idx) else {
-            return true;
-        };
-        waker.replace(parking.get_waker());
-    }
-    parking.wait(timeout.unwrap_or(Duration::from_secs(3600 * 24 * 365 * 10)))
 }

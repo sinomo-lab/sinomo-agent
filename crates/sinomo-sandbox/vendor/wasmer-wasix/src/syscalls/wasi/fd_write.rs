@@ -1,13 +1,13 @@
 use std::task::Waker;
 
 use super::*;
-use virtual_fs::DeviceFile;
 #[cfg(feature = "journal")]
 use crate::{
     journal::{JournalEffector, JournalEntry},
     utils::map_snapshot_err,
 };
 use crate::{net::socket::TimeType, syscalls::*};
+use virtual_fs::DeviceFile;
 
 /// ### `fd_write()`
 /// Write data to the file descriptor
@@ -263,12 +263,11 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                                 &mut file_size_remaining,
                                                 written,
                                             )?;
-                                            let local_written =
-                                                match handle.write(buf).await {
-                                                    Ok(s) => s,
-                                                    Err(_) if written > 0 => break,
-                                                    Err(err) => return Err(map_io_err(err)),
-                                                };
+                                            let local_written = match handle.write(buf).await {
+                                                Ok(s) => s,
+                                                Err(_) if written > 0 => break,
+                                                Err(err) => return Err(map_io_err(err)),
+                                            };
                                             written += local_written;
                                             if local_written != buf.len() {
                                                 break;
@@ -549,8 +548,10 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                     if fd_flags.contains(Fdflags::APPEND) {
                         offset = buffer.len() as u64;
                     }
-                    let mut file_size_remaining =
-                        Some(file_size_write_remaining(env.process.file_size_limit(), offset));
+                    let mut file_size_remaining = Some(file_size_write_remaining(
+                        env.process.file_size_limit(),
+                        offset,
+                    ));
                     let write_offset: usize =
                         wasi_try_ok_ok!(offset.try_into().map_err(|_| Errno::Overflow));
                     if write_offset > buffer.len() {

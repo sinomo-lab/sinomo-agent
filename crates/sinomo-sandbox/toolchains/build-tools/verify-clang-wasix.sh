@@ -3,9 +3,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${ROOT}/../../../.." && pwd)"
+LLVM_VERSION="${LLVM_VERSION:-21.1.6}"
 TARGET_DIR="${TARGET_DIR:-"${REPO_ROOT}/target"}"
 CLANG_WORKDIR="${CLANG_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-clang-wasix-work"}"
 CLANG_OUTDIR="${CLANG_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-clang-wasix-out"}"
+WASIX_SYSROOT_WORKDIR="${WASIX_SYSROOT_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-wasix-sysroot-work"}"
+WASIX_BUILD_SYSROOT="${WASIX_BUILD_SYSROOT:-"${WASIX_SYSROOT_WORKDIR}/build/sysroot"}"
+WASIX_PACKAGE_SYSROOT="${WASIX_PACKAGE_SYSROOT:-"${WASIX_SYSROOT_WORKDIR}/package/sysroot"}"
 SINOMO_VERIFY_TMPDIR="${SINOMO_VERIFY_TMPDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-clang-wasix-tmp"}"
 if [ -z "${SINOMO_VERIFY_DATA_DIR+x}" ]; then
     mkdir -p "${SINOMO_VERIFY_TMPDIR}"
@@ -47,9 +51,23 @@ cleanup() {
 trap cleanup EXIT
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-    echo "building Clang/LLVM WASIX package"
-    WORKDIR="${CLANG_WORKDIR}" OUTDIR="${CLANG_OUTDIR}" \
+    echo "preparing Clang build sysroot"
+    WORKDIR="${WASIX_SYSROOT_WORKDIR}/build" \
+        SYSROOT_OUTDIR="${WASIX_BUILD_SYSROOT}" \
+        "${ROOT}/prepare-wasix-sysroot.sh"
+
+    echo "building Clang/LLVM WASIX modules"
+    WORKDIR="${CLANG_WORKDIR}" OUTDIR="${CLANG_OUTDIR}" WASIX_SYSROOT="${WASIX_BUILD_SYSROOT}" \
         "${ROOT}/build-clang-wasix.sh"
+
+    echo "preparing Clang package sysroot"
+    WORKDIR="${WASIX_SYSROOT_WORKDIR}/package" \
+        SYSROOT_OUTDIR="${WASIX_PACKAGE_SYSROOT}" \
+        HOST_ENV_OUT="${WASIX_SYSROOT_WORKDIR}/package/host-env.sh" \
+        "${ROOT}/prepare-wasix-sysroot.sh"
+
+    OUTDIR="${CLANG_OUTDIR}" WASIX_SYSROOT="${WASIX_PACKAGE_SYSROOT}" LLVM_VERSION="${LLVM_VERSION}" \
+        "${ROOT}/package-clang-wasix.sh"
 fi
 
 if [ ! -f "${CLANG_OUTDIR}/package.json" ]; then

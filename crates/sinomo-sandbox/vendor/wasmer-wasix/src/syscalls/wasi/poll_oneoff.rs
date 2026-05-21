@@ -316,9 +316,10 @@ where
                                 .flags
                                 .contains(Subclockflags::SUBSCRIPTION_CLOCK_ABSTIME)
                             {
-                                let now =
-                                    wasi_try_ok!(platform_clock_time_get(clock_info.clock_id.into(), 1))
-                                        as u64;
+                                let now = wasi_try_ok!(platform_clock_time_get(
+                                    clock_info.clock_id.into(),
+                                    1
+                                )) as u64;
 
                                 if clock_info.timeout <= now {
                                     Duration::ZERO

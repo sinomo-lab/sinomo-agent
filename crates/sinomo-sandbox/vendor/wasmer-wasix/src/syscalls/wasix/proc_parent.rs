@@ -1,4 +1,4 @@
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::{Ordering, fence};
 
 use super::*;
 use crate::WasiProcess;
@@ -238,8 +238,8 @@ pub fn proc_get_name<M: MemorySize>(
         .unwrap_or_else(|| default_process_name(&env.process));
     let memory = unsafe { env.memory_view(&ctx) };
     let ret_name_len_u64: u64 = ret_name_len.into();
-    let len = usize::try_from(ret_name_len_u64)
-        .map_err(|_| WasiError::Exit(Errno::Overflow.into()))?;
+    let len =
+        usize::try_from(ret_name_len_u64).map_err(|_| WasiError::Exit(Errno::Overflow.into()))?;
     if len == 0 {
         return Ok(Errno::Success);
     }
@@ -306,8 +306,8 @@ pub fn proc_get_uts_name<M: MemorySize>(
     };
     let memory = unsafe { env.memory_view(&ctx) };
     let ret_name_len_u64: u64 = ret_name_len.into();
-    let len = usize::try_from(ret_name_len_u64)
-        .map_err(|_| WasiError::Exit(Errno::Overflow.into()))?;
+    let len =
+        usize::try_from(ret_name_len_u64).map_err(|_| WasiError::Exit(Errno::Overflow.into()))?;
     if len == 0 {
         return Ok(Errno::Success);
     }
@@ -490,10 +490,7 @@ pub fn proc_set_clear_child_tid(
 /// Linux-shaped clear-child-TID registration. Stores the clear-child-TID
 /// address for the calling thread and returns the caller's thread id.
 #[instrument(level = "trace", skip_all, fields(address), ret)]
-pub fn set_tid_address(
-    ctx: FunctionEnvMut<'_, WasiEnv>,
-    address: u64,
-) -> Result<i32, WasiError> {
+pub fn set_tid_address(ctx: FunctionEnvMut<'_, WasiEnv>, address: u64) -> Result<i32, WasiError> {
     let tid = ctx.data().thread.tid().raw();
     let errno = proc_set_clear_child_tid(ctx, address)?;
     if errno == Errno::Success {
@@ -849,8 +846,7 @@ const SUPPORTED_SETNS_FLAGS: u64 = CLONE_NEWNS
     | CLONE_NEWUSER
     | CLONE_NEWPID
     | CLONE_NEWNET;
-const SUPPORTED_UNSHARE_FLAGS: u64 =
-    CLONE_FS | CLONE_FILES | CLONE_SYSVSEM | SUPPORTED_SETNS_FLAGS;
+const SUPPORTED_UNSHARE_FLAGS: u64 = CLONE_FS | CLONE_FILES | CLONE_SYSVSEM | SUPPORTED_SETNS_FLAGS;
 
 fn namespaces_for_clone_flags(flags: u64) -> Vec<&'static str> {
     let mut namespaces = Vec::new();

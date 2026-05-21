@@ -33,6 +33,7 @@ mod vmcontext;
 
 pub mod libcalls;
 
+use std::cell::Cell;
 use std::ptr::NonNull;
 
 pub use crate::exception::{VMExceptionObj, VMExceptionRef};
@@ -72,6 +73,31 @@ pub use wasmer_types::{StoreId, TargetSharedSignatureIndex, VMBuiltinFunctionInd
 
 /// Version number of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+thread_local! {
+    static SKIP_SHARED_MEMORY_DATA_INITIALIZERS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` while suppressing active data initializers for shared memories.
+///
+/// WASIX creates fresh instances for pthreads while importing the process
+/// shared memory. Re-applying active data segments during those secondary
+/// instantiations rewrites process memory and violates POSIX thread semantics.
+pub fn with_skipped_shared_memory_data_initializers<T>(f: impl FnOnce() -> T) -> T {
+    let previous = SKIP_SHARED_MEMORY_DATA_INITIALIZERS.with(|flag| flag.replace(true));
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SKIP_SHARED_MEMORY_DATA_INITIALIZERS.with(|flag| flag.set(self.0));
+        }
+    }
+    let _guard = Guard(previous);
+    f()
+}
+
+pub(crate) fn skip_shared_memory_data_initializers() -> bool {
+    SKIP_SHARED_MEMORY_DATA_INITIALIZERS.with(Cell::get)
+}
 
 /// Pointers to section data.
 #[derive(Clone, Copy, Debug)]

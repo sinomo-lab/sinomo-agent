@@ -16,7 +16,11 @@ pub fn path_remove_directory<M: MemorySize>(
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
     let base_dir = wasi_try_ok!(state.fs.get_fd(fd));
-    if !base_dir.inner.rights.contains(Rights::PATH_REMOVE_DIRECTORY) {
+    if !base_dir
+        .inner
+        .rights
+        .contains(Rights::PATH_REMOVE_DIRECTORY)
+    {
         return Ok(Errno::Access);
     }
     let path_str = unsafe { get_input_str_ok!(&memory, path, path_len) };

@@ -19,6 +19,11 @@ pub fn futex_wake_all<M: MemorySize>(
     let state = env.state.deref();
 
     let pointer: u64 = futex_ptr.offset().into();
+    let sync_shared = is_registered_shared_futex_offset(env, pointer);
+    if sync_shared {
+        sync_shared_memory_range_from_guest::<M>(env, &memory, pointer, 4)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    }
     //Span::current().record("futex_idx", pointer);
 
     let woken = {

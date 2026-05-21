@@ -47,16 +47,14 @@ pub fn path_readlink<M: MemorySize>(
         .into_iter()
         .map(|thread| thread.raw())
         .collect::<Vec<_>>();
-    if let Some(link_target) =
-        fd_alias_readlink_target(
-            state,
-            Some(&env.process),
-            Some(env.pid().raw()),
-            &process_tids,
-            &processes,
-            &path_str,
-        )
-    {
+    if let Some(link_target) = fd_alias_readlink_target(
+        state,
+        Some(&env.process),
+        Some(env.pid().raw()),
+        &process_tids,
+        &processes,
+        &path_str,
+    ) {
         return write_readlink_target(&memory, buf, buf_len, buf_used, &link_target);
     }
 
@@ -133,7 +131,8 @@ fn fd_alias_readlink_target(
 }
 
 fn proc_thread_self_alias_target(path: &str) -> Option<String> {
-    proc_path_alias_tail(path, "/proc/thread-self").map(|tail| join_virtual_path("/proc/self", tail))
+    proc_path_alias_tail(path, "/proc/thread-self")
+        .map(|tail| join_virtual_path("/proc/self", tail))
 }
 
 fn proc_task_alias_target(process_tids: &[u32], path: &str) -> Option<String> {

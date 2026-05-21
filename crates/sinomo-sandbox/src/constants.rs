@@ -41,7 +41,7 @@ pub const CLANG_TOOLCHAIN_RECIPE: &str =
     "crates/sinomo-sandbox/toolchains/build-tools/build-clang-wasix.sh";
 pub const CLANG_TOOLCHAIN_COMMAND: &str = "clang";
 pub const SANDBOX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
-pub const SANDBOX_WASIX_MAX_TASKS: usize = 64;
+pub const SANDBOX_WASIX_MAX_TASKS: usize = 2048;
 pub const SANDBOX_NETWORK_HTTP_CAPABILITY: &str = "network.http";
 pub const SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY: &str = "child-process-exec";
 pub const SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY: &str = "wasix.asyncified-fork";

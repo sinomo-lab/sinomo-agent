@@ -5,6 +5,9 @@
 
 /.claude/settings.local.json
 
+/crates/sinomo-sandbox/toolchains/**/out-*/
+/crates/sinomo-sandbox/toolchains/**/work-*/
+
 __pycache__/
 *.pyc
 *.pyo

@@ -175,52 +175,75 @@ impl VirtualTaskManager for TokioTaskManager {
         let recycle = task.recycle;
         let env = task.env;
         let pre_run = task.pre_run;
-
-        let make_memory: SpawnMemoryTypeOrStore = match &task.spawn_type {
-            SpawnType::CreateMemory | SpawnType::NewLinkerInstanceGroup(..) => {
-                SpawnMemoryTypeOrStore::New
-            }
-            SpawnType::CreateMemoryOfType(t) => SpawnMemoryTypeOrStore::Type(*t),
-            SpawnType::ShareMemory(_, _) | SpawnType::CopyMemory(_, _) => {
-                let mut store = env.runtime().new_store();
-                let memory = self.build_memory(&mut store.as_store_mut(), &task.spawn_type)?;
-                SpawnMemoryTypeOrStore::StoreAndMemory(store, memory)
-            }
-        };
+        let spawn_type = task.spawn_type;
 
         // This should actually run in the blocking thread, just like the task itself.
         // See the comment below for why we can't do it there yet.
         //
         // For now block_in_place at least ensures that we don't block the async runtime
-        let ret = tokio::task::block_in_place(move || {
-            if let SpawnType::NewLinkerInstanceGroup(
-                linker,
-                func_env,
-                mut store,
-                copy_memory,
-            ) = task.spawn_type
-            {
-                WasiFunctionEnv::new_with_store(
-                    task.module,
-                    env,
-                    task.globals,
-                    make_memory,
-                    task.update_layout,
-                    task.call_initialize,
-                    Some((linker, &mut func_env.into_mut(&mut store), copy_memory)),
-                )
-            } else {
-                WasiFunctionEnv::new_with_store(
-                    task.module,
-                    env,
-                    task.globals,
-                    make_memory,
-                    task.update_layout,
-                    task.call_initialize,
-                    None,
-                )
+        let ret = match spawn_type {
+            SpawnType::NewLinkerInstanceGroup(linker, func_env, mut store, copy_memory) => {
+                tokio::task::block_in_place(move || {
+                    WasiFunctionEnv::new_with_store(
+                        task.module,
+                        env,
+                        task.globals,
+                        SpawnMemoryTypeOrStore::New,
+                        task.update_layout,
+                        task.call_initialize,
+                        Some((linker, &mut func_env.into_mut(&mut store), copy_memory)),
+                    )
+                })
             }
-        });
+            other_spawn_type => {
+                let shared_memory_spawn = matches!(
+                    &other_spawn_type,
+                    SpawnType::ShareMemory(_, _) | SpawnType::StoreAndMemory(_, _)
+                );
+                let make_memory = match other_spawn_type {
+                    SpawnType::CreateMemory => SpawnMemoryTypeOrStore::New,
+                    SpawnType::CreateMemoryOfType(t) => SpawnMemoryTypeOrStore::Type(t),
+                    SpawnType::StoreAndMemory(store, memory) => {
+                        SpawnMemoryTypeOrStore::StoreAndMemory(store, memory)
+                    }
+                    SpawnType::ShareMemory(memory, old_store) => {
+                        let mut store = env.runtime().new_store();
+                        let memory = self.build_memory(
+                            &mut store.as_store_mut(),
+                            &SpawnType::ShareMemory(memory, old_store),
+                        )?;
+                        SpawnMemoryTypeOrStore::StoreAndMemory(store, memory)
+                    }
+                    SpawnType::CopyMemory(memory, old_store) => {
+                        let mut store = env.runtime().new_store();
+                        let memory = self.build_memory(
+                            &mut store.as_store_mut(),
+                            &SpawnType::CopyMemory(memory, old_store),
+                        )?;
+                        SpawnMemoryTypeOrStore::StoreAndMemory(store, memory)
+                    }
+                    SpawnType::NewLinkerInstanceGroup(..) => unreachable!(),
+                };
+                tokio::task::block_in_place(move || {
+                    let instantiate = || {
+                        WasiFunctionEnv::new_with_store(
+                            task.module,
+                            env,
+                            task.globals,
+                            make_memory,
+                            task.update_layout,
+                            task.call_initialize,
+                            None,
+                        )
+                    };
+                    if shared_memory_spawn {
+                        wasmer_vm::with_skipped_shared_memory_data_initializers(instantiate)
+                    } else {
+                        instantiate()
+                    }
+                })
+            }
+        };
 
         if let Some(trigger) = task.trigger {
             tracing::trace!("spawning task_wasm trigger in async pool");

@@ -8,9 +8,9 @@ use crate::{
     fs::{WasiFsRoot, WasiInodes},
     import_object_for_all_wasi_versions,
     os::task::{
+        TaskStatus,
         control_plane::ControlPlaneError,
         process::{WasiProcess, WasiProcessId, signal_default_stops, signal_default_terminates},
-        TaskStatus,
         thread::{WasiMemoryLayout, WasiThread, WasiThreadHandle, WasiThreadId},
     },
     syscalls::{platform_clock_time_get, sync_process_metadata},
@@ -97,11 +97,19 @@ impl WasiEnvInit {
                 inodes,
                 fs,
                 futexs: Default::default(),
+                shared_futex_ranges: Default::default(),
+                shared_mutex_owners: Default::default(),
+                shared_mutex_owner_pids: Default::default(),
+                shared_mutex_depths: Default::default(),
+                shared_cond_sequences: Default::default(),
+                shared_rwlocks: Default::default(),
+                shared_memory_cross_process: Default::default(),
                 pidfds: Default::default(),
                 timerfds: Default::default(),
                 signalfds: Default::default(),
                 posix_timers: Default::default(),
                 interval_timers: Default::default(),
+                shared_memory_mappings: Default::default(),
                 signal_stack: Default::default(),
                 clock_offset: std::sync::Mutex::new(
                     self.state.clock_offset.lock().unwrap().clone(),
@@ -689,7 +697,7 @@ impl WasiEnv {
             .try_inner()
             .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
         let inner = env_inner.main_module_instance_handles();
-        if !inner.signal_set {
+        if !inner.signal_set && inner.signal.is_none() {
             let signals = env.thread.pop_signals();
             if !signals.is_empty() {
                 let processed = Self::process_default_signal_batch(ctx, signals)?;
@@ -776,7 +784,7 @@ impl WasiEnv {
                 .try_inner()
                 .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
             let inner = env_inner.main_module_instance_handles();
-            if !inner.signal_set {
+            if !inner.signal_set && inner.signal.is_none() {
                 Self::process_default_signal_batch(ctx, signals)?;
             } else {
                 Self::process_signals_internal(ctx, signals)?;
@@ -793,7 +801,7 @@ impl WasiEnv {
             .try_inner()
             .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
         let inner = env_inner.main_module_instance_handles();
-        if !inner.signal_set {
+        if !inner.signal_set && inner.signal.is_none() {
             return Ok(Ok(false));
         }
 
@@ -1418,6 +1426,12 @@ impl WasiEnv {
             let process = self.process.clone();
             let disable_fs_cleanup = self.disable_fs_cleanup;
             let pid = self.pid();
+            let tid = self.tid();
+            let shared_mutex_owner_token = {
+                let token = pid.raw().wrapping_mul(65_537) ^ tid.raw();
+                let token = token & 0x7fff_ffff;
+                if token == 0 { 1 } else { token }
+            };
 
             let timeout = self.tasks().sleep_now(CLEANUP_TIMEOUT);
             let state = self.state.clone();
@@ -1429,6 +1443,7 @@ impl WasiEnv {
                 process.signal_process(Signal::Sigquit);
                 process.terminate(process_exit_code);
                 process.notify_parent_child_status_changed();
+                let _ = shared_mutex_owner_token;
 
                 if !disable_fs_cleanup {
                     tracing::trace!(pid = %pid, "cleaning up open file handles");

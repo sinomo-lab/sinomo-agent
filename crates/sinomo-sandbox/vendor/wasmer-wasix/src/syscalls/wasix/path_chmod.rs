@@ -1,6 +1,6 @@
 use super::*;
-use crate::syscalls::*;
 use crate::VIRTUAL_ROOT_FD;
+use crate::syscalls::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -118,7 +118,11 @@ pub fn path_mode_at<M: MemorySize>(
 /// ### `fd_chmod()`
 /// Sets POSIX permission bits on a sandbox file descriptor backed by the host filesystem.
 #[instrument(level = "trace", skip_all, fields(%fd, mode = %mode), ret)]
-pub fn fd_chmod(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd, mode: u32) -> Result<Errno, WasiError> {
+pub fn fd_chmod(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    fd: WasiFd,
+    mode: u32,
+) -> Result<Errno, WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
@@ -162,7 +166,13 @@ pub fn path_chown<M: MemorySize>(
     let memory = unsafe { env.memory_view(&ctx) };
     let path = unsafe { get_input_str_ok!(&memory, path, path_len) };
     Span::current().record("path", path.as_str());
-    Ok(path_chown_at_internal(env, VIRTUAL_ROOT_FD, &path, uid, gid))
+    Ok(path_chown_at_internal(
+        env,
+        VIRTUAL_ROOT_FD,
+        &path,
+        uid,
+        gid,
+    ))
 }
 
 /// ### `path_chown_at()`
@@ -625,7 +635,9 @@ pub(crate) fn path_write_allowed_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Re
     let identity = env.process.identity();
     let mode = path_mode_at_internal(env, fd, path)?;
     let (uid, gid) = path_owner_at_internal(env, fd, path)?;
-    Ok(identity_allows_mode(&identity, mode, uid, gid, 0o200, 0o020, 0o002))
+    Ok(identity_allows_mode(
+        &identity, mode, uid, gid, 0o200, 0o020, 0o002,
+    ))
 }
 
 pub(crate) fn path_parent_mutation_allowed_at(
@@ -653,13 +665,7 @@ pub(crate) fn path_touch_parent_at(env: &WasiEnv, fd: WasiFd, path: &str) {
     }
 }
 
-pub(crate) fn path_set_times_at(
-    env: &WasiEnv,
-    fd: WasiFd,
-    path: &str,
-    atime: u64,
-    mtime: u64,
-) {
+pub(crate) fn path_set_times_at(env: &WasiEnv, fd: WasiFd, path: &str, atime: u64, mtime: u64) {
     if let Ok(inode) = sandbox_inode_at(env, fd, path) {
         set_inode_times(inode.ino().as_u64(), atime, mtime, current_time_ns());
     }
@@ -770,10 +776,12 @@ pub(crate) fn path_rename_symlink_at(
     {
         return Errno::Noent;
     }
-    if let Err(error) = block_on(env.state.fs.root_fs.rename(
-        Path::new(&source_key),
-        Path::new(&target_key),
-    )) {
+    if let Err(error) = block_on(
+        env.state
+            .fs
+            .root_fs
+            .rename(Path::new(&source_key), Path::new(&target_key)),
+    ) {
         return fs_error_into_errno(error);
     }
     let mut times = load_persistent_times(env);
@@ -822,7 +830,8 @@ fn validate_chmod_request(
         return Err(Errno::Perm);
     }
     let mut mode = requested_mode;
-    let group_matches = identity.effective_gid == gid || identity.groups.iter().any(|group| *group == gid);
+    let group_matches =
+        identity.effective_gid == gid || identity.groups.iter().any(|group| *group == gid);
     if !group_matches {
         mode &= !0o2000;
     }
@@ -897,12 +906,7 @@ fn path_symlink_at_internal(env: &WasiEnv, fd: WasiFd, path: &str, target: &str)
     if env.state.fs.root_fs.symlink_metadata(&link_path).is_ok() {
         return Errno::Exist;
     }
-    if let Err(error) = env
-        .state
-        .fs
-        .root_fs
-        .symlink(Path::new(target), &link_path)
-    {
+    if let Err(error) = env.state.fs.root_fs.symlink(Path::new(target), &link_path) {
         return fs_error_into_errno(error);
     }
     let now = current_time_ns();
@@ -922,8 +926,8 @@ fn path_symlink_at_internal(env: &WasiEnv, fd: WasiFd, path: &str, target: &str)
 }
 
 fn path_symlink_target_at_internal(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<String, Errno> {
-    let key = sandbox_host_path_at(env, fd, path)
-        .or_else(|_| new_child_host_path_at(env, fd, path))?;
+    let key =
+        sandbox_host_path_at(env, fd, path).or_else(|_| new_child_host_path_at(env, fd, path))?;
     env.state
         .fs
         .root_fs
@@ -970,7 +974,11 @@ fn sandbox_host_path(env: &WasiEnv, path: &str) -> Result<PathBuf, Errno> {
     sandbox_host_path_at(env, VIRTUAL_ROOT_FD, path)
 }
 
-pub(crate) fn sandbox_host_path_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<PathBuf, Errno> {
+pub(crate) fn sandbox_host_path_at(
+    env: &WasiEnv,
+    fd: WasiFd,
+    path: &str,
+) -> Result<PathBuf, Errno> {
     let inode = sandbox_inode_at(env, fd, path)?;
     inode_host_path(&inode)
 }
@@ -1134,7 +1142,9 @@ fn key_for_path_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Option<String> {
     let guard = inode.read();
     let base = match guard.deref() {
         Kind::Dir { path, .. } => normalize_mode_key(path),
-        Kind::File { path, .. } => normalize_absolute_virtual_path(&path.parent()?.to_string_lossy()),
+        Kind::File { path, .. } => {
+            normalize_absolute_virtual_path(&path.parent()?.to_string_lossy())
+        }
         Kind::Root { .. } => "/".to_string(),
         _ => return None,
     };
@@ -1150,7 +1160,12 @@ fn current_time_ns() -> u64 {
 }
 
 fn persistent_metadata_path(env: &WasiEnv, name: &str) -> Option<PathBuf> {
-    Some(env.sinomo_metadata_root.as_ref()?.join(POSIX_METADATA_DIR).join(name))
+    Some(
+        env.sinomo_metadata_root
+            .as_ref()?
+            .join(POSIX_METADATA_DIR)
+            .join(name),
+    )
 }
 
 fn read_persistent_metadata(env: &WasiEnv, name: &str) -> Option<String> {

@@ -15,6 +15,18 @@ pub fn proc_exit2<M: MemorySize>(
     code: ExitCode,
 ) -> Result<(), WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
+    {
+        let env = ctx.data();
+        let memory = unsafe { env.memory_view(&ctx) };
+        let preserve_ranges = env
+            .state
+            .shared_futex_ranges()
+            .into_iter()
+            .map(|range| (range.start, range.end.saturating_sub(range.start) as usize))
+            .collect::<Vec<_>>();
+        sync_shared_memory_from_guest_preserving_ranges::<M>(env, &memory, &preserve_ranges)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    }
 
     let Some(mut vfork) = ctx.data_mut().vfork.take() else {
         // Not in a vfork, just exit normally

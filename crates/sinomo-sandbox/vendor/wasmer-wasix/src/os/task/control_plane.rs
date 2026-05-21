@@ -105,7 +105,7 @@ impl WasiControlPlane {
     }
 
     /// Get the current count of active tasks (threads).
-    fn active_task_count(&self) -> usize {
+    pub(crate) fn active_task_count(&self) -> usize {
         self.state.task_count.load(Ordering::SeqCst)
     }
 

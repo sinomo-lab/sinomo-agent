@@ -12,5 +12,5 @@ pub fn sched_yield<M: MemorySize + 'static>(
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
 
     //trace!("wasi[{}:{}]::sched_yield", ctx.data().pid(), ctx.data().tid());
-    thread_sleep_internal::<M>(ctx, 0)
+    thread_sleep_internal::<M>(ctx, 1_000_000)
 }

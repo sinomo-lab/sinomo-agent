@@ -2947,21 +2947,19 @@ fn wasix_runner_posix_fork_fails_cleanly_without_asyncify_exports() {
           (func (export "_start") (local $pid i32)
             call $fork
             local.tee $pid
-            i32.const 0
-            i32.lt_s
+            i32.const -45
+            i32.ne
             if
-            else
-              i32.const 91
+              i32.const 79
               call $proc_exit
             end
 
             call $vfork
             local.tee $pid
-            i32.const 0
-            i32.lt_s
+            i32.const -45
+            i32.ne
             if
-            else
-              i32.const 92
+              i32.const 80
               call $proc_exit
             end
 
@@ -2974,21 +2972,24 @@ fn wasix_runner_posix_fork_fails_cleanly_without_asyncify_exports() {
             i32.const 1
             call $clone_thread
             local.tee $pid
-            i32.const 0
-            i32.lt_s
+            i32.const -45
+            i32.eq
             if
               i32.const 0
               call $proc_exit
             end
 
-            i32.const 93
+            i32.const 81
             call $proc_exit))
         "#;
 
     let outcome = runtime::run_wasix_module(
         wat::parse_str(module).expect("module").as_slice(),
         test_wasi_request(5_000),
-        SandboxWasiRunOptions::default(),
+        SandboxWasiRunOptions {
+            wasix_auto_asyncify: false,
+            ..SandboxWasiRunOptions::default()
+        },
     )
     .expect("run");
 
@@ -3438,7 +3439,7 @@ fn wasix_runner_spawns_thread_with_imported_shared_memory() {
 
 #[cfg(feature = "wasix-runtime")]
 #[test]
-fn wasix_runner_enforces_thread_task_limit_at_boundary() {
+fn wasix_runner_allows_more_than_legacy_default_thread_task_limit() {
     let module = r#"
         (module
           (import "env" "memory" (memory 8 128 shared))
@@ -3476,7 +3477,7 @@ fn wasix_runner_enforces_thread_task_limit_at_boundary() {
               local.set $errno
 
               local.get $index
-              i32.const 63
+              i32.const 64
               i32.lt_u
               if
                 local.get $errno
@@ -3494,8 +3495,6 @@ fn wasix_runner_enforces_thread_task_limit_at_boundary() {
               end
 
               local.get $errno
-              i32.const 6
-              i32.ne
               if
                 i32.const 92
                 call $proc_exit
