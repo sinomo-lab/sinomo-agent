@@ -1,6 +1,10 @@
 //! POSIX-like functions supporting absolute path arguments, implemented in
 //! terms of `__wasilibc_find_relpath` and `*at`-style functions.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include <stdarg.h>
 #include <stdint.h>
 #include <errno.h>
@@ -23,6 +27,7 @@
 #include <unistd.h>
 #include <utime.h>
 #include <wasi/api.h>
+#include <wasi/api_wasix.h>
 #include <wasi/libc.h>
 #include <wasi/libc-find-relpath.h>
 #include <wasi/libc-nocwd.h>
@@ -229,11 +234,6 @@ int32_t __imported_wasix_fchdir(int32_t fd) __attribute__((
     __import_name__("fchdir")
 ));
 
-int32_t __imported_wasix_fork(void) __attribute__((
-    __import_module__("wasix_32v1"),
-    __import_name__("fork")
-));
-
 int32_t __imported_wasix_sched_get_priority_max(int32_t policy) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("sched_get_priority_max")
@@ -257,6 +257,41 @@ int32_t __imported_wasix_sched_getparam(int32_t pid, int32_t *priority) __attrib
 int32_t __imported_wasix_sched_setscheduler(int32_t pid, int32_t policy, int32_t priority) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("sched_setscheduler")
+));
+
+int32_t __imported_wasix_sched_getcpu(void) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("sched_getcpu")
+));
+
+int32_t __imported_wasix_sched_getaffinity(int32_t pid, uint64_t *mask_low, uint64_t *mask_high) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("sched_getaffinity")
+));
+
+int32_t __imported_wasix_sched_setaffinity(int32_t pid, uint64_t mask_low, uint64_t mask_high) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("sched_setaffinity")
+));
+
+int32_t __imported_wasix_sched_rr_get_interval(int32_t pid, struct timespec *interval) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("sched_rr_get_interval")
+));
+
+int32_t __imported_wasix_getpriority(int32_t which, int32_t who) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("getpriority")
+));
+
+int32_t __imported_wasix_setpriority(int32_t which, int32_t who, int32_t priority) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("setpriority")
+));
+
+int32_t __imported_wasix_nice(int32_t increment) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("nice")
 ));
 
 int32_t __imported_wasix_getrlimit(int32_t resource, uint64_t *current, uint64_t *maximum) __attribute__((
@@ -849,6 +884,16 @@ static void sinomo_wasix_unlock_orphaned_standard_streams(void) {
     sinomo_wasix_unlock_orphaned_stream(stderr);
 }
 
+int fork(void) {
+    __wasi_pid_t pid = 0;
+    __wasi_errno_t err = __wasi_proc_fork(1, &pid);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    return pid;
+}
+
 int sched_get_priority_max(int policy) {
     int32_t result = __imported_wasix_sched_get_priority_max(policy);
     if (result < 0) {
@@ -913,6 +958,306 @@ int sched_setparam(pid_t pid, const struct sched_param *param) {
     if (policy < 0)
         return -1;
     return sched_setscheduler(pid, policy, param);
+}
+
+int sched_getcpu(void) {
+    int32_t result = __imported_wasix_sched_getcpu();
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
+}
+
+int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask) {
+    if (mask == NULL || cpusetsize < sizeof(cpu_set_t)) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t mask_low = 0;
+    uint64_t mask_high = 0;
+    int32_t result = __imported_wasix_sched_getaffinity((int32_t)pid, &mask_low, &mask_high);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    memset(mask, 0, cpusetsize);
+    unsigned char *bytes = (unsigned char *)mask;
+    for (size_t i = 0; i < 8 && i < cpusetsize; i++)
+        bytes[i] = (unsigned char)((mask_low >> (i * 8)) & 0xffu);
+    for (size_t i = 0; i < 8 && i + 8 < cpusetsize; i++)
+        bytes[i + 8] = (unsigned char)((mask_high >> (i * 8)) & 0xffu);
+    return 0;
+}
+
+int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask) {
+    if (mask == NULL || cpusetsize == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t mask_low = 0;
+    uint64_t mask_high = 0;
+    const unsigned char *bytes = (const unsigned char *)mask;
+    for (size_t i = 0; i < 8 && i < cpusetsize; i++)
+        mask_low |= ((uint64_t)bytes[i]) << (i * 8);
+    for (size_t i = 0; i < 8 && i + 8 < cpusetsize; i++)
+        mask_high |= ((uint64_t)bytes[i + 8]) << (i * 8);
+    int32_t result = __imported_wasix_sched_setaffinity((int32_t)pid, mask_low, mask_high);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return 0;
+}
+
+int sched_rr_get_interval(pid_t pid, struct timespec *interval) {
+    if (interval == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int32_t result = __imported_wasix_sched_rr_get_interval((int32_t)pid, interval);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
+}
+
+int __sched_cpucount(size_t cpusetsize, const cpu_set_t *mask) {
+    if (mask == NULL)
+        return 0;
+    const unsigned char *bytes = (const unsigned char *)mask;
+    int count = 0;
+    for (size_t i = 0; i < cpusetsize; i++) {
+        unsigned char value = bytes[i];
+        while (value != 0) {
+            count += value & 1u;
+            value >>= 1u;
+        }
+    }
+    return count;
+}
+
+int getpriority(int which, id_t who) {
+    int32_t result = __imported_wasix_getpriority((int32_t)which, (int32_t)who);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
+}
+
+int setpriority(int which, id_t who, int priority) {
+    int32_t result = __imported_wasix_setpriority((int32_t)which, (int32_t)who, (int32_t)priority);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
+}
+
+int nice(int inc) {
+    int32_t result = __imported_wasix_nice((int32_t)inc);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
+}
+
+int close_range(unsigned int first, unsigned int last, int flags) {
+    if (first > last) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (flags != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (unsigned int fd = first; fd <= last && fd < 65536u; fd++) {
+        if (close((int)fd) != 0 && errno != EBADF)
+            return -1;
+        if (fd == UINT32_MAX)
+            break;
+    }
+    return 0;
+}
+
+void closefrom(int lowfd) {
+    if (lowfd < 0)
+        lowfd = 0;
+    (void)close_range((unsigned int)lowfd, 65535u, 0);
+}
+
+ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out, size_t len, unsigned int flags) {
+    if (flags != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (len == 0)
+        return 0;
+    size_t chunk_size = len < 65536 ? len : 65536;
+    char *buffer = malloc(chunk_size);
+    if (buffer == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+    ssize_t total = 0;
+    while ((size_t)total < len) {
+        size_t chunk = len - (size_t)total;
+        if (chunk > chunk_size)
+            chunk = chunk_size;
+        ssize_t read_count;
+        if (off_in != NULL) {
+            read_count = pread(fd_in, buffer, chunk, *off_in);
+        } else {
+            read_count = read(fd_in, buffer, chunk);
+        }
+        if (read_count < 0) {
+            int saved = errno;
+            free(buffer);
+            errno = saved;
+            return total > 0 ? total : -1;
+        }
+        if (read_count == 0)
+            break;
+        ssize_t written_total = 0;
+        while (written_total < read_count) {
+            ssize_t written;
+            if (off_out != NULL) {
+                written = pwrite(fd_out, buffer + written_total, (size_t)(read_count - written_total), *off_out);
+            } else {
+                written = write(fd_out, buffer + written_total, (size_t)(read_count - written_total));
+            }
+            if (written < 0) {
+                int saved = errno;
+                free(buffer);
+                errno = saved;
+                return total > 0 ? total : -1;
+            }
+            if (written == 0)
+                break;
+            if (off_out != NULL)
+                *off_out += written;
+            written_total += written;
+        }
+        if (off_in != NULL)
+            *off_in += read_count;
+        total += written_total;
+        if (written_total < read_count)
+            break;
+    }
+    free(buffer);
+    return total;
+}
+
+char *ctermid_r(char *buf) {
+    if (buf == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
+    strcpy(buf, "/dev/tty");
+    return buf;
+}
+
+char *ctermid(char *buf) {
+    static char terminal[] = "/dev/tty";
+    if (buf == NULL)
+        return terminal;
+    strcpy(buf, terminal);
+    return buf;
+}
+
+char *getlogin(void) {
+    return "sandbox";
+}
+
+int getlogin_r(char *name, size_t namesize) {
+    if (name == NULL || namesize == 0)
+        return EINVAL;
+    const char *login = getlogin();
+    if (login == NULL)
+        login = "sandbox";
+    size_t len = strlen(login);
+    if (len + 1 > namesize)
+        return ERANGE;
+    memcpy(name, login, len + 1);
+    return 0;
+}
+
+int getloadavg(double loadavg[], int nelem) {
+    if (nelem < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    int count = nelem > 3 ? 3 : nelem;
+    for (int i = 0; i < count; i++)
+        loadavg[i] = 0.0;
+    return count;
+}
+
+int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
+    uint32_t raw_ruid = 0;
+    uint32_t raw_euid = 0;
+    uint32_t raw_suid = 0;
+    int32_t error = __imported_wasix_proc_getresuid(&raw_ruid, &raw_euid, &raw_suid);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    if (ruid != NULL)
+        *ruid = raw_ruid;
+    if (euid != NULL)
+        *euid = raw_euid;
+    if (suid != NULL)
+        *suid = raw_suid;
+    return 0;
+}
+
+int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
+    uint32_t raw_rgid = 0;
+    uint32_t raw_egid = 0;
+    uint32_t raw_sgid = 0;
+    int32_t error = __imported_wasix_proc_getresgid(&raw_rgid, &raw_egid, &raw_sgid);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    if (rgid != NULL)
+        *rgid = raw_rgid;
+    if (egid != NULL)
+        *egid = raw_egid;
+    if (sgid != NULL)
+        *sgid = raw_sgid;
+    return 0;
+}
+
+int lockf(int fd, int cmd, off_t len) {
+    (void)fd;
+    (void)cmd;
+    (void)len;
+    errno = ENOSYS;
+    return -1;
+}
+
+void sync(void) {
+}
+
+int sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flags) {
+    (void)offset;
+    (void)nbytes;
+    (void)flags;
+    return fsync(fd);
+}
+
+int pause(void) {
+    for (;;) {
+        int32_t error = __imported_wasix_thread_sleep(UINT64_MAX);
+        if (error != 0) {
+            errno = error < 0 ? -error : error;
+            return -1;
+        }
+    }
 }
 
 int getrlimit(int resource, struct rlimit *limit) {
@@ -3695,6 +4040,39 @@ int seteuid(uid_t uid) {
     return 0;
 }
 
+int setreuid(uid_t ruid, uid_t euid) {
+    int32_t raw_ruid = ruid == (uid_t)-1 ? UINT32_MAX : (uint32_t)ruid;
+    int32_t raw_euid = euid == (uid_t)-1 ? UINT32_MAX : (uint32_t)euid;
+    int32_t error = __imported_wasix_proc_setresuid((uint32_t)raw_ruid, (uint32_t)raw_euid, UINT32_MAX);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    if (ruid != (uid_t)-1)
+        sinomo_wasix_ruid = ruid;
+    if (euid != (uid_t)-1)
+        sinomo_wasix_euid = euid;
+    return 0;
+}
+
+int setresuid(uid_t ruid, uid_t euid, uid_t suid) {
+    uint32_t raw_ruid = ruid == (uid_t)-1 ? UINT32_MAX : (uint32_t)ruid;
+    uint32_t raw_euid = euid == (uid_t)-1 ? UINT32_MAX : (uint32_t)euid;
+    uint32_t raw_suid = suid == (uid_t)-1 ? UINT32_MAX : (uint32_t)suid;
+    int32_t error = __imported_wasix_proc_setresuid(raw_ruid, raw_euid, raw_suid);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    if (ruid != (uid_t)-1)
+        sinomo_wasix_ruid = ruid;
+    if (euid != (uid_t)-1)
+        sinomo_wasix_euid = euid;
+    if (suid != (uid_t)-1)
+        sinomo_wasix_suid = suid;
+    return 0;
+}
+
 int setgid(gid_t gid) {
     int32_t error = __imported_wasix_proc_setresgid(gid, gid, gid);
     if (error != 0) {
@@ -3714,6 +4092,39 @@ int setegid(gid_t gid) {
         return -1;
     }
     sinomo_wasix_egid = gid;
+    return 0;
+}
+
+int setregid(gid_t rgid, gid_t egid) {
+    uint32_t raw_rgid = rgid == (gid_t)-1 ? UINT32_MAX : (uint32_t)rgid;
+    uint32_t raw_egid = egid == (gid_t)-1 ? UINT32_MAX : (uint32_t)egid;
+    int32_t error = __imported_wasix_proc_setresgid(raw_rgid, raw_egid, UINT32_MAX);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    if (rgid != (gid_t)-1)
+        sinomo_wasix_rgid = rgid;
+    if (egid != (gid_t)-1)
+        sinomo_wasix_egid = egid;
+    return 0;
+}
+
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
+    uint32_t raw_rgid = rgid == (gid_t)-1 ? UINT32_MAX : (uint32_t)rgid;
+    uint32_t raw_egid = egid == (gid_t)-1 ? UINT32_MAX : (uint32_t)egid;
+    uint32_t raw_sgid = sgid == (gid_t)-1 ? UINT32_MAX : (uint32_t)sgid;
+    int32_t error = __imported_wasix_proc_setresgid(raw_rgid, raw_egid, raw_sgid);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    if (rgid != (gid_t)-1)
+        sinomo_wasix_rgid = rgid;
+    if (egid != (gid_t)-1)
+        sinomo_wasix_egid = egid;
+    if (sgid != (gid_t)-1)
+        sinomo_wasix_sgid = sgid;
     return 0;
 }
 

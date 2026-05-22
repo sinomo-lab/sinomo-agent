@@ -124,7 +124,18 @@ pub fn proc_fork<M: MemorySize>(
     copy_memory: Bool,
     pid_ptr: WasmPtr<Pid, M>,
 ) -> Result<Errno, WasiError> {
+    sinomo_debug!(
+        "sinomo-debug proc_fork syscall pid={} copy_memory={:?}",
+        ctx.data().pid().raw(),
+        copy_memory
+    );
     let outcome = proc_fork_common(ctx, copy_memory, Some(pid_ptr))?;
+    sinomo_debug!(
+        "sinomo-debug proc_fork syscall-done pid={} ret={:?} child={}",
+        outcome.pid,
+        outcome.ret,
+        outcome.pid
+    );
     Ok(outcome.ret)
 }
 
@@ -133,16 +144,22 @@ pub fn proc_fork<M: MemorySize>(
 /// parent, or a negative errno value on failure.
 #[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
 pub fn fork<M: MemorySize>(ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<i32, WasiError> {
+    sinomo_debug!("sinomo-debug fork syscall pid={}", ctx.data().pid().raw());
     let outcome = proc_fork_common::<M>(ctx, Bool::True, None)?;
-    Ok(fork_outcome_to_posix(outcome))
+    let posix_ret = fork_outcome_to_posix(outcome);
+    sinomo_debug!("sinomo-debug fork syscall-done ret={}", posix_ret);
+    Ok(posix_ret)
 }
 
 /// ### `vfork()`
 /// POSIX-shaped vfork wrapper over the existing WASIX lightweight fork path.
 #[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
 pub fn vfork<M: MemorySize>(ctx: FunctionEnvMut<'_, WasiEnv>) -> Result<i32, WasiError> {
+    sinomo_debug!("sinomo-debug vfork syscall pid={}", ctx.data().pid().raw());
     let outcome = proc_fork_common::<M>(ctx, Bool::False, None)?;
-    Ok(fork_outcome_to_posix(outcome))
+    let posix_ret = fork_outcome_to_posix(outcome);
+    sinomo_debug!("sinomo-debug vfork syscall-done ret={}", posix_ret);
+    Ok(posix_ret)
 }
 
 /// Runtime hint used by the POSIX sysroot `mmap()` implementation when a
@@ -3062,6 +3079,13 @@ fn proc_fork_common<M: MemorySize>(
     copy_memory: Bool,
     pid_ptr: Option<WasmPtr<Pid, M>>,
 ) -> Result<ForkOutcome, WasiError> {
+    sinomo_debug!(
+        "sinomo-debug proc_fork begin pid={} tid={} copy_memory={:?} pid_ptr={}",
+        ctx.data().pid().raw(),
+        ctx.data().tid().raw(),
+        copy_memory,
+        pid_ptr.is_some()
+    );
     WasiEnv::do_pending_operations(&mut ctx)?;
 
     if let Some(context_switching_environment) = ctx.data().context_switching_environment.as_ref()
@@ -3146,6 +3170,10 @@ fn proc_fork_common<M: MemorySize>(
             ret: Errno::Noexec,
         });
     }
+    sinomo_debug!(
+        "sinomo-debug proc_fork asyncify-ok pid={}",
+        ctx.data().pid().raw()
+    );
     let shared_memory_was_cross_process = ctx.data().state.has_cross_process_shared_memory();
     if ctx.data().state.has_shared_memory_mappings() {
         ctx.data().state.mark_cross_process_shared_memory();
@@ -3171,6 +3199,11 @@ fn proc_fork_common<M: MemorySize>(
         }
     };
     let child_pid = child_env.process.pid();
+    sinomo_debug!(
+        "sinomo-debug proc_fork env-forked parent_pid={} child_pid={}",
+        ctx.data().pid().raw(),
+        child_pid.raw()
+    );
     let child_finished = child_env.process.finished.clone();
     if let Ok(now) = platform_clock_time_get(Snapshot0Clockid::ProcessCputimeId, 1) {
         child_env
@@ -3318,12 +3351,25 @@ fn proc_fork_common<M: MemorySize>(
     }
 
     // Create the thread that will back this forked process
+    let parent_pid = env.pid();
     let state = env.state.clone();
     let bin_factory = env.bin_factory.clone();
 
     // Perform the unwind action
     let snapshot = capture_store_snapshot(&mut ctx.as_store_mut());
+    sinomo_debug!(
+        "sinomo-debug proc_fork snapshot-captured parent_pid={} child_pid={}",
+        parent_pid.raw(),
+        child_pid.raw()
+    );
     unwind::<M, _>(ctx, move |mut ctx, mut memory_stack, rewind_stack| {
+        sinomo_debug!(
+            "sinomo-debug proc_fork unwind-callback parent_pid={} child_pid={} memory_stack_len={} rewind_stack_len={}",
+            ctx.data().pid().raw(),
+            child_pid.raw(),
+            memory_stack.len(),
+            rewind_stack.len()
+        );
         let tasks = ctx.data().tasks().clone();
         let span = debug_span!(
             "unwind",
@@ -3358,6 +3404,12 @@ fn proc_fork_common<M: MemorySize>(
             }
         };
         let store_data = Bytes::from(store_data);
+        sinomo_debug!(
+            "sinomo-debug proc_fork store-serialized parent_pid={} child_pid={} store_data_len={}",
+            ctx.data().pid().raw(),
+            child_pid.raw(),
+            store_data.len()
+        );
 
         // Now we use the environment and memory references
         let runtime = child_env.runtime.clone();
@@ -3461,6 +3513,11 @@ fn proc_fork_common<M: MemorySize>(
                     err
                 });
             if spawn_result.is_err() {
+                sinomo_debug!(
+                    "sinomo-debug proc_fork child-spawn-failed parent_pid={} child_pid={}",
+                    ctx.data().pid().raw(),
+                    child_pid.raw()
+                );
                 {
                     let mut inner = ctx.data().process.lock();
                     inner.children.retain(|child| child.pid != child_pid);
@@ -3483,13 +3540,11 @@ fn proc_fork_common<M: MemorySize>(
                     }
                 }
             } else {
-                if state.has_shared_memory_mappings() {
-                    sinomo_debug!(
-                        "sinomo-debug proc_fork child-spawned parent_pid={} child_pid={}",
-                        ctx.data().pid().raw(),
-                        child_pid.raw()
-                    );
-                }
+                sinomo_debug!(
+                    "sinomo-debug proc_fork child-spawned parent_pid={} child_pid={}",
+                    ctx.data().pid().raw(),
+                    child_pid.raw()
+                );
                 match rewind::<M, _>(
                     ctx,
                     Some(memory_stack),

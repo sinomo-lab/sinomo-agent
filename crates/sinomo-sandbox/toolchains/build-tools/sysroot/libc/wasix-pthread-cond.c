@@ -262,6 +262,10 @@ int pthread_cond_broadcast(pthread_cond_t *cond) {
     return 0;
 }
 
+int __private_cond_signal(pthread_cond_t *cond, int broadcast) {
+    return broadcast < 0 ? pthread_cond_broadcast(cond) : pthread_cond_signal(cond);
+}
+
 int pthread_cond_timedwait(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex, const struct timespec *restrict abstime) {
     if (cond == 0 || mutex == 0)
         return EINVAL;

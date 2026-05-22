@@ -1339,6 +1339,32 @@ pub(crate) unsafe fn get_memory_stack_pointer(
     Ok(stack_pointer)
 }
 
+fn get_memory_stack_pointer_from_handles(
+    env: &WasiEnv,
+    store: &mut impl AsStoreMut,
+) -> Result<u64, String> {
+    let stack_upper = get_stack_upper(env);
+    let handles = env.inner().main_module_instance_handles();
+    if let Some(stack_pointer) = handles.stack_pointer.clone() {
+        return Ok(match stack_pointer.get(store) {
+            Value::I32(a) => a as u64,
+            Value::I64(a) => a as u64,
+            _ => stack_upper,
+        });
+    }
+    if let Ok(get_stack_pointer) = handles
+        .instance
+        .exports
+        .get_typed_function::<(), i32>(store, "__wasilibc_get_stack_pointer")
+    {
+        return get_stack_pointer
+            .call(store)
+            .map(|stack_pointer| stack_pointer as u64)
+            .map_err(|err| format!("failed to read stack pointer export: {err}"));
+    }
+    Err("failed to save stack: no __stack_pointer global".to_string())
+}
+
 pub(crate) unsafe fn get_memory_stack_offset(
     ctx: &mut FunctionEnvMut<'_, WasiEnv>,
 ) -> Result<u64, String> {
@@ -1355,12 +1381,8 @@ pub(crate) fn set_memory_stack_offset(
     // Sets the stack pointer
     let stack_upper = get_stack_upper(env);
     let stack_pointer = stack_upper - offset;
-    if let Some(stack_pointer_ptr) = env
-        .inner()
-        .main_module_instance_handles()
-        .stack_pointer
-        .clone()
-    {
+    let handles = env.inner().main_module_instance_handles();
+    if let Some(stack_pointer_ptr) = handles.stack_pointer.clone() {
         match stack_pointer_ptr.get(store) {
             Value::I32(_) => {
                 stack_pointer_ptr.set(store, Value::I32(stack_pointer as i32));
@@ -1375,6 +1397,14 @@ pub(crate) fn set_memory_stack_offset(
                 );
             }
         }
+    } else if let Ok(set_stack_pointer) = handles
+        .instance
+        .exports
+        .get_typed_function::<i32, ()>(store, "__wasilibc_set_stack_pointer")
+    {
+        set_stack_pointer
+            .call(store, stack_pointer as i32)
+            .map_err(|err| format!("failed to set stack pointer export: {err}"))?;
     } else {
         return Err("failed to save stack: no __stack_pointer global".to_string());
     }
@@ -1388,21 +1418,7 @@ pub(crate) fn get_memory_stack<M: MemorySize>(
 ) -> Result<BytesMut, String> {
     // Get the current value of the stack pointer (which we will use
     // to save all of the stack)
-    let stack_base = get_stack_upper(env);
-    let stack_pointer = if let Some(stack_pointer) = env
-        .inner()
-        .main_module_instance_handles()
-        .stack_pointer
-        .clone()
-    {
-        match stack_pointer.get(store) {
-            Value::I32(a) => a as u64,
-            Value::I64(a) => a as u64,
-            _ => stack_base,
-        }
-    } else {
-        return Err("failed to save stack: no __stack_pointer global".to_string());
-    };
+    let stack_pointer = get_memory_stack_pointer_from_handles(env, store)?;
     let memory = env
         .try_memory_view(store)
         .ok_or_else(|| "unable to access the memory of the instance".to_string())?;
@@ -1572,6 +1588,15 @@ where
         + Sync
         + 'static,
 {
+    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+        eprintln!(
+            "sinomo-debug unwind begin pid={} tid={} stack_lower={} stack_upper={}",
+            ctx.data().pid().raw(),
+            ctx.data().tid().raw(),
+            ctx.data().layout.stack_lower,
+            ctx.data().layout.stack_upper
+        );
+    }
     // Get the current stack pointer (this will be used to determine the
     // upper limit of stack space remaining to unwind into)
     let (env, mut store) = ctx.data_and_store_mut();
@@ -1579,9 +1604,20 @@ where
         Ok(a) => a,
         Err(err) => {
             warn!("unable to get the memory stack - {}", err);
+            if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                eprintln!("sinomo-debug unwind get-memory-stack-error {err}");
+            }
             return Err(WasiError::Exit(Errno::Unknown.into()));
         }
     };
+    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+        eprintln!(
+            "sinomo-debug unwind memory-stack pid={} tid={} len={}",
+            ctx.data().pid().raw(),
+            ctx.data().tid().raw(),
+            memory_stack.len()
+        );
+    }
 
     // Perform a check to see if we have enough room
     let env = ctx.data();
@@ -1613,7 +1649,30 @@ where
         .asyncify_start_unwind
         .clone()
     {
-        asyncify_start_unwind.call(&mut ctx, asyncify_data);
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!(
+                "sinomo-debug unwind start pid={} tid={} asyncify_data={} stack_begin={} stack_end={}",
+                ctx.data().pid().raw(),
+                ctx.data().tid().raw(),
+                asyncify_data,
+                unwind_data.start.into(),
+                unwind_data.end.into()
+            );
+        }
+        if let Err(err) = asyncify_start_unwind.call(&mut ctx, asyncify_data) {
+            warn!("failed to start asyncify unwind - {}", err);
+            if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                eprintln!("sinomo-debug unwind start-error {err}");
+            }
+            return Err(WasiError::Exit(Errno::Unknown.into()));
+        }
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!(
+                "sinomo-debug unwind started pid={} tid={}",
+                ctx.data().pid().raw(),
+                ctx.data().tid().raw()
+            );
+        }
     } else {
         warn!("failed to unwind the stack because the asyncify_start_rewind export is missing");
         return Err(WasiError::Exit(Errno::Noexec.into()));

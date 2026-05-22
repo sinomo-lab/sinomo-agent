@@ -1708,13 +1708,7 @@ impl Linker {
         // FIXME: this needs to become a parameter if we ever decouple the linker from WASIX
         let (stack_low, stack_high, tls_base) = {
             let layout = &func_env.env.as_ref(store).layout;
-            (
-                layout.stack_lower,
-                layout.stack_upper,
-                layout.tls_base.expect(
-                    "tls_base must be set in memory layout of new instance group's main instance",
-                ),
-            )
+            (layout.stack_lower, layout.stack_upper, layout.tls_base.unwrap_or(0))
         };
 
         trace!(stack_low, stack_high, "Memory layout");

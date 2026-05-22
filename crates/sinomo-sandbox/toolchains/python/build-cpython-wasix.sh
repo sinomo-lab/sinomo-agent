@@ -165,6 +165,11 @@ patch_wasix_sysroot() {
     local stem
     local posix_object
     local at_fdcwd_object
+    local futex_object
+    local semaphore_object
+    local pthread_mutex_object
+    local pthread_self_object
+    local pthread_cond_object
 
     if [ ! -f "${sysroot}/include/unistd.h" ] || [ ! -f "${sysroot}/lib/wasm32-wasi/libc.a" ]; then
         echo "WASIX sysroot is missing required files: ${sysroot}" >&2
@@ -174,6 +179,11 @@ patch_wasix_sysroot() {
     stem="$(basename "${sysroot}")"
     posix_object="${WORKDIR}/sinomo-${stem}-wasix-posix.o"
     at_fdcwd_object="${WORKDIR}/sinomo-${stem}-wasix-at-fdcwd.o"
+    futex_object="${WORKDIR}/sinomo-${stem}-wasix-futex.o"
+    semaphore_object="${WORKDIR}/sinomo-${stem}-wasix-semaphore.o"
+    pthread_mutex_object="${WORKDIR}/sinomo-${stem}-wasix-pthread-mutex.o"
+    pthread_self_object="${WORKDIR}/sinomo-${stem}-wasix-pthread-self.o"
+    pthread_cond_object="${WORKDIR}/sinomo-${stem}-wasix-pthread-cond.o"
     if [ -f "${sysroot}/include/__header_sys_socket.h" ]; then
         python3 - "${sysroot}/include/__header_sys_socket.h" <<'PY'
 import pathlib
@@ -241,12 +251,89 @@ PY
         -Os \
         -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-at-fdcwd.c" \
         -o "${at_fdcwd_object}"
+    for source_and_output in \
+        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-futex.c:${futex_object}" \
+        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-semaphore.c:${semaphore_object}" \
+        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-pthread-mutex.c:${pthread_mutex_object}" \
+        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-pthread-self.c:${pthread_self_object}" \
+        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-pthread-cond.c:${pthread_cond_object}"
+    do
+        "${WASI_SDK}/bin/clang" \
+            --target=wasm32-wasi \
+            --sysroot="${sysroot}" \
+            -matomics \
+            -mbulk-memory \
+            -mmutable-globals \
+            -pthread \
+            -mthread-model posix \
+            -fPIC \
+            -Os \
+            -c "${source_and_output%:*}" \
+            -o "${source_and_output#*:}"
+    done
     "${WASI_SDK}/bin/llvm-ar" d "${sysroot}/lib/wasm32-wasi/libc.a" \
         posix.o at_fdcwd.o chdir.o fchdir.o chown.o fchown.o fchownat.o lchown.o \
-        ftruncate.o truncate.o getegid.o geteuid.o getgid.o getuid.o setegid.o seteuid.o setgid.o setgroups.o setuid.o >/dev/null 2>&1 || true
+        ftruncate.o truncate.o getegid.o geteuid.o getgid.o getuid.o setegid.o seteuid.o setgid.o setgroups.o setuid.o \
+        pthread_self.o pthread_mutex_destroy.o pthread_mutex_getprioceiling.o pthread_mutex_init.o \
+        pthread_mutex_lock.o pthread_mutex_setprioceiling.o pthread_mutex_timedlock.o \
+        pthread_mutex_trylock.o pthread_mutex_unlock.o pthread_mutexattr_destroy.o \
+        pthread_mutexattr_getprioceiling.o pthread_mutexattr_getprotocol.o pthread_mutexattr_getpshared.o \
+        pthread_mutexattr_getrobust.o pthread_mutexattr_gettype.o pthread_mutexattr_init.o \
+        pthread_mutexattr_setprioceiling.o pthread_mutexattr_setprotocol.o \
+        pthread_mutexattr_setpshared.o pthread_mutexattr_setrobust.o pthread_mutexattr_settype.o \
+        pthread_cond_broadcast.o pthread_cond_destroy.o pthread_cond_init.o pthread_cond_signal.o \
+        pthread_cond_timedwait.o pthread_cond_wait.o sem_close.o sem_destroy.o sem_getvalue.o \
+        sem_init.o sem_open.o sem_post.o sem_timedwait.o sem_trywait.o sem_unlink.o sem_wait.o \
+        clock_nanosleep.o getitimer.o getrlimit.o kill.o nanosleep.o pthread_atfork.o pthread_attr_get.o \
+        pthread_attr_setinheritsched.o pthread_attr_setschedparam.o pthread_attr_setschedpolicy.o \
+        pthread_attr_setstack.o pthread_attr_setstacksize.o pthread_barrier_destroy.o \
+        pthread_barrier_init.o pthread_barrier_wait.o pthread_barrierattr_destroy.o \
+        pthread_barrierattr_getpshared.o pthread_barrierattr_init.o pthread_barrierattr_setpshared.o pthread_cancel.o \
+        pthread_condattr_destroy.o pthread_condattr_init.o pthread_condattr_setclock.o \
+        pthread_condattr_setpshared.o pthread_detach.o pthread_getattr_np.o \
+        pthread_getcpuclockid.o pthread_getschedparam.o pthread_getspecific.o pthread_join.o \
+        pthread_kill.o pthread_mutexattr_destroy.o pthread_mutexattr_init.o \
+        pthread_mutexattr_setprioceiling.o pthread_mutexattr_setprotocol.o \
+        pthread_mutexattr_setpshared.o pthread_mutexattr_setrobust.o pthread_mutexattr_settype.o \
+        pthread_rwlock_destroy.o pthread_rwlock_init.o pthread_rwlock_rdlock.o \
+        pthread_rwlock_timedrdlock.o pthread_rwlock_timedwrlock.o pthread_rwlock_tryrdlock.o \
+        pthread_rwlock_trywrlock.o pthread_rwlock_unlock.o pthread_rwlock_wrlock.o \
+        pthread_rwlockattr_destroy.o pthread_rwlockattr_getpshared.o pthread_rwlockattr_init.o pthread_rwlockattr_setpshared.o \
+        pthread_setschedparam.o pthread_setschedprio.o pthread_sigmask.o pthread_spin_destroy.o \
+        pthread_spin_init.o pthread_spin_lock.o pthread_spin_trylock.o pthread_spin_unlock.o \
+        pthread_testcancel.o raise.o setitimer.o setrlimit.o sigpending.o sigprocmask.o sleep.o times.o \
+        usleep.o wait.o waitpid.o __wasilibc_futex.o >/dev/null 2>&1 || true
     "${WASI_SDK}/bin/llvm-ar" r "${sysroot}/lib/wasm32-wasi/libc.a" \
         "${posix_object}" \
-        "${at_fdcwd_object}"
+        "${at_fdcwd_object}" \
+        "${futex_object}" \
+        "${semaphore_object}" \
+        "${pthread_mutex_object}" \
+        "${pthread_self_object}" \
+        "${pthread_cond_object}"
+    "${WASI_SDK}/bin/llvm-ranlib" "${sysroot}/lib/wasm32-wasi/libc.a"
+    (
+        signal_archive_dir="${WORKDIR}/sinomo-${stem}-wasi-emulated-signal"
+        rm -rf "${signal_archive_dir}"
+        mkdir -p "${signal_archive_dir}"
+        cd "${signal_archive_dir}"
+        "${WASI_SDK}/bin/llvm-ar" x "${sysroot}/lib/wasm32-wasi/libc.a" \
+            psignal.o sigaction.o sigaddset.o sigaltstack.o sigandset.o \
+            sigdelset.o sigemptyset.o sigfillset.o sighold.o sigignore.o \
+            siginterrupt.o sigisemptyset.o sigismember.o siglongjmp.o \
+            signal.o sigorset.o sigpause.o sigqueue.o sigrelse.o sigrtmax.o \
+            sigrtmin.o sigset.o sigsetjmp.o sigsetjmp_tail.o sigsuspend.o \
+            sigtimedwait.o sigwait.o sigwaitinfo.o strsignal.o
+        "${WASI_SDK}/bin/llvm-ar" rcs "${sysroot}/lib/wasm32-wasi/libwasi-emulated-signal.a" ./*.o
+        "${WASI_SDK}/bin/llvm-ranlib" "${sysroot}/lib/wasm32-wasi/libwasi-emulated-signal.a"
+    )
+    "${WASI_SDK}/bin/llvm-ar" d "${sysroot}/lib/wasm32-wasi/libc.a" \
+        psignal.o sigaction.o sigaddset.o sigaltstack.o sigandset.o \
+        sigdelset.o sigemptyset.o sigfillset.o sighold.o sigignore.o \
+        siginterrupt.o sigisemptyset.o sigismember.o siglongjmp.o \
+        signal.o sigorset.o sigpause.o sigqueue.o sigrelse.o sigrtmax.o \
+        sigrtmin.o sigset.o sigsetjmp.o sigsetjmp_tail.o sigsuspend.o \
+        sigtimedwait.o sigwait.o sigwaitinfo.o strsignal.o >/dev/null 2>&1 || true
     "${WASI_SDK}/bin/llvm-ranlib" "${sysroot}/lib/wasm32-wasi/libc.a"
 }
 
@@ -264,7 +351,7 @@ WASIXCC_SETTINGS=(
     "-sRUN_WASM_OPT=no"
 )
 WASIX_CFLAGS="-Os -fPIC -D_WASI_EMULATED_MMAN -fno-ident -ffile-prefix-map=${WORKDIR}=sinomo-python-wasix-build -ffile-prefix-map=${REPO_ROOT}=sinomo"
-WASIX_LDFLAGS="-L${ZLIB_OUT}/lib -L${OPENSSL_OUT}/lib -lwasi-emulated-mman -lcrypt"
+WASIX_LDFLAGS="-L${ZLIB_OUT}/lib -L${OPENSSL_OUT}/lib -lwasi-emulated-signal -lwasi-emulated-mman -lcrypt -Wl,--initial-memory=268435456 -Wl,-z,stack-size=67108864"
 mkdir -p "${ZLIB_OUT}/lib" "${ZLIB_OUT}/include"
 (
     cd "${ZLIB_SRC}"
@@ -337,46 +424,23 @@ mkdir -p "${WASIX_BUILD_DIR}"
     OPENSSL_LIBS="-L${OPENSSL_OUT}/lib -lssl -lcrypto" \
     ZLIB_CFLAGS="-I${ZLIB_OUT}/include" \
     ZLIB_LIBS="-L${ZLIB_OUT}/lib -lz" \
-    ../../configure \
-        --host=wasm32-wasi \
-        --build="$(../../config.guess)" \
-        --with-build-python="${HOST_BUILD_PYTHON}" \
-        --with-openssl="${OPENSSL_OUT}" \
-        --with-openssl-rpath=no \
-        --without-readline \
-        --disable-test-modules
-    python3 - Makefile <<'PY'
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-text, initial_memory_replacements = re.subn(
-    r"-Wl,--initial-memory=\d+",
-    "-Wl,--initial-memory=268435456",
-    text,
-)
-if initial_memory_replacements == 0:
-    raise SystemExit("CPython WASIX Makefile initial-memory flag not found")
-text, stack_size_replacements = re.subn(
-    r"-z stack-size=\d+",
-    "-z stack-size=67108864",
-    text,
-)
-if stack_size_replacements == 0:
-    raise SystemExit("CPython WASIX Makefile stack-size flag not found")
-text = text.replace(
-    "Python/$(DYNLOADFILE) \\\n",
-    "Python/$(DYNLOADFILE) \\\n\t\tPython/emscripten_trampoline.o \\\n",
-    1,
-)
-path.write_text(text)
-PY
-    perl -0pi -e 's/ -lwasi-emulated-signal//g; s/ -latomic//g' Makefile
-    make -j"${JOBS}" python.wasm
-    make platform
-)
+    ac_sys_system=WASI \
+    MACHDEP=wasix \
+	    ../../configure \
+	        --host=wasm32-wasi \
+	        --build="$(../../config.guess)" \
+	        --with-build-python="${HOST_BUILD_PYTHON}" \
+	        --with-openssl="${OPENSSL_OUT}" \
+	        --with-openssl-rpath=no \
+	        --without-readline \
+	        --disable-test-modules
+    cat > Modules/Setup.local <<'SETUP_LOCAL'
+_posixsubprocess _posixsubprocess.c
+_multiprocessing _multiprocessing/multiprocessing.c _multiprocessing/semaphore.c
+SETUP_LOCAL
+	    make -j"${JOBS}" python.wasm
+	    make platform
+	)
 
 PYTHON_WASM_UNOPTIMIZED="${OUTDIR}/python-${CPYTHON_VERSION}-wasix.unoptimized.wasm"
 PYTHON_WASM="${OUTDIR}/python-${CPYTHON_VERSION}-wasix.wasm"
@@ -457,12 +521,12 @@ mkdir -p "${PACKAGE_ROOT}/etc/ssl/certs"
 if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
     cp /etc/ssl/certs/ca-certificates.crt "${PACKAGE_ROOT}/etc/ssl/certs/ca-certificates.crt"
 fi
-if [ -d "${WASIX_BUILD_DIR}/build/lib.wasi-wasm32-3.13" ]; then
-    cp -a "${WASIX_BUILD_DIR}/build/lib.wasi-wasm32-3.13" \
-        "${PACKAGE_ROOT}/cross-build/wasm32-wasix/build/"
+SYSCONFIG_BUILD_DIR="$(find "${WASIX_BUILD_DIR}/build" -mindepth 1 -maxdepth 1 -type d -name 'lib.*-wasm32-3.13' | sort | head -n 1)"
+if [ -n "${SYSCONFIG_BUILD_DIR}" ]; then
+    cp -a "${SYSCONFIG_BUILD_DIR}" "${PACKAGE_ROOT}/cross-build/wasm32-wasix/build/"
 fi
 
-SYSCONFIG_DATA_DIR="${PACKAGE_ROOT}/cross-build/wasm32-wasix/build/lib.wasi-wasm32-3.13"
+SYSCONFIG_DATA_DIR="${PACKAGE_ROOT}/cross-build/wasm32-wasix/build/$(basename "${SYSCONFIG_BUILD_DIR:-lib.wasix-wasm32-3.13}")"
 SYSCONFIG_DATA_FILES=("${SYSCONFIG_DATA_DIR}"/_sysconfigdata_*.py)
 if [ -e "${SYSCONFIG_DATA_FILES[0]}" ]; then
     python3 - "${WORKDIR}" "${SYSCONFIG_DATA_FILES[@]}" <<'PY'

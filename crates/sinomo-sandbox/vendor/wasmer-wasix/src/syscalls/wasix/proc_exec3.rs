@@ -257,6 +257,16 @@ fn proc_exec3_prepared<M: MemorySize>(
     search_path: Bool,
     path: Option<String>,
 ) -> Result<Errno, WasiError> {
+    if std::env::var_os("SINOMO_WASIX_EXEC_DEBUG").is_some() {
+        eprintln!(
+            "sinomo-debug proc_exec begin pid={} name={:?} search_path={:?} path={:?} args={:?}",
+            ctx.data().pid().raw(),
+            name,
+            search_path,
+            path,
+            args
+        );
+    }
     let reexec_current_executable = name.is_empty();
     if name.is_empty()
         && let Some(current_executable) = ctx.data().process.executable_path()
@@ -294,12 +304,30 @@ fn proc_exec3_prepared<M: MemorySize>(
         let (_, state, inodes) =
             unsafe { ctx.data().get_memory_and_wasi_state_and_inodes(&ctx, 0) };
         match find_executable_in_path(&state.fs, inodes, path.iter().map(AsRef::as_ref), &name) {
-            FindExecutableResult::Found(p) => name = p,
-            FindExecutableResult::AccessError => return Ok(Errno::Access),
-            FindExecutableResult::NotFound => return Ok(Errno::Noexec),
+            FindExecutableResult::Found(p) => {
+                if std::env::var_os("SINOMO_WASIX_EXEC_DEBUG").is_some() {
+                    eprintln!("sinomo-debug proc_exec path-found {:?}", p);
+                }
+                name = p;
+            }
+            FindExecutableResult::AccessError => {
+                if std::env::var_os("SINOMO_WASIX_EXEC_DEBUG").is_some() {
+                    eprintln!("sinomo-debug proc_exec path-access-error");
+                }
+                return Ok(Errno::Access);
+            }
+            FindExecutableResult::NotFound => {
+                if std::env::var_os("SINOMO_WASIX_EXEC_DEBUG").is_some() {
+                    eprintln!("sinomo-debug proc_exec path-not-found");
+                }
+                return Ok(Errno::Noexec);
+            }
         }
     } else if !name.starts_with('/') {
         name = ctx.data().state.fs.relative_path_to_absolute(name);
+    }
+    if std::env::var_os("SINOMO_WASIX_EXEC_DEBUG").is_some() {
+        eprintln!("sinomo-debug proc_exec resolved-name {:?}", name);
     }
 
     trace!(name);
@@ -522,6 +550,9 @@ fn proc_exec3_prepared<M: MemorySize>(
                     "failed to execve as the process could not be spawned (fork)[0] - {}",
                     err
                 );
+                if std::env::var_os("SINOMO_WASIX_EXEC_DEBUG").is_some() {
+                    eprintln!("sinomo-debug proc_exec spawn-error {err:?}");
+                }
                 restore_on_exec_failure.restore(ctx.data());
                 Ok(conv_spawn_err_to_errno(&err))
             }
