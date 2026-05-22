@@ -1,12 +1,17 @@
 # Sandbox Implementation Notes
 
-This document is the detailed implementation record for `sinomo-sandbox`. The project plan should stay roadmap-level; current implementation status, remaining gaps, and historical detailed notes belong here.
+This document is the detailed implementation record for `sinomo-sandbox`. The project plan stays roadmap-level in `docs/plans/sifs-wasm-sandbox-plan.md`; current implementation status, remaining gaps, and detailed design notes belong here.
 
-## Current Status And Gaps
+## Reading Guide
 
-The project roadmap lives in `docs/plans/sifs-wasm-sandbox-plan.md`, and the crate README stays focused on developer onboarding.
+- Start with the current implementation snapshot for the active runtime, filesystem, toolchain, and shell status.
+- Use the remaining gaps section as the working backlog for POSIX, SIFS, operations, and verification work.
+- Use the detailed design notes as the implementation record behind the roadmap. They intentionally keep lower-level details out of the plan document and the crate README.
+- Use the appendices for settled decisions, open questions, near-term recommendations, and references.
 
-## Current Baseline
+## Current Implementation Snapshot
+
+### Baseline
 
 - WASIX is the default runtime. Preview1 is retained for compatibility with simple single-process modules.
 - Local and daemon-backed SIFS sandbox operations are wired through the CLI for create, status, config, run, shell, logs, file inspection, file writes, HTTP fetch, checkpoint, resume, reboot, destroy, toolchain import, and policy.
@@ -15,7 +20,7 @@ The project roadmap lives in `docs/plans/sifs-wasm-sandbox-plan.md`, and the cra
 - The default policy lets a sandbox use available host memory and does not set wall-time or workspace-size limits unless cluster policy overrides them.
 - Ambient WASIX HTTP is denied. Network fetches go through the mediated sandbox fetch path and produce audit records.
 
-## Runtime Status
+### Runtime
 
 The WASIX runner currently provides:
 
@@ -75,7 +80,7 @@ The WASIX runner currently provides:
 - failed WASIX thread creation paths that discover a missing `wasi_thread_start` export now remove the pre-created thread handle, so repeated failed `thread_spawn_v2` calls do not consume the process task budget.
 - threaded CPython workloads avoid the guest asyncify futex path and use shared-memory atomic waits/wakes for Python's libc futex calls.
 
-## Threading Status
+### Threading
 
 Basic threaded execution has been proven for WASIX modules that import shared memory. Threaded modules should be built with imported shared memory; modules that define and export their own shared memory can spawn smoke-test workers but do not provide the same shared-memory behavior expected by real pthread toolchains.
 
@@ -96,7 +101,7 @@ The Clang package verifier now covers normal `clang` invocation for hello-world 
 
 BusyBox WASIX and CPython WASIX recipes now lower POSIX `fork()` and `vfork()` calls to the direct WASIX `fork`/`vfork` compatibility imports. CPython WASIX also lowers thread-shaped Linux `clone` calls to the runtime `clone_thread` import instead of keeping the shared-address-space case as a libc-side unsupported branch. BusyBox WASIX also lowers `getppid`, `getpgrp`, `getpgid`, `getsid`, `setpgid`, `setsid`, `tcgetpgrp`, `tcgetsid`, `tcsetpgrp`, `kill`, `raise`, `dup`, `dup2`, `pipe`, `chdir`, `execv`, `execve`, `execvp`, `fchdir`, `wait`, and `waitpid` to runtime process imports instead of returning compatibility stubs. The legacy pointer-return `proc_fork` ABI, length-based `proc_chdir` ABI, positive-errno `proc_fchdir` ABI, and WASIX errno-return `proc_signal`/`proc_raise` ABI remain exported for existing WASIX callers, but new POSIX-facing toolchain wrappers no longer need to encode child pids or paths through non-POSIX shapes. CPython WASIX lowers Linux clear-child-TID, robust-list, sleep, clock, `sched_yield`, scheduler priority bounds, scheduler interval, `waitid`, `arch_prctl`, `membarrier`, `rseq`, `tkill`, `tgkill`, `rt_sigreturn`, `FUTEX_FD`, pidfd, timerfd, POSIX timer, process interval timer, `sigaltstack`, signal masks, and signalfd syscall paths plus `pipe2`, `dup3`, `eventfd`, `unshare`, and `setns` descriptor/process operations into runtime process/thread imports instead of keeping those lifecycle, descriptor, event, wait-status, and namespace hooks entirely inside the compatibility layer.
 
-## Filesystem Status
+### Filesystem
 
 The sandbox has local and SIFS virtual filesystem backends, staging helpers, path normalization, symlink escape checks, quota accounting, workspace diffing, logs, checkpoints, and read-write mount sync.
 
@@ -108,7 +113,7 @@ Generated virtual filesystem features include:
 - package/toolchain mounts under `/bin`, `/lib`, `/share`, `/include`, and `/etc`.
 - local raw WASIX module runs now stage the sandbox's pinned toolchain runtime before launch, so child `exec` from a test or user program can resolve standard commands such as `/bin/ls` through the same real toolchain files used by named sandbox commands.
 
-## Toolchain Status
+### Toolchains
 
 Maintained packages:
 
@@ -122,11 +127,11 @@ Maintained packages:
 
 The CPython WASIX native gate currently passes locally with real `pip`: `pip install --find-links` installs `numpy` and `matplotlib` into the sandbox workspace, `numpy` imports and runs array operations, and `matplotlib` imports with the Agg backend and renders a PNG artifact inside `/work`. The Python main module is linked through the WASIX C++ linker so dynamically loaded native extension side modules can resolve the C++ runtime ABI from the main image.
 
-## Process-Plan And Shell Status
+### Process Plans And Shell
 
 `SandboxProcessPlan` can run multiple pinned commands with explicit stdout-to-stdin pipes. It is a low-level execution substrate, not a shell syntax implementation.
 
-`sinomo sandbox shell` requires a pinned real `sh`; the maintained route is the WASIX Bash package. BusyBox ash should not be patched to fake missing process support. The runtime must support the process behavior real shells need.
+`sinomo sandbox shell` requires a pinned real `sh`; the default route is the BusyBox ash WASIX applet in the maintained BusyBox package. Bash remains the richer shell package target. BusyBox ash should not be patched to fake missing process support. The runtime must support the process behavior real shells need.
 
 ## Remaining Gaps
 
@@ -186,11 +191,9 @@ The target is a real POSIX coding sandbox backed by SIFS. A developer or agent s
 - Add workload-driven verification before conformance tightening; use real tools to expose missing runtime behavior.
 - Track known verifier failures with the exact failing command, expected Linux behavior, current sandbox behavior, and owning layer for the fix.
 
+## Detailed Design Notes
 
-## Historical Extracted Plan Content
-
-
-## Purpose
+### Purpose And Scope
 
 Sinomo needs a resumable sandbox for agent actions, tool execution, lightweight build/test work, and long-running task workspaces. The target is inspired by WebVM's browser-hosted Linux-like command environment, but the Sinomo sandbox should not boot a full Linux distribution or emulate a whole machine.
 
@@ -209,26 +212,26 @@ The sandbox should provide:
 - inspectable execution records for agents and operators,
 - a path toward richer toolchains without trusting host binaries by default.
 
-## Implementation Status
+### Phase Status
 
-Current repo status:
+This status record is intentionally more detailed than the snapshot above. Use it when tracing why a subsystem exists or when updating evidence after implementation work.
 
 | Phase | Status | Evidence |
 |---|---|---|
 | Phase 0: Architecture And API Skeleton | Implemented | `sinomo-sandbox` defines sandbox IDs, manifests, resource limits, VFS traits, storage registration, path normalization, and error shapes. `sinomo-cli` exposes `sinomo sandbox` help. |
 | Phase 1: Local WASI Command Runner | Partially implemented | WASIX is now the default sandbox runtime target and the `wasix-runtime` feature is enabled by default in the crates that expose sandbox execution. The WASIX runner handles buffered stdin, fd-backed stdin pipes, stdout/stderr capture, stdout pipe teeing, process-tree signaling, input/output limits, static memory-budget checks, instruction metering, mapped preopen/cwd validation, and raw WASIX HTTP import denial. `LocalWasiCommandRunner` remains the WASI Preview1 compatibility runner for simple single-process modules through Wasmtime, with timeout/cancellation, memory limits, output limits, explicit read-write/read-only preopens, and path-escape denial. `LocalStagedSandboxCommandRunner` wraps local staged command execution with checkpoint rollback, quota checks, changed-path reporting, stdin forwarding, stdout/stderr persistence, command records, and optional per-command effective resource limits. `SandboxToolchainManifest`, `LocalSandboxToolchainStore`, and `SifsSandboxToolchainStore` record command names, module paths, BLAKE3 hashes, support artifact paths/hashes, capabilities, default limits, provenance, local cache persistence, and SIFS persistence under `/services/sandbox/toolchains/<toolchain_id>`. `sinomo sandbox toolchain add-command` and generic package manifests default to WASIX unless `target_abi = "preview1"` is explicitly selected. BusyBox is imported through the generic `sinomo sandbox toolchain import-package` package path as the default core applet toolchain. |
 | Phase 2: SIFS-Backed Workspace | Partially implemented | `LocalSandboxInstanceStore` creates the planned instance directory layout and persists `manifest.sobj` through `sinomo-object`; `LocalSandboxFileSystem` provides a tested local staging VFS for root/home/tmp/work/logs/artifacts paths with path-escape and symlink-escape checks, snapshot/diff changed-path reporting, workspace file-count/byte accounting, per-command written-byte accounting, local checkpoint/resume/reboot/destroy, and checkpoint cleanup; command stdout/stderr plus structured `.record.sobj` records are persisted under `/logs` through backend-agnostic helpers tested against both local and SIFS filesystems, command ids are appended to the sandbox manifest command history after completed, failed, cancelled, or resource-exhausted runs, persisted `cwd` and environment variables are configurable through `sinomo sandbox config`, `sandbox_command_record_event` lowers completed/failed/resource-exhausted records into cluster event envelopes, `sandbox_policy_denied_event` and `sandbox_scheduling_failed_event` provide typed denial/failure events, and `append_sandbox_command_record_events` reads persisted local/SIFS command records plus stdout/stderr logs and appends reconstructed `sandbox.command.started`, raw `sandbox.command.output` chunk events, and the final command-status event into an `EventStore`; `sinomo sandbox logs <sandbox-id> <command-id>` decodes the command record before printing raw streams; `SifsSandboxInstanceStore` creates/loads/saves instance manifests and standard directories under `/services/sandbox/instances/<sandbox_id>`, with SIFS checkpoint/resume/reboot/delete/destroy support for root/home/tmp/work/logs/artifacts and explicit replica-candidate writes for distributed persistence tests; `SifsSandboxFileSystem` adapts sandbox virtual paths to the existing SIFS POSIX API for stat/read/write/list/rename/unlink/create-dir, supports explicit replica candidates, and is tested with `NetworkedDfsService` including a cross-node resume/read regression; backend-agnostic workspace sync copies root/home/tmp/work/logs/artifacts between local staging and SIFS while preserving empty directories and removing stale destination entries; `SifsStagedSandboxCommandRunner` stages a SIFS workspace into a local WASI runtime, stages declared SIFS mounts into local WASI preopens, executes through the local staged runner, syncs read-write mounts back to SIFS, syncs command logs/workspace data back to SIFS, saves updated manifest command history back to SIFS, accepts explicit replica candidates for workspace/log/mount writeback, and is tested with command-write, process-plan output, and read-write mount resume/read regressions from a replica node; `SifsSandboxToolchainStore` writes and reads toolchain manifests/modules through SIFS with hash verification; `sinomo sandbox create`, `status`, `config`, named `run`, `run --wasm`, `logs`, `ls`, `cat`, `write`, `checkpoint`, `resume`, `reboot`, `destroy`, and local `toolchain add-command` are wired, `sinomo sandbox create --mount <sifs-path>:<mount-path>[:ro|rw]` persists mount declarations in the manifest, and local `sandbox run` now validates declared mounts, pinned command capabilities, effective command limits, and `argv[0]` before delegating the execution transaction to `sinomo-sandbox`. Local CLI commands still default to local staging, but `sinomo sandbox create --daemon`, `status --daemon`, `config --daemon`, `run --daemon`, `shell --daemon`, `logs --daemon`, `ls --daemon`, `cat --daemon`, `write --daemon`, `fetch --daemon`, `checkpoint --daemon`, `resume --daemon`, `reboot --daemon`, and `destroy --daemon` now use the daemon/SIFS path for SIFS-backed instances, SIFS toolchains, status reads, command execution, real pinned shell invocation when available, logs, file inspection, writes, daemon-backed HTTP fetch-to-file, checkpoint, resume, reboot, and destroy. |
-| Phase 3+: BusyBox userspace, scheduling, network, richer toolchains | Partially implemented | `SandboxPolicy` provides reusable checks for allowed mount prefixes, local-owned mount locality, resource budgets, concurrent command/sandbox budgets, command capability allowlists, signed/allowlisted toolchains, toolchain provenance prefix allowlists, package-cache SIFS prefix allowlists, HTTP host allowlists, HTTP byte/timeout budgets, toolchain update preflight, and full invocation validation across instance manifest, pinned toolchain, selected command, and execution node. `SandboxClusterPolicyConfig` owns the typed cluster KV policy contract at `/config/sandbox/policy`, with snapshot decode and transaction helpers. `select_sandbox_execution_node` provides the tested node-locality scheduling primitive, prefers the owner node for `/sinomo/nodes/<node_id>/files` mounts, returns inspectable `unavailable-offline` and `policy-blocked` reasons, and SIFS staged execution records `last_placement` in the sandbox manifest. Local CLI named command execution plus local and SIFS staged runners reject denied manifests before execution or staging, and named pinned toolchain commands only run after validating toolchain signature/allowlist/provenance where applicable, package-cache paths, command capabilities, matching `argv[0]`, and effective command limits. Local and SIFS filesystem APIs expose virtual `/dev`, `/dev/null`, and bounded `/dev/zero`; staged WASI command execution now installs a per-run Sinomo-owned `/dev` preopen so commands can open `/dev/null` and bounded `/dev/zero` without mapping host devices. The daemon now exposes `/sandbox/create`, `/sandbox/status`, `/sandbox/checkpoint`, `/sandbox/resume`, `/sandbox/destroy`, `/sandbox/list`, `/sandbox/read`, `/sandbox/write`, `/sandbox/http/fetch`, `/sandbox/http/fetch-to-file`, `/sandbox/toolchain/import-package`, `/sandbox/toolchain/add-command`, `/sandbox/toolchain/add-artifact`, and `/sandbox/run/toolchain`, `/sandbox/run/toolchain/stream`, `/sandbox/run/process-plan`, and `/sandbox/run/process-plan/stream`, loads the cluster sandbox policy, rejects denied create/config/write/checkpoint/resume/reboot mutations before changing SIFS state, preflights daemon toolchain imports/adds before writing SIFS package state, enforces active execution concurrency limits before daemon-backed runs, opens SIFS through the local DFS metadata/content stores, runs the pinned SIFS toolchain command through `SifsStagedSandboxCommandRunner`, derives replica candidates from DFS content-service advertisements, and persists placement/log/workspace changes back to SIFS. `sinomo sandbox create --daemon`, `status --daemon`, `toolchain import-package --daemon`, `toolchain add-command --daemon`, `toolchain add-artifact --daemon`, `run --daemon`, `shell --daemon`, `logs --daemon`, `ls --daemon`, `cat --range`, `write --daemon`, `fetch --daemon`, `checkpoint --daemon`, `resume --daemon`, `reboot --daemon`, and `destroy --daemon` select daemon-backed SIFS paths while direct `--wasm` execution remains local only. `sinomo sandbox process-plan <sandbox-id> <plan.json> [--daemon]` exposes the structured process-plan substrate for pinned toolchain commands and explicit stdout-to-stdin pipes without parsing shell syntax, using either the local staging backend, the daemon-backed single-response SIFS RPC route at `/sandbox/run/process-plan`, or the live-output stream route at `/sandbox/run/process-plan/stream`; local and SIFS/daemon WASIX-only linear pipelines now run connected steps concurrently with fd-backed stdout-to-stdin pipes, including staged SIFS mount preopens and read-write mount sync, while mixed-ABI plans keep the existing staged handoff path. `sinomo sandbox policy show/set` reads and writes the cluster-scoped policy through cluster KV, including allowed mount prefixes, package-cache prefixes, toolchain provenance prefixes, concurrency limits, and HTTP hosts. `sinomo sandbox doctor [<sandbox-id>]` reports local toolchain readiness, missing pinned toolchains, coding-toolchain command gaps for every BusyBox applet and QuickJS command required by `verify-coding`, missing commands from the planned minimal POSIX command environment, policy incompatibilities, placement metadata, recent policy-denial and resource-exhaustion events from the durable event log, and local CLI backend limitations. `SandboxBusyBoxToolchainSpec` declares the core BusyBox applet set and installs a real BusyBox WASIX module into local or SIFS toolchain stores by default; `BUSYBOX_TOOLCHAIN_FIDELITY_CASES` declares host-side real-tool checks, `sinomo sandbox toolchain busybox-plan` prints the applet/fidelity plan, and `sinomo sandbox toolchain verify-busybox [--daemon]` runs the BusyBox fidelity suite against local or daemon-backed SIFS sandboxes. Generic WASI command modules, support artifacts, and declared packages can now be added to local or SIFS toolchain manifests with `sinomo sandbox toolchain add-command [--daemon]`, `sinomo sandbox toolchain add-artifact [--daemon]`, and `sinomo sandbox toolchain import-package [--daemon] [--into <toolchain-id>]`, letting richer language/runtime packages be imported as standalone toolchains or merged into a BusyBox-based coding toolchain through the same SIFS replication path. `sinomo sandbox toolchain hash <file>` prints the exact BLAKE3 content hash expected by package manifests. `crates/sinomo-sandbox/toolchains/busybox/README.md` documents the current import contract and explicitly forbids fake BusyBox substitutes, and the same directory now includes the pinned containerized BusyBox WASIX package recipe. `crates/sinomo-sandbox/toolchains/quickjs/README.md` adds an optional language-runtime package target: a pinned QuickJS WASIp1 recipe that generates a generic `import-package` manifest for command `qjs` plus support artifacts; `sinomo sandbox toolchain quickjs-plan` prints the maintained QuickJS target, standalone and BusyBox-merged import paths, `verify-coding` command, and fidelity case set. The active coding target is WASIX: Bash provides real `bash` and `sh`, CPython WASIX provides `python` and `pip` with native-wheel support, and Make/TinyCC provide build-tool coverage. `SandboxProcessPlan` adds a reusable lower-level process substrate that runs multiple pinned toolchain commands as separate WASI invocations and can pipe stdout from one step into stdin of the next through both local and SIFS-backed staged runners; it rejects ambiguous steps where an explicit stdin payload would conflict with a pipe from the previous step, and it is not exposed as `sh` and does not claim shell syntax or general POSIX process parity. WASIX terminal process support now tracks process groups, sessions, foreground terminal ownership, background stdin `SIGTTIN`, background `tcsetpgrp` `SIGTTOU`, and POSIX `TOSTOP` background stdout/stderr `SIGTTOU` through the terminal fd path. `sinomo sandbox shell` requires a pinned real `sh` command and does not provide a fake fallback; the maintained Bash WASIX package is the default route for real `sh` when imported into the pinned toolchain and allowed by cluster policy. Mediated HTTP exchange records now persist under `/logs` as SOBJ files, round-trip through local and SIFS filesystems, lower into `sandbox.network.http` events containing redacted request metadata, and the recording fetch helper audits successful and failed post-policy transport attempts. `sandbox_http_fetch_to_file` stores successful response bodies into the sandbox filesystem, and `sinomo sandbox fetch` exposes a curl-like command surface backed by the sandbox HTTP transport abstraction; the production path now routes through local daemon object RPC at `/sandbox/http/fetch` and `/sandbox/http/fetch-to-file`, and the daemon applies cluster sandbox policy before outbound HTTP. Remaining implementation work includes arbitrary POSIX fork/exec/wait parity, broader job control, and more production hardening around process-oriented tools. |
+| Phase 3+: BusyBox userspace, scheduling, network, richer toolchains | Partially implemented | `SandboxPolicy` provides reusable checks for allowed mount prefixes, local-owned mount locality, resource budgets, concurrent command/sandbox budgets, command capability allowlists, signed/allowlisted toolchains, toolchain provenance prefix allowlists, package-cache SIFS prefix allowlists, HTTP host allowlists, HTTP byte/timeout budgets, toolchain update preflight, and full invocation validation across instance manifest, pinned toolchain, selected command, and execution node. `SandboxClusterPolicyConfig` owns the typed cluster KV policy contract at `/config/sandbox/policy`, with snapshot decode and transaction helpers. `select_sandbox_execution_node` provides the tested node-locality scheduling primitive, prefers the owner node for `/sinomo/nodes/<node_id>/files` mounts, returns inspectable `unavailable-offline` and `policy-blocked` reasons, and SIFS staged execution records `last_placement` in the sandbox manifest. Local CLI named command execution plus local and SIFS staged runners reject denied manifests before execution or staging, and named pinned toolchain commands only run after validating toolchain signature/allowlist/provenance where applicable, package-cache paths, command capabilities, matching `argv[0]`, and effective command limits. Local and SIFS filesystem APIs expose virtual `/dev`, `/dev/null`, and bounded `/dev/zero`; staged WASI command execution now installs a per-run Sinomo-owned `/dev` preopen so commands can open `/dev/null` and bounded `/dev/zero` without mapping host devices. The daemon now exposes `/sandbox/create`, `/sandbox/status`, `/sandbox/checkpoint`, `/sandbox/resume`, `/sandbox/destroy`, `/sandbox/list`, `/sandbox/read`, `/sandbox/write`, `/sandbox/http/fetch`, `/sandbox/http/fetch-to-file`, `/sandbox/toolchain/import-package`, `/sandbox/toolchain/add-command`, `/sandbox/toolchain/add-artifact`, and `/sandbox/run/toolchain`, `/sandbox/run/toolchain/stream`, `/sandbox/run/process-plan`, and `/sandbox/run/process-plan/stream`, loads the cluster sandbox policy, rejects denied create/config/write/checkpoint/resume/reboot mutations before changing SIFS state, preflights daemon toolchain imports/adds before writing SIFS package state, enforces active execution concurrency limits before daemon-backed runs, opens SIFS through the local DFS metadata/content stores, runs the pinned SIFS toolchain command through `SifsStagedSandboxCommandRunner`, derives replica candidates from DFS content-service advertisements, and persists placement/log/workspace changes back to SIFS. `sinomo sandbox create --daemon`, `status --daemon`, `toolchain import-package --daemon`, `toolchain add-command --daemon`, `toolchain add-artifact --daemon`, `run --daemon`, `shell --daemon`, `logs --daemon`, `ls --daemon`, `cat --range`, `write --daemon`, `fetch --daemon`, `checkpoint --daemon`, `resume --daemon`, `reboot --daemon`, and `destroy --daemon` select daemon-backed SIFS paths while direct `--wasm` execution remains local only. `sinomo sandbox process-plan <sandbox-id> <plan.json> [--daemon]` exposes the structured process-plan substrate for pinned toolchain commands and explicit stdout-to-stdin pipes without parsing shell syntax, using either the local staging backend, the daemon-backed single-response SIFS RPC route at `/sandbox/run/process-plan`, or the live-output stream route at `/sandbox/run/process-plan/stream`; local and SIFS/daemon WASIX-only linear pipelines now run connected steps concurrently with fd-backed stdout-to-stdin pipes, including staged SIFS mount preopens and read-write mount sync, while mixed-ABI plans keep the existing staged handoff path. `sinomo sandbox policy show/set` reads and writes the cluster-scoped policy through cluster KV, including allowed mount prefixes, package-cache prefixes, toolchain provenance prefixes, concurrency limits, and HTTP hosts. `sinomo sandbox doctor [<sandbox-id>]` reports local toolchain readiness, missing pinned toolchains, coding-toolchain command gaps for every BusyBox applet and QuickJS command required by `verify-coding`, missing commands from the planned minimal POSIX command environment, policy incompatibilities, placement metadata, recent policy-denial and resource-exhaustion events from the durable event log, and local CLI backend limitations. `SandboxBusyBoxToolchainSpec` declares the core BusyBox applet set and installs a real BusyBox WASIX module into local or SIFS toolchain stores by default; `BUSYBOX_TOOLCHAIN_FIDELITY_CASES` declares host-side real-tool checks, `sinomo sandbox toolchain busybox-plan` prints the applet/fidelity plan, and `sinomo sandbox toolchain verify-busybox [--daemon]` runs the BusyBox fidelity suite against local or daemon-backed SIFS sandboxes. Generic WASI command modules, support artifacts, and declared packages can now be added to local or SIFS toolchain manifests with `sinomo sandbox toolchain add-command [--daemon]`, `sinomo sandbox toolchain add-artifact [--daemon]`, and `sinomo sandbox toolchain import-package [--daemon] [--into <toolchain-id>]`, letting richer language/runtime packages be imported as standalone toolchains or merged into a BusyBox-based coding toolchain through the same SIFS replication path. `sinomo sandbox toolchain hash <file>` prints the exact BLAKE3 content hash expected by package manifests. `crates/sinomo-sandbox/toolchains/busybox/README.md` documents the current import contract and explicitly forbids fake BusyBox substitutes, and the same directory now includes the pinned containerized BusyBox WASIX package recipe. `crates/sinomo-sandbox/toolchains/quickjs/README.md` adds an optional language-runtime package target: a pinned QuickJS WASIp1 recipe that generates a generic `import-package` manifest for command `qjs` plus support artifacts; `sinomo sandbox toolchain quickjs-plan` prints the maintained QuickJS target, standalone and BusyBox-merged import paths, `verify-coding` command, and fidelity case set. The active coding target is WASIX: Bash provides real `bash` and `sh`, CPython WASIX provides `python` and `pip` with native-wheel support, and Make/TinyCC provide build-tool coverage. `SandboxProcessPlan` adds a reusable lower-level process substrate that runs multiple pinned toolchain commands as separate WASI invocations and can pipe stdout from one step into stdin of the next through both local and SIFS-backed staged runners; it rejects ambiguous steps where an explicit stdin payload would conflict with a pipe from the previous step, and it is not exposed as `sh` and does not claim shell syntax or general POSIX process parity. WASIX terminal process support now tracks process groups, sessions, foreground terminal ownership, background stdin `SIGTTIN`, background `tcsetpgrp` `SIGTTOU`, and POSIX `TOSTOP` background stdout/stderr `SIGTTOU` through the terminal fd path. `sinomo sandbox shell` requires a pinned real `sh` command and does not provide a fake fallback; the maintained BusyBox WASIX package provides default `sh` through upstream ash, while Bash remains the richer shell package target. Mediated HTTP exchange records now persist under `/logs` as SOBJ files, round-trip through local and SIFS filesystems, lower into `sandbox.network.http` events containing redacted request metadata, and the recording fetch helper audits successful and failed post-policy transport attempts. `sandbox_http_fetch_to_file` stores successful response bodies into the sandbox filesystem, and `sinomo sandbox fetch` exposes a curl-like command surface backed by the sandbox HTTP transport abstraction; the production path now routes through local daemon object RPC at `/sandbox/http/fetch` and `/sandbox/http/fetch-to-file`, and the daemon applies cluster sandbox policy before outbound HTTP. Remaining implementation work includes arbitrary POSIX fork/exec/wait parity, broader job control, and more production hardening around process-oriented tools. |
 
 Recent fetch-to-file quota handling update: local and daemon-backed `sinomo sandbox fetch` now emit `sandbox.resource.exhausted` when the mediated response body would exceed the sandbox write/workspace quota, while retaining the HTTP audit record for the completed network attempt.
 
-The Bash target now has a checked-in Sinomo-owned WASIX recipe under `crates/sinomo-sandbox/toolchains/bash/`. It pins GNU Bash, wasi-sdk, Binaryen, and wasix-libc inputs, verifies downloads, builds real upstream Bash with the WASIX sysroot, applies Binaryen asyncify plus function-pointer cast emulation for Bash's setjmp/longjmp and generic callback paths, and emits a generic `import-package` manifest only after a real module exists. The recipe builds a real GNU Bash WASIX module and the generated package manifest passes Sinomo package validation. The package exposes `bash` and `sh` command entries backed by the same upstream Bash module, with `sh` relying on Bash's real invocation-name behavior rather than a shim. Local and daemon-local SIFS-backed `verify-bash` now pass after importing Bash into the BusyBox WASIX package: Bash builtin `printf`, external-command pipeline with `grep`, redirection plus external `cat`, descriptor duplication with `2>&1`, command substitution, `set -e`, `/work` shebang execution, `sh -c` external-pipeline behavior, and an explicit sandbox-local WASM executable staged into `/work` all run through the WASIX runtime. Bash remains gated from ordinary agent use by sandbox policy and production readiness: Bash/WASIX command manifests declare both `child-process-exec` and `wasix.unpinned-child-exec`, and the default policy denies both capabilities. Ordinary clusters must explicitly allow the Bash/WASIX toolchain plus both capabilities before `bash` or `sh` is available to agents. No shim or BusyBox shell substitute is allowed.
+The Bash target now has a checked-in Sinomo-owned WASIX recipe under `crates/sinomo-sandbox/toolchains/bash/`. It pins GNU Bash, wasi-sdk, Binaryen, and wasix-libc inputs, verifies downloads, builds real upstream Bash with the WASIX sysroot, applies Binaryen asyncify plus function-pointer cast emulation for Bash's setjmp/longjmp and generic callback paths, and emits a generic `import-package` manifest only after a real module exists. The recipe builds a real GNU Bash WASIX module and the generated package manifest passes Sinomo package validation. The package exposes `bash` and `sh` command entries backed by the same upstream Bash module, with `sh` relying on Bash's real invocation-name behavior rather than a shim. Local and daemon-local SIFS-backed `verify-bash` now pass after importing Bash into the BusyBox WASIX package: Bash builtin `printf`, external-command pipeline with `grep`, redirection plus external `cat`, descriptor duplication with `2>&1`, command substitution, `set -e`, `/work` shebang execution, `sh -c` external-pipeline behavior, and an explicit sandbox-local WASM executable staged into `/work` all run through the WASIX runtime. Bash remains the richer shell package target and is gated from ordinary agent use by sandbox policy and production readiness: Bash/WASIX command manifests declare both `child-process-exec` and `wasix.unpinned-child-exec`, and the default policy denies both capabilities. Ordinary clusters must explicitly allow the Bash/WASIX toolchain plus both capabilities before `bash` is available to agents. No shim shell substitute is allowed.
 
 BusyBox recipe status: `crates/sinomo-sandbox/toolchains/busybox/verify-busybox-wasi.sh` is now the required end-to-end gate for applet additions. It builds the pinned BusyBox WASIX package recipe, validates and imports the generated `package.json`, creates a disposable sandbox, and runs `verify-busybox`. The recipe builds against the real WASIX sysroot, applies the checked-in BusyBox patch, uses Binaryen asyncify plus function-pointer cast emulation, and emits a generic `import-package` manifest. The old `wasi-compat` header directory was a Preview1-only pile of fake libc/POSIX substitutions, so none of it belongs in the shared WASIX sysroot. Generic POSIX support belongs in `crates/sinomo-sandbox/toolchains/build-tools/sysroot` and the runtime/system-library layer. No new BusyBox applet should be exposed unless the verifier passes for the applet. `crates/sinomo-sandbox/toolchains/verify-bash-wasix.sh` is the combined local Bash gate: it builds BusyBox WASIX and Bash WASIX, validates both package manifests, imports Bash into the BusyBox WASIX toolchain in a disposable data directory, creates a sandbox, and runs `sinomo sandbox toolchain verify-bash`. Set `VERIFY_BACKEND=daemon-local` to run the same package/import/execution gate through a disposable local daemon, cluster policy, and SIFS-backed sandbox workspace. `crates/sinomo-sandbox/toolchains/verify-coding-wasi.sh` is the combined coding-toolchain verifier: it builds the pinned BusyBox and QuickJS recipes, imports QuickJS into the BusyBox toolchain in a disposable local data directory, creates a sandbox, and runs `sinomo sandbox toolchain verify-coding`. `verify-coding` now includes the Phase 3 command workflow against `/work` before the QuickJS/BusyBox cross-tool file workflow. The workflow covers creation, copy/move/compare, permission changes, archive create/list, remove/rmdir cleanup, stdin text processing, search, and cross-tool file handoff, so the local gate covers the documented coding-task acceptance path instead of only isolated applet checks. `crates/sinomo-sandbox/toolchains/verify-coding-wasi.sh` accepts `VERIFY_FULL=1` as the explicit heavier local gate. Full mode runs the active WASIX shell/build workspace with BusyBox WASIX plus Bash, Python, Make, and TCC; compatibility Preview1 modules can still be tested separately through their own package paths. `VERIFY_FULL=1 SKIP_BUILD=1` intentionally reuses existing package outputs and fails early if any required BusyBox WASIX, Bash, Python, Make, or TCC package manifest is missing. The QuickJS recipe also maps build and repository paths out of compiler-visible file/debug paths so the generated module is byte-identical across independent work directories.
 
 The durable event path is now shared with the wider event subsystem: `sinomo-events` registers `events/event-log.jsonl`, and `JsonlEventStore` persists newline-delimited `EventEnvelope` records with replay filters and duplicate id rejection. The daemon-backed sandbox path appends `sandbox.instance.created`, `sandbox.instance.updated`, `sandbox.instance.checkpointed`, `sandbox.instance.resumed`, `sandbox.instance.rebooted`, `sandbox.instance.destroyed`, `sandbox.command.started`, `sandbox.command.output`, `sandbox.command.completed`, `sandbox.mount.added`, `sandbox.mount.denied`, `sandbox.toolchain.pinned`, `sandbox.toolchain.updated`, and `sandbox.network.http` records to that store after the corresponding SIFS state has been written. Command output events currently persist captured raw stdout/stderr chunks after command completion. The WASI and SIFS-staged runners now expose an output sink that receives raw stdout/stderr chunks while the command runs, and local `sinomo sandbox run`/`shell` uses that sink for operator-visible streaming. Daemon-backed toolchain execution also has a streaming RPC route that sends output chunk frames before the final command outcome frame.
 
-## WebVM Lessons To Reuse
+### WebVM Lessons To Reuse
 
 WebVM demonstrates a useful product shape:
 
@@ -251,7 +254,7 @@ Key differences:
 | Networking | Browser-mediated networking | Sinomo-network mediated allowlisted egress |
 | Security model | Browser sandbox plus VM boundary | Sinomo policy, capability checks, resource limits, and node-local enforcement |
 
-## Design Position
+### Design Position
 
 Use a layered sandbox:
 
@@ -270,7 +273,7 @@ The sandbox runtime should be a production Sinomo service, not an experiment in 
 
 The initial runtime should prioritize correctness, observability, and resumable state over breadth. The goal is not a "POSIX-like" imitation. It is a minimal real POSIX system for the agent: if Sinomo exposes `grep`, `sed`, `awk`, `tar`, or any other command, that command must behave as the genuine tool within the documented sandbox limits. If Sinomo cannot provide a real implementation, the command should be absent and the runtime should report that it is unsupported.
 
-## Filesystem Model
+### Filesystem Model
 
 Every sandbox has one SIFS workspace root:
 
@@ -308,7 +311,7 @@ The runtime mounts these as a virtual Unix tree:
 
 The first version should not expose arbitrary host paths. Host access should only appear through explicit SIFS mounts. Existing local-owned SIFS paths such as `/sinomo/nodes/<node_id>/files` can be mounted read-only or read-write only when policy grants that capability.
 
-### Workspace Persistence
+#### Workspace Persistence
 
 SIFS is the durability boundary. The sandbox should commit meaningful progress to SIFS after each command or explicit checkpoint:
 
@@ -335,7 +338,7 @@ continue with the next command
 
 Long-running process suspension can come later as an explicit checkpointable process model.
 
-## Runtime Model
+### Runtime Model
 
 Use a Rust WASM runtime with WASI support as the execution core. Candidate runtimes:
 
@@ -364,7 +367,7 @@ The runtime should provide:
 
 The current WASI runner explicitly disables ambient TCP, UDP, and name lookup. Network egress for sandbox commands must go through Sinomo-mediated HTTP/fetch paths so policy, byte budgets, audit logs, and cluster routing remain enforceable.
 
-### Command Execution Contract
+#### Command Execution Contract
 
 The service API should be command-oriented:
 
@@ -397,7 +400,7 @@ Stdout and stderr should be streamed to the caller and persisted under:
 
 Large outputs should be chunked and referenced by SIFS paths instead of returned inline.
 
-## Command Environment
+### Command Environment
 
 The first root image should be a signed tool bundle, not a Linux distro. It should contain WASM builds or native WASI ports of common tools plus a real POSIX `sh`.
 
@@ -459,7 +462,7 @@ curl-like client routed through Sinomo-network policy
 
 Start with BusyBox as the first command environment target. BusyBox is useful because it can provide a compact real userspace. Sinomo should maintain its own BusyBox build path so the runtime, filesystem assumptions, patches, and reproducible build inputs are controlled by the project. The current WASIX package keeps BusyBox ash close to upstream: it does not patch shell command execution, pipeline, here-doc, or redirection semantics to hide missing runtime behavior. Job control, fd-backed concurrent pipelines, exec/wait, and arbitrary POSIX fork/exec remain pending until Sinomo provides the runtime fd/process substrate they require. `gzip` is now part of the profile after the BusyBox recipe switched descriptor moves to WASI `fd_renumber` and enabled decompression support. `chmod` is also part of the profile after Sinomo added WASI extensions that apply mode changes to explicit read-write preopens and report real permission bits back to BusyBox `stat`/`lstat` callers. BusyBox `awk` is now part of the profile for real in-process awk programs; awk external command features fail with `ENOTSUP` until Sinomo has a real child-process substrate. Sinomo should still expose only commands that behave as real tools inside the sandbox contract. A smaller set of real, tested tools is better than a broad but brittle surface.
 
-### Tool Packaging
+#### Tool Packaging
 
 Tool bundles should be immutable SIFS artifacts:
 
@@ -484,7 +487,7 @@ Sandbox instances pin a toolchain version in their manifest. Resuming a sandbox 
 
 Toolchains, language runtimes, package archives, and large support files should be replicated through SIFS. Local nodes may cache already-replicated content for performance, but the source of truth is SIFS. SIFS is expected to host large files and should be used for this rather than creating a separate local-only toolchain distribution path.
 
-## SIFS Integration
+### SIFS Integration
 
 The sandbox should use `sinomo-dfs` through a virtual filesystem trait:
 
@@ -502,7 +505,7 @@ trait SandboxFileSystem {
 
 The first backend can adapt the existing SIFS path API. It should keep all sandbox path normalization inside the sandbox crate so WASM tools never see real host paths.
 
-### Locality
+#### Locality
 
 Execution should be scheduled on a node that can efficiently serve the mounted SIFS paths:
 
@@ -512,7 +515,7 @@ Execution should be scheduled on a node that can efficiently serve the mounted S
 
 The scheduler should expose the selected node and path locality in the sandbox manifest.
 
-## Policy And Security
+### Policy And Security
 
 The sandbox is a policy boundary, not only a WASM runtime boundary.
 
@@ -554,7 +557,7 @@ The cluster policy exposes the two concurrency budgets as `max_concurrent_comman
 
 Every denial should emit structured events and be visible in `sandbox doctor` or `cluster doctor`. Sandbox policy-denial and resource-exhaustion events are already surfaced by `sinomo sandbox doctor`, both globally and for a specific sandbox id.
 
-## Network Model
+### Network Model
 
 Networking should not be a raw WASI socket pass-through in the first version.
 
@@ -576,7 +579,7 @@ Initial network capabilities:
 
 Raw TCP/UDP can be revisited later.
 
-## Event And Audit Model
+### Event And Audit Model
 
 Initial event kinds:
 
@@ -629,7 +632,7 @@ Agents should receive raw stdout/stderr chunks as the command runs. Summaries ca
 
 The runtime-level streaming hook is implemented through `SandboxOutputSink` on `SandboxWasiRunOptions` and the staged SIFS runner, and local CLI execution uses it to write stdout/stderr before printing the command summary. Daemon toolchain execution streams live output through `/sandbox/run/toolchain/stream`, and daemon process-plan execution streams live output through `/sandbox/run/process-plan/stream`; the older `/sandbox/run/toolchain` and `/sandbox/run/process-plan` routes remain available for single-response callers. Stream de-duplication keys include the command id, stream, and offset so process plans do not collapse same-offset chunks from different steps. `sinomo sandbox reboot [--daemon]` now provides the agent-session reboot boundary. Reboot preserves durable workspace state and clears `/tmp` when the instance uses the default `clear-on-session-start` policy; instances created with `--tmp retain` or `--keep-tmp` retain `/tmp` across reboot. Daemon-backed reboot emits `sandbox.instance.rebooted` with the applied temp-policy result. The sandbox crate has focused local and SIFS tests for this contract: `/work` survives reboot, `/tmp` is removed from SIFS and recreated behind a fresh epoch by default, and retained instances keep `/tmp` across reboot.
 
-## CLI Shape
+### CLI Shape
 
 The first CLI should support direct operator testing:
 
@@ -684,7 +687,7 @@ sandbox.checkpoint
 sandbox.resume
 ```
 
-## Crate Boundaries
+### Crate Boundaries
 
 Recommended crates/modules:
 
@@ -709,7 +712,7 @@ Within `sinomo-sandbox`, implementation ownership is split so new WASIX and tool
 - `src/toolchain/local.rs` and `src/toolchain/sifs.rs` own local and SIFS toolchain stores; manifests, built-in BusyBox registration, SOBJ serde, and shared hash/bundle/validation helpers stay in sibling toolchain modules.
 - `src/policy/core.rs`, `src/events/envelope.rs`, `src/http/protocol.rs`, and `src/fidelity/cases.rs` keep policy, event, protocol, and verifier case-table ownership out of the crate facade modules.
 
-## Storage Registration
+### Storage Registration
 
 `sinomo-sandbox` should register its own local storage paths:
 
@@ -734,9 +737,9 @@ Toolchain caches are only caches. The complete toolchain artifacts should be add
 
 Storage contract violations should be reported as node health findings, not as startup blockers. The current CLI path implements this as install-time warnings and `sinomo cluster doctor` warning findings through `data_dir_storage_contract_findings`; unregistered sandbox-local paths therefore degrade diagnostics without preventing the daemon or install path from starting.
 
-## Implementation Phases
+### Implementation Phases
 
-### Phase 0: Architecture And API Skeleton
+#### Phase 0: Architecture And API Skeleton
 
 - Add this design as the planning document.
 - Define `SandboxId`, `SandboxCommandId`, manifest structs, resource limit structs, and error types.
@@ -744,7 +747,7 @@ Storage contract violations should be reported as node health findings, not as s
 - Add empty CLI command group and help text.
 - Add unit tests for path normalization and policy denial shapes.
 
-### Phase 1: Local WASI Command Runner
+#### Phase 1: Local WASI Command Runner
 
 - Integrate Wasmtime.
 - Run one WASM command with preopened in-memory or temporary directories.
@@ -753,7 +756,7 @@ Storage contract violations should be reported as node health findings, not as s
 - Package one or two proof commands, such as real `echo` and real `cat`.
 - Add tests for no host path escape, timeout, and output limits.
 
-### Phase 2: SIFS-Backed Workspace
+#### Phase 2: SIFS-Backed Workspace
 
 - Implement `SandboxFileSystem` on top of the existing SIFS path API. Local and SIFS filesystem backends now expose `/dev`, `/dev/null`, bounded reads from `/dev/zero`, and random reads from `/dev/random` and `/dev/urandom` as virtual paths without persisting device files into SIFS. Writes to virtual device sinks bypass workspace write quotas and do not emit durable file-write events. Staged WASI command execution now installs a per-run Sinomo-owned `/dev` preopen for `/dev/null`, bounded `/dev/zero`, seeded random devices, stdio aliases, `/dev/tty`, `/dev/fd/{0,1,2}`, and a per-run `/dev/shm` directory. A host symlink staging approach is explicitly not accepted: the WASI runner has a regression test that confirms symlink escape to host `/dev/null` does not succeed.
 - Persist sandbox manifests under `/services/sandbox/instances/<sandbox_id>`.
@@ -773,10 +776,10 @@ resume sandbox
 read file from another node
 ```
 
-### Phase 3: Minimal Real POSIX Command Environment
+#### Phase 3: Minimal Real POSIX Command Environment
 
-- Add a Sinomo-maintained BusyBox build as the first userspace target, with its real applets first. BusyBox ash is not exposed in the default profile until descriptor and process support exist; runtime gaps must be fixed below ash rather than through shell-behavior patches.
-- Add the core tools listed in the command environment section as each command builds and passes fidelity inside the sandbox contract. The current BusyBox WASIX package includes `cat`, `cp`, `cmp`, `date`, `diff`, `awk`, `echo`, `env`, `false`, `find`, `grep`, `gzip`, `head`, `ln`, `ls`, `mkdir`, `mv`, `patch`, `printf`, `pwd`, `rm`, `rmdir`, `sed`, `sha256sum`, `sort`, `tail`, `tar`, `test`, `touch`, `true`, `uniq`, `wc` and `chmod`; the BusyBox fidelity declaration now requires every exposed applet to have at least one direct invocation case before it remains in the default manifest. BusyBox `awk` runs real awk programs, while pipe redirections and `system()` remain bounded by the sandbox's current incomplete fd/process substrate.
+- Add a Sinomo-maintained BusyBox build as the first userspace target, with its real applets first. BusyBox ash is exposed as the default `sh` only through the upstream WASIX BusyBox applet; runtime gaps must be fixed below ash rather than through shell-behavior patches.
+- Add the core tools listed in the command environment section as each command builds and passes fidelity inside the sandbox contract. The current BusyBox WASIX package includes `cat`, `cp`, `cmp`, `date`, `diff`, `awk`, `echo`, `env`, `false`, `find`, `grep`, `gzip`, `head`, `ln`, `ls`, `mkdir`, `mv`, `patch`, `printf`, `pwd`, `rm`, `rmdir`, `sed`, `sha256sum`, `sh`, `sort`, `tail`, `tar`, `test`, `touch`, `true`, `uniq`, `wc` and `chmod`; the BusyBox fidelity declaration now requires every exposed applet to have at least one direct invocation case before it remains in the default manifest. BusyBox `awk` runs real awk programs, and BusyBox `sh` is covered by a pipeline/current-directory shell case.
 - Build or vendor WASI-compatible tool modules with reproducible hashes.
 - Add host-side tool fidelity tests before exposing each command name.
 - Store toolchain manifest in SIFS.
@@ -797,7 +800,7 @@ diff /work/a/file /work/a/file
 resume on another node and inspect outputs
 ```
 
-### Phase 4: Policy And Node Scheduling
+#### Phase 4: Policy And Node Scheduling
 
 - Add mount declarations and policy checks.
 - Add read-only/read-write mount enforcement.
@@ -815,7 +818,7 @@ verify denied write to /host
 verify policy event
 ```
 
-### Phase 5: Network And Package Fetching
+#### Phase 5: Network And Package Fetching
 
 - Add allowlisted HTTP fetch through Sinomo-network. The sandbox crate now has the typed HTTP request/response contract, default-deny policy validation, host allowlists, byte/timeout budgets, redacted exchange records, durable SOBJ log persistence, recording fetch helper, response-body file writes tested against local and SIFS filesystems, replica-node readback coverage for fetched bodies and audit records, and `sandbox.network.http` event lowering. `sinomo sandbox fetch` sends HTTP requests to the local daemon for mediated egress, and `sinomo sandbox fetch --daemon` lets the daemon validate cluster policy, store the response body in SIFS, persist the HTTP audit record, and append the network event.
 - Add `curl`-like command backed by mediated network API. `sinomo sandbox fetch` now parses URL/output/limits/header options and executes against the sandbox HTTP transport abstraction, with the production transport connected to daemon-mediated routing.
@@ -831,7 +834,7 @@ response body stored in SIFS
 audit event includes URL policy metadata
 ```
 
-### Phase 6: Richer Toolchains
+#### Phase 6: Richer Toolchains
 
 - Add required shell and language runtimes as toolchain packages.
   `sinomo sandbox toolchain import-package [--daemon] [--into <toolchain-id>] <package.json>` now
@@ -1364,25 +1367,27 @@ error if `wasi_thread_start`, the thread id, or the start pointer cannot be
 - Evaluate whether any commands need a Linux syscall compatibility layer. Do
   not add one unless real workflows require it.
 
-## Settled Decisions
+## Appendices
+
+### Settled Decisions
 
 | Decision | Resolution |
 |---|---|
 | Sandbox instance root | `/services/sandbox` |
 | `/tmp` durability | Durable for the sandbox instance; cleared by default on agent session reboot; retention across sessions is an instance policy flag; deleted when the sandbox instance is destroyed |
 | First userspace target | Sinomo-maintained BusyBox build |
-| Shell model | Real shell support uses the WASIX Bash package for verified pipelines, redirection, descriptor duplication, command substitution, shebang execution, and sandbox-local child exec; full fork/exec shell parity, exec/wait, and job control still wait for the fd/process substrate; structured shell is out of scope for now |
+| Shell model | Default `sh` is the real upstream BusyBox ash applet from the maintained BusyBox WASIX package; Bash remains the richer shell package target; full fork/exec shell parity, exec/wait, and job control still wait for the fd/process substrate; structured shell is out of scope for now |
 | Command policy | Real, fully functional Linux/POSIX tools or no tool; no fake substitutes |
 | Sandbox interior permissions | Agent has full permission inside the sandbox instance |
 | Initial workload target | Coding tasks with language toolchains available through sandbox toolchain packages |
 | Toolchain storage | Replicate complete toolchains through SIFS |
 | Agent command stream | Raw stdout/stderr chunks |
 
-## Remaining Open Questions
+### Remaining Open Questions
 
 No product-level open questions remain for the MVP. The active BusyBox route is WASIX-only; Preview1 remains available for simple standalone modules through the generic command path, but not as the maintained BusyBox target. Remaining implementation work is to close the fd/process substrate gaps before claiming job control, arbitrary POSIX fork/exec, or other process-oriented tools, and to expose additional initial commands only after their real implementations pass the verifier.
 
-## Near-Term Recommendation
+### Near-Term Recommendation
 
 Continue with a narrow but real WASIX-first MVP:
 
@@ -1392,7 +1397,7 @@ WASIX runtime + SIFS workspace + Sinomo-maintained BusyBox/Bash/Python toolchain
 
 Avoid host binary execution and avoid exposing fake tools. The active runtime target is WASIX because shell, Python, pip, native extensions, and build tools need real process behavior that Preview1 cannot provide. Keep Preview1 only as a compatibility adapter for simple single-process modules. The next runtime work should close the remaining fd/process gaps: arbitrary fork/exec/wait parity, job-control behavior, and stronger budget enforcement for non-yielding process trees. The highest-risk integration is now the boundary between that process substrate, SIFS-backed VFS semantics, raw output streaming, and reliable resume across node restarts.
 
-## References
+### References
 
 - WebVM repository: https://github.com/leaningtech/webvm
 - WebVM 2.0 overview: https://labs.leaningtech.com/blog/webvm-20.html

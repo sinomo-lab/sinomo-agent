@@ -112,6 +112,7 @@ impl Tunables for SandboxWasixTunables {
 mod tests {
     use super::*;
     use wasmer::sys::Target;
+    use wasmer_vm::LinearMemory;
 
     #[test]
     fn sandbox_wasix_tunables_reject_memory_above_budget() {

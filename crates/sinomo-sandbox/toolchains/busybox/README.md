@@ -68,11 +68,11 @@ The current recipes build a deliberately narrow profile. They register these cor
 
 ```text
 awk cat chmod cp cmp date diff dirname echo env false find grep gzip head ln ls
-mkdir mv patch printf pwd rm rmdir sed sha256sum sort tail tar test touch true
+mkdir mv patch printf pwd rm rmdir sed sha256sum sh sort tail tar test touch true
 tr uname uniq wc
 ```
 
-`sh` is exposed by the WASIX package only when upstream BusyBox ash works against the runtime process/fd substrate. The recipe must not patch ash command execution, pipeline, here-doc, or redirection semantics to hide runtime gaps. The runtime must not substitute a fake shell or a mostly-compatible command.
+`sh` is the upstream BusyBox ash applet in the WASIX package. The recipe must not patch ash command execution, pipeline, here-doc, or redirection semantics to hide runtime gaps. The runtime must not substitute a fake shell or a mostly-compatible command.
 
 The exposed command list remains conservative because some BusyBox applets depend on filesystem or process operations that still need runtime hardening. BusyBox build and runtime failures are verifier output for improving the POSIX runtime, VFS, sysroot, or system library. The removed `wasi-compat` headers were Preview1-only fake libc substitutions and should not be moved into the shared WASIX sysroot.
 

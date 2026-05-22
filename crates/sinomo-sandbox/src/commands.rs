@@ -29,6 +29,7 @@ pub const BUSYBOX_TOOLCHAIN_COMMANDS: &[&str] = &[
     "rmdir",
     "sed",
     "sha256sum",
+    "sh",
     "sort",
     "tail",
     "tar",
@@ -81,10 +82,7 @@ pub const SANDBOX_MVP_COMMANDS: &[&str] = &[
     "uname",
 ];
 
-pub const SANDBOX_MVP_COMMAND_GAPS: &[SandboxMvpCommandGap] = &[SandboxMvpCommandGap {
-    command: "sh",
-    reason: "real shell support is provided by the maintained BusyBox ash WASIX package when imported into the pinned toolchain and allowed by child-process-exec plus the current WASIX child-exec gap acknowledgement",
-}];
+pub const SANDBOX_MVP_COMMAND_GAPS: &[SandboxMvpCommandGap] = &[];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SandboxMvpCommandGap {

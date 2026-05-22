@@ -2195,7 +2195,7 @@ pub(crate) fn sandbox_doctor_findings_with_stores_and_events(
     .expect("static toolchain id");
     match toolchain_store.load_manifest(&busybox_id) {
         Ok((manifest, _layout)) => {
-            for command in ["cat", "grep", "find", "printf"] {
+            for command in ["cat", "grep", "find", "printf", "sh"] {
                 if !manifest.commands.contains_key(command) {
                     findings.push(SandboxDoctorFinding::warning(
                         "busybox-command-missing",
@@ -3000,9 +3000,11 @@ pub(crate) fn sandbox_toolchain_busybox_plan_text() -> String {
     for case in sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_FIDELITY_CASES {
         output.push_str(&format!("  {}: {}\n", case.name, case.command));
     }
-    output.push_str("known MVP gaps:\n");
-    for gap in sinomo_runtime::sandbox::SANDBOX_MVP_COMMAND_GAPS {
-        output.push_str(&format!("  {}: {}\n", gap.command, gap.reason));
+    if !sinomo_runtime::sandbox::SANDBOX_MVP_COMMAND_GAPS.is_empty() {
+        output.push_str("known MVP gaps:\n");
+        for gap in sinomo_runtime::sandbox::SANDBOX_MVP_COMMAND_GAPS {
+            output.push_str(&format!("  {}: {}\n", gap.command, gap.reason));
+        }
     }
     output
 }

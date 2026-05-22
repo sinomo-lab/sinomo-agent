@@ -20,6 +20,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${ROOT}/../../../.." && pwd)"
 WORKDIR="${WORKDIR:-"${ROOT}/work"}"
 OUTDIR="${OUTDIR:-"${ROOT}/out"}"
+SYSROOT_WORKDIR="${SYSROOT_WORKDIR:-"${WORKDIR}/sysroot-work"}"
+WASIX_SYSROOT="${WASIX_SYSROOT:-"${WORKDIR}/wasix-sysroot/sysroot"}"
+mkdir -p "${WORKDIR}" "${OUTDIR}" "${SYSROOT_WORKDIR}" "$(dirname "${WASIX_SYSROOT}")"
+WORKDIR="$(cd "${WORKDIR}" && pwd)"
+OUTDIR="$(cd "${OUTDIR}" && pwd)"
+SYSROOT_WORKDIR="$(cd "${SYSROOT_WORKDIR}" && pwd)"
+WASIX_SYSROOT="$(cd "$(dirname "${WASIX_SYSROOT}")" && pwd)/$(basename "${WASIX_SYSROOT}")"
 
 BASH_TARBALL="bash-${GNU_BASH_VERSION}.tar.gz"
 BASH_URL="https://ftp.gnu.org/gnu/bash/${BASH_TARBALL}"
@@ -62,22 +69,34 @@ sinomo_hash() {
     fi
 }
 
-mkdir -p "${WORKDIR}" "${OUTDIR}" "${WORKDIR}/downloads"
+mkdir -p "${WORKDIR}/downloads"
 
 download "${BASH_URL}" "${WORKDIR}/downloads/${BASH_TARBALL}"
 download "${WASI_SDK_URL}" "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 download "${BINARYEN_URL}" "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-download "${WASIX_LIBC_URL}" "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
 verify_sha256 "${BASH_SHA256}" "${WORKDIR}/downloads/${BASH_TARBALL}"
 verify_sha256 "${WASI_SDK_SHA256}" "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 verify_sha256 "${BINARYEN_SHA256}" "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-verify_sha256 "${WASIX_LIBC_SHA256}" "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
 
-rm -rf "${WORKDIR}/bash-${GNU_BASH_VERSION}" "${WORKDIR}"/wasi-sdk-${WASI_SDK_VERSION_FULL}* "${WORKDIR}"/binaryen-version_${BINARYEN_VERSION} "${WORKDIR}/wasix-sysroot"
+rm -rf "${WORKDIR}/bash-${GNU_BASH_VERSION}" "${WORKDIR}"/wasi-sdk-${WASI_SDK_VERSION_FULL}* "${WORKDIR}"/binaryen-version_${BINARYEN_VERSION}
 tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${BASH_TARBALL}"
 tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
+
+SYSROOT_ENV="${WORKDIR}/wasix-sysroot.env"
+WORKDIR="${SYSROOT_WORKDIR}" \
+SYSROOT_OUTDIR="${WASIX_SYSROOT}" \
+HOST_ENV_OUT="${SYSROOT_ENV}" \
+WASI_SDK_VERSION="${WASI_SDK_VERSION}" \
+WASI_SDK_VERSION_FULL="${WASI_SDK_VERSION_FULL}" \
+WASI_SDK_ARCH="${WASI_SDK_ARCH}" \
+WASI_SDK_OS="${WASI_SDK_OS}" \
+WASI_SDK_SHA256="${WASI_SDK_SHA256}" \
+WASIX_LIBC_VERSION="${WASIX_LIBC_VERSION}" \
+WASIX_LIBC_TARBALL="${WASIX_LIBC_TARBALL}" \
+WASIX_LIBC_SHA256="${WASIX_LIBC_SHA256}" \
+WASIX_LIBC_URL="${WASIX_LIBC_URL}" \
+    "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/prepare-wasix-sysroot.sh"
 
 BASH_SRC="${WORKDIR}/bash-${GNU_BASH_VERSION}"
 WASI_SDK="$(find "${WORKDIR}" -maxdepth 1 -type d -name "wasi-sdk-${WASI_SDK_VERSION_FULL}*" | sort | head -n 1)"
@@ -90,9 +109,8 @@ if [ ! -x "${BINARYEN}/bin/wasm-opt" ]; then
     echo "Binaryen wasm-opt not found after extracting ${BINARYEN_TARBALL}" >&2
     exit 1
 fi
-WASIX_SYSROOT="${WORKDIR}/wasix-sysroot/sysroot"
 if [ ! -f "${WASIX_SYSROOT}/include/unistd.h" ] || [ ! -f "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" ]; then
-    echo "wasix-libc sysroot not found after extracting ${WASIX_LIBC_TARBALL}" >&2
+    echo "prepared WASIX sysroot not found at ${WASIX_SYSROOT}" >&2
     exit 1
 fi
 
@@ -100,60 +118,18 @@ export SOURCE_DATE_EPOCH
 export CC="${WASI_SDK}/bin/clang --target=wasm32-wasi --sysroot=${WASIX_SYSROOT}"
 export AR="${WASI_SDK}/bin/llvm-ar"
 export RANLIB="${WASI_SDK}/bin/llvm-ranlib"
-BASH_COMPAT_INCLUDE="${SINOMO_BASH_WASIX_DIR}/bash-compat.h"
-BASH_ENV_COMPAT_SOURCE="${SINOMO_BASH_WASIX_DIR}/env-compat.c"
-BASH_ENV_COMPAT_OBJECT="${WORKDIR}/sinomo-bash-wasix-env-compat.o"
+ENV_RM_ADD_OBJECT="${WORKDIR}/sinomo-wasix-env-rm-add.o"
+MAIN_ARGC_ARGV_OBJECT="${WORKDIR}/sinomo-wasix-main-argc-argv.o"
 
-BASH_MAIN_COMPAT_SOURCE="${SINOMO_BASH_WASIX_DIR}/main-compat.c"
-BASH_MAIN_COMPAT_OBJECT="${WORKDIR}/sinomo-bash-wasix-main-compat.o"
-"${WASI_SDK}/bin/clang" \
-    --target=wasm32-wasi \
-    --sysroot="${WASIX_SYSROOT}" \
-    -Os \
-    -matomics \
-    -mbulk-memory \
-    -mmutable-globals \
-    -pthread \
-    -mthread-model posix \
-    -fno-exceptions \
-    -ftls-model=local-exec \
-    -c "${BASH_ENV_COMPAT_SOURCE}" \
-    -o "${BASH_ENV_COMPAT_OBJECT}"
-"${WASI_SDK}/bin/clang" \
-    --target=wasm32-wasi \
-    --sysroot="${WASIX_SYSROOT}" \
-    -Os \
-    -matomics \
-    -mbulk-memory \
-    -mmutable-globals \
-    -pthread \
-    -mthread-model posix \
-    -fno-exceptions \
-    -ftls-model=local-exec \
-    -c "${BASH_MAIN_COMPAT_SOURCE}" \
-    -o "${BASH_MAIN_COMPAT_OBJECT}"
-
-# Bash intentionally overrides libc getenv/putenv/setenv/unsetenv so library
-# calls observe the shell's exported variable table. Static Wasm archives cannot
-# tolerate duplicate strong putenv/setenv definitions, so this recipe derives a
-# Bash-local libc archive by removing only the colliding libc objects and adding
-# tiny compatibility objects needed by wasix-libc startup/clearenv. This keeps
-# upstream Bash source and shell behavior unchanged.
-"${WASI_SDK}/bin/llvm-ar" d "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" setenv.o putenv.o
-"${WASI_SDK}/bin/llvm-ar" r \
-    "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" \
-    "${BASH_ENV_COMPAT_OBJECT}" \
-    "${BASH_MAIN_COMPAT_OBJECT}"
-
-export CFLAGS="-Os -fwrapv -fno-ident -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -fno-trapping-math -fno-exceptions -ftls-model=local-exec -msimd128 -mrelaxed-simd -mextended-const -include ${BASH_COMPAT_INCLUDE} -ffile-prefix-map=${WORKDIR}=sinomo-bash-build -ffile-prefix-map=${REPO_ROOT}=sinomo -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS"
+export CFLAGS="-Os -fwrapv -fno-ident -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -fno-trapping-math -fno-exceptions -ftls-model=local-exec -msimd128 -mrelaxed-simd -mextended-const -ffile-prefix-map=${WORKDIR}=sinomo-bash-build -ffile-prefix-map=${REPO_ROOT}=sinomo -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS"
 export LDFLAGS="-Wl,--export-all -Wl,--export-dynamic -Wl,--shared-memory -Wl,--import-memory -Wl,--extra-features=atomics -Wl,--extra-features=bulk-memory -Wl,--extra-features=mutable-globals -Wl,--export=__wasm_call_ctors -Wl,--export=__wasm_init_tls -Wl,--export=__wasm_signal -Wl,--export=__tls_size -Wl,--export=__tls_align -Wl,--export=__tls_base -Wl,--export-if-defined=__indirect_function_table -Wl,--export-if-defined=__stack_pointer -Wl,--export-if-defined=__heap_base -Wl,--export-if-defined=__data_end -Wl,-z,stack-size=1048576 -Wl,--initial-memory=67108864 -Wl,--max-memory=268435456 -lwasi-emulated-getpid -lwasi-emulated-mman -lwasi-emulated-process-clocks -lresolv -lrt -lm -lpthread -lutil"
 BUILD_CFLAGS="-g -DCROSS_COMPILING -std=gnu89"
 
 cd "${BASH_SRC}"
 
 # Keep the first recipe close to upstream Bash. The build may still fail until
-# Sinomo's WASIX/POSIX substrate and the required compatibility patches are
-# complete; failures are intentional blockers, not a reason to expose a shim.
+# Sinomo's WASIX/POSIX substrate and shared sysroot support are complete;
+# failures are intentional blockers, not a reason to expose a shim.
 #
 # These are cross-compile answers for libc surfaces that the pinned wasix-libc
 # sysroot provides but upstream Bash cannot execute-probe while targeting wasm.
@@ -169,6 +145,25 @@ CONFIG_SITE=/dev/null ./configure \
     --disable-readline \
     --disable-history \
     --enable-minimal-config
+
+"${WASI_SDK}/bin/clang" \
+    --target=wasm32-wasi \
+    --sysroot="${WASIX_SYSROOT}" \
+    -Os \
+    -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-env-rm-add.c" \
+    -o "${ENV_RM_ADD_OBJECT}"
+"${WASI_SDK}/bin/clang" \
+    --target=wasm32-wasi \
+    --sysroot="${WASIX_SYSROOT}" \
+    -Os \
+    -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-main-argc-argv.c" \
+    -o "${MAIN_ARGC_ARGV_OBJECT}"
+"${WASI_SDK}/bin/llvm-ar" d "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" setenv.o putenv.o __main_void.o
+"${WASI_SDK}/bin/llvm-ar" r \
+    "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" \
+    "${ENV_RM_ADD_OBJECT}" \
+    "${MAIN_ARGC_ARGV_OBJECT}"
+"${WASI_SDK}/bin/llvm-ranlib" "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a"
 
 make -j"${JOBS}" CFLAGS_FOR_BUILD="${BUILD_CFLAGS}" BASE_CFLAGS_FOR_BUILD="${BUILD_CFLAGS}"
 

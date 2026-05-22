@@ -186,7 +186,7 @@ fn busybox_toolchain_spec_registers_core_applets_locally() {
 
     assert_eq!(manifest.target_abi, SandboxWasiAbi::Wasix);
     assert_eq!(manifest.commands.len(), BUSYBOX_TOOLCHAIN_COMMANDS.len());
-    for command in ["cat", "grep", "find", "printf", "sha256sum"] {
+    for command in ["cat", "grep", "find", "printf", "sha256sum", "sh"] {
         assert_eq!(
             store
                 .load_command_module(&manifest, command)
@@ -238,21 +238,15 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
             "declared BusyBox command {command} is not tracked in the MVP command list"
         );
     }
-    for pending in ["sh"] {
-        assert!(
-            mvp_commands.contains(pending),
-            "known pending MVP command {pending} is missing from the MVP command list"
-        );
-        assert!(
-            !BUSYBOX_TOOLCHAIN_COMMANDS.contains(&pending),
-            "pending MVP command {pending} should not be exposed before fidelity is real"
-        );
-        assert!(
-            sandbox_mvp_command_gap(pending).is_some(),
-            "pending MVP command {pending} should explain why it is not exposed yet"
-        );
-    }
-    assert_eq!(SANDBOX_MVP_COMMAND_GAPS.len(), 1);
+    assert!(
+        BUSYBOX_TOOLCHAIN_COMMANDS.contains(&"sh"),
+        "BusyBox shell should be exposed as part of the default toolchain"
+    );
+    assert!(
+        sandbox_mvp_command_gap("sh").is_none(),
+        "sh should no longer be tracked as a pending MVP gap"
+    );
+    assert_eq!(SANDBOX_MVP_COMMAND_GAPS.len(), 0);
     let gap_commands: BTreeSet<_> = SANDBOX_MVP_COMMAND_GAPS
         .iter()
         .map(|gap| gap.command)
@@ -840,7 +834,7 @@ fn busybox_toolchain_spec_registers_core_applets_in_sifs() {
 
     assert_eq!(manifest.target_abi, SandboxWasiAbi::Wasix);
     assert_eq!(manifest.commands.len(), BUSYBOX_TOOLCHAIN_COMMANDS.len());
-    for command in ["cat", "grep", "find", "printf", "sha256sum"] {
+    for command in ["cat", "grep", "find", "printf", "sha256sum", "sh"] {
         assert_eq!(
             store
                 .load_command_module(&manifest, command)

@@ -86,6 +86,18 @@ pub const BUSYBOX_TOOLCHAIN_FIDELITY_CASES: &[SandboxBusyBoxFidelityCase] = &[
         expected_exit_status: 0,
     },
     SandboxBusyBoxFidelityCase {
+        name: "sh-command-substitution-and-pipeline",
+        command: SH_TOOLCHAIN_COMMAND,
+        argv: &[
+            SH_TOOLCHAIN_COMMAND,
+            "-c",
+            "printf '%s\\n' alpha beta | grep bet && echo shell:$PWD",
+        ],
+        stdin: None,
+        expected_stdout: "beta\nshell:/work\n",
+        expected_exit_status: 0,
+    },
+    SandboxBusyBoxFidelityCase {
         name: "find-file",
         command: "find",
         argv: &["find", "/work", "-type", "f"],
@@ -471,7 +483,7 @@ pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
     SandboxCommandFidelityCase {
         name: "bash-printf",
         command: BASH_TOOLCHAIN_COMMAND,
-        argv: &[BASH_TOOLCHAIN_COMMAND, "-lc", "printf 'sinomo bash\\n'"],
+        argv: &[BASH_TOOLCHAIN_COMMAND, "-c", "printf 'sinomo bash\\n'"],
         stdin: None,
         setup_files: &[],
         expected_stdout: Some("sinomo bash\n"),
@@ -484,7 +496,7 @@ pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
         command: BASH_TOOLCHAIN_COMMAND,
         argv: &[
             BASH_TOOLCHAIN_COMMAND,
-            "-lc",
+            "-c",
             "printf 'alpha\\nbeta\\n' | grep beta",
         ],
         stdin: None,
@@ -499,7 +511,7 @@ pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
         command: BASH_TOOLCHAIN_COMMAND,
         argv: &[
             BASH_TOOLCHAIN_COMMAND,
-            "-lc",
+            "-c",
             "value=$(printf 'substitution'); printf '%s\\n' \"$value\"",
         ],
         stdin: None,
@@ -514,7 +526,7 @@ pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
         command: BASH_TOOLCHAIN_COMMAND,
         argv: &[
             BASH_TOOLCHAIN_COMMAND,
-            "-lc",
+            "-c",
             "printf 'from bash\\n' > /work/bash-fixture.txt && cat /work/bash-fixture.txt",
         ],
         stdin: None,
@@ -529,7 +541,7 @@ pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
         command: BASH_TOOLCHAIN_COMMAND,
         argv: &[
             BASH_TOOLCHAIN_COMMAND,
-            "-lc",
+            "-c",
             "{ printf 'stdout\\n'; printf 'stderr\\n' >&2; } 2>&1",
         ],
         stdin: None,
@@ -544,7 +556,7 @@ pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
         command: BASH_TOOLCHAIN_COMMAND,
         argv: &[
             BASH_TOOLCHAIN_COMMAND,
-            "-lc",
+            "-c",
             "set -e; false; printf unreachable",
         ],
         stdin: None,
@@ -559,7 +571,7 @@ pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
         command: BASH_TOOLCHAIN_COMMAND,
         argv: &[
             BASH_TOOLCHAIN_COMMAND,
-            "-lc",
+            "-c",
             "printf '#!/bin/sh\\nprintf \"script-local\\\\n\"\\n' > /work/work-script && chmod +x /work/work-script && /work/work-script",
         ],
         stdin: None,

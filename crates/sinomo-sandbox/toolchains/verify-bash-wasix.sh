@@ -141,7 +141,7 @@ WRITE_ARGS=(sandbox write "${SANDBOX_ID}" /work/printf --file "${WORK_EXEC_WASM}
 RUN_ARGS=(
     sandbox run "${SANDBOX_ID}"
     --timeout-ms 30000
-    bash -- -lc "chmod +x /work/printf && /work/printf 'sandbox local exec\\n'"
+    bash -- -c "chmod +x /work/printf && /work/printf 'sandbox local exec\\n'"
 )
 if [[ "${VERIFY_BACKEND}" == daemon* ]]; then
     WRITE_ARGS+=(--daemon)
@@ -152,7 +152,7 @@ else
         --allow-capability child-process-exec
         --allow-capability wasix.unpinned-child-exec
         --timeout-ms 30000
-        bash -- -lc "chmod +x /work/printf && /work/printf 'sandbox local exec\\n'"
+        bash -- -c "chmod +x /work/printf && /work/printf 'sandbox local exec\\n'"
     )
 fi
 
