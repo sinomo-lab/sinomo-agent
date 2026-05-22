@@ -37,6 +37,9 @@ pub const TCC_TOOLCHAIN_COMMAND: &str = "tcc";
 pub const MAKE_TOOLCHAIN_RECIPE: &str =
     "crates/sinomo-sandbox/toolchains/build-tools/build-make-wasix.sh";
 pub const MAKE_TOOLCHAIN_COMMAND: &str = "make";
+pub const MAKEPKG_TOOLCHAIN_RECIPE: &str =
+    "crates/sinomo-sandbox/toolchains/build-tools/build-makepkg-wasix.sh";
+pub const MAKEPKG_TOOLCHAIN_COMMAND: &str = "makepkg";
 pub const CLANG_TOOLCHAIN_RECIPE: &str =
     "crates/sinomo-sandbox/toolchains/build-tools/build-clang-wasix.sh";
 pub const CLANG_TOOLCHAIN_COMMAND: &str = "clang";
@@ -111,6 +114,12 @@ pub const SANDBOX_RICH_TOOLCHAIN_TARGETS: &[SandboxRichToolchainTarget] = &[
         recipe: Some(MAKE_TOOLCHAIN_RECIPE),
         status: SandboxRichToolchainStatus::Implemented,
         note: "GNU Make has a maintained WASIX build recipe and passes the combined local plus daemon-local SIFS verify-build-tools gate for Makefile parsing, dependency ordering, failure status, and recipe execution through pinned sandbox commands",
+    },
+    SandboxRichToolchainTarget {
+        command: MAKEPKG_TOOLCHAIN_COMMAND,
+        recipe: Some(MAKEPKG_TOOLCHAIN_RECIPE),
+        status: SandboxRichToolchainStatus::Required,
+        note: "makepkg is packaged from upstream pacman scripts with sandbox /usr, /etc, and /var paths. The command starts, reports its upstream version, and can load Bash programmable-completion features such as compgen, but broad PKGBUILD execution remains gated on package-build dependencies such as pacman/libalpm, libarchive, file, gettext, fakeroot, compression tools, and mediated fetchers",
     },
     SandboxRichToolchainTarget {
         command: CLANG_TOOLCHAIN_COMMAND,

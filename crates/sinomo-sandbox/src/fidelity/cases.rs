@@ -1,7 +1,7 @@
 use super::{SandboxBusyBoxFidelityCase, SandboxCommandFidelityCase, SandboxQuickJsFidelityCase};
 use crate::{
-    BASH_TOOLCHAIN_COMMAND, MAKE_TOOLCHAIN_COMMAND, PIP_TOOLCHAIN_COMMAND,
-    PYTHON_TOOLCHAIN_COMMAND, SH_TOOLCHAIN_COMMAND, TCC_TOOLCHAIN_COMMAND,
+    BASH_TOOLCHAIN_COMMAND, MAKE_TOOLCHAIN_COMMAND, MAKEPKG_TOOLCHAIN_COMMAND,
+    PIP_TOOLCHAIN_COMMAND, PYTHON_TOOLCHAIN_COMMAND, SH_TOOLCHAIN_COMMAND, TCC_TOOLCHAIN_COMMAND,
 };
 
 pub const BUSYBOX_TOOLCHAIN_FIDELITY_CASES: &[SandboxBusyBoxFidelityCase] = &[
@@ -582,6 +582,21 @@ pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
         expected_exit_status: 0,
     },
     SandboxCommandFidelityCase {
+        name: "bash-compgen-wordlist",
+        command: BASH_TOOLCHAIN_COMMAND,
+        argv: &[
+            BASH_TOOLCHAIN_COMMAND,
+            "-c",
+            "compgen -W 'alpha beta gamma' -- b",
+        ],
+        stdin: None,
+        setup_files: &[],
+        expected_stdout: Some("beta\n"),
+        expected_stdout_contains: None,
+        expected_stderr_contains: None,
+        expected_exit_status: 0,
+    },
+    SandboxCommandFidelityCase {
         name: "sh-printf",
         command: SH_TOOLCHAIN_COMMAND,
         argv: &[SH_TOOLCHAIN_COMMAND, "-c", "printf 'sinomo sh\\n'"],
@@ -861,6 +876,19 @@ pub const MAKE_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
         expected_exit_status: 2,
     },
 ];
+
+pub const MAKEPKG_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] =
+    &[SandboxCommandFidelityCase {
+        name: "makepkg-version",
+        command: MAKEPKG_TOOLCHAIN_COMMAND,
+        argv: &[MAKEPKG_TOOLCHAIN_COMMAND, "--version"],
+        stdin: None,
+        setup_files: &[],
+        expected_stdout: None,
+        expected_stdout_contains: Some("makepkg (pacman) 7.1.0"),
+        expected_stderr_contains: None,
+        expected_exit_status: 0,
+    }];
 
 pub const TCC_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[
     SandboxCommandFidelityCase {

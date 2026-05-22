@@ -59,7 +59,7 @@ impl AsyncWrite for DeviceFile {
         _cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Ok(bufs.len()))
+        Poll::Ready(Ok(bufs.iter().map(|buf| buf.len()).sum()))
     }
 
     fn is_write_vectored(&self) -> bool {

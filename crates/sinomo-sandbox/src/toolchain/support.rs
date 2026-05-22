@@ -197,11 +197,10 @@ pub(crate) fn validate_toolchain_artifact_relative_path(
         components.push(component);
     }
     match components.first().copied() {
-        Some("bin" | "lib" | "share" | "include" | "etc" | "Lib" | "cross-build" | "sysroot")
-            if components.len() > 1 =>
-        {
-            Ok(components.join("/"))
-        }
+        Some(
+            "bin" | "lib" | "share" | "include" | "etc" | "usr" | "var" | "Lib" | "cross-build"
+            | "sysroot",
+        ) if components.len() > 1 => Ok(components.join("/")),
         _ => Err(SandboxToolchainError::InvalidArtifactPath {
             path: path.to_string(),
         }),

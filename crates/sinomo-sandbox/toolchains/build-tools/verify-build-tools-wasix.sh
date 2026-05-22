@@ -12,6 +12,8 @@ BASH_WORKDIR="${BASH_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-bash-wasi
 BASH_OUTDIR="${BASH_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-bash-wasix-out"}"
 MAKE_WORKDIR="${MAKE_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-make-wasix-work"}"
 MAKE_OUTDIR="${MAKE_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-make-wasix-out"}"
+MAKEPKG_WORKDIR="${MAKEPKG_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-makepkg-wasix-work"}"
+MAKEPKG_OUTDIR="${MAKEPKG_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-makepkg-wasix-out"}"
 TCC_WORKDIR="${TCC_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-tcc-wasix-work"}"
 TCC_OUTDIR="${TCC_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-tcc-wasix-out"}"
 CLANG_WORKDIR="${CLANG_WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-verify-clang-wasix-work"}"
@@ -80,6 +82,10 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     WORKDIR="${MAKE_WORKDIR}" OUTDIR="${MAKE_OUTDIR}" \
         "${ROOT}/build-make-wasix.sh"
 
+    echo "packaging upstream makepkg WASIX command"
+    WORKDIR="${MAKEPKG_WORKDIR}" OUTDIR="${MAKEPKG_OUTDIR}" BASH_OUTDIR="${BASH_OUTDIR}" \
+        "${ROOT}/build-makepkg-wasix.sh"
+
     echo "building TinyCC WASIX package"
     WORKDIR="${TCC_WORKDIR}" OUTDIR="${TCC_OUTDIR}" \
         "${ROOT}/build-tcc-wasix.sh"
@@ -109,6 +115,7 @@ for manifest in \
     "${BUSYBOX_OUTDIR}/package.json" \
     "${BASH_OUTDIR}/package.json" \
     "${MAKE_OUTDIR}/package.json" \
+    "${MAKEPKG_OUTDIR}/package.json" \
     "${TCC_OUTDIR}/package.json"
 do
     if [ ! -f "${manifest}" ]; then
@@ -125,6 +132,7 @@ echo "verifying package manifests"
 "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BUSYBOX_OUTDIR}/package.json"
 "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BASH_OUTDIR}/package.json"
 "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${MAKE_OUTDIR}/package.json"
+"${SINOMO_CMD[@]}" sandbox toolchain verify-package "${MAKEPKG_OUTDIR}/package.json"
 "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${TCC_OUTDIR}/package.json"
 if [ "${VERIFY_CLANG}" = "1" ]; then
     "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${CLANG_OUTDIR}/package.json"
@@ -163,6 +171,7 @@ if [ "${UPDATE_CLUSTER_POLICY}" = "1" ]; then
         --allow-toolchain-provenance-prefix "Sinomo BusyBox WASIX recipe:" \
         --allow-toolchain-provenance-prefix "Sinomo Bash WASIX recipe:" \
         --allow-toolchain-provenance-prefix "Sinomo GNU Make WASIX recipe:" \
+        --allow-toolchain-provenance-prefix "Sinomo makepkg WASIX recipe:" \
         --allow-toolchain-provenance-prefix "Sinomo TinyCC WASIX recipe:" \
         --allow-toolchain-provenance-prefix "Sinomo Clang/LLVM WASIX recipe:" \
         --allow-package-cache-prefix /services/sandbox/toolchains >/dev/null
@@ -171,14 +180,17 @@ fi
 IMPORT_ARGS=(sandbox toolchain import-package)
 CREATE_ARGS=(sandbox create --id "${SANDBOX_ID}" --toolchain "${TOOLCHAIN_ID}")
 VERIFY_ARGS=(sandbox toolchain verify-make "${SANDBOX_ID}")
+VERIFY_MAKEPKG_ARGS=(sandbox toolchain verify-makepkg "${SANDBOX_ID}")
 VERIFY_TCC_ARGS=(sandbox toolchain verify-tcc "${SANDBOX_ID}")
 if [[ "${VERIFY_BACKEND}" == daemon* ]]; then
     IMPORT_ARGS+=(--daemon)
     CREATE_ARGS+=(--daemon)
     VERIFY_ARGS+=(--daemon)
+    VERIFY_MAKEPKG_ARGS+=(--daemon)
     VERIFY_TCC_ARGS+=(--daemon)
 else
     VERIFY_ARGS+=(--allow-unsigned)
+    VERIFY_MAKEPKG_ARGS+=(--allow-unsigned)
     VERIFY_TCC_ARGS+=(--allow-unsigned)
 fi
 
@@ -192,6 +204,9 @@ env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${IMPORT_ARGS[@]}" \
     "${MAKE_OUTDIR}/package.json"
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${IMPORT_ARGS[@]}" \
     --into "${TOOLCHAIN_ID}" \
+    "${MAKEPKG_OUTDIR}/package.json"
+env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${IMPORT_ARGS[@]}" \
+    --into "${TOOLCHAIN_ID}" \
     "${TCC_OUTDIR}/package.json"
 if [ "${VERIFY_CLANG}" = "1" ]; then
     env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${IMPORT_ARGS[@]}" \
@@ -201,4 +216,5 @@ fi
 
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${CREATE_ARGS[@]}"
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${VERIFY_ARGS[@]}"
+env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${VERIFY_MAKEPKG_ARGS[@]}"
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" "${VERIFY_TCC_ARGS[@]}"

@@ -654,6 +654,9 @@ fn required_bash_python_pip_and_make_fidelity_cases_are_declared() {
         case.name == "bash-descriptor-duplication" && case.expected_stderr_contains.is_none()
     }));
     assert!(BASH_TOOLCHAIN_FIDELITY_CASES.iter().any(|case| {
+        case.name == "bash-compgen-wordlist" && case.expected_stdout == Some("beta\n")
+    }));
+    assert!(BASH_TOOLCHAIN_FIDELITY_CASES.iter().any(|case| {
         case.name == "sh-pipe-external-grep"
             && case.command == SH_TOOLCHAIN_COMMAND
             && case.expected_exit_status == 0
@@ -719,6 +722,13 @@ fn required_bash_python_pip_and_make_fidelity_cases_are_declared() {
                 && case.expected_stderr_contains == Some("Error 1"))
     );
 
+    assert!(!MAKEPKG_TOOLCHAIN_FIDELITY_CASES.is_empty());
+    assert!(MAKEPKG_TOOLCHAIN_FIDELITY_CASES.iter().any(|case| {
+        case.name == "makepkg-version"
+            && case.command == MAKEPKG_TOOLCHAIN_COMMAND
+            && case.expected_stdout_contains == Some("makepkg (pacman) 7.1.0")
+    }));
+
     assert!(!TCC_TOOLCHAIN_FIDELITY_CASES.is_empty());
     assert!(TCC_TOOLCHAIN_FIDELITY_CASES.iter().any(|case| {
         case.name == "tcc-compile-object"
@@ -739,6 +749,7 @@ fn required_bash_python_pip_and_make_fidelity_cases_are_declared() {
         .chain(PYTHON_TOOLCHAIN_FIDELITY_CASES.iter())
         .chain(PIP_TOOLCHAIN_FIDELITY_CASES.iter())
         .chain(MAKE_TOOLCHAIN_FIDELITY_CASES.iter())
+        .chain(MAKEPKG_TOOLCHAIN_FIDELITY_CASES.iter())
         .chain(TCC_TOOLCHAIN_FIDELITY_CASES.iter())
     {
         assert_eq!(case.argv.first().copied(), Some(case.command));
@@ -801,6 +812,15 @@ fn rich_toolchain_targets_track_implemented_and_planned_packages() {
     assert_eq!(make.recipe, Some(MAKE_TOOLCHAIN_RECIPE));
     assert!(make.note.contains("verify-build-tools"));
     assert!(make.note.contains("daemon-local"));
+
+    let makepkg = SANDBOX_RICH_TOOLCHAIN_TARGETS
+        .iter()
+        .find(|target| target.command == MAKEPKG_TOOLCHAIN_COMMAND)
+        .expect("makepkg target");
+    assert_eq!(makepkg.status, SandboxRichToolchainStatus::Required);
+    assert_eq!(makepkg.recipe, Some(MAKEPKG_TOOLCHAIN_RECIPE));
+    assert!(makepkg.note.contains("upstream pacman"));
+    assert!(makepkg.note.contains("compgen"));
 
     let tcc = SANDBOX_RICH_TOOLCHAIN_TARGETS
         .iter()

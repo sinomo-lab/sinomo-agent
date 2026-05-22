@@ -9,20 +9,21 @@ use super::{
     InteractionSurfaceKind, MainAgentInteractionHandler, ModelBackedInteractionHandler,
     ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
     ProviderCommandOptions, ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    SandboxCliCommand, SandboxToolchainVerifyMakeOptions, SandboxToolchainVerifyTccOptions,
-    SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
-    apply_cluster_raft_role, authenticate_daemon_control_request,
-    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
-    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
-    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_checkpoint,
-    daemon_handle_daemon_sandbox_create, daemon_handle_daemon_sandbox_destroy,
-    daemon_handle_daemon_sandbox_http_fetch, daemon_handle_daemon_sandbox_http_fetch_to_file,
-    daemon_handle_daemon_sandbox_import_busybox, daemon_handle_daemon_sandbox_list,
-    daemon_handle_daemon_sandbox_read, daemon_handle_daemon_sandbox_reboot,
-    daemon_handle_daemon_sandbox_resume, daemon_handle_daemon_sandbox_run_process_plan,
+    SandboxCliCommand, SandboxToolchainVerifyMakeOptions, SandboxToolchainVerifyMakepkgOptions,
+    SandboxToolchainVerifyTccOptions, SelfRolloutPaths, UninstallOptions,
+    advertised_peer_route_targets, apply_cluster_node_role, apply_cluster_raft_role,
+    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
+    cli_command_requires_cluster_state, cluster_connectivity_sync_ops, cluster_doctor_findings,
+    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_publish_targets,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
+    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
+    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
+    daemon_handle_daemon_sandbox_checkpoint, daemon_handle_daemon_sandbox_create,
+    daemon_handle_daemon_sandbox_destroy, daemon_handle_daemon_sandbox_http_fetch,
+    daemon_handle_daemon_sandbox_http_fetch_to_file, daemon_handle_daemon_sandbox_import_busybox,
+    daemon_handle_daemon_sandbox_list, daemon_handle_daemon_sandbox_read,
+    daemon_handle_daemon_sandbox_reboot, daemon_handle_daemon_sandbox_resume,
+    daemon_handle_daemon_sandbox_run_process_plan,
     daemon_handle_daemon_sandbox_run_process_plan_stream,
     daemon_handle_daemon_sandbox_run_toolchain_stream, daemon_handle_daemon_sandbox_status,
     daemon_handle_daemon_sandbox_toolchain_add_artifact,
@@ -878,10 +879,13 @@ fn sandbox_toolchain_build_tools_plan_reports_planned_real_tool_gates() {
     assert!(plan.contains("tracked build tool commands:"));
     assert!(plan.contains("  tcc (implemented):"));
     assert!(plan.contains("  make (implemented):"));
+    assert!(plan.contains("  makepkg (required):"));
     assert!(plan.contains("toolchains/build-tools/build-tcc-wasix.sh"));
     assert!(plan.contains("toolchains/build-tools/build-make-wasix.sh"));
+    assert!(plan.contains("toolchains/build-tools/build-makepkg-wasix.sh"));
     assert!(plan.contains("verify-tcc <sandbox-id>"));
     assert!(plan.contains("verify-make <sandbox-id>"));
+    assert!(plan.contains("verify-makepkg <sandbox-id>"));
     assert!(plan.contains("real WASI packages"));
     assert!(plan.contains("do not expose host fallbacks"));
     assert!(plan.contains("local and daemon/SIFS verifier coverage"));
@@ -900,6 +904,29 @@ fn sandbox_toolchain_verify_make_parser_accepts_command() {
     assert_eq!(
         command,
         SandboxCliCommand::ToolchainVerifyMake(SandboxToolchainVerifyMakeOptions {
+            sandbox_id: sinomo_runtime::sandbox::SandboxId::new(
+                "01k4z8q5d00000000000000001".to_string()
+            )
+            .expect("sandbox id"),
+            allow_unsigned: true,
+            execution: super::SandboxMetadataExecution::Local,
+        })
+    );
+}
+
+#[test]
+fn sandbox_toolchain_verify_makepkg_parser_accepts_command() {
+    let command = parse_sandbox_command(&[
+        "toolchain".to_string(),
+        "verify-makepkg".to_string(),
+        "01k4z8q5d00000000000000001".to_string(),
+        "--allow-unsigned".to_string(),
+    ])
+    .expect("verify makepkg");
+
+    assert_eq!(
+        command,
+        SandboxCliCommand::ToolchainVerifyMakepkg(SandboxToolchainVerifyMakepkgOptions {
             sandbox_id: sinomo_runtime::sandbox::SandboxId::new(
                 "01k4z8q5d00000000000000001".to_string()
             )
@@ -953,8 +980,7 @@ fn sandbox_toolchain_busybox_plan_reports_known_mvp_gaps() {
     assert!(plan.contains("  grep\n"));
     assert!(plan.contains("fidelity cases:"));
     assert!(plan.contains("awk-system-spawn: awk"));
-    assert!(plan.contains("known MVP gaps:"));
-    assert!(plan.contains("  sh:"));
+    assert!(!plan.contains("known MVP gaps:"));
 }
 
 #[test]
@@ -978,18 +1004,12 @@ fn sandbox_toolchain_python_plan_reports_wasip1_gate() {
     let plan = sandbox_toolchain_python_plan_text();
     assert!(plan.contains("  python\n"));
     assert!(plan.contains("  pip\n"));
-    assert!(plan.contains("target ABI: preview1"));
-    assert!(plan.contains("toolchains/python/build-cpython-wasi.sh"));
-    assert!(plan.contains("maintained CPython WASIp1 package passes"));
-    assert!(plan.contains("daemon-local mediated simple-index dependency acquisition"));
-    assert!(plan.contains("normalized package names"));
-    assert!(plan.contains("environment markers"));
-    assert!(plan.contains("requires-python link filtering"));
-    assert!(plan.contains("yanked release filtering"));
-    assert!(plan.contains("constraints"));
-    assert!(plan.contains("hash-checked requirements with mismatch denial"));
-    assert!(plan.contains("extras"));
-    assert!(plan.contains("transitive dependencies"));
+    assert!(plan.contains("target ABI: wasix"));
+    assert!(plan.contains("toolchains/python/build-cpython-wasix.sh"));
+    assert!(plan.contains("maintained CPython WASIX package is the active POSIX/process gate"));
+    assert!(plan.contains("native-extension loading"));
+    assert!(plan.contains("numpy array execution"));
+    assert!(plan.contains("matplotlib Agg rendering"));
     assert!(plan.contains("verify-python <sandbox-id>"));
     assert!(plan.contains("python-json-stdlib: python"));
     assert!(plan.contains("pip-wheel-local-pure-package: python"));
@@ -1191,6 +1211,9 @@ fn sandbox_toolchain_verify_parser_rejects_daemon_unsigned_override() {
         "verify-quickjs",
         "verify-python",
         "verify-coding",
+        "verify-make",
+        "verify-makepkg",
+        "verify-tcc",
     ] {
         let error = parse_sandbox_command(&[
             "toolchain".to_string(),

@@ -142,10 +142,6 @@ pub(super) fn configure_wasix_mapped_directories(
         let devices =
             LocalWasiVirtualDeviceDir::create(zero_device_bytes, argv, env, &mount_table)?;
         mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-            host: devices.path().to_path_buf(),
-            guest: "/dev".to_string(),
-        });
-        mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
             host: devices.proc_path().to_path_buf(),
             guest: "/proc".to_string(),
         });

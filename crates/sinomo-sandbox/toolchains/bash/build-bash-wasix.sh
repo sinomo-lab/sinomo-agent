@@ -27,6 +27,9 @@ WORKDIR="$(cd "${WORKDIR}" && pwd)"
 OUTDIR="$(cd "${OUTDIR}" && pwd)"
 SYSROOT_WORKDIR="$(cd "${SYSROOT_WORKDIR}" && pwd)"
 WASIX_SYSROOT="$(cd "$(dirname "${WASIX_SYSROOT}")" && pwd)/$(basename "${WASIX_SYSROOT}")"
+if [ -n "${SINOMO_BIN:-}" ]; then
+    SINOMO_BIN="$(cd "$(dirname "${SINOMO_BIN}")" && pwd)/$(basename "${SINOMO_BIN}")"
+fi
 
 BASH_TARBALL="bash-${GNU_BASH_VERSION}.tar.gz"
 BASH_URL="https://ftp.gnu.org/gnu/bash/${BASH_TARBALL}"
@@ -121,7 +124,7 @@ export RANLIB="${WASI_SDK}/bin/llvm-ranlib"
 ENV_RM_ADD_OBJECT="${WORKDIR}/sinomo-wasix-env-rm-add.o"
 MAIN_ARGC_ARGV_OBJECT="${WORKDIR}/sinomo-wasix-main-argc-argv.o"
 
-export CFLAGS="-Os -fwrapv -fno-ident -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -fno-trapping-math -fno-exceptions -ftls-model=local-exec -msimd128 -mrelaxed-simd -mextended-const -ffile-prefix-map=${WORKDIR}=sinomo-bash-build -ffile-prefix-map=${REPO_ROOT}=sinomo -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS"
+export CFLAGS="-Os -fwrapv -fno-ident -Wno-error=implicit-function-declaration -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -fno-trapping-math -fno-exceptions -ftls-model=local-exec -msimd128 -mrelaxed-simd -mextended-const -ffile-prefix-map=${WORKDIR}=sinomo-bash-build -ffile-prefix-map=${REPO_ROOT}=sinomo -DNEED_EXTERN_PC -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS"
 export LDFLAGS="-Wl,--export-all -Wl,--export-dynamic -Wl,--shared-memory -Wl,--import-memory -Wl,--extra-features=atomics -Wl,--extra-features=bulk-memory -Wl,--extra-features=mutable-globals -Wl,--export=__wasm_call_ctors -Wl,--export=__wasm_init_tls -Wl,--export=__wasm_signal -Wl,--export=__tls_size -Wl,--export=__tls_align -Wl,--export=__tls_base -Wl,--export-if-defined=__indirect_function_table -Wl,--export-if-defined=__stack_pointer -Wl,--export-if-defined=__heap_base -Wl,--export-if-defined=__data_end -Wl,-z,stack-size=1048576 -Wl,--initial-memory=67108864 -Wl,--max-memory=268435456 -lwasi-emulated-getpid -lwasi-emulated-mman -lwasi-emulated-process-clocks -lresolv -lrt -lm -lpthread -lutil"
 BUILD_CFLAGS="-g -DCROSS_COMPILING -std=gnu89"
 
@@ -137,14 +140,14 @@ cd "${BASH_SRC}"
 bash_cv_getcwd_malloc=yes \
 bash_cv_getenv_redef=yes \
 ac_cv_func_siginterrupt=yes \
+bash_cv_termcap_lib=gnutermcap \
 CONFIG_SITE=/dev/null ./configure \
     --host=wasm32-wasi \
     --build="$(sh ./support/config.guess)" \
     --without-bash-malloc \
+    --enable-progcomp \
     --disable-nls \
-    --disable-readline \
-    --disable-history \
-    --enable-minimal-config
+    --with-installed-readline=no
 
 "${WASI_SDK}/bin/clang" \
     --target=wasm32-wasi \

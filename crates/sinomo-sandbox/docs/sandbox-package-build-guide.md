@@ -175,14 +175,26 @@ Missing behavior should be implemented in the runtime, VFS, compiler, sysroot, o
 
 ## Makepkg Base Environment Gap
 
-The first `makepkg` target should bring up source-package workflows before trying to support every Arch packaging feature. Excluding compilers, the current sandbox already has a meaningful base: real WASIX Bash/`sh`, BusyBox applets for common file and text operations, GNU Make, Python/pip, and a Clang/LLVM package recipe. The current source declarations and package recipes expose BusyBox commands `awk cat chmod cp cmp date diff dirname echo env false find grep gzip head ln ls mkdir mv patch printf pwd rm rmdir sed sha256sum sort tail tar test touch true tr uname uniq wc`, Bash commands `bash sh`, GNU Make as `make`, Python as `python pip`, and Clang/LLVM commands `clang clang++ cc c++ wasm-ld ld.lld llvm-ar llvm-ranlib llvm-nm`. That is enough to start a smoke target such as a local `PKGBUILD` that uses a local source archive, runs `prepare()`, `build()`, and `package()`, and emits an uncompressed or gzip-compressed package archive.
+The first `makepkg` target should bring up source-package workflows before trying to support every Arch packaging feature. Excluding compilers, the current sandbox already has a meaningful base: real WASIX Bash/`sh`, BusyBox applets for common file and text operations, GNU Make, Python/pip, a Clang/LLVM package recipe, and an upstream pacman makepkg package recipe. The current source declarations and package recipes expose BusyBox commands `awk cat chmod cp cmp date diff dirname echo env false find grep gzip head ln ls mkdir mv patch printf pwd rm rmdir sed sha256sum sort tail tar test touch true tr uname uniq wc`, Bash commands `bash sh`, GNU Make as `make`, upstream pacman `makepkg`, Python as `python pip`, and Clang/LLVM commands `clang clang++ cc c++ wasm-ld ld.lld llvm-ar llvm-ranlib llvm-nm`.
+
+The makepkg package recipe renders upstream pacman 7.1.0 scripts and configuration into the sandbox's normal Linux paths:
+
+```text
+/usr/bin/makepkg
+/usr/share/makepkg/
+/etc/makepkg.conf
+/etc/makepkg.conf.d/
+/etc/pacman.conf
+/etc/pacman.d/
+```
+
+The current verifier imports BusyBox, Bash, Make, makepkg, and TCC into one pinned WASIX toolchain and verifies `makepkg --version`. Full PKGBUILD execution is not claimed yet. A simple local-source `PKGBUILD` now reaches upstream libmakepkg startup, loads `/etc/makepkg.conf.d/*.conf` through Bash's real `compgen`, and then fails when upstream makepkg looks for a real `pacman` command. That should be fixed by bringing in real pacman/libalpm support, not by patching makepkg.
 
 Upstream `makepkg.sh.in` declares its minimum external program set as `awk`, `bsdtar`/libarchive, `bzip2`, coreutils, `fakeroot`, `file`, findutils, gettext, `gpg`, `grep`, `gzip`, `sed`, `tput`/ncurses, and `xz`. The default `makepkg.conf` also assumes `curl`-based download agents, VCS client mappings, optional signing, optional stripping/debug helpers, multiple compression formats, and `INTEGRITY_CHECK=(ck)`. For Sinomo, those defaults should be narrowed in the first package until the corresponding real packages and policy paths exist.
 
 The remaining base-system gaps for real `makepkg` are:
 
 - `pacman`, `libalpm`, `repo-add`, `vercmp`, package database layout, package query, and dependency resolution under `/var/lib/pacman`;
-- installed `makepkg` support tree under `/usr/share/makepkg`, plus generated `/etc/makepkg.conf`, `/etc/makepkg.conf.d/*.conf`, `/etc/pacman.conf`, and `/etc/pacman.d/`;
 - `bsdtar`/libarchive, because upstream `makepkg` uses archive type detection and extraction through libarchive rather than plain BusyBox `tar`;
 - compression tools beyond the current BusyBox `gzip`: at minimum `bzip2`, `xz`, and `zstd`, with `lz4`, `lzip`, `lzop`, `lrzip`, and legacy `compress` either packaged or disabled through the sandbox makepkg config;
 - checksum commands for configured integrity modes: `cksum`, `md5sum`, `sha1sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum`, and `b2sum`; currently only `sha256sum` is documented as present in the BusyBox profile;
@@ -200,10 +212,10 @@ The remaining base-system gaps for real `makepkg` are:
 Recommended preparation order:
 
 1. Add the missing core utilities needed by makepkg scripts to the BusyBox WASIX package or to dedicated real-tool packages.
-2. Package pacman scripts and libmakepkg in a WASIX package with a sandbox-specific config that disables signing, fakeroot-dependent packaging, strip/debug, VCS, non-gzip compression, and download agents except `file::` sources.
-3. Add `libarchive`/`bsdtar`, `file`, `gettext`, `cksum`, and the missing checksum/compression commands.
-4. Implement an in-sandbox fakeroot-compatible ownership layer in the runtime/VFS instead of patching `makepkg` packaging logic.
-5. Add pacman/libalpm local database operations and a tiny SIFS-backed repository containing the base packages.
+2. Keep the pacman makepkg package recipe aligned with upstream scripts and Linux paths.
+3. Add pacman/libalpm local database operations and a tiny SIFS-backed repository containing the base packages.
+4. Add `libarchive`/`bsdtar`, `file`, `gettext`, `cksum`, and the missing checksum/compression commands.
+5. Implement an in-sandbox fakeroot-compatible ownership layer in the runtime/VFS instead of patching `makepkg` packaging logic.
 6. Enable mediated `curl` downloads through `DLAGENTS`, then add GPG/GPGME and VCS clients.
 7. Re-enable strip/debug/autodeps after binutils and metadata fidelity are strong enough.
 

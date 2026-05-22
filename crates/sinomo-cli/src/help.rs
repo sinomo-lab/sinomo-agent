@@ -252,7 +252,9 @@ pub(super) fn print_sandbox_help() {
     println!("  sinomo sandbox toolchain bash-plan");
     println!("      Show the required Bash WASIX package target and fidelity cases.");
     println!("  sinomo sandbox toolchain build-tools-plan");
-    println!("      Show real compiler/build-tool package status and gates for tcc and make.");
+    println!(
+        "      Show real compiler/build-tool package status and gates for makepkg, tcc, and make."
+    );
     println!("  sinomo sandbox toolchain quickjs-plan");
     println!("      Show the maintained QuickJS package target and fidelity cases.");
     println!("  sinomo sandbox toolchain python-plan");
@@ -271,6 +273,10 @@ pub(super) fn print_sandbox_help() {
     println!("      Run fidelity cases against the sandbox's pinned CPython/pip toolchain.");
     println!("  sinomo sandbox toolchain verify-make <sandbox-id> [--daemon] [--allow-unsigned]");
     println!("      Run fidelity cases against the sandbox's pinned GNU Make WASIX toolchain.");
+    println!(
+        "  sinomo sandbox toolchain verify-makepkg <sandbox-id> [--daemon] [--allow-unsigned]"
+    );
+    println!("      Run fidelity cases against the sandbox's pinned makepkg WASIX package.");
     println!("  sinomo sandbox toolchain verify-tcc <sandbox-id> [--daemon] [--allow-unsigned]");
     println!("      Run fidelity cases against the sandbox's pinned TinyCC WASIX toolchain.");
     println!(

@@ -5,8 +5,9 @@ This target tracks real compiler and build-tool commands for coding sandboxes. T
 - `tcc`
 - `make`
 - `clang`
+- `makepkg`
 
-These commands are available only after Sinomo has real WASI or WASIX packages and verifier coverage. Do not expose host binaries, fake compilers, fake `make`, reduced parsers, or wrappers under these names. `make` and `tcc` currently have maintained package recipes and default verifier gates. Clang has a maintained WASIX recipe and an opt-in verifier because a full LLVM build is large enough that it should not run on every build-tools check by default.
+These commands are available only after Sinomo has real WASI or WASIX packages and verifier coverage. Do not expose host binaries, fake compilers, fake `make`, reduced parsers, or wrappers under these names. `make`, `makepkg`, and `tcc` currently have maintained package recipes and default verifier gates. Clang has a maintained WASIX recipe and an opt-in verifier because a full LLVM build is large enough that it should not run on every build-tools check by default.
 
 `build-make-wasix.sh` is the real GNU Make package recipe. It builds upstream GNU Make 4.4.1 against the pinned WASIX sysroot, applies only the compile-time compatibility needed for wasix-libc's flexible `struct dirent` layout and WASIX startup, runs Binaryen asyncify/function-pointer cast emulation, and emits a generic `import-package` manifest for command `make`.
 
@@ -16,11 +17,13 @@ These commands are available only after Sinomo has real WASI or WASIX packages a
 
 `build-clang-wasix.sh` is the real Clang/LLVM module recipe. It targets LLVM 21.1.6 by default and pins the `llvm-project-21.1.6.src.tar.xz` hash from the upstream release attestation. It builds native LLVM tablegen tools for the build host, then cross-builds LLVM's Clang driver, LLD, `llvm-ar`, `llvm-ranlib`, and `llvm-nm` as WASIX command modules. It consumes a prepared sysroot from `WASIX_SYSROOT` and does not create, mutate, prepare, or package that sysroot itself. After the modules exist, prepare the package sysroot with `prepare-wasix-sysroot.sh`, then run `package-clang-wasix.sh` with `WASIX_SYSROOT=<prepared-package-sysroot>` to copy/validate that sysroot and write `package.json` without rebuilding LLVM. The sandbox still executes only the WASIX command modules; host compiler binaries are never exposed as sandbox commands.
 
+`build-makepkg-wasix.sh` packages upstream pacman `makepkg` scripts for WASIX. It renders upstream `makepkg.sh.in`, `libmakepkg`, `makepkg.conf`, and `pacman.conf` into normal Linux paths under `/usr`, `/etc`, and `/var`, then runs the command through the real Bash WASIX module. The maintained gate verifies the upstream version command, and the Bash package now includes real readline/progcomp support for builtins such as `compgen`. Full PKGBUILD execution is intentionally not claimed yet: upstream makepkg now reaches the missing real `pacman` command, and broader Arch-style builds still need real package dependencies such as libarchive/`bsdtar`, `file`, gettext, fakeroot semantics, compression tools, mediated fetchers, and pacman/libalpm database support.
+
 Generated sysroot and Clang outputs default to `target/` paths. Avoid using `crates/sinomo-sandbox/toolchains/**/out-*` or `work-*` as build destinations; those legacy output names are ignored to keep generated toolchain artifacts out of source control.
 
 Sysroot and libc compatibility sources live under `sysroot/`. Headers that extend the packaged WASIX sysroot belong in `sysroot/include/`, and libc archive replacement/addition objects belong in `sysroot/libc/`. Build scripts should copy or compile those files from this maintained location instead of generating POSIX headers or libc patches with inline here-documents.
 
-`verify-build-tools-wasix.sh` builds BusyBox WASIX, Bash WASIX, GNU Make WASIX, and TinyCC WASIX into one pinned toolchain and runs `sinomo sandbox toolchain verify-make` plus `sinomo sandbox toolchain verify-tcc` against the result. That gate passes locally; set `VERIFY_BACKEND=daemon-local` to exercise daemon-backed SIFS import and execution. The availability claims are still scoped: `make` declares both `child-process-exec` and `wasix.unpinned-child-exec`, executes recipes through the sandbox `sh`/BusyBox commands, and can run sandbox-local WASM modules and scripts from writable mounts such as `/work` when policy allows that capability. `tcc -run` remains explicitly unsupported.
+`verify-build-tools-wasix.sh` builds BusyBox WASIX, Bash WASIX, GNU Make WASIX, makepkg, and TinyCC WASIX into one pinned toolchain and runs `sinomo sandbox toolchain verify-make`, `verify-makepkg`, and `verify-tcc` against the result. That gate passes locally; set `VERIFY_BACKEND=daemon-local` to exercise daemon-backed SIFS import and execution. The availability claims are still scoped: `make` declares both `child-process-exec` and `wasix.unpinned-child-exec`, executes recipes through the sandbox `sh`/BusyBox commands, and can run sandbox-local WASM modules and scripts from writable mounts such as `/work` when policy allows that capability. `makepkg` is currently an upstream entry-point smoke target, not a full package-build claim. `tcc -run` remains explicitly unsupported.
 
 Set `VERIFY_CLANG=1` on `verify-build-tools-wasix.sh` to include the Clang package in the same pinned toolchain. For a narrower compiler-only check, run `verify-clang-wasix.sh`; it imports the package, writes a real C source into `/work`, verifies `clang --version`, compiles to an object file, and asks Clang to invoke sandbox `wasm-ld` to link a WASM output.
 
@@ -73,7 +76,16 @@ Before `clang` can remain available:
 - verify linker child-process execution through pinned sandbox `wasm-ld`,
 - keep host-side module recipe builds pointed at the same pinned compiler inputs instead of maintaining an unrelated second Clang distribution.
 
-Current recipe status: `build-make-wasix.sh` builds and packages a real GNU Make WASIX module. `build-tcc-wasix.sh` builds and packages a real TinyCC WASIX module. `build-clang-wasix.sh` builds Clang/LLVM as a WASIX module set, and the verifier composes that build with standalone sysroot preparation and manifest generation. The full Clang verifier is intentionally opt-in because LLVM is much larger than the other build tools. `verify-build-tools-wasix.sh` validates the BusyBox, Bash, Make, and TCC package manifests, imports them into one pinned toolchain, creates a sandbox, and runs the maintained `verify-make` and `verify-tcc` workflow cases. With `VERIFY_CLANG=1`, it also merges the Clang package before creating the sandbox. The same gate supports `VERIFY_BACKEND=daemon-local`, which exercises daemon-backed SIFS toolchain import and command execution.
+Before `makepkg` can be treated as a package-build-capable command:
+
+- package the upstream pacman makepkg scripts and libmakepkg tree through `import-package`,
+- verify `makepkg --version` inside the sandbox,
+- verify that Bash supports the upstream builtins and script features makepkg requires,
+- add the Arch base/base-devel style runtime tools as real packages instead of host fallbacks,
+- verify a local-source `PKGBUILD` that reaches `prepare()`, `build()`, `package()`, and package archive output,
+- keep unsupported signing, fakeroot, VCS, and network-fetch paths disabled until the corresponding real packages and policies exist.
+
+Current recipe status: `build-make-wasix.sh` builds and packages a real GNU Make WASIX module. `build-makepkg-wasix.sh` packages upstream pacman makepkg scripts and passes the upstream version smoke gate; a local-source PKGBUILD reaches the upstream `pacman` lookup after Bash `compgen` succeeds, so full PKGBUILD execution remains blocked on a real pacman/libalpm package and other base package dependencies. `build-tcc-wasix.sh` builds and packages a real TinyCC WASIX module. `build-clang-wasix.sh` builds Clang/LLVM as a WASIX module set, and the verifier composes that build with standalone sysroot preparation and manifest generation. The full Clang verifier is intentionally opt-in because LLVM is much larger than the other build tools. `verify-build-tools-wasix.sh` validates the BusyBox, Bash, Make, makepkg, and TCC package manifests, imports them into one pinned toolchain, creates a sandbox, and runs the maintained `verify-make`, `verify-makepkg`, and `verify-tcc` workflow cases. With `VERIFY_CLANG=1`, it also merges the Clang package before creating the sandbox. The same gate supports `VERIFY_BACKEND=daemon-local`, which exercises daemon-backed SIFS toolchain import and command execution.
 
 ## Expected Verifier Shape
 

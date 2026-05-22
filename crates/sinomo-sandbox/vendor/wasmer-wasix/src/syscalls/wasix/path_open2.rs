@@ -1,8 +1,13 @@
 use super::*;
+use crate::fs::Inode;
 use crate::os::task::TaskStatus;
 use crate::syscalls::wasix::default_process_name;
 use crate::syscalls::*;
 use crate::{VIRTUAL_ROOT_FD, WasiProcess};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use virtual_fs::random_file::RandomFile;
+use virtual_fs::{NullFile, VirtualFile, ZeroFile};
 
 /// ### `path_open()`
 /// Open file located at the given path
@@ -157,6 +162,45 @@ pub(crate) fn path_open_internal(
     }
     let path = proc_pid_alias_target(env, state, inodes, path).unwrap_or_else(|| path.to_string());
     let path = path.as_str();
+
+    if let Some(file) = virtual_device_file(path) {
+        let stat = Filestat {
+            st_filetype: Filetype::CharacterDevice,
+            st_ino: Inode::from_path(path).as_u64(),
+            ..Filestat::default()
+        };
+        let inode = state.fs.create_inode_with_stat(
+            inodes,
+            Kind::File {
+                fd: None,
+                handle: Some(Arc::new(RwLock::new(file))),
+                path: PathBuf::new(),
+            },
+            false,
+            path.to_string().into(),
+            stat,
+        );
+        let mut open_flags = 0;
+        if fs_rights_base.contains(Rights::FD_READ) {
+            open_flags |= Fd::READ;
+        }
+        if fs_rights_base.contains(Rights::FD_WRITE) {
+            open_flags |= Fd::WRITE;
+        }
+        if o_flags.contains(Oflags::TRUNC) {
+            open_flags |= Fd::TRUNCATE;
+        }
+        let fd = wasi_try_ok_ok!(state.fs.create_fd(
+            fs_rights_base,
+            fs_rights_inheriting,
+            fs_flags,
+            fd_flags,
+            open_flags,
+            inode,
+        ));
+        sync_process_metadata(env);
+        return Ok(Ok(fd));
+    }
 
     if let Some(bytes) = proc_generated_file(env, path) {
         if o_flags.intersects(Oflags::CREATE | Oflags::TRUNC)
@@ -342,11 +386,17 @@ pub(crate) fn path_open_internal(
                 if minimum_rights.truncate {
                     open_flags |= Fd::TRUNCATE;
                 }
-                // TODO: I strongly suspect that assigning the handle unconditionally
-                // breaks opening the same file multiple times.
-                *handle = Some(Arc::new(std::sync::RwLock::new(wasi_try_ok_ok!(
-                    open_options.open(&path).map_err(fs_error_into_wasi_err)
-                ))));
+                if path.as_os_str().is_empty() {
+                    if handle.is_none() {
+                        return Ok(Err(Errno::Io));
+                    }
+                } else {
+                    // TODO: I strongly suspect that assigning the handle unconditionally
+                    // breaks opening the same file multiple times.
+                    *handle = Some(Arc::new(std::sync::RwLock::new(wasi_try_ok_ok!(
+                        open_options.open(&path).map_err(fs_error_into_wasi_err)
+                    ))));
+                }
 
                 if let Some(handle) = handle {
                     let handle = handle.read().unwrap();
@@ -578,6 +628,15 @@ pub(crate) fn path_open_internal(
     sync_process_metadata(env);
 
     Ok(Ok(out_fd))
+}
+
+fn virtual_device_file(path: &str) -> Option<Box<dyn VirtualFile + Send + Sync + 'static>> {
+    match path {
+        "/dev/null" => Some(Box::<NullFile>::default()),
+        "/dev/zero" => Some(Box::<ZeroFile>::default()),
+        "/dev/random" | "/dev/urandom" => Some(Box::<RandomFile>::default()),
+        _ => None,
+    }
 }
 
 fn proc_generated_file(env: &WasiEnv, path: &str) -> Option<Vec<u8>> {

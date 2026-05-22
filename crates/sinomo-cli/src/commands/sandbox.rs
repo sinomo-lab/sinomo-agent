@@ -39,6 +39,7 @@ pub(crate) enum SandboxCliCommand {
     ToolchainVerifyBusyBox(SandboxToolchainVerifyBusyBoxOptions),
     ToolchainVerifyCoding(SandboxToolchainVerifyCodingOptions),
     ToolchainVerifyMake(SandboxToolchainVerifyMakeOptions),
+    ToolchainVerifyMakepkg(SandboxToolchainVerifyMakepkgOptions),
     ToolchainVerifyPython(SandboxToolchainVerifyPythonOptions),
     ToolchainVerifyTcc(SandboxToolchainVerifyTccOptions),
     ToolchainVerifyQuickJs(SandboxToolchainVerifyQuickJsOptions),
@@ -313,6 +314,13 @@ pub(crate) struct SandboxToolchainVerifyCodingOptions {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct SandboxToolchainVerifyMakeOptions {
+    pub(crate) sandbox_id: sinomo_runtime::sandbox::SandboxId,
+    pub(crate) allow_unsigned: bool,
+    pub(crate) execution: SandboxMetadataExecution,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SandboxToolchainVerifyMakepkgOptions {
     pub(crate) sandbox_id: sinomo_runtime::sandbox::SandboxId,
     pub(crate) allow_unsigned: bool,
     pub(crate) execution: SandboxMetadataExecution,
@@ -1220,6 +1228,11 @@ pub(crate) fn parse_sandbox_toolchain_command(
                 parse_sandbox_toolchain_verify_make_options(rest)?,
             ))
         }
+        Some((command, rest)) if command == "verify-makepkg" => {
+            Ok(SandboxCliCommand::ToolchainVerifyMakepkg(
+                parse_sandbox_toolchain_verify_makepkg_options(rest)?,
+            ))
+        }
         Some((command, rest)) if command == "verify-tcc" => {
             Ok(SandboxCliCommand::ToolchainVerifyTcc(
                 parse_sandbox_toolchain_verify_tcc_options(rest)?,
@@ -1416,6 +1429,27 @@ pub(crate) fn parse_sandbox_toolchain_verify_make_options(
     }
     validate_sandbox_verify_unsigned_scope(allow_unsigned, execution)?;
     Ok(SandboxToolchainVerifyMakeOptions {
+        sandbox_id: parse_sandbox_id(sandbox_id)?,
+        allow_unsigned,
+        execution,
+    })
+}
+
+pub(crate) fn parse_sandbox_toolchain_verify_makepkg_options(
+    args: &[String],
+) -> Result<SandboxToolchainVerifyMakepkgOptions, CliError> {
+    let (sandbox_id, rest) = args.split_first().ok_or(CliError::Usage)?;
+    let mut allow_unsigned = false;
+    let mut execution = SandboxMetadataExecution::Local;
+    for arg in rest {
+        match arg.as_str() {
+            "--allow-unsigned" => allow_unsigned = true,
+            "--daemon" => execution = SandboxMetadataExecution::Daemon,
+            _ => return Err(CliError::Usage),
+        }
+    }
+    validate_sandbox_verify_unsigned_scope(allow_unsigned, execution)?;
+    Ok(SandboxToolchainVerifyMakepkgOptions {
         sandbox_id: parse_sandbox_id(sandbox_id)?,
         allow_unsigned,
         execution,
@@ -1870,6 +1904,9 @@ pub(crate) fn run_sandbox_cli_command(command: SandboxCliCommand) -> Result<(), 
             sandbox_toolchain_verify_coding(options)
         }
         SandboxCliCommand::ToolchainVerifyMake(options) => sandbox_toolchain_verify_make(options),
+        SandboxCliCommand::ToolchainVerifyMakepkg(options) => {
+            sandbox_toolchain_verify_makepkg(options)
+        }
         SandboxCliCommand::ToolchainVerifyPython(options) => {
             sandbox_toolchain_verify_python(options)
         }
@@ -3022,6 +3059,7 @@ pub(crate) fn sandbox_toolchain_build_tools_plan_text() -> String {
             target.command,
             sinomo_runtime::sandbox::TCC_TOOLCHAIN_COMMAND
                 | sinomo_runtime::sandbox::MAKE_TOOLCHAIN_COMMAND
+                | sinomo_runtime::sandbox::MAKEPKG_TOOLCHAIN_COMMAND
         ) {
             let status = match target.status {
                 sinomo_runtime::sandbox::SandboxRichToolchainStatus::Implemented => "implemented",
@@ -3047,6 +3085,9 @@ pub(crate) fn sandbox_toolchain_build_tools_plan_text() -> String {
     output.push_str("  local and daemon/SIFS verifier coverage for compile/build workflows\n");
     output.push_str(
         "  sinomo sandbox toolchain verify-make <sandbox-id> [--daemon] [--allow-unsigned]\n",
+    );
+    output.push_str(
+        "  sinomo sandbox toolchain verify-makepkg <sandbox-id> [--daemon] [--allow-unsigned]\n",
     );
     output.push_str(
         "  sinomo sandbox toolchain verify-tcc <sandbox-id> [--daemon] [--allow-unsigned]\n",
@@ -3973,6 +4014,32 @@ pub(crate) fn sandbox_toolchain_verify_make(
             &options.sandbox_id,
             sinomo_runtime::sandbox::MAKE_TOOLCHAIN_FIDELITY_CASES,
             "GNU Make fidelity verification failed",
+        ),
+    }
+}
+
+pub(crate) fn sandbox_toolchain_verify_makepkg(
+    options: SandboxToolchainVerifyMakepkgOptions,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    match options.execution {
+        SandboxMetadataExecution::Local => sandbox_toolchain_verify_command_cases_with_stores(
+            &options.sandbox_id,
+            options.allow_unsigned,
+            &[
+                sinomo_runtime::sandbox::SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY,
+                sinomo_runtime::sandbox::SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY,
+            ],
+            &sandbox_store_from_data_dir(&data_dir),
+            &sandbox_toolchain_store_from_data_dir(&data_dir),
+            sinomo_runtime::sandbox::MAKEPKG_TOOLCHAIN_FIDELITY_CASES,
+            "makepkg fidelity verification failed",
+        ),
+        SandboxMetadataExecution::Daemon => sandbox_toolchain_verify_command_cases_with_daemon(
+            &options.sandbox_id,
+            sinomo_runtime::sandbox::MAKEPKG_TOOLCHAIN_FIDELITY_CASES,
+            "makepkg fidelity verification failed",
         ),
     }
 }
