@@ -289,11 +289,16 @@ else
     echo "using host WASIX compiler: ${POSIXTESTSUITE_HOST_CC_BIN}"
     echo "using host WASIX sysroot: ${POSIXTESTSUITE_HOST_SYSROOT}"
 fi
+if [ -f "${BUSYBOX_OUTDIR}/package.json" ]; then
+    "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BUSYBOX_OUTDIR}/package.json" >/dev/null
+    HAVE_BASE_TOOLCHAIN=1
+else
+    HAVE_BASE_TOOLCHAIN=0
+fi
 if [ "${POSIXTESTSUITE_RUN_SHELL}" = "1" ] &&
     [ "${#SH_TESTS[@]}" -gt 0 ] &&
-    [ -f "${BUSYBOX_OUTDIR}/package.json" ] &&
+    [ "${HAVE_BASE_TOOLCHAIN}" = "1" ] &&
     [ -f "${BASH_OUTDIR}/package.json" ]; then
-    "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BUSYBOX_OUTDIR}/package.json" >/dev/null
     "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${BASH_OUTDIR}/package.json" >/dev/null
     HAVE_SHELL_TOOLCHAIN=1
 else
@@ -319,8 +324,10 @@ env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox policy set \
 if [ "${POSIXTESTSUITE_COMPILE_MODE}" = "sandbox" ]; then
     env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox toolchain import-package --into "${TOOLCHAIN_ID}" "${CLANG_OUTDIR}/package.json" >/dev/null
 fi
-if [ "${HAVE_SHELL_TOOLCHAIN}" = "1" ]; then
+if [ "${HAVE_BASE_TOOLCHAIN}" = "1" ]; then
     env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox toolchain import-package --into "${TOOLCHAIN_ID}" "${BUSYBOX_OUTDIR}/package.json" >/dev/null
+fi
+if [ "${HAVE_SHELL_TOOLCHAIN}" = "1" ]; then
     env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox toolchain import-package --into "${TOOLCHAIN_ID}" "${BASH_OUTDIR}/package.json" >/dev/null
 fi
 env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox create \
@@ -358,7 +365,7 @@ for test_path in "${C_TESTS[@]}"; do
 
     env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox write "${SANDBOX_ID}" "${guest_source}" --file "${source_path}" >/dev/null
     stage_c_test_companions "${test_path}"
-    if rg -q '\bmain[[:space:]]*\(|^[[:space:]]*#[[:space:]]+define[[:space:]]+STD_MAIN\b' "${source_path}"; then
+    if rg -q '\bmain[[:space:]]*\(|^[[:space:]]*#[[:space:]]+define[[:space:]]+STD_MAIN\b|#include[[:space:]]+"threads_scenarii\.c"' "${source_path}"; then
         if [ "${POSIXTESTSUITE_COMPILE_MODE}" = "host" ]; then
             if "${POSIXTESTSUITE_HOST_CC_BIN}" \
                 --target=wasm32-wasi \

@@ -12,7 +12,13 @@ use wasmer::FromToNativeWasmType;
 #[instrument(level = "trace", skip_all, fields(sig), ret)]
 pub fn proc_raise(mut ctx: FunctionEnvMut<'_, WasiEnv>, sig: Signal) -> Result<Errno, WasiError> {
     let env = ctx.data();
-    env.process.signal_process(sig);
+    for tid in env.process.signal_process(sig) {
+        crate::syscalls::wasix::wake_futex_waiters_for_thread(env.state.deref(), tid.raw());
+        crate::syscalls::wasix::wake_shared_cond_waiters_for_thread(
+            env.state.deref(),
+            tid.raw(),
+        );
+    }
 
     WasiEnv::do_pending_operations(&mut ctx)?;
 
@@ -46,7 +52,7 @@ pub fn proc_raise_interval(
     let env = ctx.data();
     let interval = match interval {
         0 => None,
-        a => Some(Duration::from_millis(a)),
+        a => Some(Duration::from_nanos(a)),
     };
     let repeat = matches!(repeat, Bool::True);
     env.process.signal_interval(sig, interval, repeat);
@@ -123,6 +129,31 @@ pub fn signal_mask_get<M: MemorySize + 'static>(
         return Ok(-Errno::Fault.to_native());
     }
     let (low_value, high_value) = ctx.data().thread.signal_mask();
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    if let Err(err) = low.write(&memory, low_value as i64) {
+        return Ok(-mem_error_to_wasi(err).to_native());
+    }
+    if let Err(err) = high.write(&memory, high_value as i64) {
+        return Ok(-mem_error_to_wasi(err).to_native());
+    }
+    Ok(0)
+}
+
+/// ### `signal_pending_get()`
+/// Reads POSIX pending signal words for the current process/thread.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn signal_pending_get<M: MemorySize + 'static>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    low: WasmPtr<i64, M>,
+    high: WasmPtr<i64, M>,
+) -> Result<i32, WasiError> {
+    if low.is_null() || high.is_null() {
+        return Ok(-Errno::Fault.to_native());
+    }
+    let (low_value, high_value) = ctx
+        .data()
+        .process
+        .pending_signal_words_for_thread(&ctx.data().thread);
     let memory = unsafe { ctx.data().memory_view(&ctx) };
     if let Err(err) = low.write(&memory, low_value as i64) {
         return Ok(-mem_error_to_wasi(err).to_native());

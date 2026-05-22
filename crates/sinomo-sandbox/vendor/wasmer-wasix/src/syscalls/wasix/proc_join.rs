@@ -657,6 +657,9 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
 
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
+    if let Err(err) = sync_shared_memory_from_guest::<M>(env, &memory) {
+        return Ok(err);
+    }
     if let Err(err) = sync_shared_memory_to_guest::<M>(env, &memory) {
         return Ok(err);
     }

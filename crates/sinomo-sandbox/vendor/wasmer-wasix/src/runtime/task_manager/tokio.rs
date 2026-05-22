@@ -121,20 +121,14 @@ impl TokioTaskManager {
     where
         F: FnOnce() + Send + 'static,
     {
+        let mut builder = std::thread::Builder::new().name(task_name.to_string());
         if let Some(stack_size) = self.wasm_thread_stack_size {
-            std::thread::Builder::new()
-                .name(task_name.to_string())
-                .stack_size(stack_size)
-                .spawn(task)
-                .map(|_| ())
-                .map_err(|error| {
-                    tracing::error!("failed to spawn WASIX worker thread: {error}");
-                    WasiThreadError::InvalidWasmContext
-                })
-        } else {
-            self.pool.execute(task);
-            Ok(())
+            builder = builder.stack_size(stack_size);
         }
+        builder.spawn(task).map(|_| ()).map_err(|error| {
+            tracing::error!("failed to spawn WASIX worker thread: {error}");
+            WasiThreadError::InvalidWasmContext
+        })
     }
 }
 
@@ -196,9 +190,11 @@ impl VirtualTaskManager for TokioTaskManager {
                 })
             }
             other_spawn_type => {
-                let shared_memory_spawn = matches!(
+                let supplied_memory_spawn = matches!(
                     &other_spawn_type,
-                    SpawnType::ShareMemory(_, _) | SpawnType::StoreAndMemory(_, _)
+                    SpawnType::ShareMemory(_, _)
+                        | SpawnType::CopyMemory(_, _)
+                        | SpawnType::StoreAndMemory(_, _)
                 );
                 let make_memory = match other_spawn_type {
                     SpawnType::CreateMemory => SpawnMemoryTypeOrStore::New,
@@ -236,7 +232,7 @@ impl VirtualTaskManager for TokioTaskManager {
                             None,
                         )
                     };
-                    if shared_memory_spawn {
+                    if supplied_memory_spawn {
                         wasmer_vm::with_skipped_shared_memory_data_initializers(instantiate)
                     } else {
                         instantiate()

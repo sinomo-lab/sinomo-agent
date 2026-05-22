@@ -19,8 +19,18 @@ pub fn futex_wake_all<M: MemorySize>(
     let state = env.state.deref();
 
     let pointer: u64 = futex_ptr.offset().into();
-    let sync_shared = is_registered_shared_futex_offset(env, pointer);
-    if sync_shared {
+    let sync_shared_memory =
+        has_live_cross_process_shared_memory(env) && is_registered_shared_memory_offset(env, pointer);
+    let sync_shared_futex = is_registered_shared_futex_offset(env, pointer);
+    let sync_mapped_futex_word =
+        env.state.has_cross_process_shared_memory() && is_registered_shared_memory_offset(env, pointer);
+    if sync_shared_memory {
+        sync_shared_memory_from_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    } else if sync_shared_futex {
+        sync_shared_memory_range_from_guest::<M>(env, &memory, pointer, 4)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    } else if sync_mapped_futex_word {
         sync_shared_memory_range_from_guest::<M>(env, &memory, pointer, 4)
             .map_err(|err| WasiError::Exit(err.into()))?;
     }
@@ -32,6 +42,8 @@ pub fn futex_wake_all<M: MemorySize>(
             let woke_waiter = !futex.wakers.is_empty();
             for (poller_idx, waker) in futex.wakers {
                 guard.poller_futexes.remove(&poller_idx);
+                guard.poller_threads.remove(&poller_idx);
+                guard.interrupted_pollers.remove(&poller_idx);
                 guard.woken_pollers.insert(poller_idx);
                 if let Some(waker) = waker {
                     waker.wake();

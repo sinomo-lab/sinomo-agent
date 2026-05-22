@@ -1065,7 +1065,7 @@ fn inode_mode(ino: u64) -> Option<u32> {
     POSIX_MODE_OVERRIDES.lock().ok()?.get(&ino).copied()
 }
 
-fn set_inode_mode(ino: u64, mode: u32) {
+pub(crate) fn set_inode_mode(ino: u64, mode: u32) {
     if let Ok(mut modes) = POSIX_MODE_OVERRIDES.lock() {
         modes.insert(ino, mode & 0o7777);
     }
@@ -1075,7 +1075,7 @@ fn inode_owner(ino: u64) -> Option<(u32, u32)> {
     POSIX_OWNER_OVERRIDES.lock().ok()?.get(&ino).copied()
 }
 
-fn set_inode_owner(ino: u64, uid: u32, gid: u32) {
+pub(crate) fn set_inode_owner(ino: u64, uid: u32, gid: u32) {
     if let Ok(mut owners) = POSIX_OWNER_OVERRIDES.lock() {
         owners.insert(ino, (uid, gid));
     }

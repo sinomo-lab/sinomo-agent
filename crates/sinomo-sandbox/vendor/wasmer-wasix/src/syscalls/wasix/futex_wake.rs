@@ -58,10 +58,24 @@ pub fn futex_requeue<M: MemorySize>(
     let state = env.state.deref();
     let from = from_futex.offset().into();
     let to = to_futex.offset().into();
-    let sync_shared =
+    let sync_shared_memory = has_live_cross_process_shared_memory(env)
+        && (is_registered_shared_memory_offset(env, from)
+            || is_registered_shared_memory_offset(env, to));
+    let sync_shared_futex =
         is_registered_shared_futex_offset(env, from) || is_registered_shared_futex_offset(env, to);
-    if sync_shared {
+    let sync_mapped_futex_word = env.state.has_cross_process_shared_memory()
+        && (is_registered_shared_memory_offset(env, from)
+            || is_registered_shared_memory_offset(env, to));
+    if sync_shared_memory {
         sync_shared_memory_from_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    } else if sync_shared_futex {
+        sync_shared_memory_from_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    } else if sync_mapped_futex_word {
+        sync_shared_memory_range_from_guest::<M>(env, &memory, from, 4)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+        sync_shared_memory_range_from_guest::<M>(env, &memory, to, 4)
             .map_err(|err| WasiError::Exit(err.into()))?;
     }
 
@@ -119,6 +133,8 @@ fn requeue_futex_address_locked(
     }
     for id in woke_pollers {
         guard.poller_futexes.remove(&id);
+        guard.poller_threads.remove(&id);
+        guard.interrupted_pollers.remove(&id);
         guard.woken_pollers.insert(id);
     }
     for id in moved_pollers {
@@ -149,10 +165,31 @@ fn futex_wake_mask_internal<M: MemorySize>(
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let pointer: u64 = futex_ptr.offset().into();
-    let sync_shared = is_registered_shared_futex_offset(env, pointer);
-    if sync_shared {
+    let sync_shared_memory =
+        has_live_cross_process_shared_memory(env) && is_registered_shared_memory_offset(env, pointer);
+    let sync_shared_futex = is_registered_shared_futex_offset(env, pointer);
+    let sync_mapped_futex_word =
+        env.state.has_cross_process_shared_memory() && is_registered_shared_memory_offset(env, pointer);
+    if sync_shared_memory {
+        sync_shared_memory_from_guest::<M>(env, &memory)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    } else if sync_shared_futex {
         sync_shared_memory_range_from_guest::<M>(env, &memory, pointer, 4)
             .map_err(|err| WasiError::Exit(err.into()))?;
+    } else if sync_mapped_futex_word {
+        sync_shared_memory_range_from_guest::<M>(env, &memory, pointer, 4)
+            .map_err(|err| WasiError::Exit(err.into()))?;
+    }
+    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+        let value = futex_ptr.read(&memory).unwrap_or(0);
+        sinomo_debug!(
+            "sinomo-debug futex_wake_word pid={} tid={} pointer={:#x} value={} memory_ptr={:#x}",
+            env.pid().raw(),
+            env.tid().raw(),
+            pointer,
+            value,
+            memory.data_ptr() as usize
+        );
     }
     let state = env.state.deref();
 
@@ -217,6 +254,8 @@ fn wake_futex_address_locked(
     }
     for id in woke_pollers {
         guard.poller_futexes.remove(&id);
+        guard.poller_threads.remove(&id);
+        guard.interrupted_pollers.remove(&id);
         guard.woken_pollers.insert(id);
     }
     if remove_futex {

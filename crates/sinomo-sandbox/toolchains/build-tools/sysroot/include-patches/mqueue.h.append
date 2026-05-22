@@ -1,0 +1,7 @@
+
+#ifndef SINOMO_WASIX_MQUEUE_LIMITS
+#define SINOMO_WASIX_MQUEUE_LIMITS
+#ifndef MQ_PRIO_MAX
+#define MQ_PRIO_MAX 32768
+#endif
+#endif

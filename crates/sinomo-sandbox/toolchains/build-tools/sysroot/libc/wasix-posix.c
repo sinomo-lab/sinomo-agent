@@ -8,14 +8,17 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
+#include <mqueue.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/times.h>
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
@@ -23,6 +26,39 @@
 #include <wasi/libc.h>
 #include <wasi/libc-find-relpath.h>
 #include <wasi/libc-nocwd.h>
+
+#define SINOMO_STDIO_MAYBE_WAITERS 0x40000000
+
+struct sinomo_wasix_file_lock_view {
+    unsigned flags;
+    unsigned char *rpos;
+    unsigned char *rend;
+    int (*close)(FILE *);
+    unsigned char *wend;
+    unsigned char *wpos;
+    unsigned char *wbase;
+    size_t (*read)(FILE *, unsigned char *, size_t);
+    size_t (*write)(FILE *, const unsigned char *, size_t);
+    off_t (*seek)(FILE *, off_t, int);
+    unsigned char *buf;
+    size_t buf_size;
+    FILE *prev;
+    FILE *next;
+    int fd;
+    int pipe_pid;
+    long lockcount;
+    int mode;
+    volatile int lock;
+    int lbf;
+    void *cookie;
+    off_t off;
+    char *getln_buf;
+    unsigned char *shend;
+    off_t shlim;
+    off_t shcnt;
+    FILE *prev_locked;
+    FILE *next_locked;
+};
 
 #ifndef SINOMO_PTHREAD_DEBUG
 #define SINOMO_PTHREAD_DEBUG 0
@@ -33,8 +69,80 @@
 #ifndef SIGCANCEL
 #define SIGCANCEL 32
 #endif
+#ifndef WNOHANG
+#define WNOHANG 1
+#endif
+#ifndef WUNTRACED
+#define WUNTRACED 2
+#endif
 
 #define SINOMO_WASIX_DEFAULT_THREAD_STACK_SIZE (128u * 1024u)
+
+struct sinomo_wasix_atfork_handler {
+    void (*prepare)(void);
+    void (*parent)(void);
+    void (*child)(void);
+};
+
+static struct sinomo_wasix_atfork_handler *sinomo_wasix_atfork_handlers;
+static size_t sinomo_wasix_atfork_count;
+static size_t sinomo_wasix_atfork_capacity;
+static volatile int sinomo_wasix_atfork_lock;
+
+static void sinomo_wasix_atfork_lock_acquire(void) {
+    while (__atomic_exchange_n(&sinomo_wasix_atfork_lock, 1, __ATOMIC_ACQUIRE) != 0)
+        sched_yield();
+}
+
+static void sinomo_wasix_atfork_lock_release(void) {
+    __atomic_store_n(&sinomo_wasix_atfork_lock, 0, __ATOMIC_RELEASE);
+}
+
+int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void)) {
+    sched_yield();
+    sinomo_wasix_atfork_lock_acquire();
+    if (sinomo_wasix_atfork_count == sinomo_wasix_atfork_capacity) {
+        size_t new_capacity = sinomo_wasix_atfork_capacity == 0 ? 16 : sinomo_wasix_atfork_capacity * 2;
+        if (new_capacity <= sinomo_wasix_atfork_capacity) {
+            sinomo_wasix_atfork_lock_release();
+            return ENOMEM;
+        }
+        struct sinomo_wasix_atfork_handler *new_handlers =
+            realloc(sinomo_wasix_atfork_handlers, new_capacity * sizeof(*new_handlers));
+        if (new_handlers == NULL) {
+            sinomo_wasix_atfork_lock_release();
+            return ENOMEM;
+        }
+        sinomo_wasix_atfork_handlers = new_handlers;
+        sinomo_wasix_atfork_capacity = new_capacity;
+    }
+    sinomo_wasix_atfork_handlers[sinomo_wasix_atfork_count++] = (struct sinomo_wasix_atfork_handler){
+        .prepare = prepare,
+        .parent = parent,
+        .child = child,
+    };
+    sinomo_wasix_atfork_lock_release();
+    return 0;
+}
+
+void __fork_handler(int who) {
+    sinomo_wasix_atfork_lock_acquire();
+    size_t count = sinomo_wasix_atfork_count;
+    if (who < 0) {
+        for (size_t i = count; i > 0; i--) {
+            void (*handler)(void) = sinomo_wasix_atfork_handlers[i - 1].prepare;
+            if (handler != NULL)
+                handler();
+        }
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            void (*handler)(void) = who ? sinomo_wasix_atfork_handlers[i].child : sinomo_wasix_atfork_handlers[i].parent;
+            if (handler != NULL)
+                handler();
+        }
+    }
+    sinomo_wasix_atfork_lock_release();
+}
 
 int32_t __imported_wasix_fd_chmod(int32_t fd, uint32_t mode) __attribute__((
     __import_module__("wasix_32v1"),
@@ -151,6 +259,27 @@ int32_t __imported_wasix_sched_setscheduler(int32_t pid, int32_t policy, int32_t
     __import_name__("sched_setscheduler")
 ));
 
+int32_t __imported_wasix_getrlimit(int32_t resource, uint64_t *current, uint64_t *maximum) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("getrlimit")
+));
+
+int32_t __imported_wasix_setrlimit(int32_t resource, uint64_t current, uint64_t maximum) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("setrlimit")
+));
+
+int32_t __imported_wasix_proc_times(
+    uint64_t *elapsed_ticks,
+    uint64_t *user_ticks,
+    uint64_t *system_ticks,
+    uint64_t *child_user_ticks,
+    uint64_t *child_system_ticks
+) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("proc_times")
+));
+
 int32_t __imported_wasix_signal_mask_set(uint64_t low, uint64_t high) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("signal_mask_set")
@@ -159,6 +288,11 @@ int32_t __imported_wasix_signal_mask_set(uint64_t low, uint64_t high) __attribut
 int32_t __imported_wasix_signal_mask_get(uint64_t *low, uint64_t *high) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("signal_mask_get")
+));
+
+int32_t __imported_wasix_signal_pending_get(uint64_t *low, uint64_t *high) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("signal_pending_get")
 ));
 
 int32_t __imported_wasix_thread_signal(uint32_t tid, uint32_t sig) __attribute__((
@@ -176,6 +310,139 @@ int32_t __imported_wasix_thread_join(uint32_t tid) __attribute__((
     __import_name__("thread_join")
 ));
 
+int32_t __imported_wasix_itimer_settime(
+    int32_t which,
+    int64_t value_sec,
+    int64_t value_usec,
+    int64_t interval_sec,
+    int64_t interval_usec,
+    int64_t *old_value_sec,
+    int64_t *old_value_usec,
+    int64_t *old_interval_sec,
+    int64_t *old_interval_usec
+) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("itimer_settime")
+));
+
+int32_t __imported_wasix_itimer_gettime(
+    int32_t which,
+    int64_t *value_sec,
+    int64_t *value_usec,
+    int64_t *interval_sec,
+    int64_t *interval_usec
+) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("itimer_gettime")
+));
+
+int32_t __imported_wasix_posix_timer_create(int32_t clock_id) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("posix_timer_create")
+));
+
+int32_t __imported_wasix_posix_timer_settime(
+    uint32_t timer_id,
+    int32_t flags,
+    int64_t value_sec,
+    int64_t value_nsec,
+    int64_t interval_sec,
+    int64_t interval_nsec,
+    int64_t *old_value_sec,
+    int64_t *old_value_nsec,
+    int64_t *old_interval_sec,
+    int64_t *old_interval_nsec
+) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("posix_timer_settime")
+));
+
+int32_t __imported_wasix_posix_timer_gettime(
+    uint32_t timer_id,
+    int64_t *value_sec,
+    int64_t *value_nsec,
+    int64_t *interval_sec,
+    int64_t *interval_nsec
+) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("posix_timer_gettime")
+));
+
+int32_t __imported_wasix_posix_timer_getoverrun(uint32_t timer_id) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("posix_timer_getoverrun")
+));
+
+int32_t __imported_wasix_posix_timer_delete(uint32_t timer_id) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("posix_timer_delete")
+));
+
+int32_t __imported_wasix_mqueue_open(
+    const char *name,
+    uintptr_t name_len,
+    int32_t flags,
+    int32_t create,
+    int32_t exclusive,
+    int32_t has_attr,
+    uint64_t max_messages,
+    uint64_t message_size
+) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_open")
+));
+
+int32_t __imported_wasix_mqueue_send(int32_t descriptor, const char *message, uintptr_t message_len, uint32_t priority) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_send")
+));
+
+int32_t __imported_wasix_mqueue_timedsend(int32_t descriptor, const char *message, uintptr_t message_len, uint32_t priority, int64_t timeout_sec, int64_t timeout_nsec) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_timedsend")
+));
+
+int32_t __imported_wasix_mqueue_receive(int32_t descriptor, char *buffer, uintptr_t buffer_len, uint32_t *priority) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_receive")
+));
+
+int32_t __imported_wasix_mqueue_timedreceive(int32_t descriptor, char *buffer, uintptr_t buffer_len, uint32_t *priority, int64_t timeout_sec, int64_t timeout_nsec) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_timedreceive")
+));
+
+int32_t __imported_wasix_mqueue_getattr(
+    int32_t descriptor,
+    int64_t *flags,
+    int64_t *max_messages,
+    int64_t *message_size,
+    int64_t *current_messages
+) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_getattr")
+));
+
+int32_t __imported_wasix_mqueue_setattr(int32_t descriptor, int64_t flags) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_setattr")
+));
+
+int32_t __imported_wasix_mqueue_close(int32_t descriptor) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_close")
+));
+
+int32_t __imported_wasix_mqueue_notify(int32_t descriptor, int32_t has_notification, uint32_t signal) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_notify")
+));
+
+int32_t __imported_wasix_mqueue_unlink(const char *name, uintptr_t name_len) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("mqueue_unlink")
+));
+
 int32_t __sinomo_wasix_shared_memory_sync_from(void) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("shared_memory_sync_from")
@@ -187,6 +454,14 @@ int32_t __sinomo_wasix_shared_memory_sync_from_preserving_futexes(void) __attrib
 int32_t __sinomo_wasix_shared_memory_sync_to(void) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("shared_memory_sync_to")
+));
+int32_t __sinomo_wasix_shared_memory_range_sync_from(uintptr_t offset, uintptr_t len) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("shared_memory_range_sync_from")
+));
+int32_t __sinomo_wasix_shared_memory_range_sync_to(uintptr_t offset, uintptr_t len) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("shared_memory_range_sync_to")
 ));
 int32_t __sinomo_wasix_shared_futex_hint(uintptr_t offset, uintptr_t len) __attribute__((
     __import_module__("wasix_32v1"),
@@ -200,6 +475,31 @@ uint32_t __sinomo_wasix_shared_memory_is_cross_process(void) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("shared_memory_is_cross_process")
 ));
+uint32_t __sinomo_wasix_shared_memory_was_cross_process(void) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("shared_memory_was_cross_process")
+));
+
+static void sinomo_wasix_sync_from_guest_if_shared(void) {
+    if (__sinomo_wasix_shared_memory_is_cross_process() != 0)
+        (void)__sinomo_wasix_shared_memory_sync_from();
+}
+
+static void sinomo_wasix_sync_to_guest_if_shared(void) {
+    if (__sinomo_wasix_shared_memory_is_cross_process() != 0 ||
+        __sinomo_wasix_shared_memory_was_cross_process() != 0)
+        (void)__sinomo_wasix_shared_memory_sync_to();
+}
+
+static void sinomo_wasix_sync_range_from_guest_if_shared(const void *ptr, size_t len) {
+    if (__sinomo_wasix_shared_memory_is_cross_process() != 0)
+        (void)__sinomo_wasix_shared_memory_range_sync_from((uintptr_t)ptr, (uintptr_t)len);
+}
+
+static void sinomo_wasix_sync_range_to_guest_if_shared(const void *ptr, size_t len) {
+    if (__sinomo_wasix_shared_memory_is_cross_process() != 0)
+        (void)__sinomo_wasix_shared_memory_range_sync_to((uintptr_t)ptr, (uintptr_t)len);
+}
 uint32_t __sinomo_wasix_shared_barrier_generation(uintptr_t offset) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("shared_barrier_generation")
@@ -265,6 +565,7 @@ static __thread uint64_t sinomo_wasix_pending_signal_high = 0;
 static __thread int sinomo_wasix_tls_sched_valid = 0;
 static __thread int sinomo_wasix_tls_sched_policy = SCHED_OTHER;
 static __thread int sinomo_wasix_tls_sched_priority = 0;
+static __thread int sinomo_wasix_publish_before_next_sleep = 0;
 
 static int normalize_absolute_path(const char *path, char **normalized_out) {
     size_t len = strlen(path);
@@ -514,13 +815,38 @@ int fchdir(int fd) {
     return 0;
 }
 
-pid_t fork(void) {
-    int32_t result = __imported_wasix_fork();
-    if (result < 0) {
-        errno = -result;
-        return -1;
+extern void __do_orphaned_stdio_locks(void);
+
+static void sinomo_wasix_after_fork_child(void) {
+    sinomo_wasix_pending_signal_low = 0;
+    sinomo_wasix_pending_signal_high = 0;
+    __do_orphaned_stdio_locks();
+    funlockfile(stdin);
+    funlockfile(stdout);
+    funlockfile(stderr);
+}
+
+__attribute__((constructor))
+static void sinomo_wasix_register_fork_handlers(void) {
+    (void)pthread_atfork(NULL, NULL, sinomo_wasix_after_fork_child);
+}
+
+static void sinomo_wasix_unlock_orphaned_stream(FILE *stream) {
+    if (stream == NULL)
+        return;
+    struct sinomo_wasix_file_lock_view *view = (struct sinomo_wasix_file_lock_view *)stream;
+    if (view->lock == SINOMO_STDIO_MAYBE_WAITERS) {
+        view->lock = 0;
+        view->lockcount = 0;
+        view->prev_locked = NULL;
+        view->next_locked = NULL;
     }
-    return (pid_t)result;
+}
+
+static void sinomo_wasix_unlock_orphaned_standard_streams(void) {
+    sinomo_wasix_unlock_orphaned_stream(stdin);
+    sinomo_wasix_unlock_orphaned_stream(stdout);
+    sinomo_wasix_unlock_orphaned_stream(stderr);
 }
 
 int sched_get_priority_max(int policy) {
@@ -539,6 +865,111 @@ int sched_get_priority_min(int policy) {
         return -1;
     }
     return result;
+}
+
+int sched_getscheduler(pid_t pid) {
+    int32_t result = __imported_wasix_sched_getscheduler((int32_t)pid);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
+}
+
+int sched_getparam(pid_t pid, struct sched_param *param) {
+    if (param == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    int32_t priority = 0;
+    int32_t result = __imported_wasix_sched_getparam((int32_t)pid, &priority);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    param->sched_priority = priority;
+    return 0;
+}
+
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param) {
+    if (param == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    int32_t result = __imported_wasix_sched_setscheduler((int32_t)pid, policy, param->sched_priority);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
+}
+
+int sched_setparam(pid_t pid, const struct sched_param *param) {
+    if (param == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    int policy = sched_getscheduler(pid);
+    if (policy < 0)
+        return -1;
+    return sched_setscheduler(pid, policy, param);
+}
+
+int getrlimit(int resource, struct rlimit *limit) {
+    if (limit == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    uint64_t current = 0;
+    uint64_t maximum = 0;
+    int32_t result = __imported_wasix_getrlimit(resource, &current, &maximum);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    limit->rlim_cur = (rlim_t)current;
+    limit->rlim_max = (rlim_t)maximum;
+    return 0;
+}
+
+int setrlimit(int resource, const struct rlimit *limit) {
+    if (limit == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int32_t result = __imported_wasix_setrlimit(resource, (uint64_t)limit->rlim_cur, (uint64_t)limit->rlim_max);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return 0;
+}
+
+clock_t times(struct tms *buffer) {
+    if (buffer == NULL) {
+        errno = EFAULT;
+        return (clock_t)-1;
+    }
+    uint64_t elapsed_ticks = 0;
+    uint64_t user_ticks = 0;
+    uint64_t system_ticks = 0;
+    uint64_t child_user_ticks = 0;
+    uint64_t child_system_ticks = 0;
+    int32_t result = __imported_wasix_proc_times(
+        &elapsed_ticks,
+        &user_ticks,
+        &system_ticks,
+        &child_user_ticks,
+        &child_system_ticks);
+    if (result < 0) {
+        errno = -result;
+        return (clock_t)-1;
+    }
+    buffer->tms_utime = (clock_t)user_ticks;
+    buffer->tms_stime = (clock_t)system_ticks;
+    buffer->tms_cutime = (clock_t)child_user_ticks;
+    buffer->tms_cstime = (clock_t)child_system_ticks;
+    return (clock_t)elapsed_ticks;
 }
 
 int pthread_attr_getschedpolicy(const pthread_attr_t *restrict attr, int *restrict policy) {
@@ -595,6 +1026,25 @@ int pthread_attr_getstacksize(const pthread_attr_t *restrict attr, size_t *restr
     if (attr == NULL || size == NULL)
         return EINVAL;
     *size = attr->__u.__s[0];
+    return 0;
+}
+
+int pthread_attr_setstack(pthread_attr_t *attr, void *addr, size_t size) {
+    if (attr == NULL || addr == NULL)
+        return EINVAL;
+    if (size < PTHREAD_STACK_MIN)
+        return EINVAL;
+    attr->__u.__s[0] = size;
+    attr->__u.__s[2] = (uintptr_t)addr + size;
+    return 0;
+}
+
+int pthread_attr_setstacksize(pthread_attr_t *attr, size_t size) {
+    if (attr == NULL)
+        return EINVAL;
+    if (size < PTHREAD_STACK_MIN)
+        return EINVAL;
+    attr->__u.__s[0] = size;
     return 0;
 }
 
@@ -839,15 +1289,82 @@ int pthread_condattr_getclock(const pthread_condattr_t *restrict attr, clockid_t
     return 0;
 }
 
+#define SINOMO_MUTEX_ATTR_MAGIC 0x80000000u
+#define SINOMO_MUTEX_ATTR_PRIOCEILING_MASK (0x7fffU << 16)
+
+static int sinomo_mutexattr_valid(const pthread_mutexattr_t *attr) {
+    return attr != NULL && (attr->__attr & SINOMO_MUTEX_ATTR_MAGIC) != 0;
+}
+
 int pthread_mutexattr_getprotocol(const pthread_mutexattr_t *restrict attr, int *restrict protocol) {
     if (attr == NULL || protocol == NULL)
         return EINVAL;
-    *protocol = attr->__attr / 8U % 2;
+    if (!sinomo_mutexattr_valid(attr))
+        return EINVAL;
+    *protocol = (attr->__attr >> 3) & 3U;
+    if (*protocol > PTHREAD_PRIO_PROTECT)
+        return EINVAL;
+    return 0;
+}
+
+int pthread_mutexattr_setprotocol(pthread_mutexattr_t *attr, int protocol) {
+    if (attr == NULL)
+        return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
+        return EINVAL;
+    switch (protocol) {
+    case PTHREAD_PRIO_NONE:
+    case PTHREAD_PRIO_INHERIT:
+    case PTHREAD_PRIO_PROTECT:
+        attr->__attr = (attr->__attr & ~(3U << 3)) | ((unsigned)protocol << 3);
+        return 0;
+    default:
+        return EINVAL;
+    }
+}
+
+static int sinomo_mutex_default_prioceiling(void) {
+    int min = sched_get_priority_min(SCHED_FIFO);
+    int max = sched_get_priority_max(SCHED_FIFO);
+    if (min >= 0 && max >= min)
+        return min;
+    return 0;
+}
+
+static int sinomo_mutex_valid_prioceiling(int prioceiling) {
+    int min = sched_get_priority_min(SCHED_FIFO);
+    int max = sched_get_priority_max(SCHED_FIFO);
+    if (min < 0 || max < min)
+        return prioceiling >= 0;
+    return prioceiling >= min && prioceiling <= max;
+}
+
+int pthread_mutexattr_getprioceiling(const pthread_mutexattr_t *restrict attr, int *restrict prioceiling) {
+    if (attr == NULL || prioceiling == NULL)
+        return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
+        return EINVAL;
+    unsigned encoded = (attr->__attr >> 16) & 0x7fffU;
+    *prioceiling = encoded == 0 ? sinomo_mutex_default_prioceiling() : (int)encoded;
+    return 0;
+}
+
+int pthread_mutexattr_setprioceiling(pthread_mutexattr_t *attr, int prioceiling) {
+    if (attr == NULL)
+        return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
+        return EINVAL;
+    if (!sinomo_mutex_valid_prioceiling(prioceiling))
+        return EINVAL;
+    attr->__attr = (attr->__attr & ~SINOMO_MUTEX_ATTR_PRIOCEILING_MASK) |
+        (((unsigned)prioceiling << 16) & SINOMO_MUTEX_ATTR_PRIOCEILING_MASK);
     return 0;
 }
 
 int pthread_mutexattr_getpshared(const pthread_mutexattr_t *restrict attr, int *restrict pshared) {
     if (attr == NULL || pshared == NULL)
+        return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
         return EINVAL;
     *pshared = attr->__attr / 128U % 2;
     return 0;
@@ -856,12 +1373,33 @@ int pthread_mutexattr_getpshared(const pthread_mutexattr_t *restrict attr, int *
 int pthread_mutexattr_getrobust(const pthread_mutexattr_t *restrict attr, int *restrict robust) {
     if (attr == NULL || robust == NULL)
         return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
+        return EINVAL;
     *robust = attr->__attr / 4U % 2;
     return 0;
 }
 
+int pthread_mutexattr_setrobust(pthread_mutexattr_t *attr, int robust) {
+    if (attr == NULL)
+        return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
+        return EINVAL;
+    switch (robust) {
+    case PTHREAD_MUTEX_STALLED:
+        attr->__attr &= ~4U;
+        return 0;
+    case PTHREAD_MUTEX_ROBUST:
+        attr->__attr |= 4U;
+        return 0;
+    default:
+        return EINVAL;
+    }
+}
+
 int pthread_mutexattr_gettype(const pthread_mutexattr_t *restrict attr, int *restrict type) {
     if (attr == NULL || type == NULL)
+        return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
         return EINVAL;
     *type = attr->__attr & 3;
     return 0;
@@ -870,7 +1408,7 @@ int pthread_mutexattr_gettype(const pthread_mutexattr_t *restrict attr, int *res
 int pthread_mutexattr_init(pthread_mutexattr_t *attr) {
     if (attr == NULL)
         return EINVAL;
-    attr->__attr = PTHREAD_MUTEX_DEFAULT;
+    attr->__attr = SINOMO_MUTEX_ATTR_MAGIC | PTHREAD_MUTEX_DEFAULT;
     return 0;
 }
 
@@ -883,6 +1421,8 @@ int pthread_mutexattr_destroy(pthread_mutexattr_t *attr) {
 
 int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int type) {
     if (attr == NULL)
+        return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
         return EINVAL;
     switch (type) {
     case PTHREAD_MUTEX_NORMAL:
@@ -897,6 +1437,8 @@ int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int type) {
 
 int pthread_mutexattr_setpshared(pthread_mutexattr_t *attr, int pshared) {
     if (attr == NULL)
+        return EINVAL;
+    if (!sinomo_mutexattr_valid(attr))
         return EINVAL;
     switch (pshared) {
     case PTHREAD_PROCESS_PRIVATE:
@@ -929,6 +1471,24 @@ static void sinomo_wasix_get_current_sched(int *policy, int *priority);
 
 static int rwlock_is_shared(volatile int *words) {
     return words[SINOMO_RWLOCK_PSHARED_WORD] == PTHREAD_PROCESS_SHARED;
+}
+
+static int rwlock_ensure_initialized(pthread_rwlock_t *rwlock) {
+    if (rwlock == NULL)
+        return EINVAL;
+    volatile int *words = rwlock->__u.__vi;
+    int magic = __atomic_load_n(&words[SINOMO_RWLOCK_MAGIC_WORD], __ATOMIC_SEQ_CST);
+    if (magic == SINOMO_RWLOCK_MAGIC)
+        return 0;
+    if (magic != 0)
+        return EINVAL;
+    __atomic_store_n(&words[SINOMO_RWLOCK_STATE_WORD], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_WAITERS_WORD], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&words[SINOMO_RWLOCK_PSHARED_WORD], PTHREAD_PROCESS_PRIVATE, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_PRIORITY_WORD], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_POLICY_WORD], SCHED_OTHER, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&words[SINOMO_RWLOCK_MAGIC_WORD], SINOMO_RWLOCK_MAGIC, __ATOMIC_SEQ_CST);
+    return 0;
 }
 
 static int rwlock_sync_to_if_shared(volatile int *words) {
@@ -1050,11 +1610,10 @@ int pthread_rwlock_init(pthread_rwlock_t *restrict rwlock, const pthread_rwlocka
 }
 
 int pthread_rwlock_destroy(pthread_rwlock_t *rwlock) {
-    if (rwlock == NULL)
-        return EINVAL;
+    int init_ret = rwlock_ensure_initialized(rwlock);
+    if (init_ret != 0)
+        return init_ret;
     volatile int *words = rwlock->__u.__vi;
-    if (words[SINOMO_RWLOCK_MAGIC_WORD] != SINOMO_RWLOCK_MAGIC)
-        return EINVAL;
     int32_t destroy = __sinomo_wasix_shared_rwlock_destroy((uintptr_t)rwlock);
     if (destroy != 0)
         return (int)destroy;
@@ -1065,12 +1624,11 @@ int pthread_rwlock_destroy(pthread_rwlock_t *rwlock) {
 }
 
 int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock) {
-    if (rwlock == NULL)
-        return EINVAL;
+    int init_ret = rwlock_ensure_initialized(rwlock);
+    if (init_ret != 0)
+        return init_ret;
     volatile int *words = rwlock->__u.__vi;
     SINOMO_PTHREAD_ENV_LOG("sinomo-debug rwlock_tryrd enter rwlock=%p words=[%d,%d,%d,%d]\n", (void *)rwlock, words[0], words[1], words[2], words[3]);
-    if (words[SINOMO_RWLOCK_MAGIC_WORD] != SINOMO_RWLOCK_MAGIC)
-        return EINVAL;
     int policy = SCHED_OTHER;
     int priority = 0;
     rwlock_current_sched(&policy, &priority);
@@ -1080,12 +1638,11 @@ int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock) {
 }
 
 int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock) {
-    if (rwlock == NULL)
-        return EINVAL;
+    int init_ret = rwlock_ensure_initialized(rwlock);
+    if (init_ret != 0)
+        return init_ret;
     volatile int *words = rwlock->__u.__vi;
     SINOMO_PTHREAD_ENV_LOG("sinomo-debug rwlock_trywr enter rwlock=%p words=[%d,%d,%d,%d]\n", (void *)rwlock, words[0], words[1], words[2], words[3]);
-    if (words[SINOMO_RWLOCK_MAGIC_WORD] != SINOMO_RWLOCK_MAGIC)
-        return EINVAL;
     int policy = SCHED_OTHER;
     int priority = 0;
     rwlock_current_sched(&policy, &priority);
@@ -1095,8 +1652,9 @@ int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock) {
 }
 
 int pthread_rwlock_timedrdlock(pthread_rwlock_t *restrict rwlock, const struct timespec *restrict abstime) {
-    if (rwlock == NULL)
-        return EINVAL;
+    int init_ret = rwlock_ensure_initialized(rwlock);
+    if (init_ret != 0)
+        return init_ret;
     volatile int *words = rwlock->__u.__vi;
     int policy = SCHED_OTHER;
     int priority = 0;
@@ -1142,8 +1700,9 @@ int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock) {
 }
 
 int pthread_rwlock_timedwrlock(pthread_rwlock_t *restrict rwlock, const struct timespec *restrict abstime) {
-    if (rwlock == NULL)
-        return EINVAL;
+    int init_ret = rwlock_ensure_initialized(rwlock);
+    if (init_ret != 0)
+        return init_ret;
     volatile int *words = rwlock->__u.__vi;
     SINOMO_PTHREAD_ENV_LOG("sinomo-debug rwlock_wrlock enter rwlock=%p words=[%d,%d,%d,%d]\n", (void *)rwlock, words[0], words[1], words[2], words[3]);
     int registered_waiter = 0;
@@ -1191,12 +1750,11 @@ int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock) {
 }
 
 int pthread_rwlock_unlock(pthread_rwlock_t *rwlock) {
-    if (rwlock == NULL)
-        return EINVAL;
+    int init_ret = rwlock_ensure_initialized(rwlock);
+    if (init_ret != 0)
+        return init_ret;
     volatile int *words = rwlock->__u.__vi;
     SINOMO_PTHREAD_ENV_LOG("sinomo-debug rwlock_unlock enter rwlock=%p words=[%d,%d,%d,%d]\n", (void *)rwlock, words[0], words[1], words[2], words[3]);
-    if (words[SINOMO_RWLOCK_MAGIC_WORD] != SINOMO_RWLOCK_MAGIC)
-        return EINVAL;
     int32_t ret = __sinomo_wasix_shared_rwlock_unlock((uintptr_t)rwlock);
     if (ret == 0)
         (void)__wasilibc_futex_wake_wasix((int *)&words[SINOMO_RWLOCK_STATE_WORD], INT_MAX);
@@ -1260,6 +1818,15 @@ int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id) {
     return 0;
 }
 
+int clock_getcpuclockid(pid_t pid, clockid_t *clock_id) {
+    if (clock_id == NULL)
+        return EINVAL;
+    if (pid < 0)
+        return EINVAL;
+    *clock_id = CLOCK_PROCESS_CPUTIME_ID;
+    return 0;
+}
+
 int __pthread_create(
     pthread_t *restrict thread,
     const pthread_attr_t *restrict attr,
@@ -1269,12 +1836,15 @@ int __pthread_create(
 
 #define SINOMO_WASIX_PTHREAD_DETACHED_SLOTS 1024
 static uintptr_t sinomo_wasix_detached_threads[SINOMO_WASIX_PTHREAD_DETACHED_SLOTS];
+static uintptr_t sinomo_wasix_joined_threads[SINOMO_WASIX_PTHREAD_DETACHED_SLOTS];
 
 struct sinomo_wasix_thread_sched_record {
     uintptr_t thread;
     int tid;
     int policy;
     int priority;
+    uintptr_t stack_addr;
+    uintptr_t stack_size;
 };
 
 static struct sinomo_wasix_thread_sched_record sinomo_wasix_thread_sched[SINOMO_WASIX_PTHREAD_DETACHED_SLOTS];
@@ -1318,6 +1888,26 @@ static int sinomo_wasix_is_detached_thread(pthread_t thread) {
     if (thread == NULL)
         return 0;
     return sinomo_wasix_detached_threads[sinomo_wasix_detached_slot(thread)] == (uintptr_t)thread;
+}
+
+static void sinomo_wasix_mark_joined_thread(pthread_t thread) {
+    if (thread == NULL)
+        return;
+    sinomo_wasix_joined_threads[sinomo_wasix_detached_slot(thread)] = (uintptr_t)thread;
+}
+
+static void sinomo_wasix_clear_joined_thread(pthread_t thread) {
+    if (thread == NULL)
+        return;
+    size_t slot = sinomo_wasix_detached_slot(thread);
+    if (sinomo_wasix_joined_threads[slot] == (uintptr_t)thread)
+        sinomo_wasix_joined_threads[slot] = 0;
+}
+
+static int sinomo_wasix_is_joined_thread(pthread_t thread) {
+    if (thread == NULL)
+        return 0;
+    return sinomo_wasix_joined_threads[sinomo_wasix_detached_slot(thread)] == (uintptr_t)thread;
 }
 
 static int sinomo_wasix_valid_sched_policy(int policy) {
@@ -1378,6 +1968,29 @@ static void sinomo_wasix_set_thread_sched(pthread_t thread, int tid, int policy,
     sinomo_wasix_thread_sched[slot].tid = tid;
     sinomo_wasix_thread_sched[slot].policy = policy;
     sinomo_wasix_thread_sched[slot].priority = priority;
+}
+
+static void sinomo_wasix_set_thread_stack(pthread_t thread, void *stack_addr, size_t stack_size) {
+    if (thread == NULL)
+        return;
+    size_t slot = sinomo_wasix_detached_slot(thread);
+    if (sinomo_wasix_thread_sched[slot].thread != (uintptr_t)thread)
+        sinomo_wasix_thread_sched[slot].thread = (uintptr_t)thread;
+    sinomo_wasix_thread_sched[slot].stack_addr = (uintptr_t)stack_addr;
+    sinomo_wasix_thread_sched[slot].stack_size = (uintptr_t)stack_size;
+}
+
+static int sinomo_wasix_get_thread_stack(pthread_t thread, void **stack_addr, size_t *stack_size) {
+    if (thread == NULL)
+        return 0;
+    size_t slot = sinomo_wasix_detached_slot(thread);
+    if (sinomo_wasix_thread_sched[slot].thread != (uintptr_t)thread)
+        return 0;
+    if (stack_addr != NULL)
+        *stack_addr = (void *)sinomo_wasix_thread_sched[slot].stack_addr;
+    if (stack_size != NULL)
+        *stack_size = (size_t)sinomo_wasix_thread_sched[slot].stack_size;
+    return sinomo_wasix_thread_sched[slot].stack_size != 0;
 }
 
 static void sinomo_wasix_clear_thread_sched(pthread_t thread) {
@@ -1496,6 +2109,8 @@ int pthread_create(
         }
     }
     int before_created = __atomic_load_n(&sinomo_wasix_created_thread_count, __ATOMIC_SEQ_CST);
+    SINOMO_PTHREAD_ENV_LOG("sinomo-debug pthread_create enter created=%d attr=%p start=%p arg=%p\n",
+        before_created, (void *)attr, (void *)start_routine, arg);
     if (before_created >= 190) {
         SINOMO_PTHREAD_LOG("sinomo-debug pthread_create enter created=%d attr=%p\n",
             before_created, (void *)attr);
@@ -1504,6 +2119,9 @@ int pthread_create(
     sinomo_wasix_pending_create_sched_valid = 0;
     if (result == 0 && thread != NULL) {
         int created = __atomic_add_fetch(&sinomo_wasix_created_thread_count, 1, __ATOMIC_SEQ_CST);
+        SINOMO_PTHREAD_ENV_LOG("sinomo-debug pthread_create created=%d thread=%p tid=%d\n",
+            created, (void *)*thread,
+            *thread != NULL ? ((struct sinomo_wasix_pthread_tid_prefix *)*thread)->tid : 0);
         if ((created % 100) == 0 || created >= 190) {
             SINOMO_PTHREAD_LOG("sinomo-debug pthread_create created=%d thread=%p\n", created, (void *)*thread);
         }
@@ -1511,9 +2129,16 @@ int pthread_create(
             sinomo_wasix_mark_detached_thread(*thread);
         else
             sinomo_wasix_clear_detached_thread(*thread);
+        sinomo_wasix_clear_joined_thread(*thread);
         if (create_has_sched) {
             struct sinomo_wasix_pthread_tid_prefix *created_thread = (struct sinomo_wasix_pthread_tid_prefix *)*thread;
             sinomo_wasix_set_thread_sched(*thread, created_thread != NULL ? created_thread->tid : 0, create_policy, create_priority);
+        }
+        if (create_attr != NULL && create_attr != (const pthread_attr_t *)(uintptr_t)-1) {
+            void *stack_addr = NULL;
+            size_t stack_size = 0;
+            if (pthread_attr_getstack(create_attr, &stack_addr, &stack_size) == 0)
+                sinomo_wasix_set_thread_stack(*thread, stack_addr, stack_size);
         }
     } else if (result != 0) {
         int created = __atomic_load_n(&sinomo_wasix_created_thread_count, __ATOMIC_SEQ_CST);
@@ -1550,12 +2175,16 @@ struct sinomo_wasix_pthread_state {
     uintptr_t stack_size;
     uintptr_t guard_size;
     uintptr_t result;
+    uintptr_t cancelbuf;
+    void **tsd;
 };
 
 extern _Thread_local struct sinomo_wasix_pthread_state *__wasilibc_pthread_self;
 
 static int sinomo_wasix_pthread_join_impl(pthread_t thread, void **retval) {
     if (thread == NULL)
+        return ESRCH;
+    if (sinomo_wasix_is_joined_thread(thread))
         return ESRCH;
     struct sinomo_wasix_pthread_state *target = (struct sinomo_wasix_pthread_state *)thread;
     if (target == __wasilibc_pthread_self)
@@ -1571,6 +2200,8 @@ static int sinomo_wasix_pthread_join_impl(pthread_t thread, void **retval) {
             return ESRCH;
         debug_count++;
         if (debug_count == 1 || (debug_count % 10000u) == 0u) {
+            SINOMO_PTHREAD_ENV_LOG("sinomo-debug pthread_join waiting thread=%p tid=%d state=%d count=%u\n",
+                (void *)thread, target->tid, state, debug_count);
             SINOMO_PTHREAD_LOG("sinomo-debug pthread_join waiting thread=%p tid=%d state=%d count=%u\n",
                 (void *)thread, target->tid, state, debug_count);
         }
@@ -1584,9 +2215,16 @@ static int sinomo_wasix_pthread_join_impl(pthread_t thread, void **retval) {
     if (retval != NULL)
         *retval = (void *)target->result;
     int saved_tid = sinomo_wasix_get_thread_tid(thread);
+    if (saved_tid <= 0)
+        saved_tid = target->tid;
+    SINOMO_PTHREAD_ENV_LOG("sinomo-debug pthread_join bridge thread=%p target_tid=%d saved_tid=%d state=%d\n",
+        (void *)thread, target->tid, saved_tid, state);
+    SINOMO_PTHREAD_LOG("sinomo-debug pthread_join bridge thread=%p target_tid=%d saved_tid=%d state=%d\n",
+        (void *)thread, target->tid, saved_tid, state);
     int32_t join_ret = saved_tid > 0 ? __imported_wasix_thread_join((uint32_t)saved_tid) : 0;
     if (join_ret != 0)
         return (int)join_ret;
+    sinomo_wasix_unlock_orphaned_standard_streams();
     __atomic_store_n(&target->detach_state, SINOMO_WASIX_DT_DETACHED, __ATOMIC_SEQ_CST);
     sinomo_wasix_clear_detached_thread(thread);
     sinomo_wasix_clear_thread_sched(thread);
@@ -1597,6 +2235,7 @@ static int sinomo_wasix_pthread_join_impl(pthread_t thread, void **retval) {
     }
     uintptr_t map_base = target->map_base;
     uintptr_t map_size = target->map_size;
+    sinomo_wasix_mark_joined_thread(thread);
     if (map_base != 0 && map_size != 0)
         (void)munmap((void *)map_base, (size_t)map_size);
     return 0;
@@ -1610,6 +2249,87 @@ int __pthread_join(pthread_t thread, void **retval) {
     return sinomo_wasix_pthread_join_impl(thread, retval);
 }
 
+int pthread_detach(pthread_t thread) {
+    if (thread == NULL)
+        return ESRCH;
+    if (sinomo_wasix_is_joined_thread(thread))
+        return ESRCH;
+
+    struct sinomo_wasix_pthread_state *target = (struct sinomo_wasix_pthread_state *)thread;
+    int state = __atomic_load_n(&target->detach_state, __ATOMIC_SEQ_CST);
+    for (;;) {
+        if (state == SINOMO_WASIX_DT_DETACHED)
+            return EINVAL;
+        if (state != SINOMO_WASIX_DT_JOINABLE &&
+            state != SINOMO_WASIX_DT_EXITING &&
+            state != SINOMO_WASIX_DT_EXITED)
+            return ESRCH;
+        if (__atomic_compare_exchange_n(&target->detach_state, &state, SINOMO_WASIX_DT_DETACHED, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            break;
+    }
+
+    sinomo_wasix_mark_detached_thread(thread);
+    if (state == SINOMO_WASIX_DT_EXITED) {
+        int saved_tid = sinomo_wasix_get_thread_tid(thread);
+        if (saved_tid <= 0)
+            saved_tid = target->tid;
+        int32_t join_ret = saved_tid > 0 ? __imported_wasix_thread_join((uint32_t)saved_tid) : 0;
+        if (join_ret != 0)
+            return (int)join_ret;
+        sinomo_wasix_clear_detached_thread(thread);
+        sinomo_wasix_clear_thread_sched(thread);
+        uintptr_t map_base = target->map_base;
+        uintptr_t map_size = target->map_size;
+        sinomo_wasix_mark_joined_thread(thread);
+        if (map_base != 0 && map_size != 0)
+            (void)munmap((void *)map_base, (size_t)map_size);
+    }
+    return 0;
+}
+
+int __pthread_detach(pthread_t thread) {
+    return pthread_detach(thread);
+}
+
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr) {
+    if (thread == NULL || attr == NULL)
+        return EINVAL;
+    int ret = pthread_attr_init(attr);
+    if (ret != 0)
+        return ret;
+
+    void *stack_addr = NULL;
+    size_t stack_size = 0;
+    if (sinomo_wasix_get_thread_stack(thread, &stack_addr, &stack_size)) {
+        ret = stack_addr == NULL
+            ? pthread_attr_setstacksize(attr, stack_size)
+            : pthread_attr_setstack(attr, stack_addr, stack_size);
+        if (ret != 0)
+            return ret;
+    } else {
+        struct sinomo_wasix_pthread_state *target = (struct sinomo_wasix_pthread_state *)thread;
+        if (target->stack_size != 0) {
+            attr->__u.__s[0] = target->stack_size;
+            attr->__u.__s[2] = target->stack == 0 ? 0 : target->stack + target->stack_size;
+        }
+    }
+    if (sinomo_wasix_is_detached_thread(thread))
+        attr->__u.__i[3] = PTHREAD_CREATE_DETACHED;
+    else
+        attr->__u.__i[3] = PTHREAD_CREATE_JOINABLE;
+    return 0;
+}
+
+void *pthread_getspecific(pthread_key_t key) {
+    struct sinomo_wasix_pthread_state *self = __wasilibc_pthread_self;
+    if (self == NULL || key >= PTHREAD_KEYS_MAX)
+        return NULL;
+    void **tsd = self->tsd;
+    if (tsd == NULL)
+        return NULL;
+    return tsd[key];
+}
+
 long __cancel(void) {
     struct sinomo_wasix_pthread_state *self = __wasilibc_pthread_self;
     if (self != NULL && self->canceldisable == PTHREAD_CANCEL_ENABLE)
@@ -1621,6 +2341,8 @@ long __cancel(void) {
 
 void __testcancel(void) {
     struct sinomo_wasix_pthread_state *self = __wasilibc_pthread_self;
+    if (self != NULL)
+        sinomo_wasix_sync_range_to_guest_if_shared((const void *)&self->cancel, sizeof(self->cancel));
     if (self != NULL &&
         __atomic_load_n(&self->cancel, __ATOMIC_SEQ_CST) &&
         self->canceldisable == PTHREAD_CANCEL_ENABLE) {
@@ -1666,6 +2388,130 @@ static int sinomo_wasix_clock_now_ns(clockid_t clock_id, int64_t *now_out) {
     return 0;
 }
 
+static int sinomo_wasix_sleep_relative_ns(int64_t duration_ns, struct timespec *rem);
+
+struct sinomo_wasix_posix_timer_slot {
+    int allocated;
+    unsigned generation;
+    int notify;
+    int signo;
+    union sigval value;
+    void (*notify_function)(union sigval);
+    pthread_attr_t notify_attributes;
+    int has_notify_attributes;
+};
+
+#define SINOMO_WASIX_POSIX_TIMER_MAX 256
+
+static pthread_mutex_t sinomo_wasix_posix_timer_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sinomo_wasix_posix_timer_slot sinomo_wasix_posix_timers[SINOMO_WASIX_POSIX_TIMER_MAX];
+
+struct sinomo_wasix_timer_thread_arg {
+    uint32_t timer_id;
+    unsigned generation;
+    int64_t value_sec;
+    int64_t value_nsec;
+    int64_t interval_sec;
+    int64_t interval_nsec;
+};
+
+static uint32_t sinomo_wasix_timer_id_from_timer(timer_t timer_id) {
+    return (uint32_t)(uintptr_t)timer_id;
+}
+
+static timer_t sinomo_wasix_timer_from_id(uint32_t timer_id) {
+    return (timer_t)(uintptr_t)timer_id;
+}
+
+static int64_t sinomo_wasix_timer_duration_ns(int64_t sec, int64_t nsec) {
+    if (sec < 0 || nsec < 0 || nsec >= 1000000000LL)
+        return -1;
+    if (sec > (INT64_MAX - nsec) / 1000000000LL)
+        return INT64_MAX;
+    return sec * 1000000000LL + nsec;
+}
+
+static int sinomo_wasix_timer_slot_snapshot(
+    uint32_t timer_id,
+    unsigned generation,
+    struct sinomo_wasix_posix_timer_slot *snapshot
+) {
+    if (timer_id == 0 || timer_id > SINOMO_WASIX_POSIX_TIMER_MAX)
+        return 0;
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[timer_id - 1];
+    int active = slot->allocated && slot->generation == generation;
+    if (active)
+        *snapshot = *slot;
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+    return active;
+}
+
+static void *sinomo_wasix_timer_thread_main(void *arg_ptr) {
+    struct sinomo_wasix_timer_thread_arg arg = *(struct sinomo_wasix_timer_thread_arg *)arg_ptr;
+    free(arg_ptr);
+
+    for (;;) {
+        int64_t sleep_ns = sinomo_wasix_timer_duration_ns(arg.value_sec, arg.value_nsec);
+        if (sleep_ns <= 0)
+            return NULL;
+        if (sinomo_wasix_sleep_relative_ns(sleep_ns, NULL) != 0)
+            return NULL;
+
+        struct sinomo_wasix_posix_timer_slot slot = {0};
+        if (!sinomo_wasix_timer_slot_snapshot(arg.timer_id, arg.generation, &slot))
+            return NULL;
+
+        if (slot.notify == SIGEV_THREAD && slot.notify_function != NULL) {
+            slot.notify_function(slot.value);
+        } else if (slot.notify == SIGEV_SIGNAL && slot.signo > 0) {
+            raise(slot.signo);
+        }
+
+        if (arg.interval_sec == 0 && arg.interval_nsec == 0)
+            return NULL;
+        arg.value_sec = arg.interval_sec;
+        arg.value_nsec = arg.interval_nsec;
+    }
+}
+
+static void sinomo_wasix_start_timer_thread(
+    uint32_t timer_id,
+    unsigned generation,
+    const struct itimerspec *new_value
+) {
+    if (new_value == NULL)
+        return;
+    if (new_value->it_value.tv_sec == 0 && new_value->it_value.tv_nsec == 0)
+        return;
+
+    struct sinomo_wasix_timer_thread_arg *arg = calloc(1, sizeof(*arg));
+    if (arg == NULL)
+        return;
+    arg->timer_id = timer_id;
+    arg->generation = generation;
+    arg->value_sec = new_value->it_value.tv_sec;
+    arg->value_nsec = new_value->it_value.tv_nsec;
+    arg->interval_sec = new_value->it_interval.tv_sec;
+    arg->interval_nsec = new_value->it_interval.tv_nsec;
+
+    struct sinomo_wasix_posix_timer_slot slot = {0};
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (sinomo_wasix_timer_slot_snapshot(timer_id, generation, &slot) &&
+        slot.has_notify_attributes) {
+        attr = slot.notify_attributes;
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    }
+
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, sinomo_wasix_timer_thread_main, arg) != 0)
+        free(arg);
+    if (!slot.has_notify_attributes)
+        pthread_attr_destroy(&attr);
+}
+
 static int sinomo_wasix_sleep_relative_ns(int64_t duration_ns, struct timespec *rem) {
     const int64_t chunk_ns = 100000000LL;
     int64_t remaining = duration_ns;
@@ -1674,8 +2520,14 @@ static int sinomo_wasix_sleep_relative_ns(int64_t duration_ns, struct timespec *
     while (remaining > 0) {
         pthread_testcancel();
         uint64_t chunk = remaining > chunk_ns ? (uint64_t)chunk_ns : (uint64_t)remaining;
+        if (sinomo_wasix_publish_before_next_sleep) {
+            sinomo_wasix_sync_from_guest_if_shared();
+            sinomo_wasix_publish_before_next_sleep = 0;
+        }
+        sinomo_wasix_sync_to_guest_if_shared();
         int32_t error = __imported_wasix_thread_sleep(chunk);
         pthread_testcancel();
+        sinomo_wasix_sync_to_guest_if_shared();
         if (error != 0) {
             if (rem != NULL) {
                 rem->tv_sec = remaining / 1000000000LL;
@@ -1744,6 +2596,460 @@ int usleep(useconds_t useconds) {
     return nanosleep(&req, NULL);
 }
 
+int setitimer(int which, const struct itimerval *restrict new_value, struct itimerval *restrict old_value) {
+    if (new_value == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int64_t old_value_sec = 0;
+    int64_t old_value_usec = 0;
+    int64_t old_interval_sec = 0;
+    int64_t old_interval_usec = 0;
+    int32_t ret = __imported_wasix_itimer_settime(
+        which,
+        new_value->it_value.tv_sec,
+        new_value->it_value.tv_usec,
+        new_value->it_interval.tv_sec,
+        new_value->it_interval.tv_usec,
+        &old_value_sec,
+        &old_value_usec,
+        &old_interval_sec,
+        &old_interval_usec);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    if (old_value != NULL) {
+        old_value->it_value.tv_sec = old_value_sec;
+        old_value->it_value.tv_usec = old_value_usec;
+        old_value->it_interval.tv_sec = old_interval_sec;
+        old_value->it_interval.tv_usec = old_interval_usec;
+    }
+    return 0;
+}
+
+int getitimer(int which, struct itimerval *value) {
+    if (value == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int64_t value_sec = 0;
+    int64_t value_usec = 0;
+    int64_t interval_sec = 0;
+    int64_t interval_usec = 0;
+    int32_t ret = __imported_wasix_itimer_gettime(
+        which,
+        &value_sec,
+        &value_usec,
+        &interval_sec,
+        &interval_usec);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    value->it_value.tv_sec = value_sec;
+    value->it_value.tv_usec = value_usec;
+    value->it_interval.tv_sec = interval_sec;
+    value->it_interval.tv_usec = interval_usec;
+    return 0;
+}
+
+int timer_create(clockid_t clock_id, struct sigevent *restrict event, timer_t *restrict timer_id) {
+    if (timer_id == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int32_t ret = __imported_wasix_posix_timer_create((int32_t)clock_id);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    if (ret == 0 || ret > SINOMO_WASIX_POSIX_TIMER_MAX) {
+        (void)__imported_wasix_posix_timer_delete((uint32_t)ret);
+        errno = EAGAIN;
+        return -1;
+    }
+
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[ret - 1];
+    memset(slot, 0, sizeof(*slot));
+    slot->allocated = 1;
+    slot->generation++;
+    if (slot->generation == 0)
+        slot->generation = 1;
+    if (event != NULL) {
+        slot->notify = event->sigev_notify;
+        slot->signo = event->sigev_signo;
+        slot->value = event->sigev_value;
+        slot->notify_function = event->sigev_notify_function;
+        if (event->sigev_notify_attributes != NULL) {
+            slot->notify_attributes = *event->sigev_notify_attributes;
+            slot->has_notify_attributes = 1;
+        }
+    } else {
+        slot->notify = SIGEV_SIGNAL;
+        slot->signo = SIGALRM;
+        slot->value.sival_int = ret;
+    }
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+
+    *timer_id = sinomo_wasix_timer_from_id((uint32_t)ret);
+    return 0;
+}
+
+int timer_settime(timer_t timer_id, int flags, const struct itimerspec *restrict new_value, struct itimerspec *restrict old_value) {
+    if (new_value == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    uint32_t id = sinomo_wasix_timer_id_from_timer(timer_id);
+    if (id == 0 || id > SINOMO_WASIX_POSIX_TIMER_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int64_t old_value_sec = 0;
+    int64_t old_value_nsec = 0;
+    int64_t old_interval_sec = 0;
+    int64_t old_interval_nsec = 0;
+    int32_t ret = __imported_wasix_posix_timer_settime(
+        id,
+        flags,
+        new_value->it_value.tv_sec,
+        new_value->it_value.tv_nsec,
+        new_value->it_interval.tv_sec,
+        new_value->it_interval.tv_nsec,
+        old_value != NULL ? &old_value_sec : NULL,
+        old_value != NULL ? &old_value_nsec : NULL,
+        old_value != NULL ? &old_interval_sec : NULL,
+        old_value != NULL ? &old_interval_nsec : NULL);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    unsigned generation = 0;
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[id - 1];
+    if (!slot->allocated) {
+        pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+        errno = EINVAL;
+        return -1;
+    }
+    slot->generation++;
+    if (slot->generation == 0)
+        slot->generation = 1;
+    generation = slot->generation;
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+
+    if (old_value != NULL) {
+        old_value->it_value.tv_sec = old_value_sec;
+        old_value->it_value.tv_nsec = old_value_nsec;
+        old_value->it_interval.tv_sec = old_interval_sec;
+        old_value->it_interval.tv_nsec = old_interval_nsec;
+    }
+    sinomo_wasix_start_timer_thread(id, generation, new_value);
+    return 0;
+}
+
+int timer_gettime(timer_t timer_id, struct itimerspec *value) {
+    if (value == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    uint32_t id = sinomo_wasix_timer_id_from_timer(timer_id);
+    int64_t value_sec = 0;
+    int64_t value_nsec = 0;
+    int64_t interval_sec = 0;
+    int64_t interval_nsec = 0;
+    int32_t ret = __imported_wasix_posix_timer_gettime(
+        id,
+        &value_sec,
+        &value_nsec,
+        &interval_sec,
+        &interval_nsec);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    value->it_value.tv_sec = value_sec;
+    value->it_value.tv_nsec = value_nsec;
+    value->it_interval.tv_sec = interval_sec;
+    value->it_interval.tv_nsec = interval_nsec;
+    return 0;
+}
+
+int timer_getoverrun(timer_t timer_id) {
+    uint32_t id = sinomo_wasix_timer_id_from_timer(timer_id);
+    int32_t ret = __imported_wasix_posix_timer_getoverrun(id);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
+int timer_delete(timer_t timer_id) {
+    uint32_t id = sinomo_wasix_timer_id_from_timer(timer_id);
+    int32_t ret = __imported_wasix_posix_timer_delete(id);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    if (id > 0 && id <= SINOMO_WASIX_POSIX_TIMER_MAX) {
+        pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+        struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[id - 1];
+        slot->allocated = 0;
+        slot->generation++;
+        pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+    }
+    return 0;
+}
+
+mqd_t mq_open(const char *name, int flags, ...) {
+    if (name == NULL) {
+        errno = EFAULT;
+        return (mqd_t)-1;
+    }
+
+    mode_t mode = 0;
+    const struct mq_attr *attr = NULL;
+    if ((flags & O_CREAT) != 0) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        attr = va_arg(ap, const struct mq_attr *);
+        va_end(ap);
+    }
+
+    uint64_t max_messages = attr != NULL ? (uint64_t)attr->mq_maxmsg : 0;
+    uint64_t message_size = attr != NULL ? (uint64_t)attr->mq_msgsize : 0;
+    int32_t ret = __imported_wasix_mqueue_open(
+        name,
+        (uintptr_t)strlen(name),
+        flags,
+        (flags & O_CREAT) != 0,
+        (flags & O_EXCL) != 0,
+        attr != NULL,
+        max_messages,
+        message_size);
+    (void)mode;
+    if (ret < 0) {
+        errno = -ret;
+        return (mqd_t)-1;
+    }
+    return (mqd_t)ret;
+}
+
+int mq_send(mqd_t mqdes, const char *msg_ptr, size_t msg_len, unsigned msg_prio) {
+    if (msg_ptr == NULL && msg_len != 0) {
+        errno = EFAULT;
+        return -1;
+    }
+    int32_t ret = __imported_wasix_mqueue_send((int32_t)mqdes, msg_ptr, (uintptr_t)msg_len, msg_prio);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    return 0;
+}
+
+ssize_t mq_receive(mqd_t mqdes, char *msg_ptr, size_t msg_len, unsigned *msg_prio) {
+    if (msg_ptr == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int32_t ret = __imported_wasix_mqueue_receive((int32_t)mqdes, msg_ptr, (uintptr_t)msg_len, msg_prio);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return (ssize_t)ret;
+}
+
+int mq_getattr(mqd_t mqdes, struct mq_attr *attr) {
+    if (attr == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int64_t flags = 0;
+    int64_t max_messages = 0;
+    int64_t message_size = 0;
+    int64_t current_messages = 0;
+    int32_t ret = __imported_wasix_mqueue_getattr(
+        (int32_t)mqdes,
+        &flags,
+        &max_messages,
+        &message_size,
+        &current_messages);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    memset(attr, 0, sizeof(*attr));
+    attr->mq_flags = (long)flags;
+    attr->mq_maxmsg = (long)max_messages;
+    attr->mq_msgsize = (long)message_size;
+    attr->mq_curmsgs = (long)current_messages;
+    return 0;
+}
+
+int mq_close(mqd_t mqdes) {
+    int32_t ret = __imported_wasix_mqueue_close((int32_t)mqdes);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    return 0;
+}
+
+int mq_unlink(const char *name) {
+    if (name == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int32_t ret = __imported_wasix_mqueue_unlink(name, (uintptr_t)strlen(name));
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    return 0;
+}
+
+int mq_setattr(mqd_t mqdes, const struct mq_attr *restrict newattr, struct mq_attr *restrict oldattr) {
+    if (oldattr != NULL && mq_getattr(mqdes, oldattr) != 0)
+        return -1;
+    if (newattr == NULL)
+        return 0;
+    int32_t ret = __imported_wasix_mqueue_setattr((int32_t)mqdes, (int64_t)newattr->mq_flags);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    return 0;
+}
+
+int mq_notify(mqd_t mqdes, const struct sigevent *event) {
+    uint32_t signal = 0;
+    int32_t has_notification = event != NULL;
+    if (event != NULL) {
+        if (event->sigev_notify != SIGEV_SIGNAL) {
+            errno = ENOTSUP;
+            return -1;
+        }
+        signal = (uint32_t)event->sigev_signo;
+    }
+    int32_t ret = __imported_wasix_mqueue_notify((int32_t)mqdes, has_notification, signal);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    return 0;
+}
+
+ssize_t mq_timedreceive(mqd_t mqdes, char *restrict msg_ptr, size_t msg_len, unsigned *restrict msg_prio, const struct timespec *restrict timeout) {
+    if (msg_ptr == NULL || timeout == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int32_t ret = __imported_wasix_mqueue_timedreceive(
+        (int32_t)mqdes,
+        msg_ptr,
+        (uintptr_t)msg_len,
+        msg_prio,
+        (int64_t)timeout->tv_sec,
+        (int64_t)timeout->tv_nsec);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return (ssize_t)ret;
+}
+
+int mq_timedsend(mqd_t mqdes, const char *msg_ptr, size_t msg_len, unsigned msg_prio, const struct timespec *timeout) {
+    if ((msg_ptr == NULL && msg_len != 0) || timeout == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    int32_t ret = __imported_wasix_mqueue_timedsend(
+        (int32_t)mqdes,
+        msg_ptr,
+        (uintptr_t)msg_len,
+        msg_prio,
+        (int64_t)timeout->tv_sec,
+        (int64_t)timeout->tv_nsec);
+    if (ret != 0) {
+        errno = ret < 0 ? -ret : ret;
+        return -1;
+    }
+    return 0;
+}
+
+int waitpid(pid_t pid, int *wstatus, int options) {
+    __wasi_option_pid_t option_pid = {0};
+    __wasi_join_flags_t flags = 0;
+    __wasi_join_status_t status = {0};
+
+    if (pid == -1) {
+        option_pid.tag = __WASI_OPTION_NONE;
+    } else if (pid > 0) {
+        option_pid.tag = __WASI_OPTION_SOME;
+        option_pid.u.some = (__wasi_pid_t)pid;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if ((options & ~(WNOHANG | WUNTRACED)) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((options & WNOHANG) != 0)
+        flags |= __WASI_JOIN_FLAGS_NON_BLOCKING;
+    if ((options & WUNTRACED) != 0)
+        flags |= __WASI_JOIN_FLAGS_WAKE_STOPPED;
+
+    SINOMO_PTHREAD_ENV_LOG("sinomo-debug waitpid enter pid=%d options=%d cross=%u\n",
+        (int)pid, options, __sinomo_wasix_shared_memory_is_cross_process());
+    sinomo_wasix_sync_from_guest_if_shared();
+    __wasi_errno_t error = __wasi_proc_join(&option_pid, flags, &status);
+    sinomo_wasix_sync_to_guest_if_shared();
+    SINOMO_PTHREAD_ENV_LOG("sinomo-debug waitpid result error=%u tag=%u pid_tag=%u pid=%u\n",
+        (unsigned)error, (unsigned)status.tag, (unsigned)option_pid.tag, (unsigned)option_pid.u.some);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+
+    if (status.tag == __WASI_JOIN_STATUS_TYPE_NOTHING)
+        return 0;
+    if (option_pid.tag != __WASI_OPTION_SOME) {
+        errno = ECHILD;
+        return -1;
+    }
+
+    if (wstatus != NULL) {
+        switch (status.tag) {
+        case __WASI_JOIN_STATUS_TYPE_EXIT_NORMAL:
+            *wstatus = ((int)status.u.exit_normal & 0xff) << 8;
+            break;
+        case __WASI_JOIN_STATUS_TYPE_EXIT_SIGNAL:
+            *wstatus = (int)status.u.exit_signal.signal & 0x7f;
+            break;
+        case __WASI_JOIN_STATUS_TYPE_STOPPED:
+            *wstatus = (((int)status.u.stopped & 0xff) << 8) | 0x7f;
+            break;
+        default:
+            *wstatus = 0;
+            break;
+        }
+    }
+    return (pid_t)option_pid.u.some;
+}
+
+pid_t wait(int *wstatus) {
+    return waitpid(-1, wstatus, 0);
+}
+
 int pthread_cancel(pthread_t thread) {
     if (thread == NULL)
         return ESRCH;
@@ -1753,6 +3059,7 @@ int pthread_cancel(pthread_t thread) {
         return ESRCH;
 
     __atomic_store_n(&target->cancel, 1, __ATOMIC_SEQ_CST);
+    sinomo_wasix_sync_range_from_guest_if_shared((const void *)&target->cancel, sizeof(target->cancel));
     SINOMO_PTHREAD_LOG("sinomo-debug pthread_cancel target=%p tid=%d disable=%u async=%u\n",
         (void *)thread, target->tid, (unsigned)target->canceldisable, (unsigned)target->cancelasync);
 
@@ -1764,6 +3071,102 @@ int pthread_cancel(pthread_t thread) {
 
     int32_t error = __imported_wasix_thread_signal((uint32_t)target->tid, (uint32_t)SIGCANCEL);
     return error < 0 ? -error : error;
+}
+
+int pthread_kill(pthread_t thread, int sig) {
+    if (thread == NULL)
+        return ESRCH;
+    if (sig < 0 || sig >= NSIG)
+        return EINVAL;
+
+    struct sinomo_wasix_pthread_state *target = (struct sinomo_wasix_pthread_state *)thread;
+    if (target->tid <= 0)
+        return ESRCH;
+    if (sig == 0)
+        return 0;
+
+    int32_t error = __imported_wasix_thread_signal((uint32_t)target->tid, (uint32_t)sig);
+    return error < 0 ? -error : error;
+}
+
+#define SINOMO_SPIN_UNLOCKED 0
+#define SINOMO_SPIN_LOCKED EBUSY
+#define SINOMO_SPIN_INVALID 0x7ffffffe
+
+int pthread_spin_init(pthread_spinlock_t *lock, int pshared) {
+    if (lock == NULL)
+        return EINVAL;
+    if (pshared != PTHREAD_PROCESS_PRIVATE && pshared != PTHREAD_PROCESS_SHARED)
+        return EINVAL;
+    __atomic_store_n((int *)lock, SINOMO_SPIN_UNLOCKED, __ATOMIC_SEQ_CST);
+    SINOMO_PTHREAD_ENV_LOG("sinomo-debug spin_init lock=%p pshared=%d state=%d cross=%u\n",
+        (void *)lock, pshared, __atomic_load_n((int *)lock, __ATOMIC_SEQ_CST), __sinomo_wasix_shared_memory_is_cross_process());
+    if (pshared == PTHREAD_PROCESS_SHARED)
+        (void)__sinomo_wasix_shared_futex_hint((uintptr_t)lock, (uintptr_t)sizeof(*lock));
+    sinomo_wasix_sync_range_from_guest_if_shared(lock, sizeof(*lock));
+    sinomo_wasix_publish_before_next_sleep = 1;
+    return 0;
+}
+
+int pthread_spin_destroy(pthread_spinlock_t *lock) {
+    if (lock == NULL)
+        return EINVAL;
+    __atomic_store_n((int *)lock, SINOMO_SPIN_INVALID, __ATOMIC_SEQ_CST);
+    (void)__sinomo_wasix_shared_futex_unhint((uintptr_t)lock, (uintptr_t)sizeof(*lock));
+    sinomo_wasix_sync_range_from_guest_if_shared(lock, sizeof(*lock));
+    return 0;
+}
+
+int pthread_spin_trylock(pthread_spinlock_t *lock) {
+    if (lock == NULL)
+        return EINVAL;
+    sinomo_wasix_sync_range_to_guest_if_shared(lock, sizeof(*lock));
+    int expected = SINOMO_SPIN_UNLOCKED;
+    SINOMO_PTHREAD_ENV_LOG("sinomo-debug spin_trylock before lock=%p state=%d cross=%u\n",
+        (void *)lock, __atomic_load_n((int *)lock, __ATOMIC_SEQ_CST), __sinomo_wasix_shared_memory_is_cross_process());
+    if (__atomic_compare_exchange_n((int *)lock, &expected, SINOMO_SPIN_LOCKED, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        sinomo_wasix_sync_range_from_guest_if_shared(lock, sizeof(*lock));
+        sinomo_wasix_publish_before_next_sleep = 1;
+        SINOMO_PTHREAD_ENV_LOG("sinomo-debug spin_trylock acquired lock=%p state=%d\n",
+            (void *)lock, __atomic_load_n((int *)lock, __ATOMIC_SEQ_CST));
+        return 0;
+    }
+    SINOMO_PTHREAD_ENV_LOG("sinomo-debug spin_trylock busy lock=%p expected=%d state=%d\n",
+        (void *)lock, expected, __atomic_load_n((int *)lock, __ATOMIC_SEQ_CST));
+    if (expected == SINOMO_SPIN_INVALID)
+        return EINVAL;
+    sinomo_wasix_publish_before_next_sleep = 1;
+    return EBUSY;
+}
+
+int pthread_spin_lock(pthread_spinlock_t *lock) {
+    if (lock == NULL)
+        return EINVAL;
+    for (;;) {
+        int ret = pthread_spin_trylock(lock);
+        if (ret == 0 || ret == EINVAL)
+            return ret;
+        int32_t sleep_ret = __imported_wasix_thread_sleep(1000000ULL);
+        sinomo_wasix_sync_to_guest_if_shared();
+        if (sleep_ret != 0 && sleep_ret != EINTR && sleep_ret != ECANCELED)
+            return sleep_ret < 0 ? -sleep_ret : sleep_ret;
+        pthread_testcancel();
+    }
+}
+
+int pthread_spin_unlock(pthread_spinlock_t *lock) {
+    if (lock == NULL)
+        return EINVAL;
+    int state = __atomic_load_n((int *)lock, __ATOMIC_SEQ_CST);
+    if (state == SINOMO_SPIN_INVALID)
+        return EINVAL;
+    __atomic_store_n((int *)lock, SINOMO_SPIN_UNLOCKED, __ATOMIC_SEQ_CST);
+    SINOMO_PTHREAD_ENV_LOG("sinomo-debug spin_unlock lock=%p old=%d state=%d cross=%u\n",
+        (void *)lock, state, __atomic_load_n((int *)lock, __ATOMIC_SEQ_CST), __sinomo_wasix_shared_memory_is_cross_process());
+    sinomo_wasix_sync_range_from_guest_if_shared(lock, sizeof(*lock));
+    sinomo_wasix_publish_before_next_sleep = 1;
+    (void)__wasilibc_futex_wake_wasix((int *)lock, INT_MAX);
+    return 0;
 }
 
 static uint64_t signal_bit(int sig, uint64_t *high) {
@@ -1896,7 +3299,17 @@ int sigpending(sigset_t *set) {
         errno = EFAULT;
         return -1;
     }
-    words_to_sigset(set, sinomo_wasix_pending_signal_low, sinomo_wasix_pending_signal_high);
+    uint64_t runtime_low = 0;
+    uint64_t runtime_high = 0;
+    int32_t error = __imported_wasix_signal_pending_get(&runtime_low, &runtime_high);
+    if (error != 0) {
+        errno = error < 0 ? -error : error;
+        return -1;
+    }
+    words_to_sigset(
+        set,
+        sinomo_wasix_pending_signal_low | runtime_low,
+        sinomo_wasix_pending_signal_high | runtime_high);
     return 0;
 }
 
@@ -1930,6 +3343,19 @@ int raise(int sig) {
     error = __imported_wasix_thread_signal((uint32_t)tid, (uint32_t)sig);
     if (error != 0) {
         errno = error < 0 ? -error : error;
+        return -1;
+    }
+    return 0;
+}
+
+int kill(pid_t pid, int sig) {
+    if (sig < 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    __wasi_errno_t error = __wasi_proc_signal((__wasi_pid_t)pid, (__wasi_signal_t)sig);
+    if (error != 0) {
+        errno = error;
         return -1;
     }
     return 0;

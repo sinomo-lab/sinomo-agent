@@ -63,6 +63,9 @@ int __wasilibc_futex_wait_wasix(volatile void *addr, int op, int expected, int64
     if (addr == 0)
         return -EINVAL;
 
+    if (current_thread_cancel_pending())
+        return -ECANCELED;
+
     if ((((uintptr_t)addr) & 3) != 0)
         return wait_unaligned_futex((volatile int *)addr, expected, max_wait_ns);
 
@@ -78,6 +81,8 @@ int __wasilibc_futex_wait_wasix(volatile void *addr, int op, int expected, int64
 
     if (*(volatile int *)addr != expected)
         return -EAGAIN;
+    if (current_thread_cancel_pending())
+        return -ECANCELED;
 
     __wasi_bool_t woken = 0;
     __wasi_errno_t error = __wasi_futex_wait((uint32_t *)addr, (uint32_t)expected, timeout_ptr, &woken);

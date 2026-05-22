@@ -1,5 +1,6 @@
 use crate::{SANDBOX_WASIX_MAX_TASKS, SandboxWasiError};
 use std::{
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -24,6 +25,7 @@ pub(super) fn run_wasix_process_tree(
     module_hash: wasmer_types::ModuleHash,
     memory_limit_bytes: usize,
     timeout_ms: u64,
+    task_limit: usize,
     cancellation: crate::SandboxCancellation,
 ) -> Result<Result<ExitCode, Arc<WasiRuntimeError>>, SandboxWasiError> {
     let wasi = webc::metadata::annotations::Wasi::new(program_name);
@@ -51,11 +53,7 @@ pub(super) fn run_wasix_process_tree(
     let runtime = env.runtime.clone();
     let tasks = runtime.task_manager().clone();
     let process = env.process.clone();
-    process.set_sandbox_resource_limits(
-        memory_limit_bytes as u64,
-        timeout_ms,
-        SANDBOX_WASIX_MAX_TASKS as u64,
-    );
+    process.set_sandbox_resource_limits(memory_limit_bytes as u64, timeout_ms, task_limit as u64);
     env.sync_process_resource_limits();
     let budget_guard = WasixProcessBudgetGuard::start(timeout_ms, cancellation, process);
     let timeout_process = env.process.clone();
@@ -168,10 +166,86 @@ pub(crate) fn wasix_command_exceeded_requested_timeout(elapsed: Duration, timeou
     elapsed >= Duration::from_millis(timeout_ms)
 }
 
+#[cfg(test)]
 pub(crate) fn sandbox_wasix_capabilities() -> wasmer_wasix::capabilities::Capabilities {
+    sandbox_wasix_capabilities_with_task_limit(SANDBOX_WASIX_MAX_TASKS)
+}
+
+pub(crate) fn sandbox_wasix_capabilities_with_task_limit(
+    task_limit: usize,
+) -> wasmer_wasix::capabilities::Capabilities {
     let mut capabilities = wasmer_wasix::capabilities::Capabilities::new();
-    capabilities.threading.max_threads = Some(SANDBOX_WASIX_MAX_TASKS);
+    capabilities.threading.max_threads = Some(task_limit);
     capabilities
+}
+
+pub(crate) fn effective_sandbox_wasix_task_limit() -> usize {
+    SANDBOX_WASIX_MAX_TASKS.min(host_cgroup_task_capacity().unwrap_or(SANDBOX_WASIX_MAX_TASKS))
+}
+
+#[cfg(target_os = "linux")]
+fn host_cgroup_task_capacity() -> Option<usize> {
+    const HOST_TASK_RESERVE: usize = 16;
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = cgroup.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("0"), Some(""), Some(path)) => Some(path.trim_start_matches('/')),
+            _ => None,
+        }
+    })?;
+    let mut path = PathBuf::from("/sys/fs/cgroup");
+    if !relative.is_empty() {
+        path.push(relative);
+    }
+
+    let mut best_available = None::<usize>;
+    loop {
+        let max_path = path.join("pids.max");
+        let current_path = path.join("pids.current");
+        if let (Some(max), Some(current)) = (
+            read_cgroup_pids_max(&max_path),
+            read_cgroup_pids_current(&current_path),
+        ) {
+            let available = max.saturating_sub(current);
+            best_available = Some(match best_available {
+                Some(best) => best.min(available),
+                None => available,
+            });
+        }
+        if path == PathBuf::from("/sys/fs/cgroup") {
+            break;
+        }
+        if !path.pop() {
+            break;
+        }
+    }
+
+    best_available.map(|available| {
+        let capacity = available.saturating_sub(HOST_TASK_RESERVE).max(3);
+        capacity.min(available.max(1))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_cgroup_task_capacity() -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_cgroup_pids_max(path: &std::path::Path) -> Option<usize> {
+    let value = std::fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    if value == "max" {
+        None
+    } else {
+        value.parse().ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_cgroup_pids_current(path: &std::path::Path) -> Option<usize> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn configure_default_ignored_signals(builder: &mut wasmer_wasix::WasiEnvBuilder) {

@@ -7644,6 +7644,7 @@ dependencies = [
  "pin-project",
  "pin-utils",
  "rand 0.8.6",
+ "region",
  "rkyv",
  "rusty_pool",
  "semver",

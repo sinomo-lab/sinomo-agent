@@ -21,7 +21,8 @@ use std::sync::Arc;
 use tracing::*;
 use virtual_mio::block_on;
 use wasmer::{Function, Memory32, Memory64, Module, RuntimeError, Store, Value};
-use wasmer_wasix_types::wasi::Errno;
+use wasmer_types::TrapCode;
+use wasmer_wasix_types::wasi::{Errno, Signal};
 
 #[tracing::instrument(level = "trace", skip_all, fields(%name, package_id=%binary.id))]
 pub async fn spawn_exec(
@@ -321,7 +322,50 @@ fn call_module(
         };
     };
 
-    let ret = if let Err(err) = call_ret {
+    let ret = if let Err(err) = &call_ret {
+        if err.clone().to_trap() == Some(TrapCode::HeapAccessOutOfBounds) {
+            let mut signal_ctx = ctx.env.clone().into_mut(&mut store);
+            match WasiEnv::process_signals_internal(&mut signal_ctx, vec![Signal::Sigsegv]) {
+                Ok(true) => {
+                    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                        eprintln!("sinomo-debug heap_trap_sigsegv_handled pid={}", pid.raw());
+                    }
+                    call_ret = Err(RuntimeError::user(Box::new(WasiError::Exit(
+                        Errno::Success.into(),
+                    ))));
+                }
+                Ok(false) => {
+                    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                        eprintln!("sinomo-debug heap_trap_sigsegv_unhandled pid={}", pid.raw());
+                    }
+                }
+                Err(WasiError::Exit(code)) => {
+                    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                        eprintln!(
+                            "sinomo-debug heap_trap_sigsegv_exit pid={} code={}",
+                            pid.raw(),
+                            code.raw()
+                        );
+                    }
+                    call_ret = Err(RuntimeError::user(Box::new(WasiError::Exit(code))));
+                }
+                Err(signal_err) => {
+                    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                        eprintln!(
+                            "sinomo-debug heap_trap_sigsegv_error pid={} error={}",
+                            pid.raw(),
+                            signal_err
+                        );
+                    }
+                    call_ret = Err(RuntimeError::user(Box::new(signal_err)));
+                }
+            }
+            drop(signal_ctx);
+        }
+        let err = match call_ret {
+            Err(err) => err,
+            Ok(_) => unreachable!(),
+        };
         match err.downcast::<WasiError>() {
             Ok(WasiError::Exit(code)) if code.is_success() => Ok(Errno::Success),
             Ok(WasiError::ThreadExit) => Ok(Errno::Success),

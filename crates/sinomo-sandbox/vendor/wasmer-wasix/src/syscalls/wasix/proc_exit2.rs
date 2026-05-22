@@ -1,6 +1,14 @@
 use super::*;
 use crate::{WasiVForkAsyncify, syscalls::*};
 
+macro_rules! sinomo_debug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// ### `proc_exit2()`
 /// Similar to `proc_exit()`
 ///
@@ -15,16 +23,16 @@ pub fn proc_exit2<M: MemorySize>(
     code: ExitCode,
 ) -> Result<(), WasiError> {
     WasiEnv::do_pending_operations(&mut ctx)?;
+    sinomo_debug!(
+        "sinomo-debug proc_exit2 enter pid={} tid={} code={}",
+        ctx.data().pid().raw(),
+        ctx.data().tid().raw(),
+        code.raw()
+    );
     {
         let env = ctx.data();
         let memory = unsafe { env.memory_view(&ctx) };
-        let preserve_ranges = env
-            .state
-            .shared_futex_ranges()
-            .into_iter()
-            .map(|range| (range.start, range.end.saturating_sub(range.start) as usize))
-            .collect::<Vec<_>>();
-        sync_shared_memory_from_guest_preserving_ranges::<M>(env, &memory, &preserve_ranges)
+        sync_shared_memory_from_exiting_guest(env, &memory)
             .map_err(|err| WasiError::Exit(err.into()))?;
     }
 

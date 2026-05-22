@@ -1,6 +1,7 @@
 use std::f32::consts::E;
 
 use super::*;
+use super::proc_fork::map_shared_memory_backing;
 #[cfg(feature = "journal")]
 use crate::journal::JournalEffector;
 use crate::{
@@ -124,7 +125,22 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
     let (signal_mask_low, signal_mask_high) = env.thread.signal_mask();
     thread_handle.set_signal_mask(signal_mask_low, signal_mask_high);
     let thread_id: Tid = thread_handle.id().into();
+    sinomo_debug!(
+        "sinomo-debug thread_spawn_v2 parent_pid={} parent_tid={} new_tid={}",
+        env.process.pid().raw(),
+        env.thread.id().raw(),
+        thread_id
+    );
     Span::current().record("tid", thread_id);
+    if env.state.has_cross_process_shared_memory() && env.state.has_shared_memory_mappings() {
+        let memory = unsafe { env.memory_view(&ctx) };
+        for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
+            if let Err(err) = map_shared_memory_backing(env, &memory, &mapping) {
+                env.process.remove_thread(&thread_handle.id());
+                return Err(err);
+            }
+        }
+    }
 
     // Spawn the thread
     thread_spawn_internal_using_layout::<M>(
@@ -212,6 +228,18 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
 
     let thread_memory = module_handles.memory_clone();
     let linker = env_inner.linker().cloned();
+    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+        let store_ref = store.as_store_ref();
+        let view = thread_memory.view(&store_ref);
+        eprintln!(
+            "sinomo-debug thread_spawn_memory parent_pid={} parent_tid={} memory_ptr={:#x} pages={} dynamic_linker={}",
+            env.pid().raw(),
+            env.tid().raw(),
+            view.data_ptr() as usize,
+            thread_memory.size(&store_ref).0,
+            linker.is_some(),
+        );
+    }
 
     // We capture some local variables
     let state = env.state.clone();
@@ -295,6 +323,35 @@ fn call_module_internal<M: MemorySize>(
     start_ptr_offset: M::Offset,
     initialize_layout_globals: bool,
 ) -> (Store, Result<Option<ExitCode>, DeepSleepWork>) {
+    {
+        let env = ctx.data(&store);
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            let memory = unsafe { env.memory_view(&store) };
+            eprintln!(
+                "sinomo-debug thread_start_memory pid={} tid={} memory_ptr={:#x} pages={}",
+                env.pid().raw(),
+                env.tid().raw(),
+                memory.data_ptr() as usize,
+                env.inner()
+                    .main_module_instance_handles()
+                    .memory_clone()
+                    .size(&store.as_store_ref())
+                    .0,
+            );
+        }
+        if env.state.has_cross_process_shared_memory() && env.state.has_shared_memory_mappings() {
+            let memory = unsafe { env.memory_view(&store) };
+            for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
+                if let Err(err) = map_shared_memory_backing(env, &memory, &mapping) {
+                    let tid = env.tid();
+                    warn!(%tid, ?err, "failed to map shared memory backing for spawned thread");
+                    let exit_code = Some(err.into());
+                    ctx.on_exit(&mut store, None);
+                    return (store, Ok(exit_code));
+                }
+            }
+        }
+    }
     if initialize_layout_globals && let Err(err) = initialize_static_thread_globals(ctx, &mut store)
     {
         let tid = ctx.data(&store).tid();

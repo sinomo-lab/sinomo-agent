@@ -9,6 +9,10 @@
 #include <sys/uio.h>
 #include <time.h>
 
+#ifndef _POSIX_MEMORY_PROTECTION
+#define _POSIX_MEMORY_PROTECTION _POSIX_VERSION
+#endif
+
 struct iovec;
 struct statvfs;
 

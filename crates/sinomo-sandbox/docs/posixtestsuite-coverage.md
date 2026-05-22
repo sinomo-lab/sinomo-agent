@@ -1,99 +1,43 @@
 # POSIX Test Suite Coverage
 
-This document tracks Sinomo WASIX coverage derived from [`emscripten-core/posixtestsuite`](https://github.com/emscripten-core/posixtestsuite). The current reference commit is `85555325079ea362fa680bd2209c843cfe47e670`.
+This document tracks high-level Sinomo WASIX coverage against [`emscripten-core/posixtestsuite`](https://github.com/emscripten-core/posixtestsuite). Detailed verifier output belongs under `target/sinomo-posixtestsuite-results/` and should not be committed.
 
-The current in-tree tests do not vendor the GPL test sources. They encode selected upstream assertions as WASIX WAT modules that call the same POSIX-shaped WASIX imports the C library lowers to. The source-level verifier fetches the pinned upstream commit into `target/`, compiles selected C tests with the maintained WASIX Clang/sysroot package, and runs the resulting modules through `sinomo sandbox run --wasm`.
+## Status Key
 
-## Harness Status
-
-| Area | Status | Evidence |
-| --- | --- | --- |
-| Upstream source reference | Started | `emscripten-core/posixtestsuite@85555325079ea362fa680bd2209c843cfe47e670` is recorded in `src/tests/posixtestsuite_tests.rs`. |
-| In-tree test module | Started | `crates/sinomo-sandbox/src/tests/posixtestsuite_tests.rs` runs selected WASIX WAT tests derived from upstream assertions. |
-| Native C compile/run harness | Started | `crates/sinomo-sandbox/toolchains/build-tools/verify-posixtestsuite-wasix.sh` fetches the pinned suite, stages C and shell sources into a disposable sandbox, compiles C tests with sandboxed Clang, runs generated WASM outputs, and records all phases to a TSV results file. |
-| Full-suite enumeration | Started | The pinned upstream tree currently contains 2,095 C tests and 188 shell tests under `conformance/`, `functional/`, and `stress/`; the verifier supports `POSIXTESTSUITE_SCOPE=all`, `POSIXTESTSUITE_SCOPE=path:<prefix>`, `POSIXTESTSUITE_LIMIT=<n>`, and `POSIXTESTSUITE_OFFSET=<n>` for chunked runs. |
-| Coverage results | Partial | Targeted WAT tests pass locally with `cargo test -p sinomo-sandbox --features wasix-runtime posixtestsuite_ -- --nocapture`; the 10-test source-level smoke subset passes locally with `POSIXTESTSUITE_SCOPE=smoke crates/sinomo-sandbox/toolchains/build-tools/verify-posixtestsuite-wasix.sh`. A full-suite run has not completed yet and must complete before this goal can be considered done. |
-
-## Source-Level C Results
-
-These cases are compiled from upstream C sources by the WASIX Clang package and then run as generated WASM modules.
-
-| Upstream path | Assertion represented | Harness | Result | Notes |
-| --- | --- | --- | --- | --- |
-| `conformance/interfaces/clock_gettime/1-1.c` | `clock_gettime(CLOCK_REALTIME, &tp)` succeeds and fills a non-empty `timespec`. | `verify-posixtestsuite-wasix.sh` | Pass | Exercises C headers, libc call path, linking, and runtime execution. |
-| `conformance/interfaces/clock_gettime/7-1.c` | Invalid clock id returns `-1` and sets `errno` to `EINVAL`. | `verify-posixtestsuite-wasix.sh` | Pass | Confirms libc errno translation for this failure path. |
-| `conformance/interfaces/clock_gettime/8-1.c` | Invalid clock id returns failure without relying on stale `errno`. | `verify-posixtestsuite-wasix.sh` | Pass | Covers source-level invalid clock handling. |
-| `conformance/interfaces/clock_gettime/8-2.c` | Boundary and unassigned invalid clock ids fail with `EINVAL`. | `verify-posixtestsuite-wasix.sh` | Pass | Covers multiple invalid IDs through the C library. |
-| `conformance/interfaces/clock_getres/1-1.c` | `clock_getres(CLOCK_REALTIME, &res)` succeeds and fills `res`. | `verify-posixtestsuite-wasix.sh` | Pass | Exercises source-level `struct timespec` layout. |
-| `conformance/interfaces/clock_getres/5-1.c` | Invalid clock id returns `-1` and sets `errno` to `EINVAL`. | `verify-posixtestsuite-wasix.sh` | Pass | Confirms libc errno translation for `clock_getres`. |
-| `conformance/interfaces/clock_getres/6-1.c` | Invalid clock id returns failure without relying on stale `errno`. | `verify-posixtestsuite-wasix.sh` | Pass | Covers source-level invalid clock handling. |
-| `conformance/interfaces/clock_getres/6-2.c` | Boundary and unassigned invalid clock ids fail with `EINVAL`. | `verify-posixtestsuite-wasix.sh` | Pass | Covers multiple invalid IDs through the C library. |
-| `conformance/interfaces/nanosleep/5-1.c` | Negative `tv_sec` fails with `EINVAL`. | `verify-posixtestsuite-wasix.sh` | Pass | Exercises libc `nanosleep` failure behavior. |
-| `conformance/interfaces/nanosleep/6-1.c` | Invalid `tv_nsec` values fail with `EINVAL`. | `verify-posixtestsuite-wasix.sh` | Pass | Covers the upstream invalid nanosecond table. |
-
-## Full-Suite Runner Status
-
-The verifier now discovers all upstream C and shell tests instead of relying only on a hard-coded subset. Its current behavior is:
-
-- C sources under `conformance/`, `functional/`, and `stress/` are staged into the sandbox.
-- Sources with `main()` are compiled and linked by sandboxed Clang, copied out as WASM, and run through `sinomo sandbox run --wasm`.
-- Compile-only sources without `main()` are wrapped with a generated `main()` so header/type/prototype coverage still exercises the sandboxed compiler and linker, then their run phase is recorded as `SKIP`.
-- Shell tests are staged and run through sandboxed `sh` when BusyBox and Bash package manifests are available; otherwise they are recorded as `UNSUPPORTED`.
-- POSIX test result codes are classified as `PASS`, `FAIL`, `UNRESOLVED`, `UNSUPPORTED`, `UNTESTED`, or `INTERRUPTED` instead of collapsing every nonzero exit into a generic failure.
-
-Verified runner checks so far:
-
-| Scope | Command | Result | Notes |
-| --- | --- | --- | --- |
-| 10-test smoke subset | `POSIXTESTSUITE_SCOPE=smoke crates/sinomo-sandbox/toolchains/build-tools/verify-posixtestsuite-wasix.sh` | Pass | 10 compile, 10 link, and 10 run phases passed. |
-| `conformance/definitions` chunk | `POSIXTESTSUITE_SCOPE=path:conformance/definitions POSIXTESTSUITE_RUN_SHELL=0 POSIXTESTSUITE_LIMIT=60 crates/sinomo-sandbox/toolchains/build-tools/verify-posixtestsuite-wasix.sh` | Interrupted after harness validation | Confirmed compile-only wrapper tests are recorded with run `SKIP`; POSIX `PTS_UNTESTED` exits are recorded as `UNTESTED`. This was not a full-suite result. |
-
-## WAT Runtime Results
-
-| Upstream path | Assertion represented | Sinomo test | Result | Notes |
-| --- | --- | --- | --- | --- |
-| `conformance/interfaces/clock_gettime/1-1.c` | `clock_gettime(CLOCK_REALTIME, &tp)` succeeds and fills a non-empty `timespec`. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Direct WASIX import checks return code and `tv_sec != 0`; libc `errno` is not involved in this direct ABI test. |
-| `conformance/interfaces/clock_gettime/3-1.c` | `CLOCK_MONOTONIC` is supported and non-decreasing. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Uses two immediate monotonic reads instead of the upstream long sleeps to keep unit tests fast. |
-| `conformance/interfaces/clock_gettime/7-1.c` | Invalid clock id returns failure. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Direct ABI expects a negative errno-style return. |
-| `conformance/interfaces/clock_gettime/8-2.c` | Boundary and unassigned invalid clock ids fail. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Covers `INT32_MIN`, `INT32_MAX`, `-1073743192`, `1073743192`, `-1`, and `17`. |
-| `conformance/interfaces/clock_getres/1-1.c` | `clock_getres(CLOCK_REALTIME, &res)` succeeds and fills `res`. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Checks `tv_sec` changed from sentinel and `tv_nsec < 1_000_000_000`. |
-| `conformance/interfaces/clock_getres/3-1.c` | `CLOCK_MONOTONIC` resolution is supported and filled. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Same direct ABI check as realtime. |
-| `conformance/interfaces/clock_getres/5-1.c` | Invalid clock id returns failure. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Direct ABI expects negative errno-style return. |
-| `conformance/interfaces/clock_getres/6-2.c` | Boundary and unassigned invalid clock ids fail. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Uses the same invalid-id set as the `clock_gettime` check. |
-| `conformance/interfaces/clock_getres/7-1.c` | `CLOCK_PROCESS_CPUTIME_ID` resolution is supported and filled. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Covers the runtime import path; source-level `sysconf(_SC_CPUTIME)` behavior is not covered yet. |
-| `conformance/interfaces/clock_getres/8-1.c` | `CLOCK_THREAD_CPUTIME_ID` resolution is supported and filled. | `posixtestsuite_clock_gettime_and_getres_subset` | Pass | Covers the runtime import path; source-level `sysconf(_SC_THREAD_CPUTIME)` behavior is not covered yet. |
-| `conformance/interfaces/nanosleep/1-1.c` | `nanosleep()` succeeds for a short interval and elapsed time advances. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Pass | Uses a 3 ns request as upstream does. |
-| `conformance/interfaces/nanosleep/2-1.c` | Multiple short `nanosleep()` intervals suspend for at least the requested interval. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Partial pass | Covers representative `3 ns` and `1 ms` intervals; the full upstream interval table is not run yet. |
-| `conformance/interfaces/nanosleep/5-1.c` | Invalid negative nanoseconds fail. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Pass | Direct ABI expects negative errno-style return. |
-| `conformance/interfaces/nanosleep/6-1.c` | Nanoseconds below zero or at least `1_000_000_000` fail with `EINVAL`. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Pass | Direct ABI covers failure shape for the invalid nanosecond values; libc `errno` storage is not covered yet. |
-| `conformance/interfaces/clock_nanosleep/1-1.c` | Relative `clock_nanosleep()` sleeps for at least the requested interval. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Pass | Uses the upstream 3 ms request. |
-| `conformance/interfaces/clock_nanosleep/3-1.c` | Absolute `clock_nanosleep()` in the past returns immediately and succeeds. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Pass | Checks success; bounded no-sleep timing should be added once timing flakiness controls exist. |
-| `conformance/interfaces/clock_nanosleep/9-1.c` | Invalid clock id fails. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Pass | Direct ABI expects negative errno-style return. |
-| `conformance/interfaces/clock_nanosleep/10-1.c` | Invalid flags fail. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Pass | Direct ABI expects negative errno-style return. |
-| `conformance/interfaces/clock_nanosleep/11-1.c` | Invalid `tv_nsec` fails. | `posixtestsuite_nanosleep_and_clock_nanosleep_subset` | Pass | Direct ABI expects negative errno-style return. |
-
-## Implementation Issues Found
-
-| Issue | Fix |
+| Status | Meaning |
 | --- | --- |
-| The WASIX import table exposed `chdir` through the legacy `proc_chdir(path, len)` ABI, so modules importing POSIX-shaped `chdir(path)` failed at instantiation. | `wasmer-wasix/src/lib.rs` now maps `chdir` to the existing POSIX-shaped `chdir` wrapper while keeping `proc_chdir` on the explicit-length ABI. |
-| The existing WASIX compatibility import test declared `arch_prctl` with an `i64` address on the 32-bit WASIX import namespace, which did not match the runtime's pointer-sized `Memory32` ABI. | The test now imports and calls `arch_prctl` with an `i32` address for the 32-bit WASIX namespace. |
-| The source-level verifier staged compiled outputs under `/work/posixtestsuite/out` without creating that sandbox directory first, so the linker could not open the output path. | The verifier now creates `/work/posixtestsuite/out` through the sandbox write path before compiling the selected C sources. |
+| Passing | The currently tracked focused verifier run passes the supported C tests in this group. |
+| Partial | The group has meaningful passing coverage, but still has known failures, unsupported shell cases, or incomplete current runs. |
+| Not covered | No useful current posixtestsuite result is tracked for this group. |
 
-## Not Covered Yet
+## Coverage Summary
 
-The following upstream areas are intentionally not counted as covered yet:
+| Test group | Status | Summary |
+| --- | --- | --- |
+| Harness and discovery | Partial | The verifier can fetch the pinned upstream suite, run focused scopes, apply resource caps, skip shell tests, and emit TSV summaries. A complete full-suite baseline is still missing. |
+| Clocks and sleeps | Passing | Core `clock_gettime`, `clock_getres`, `nanosleep`, and related invalid-argument behavior have useful coverage. The focused `nanosleep` C group now compiles, links, and runs all 12 C cases successfully; the one shell case remains unsupported while shell-driven posixtestsuite execution is disabled. |
+| Interval timers and signals | Partial | `alarm`, `getitimer`, `setitimer`, and signal interruption paths are working well enough for dependent pthread tests. Process-directed `kill(getpid(), sig)` now routes through runtime signal selection so a signal sent by a blocking thread can be delivered to another unblocked thread. Broader signal masks, handler ordering, process-group behavior, and realtime signal semantics still need focused coverage. |
+| Process, fork, and wait | Partial | Forked process state, shared mapping ownership, runtime-backed shared-memory publication, `times(2)`, POSIX timer inheritance, message-queue descriptor inheritance, pending blocked signals, and child wait synchronization have focused passing coverage. The current `fork` group compiles and links all 19 C cases and runs 18 of 19 successfully; `fork/7-1.c` remains unresolved because of an upstream message-catalog artifact. Remaining gaps include richer wait status handling, process groups, and stress cases. |
+| Shared mappings and cross-process synchronization | Partial | Same-process pthreads now rely on native WASM shared memory for ordinary `MAP_SHARED` data while runtime-backed synchronization objects coordinate pshared primitives. Cross-process mappings use host in-memory backing and direct runtime remapping for registered shared pages after fork/thread spawn, with copy-based synchronization skipped for active direct mappings. File-backed shared mappings, including read-only `shm_open` remaps of objects written through another descriptor or process, now use the shared backing immediately rather than waiting for `msync` or `munmap`. The Windows `wasmer-wasix` target compiles for the shared-memory abstraction, while Linux remains the only executed host in current verification. Mixed mmap metadata semantics, arbitrary shared-memory protocols without POSIX synchronization calls, futex cleanup, platform remapping, and broader cross-process synchronization patterns still need more coverage. |
+| Basic pthread lifecycle | Partial | Thread create, join, exit, detach, atfork handlers, and cancellation paths have focused passing coverage. The refreshed focused lifecycle directories have no supported C run failures: `pthread_create` passes 12 supported C cases with 7 upstream `UNTESTED` cases and 1 shell case unsupported, `pthread_join` passes 6 supported C cases with 3 upstream `UNTESTED` cases, `pthread_exit` passes 3 supported C cases with 7 upstream `UNTESTED` cases, and `pthread_detach` passes 5 supported C cases with 3 upstream `UNTESTED` cases. The focused `pthread_atfork` C group also passes all 7 C cases, including the signal-stress case that repeatedly registers atfork handlers while other threads send process-directed signals. Broader lifecycle stress and shell cases remain future work. |
+| Thread-specific storage and pthread once | Passing | Key creation, get/set specific data, key deletion, and `pthread_once` have strong focused coverage. Destructor ordering and high-volume stress coverage remain future work. |
+| Mutexes | Passing | The supported C `pthread_mutex` group is passing in focused runs, and the full `pthread_mutex_lock` C directory passes under resource caps. Shell cases are still excluded until the shell path is stable. |
+| Spin locks | Passing | The focused `pthread_spin` C groups pass 15 compile/link/run cases; their 6 shell-wrapped cases are recorded as unsupported while shell execution is disabled. Deadlock and ownership edge semantics still need broader POSIX review. |
+| Condition variables | Passing | The focused `pthread_cond_timedwait` group now passes all 12 C cases after fixing direct shared mapping synchronization and signal-pending delivery. Focused `pthread_cond_signal` and `pthread_cond_broadcast` groups also pass their supported C cases. Broader mixed primitive stress coverage remains future work. |
+| Barriers | Passing | The focused `pthread_barrier` groups pass all 10 supported C cases, with 4 shell-wrapped cases recorded as unsupported while shell execution is disabled. More stress and interaction coverage remains future work. |
+| Read-write locks | Passing | The focused C `pthread_rwlock` family passes under resource caps, including read, write, timed read, timed write, invalid-unlock, and process-shared cases. The timed write-lock signal-interruption case now passes after the signal/shared-mapping fixes. Shell-wrapped cases are recorded as unsupported when shell execution is disabled. Broader mixed primitive stress coverage remains future work. |
+| Cancellation | Passing | The focused `pthread_cancel` group passes with 10 compile/link/run passes after raw WASIX module runs stage the pinned toolchain runtime. Cross-primitive cancellation behavior still needs broader stress coverage. |
+| Semaphores | Passing | The focused `sem_` C slice now has no executable run failures: 67 C cases pass, 2 upstream cases report `UNTESTED`, 7 shell cleanup scripts are unsupported while shell execution is disabled, and `sem_getvalue/coverage.c` remains a non-test note file that the harness still records as a compile/link failure. Named semaphore fork/unlink lifetime now preserves the runtime semaphore while other forked processes still hold it. |
+| Memory mapping interfaces | Partial | Shared mapping and `shm_*` coverage remains meaningful, but the broad `mmap` protection summary is no longer current after deferring the load/store instrumentation path for performance. The focused `mmap/6-1.c` verifier currently compiles and links but fails at runtime because `PROT_READ` writes do not raise `SIGSEGV` without a lower-overhead protection design. The refreshed `shm_open` directory compiles and links all 42 C cases, with 28 C cases passing, 1 resource-cap unresolved stress case, 13 upstream `UNTESTED` cases, and 6 shell cases unsupported. The refreshed `shm_unlink` directory passes all 10 supported C cases with 2 shell cases unsupported, and the refreshed `munmap` directory passes all 7 supported C cases with 2 shell cases unsupported. Remaining work is concentrated in efficient mmap protection/fault fidelity, shell-driven cases, and larger stress coverage. |
+| Filesystem interfaces | Not covered | POSIX file, directory, metadata, permissions, link, symlink, and path-resolution groups have not yet been summarized from current verifier runs outside the mmap/shm-adjacent cases. |
+| Networking interfaces | Not covered | Socket, address, polling, and network error semantics do not have current posixtestsuite coverage. |
+| Message queues and realtime APIs | Partial | Runtime POSIX timer wrappers and runtime-backed POSIX message queues now cover the `fork` cases for `SIGEV_THREAD` timer inheritance and message-queue object/descriptor inheritance. The focused C `mq_open` group compiles and links all 37 cases, with 27 pass, 9 upstream `UNTESTED`, and one remaining race-sensitive `O_CREAT | O_EXCL` fork case. The focused C `mq_send` group compiles and links all 19 cases, with 18 pass and one upstream `UNTESTED` priority-scheduling case. The focused C `mq_receive`, `mq_getattr`, `mq_setattr`, `mq_notify`, `mq_close`, and `mq_unlink` groups now pass all supported C cases, with their shell or upstream `UNTESTED` cases recorded separately. Timed queue operations now have deadline-aware runtime imports: focused C `mq_timedreceive` passes all 19 C cases with 3 unsupported shell cases, and focused C `mq_timedsend` passes 25 C cases with 2 upstream `UNTESTED` cases. Broader realtime scheduling, realtime timer, and priority API coverage is still incomplete. |
+| Shell tests | Partial | The harness records shell cases and can mark them unsupported. Running shell-driven upstream tests depends on a stable sandbox shell toolchain path. |
+| Stress and functional suites | Not covered | The verifier can enumerate these suites, but resource-safe chunked runs have not been completed. |
 
-- Broader source-level libc behavior beyond the selected clock and nanosleep C cases, including `sysconf`, feature macros outside these headers, and larger suites.
-- Upstream tests that require `fork()`, `wait()`, signal handlers, process groups, shared mappings, pthreads, semaphores, message queues, and timers beyond the direct runtime imports represented above.
-- Shell-script tests and the upstream `run_tests` harness.
-- Stress and functional suites.
-- Full source-level build of the entire upstream suite using the maintained WASIX Clang/sysroot.
-- A completed `POSIXTESTSUITE_SCOPE=all` run over all 2,095 C tests and 188 shell tests.
+## Current Priorities
 
-## Next Coverage Targets
-
-1. Complete a `POSIXTESTSUITE_SCOPE=all` run, or an equivalent set of chunked runs covering every discovered C and shell test exactly once.
-2. Summarize full-suite results by top-level suite, phase, and POSIX result code in this document.
-3. Expand implementation fixes from the first failing groups with actionable diagnostics, starting with process/thread/message-queue areas that now surface through the full-suite runner.
-4. Grow toward the upstream `run_tests` harness only after individual source-level groups are stable enough to make failures actionable.
+1. Design an efficient runtime-backed protection mechanism for `PROT_*` and invalid-access behavior that does not route ordinary wasm loads and stores through host calls.
+2. Revisit large fork/stress limits separately from correctness checks; the remaining `shm_open` C unresolved case forks 1000 children and hits the verifier resource cap.
+3. Add dedicated filesystem, networking, message queue, realtime, functional, and stress coverage after the pthread/process foundation is less noisy.
+4. Enable shell-driven upstream cases once BusyBox or another real shell path is stable enough for posixtestsuite scripts.

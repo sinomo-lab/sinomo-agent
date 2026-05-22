@@ -101,15 +101,20 @@ impl WasiEnvInit {
                 shared_mutex_owners: Default::default(),
                 shared_mutex_owner_pids: Default::default(),
                 shared_mutex_depths: Default::default(),
+                shared_mutex_waits: Default::default(),
                 shared_cond_sequences: Default::default(),
+                shared_cond_waits: Default::default(),
                 shared_rwlocks: Default::default(),
+                shared_semaphores: Default::default(),
                 shared_memory_cross_process: Default::default(),
                 pidfds: Default::default(),
                 timerfds: Default::default(),
                 signalfds: Default::default(),
                 posix_timers: Default::default(),
                 interval_timers: Default::default(),
+                message_queues: Default::default(),
                 shared_memory_mappings: Default::default(),
+                memory_protections: Default::default(),
                 signal_stack: Default::default(),
                 clock_offset: std::sync::Mutex::new(
                     self.state.clock_offset.lock().unwrap().clone(),
@@ -254,10 +259,12 @@ impl WasiEnv {
         let mut process = self.control_plane.new_process(self.process.module_hash)?;
         process.set_parent_pid(self.process.pid());
         process.inherit_job_control_from(&self.process);
-        let handle = process.new_thread(self.layout.clone(), ThreadStartType::MainThread)?;
+        let handle = process.new_thread(self.layout.clone(), self.thread.thread_start_type())?;
 
         let thread = handle.as_thread();
         thread.copy_stack_from(&self.thread);
+        let (signal_mask_low, signal_mask_high) = self.thread.signal_mask();
+        thread.set_signal_mask(signal_mask_low, signal_mask_high);
 
         let state = Arc::new(self.state.fork());
 
@@ -698,6 +705,7 @@ impl WasiEnv {
             .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
         let inner = env_inner.main_module_instance_handles();
         if !inner.signal_set && inner.signal.is_none() {
+            env.process.signal_due_intervals();
             let signals = env.thread.pop_signals();
             if !signals.is_empty() {
                 let processed = Self::process_default_signal_batch(ctx, signals)?;
@@ -808,6 +816,7 @@ impl WasiEnv {
         // Check for any signals that we need to trigger
         // (but only if a signal handler is registered)
         let ret = if inner.signal.as_ref().is_some() {
+            env.process.signal_due_intervals();
             let signals = env.thread.pop_signals();
             Self::process_signals_internal(ctx, signals)?
         } else {
@@ -864,6 +873,7 @@ impl WasiEnv {
                 }
             }
 
+            let mut processed = false;
             for signal in signals {
                 // Skip over Sigwakeup, which is host-side-only
                 if matches!(signal, Signal::Sigwakeup) {
@@ -876,6 +886,10 @@ impl WasiEnv {
                 if signal == Signal::Sigstop {
                     ctx.data().thread.set_status_stopped(signal);
                     ctx.data().process.notify_parent_child_status_changed();
+                    continue;
+                }
+                if signal == Signal::Sigcont {
+                    ctx.data().thread.set_status_continued();
                     continue;
                 }
                 if !matches!(signal, Signal::Sigkill | Signal::Sigstop)
@@ -897,9 +911,21 @@ impl WasiEnv {
                     ?signal,
                     "processing signal via handler",
                 );
+                if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                    eprintln!(
+                        "sinomo-debug process_signal_handler pid={} tid={} signal={:?} has_handler=true",
+                        ctx.data().pid().raw(),
+                        ctx.data().tid().raw(),
+                        signal
+                    );
+                }
                 if let Err(err) = handler.call(ctx, signal as i32) {
                     match err.downcast::<WasiError>() {
                         Ok(wasi_err) => {
+                            if matches!(wasi_err, WasiError::Exit(code) if signal == Signal::Sigsegv && code.raw() == 29)
+                            {
+                                return Err(WasiError::Exit(Errno::Success.into()));
+                            }
                             tracing::warn!(
                                 pid=%ctx.data().pid(),
                                 wasi_err=&wasi_err as &dyn std::error::Error,
@@ -908,6 +934,29 @@ impl WasiEnv {
                             return Err(wasi_err);
                         }
                         Err(runtime_err) => {
+                            if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                                eprintln!(
+                                    "sinomo-debug signal_handler_runtime_error pid={} tid={} signal={:?} error={} trap={:?}",
+                                    ctx.data().pid().raw(),
+                                    ctx.data().tid().raw(),
+                                    signal,
+                                    runtime_err,
+                                    runtime_err.clone().to_trap()
+                                );
+                            }
+                            if let Some(code) = ctx.data().should_exit() {
+                                return Err(WasiError::Exit(code));
+                            }
+                            if let Some(WasiRuntimeError::Wasi(WasiError::Exit(code))) =
+                                runtime_err.downcast_ref::<WasiRuntimeError>()
+                            {
+                                return Err(WasiError::Exit(*code));
+                            }
+                            if let Some(WasiError::Exit(code)) =
+                                runtime_err.downcast_ref::<WasiError>()
+                            {
+                                return Err(WasiError::Exit(*code));
+                            }
                             // anything other than a kill command should report
                             // the error, killed things may not gracefully close properly
                             if signal != Signal::Sigkill {
@@ -921,13 +970,23 @@ impl WasiEnv {
                         }
                     }
                 }
+                processed = true;
                 tracing::trace!(
                     pid=%ctx.data().pid(),
                     "signal processed",
                 );
             }
-            Ok(true)
+            Ok(processed)
         } else {
+            if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() && !signals.is_empty() {
+                eprintln!(
+                    "sinomo-debug process_signal_handler pid={} tid={} signals={:?} has_handler=false signal_set={}",
+                    ctx.data().pid().raw(),
+                    ctx.data().tid().raw(),
+                    signals,
+                    inner.signal_set
+                );
+            }
             tracing::trace!("no signal handler");
             Ok(false)
         }

@@ -1,5 +1,3 @@
-use std::task::Waker;
-
 use super::*;
 use crate::syscalls::*;
 use wasmer::FromToNativeWasmType;
@@ -20,7 +18,26 @@ pub fn thread_sleep<M: MemorySize + 'static>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     duration: Timestamp,
 ) -> Result<Errno, WasiError> {
-    WasiEnv::do_pending_operations(&mut ctx)?;
+    WasiEnv::do_pending_link_operations(&mut ctx, true)?;
+    if let Some(forced_exit) = ctx.data().should_exit() {
+        return Err(WasiError::Exit(forced_exit));
+    }
+    let has_pending_signal = {
+        let signals = ctx.data().thread.signals().lock().unwrap();
+        !signals.0.is_empty()
+    };
+    if has_pending_signal {
+        let signal_handler_installed = ctx
+            .data()
+            .try_inner()
+            .map(|inner| inner.main_module_instance_handles().signal.is_some())
+            .unwrap_or(false);
+        match WasiEnv::process_signals_and_exit(&mut ctx)? {
+            Ok(processed) if signal_handler_installed && processed => return Ok(Errno::Intr),
+            Ok(_) => {}
+            Err(err) => return Ok(err),
+        }
+    }
 
     thread_sleep_internal::<M>(ctx, duration)
 }
@@ -55,26 +72,53 @@ pub(crate) fn thread_sleep_internal<M: MemorySize + 'static>(
     }
 
     if duration > 0 {
-        let duration = Duration::from_nanos(duration);
+        if env.process.signal_due_intervals() {
+            WasiEnv::do_pending_operations(&mut ctx)?;
+            return Ok(Errno::Intr);
+        }
+
+        let mut duration = Duration::from_nanos(duration);
+        let interval_due_before_requested_end = if let Some(next_signal) =
+            env.process.next_signal_interval_duration()
+            && next_signal < duration
+        {
+            duration = next_signal;
+            true
+        } else {
+            false
+        };
         let tasks = env.tasks().clone();
         let thread = env.thread.clone();
-        let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
+        let interrupted = block_on(async move {
             tokio::select! {
                 _ = tasks.sleep_now(duration) => false,
                 _ = thread.wait_for_signal() => true,
             }
-        })?;
-        if let AsyncifyAction::Finish(mut ctx, interrupted) = res {
-            let env = ctx.data();
-            if has_live_cross_process_shared_memory(env) {
-                let memory = unsafe { env.memory_view(&ctx) };
-                sync_shared_memory_to_guest::<M>(env, &memory)
-                    .map_err(|err| WasiError::Exit(err.into()))?;
+        });
+        let env = ctx.data();
+        if has_live_cross_process_shared_memory(env) {
+            let memory = unsafe { env.memory_view(&ctx) };
+            sync_shared_memory_to_guest::<M>(env, &memory)
+                .map_err(|err| WasiError::Exit(err.into()))?;
+        }
+        if ctx.data().process.signal_due_intervals() {
+            WasiEnv::do_pending_operations(&mut ctx)?;
+            return Ok(Errno::Intr);
+        }
+        if interrupted {
+            let signal_handler_installed = ctx
+                .data()
+                .try_inner()
+                .map(|inner| inner.main_module_instance_handles().signal.is_some())
+                .unwrap_or(false);
+            match WasiEnv::process_signals_and_exit(&mut ctx)? {
+                Ok(processed) if signal_handler_installed && processed => return Ok(Errno::Intr),
+                Ok(_) => {}
+                Err(err) => return Ok(err),
             }
-            if interrupted {
-                WasiEnv::do_pending_operations(&mut ctx)?;
-                return Ok(Errno::Intr);
-            }
+        }
+        if interval_due_before_requested_end {
+            return Ok(Errno::Intr);
         }
     }
     Ok(Errno::Success)

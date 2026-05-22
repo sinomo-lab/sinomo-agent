@@ -1,0 +1,15 @@
+#ifndef SINOMO_WASIX_TIME_EXTENSIONS
+#define SINOMO_WASIX_TIME_EXTENSIONS 1
+
+#include <sys/types.h>
+
+struct sigevent;
+
+int clock_getcpuclockid(pid_t pid, clockid_t *clock_id);
+int timer_create(clockid_t clock_id, struct sigevent *restrict event, timer_t *restrict timer_id);
+int timer_delete(timer_t timer_id);
+int timer_settime(timer_t timer_id, int flags, const struct itimerspec *restrict new_value, struct itimerspec *restrict old_value);
+int timer_gettime(timer_t timer_id, struct itimerspec *value);
+int timer_getoverrun(timer_t timer_id);
+
+#endif

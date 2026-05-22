@@ -131,15 +131,19 @@ compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-stat.c" "${WORKDIR}/sinomo-was
 compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-posix.c" "${WORKDIR}/sinomo-wasix-posix.o"
 compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-at-fdcwd.c" "${WORKDIR}/sinomo-wasix-at-fdcwd.o"
 compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-futex.c" "${WORKDIR}/sinomo-wasix-futex.o"
+compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-semaphore.c" "${WORKDIR}/sinomo-wasix-semaphore.o"
 compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-pthread-mutex.c" "${WORKDIR}/sinomo-wasix-pthread-mutex.o"
 compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-pthread-self.c" "${WORKDIR}/sinomo-wasix-pthread-self.o"
 compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-pthread-cond.c" "${WORKDIR}/sinomo-wasix-pthread-cond.o"
 "${WASI_SDK}/bin/llvm-ar" d "${SYSROOT_OUTDIR}/lib/wasm32-wasi/libc.a" \
-    posix.o at_fdcwd.o chdir.o fchdir.o fork.o chown.o fchown.o fchownat.o lchown.o \
+    posix.o at_fdcwd.o chdir.o fchdir.o chown.o fchown.o fchownat.o lchown.o \
     ftruncate.o truncate.o getegid.o geteuid.o getgid.o getuid.o setegid.o seteuid.o setgid.o setgroups.o setuid.o \
     pthread_self.o \
-    pthread_mutex_destroy.o pthread_mutex_init.o pthread_mutex_lock.o pthread_mutex_timedlock.o pthread_mutex_trylock.o pthread_mutex_unlock.o \
-    pthread_mutexattr_destroy.o pthread_mutexattr_init.o pthread_mutexattr_setpshared.o pthread_mutexattr_settype.o \
+    pthread_mutex_destroy.o pthread_mutex_getprioceiling.o pthread_mutex_init.o pthread_mutex_lock.o pthread_mutex_setprioceiling.o \
+    pthread_mutex_timedlock.o pthread_mutex_trylock.o pthread_mutex_unlock.o \
+    pthread_mutexattr_destroy.o pthread_mutexattr_getprioceiling.o pthread_mutexattr_getprotocol.o pthread_mutexattr_getpshared.o \
+    pthread_mutexattr_getrobust.o pthread_mutexattr_gettype.o pthread_mutexattr_init.o pthread_mutexattr_setprioceiling.o \
+    pthread_mutexattr_setprotocol.o pthread_mutexattr_setpshared.o pthread_mutexattr_setrobust.o pthread_mutexattr_settype.o \
     pthread_condattr_destroy.o pthread_condattr_init.o pthread_condattr_setclock.o pthread_condattr_setpshared.o \
     pthread_cond_broadcast.o pthread_cond_destroy.o pthread_cond_init.o pthread_cond_signal.o pthread_cond_timedwait.o pthread_cond_wait.o \
     pthread_barrier_destroy.o pthread_barrier_init.o pthread_barrier_wait.o \
@@ -148,16 +152,21 @@ compile_sysroot_object "${SYSROOT_LIBC_DIR}/wasix-pthread-cond.c" "${WORKDIR}/si
     pthread_rwlock_tryrdlock.o pthread_rwlock_trywrlock.o pthread_rwlock_unlock.o pthread_rwlock_wrlock.o \
     pthread_rwlockattr_destroy.o pthread_rwlockattr_getpshared.o pthread_rwlockattr_init.o pthread_rwlockattr_setpshared.o \
     pthread_cancel.o pthread_testcancel.o \
+    sem_close.o sem_destroy.o sem_getvalue.o sem_init.o sem_open.o sem_post.o sem_timedwait.o sem_trywait.o sem_unlink.o sem_wait.o \
     pthread_join.o \
+    pthread_spin_init.o pthread_spin_destroy.o pthread_spin_lock.o pthread_spin_trylock.o pthread_spin_unlock.o \
     pthread_attr_get.o \
+    pthread_attr_setstack.o pthread_attr_setstacksize.o pthread_getattr_np.o pthread_getspecific.o \
     pthread_attr_setinheritsched.o pthread_attr_setschedparam.o pthread_attr_setschedpolicy.o \
-    pthread_getcpuclockid.o pthread_getschedparam.o pthread_setschedparam.o pthread_setschedprio.o pthread_sigmask.o raise.o sigpending.o sigprocmask.o \
-    clock_nanosleep.o nanosleep.o sleep.o usleep.o \
+    pthread_getcpuclockid.o pthread_getschedparam.o pthread_kill.o pthread_setschedparam.o pthread_setschedprio.o pthread_sigmask.o raise.o sigpending.o sigprocmask.o kill.o \
+    pthread_atfork.o \
+    clock_nanosleep.o nanosleep.o sleep.o usleep.o wait.o waitpid.o getitimer.o setitimer.o getrlimit.o setrlimit.o times.o \
     __wasilibc_futex.o
 "${WASI_SDK}/bin/llvm-ar" r "${SYSROOT_OUTDIR}/lib/wasm32-wasi/libc.a" \
     "${WORKDIR}/sinomo-wasix-posix.o" \
     "${WORKDIR}/sinomo-wasix-at-fdcwd.o" \
     "${WORKDIR}/sinomo-wasix-futex.o" \
+    "${WORKDIR}/sinomo-wasix-semaphore.o" \
     "${WORKDIR}/sinomo-wasix-pthread-mutex.o" \
     "${WORKDIR}/sinomo-wasix-pthread-self.o" \
     "${WORKDIR}/sinomo-wasix-pthread-cond.o"

@@ -521,6 +521,16 @@ pub(crate) fn path_open_internal(
                         .create_inode(inodes, kind, false, new_entity_name.clone())
                 )
             };
+            let identity = env.process.identity();
+            crate::syscalls::set_inode_owner(
+                new_inode.ino().as_u64(),
+                identity.effective_uid,
+                identity.effective_gid,
+            );
+            crate::syscalls::set_inode_mode(
+                new_inode.ino().as_u64(),
+                0o666 & !env.process.umask(),
+            );
 
             {
                 let mut guard = parent_inode.write();

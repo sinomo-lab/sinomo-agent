@@ -5267,8 +5267,9 @@ pub(crate) fn sandbox_run_with_stores_and_stdin(
                 options.timeout_ms
             };
             let outcome = sinomo_runtime::sandbox::LocalStagedSandboxCommandRunner::new()?
-                .run_module_with_stdin_limits_preopens_and_output_sink(
+                .run_module_with_stdin_limits_preopens_output_sink_and_toolchain(
                     store,
+                    toolchain_store,
                     &options.sandbox_id,
                     wasm,
                     options.argv,

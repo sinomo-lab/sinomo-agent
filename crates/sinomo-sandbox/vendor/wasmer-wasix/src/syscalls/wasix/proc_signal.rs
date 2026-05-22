@@ -31,11 +31,14 @@ pub fn proc_signal(
             let pid: WasiProcessId = pid.into();
             if let Some(process) = env.control_plane.get_process(pid) {
                 if sig != Signal::Signone {
-                    process.signal_process(sig);
+                    for tid in process.signal_process_direct(sig) {
+                        wake_futex_waiters_for_thread(env.state.deref(), tid.raw());
+                        wake_shared_cond_waiters_for_thread(env.state.deref(), tid.raw());
+                    }
                 }
                 Errno::Success
             } else {
-                Errno::Badf
+                Errno::Srch
             }
         }
     };
@@ -219,20 +222,23 @@ fn signal_process_group(env: &WasiEnv, pgid: WasiProcessId, sig: Signal) -> Errn
         .into_iter()
         .filter(|process| process.pgid() == pgid)
         .collect::<Vec<_>>();
-    signal_process_targets(targets, sig)
+    signal_process_targets(env, targets, sig)
 }
 
 fn signal_all_processes(env: &WasiEnv, sig: Signal) -> Errno {
-    signal_process_targets(env.control_plane.processes(), sig)
+    signal_process_targets(env, env.control_plane.processes(), sig)
 }
 
-fn signal_process_targets(targets: Vec<WasiProcess>, sig: Signal) -> Errno {
+fn signal_process_targets(env: &WasiEnv, targets: Vec<WasiProcess>, sig: Signal) -> Errno {
     if targets.is_empty() {
-        return Errno::Badf;
+        return Errno::Srch;
     }
     if sig != Signal::Signone {
         for process in targets {
-            process.signal_process_direct(sig);
+            for tid in process.signal_process_direct(sig) {
+                wake_futex_waiters_for_thread(env.state.deref(), tid.raw());
+                wake_shared_cond_waiters_for_thread(env.state.deref(), tid.raw());
+            }
         }
     }
     Errno::Success

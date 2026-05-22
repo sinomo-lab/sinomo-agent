@@ -54,7 +54,7 @@ pub(crate) use std::{
     pin::Pin,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence},
         mpsc,
     },
     task::{Context, Poll},
@@ -158,21 +158,213 @@ pub(crate) fn sync_shared_memory_from_guest<M: MemorySize>(
     env: &WasiEnv,
     memory: &MemoryView,
 ) -> Result<(), Errno> {
+    let preserve_ranges = if env.state.has_cross_process_shared_memory() {
+        env.state
+            .shared_futex_ranges()
+            .into_iter()
+            .map(|range| (range.start, range.end.saturating_sub(range.start) as usize))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    sync_shared_memory_from_guest_with_preserve_ranges::<M>(env, memory, &preserve_ranges)
+}
+
+pub(crate) fn sync_shared_memory_from_guest_including_futexes<M: MemorySize>(
+    env: &WasiEnv,
+    memory: &MemoryView,
+) -> Result<(), Errno> {
+    sync_shared_memory_from_guest_with_preserve_ranges::<M>(env, memory, &[])
+}
+
+pub(crate) fn sync_shared_memory_from_exiting_guest(
+    env: &WasiEnv,
+    memory: &MemoryView,
+) -> Result<(), Errno> {
     if !env.state.has_shared_memory_mappings() {
         return Ok(());
     }
-    for mapping in env.state.shared_memory_mappings() {
-        let ptr = WasmPtr::<u8, M>::new(to_offset::<M>(
-            mapping.offset.try_into().map_err(|_| Errno::Overflow)?,
-        )?);
-        let len = to_offset::<M>(mapping.len.try_into().map_err(|_| Errno::Overflow)?)?;
-        let bytes = ptr
-            .slice(memory, len)
-            .map_err(mem_error_to_wasi)?
-            .read_to_vec()
-            .map_err(mem_error_to_wasi)?;
-        *mapping.bytes.lock().unwrap() = bytes;
+    fence(Ordering::SeqCst);
+    let data = unsafe { memory.data_unchecked() };
+    for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
+        let len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
+        let start = usize::try_from(mapping.offset).map_err(|_| Errno::Overflow)?;
+        let end = start.checked_add(len).ok_or(Errno::Overflow)?;
+        let bytes = data.get(start..end).ok_or(Errno::Fault)?;
+        mapping.write_bytes(bytes)?;
+        mapping
+            .process_snapshots
+            .lock()
+            .unwrap()
+            .insert(env.pid().raw(), bytes.to_vec());
     }
+    fence(Ordering::SeqCst);
+    Ok(())
+}
+
+fn sync_shared_memory_from_guest_with_preserve_ranges<M: MemorySize>(
+    env: &WasiEnv,
+    memory: &MemoryView,
+    preserve_ranges: &[(u64, usize)],
+) -> Result<(), Errno> {
+    if !env.state.has_shared_memory_mappings() {
+        return Ok(());
+    }
+    fence(Ordering::SeqCst);
+    for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
+        if is_direct_shared_mapping_active(env, memory, &mapping)? {
+            continue;
+        }
+        let len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
+        let start = usize::try_from(mapping.offset).map_err(|_| Errno::Overflow)?;
+        let end = start.checked_add(len).ok_or(Errno::Overflow)?;
+        let data = unsafe { memory.data_unchecked() };
+        let bytes = data.get(start..end).ok_or(Errno::Fault)?.to_vec();
+        if bytes.len() != len {
+            return Err(Errno::Inval);
+        }
+        let mapping_end = mapping.offset.saturating_add(mapping.len);
+        let mut excluded = Vec::new();
+        for (preserve_offset, preserve_len) in preserve_ranges {
+            if *preserve_len == 0 {
+                continue;
+            }
+            let preserve_end = preserve_offset.saturating_add(*preserve_len as u64);
+            let start = (*preserve_offset).max(mapping.offset);
+            let end = preserve_end.min(mapping_end);
+            if start < end {
+                excluded.push((
+                    usize::try_from(start - mapping.offset).map_err(|_| Errno::Overflow)?,
+                    usize::try_from(end - mapping.offset).map_err(|_| Errno::Overflow)?,
+                ));
+            }
+        }
+        excluded.sort_unstable_by_key(|(start, _)| *start);
+
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in excluded {
+            if let Some((_, last_end)) = merged.last_mut()
+                && start <= *last_end
+            {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        if std::env::var_os("SINOMO_WASIX_SHM_DEBUG").is_some() && !merged.is_empty() {
+            eprintln!(
+                "sinomo-debug shared_memory_publish_preserve pid={} mapping={:#x} ranges={:?}",
+                env.pid().raw(),
+                mapping.offset,
+                merged
+            );
+        }
+        publish_shared_memory_delta(&mapping, env.pid().raw(), &bytes, &merged)?;
+    }
+    Ok(())
+}
+
+fn is_direct_shared_mapping_active(
+    env: &WasiEnv,
+    memory: &MemoryView,
+    mapping: &state::WasiSharedMemoryMapping,
+) -> Result<bool, Errno> {
+    let offset = usize::try_from(mapping.offset).map_err(|_| Errno::Overflow)?;
+    if mapping.offset.saturating_add(mapping.len) > memory.data_size() {
+        return Err(Errno::Fault);
+    }
+    let base = unsafe { memory.data_ptr().add(offset) as usize };
+    Ok(mapping
+        .mapped_bases
+        .lock()
+        .unwrap()
+        .contains(&(env.pid().raw(), env.tid().raw(), base)))
+}
+
+fn publish_shared_memory_delta(
+    mapping: &state::WasiSharedMemoryMapping,
+    pid: u32,
+    guest_bytes: &[u8],
+    preserve_ranges: &[(usize, usize)],
+) -> Result<(), Errno> {
+    let len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
+    if guest_bytes.len() != len {
+        return Err(Errno::Inval);
+    }
+
+    let mut shared = mapping.read_bytes()?;
+    if shared.len() != len {
+        return Err(Errno::Inval);
+    }
+    let mut snapshots = mapping.process_snapshots.lock().unwrap();
+    let snapshot = snapshots.entry(pid).or_insert_with(|| shared.clone());
+    if snapshot.len() != len {
+        *snapshot = shared.clone();
+    }
+
+    let mut cursor = 0usize;
+    for (start, end) in preserve_ranges {
+        if cursor < *start {
+            publish_shared_memory_delta_range(&mut shared, snapshot, guest_bytes, cursor, *start);
+        }
+        cursor = cursor.max(*end);
+    }
+    if cursor < len {
+        publish_shared_memory_delta_range(&mut shared, snapshot, guest_bytes, cursor, len);
+    }
+    mapping.write_bytes(&shared)?;
+    Ok(())
+}
+
+fn publish_shared_memory_delta_range(
+    shared: &mut [u8],
+    snapshot: &mut [u8],
+    guest_bytes: &[u8],
+    start: usize,
+    end: usize,
+) {
+    for index in start..end {
+        if guest_bytes[index] != snapshot[index] {
+            shared[index] = guest_bytes[index];
+        }
+        snapshot[index] = guest_bytes[index];
+    }
+}
+
+fn publish_shared_memory_ranges(
+    mapping: &state::WasiSharedMemoryMapping,
+    pid: u32,
+    guest_bytes: &[u8],
+    preserve_ranges: &[(usize, usize)],
+) -> Result<(), Errno> {
+    let len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
+    if guest_bytes.len() != len {
+        return Err(Errno::Inval);
+    }
+
+    let mut shared = mapping.read_bytes()?;
+    if shared.len() != len {
+        return Err(Errno::Inval);
+    }
+    let mut snapshots = mapping.process_snapshots.lock().unwrap();
+    let snapshot = snapshots.entry(pid).or_insert_with(|| shared.clone());
+    if snapshot.len() != len {
+        *snapshot = shared.clone();
+    }
+
+    let mut cursor = 0usize;
+    for (start, end) in preserve_ranges {
+        if cursor < *start {
+            shared[cursor..*start].copy_from_slice(&guest_bytes[cursor..*start]);
+            snapshot[cursor..*start].copy_from_slice(&guest_bytes[cursor..*start]);
+        }
+        cursor = cursor.max(*end);
+    }
+    if cursor < len {
+        shared[cursor..].copy_from_slice(&guest_bytes[cursor..]);
+        snapshot[cursor..].copy_from_slice(&guest_bytes[cursor..]);
+    }
+    mapping.write_bytes(&shared)?;
     Ok(())
 }
 
@@ -190,7 +382,7 @@ pub(crate) fn sync_shared_memory_range_from_guest<M: MemorySize>(
     }
     let Some(mapping) = env
         .state
-        .shared_memory_mappings()
+        .shared_memory_mappings_for_pid(env.pid().raw())
         .into_iter()
         .find(|mapping| {
             offset >= mapping.offset
@@ -199,6 +391,9 @@ pub(crate) fn sync_shared_memory_range_from_guest<M: MemorySize>(
     else {
         return Ok(());
     };
+    if is_direct_shared_mapping_active(env, memory, &mapping)? {
+        return Ok(());
+    }
     let index = usize::try_from(offset - mapping.offset).map_err(|_| Errno::Overflow)?;
     let len = usize::try_from(len).map_err(|_| Errno::Overflow)?;
     let ptr = WasmPtr::<u8, M>::new(to_offset::<M>(
@@ -209,11 +404,81 @@ pub(crate) fn sync_shared_memory_range_from_guest<M: MemorySize>(
         .map_err(mem_error_to_wasi)?
         .read_to_vec()
         .map_err(mem_error_to_wasi)?;
-    let mut shared = mapping.bytes.lock().unwrap();
-    if index.saturating_add(len) > shared.len() || bytes.len() != len {
+    if bytes.len() != len {
         return Err(Errno::Inval);
     }
-    shared[index..index + len].copy_from_slice(&bytes);
+
+    let mapping_len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
+    let mut shared_range = mapping.read_range(index, len)?;
+    let mut snapshots = mapping.process_snapshots.lock().unwrap();
+    let snapshot = snapshots
+        .entry(env.pid().raw())
+        .or_insert_with(|| mapping.read_bytes().unwrap_or_else(|_| vec![0; mapping_len]));
+    if snapshot.len() != mapping_len {
+        *snapshot = mapping.read_bytes().unwrap_or_else(|_| vec![0; mapping_len]);
+    }
+    for (byte_index, guest_byte) in bytes.iter().enumerate() {
+        let shared_index = index + byte_index;
+        if *guest_byte != snapshot[shared_index] {
+            shared_range[byte_index] = *guest_byte;
+        }
+        snapshot[shared_index] = *guest_byte;
+    }
+    mapping.write_range(index, &shared_range)?;
+    Ok(())
+}
+
+pub(crate) fn sync_shared_memory_range_to_guest<M: MemorySize>(
+    env: &WasiEnv,
+    memory: &MemoryView,
+    offset: u64,
+    len: u64,
+) -> Result<(), Errno> {
+    if !env.state.has_shared_memory_mappings() {
+        return Ok(());
+    }
+    if len == 0 {
+        return Ok(());
+    }
+    let Some(mapping) = env
+        .state
+        .shared_memory_mappings_for_pid(env.pid().raw())
+        .into_iter()
+        .find(|mapping| {
+            offset >= mapping.offset
+                && offset.saturating_add(len) <= mapping.offset.saturating_add(mapping.len)
+        })
+    else {
+        return Ok(());
+    };
+    if is_direct_shared_mapping_active(env, memory, &mapping)? {
+        return Ok(());
+    }
+    let index = usize::try_from(offset - mapping.offset).map_err(|_| Errno::Overflow)?;
+    let len = usize::try_from(len).map_err(|_| Errno::Overflow)?;
+    let bytes = mapping.read_range(index, len)?;
+    if bytes.len() != len {
+        return Err(Errno::Inval);
+    }
+
+    let ptr = WasmPtr::<u8, M>::new(to_offset::<M>(
+        offset.try_into().map_err(|_| Errno::Overflow)?,
+    )?);
+    ptr.slice(memory, to_offset::<M>(len)?)
+        .map_err(mem_error_to_wasi)?
+        .write_slice(&bytes)
+        .map_err(mem_error_to_wasi)?;
+
+    let mapping_len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
+    let mut snapshots = mapping.process_snapshots.lock().unwrap();
+    let snapshot = snapshots
+        .entry(env.pid().raw())
+        .or_insert_with(|| mapping.read_bytes().unwrap_or_else(|_| vec![0; mapping_len]));
+    if snapshot.len() != mapping_len {
+        *snapshot = mapping.read_bytes().unwrap_or_else(|_| vec![0; mapping_len]);
+    }
+    snapshot[index..index + len].copy_from_slice(&bytes);
+    fence(Ordering::SeqCst);
     Ok(())
 }
 
@@ -225,16 +490,15 @@ pub(crate) fn sync_shared_memory_from_guest_preserving_ranges<M: MemorySize>(
     if !env.state.has_shared_memory_mappings() {
         return Ok(());
     }
-    for mapping in env.state.shared_memory_mappings() {
-        let ptr = WasmPtr::<u8, M>::new(to_offset::<M>(
-            mapping.offset.try_into().map_err(|_| Errno::Overflow)?,
-        )?);
+    for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
+        if is_direct_shared_mapping_active(env, memory, &mapping)? {
+            continue;
+        }
         let len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
-        let guest_bytes = ptr
-            .slice(memory, to_offset::<M>(len)?)
-            .map_err(mem_error_to_wasi)?
-            .read_to_vec()
-            .map_err(mem_error_to_wasi)?;
+        let start = usize::try_from(mapping.offset).map_err(|_| Errno::Overflow)?;
+        let end = start.checked_add(len).ok_or(Errno::Overflow)?;
+        let data = unsafe { memory.data_unchecked() };
+        let guest_bytes = data.get(start..end).ok_or(Errno::Fault)?.to_vec();
         if guest_bytes.len() != len {
             return Err(Errno::Inval);
         }
@@ -267,28 +531,14 @@ pub(crate) fn sync_shared_memory_from_guest_preserving_ranges<M: MemorySize>(
             }
             merged.push((start, end));
         }
-
-        let mut shared = mapping.bytes.lock().unwrap();
-        if shared.len() != len {
-            return Err(Errno::Inval);
-        }
-        let mut cursor = 0usize;
-        for (start, end) in merged {
-            if cursor < start {
-                shared[cursor..start].copy_from_slice(&guest_bytes[cursor..start]);
-            }
-            cursor = cursor.max(end);
-        }
-        if cursor < len {
-            shared[cursor..].copy_from_slice(&guest_bytes[cursor..]);
-        }
+        publish_shared_memory_delta(&mapping, env.pid().raw(), &guest_bytes, &merged)?;
     }
     Ok(())
 }
 
 pub(crate) fn is_registered_shared_memory_offset(env: &WasiEnv, offset: u64) -> bool {
     env.state
-        .shared_memory_mappings()
+        .shared_memory_mappings_for_pid(env.pid().raw())
         .into_iter()
         .any(|mapping| {
             offset >= mapping.offset && offset < mapping.offset.saturating_add(mapping.len)
@@ -296,21 +546,24 @@ pub(crate) fn is_registered_shared_memory_offset(env: &WasiEnv, offset: u64) -> 
 }
 
 pub(crate) fn is_registered_shared_futex_offset(env: &WasiEnv, offset: u64) -> bool {
-    has_live_cross_process_shared_memory(env) && env.state.is_shared_futex_offset(offset)
+    has_live_cross_process_shared_memory(env)
+        && (is_registered_shared_memory_offset(env, offset) || env.state.is_shared_futex_offset(offset))
 }
 
 pub(crate) fn has_live_cross_process_shared_memory(env: &WasiEnv) -> bool {
     if !env.state.has_cross_process_shared_memory() {
         return false;
     }
-    if env.process.ppid().raw() != 0 {
+    if env.process.pid().raw() != 1 && env.process.ppid().raw() != 0 {
         return true;
     }
+    let pid = env.process.pid().raw();
     env.process.lock().children.iter().any(|child| {
-        matches!(
-            child.task_status(),
-            TaskStatus::Pending | TaskStatus::Running | TaskStatus::Stopped(_)
-        )
+        child.pid().raw() != pid
+            && matches!(
+                child.task_status(),
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Stopped(_)
+            )
     })
 }
 
@@ -321,12 +574,15 @@ pub(crate) fn sync_shared_memory_to_guest<M: MemorySize>(
     if !env.state.has_shared_memory_mappings() {
         return Ok(());
     }
-    for mapping in env.state.shared_memory_mappings() {
+    for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
+        if is_direct_shared_mapping_active(env, memory, &mapping)? {
+            continue;
+        }
         let ptr = WasmPtr::<u8, M>::new(to_offset::<M>(
             mapping.offset.try_into().map_err(|_| Errno::Overflow)?,
         )?);
         let len = to_offset::<M>(mapping.len.try_into().map_err(|_| Errno::Overflow)?)?;
-        let bytes = mapping.bytes.lock().unwrap().clone();
+        let bytes = mapping.read_bytes()?;
         if bytes.len() != mapping.len as usize {
             return Err(Errno::Inval);
         }
@@ -334,7 +590,13 @@ pub(crate) fn sync_shared_memory_to_guest<M: MemorySize>(
             .map_err(mem_error_to_wasi)?
             .write_slice(&bytes)
             .map_err(mem_error_to_wasi)?;
+        mapping
+            .process_snapshots
+            .lock()
+            .unwrap()
+            .insert(env.pid().raw(), bytes);
     }
+    fence(Ordering::SeqCst);
     Ok(())
 }
 
@@ -522,14 +784,14 @@ where
     {
         type Output = Result<Fut::Output, WasiError>;
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if let Poll::Ready(res) = Pin::new(&mut self.pinned_work).poll(cx) {
-                return Poll::Ready(Ok(res));
-            }
             if let Some(signals) = self.ctx.data().thread.pop_signals_or_subscribe(cx.waker()) {
                 if let Err(err) = WasiEnv::process_signals_internal(self.ctx, signals) {
                     return Poll::Ready(Err(err));
                 }
                 return Poll::Ready(Ok(Err(Errno::Intr)));
+            }
+            if let Poll::Ready(res) = Pin::new(&mut self.pinned_work).poll(cx) {
+                return Poll::Ready(Ok(res));
             }
             Poll::Pending
         }
@@ -562,10 +824,6 @@ where
     type Output = Result<T, WasiError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Poll::Ready(res) = self.work.as_mut().poll(cx) {
-            return Poll::Ready(Ok(res));
-        }
-
         WasiEnv::do_pending_link_operations(self.ctx, false);
 
         let env = self.ctx.data();
@@ -595,19 +853,21 @@ where
                     .next()
             };
 
-            return match WasiEnv::process_signals_and_exit(self.ctx) {
+            match WasiEnv::process_signals_and_exit(self.ctx) {
                 Ok(Ok(_)) => {
                     if let Some(exit_code) = has_exit {
-                        Poll::Ready(Err(WasiError::Exit(exit_code)))
+                        return Poll::Ready(Err(WasiError::Exit(exit_code)));
                     } else {
                         // Re-subscribe so we get woken up for further signals as well
                         self.ctx.data().thread.signals_subscribe(cx.waker());
-                        Poll::Pending
                     }
                 }
-                Ok(Err(err)) => Poll::Ready(Err(WasiError::Exit(ExitCode::from(err)))),
-                Err(err) => Poll::Ready(Err(err)),
-            };
+                Ok(Err(err)) => return Poll::Ready(Err(WasiError::Exit(ExitCode::from(err)))),
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+        if let Poll::Ready(res) = self.work.as_mut().poll(cx) {
+            return Poll::Ready(Ok(res));
         }
         Poll::Pending
     }
@@ -1495,6 +1755,17 @@ pub fn rewind_ext<M: MemorySize>(
     let rewind_data_start =
         rewind_pointer + (std::mem::size_of::<__wasi_asyncify_t<M::Offset>>() as u64);
     let rewind_data_end = rewind_data_start + (rewind_stack.len() as u64);
+    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+        eprintln!(
+            "sinomo-debug rewind_ext pid={} tid={} stack_lower={} stack_upper={} rewind_len={} rewind_end={}",
+            env.pid().raw(),
+            env.tid().raw(),
+            env.layout.stack_lower,
+            env.layout.stack_upper,
+            rewind_stack.len(),
+            rewind_data_end
+        );
+    }
     if rewind_data_end > env.layout.stack_upper {
         warn!(
             "attempting to rewind a stack bigger than the allocated stack space ({} > {})",

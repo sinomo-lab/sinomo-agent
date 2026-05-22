@@ -1646,18 +1646,31 @@ impl Linker {
         // the new group, so lock the linker state while we work.
         write_linker_state!(linker_state, self, parent_group_state, parent_ctx);
 
-        let parent_store = parent_ctx.as_store_mut();
-
         let main_module = linker_state.main_module.clone();
+        let parent_memory = parent_ctx
+            .data()
+            .inner()
+            .main_module_instance_handles()
+            .memory_clone();
+        let parent_store = parent_ctx.as_store_mut();
         let memory = if copy_memory {
-            parent_group_state
-                .memory
-                .copy_to_store(&parent_store, store)?
+            parent_memory.copy_to_store(&parent_store, store)?
         } else {
-            parent_group_state
-                .memory
-                .share_in_store(&parent_store, store)?
+            parent_memory.share_in_store(&parent_store, store)?
         };
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            let parent_view = parent_memory.view(&parent_store);
+            let child_store_ref = store.as_store_ref();
+            let child_view = memory.view(&child_store_ref);
+            eprintln!(
+                "sinomo-debug linker create_instance_group_memory copy_memory={} parent_ptr={:#x} child_ptr={:#x} parent_pages={} child_pages={}",
+                copy_memory,
+                parent_view.data_ptr() as usize,
+                child_view.data_ptr() as usize,
+                parent_memory.size(&parent_store).0,
+                memory.size(&child_store_ref).0,
+            );
+        }
 
         let mut imports = import_object_for_all_wasi_versions(&main_module, store, &func_env.env);
 

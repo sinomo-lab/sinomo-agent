@@ -245,6 +245,7 @@ fn default_resource_limit(resource: i32, envs: &[Vec<u8>]) -> ProcessResourceLim
         _ => RLIM_INFINITY,
     };
     let maximum = match resource {
+        RLIMIT_MEMLOCK => RLIM_INFINITY,
         RLIMIT_STACK => memory_limit,
         _ => value,
     };
@@ -272,7 +273,7 @@ fn sandbox_resource_limits(
             maximum: wall_time_seconds,
         },
     );
-    for resource in [RLIMIT_DATA, RLIMIT_RSS, RLIMIT_AS, RLIMIT_MEMLOCK] {
+    for resource in [RLIMIT_DATA, RLIMIT_RSS, RLIMIT_AS] {
         limits.insert(
             resource,
             ProcessResourceLimit {
@@ -281,6 +282,13 @@ fn sandbox_resource_limits(
             },
         );
     }
+    limits.insert(
+        RLIMIT_MEMLOCK,
+        ProcessResourceLimit {
+            current: memory_limit_bytes,
+            maximum: RLIM_INFINITY,
+        },
+    );
     limits.insert(
         RLIMIT_STACK,
         ProcessResourceLimit {
@@ -312,7 +320,7 @@ fn sandbox_resource_limits(
     limits.insert(
         RLIMIT_NPROC,
         ProcessResourceLimit {
-            current: task_limit.min(DEFAULT_SOFT_TASK_LIMIT),
+            current: task_limit,
             maximum: task_limit,
         },
     );
@@ -1179,6 +1187,14 @@ impl WasiProcess {
         );
         inner.threads.insert(tid, ctrl.clone());
         inner.thread_count += 1;
+        sinomo_debug!(
+            "sinomo-debug new_thread pid={} tid={} main={} thread_count={} start={:?}",
+            self.pid().raw(),
+            tid.raw(),
+            is_main,
+            inner.thread_count,
+            start
+        );
 
         Ok(WasiThreadHandle::new(ctrl, &self.inner))
     }
@@ -1710,13 +1726,13 @@ impl WasiProcess {
     }
 
     /// Signals all the threads in this process
-    pub fn signal_process(&self, signal: Signal) {
-        signal_process_internal(self, signal);
+    pub fn signal_process(&self, signal: Signal) -> Vec<WasiThreadId> {
+        signal_process_internal(self, signal)
     }
 
     /// Signals this process directly without forwarding to waited-on children.
-    pub fn signal_process_direct(&self, signal: Signal) {
-        signal_process_threads(self, signal);
+    pub fn signal_process_direct(&self, signal: Signal) -> Vec<WasiThreadId> {
+        signal_process_threads(self, signal)
     }
 
     pub(crate) fn deliver_process_pending_to_thread(&self, thread: &WasiThread) {
@@ -1737,6 +1753,21 @@ impl WasiProcess {
         for signal in signals {
             thread.signal(signal);
         }
+    }
+
+    pub(crate) fn pending_signal_words_for_thread(&self, thread: &WasiThread) -> (u64, u64) {
+        let mut low = 0u64;
+        let mut high = 0u64;
+        {
+            let guard = self.inner.0.lock().unwrap();
+            for signal in &guard.pending_process_signals {
+                add_signal_to_words(*signal, &mut low, &mut high);
+            }
+        }
+        for signal in thread.pending_signals() {
+            add_signal_to_words(signal, &mut low, &mut high);
+        }
+        (low, high)
     }
 
     pub(crate) fn notify_parent_child_status_changed(&self) {
@@ -1939,6 +1970,79 @@ impl WasiProcess {
                 repeat,
             },
         );
+        sinomo_debug!(
+            "sinomo-debug signal_interval pid={} signal={:?} interval_ns={} repeat={}",
+            inner.pid.raw(),
+            signal,
+            interval.as_nanos(),
+            repeat
+        );
+    }
+
+    pub(crate) fn next_signal_interval_duration(&self) -> Option<Duration> {
+        let inner = self.inner.0.lock().unwrap();
+        if inner.signal_intervals.is_empty() {
+            return None;
+        }
+        let now = match platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000) {
+            Ok(now) => now as u128,
+            Err(err) => {
+                tracing::warn!(%err, "failed to read monotonic clock for signal interval");
+                return None;
+            }
+        };
+        inner
+            .signal_intervals
+            .values()
+            .map(|signal| {
+                let elapsed = now.saturating_sub(signal.last_signal);
+                let interval = signal.interval.as_nanos();
+                if elapsed >= interval {
+                    Duration::ZERO
+                } else {
+                    Duration::from_nanos((interval - elapsed).min(u64::MAX as u128) as u64)
+                }
+            })
+            .min()
+    }
+
+    pub(crate) fn signal_due_intervals(&self) -> bool {
+        let now = match platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000) {
+            Ok(now) => now as u128,
+            Err(err) => {
+                tracing::warn!(%err, "failed to read monotonic clock for signal interval");
+                return false;
+            }
+        };
+
+        let due = {
+            let mut inner = self.inner.0.lock().unwrap();
+            let mut due = Vec::new();
+            inner.signal_intervals.retain(|_, signal| {
+                let elapsed = now.saturating_sub(signal.last_signal);
+                if elapsed < signal.interval.as_nanos() {
+                    return true;
+                }
+                due.push(signal.signal);
+                if signal.repeat {
+                    signal.last_signal = now;
+                    true
+                } else {
+                    false
+                }
+            });
+            due
+        };
+
+        for signal in &due {
+            sinomo_debug!(
+                "sinomo-debug signal_due pid={} signal={:?}",
+                self.pid().raw(),
+                signal
+            );
+            self.signal_process_direct(*signal);
+        }
+        !due.is_empty()
     }
 
     /// Returns the number of active threads for this process
@@ -2570,7 +2674,7 @@ fn signal_orphaned_stopped_process_groups(process: &WasiProcess, groups: &[WasiP
 }
 
 /// Signals all the threads in this process
-fn signal_process_internal(process: &WasiProcess, signal: Signal) {
+fn signal_process_internal(process: &WasiProcess, signal: Signal) -> Vec<WasiThreadId> {
     let process_inner = &process.inner;
     #[allow(unused_mut)]
     let mut guard = process_inner.0.lock().unwrap();
@@ -2595,20 +2699,21 @@ fn signal_process_internal(process: &WasiProcess, signal: Signal) {
                     trigger: SnapshotTrigger::Sigint,
                 },
             );
-            return;
+            return Vec::new();
         };
     }
 
     // Check if there are subprocesses that will receive this signal
     // instead of this process
     if guard.waiting.load(Ordering::Acquire) > 0 {
+        let mut delivered = Vec::new();
         let mut triggered = false;
         for child in guard.children.iter() {
-            child.signal_process(signal);
+            delivered.extend(child.signal_process(signal));
             triggered = true;
         }
         if triggered {
-            return;
+            return delivered;
         }
     }
 
@@ -2618,12 +2723,13 @@ fn signal_process_internal(process: &WasiProcess, signal: Signal) {
         }
         guard.reported_stopped_signal = None;
     }
-    signal_process_threads_with_mut_guard(&mut guard, signal);
+    let delivered = signal_process_threads_with_mut_guard(&mut guard, signal);
     drop(guard);
     notify_parent_for_signal(process, signal);
+    delivered
 }
 
-fn signal_process_threads(process: &WasiProcess, signal: Signal) {
+fn signal_process_threads(process: &WasiProcess, signal: Signal) -> Vec<WasiThreadId> {
     let mut guard = process.inner.0.lock().unwrap();
     let pid = guard.pid;
     tracing::trace!(%pid, "signal-process-direct({:?})", signal);
@@ -2633,9 +2739,10 @@ fn signal_process_threads(process: &WasiProcess, signal: Signal) {
         }
         guard.reported_stopped_signal = None;
     }
-    signal_process_threads_with_mut_guard(&mut guard, signal);
+    let delivered = signal_process_threads_with_mut_guard(&mut guard, signal);
     drop(guard);
     notify_parent_for_signal(process, signal);
+    delivered
 }
 
 fn signal_terminal_process_group(
@@ -2650,22 +2757,25 @@ fn signal_terminal_process_group(
     tracing::trace!(%pid, %pgid, "signal-terminal-process-group({:?})", signal);
 
     let Some(control_plane) = control_plane.upgrade() else {
-        signal_process_threads_for_inner(process, signal);
+        let _ = signal_process_threads_for_inner(process, signal);
         return;
     };
     let mut delivered = false;
     for target in control_plane.processes() {
         if target.pgid() == pgid {
-            target.signal_process_direct(signal);
+            let _ = target.signal_process_direct(signal);
             delivered = true;
         }
     }
     if !delivered {
-        signal_process_threads_for_inner(process, signal);
+        let _ = signal_process_threads_for_inner(process, signal);
     }
 }
 
-fn signal_process_threads_for_inner(process: &LockableWasiProcessInner, signal: Signal) {
+fn signal_process_threads_for_inner(
+    process: &LockableWasiProcessInner,
+    signal: Signal,
+) -> Vec<WasiThreadId> {
     let mut guard = process.0.lock().unwrap();
     let pid = guard.pid;
     tracing::trace!(%pid, "signal-process-direct({:?})", signal);
@@ -2679,7 +2789,7 @@ fn signal_process_threads_for_inner(process: &LockableWasiProcessInner, signal: 
         }
         guard.reported_stopped_signal = None;
     }
-    signal_process_threads_with_mut_guard(&mut guard, signal);
+    signal_process_threads_with_mut_guard(&mut guard, signal)
 }
 
 fn notify_parent_for_signal(process: &WasiProcess, signal: Signal) {
@@ -2691,7 +2801,7 @@ fn notify_parent_for_signal(process: &WasiProcess, signal: Signal) {
 fn signal_process_threads_with_mut_guard(
     guard: &mut MutexGuard<'_, WasiProcessInner>,
     signal: Signal,
-) {
+) -> Vec<WasiThreadId> {
     if signal == Signal::Sigkill {
         for thread in guard.threads.values() {
             thread.set_or_get_exit_code_for_signal(signal);
@@ -2710,7 +2820,7 @@ fn signal_process_threads_with_mut_guard(
         for thread in guard.threads.values() {
             thread.signal(signal);
         }
-        return;
+        return guard.threads.values().map(|thread| thread.tid()).collect();
     }
 
     if let Some(thread) = guard
@@ -2718,9 +2828,28 @@ fn signal_process_threads_with_mut_guard(
         .values()
         .find(|thread| !thread_blocks_signal(thread, signal))
     {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!(
+                "sinomo-debug signal_process_deliver pid={} tid={} signal={:?}",
+                guard.pid.raw(),
+                thread.tid().raw(),
+                signal
+            );
+        }
         thread.signal(signal);
+        vec![thread.tid()]
     } else if !guard.pending_process_signals.contains(&signal) {
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!(
+                "sinomo-debug signal_process_pending pid={} signal={:?}",
+                guard.pid.raw(),
+                signal
+            );
+        }
         guard.pending_process_signals.push(signal);
+        Vec::new()
+    } else {
+        Vec::new()
     }
 }
 
@@ -2734,6 +2863,14 @@ fn signal_mask_bit(signal: Signal) -> Option<(u64, u64)> {
     } else {
         Some((0, 1u64 << (sig - 65)))
     }
+}
+
+fn add_signal_to_words(signal: Signal, low: &mut u64, high: &mut u64) {
+    let Some((low_bit, high_bit)) = signal_mask_bit(signal) else {
+        return;
+    };
+    *low |= low_bit;
+    *high |= high_bit;
 }
 
 fn thread_blocks_signal(thread: &WasiThread, signal: Signal) -> bool {

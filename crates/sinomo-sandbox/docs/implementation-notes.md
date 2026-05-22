@@ -53,11 +53,12 @@ The WASIX runner currently provides:
 - Linux pidfd compatibility exports for `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `pidfd_status`, and `pidfd_pid`, with descriptor ownership tracked in WASIX runtime state rather than CPython-local tables,
 - Linux timerfd compatibility exports for `timerfd_create`, `timerfd_settime`, `timerfd_gettime`, `timerfd_read`, `timerfd_ready`, `timerfd_remaining_ms`, and `timerfd_known`, with timer state tracked in WASIX runtime state rather than CPython-local tables,
 - POSIX interval timer compatibility exports for `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, and `timer_delete`, with timer lifecycle and scheduling state tracked in WASIX runtime state rather than CPython-local tables,
-- POSIX process interval timer compatibility exports for `getitimer`, `setitimer`, `alarm`, and `ualarm`, with process timer state tracked in WASIX runtime state rather than CPython-local tables,
+- POSIX process interval timer compatibility exports for `getitimer`, `setitimer`, `alarm`, and `ualarm`, with process timer state tracked in WASIX runtime state rather than CPython-local tables; pending-operation checkpoints now convert due interval timers into normal deliverable process signals before popping the thread signal queue, so blocking futex-backed waits can be interrupted by `SIGALRM`,
 - POSIX alternate signal stack compatibility exports for `sigaltstack`, with active stack state tracked in WASIX runtime state rather than CPython-local globals,
 - POSIX signal mask compatibility exports for `sigprocmask` and `pthread_sigmask`, with each WASIX thread tracking its own active signal mask in runtime state rather than sharing a CPython-global mask,
 - Linux `rt_sigreturn` compatibility returns successfully because the current signal delivery path invokes handlers synchronously instead of building a kernel signal frame,
 - Linux `FUTEX_FD` compatibility creates a runtime-backed `eventfd` that is notified by futex wake paths for legacy pollable futex users,
+- POSIX semaphore support covers unnamed local semaphores, pshared/runtime-backed semaphores, and named `sem_open`/`sem_close`/`sem_unlink` lifecycle state, including unlink-deferred destruction while references remain open,
 - Linux signalfd compatibility exports for `signalfd`, `signalfd_known`, `signalfd_mask_low`, and `signalfd_mask_high`, with descriptor mask ownership tracked in WASIX runtime state while libc-specific signal record formatting remains in the CPython compatibility layer,
 - WASIX TTY/job-control compatibility aliases for `tcgetpgrp`, `tcgetsid`, and `tcsetpgrp`,
 - WASIX thread-local key create/destroy/set/get storage with process-global keys and per-thread values,
@@ -70,6 +71,7 @@ The WASIX runner currently provides:
 - joined non-main WASIX threads are reaped from the process table so thread metadata and task-count guards do not linger for the rest of the process.
 - cancellation wakes WASIX commands blocked in futex deep sleep, including the case where the main thread is waiting in `thread_join` while a worker is blocked in `futex_wait`.
 - WASIX task-count accounting now rejects thread/process creation at the configured boundary instead of admitting one extra active task, and thread creation reports `EAGAIN` when that resource limit is reached.
+- The effective WASIX task limit now uses the remaining host cgroup task budget directly, minus a small host reserve, instead of dividing the budget by an assumed large host-thread multiplier. The outer cgroup remains the hard resource guard while POSIX workloads can create ordinary pthread fanout under reasonable `TasksMax` caps.
 - failed WASIX thread creation paths that discover a missing `wasi_thread_start` export now remove the pre-created thread handle, so repeated failed `thread_spawn_v2` calls do not consume the process task budget.
 - threaded CPython workloads avoid the guest asyncify futex path and use shared-memory atomic waits/wakes for Python's libc futex calls.
 
@@ -104,6 +106,7 @@ Generated virtual filesystem features include:
 - generated `/proc` entries for common Linux process probes,
 - descriptor aliases such as `/dev/fd/<n>` and `/proc/self/fd/<n>`,
 - package/toolchain mounts under `/bin`, `/lib`, `/share`, `/include`, and `/etc`.
+- local raw WASIX module runs now stage the sandbox's pinned toolchain runtime before launch, so child `exec` from a test or user program can resolve standard commands such as `/bin/ls` through the same real toolchain files used by named sandbox commands.
 
 ## Toolchain Status
 
@@ -1145,6 +1148,95 @@ error if `wasi_thread_start`, the thread id, or the start pointer cannot be
   dynamically linked children admitted through the linker-instance-group path.
   Asyncify unwind/rewind now uses main module handles, and `proc_fork` attempts
   dynamically linked vfork-style execution instead of rejecting it up front.
+  WASIX process-shared mappings use host in-memory backing for true
+  cross-process sharing, with explicit publication and pull at fork, wait,
+  sleep, process exit, and synchronization-object boundaries. Same-process
+  pthreads keep ordinary `MAP_SHARED` data in native WASM shared memory and use
+  runtime objects only for process-shared mutex, condition-variable, rwlock,
+  semaphore, and futex coordination. This avoids stale backing snapshots
+  overwriting fresh thread writes while preserving direct `fork` plus
+  `MAP_SHARED` visibility at POSIX synchronization points. Direct host remapping
+  of Wasmer linear-memory pages remains disabled because fixed mappings were
+  nondeterministic under fork; closing that gap is still required for arbitrary
+  cross-process shared-memory protocols that do not use POSIX synchronization
+  calls. Linux uses anonymous `memfd` backing; Windows has an anonymous
+  page-file mapping abstraction, with full Windows linear-memory remapping still pending. Asyncify deep-sleep
+  waiters process pending signals and then continue polling ready work in the
+  same wake, so `SIGCHLD` delivery no longer leaves a ready `waitpid(-1)` join
+  path asleep. Focused verification now covers a pthread `MAP_SHARED`
+  visibility loop, `pthread_cond_broadcast/1-2.c`, the full
+  `pthread_cond_broadcast` C directory, the full `pthread_cond_signal` C
+  directory, the full `pthread_mutex_lock` C directory, a direct `fork` plus
+  `MAP_SHARED` probe, `pthread_cancel`, `pthread_barrier`, and the full
+  `pthread_rwlock` C family with 43 compile/link/run passes, with the 14
+  shell-wrapped cases recorded as unsupported when shell execution is disabled. The
+  current `fork` interface run compiles and links all 19 C cases and runs 18 of
+  19 cases successfully after child-side signal masks, pending self signals,
+  interval timers, POSIX `timer_create`/`timer_settime` with `SIGEV_THREAD`,
+  runtime-backed POSIX message queues, `times(2)`, process CPU clock offsets,
+  `kill(pid, 0)` `ESRCH` reporting, per-process shared mapping remap tracking,
+  stdio lock cleanup, and wait-side shared mapping refresh were fixed. The
+  runtime now keeps upstream wasix-libc `fork` cleanup in place and registers
+  Sinomo's child-side WASIX cleanup through an atfork hook instead of replacing
+  libc `fork`. The sysroot now owns the POSIX `pthread_atfork` registry and
+  fork-handler ordering so atfork registration can also reach runtime signal
+  checkpoints; focused `pthread_atfork` coverage passes all 7 C cases after
+  `kill(getpid(), sig)` was changed to route process-directed self-signals
+  through runtime thread selection instead of storing them as caller-local
+  pending signals when the sending thread blocks the signal. The focused
+  `pthread_cond_timedwait/2-5.c` case now passes under a 256-task host cgroup
+  after the WASIX task cap stopped dividing available cgroup task slots by 32,
+  and the runtime shared-condvar wait path now returns POSIX `ETIMEDOUT` on
+  timeout instead of reporting success to the guest. The full `pthread_cond`
+  family still has timed-wait failures around lost wakeups after mixed
+  shared-mapping scenarios and short-timeout cross-process relock fairness, so
+  condition variables remain partial rather than fully passing. The remaining fork
+  case, `fork/7-1.c`, is unresolved because of a missing upstream test artifact.
+  POSIX message queues are now backed by runtime-owned queue objects and
+  descriptors rather than guest-local storage: descriptors keep open queue
+  objects alive across `mq_unlink`, enforce read-only/write-only access modes,
+  share named queues across forked processes, validate POSIX name and attribute
+  limits, expose `MQ_PRIO_MAX`, reject oversized messages with `EMSGSIZE`, and
+  order messages by descending priority. Focused `mq_open` coverage now compiles
+  and links all 37 C cases, with 27 passes, 9 upstream `UNTESTED` cases, and one
+  remaining race-sensitive parent/child `O_CREAT | O_EXCL` case. Focused
+  `mq_send` coverage now compiles and links all 19 C cases, with 18 passes and
+  one upstream `UNTESTED` priority-scheduling case after runtime-backed blocking
+  full-queue waits, sender wakeups, and handler-driven `EINTR` delivery were
+  added. Focused `mq_receive` coverage now compiles, links, and runs all 10 C
+  cases successfully after receive-side `EMSGSIZE`, blocking empty-queue waits,
+  receiver wakeups, and handler-driven `EINTR` delivery were added; the two
+  shell cases remain unsupported while shell execution is disabled. Timed queue
+  operations now lower through deadline-aware WASIX imports instead of reusing
+  the untimed calls: `mq_timedreceive` validates absolute `timespec` deadlines
+  only when the queue would block, returns `ETIMEDOUT` for expired deadlines,
+  and still wakes on sends or handled signals; `mq_timedsend` has symmetric
+  full-queue deadline behavior. Focused `mq_timedreceive` coverage now compiles,
+  links, and runs all 19 C cases successfully, with three shell cases unsupported
+  while shell execution is disabled. Focused `mq_timedsend` coverage compiles
+  and links all 27 C cases, with 25 passes and two upstream `UNTESTED` cases.
+  `mq_getattr` and `mq_setattr` now persist descriptor-level `O_NONBLOCK`
+  updates through runtime state, and `mq_notify` supports `SIGEV_SIGNAL`
+  registration, one-shot delivery, unregister, `EBUSY` on duplicate
+  registration, and suppression while a receiver is already blocked. Focused
+  `mq_getattr`, `mq_setattr`, and `mq_notify` coverage now passes every
+  supported C case, with shell cases still recorded as unsupported while shell
+  execution is disabled. `mq_close` now removes the notification registration
+  owned by the closed descriptor, and the runtime accepts signal-zero
+  notification registrations as no-signal registrations for the POSIX lifecycle
+  cases. Focused `mq_close` coverage passes the six supported C cases with one
+  upstream `UNTESTED` undefined-behavior case, and focused `mq_unlink` coverage
+  passes its five supported C cases with shell and upstream `UNTESTED` cases
+  recorded separately.
+  POSIX sleep delivery now uses an interruptible wait that reports `EINTR` for
+  handled signals while preserving default `SIGSTOP`/`SIGCONT` behavior; the
+  focused `nanosleep` C group compiles, links, and runs all 12 C cases
+  successfully, with the one shell case still unsupported while shell execution
+  is disabled.
+  Runtime-backed semaphore waits now treat a processed guest signal as an
+  interruptible wait and return `EINTR`; this fixes `sem_wait/7-1.c`, where a
+  child blocked in `sem_wait` installs a signal handler and expects the wait to
+  return after the parent sends `SIGABRT`.
   WASIX descriptor duplication now honors minimum-result-fd allocation, and
   `posix_spawn` dup2 file actions report failed descriptor installation.
   WASI `fd_renumber` and WASIX `posix_spawn` dup2 preserve source descriptor

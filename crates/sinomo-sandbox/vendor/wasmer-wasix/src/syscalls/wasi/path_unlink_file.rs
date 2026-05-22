@@ -90,14 +90,9 @@ pub(crate) fn path_unlink_file_internal(
         let guard = removed_inode.read();
         match guard.deref() {
             Kind::File { handle, path, .. } => {
-                if let Some(h) = handle {
-                    let mut h = h.write().unwrap();
-                    wasi_try_ok!(h.unlink().map_err(fs_error_into_wasi_err));
-                } else {
-                    let path = path.clone();
-                    drop(guard);
-                    wasi_try_ok!(state.fs_remove_file(path));
-                }
+                let path = path.clone();
+                drop(guard);
+                wasi_try_ok!(state.fs_remove_file(path));
             }
             Kind::Dir { .. } | Kind::Root { .. } => return Ok(Errno::Isdir),
             Kind::Symlink { .. } => {

@@ -20,6 +20,9 @@ pub fn thread_signal(
         if ctx.data().process.signal_thread(&tid, sig) {
             if sig == Signal::Sigwakeup {
                 wake_all_futex_waiters(ctx.data().state.deref());
+            } else if sig != Signal::Signone {
+                wake_futex_waiters_for_thread(ctx.data().state.deref(), tid.raw());
+                wake_shared_cond_waiters_for_thread(ctx.data().state.deref(), tid.raw());
             }
             Errno::Success
         } else {
@@ -61,6 +64,8 @@ fn wake_all_futex_waiters(state: &crate::state::WasiState) {
         };
         for poller_idx in woken {
             guard.poller_futexes.remove(&poller_idx);
+            guard.poller_threads.remove(&poller_idx);
+            guard.interrupted_pollers.remove(&poller_idx);
             guard.woken_pollers.insert(poller_idx);
         }
     }

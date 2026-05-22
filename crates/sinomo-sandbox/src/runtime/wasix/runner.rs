@@ -14,7 +14,8 @@ use super::output::WasixStreamingOutputCapture;
 use super::preopen::{validate_wasix_current_dir, validate_wasix_preopen_tree};
 #[cfg(feature = "wasix-runtime")]
 use super::process::{
-    run_wasix_process_tree, sandbox_wasix_capabilities, wasix_command_exceeded_requested_timeout,
+    effective_sandbox_wasix_task_limit, run_wasix_process_tree,
+    sandbox_wasix_capabilities_with_task_limit, wasix_command_exceeded_requested_timeout,
     wasix_exit_status,
 };
 #[cfg(feature = "wasix-runtime")]
@@ -303,7 +304,11 @@ fn run_wasix_module_on_worker_thread(
     if let Some(metadata_host_path) = &options.metadata_host_path {
         runner.with_sinomo_metadata_root(metadata_host_path.clone());
     }
-    runner.with_capabilities(sandbox_wasix_capabilities());
+    let task_limit = effective_sandbox_wasix_task_limit();
+    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+        eprintln!("sinomo-debug wasix task_limit={task_limit}");
+    }
+    runner.with_capabilities(sandbox_wasix_capabilities_with_task_limit(task_limit));
     runner.with_args(request.argv.iter().skip(1).cloned());
     let mut env = wasix_environment(
         &request,
@@ -378,6 +383,7 @@ fn run_wasix_module_on_worker_thread(
         module_hash,
         options.memory_limit_bytes,
         request.timeout_ms,
+        task_limit,
         options.cancellation.clone(),
     );
     drop(tokio_enter);

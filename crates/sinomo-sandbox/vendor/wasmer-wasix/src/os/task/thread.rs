@@ -365,6 +365,10 @@ impl WasiThread {
         &self.state.signals
     }
 
+    pub fn pending_signals(&self) -> Vec<Signal> {
+        self.state.signals.lock().unwrap().0.clone()
+    }
+
     pub fn set_status_running(&self) {
         self.state.status.set_running();
     }

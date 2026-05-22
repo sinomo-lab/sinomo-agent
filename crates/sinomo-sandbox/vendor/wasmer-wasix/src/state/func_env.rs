@@ -136,6 +136,36 @@ fn write_guest_u32(memory: &MemoryView, address: u64, value: u32) -> bool {
     true
 }
 
+fn publish_shared_memory_from_guest(memory: &MemoryView, state: &crate::state::WasiState, pid: u32) {
+    if !state.has_shared_memory_mappings() {
+        return;
+    }
+    let data = unsafe { memory.data_unchecked() };
+    for mapping in state.shared_memory_mappings_for_pid(pid) {
+        let Some(start) = usize::try_from(mapping.offset).ok() else {
+            continue;
+        };
+        let Some(len) = usize::try_from(mapping.len).ok() else {
+            continue;
+        };
+        let Some(end) = start.checked_add(len) else {
+            continue;
+        };
+        let Some(bytes) = data.get(start..end) else {
+            continue;
+        };
+        if let Err(err) = mapping.write_bytes(bytes) {
+            tracing::warn!(
+                pid,
+                mapping_offset = mapping.offset,
+                mapping_len = mapping.len,
+                ?err,
+                "failed to publish shared memory during thread exit"
+            );
+        }
+    }
+}
+
 fn guest_address_add(base: u64, offset: i64) -> Option<u64> {
     if offset >= 0 {
         base.checked_add(offset as u64)
@@ -531,6 +561,7 @@ impl WasiFunctionEnv {
         if let Some((head, len)) = robust_list {
             cleanup_robust_futex_list(&memory, env.state(), tid, head, len);
         }
+        publish_shared_memory_from_guest(&memory, env.state(), env.pid().raw());
     }
 
     /// Bootstraps this main thread and context with any journals that

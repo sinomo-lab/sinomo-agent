@@ -17,6 +17,8 @@
 #define SINOMO_COND_SEQ_WORD 2
 #define SINOMO_COND_WAITERS_WORD 3
 #define SINOMO_COND_CLOCK_WORD 4
+#define SINOMO_COND_RUNTIME_WORDS 5
+#define SINOMO_COND_RUNTIME_BYTES (SINOMO_COND_RUNTIME_WORDS * sizeof(int))
 #ifndef SINOMO_PTHREAD_DEBUG
 #define SINOMO_PTHREAD_DEBUG 0
 #endif
@@ -40,24 +42,65 @@ uint32_t __sinomo_wasix_shared_cond_sequence(uintptr_t offset)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_cond_sequence")));
 uint32_t __sinomo_wasix_shared_cond_broadcast(uintptr_t offset)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_cond_broadcast")));
+int32_t __sinomo_wasix_shared_cond_wait(uintptr_t offset, uint32_t expected_seq, int64_t timeout_ns)
+    __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_cond_wait")));
 uint32_t __sinomo_wasix_shared_memory_is_cross_process(void)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_is_cross_process")));
+uint32_t __sinomo_wasix_shared_memory_was_cross_process(void)
+    __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_was_cross_process")));
 
 int __wasilibc_futex_wait_wasix(volatile void *addr, int op, int expected, int64_t max_wait_ns);
 int __wasilibc_futex_wake_wasix(int *futex, int cnt);
+void pthread_testcancel(void);
+
+struct sinomo_wasix_pthread_cond_cancel_state {
+    uintptr_t self;
+    uintptr_t prev;
+    uintptr_t next;
+    uintptr_t sysinfo;
+    uintptr_t canary;
+    int32_t tid;
+    int32_t errno_val;
+    volatile int32_t detach_state;
+    volatile int32_t cancel;
+    uint8_t canceldisable;
+    uint8_t cancelasync;
+};
+
+extern _Thread_local struct sinomo_wasix_pthread_cond_cancel_state *__wasilibc_pthread_self;
+
+static int pthread_cancel_defer_for_cond_relock(void) {
+    struct sinomo_wasix_pthread_cond_cancel_state *self = __wasilibc_pthread_self;
+    if (self == 0)
+        return PTHREAD_CANCEL_ENABLE;
+    int old = self->canceldisable;
+    self->canceldisable = PTHREAD_CANCEL_DISABLE;
+    return old;
+}
+
+static void pthread_cancel_restore_after_cond_relock(int old_state) {
+    struct sinomo_wasix_pthread_cond_cancel_state *self = __wasilibc_pthread_self;
+    if (self != 0)
+        self->canceldisable = (uint8_t)old_state;
+}
 
 static int cond_is_shared(const pthread_cond_t *cond) {
     return cond->__u.__i[SINOMO_COND_SHARED_WORD] == SINOMO_COND_SHARED;
 }
 
 static int needs_runtime_shared_cond(const pthread_cond_t *cond) {
-    return cond_is_shared(cond) && __sinomo_wasix_shared_memory_is_cross_process() != 0;
+    return cond_is_shared(cond) && __sinomo_wasix_shared_memory_was_cross_process() != 0;
+}
+
+static int needs_shared_memory_sync(void) {
+    return __sinomo_wasix_shared_memory_is_cross_process() != 0 ||
+           __sinomo_wasix_shared_memory_was_cross_process() != 0;
 }
 
 static int sync_to_if_shared(const pthread_cond_t *cond) {
     if (!cond_is_shared(cond))
         return 0;
-    if (__sinomo_wasix_shared_memory_is_cross_process() == 0)
+    if (!needs_shared_memory_sync())
         return 0;
     int32_t err = __sinomo_wasix_shared_memory_range_sync_to((uintptr_t)cond, (uintptr_t)sizeof(*cond));
     return err == 0 ? 0 : (int)err;
@@ -66,7 +109,7 @@ static int sync_to_if_shared(const pthread_cond_t *cond) {
 static int sync_from_if_shared(const pthread_cond_t *cond) {
     if (!cond_is_shared(cond))
         return 0;
-    if (__sinomo_wasix_shared_memory_is_cross_process() == 0)
+    if (!needs_shared_memory_sync())
         return 0;
     int32_t err = __sinomo_wasix_shared_memory_range_sync_from((uintptr_t)cond, (uintptr_t)sizeof(*cond));
     return err == 0 ? 0 : (int)err;
@@ -75,7 +118,7 @@ static int sync_from_if_shared(const pthread_cond_t *cond) {
 static int sync_waiters_from_if_shared(const pthread_cond_t *cond) {
     if (!cond_is_shared(cond))
         return 0;
-    if (__sinomo_wasix_shared_memory_is_cross_process() == 0)
+    if (!needs_shared_memory_sync())
         return 0;
     int32_t err = __sinomo_wasix_shared_memory_range_sync_from(
         (uintptr_t)&cond->__u.__vi[SINOMO_COND_WAITERS_WORD],
@@ -86,7 +129,7 @@ static int sync_waiters_from_if_shared(const pthread_cond_t *cond) {
 static int sync_non_futex_state_from_guest_if_shared(const pthread_cond_t *cond) {
     if (!cond_is_shared(cond))
         return 0;
-    if (__sinomo_wasix_shared_memory_is_cross_process() == 0)
+    if (!needs_shared_memory_sync())
         return 0;
     int32_t err = __sinomo_wasix_shared_memory_sync_from_preserving_futexes();
     return err == 0 ? 0 : (int)err;
@@ -107,14 +150,11 @@ static int64_t abstime_to_wait_ns(clockid_t clock_id, const struct timespec *abs
         now_sec = (int64_t)tv.tv_sec;
         now_nsec = (int64_t)tv.tv_usec * 1000LL;
     } else if (clock_id == CLOCK_MONOTONIC) {
-        __wasi_timestamp_t now_timestamp = 0;
-        __wasi_errno_t error = __wasi_clock_time_get(__WASI_CLOCKID_MONOTONIC, 1, &now_timestamp);
-        if (error != 0) {
-            errno = (int)error;
+        struct timespec now;
+        if (clock_gettime(clock_id, &now) != 0)
             return INT64_MIN + 1;
-        }
-        now_sec = (int64_t)(now_timestamp / 1000000000u);
-        now_nsec = (int64_t)(now_timestamp % 1000000000u);
+        now_sec = (int64_t)now.tv_sec;
+        now_nsec = (int64_t)now.tv_nsec;
     } else {
         return INT64_MIN + 1;
     }
@@ -130,12 +170,12 @@ int pthread_cond_init(pthread_cond_t *restrict cond, const pthread_condattr_t *r
         return EINVAL;
 
     unsigned flags = attr == 0 ? 0 : attr->__attr;
-    (void)__sinomo_wasix_shared_futex_unhint((uintptr_t)cond, (uintptr_t)sizeof(*cond));
+    (void)__sinomo_wasix_shared_futex_unhint((uintptr_t)cond, (uintptr_t)SINOMO_COND_RUNTIME_BYTES);
     memset(cond, 0, sizeof(*cond));
     cond->__u.__i[SINOMO_COND_SHARED_WORD] = (flags & SINOMO_COND_PSHARED_ATTR) != 0 ? SINOMO_COND_SHARED : 0;
     cond->__u.__i[SINOMO_COND_CLOCK_WORD] = (int)(flags & SINOMO_COND_CLOCK_MASK);
     if ((flags & SINOMO_COND_PSHARED_ATTR) != 0) {
-        int32_t hint = __sinomo_wasix_shared_futex_hint((uintptr_t)cond, (uintptr_t)sizeof(*cond));
+        int32_t hint = __sinomo_wasix_shared_futex_hint((uintptr_t)cond, (uintptr_t)SINOMO_COND_RUNTIME_BYTES);
         if (hint != 0)
             return (int)hint;
         if (__sinomo_wasix_shared_memory_is_cross_process() != 0) {
@@ -155,13 +195,6 @@ int pthread_cond_destroy(pthread_cond_t *cond) {
     int cross_process = __sinomo_wasix_shared_memory_is_cross_process() != 0;
     if (shared && cross_process) {
         int32_t err = __sinomo_wasix_shared_memory_sync_to();
-        if (err != 0)
-            return (int)err;
-    }
-    (void)__sinomo_wasix_shared_futex_unhint((uintptr_t)cond, (uintptr_t)sizeof(*cond));
-    memset(cond, 0, sizeof(*cond));
-    if (shared && cross_process) {
-        int32_t err = __sinomo_wasix_shared_memory_sync_from();
         if (err != 0)
             return (int)err;
     }
@@ -207,11 +240,6 @@ int pthread_cond_broadcast(pthread_cond_t *cond) {
     int ret = sync_non_futex_state_from_guest_if_shared(cond);
     if (ret != 0)
         return ret;
-    if (cond_is_shared(cond)) {
-        SINOMO_PTHREAD_LOG("sinomo-debug cond_broadcast after_sync_from pid=%d cond=%p seq=%d waiters=%d\n",
-            (int)getpid(), (void *)cond, cond->__u.__vi[SINOMO_COND_SEQ_WORD],
-            cond->__u.__vi[SINOMO_COND_WAITERS_WORD]);
-    }
     ret = sync_to_if_shared(cond);
     if (ret != 0)
         return ret;
@@ -242,6 +270,7 @@ int pthread_cond_timedwait(pthread_cond_t *restrict cond, pthread_mutex_t *restr
     int ret = 0;
     int seq = __atomic_load_n(&words[SINOMO_COND_SEQ_WORD], __ATOMIC_SEQ_CST);
     clockid_t clock_id = (clockid_t)words[SINOMO_COND_CLOCK_WORD];
+    int runtime_shared = needs_runtime_shared_cond(cond);
     int64_t wait_ns = abstime_to_wait_ns(clock_id, abstime);
     if (wait_ns == INT64_MIN) {
         if (cond_is_shared(cond)) {
@@ -252,6 +281,10 @@ int pthread_cond_timedwait(pthread_cond_t *restrict cond, pthread_mutex_t *restr
     }
     if (wait_ns == INT64_MIN + 1)
         return errno == 0 ? EINVAL : errno;
+
+    SINOMO_PTHREAD_LOG("sinomo-debug cond_wait enter pid=%d cond=%p mutex=%p clock=%d seq=%d wait_ns=%lld waiters=%d\n",
+        (int)getpid(), (void *)cond, (void *)mutex, (int)clock_id, seq,
+        (long long)wait_ns, words[SINOMO_COND_WAITERS_WORD]);
 
     words[SINOMO_COND_SEQ_WORD] = seq;
     __atomic_add_fetch(&words[SINOMO_COND_WAITERS_WORD], 1, __ATOMIC_SEQ_CST);
@@ -265,25 +298,24 @@ int pthread_cond_timedwait(pthread_cond_t *restrict cond, pthread_mutex_t *restr
 
     ret = pthread_mutex_unlock(mutex);
     if (ret != 0) {
+        SINOMO_PTHREAD_LOG("sinomo-debug cond_wait unlock_failed pid=%d cond=%p mutex=%p ret=%d\n",
+            (int)getpid(), (void *)cond, (void *)mutex, ret);
         __atomic_sub_fetch(&words[SINOMO_COND_WAITERS_WORD], 1, __ATOMIC_SEQ_CST);
         (void)sync_waiters_from_if_shared(cond);
         return ret;
     }
+    SINOMO_PTHREAD_LOG("sinomo-debug cond_wait unlocked pid=%d cond=%p mutex=%p seq=%d wait_ns=%lld waiters=%d\n",
+        (int)getpid(), (void *)cond, (void *)mutex, seq, (long long)wait_ns,
+        words[SINOMO_COND_WAITERS_WORD]);
 
-    if (needs_runtime_shared_cond(cond)) {
+    if (runtime_shared) {
         unsigned spin_count = 0;
         for (;;) {
-            int sync_before_wait_ret = sync_to_if_shared(cond);
-            if (sync_before_wait_ret != 0) {
-                ret = sync_before_wait_ret;
-                break;
-            }
             int current_seq = (int)__sinomo_wasix_shared_cond_sequence((uintptr_t)cond);
             words[SINOMO_COND_SEQ_WORD] = current_seq;
             if (current_seq != seq) {
-                SINOMO_PTHREAD_LOG("sinomo-debug cond_wait observed pid=%d cond=%p old_seq=%d new_seq=%d waiters=%d\n",
-                    (int)getpid(), (void *)cond, seq, current_seq,
-                    words[SINOMO_COND_WAITERS_WORD]);
+                SINOMO_PTHREAD_LOG("sinomo-debug cond_wait observed pid=%d cond=%p old_seq=%d new_seq=%d\n",
+                    (int)getpid(), (void *)cond, seq, current_seq);
                 ret = 0;
                 break;
             }
@@ -310,19 +342,22 @@ int pthread_cond_timedwait(pthread_cond_t *restrict cond, pthread_mutex_t *restr
                 ret = ETIMEDOUT;
                 break;
             }
-            int wait_ret = __wasilibc_futex_wait_wasix(&words[SINOMO_COND_SEQ_WORD], 0, seq, wait_ns);
-            if (wait_ret == -ETIMEDOUT) {
+            int wait_ret = __sinomo_wasix_shared_cond_wait((uintptr_t)cond, (uint32_t)seq, wait_ns);
+            if (wait_ret == ETIMEDOUT) {
                 ret = ETIMEDOUT;
                 break;
             }
-            if (wait_ret != 0 && wait_ret != -EAGAIN && wait_ret != -EINTR && wait_ret != -ECANCELED) {
-                ret = -wait_ret;
+            if (wait_ret != 0 && wait_ret != EINTR && wait_ret != ECANCELED) {
+                ret = wait_ret;
                 break;
             }
         }
     }
     else {
         int wait_ret = __wasilibc_futex_wait_wasix(&words[SINOMO_COND_SEQ_WORD], 0, seq, wait_ns);
+        SINOMO_PTHREAD_LOG("sinomo-debug cond_wait futex_return pid=%d cond=%p mutex=%p seq=%d wait_ret=%d current_seq=%d waiters=%d\n",
+            (int)getpid(), (void *)cond, (void *)mutex, seq, wait_ret,
+            words[SINOMO_COND_SEQ_WORD], words[SINOMO_COND_WAITERS_WORD]);
         if (wait_ret == -ETIMEDOUT)
             ret = ETIMEDOUT;
         else if (wait_ret == -EAGAIN || wait_ret == -EINTR || wait_ret == -ECANCELED || wait_ret == 0)
@@ -333,14 +368,24 @@ int pthread_cond_timedwait(pthread_cond_t *restrict cond, pthread_mutex_t *restr
             ret = wait_ret;
     }
 
-    __atomic_sub_fetch(&words[SINOMO_COND_WAITERS_WORD], 1, __ATOMIC_SEQ_CST);
-    (void)sync_waiters_from_if_shared(cond);
+    /*
+     * Do not touch the condvar after the wait has been released. POSIX allows
+     * another thread to broadcast, destroy the condvar, and reuse its storage
+     * once no thread is blocked on it; at this point this waiter has already
+     * been unblocked and only needs to reacquire the mutex before returning.
+     */
+    SINOMO_PTHREAD_LOG("sinomo-debug cond_wait relock_enter pid=%d cond=%p mutex=%p ret=%d\n",
+        (int)getpid(), (void *)cond, (void *)mutex, ret);
+    int old_cancel_state = pthread_cancel_defer_for_cond_relock();
     int lock_ret = pthread_mutex_lock(mutex);
-    int sync_ret = lock_ret == 0 ? sync_to_if_shared(cond) : 0;
-    if (lock_ret == 0)
+    pthread_cancel_restore_after_cond_relock(old_cancel_state);
+    SINOMO_PTHREAD_LOG("sinomo-debug cond_wait relock_done pid=%d cond=%p mutex=%p ret=%d lock_ret=%d old_cancel_state=%d\n",
+        (int)getpid(), (void *)cond, (void *)mutex, ret, lock_ret, old_cancel_state);
+    if (lock_ret == 0) {
+        SINOMO_PTHREAD_LOG("sinomo-debug cond_wait testcancel pid=%d cond=%p mutex=%p\n",
+            (int)getpid(), (void *)cond, (void *)mutex);
         pthread_testcancel();
-    if (ret == 0 && sync_ret != 0)
-        ret = sync_ret;
+    }
     if (ret == 0 && lock_ret != 0)
         ret = lock_ret;
     return ret;

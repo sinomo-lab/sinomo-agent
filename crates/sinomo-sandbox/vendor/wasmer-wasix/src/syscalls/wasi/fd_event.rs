@@ -1,7 +1,11 @@
 use super::*;
 use crate::{
     fs::NotificationInner,
-    state::{WasiIntervalTimer, WasiPosixTimer, WasiSignalFd, WasiTimerFd},
+    state::{
+        WasiIntervalTimer, WasiMessageQueue, WasiMessageQueueDescriptor, WasiMessageQueueHandle,
+        WasiMessageQueueMessage, WasiMessageQueueNotification, WasiPosixTimer, WasiSignalFd,
+        WasiTimerFd,
+    },
     syscalls::*,
 };
 use wasmer::FromToNativeWasmType;
@@ -23,6 +27,143 @@ const LINUX_ITIMER_PROF: i32 = 2;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const NANOS_PER_USEC: u64 = 1_000;
 const POSIX_TIMER_LIMIT: u32 = 64;
+const POSIX_MQUEUE_DESCRIPTOR_LIMIT: i32 = 16_384;
+const POSIX_MQUEUE_NAME_MAX: usize = 255;
+const POSIX_MQUEUE_PATH_MAX: usize = 4096;
+const POSIX_MQUEUE_PRIO_MAX: u32 = 32_768;
+const POSIX_O_ACCMODE: i32 = 0o3;
+const POSIX_O_RDONLY: i32 = 0;
+const POSIX_O_WRONLY: i32 = 1;
+const POSIX_O_RDWR: i32 = 2;
+const WASIX_O_NONBLOCK: i32 = 1 << 2;
+const WASIX_O_RDONLY: i32 = 0x0400_0000;
+const WASIX_O_WRONLY: i32 = 0x1000_0000;
+const POSIX_MQUEUE_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MqueueAccessMode {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+fn mqueue_access_mode(flags: i32) -> Option<MqueueAccessMode> {
+    let wasix_read = flags & WASIX_O_RDONLY != 0;
+    let wasix_write = flags & WASIX_O_WRONLY != 0;
+    match (wasix_read, wasix_write) {
+        (true, true) => return Some(MqueueAccessMode::ReadWrite),
+        (true, false) => return Some(MqueueAccessMode::ReadOnly),
+        (false, true) => return Some(MqueueAccessMode::WriteOnly),
+        (false, false) => {}
+    }
+
+    match flags & POSIX_O_ACCMODE {
+        POSIX_O_RDONLY => Some(MqueueAccessMode::ReadOnly),
+        POSIX_O_WRONLY => Some(MqueueAccessMode::WriteOnly),
+        POSIX_O_RDWR => Some(MqueueAccessMode::ReadWrite),
+        _ => None,
+    }
+}
+
+fn mqueue_nonblocking(flags: i32) -> bool {
+    flags & (WASIX_O_NONBLOCK | LINUX_EFD_NONBLOCK | LINUX_TFD_NONBLOCK) != 0
+}
+
+fn mqueue_update_nonblocking_flags(current_flags: i32, new_flags: i64) -> i32 {
+    let mut flags = current_flags & !(WASIX_O_NONBLOCK | LINUX_EFD_NONBLOCK | LINUX_TFD_NONBLOCK);
+    if new_flags & i64::from(WASIX_O_NONBLOCK | LINUX_EFD_NONBLOCK | LINUX_TFD_NONBLOCK) != 0 {
+        flags |= WASIX_O_NONBLOCK;
+    }
+    flags
+}
+
+fn mqueue_insert_message(queue: &mut WasiMessageQueue, priority: u32, bytes: Vec<u8>) {
+    let insert_at = queue
+        .messages
+        .iter()
+        .position(|message| priority > message.priority)
+        .unwrap_or(queue.messages.len());
+    queue
+        .messages
+        .insert(insert_at, WasiMessageQueueMessage { priority, bytes });
+}
+
+fn mqueue_take_notification(queue: &mut WasiMessageQueue) -> Option<WasiMessageQueueNotification> {
+    if queue.messages.len() != 1 || queue.blocked_receivers != 0 {
+        return None;
+    }
+    queue.notification.take()
+}
+
+fn mqueue_deliver_notification(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    notification: WasiMessageQueueNotification,
+) -> Result<(), WasiError> {
+    if notification.signal == Signal::Signone {
+        return Ok(());
+    }
+    if let Some(process) = ctx
+        .data()
+        .control_plane
+        .get_process(notification.pid.into())
+    {
+        process.signal_process_direct(notification.signal);
+        if notification.pid == ctx.data().pid().raw() {
+            let _ = process_pending_operations_interruptibly(ctx)?;
+        }
+    }
+    Ok(())
+}
+
+fn mqueue_abs_timeout_ns(timeout_sec: i64, timeout_nsec: i64) -> Result<u64, Errno> {
+    if !(0..NANOS_PER_SEC as i64).contains(&timeout_nsec) {
+        return Err(Errno::Inval);
+    }
+    if timeout_sec < 0 {
+        return Ok(0);
+    }
+    let seconds = u64::try_from(timeout_sec).map_err(|_| Errno::Overflow)?;
+    seconds
+        .checked_mul(NANOS_PER_SEC)
+        .and_then(|base| base.checked_add(timeout_nsec as u64))
+        .ok_or(Errno::Overflow)
+}
+
+fn mqueue_wait_duration(
+    ctx: &FunctionEnvMut<'_, WasiEnv>,
+    deadline: Option<(i64, i64)>,
+) -> Result<Option<std::time::Duration>, Errno> {
+    let Some((timeout_sec, timeout_nsec)) = deadline else {
+        return Ok(Some(POSIX_MQUEUE_WAIT_SLICE));
+    };
+    let deadline_ns = mqueue_abs_timeout_ns(timeout_sec, timeout_nsec)?;
+    let now = timerfd_now(ctx, Snapshot0Clockid::Realtime).map_err(|_| Errno::Io)?;
+    if now >= deadline_ns {
+        return Ok(None);
+    }
+    let remaining = std::time::Duration::from_nanos(deadline_ns - now);
+    Ok(Some(remaining.min(POSIX_MQUEUE_WAIT_SLICE)))
+}
+
+fn process_pending_operations_interruptibly(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+) -> Result<bool, WasiError> {
+    WasiEnv::do_pending_link_operations(ctx, true)?;
+    if let Some(forced_exit) = ctx.data().should_exit() {
+        return Err(WasiError::Exit(forced_exit));
+    }
+    let signals = ctx.data().thread.pop_signals();
+    if signals.is_empty() {
+        return Ok(false);
+    }
+    WasiEnv::process_signals_internal(ctx, signals)
+}
+
+fn sinomo_mqueue_debug(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+        eprintln!("sinomo-debug mqueue {args}");
+    }
+}
 
 /// ### `fd_event()`
 /// Creates a file handle for event notifications
@@ -561,6 +702,477 @@ pub fn posix_timer_delete(
         Ok(0)
     } else {
         Ok(-Errno::Inval.to_native())
+    }
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_open<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    name_ptr: WasmPtr<u8, M>,
+    name_len: M::Offset,
+    flags: i32,
+    create: i32,
+    exclusive: i32,
+    has_attr: i32,
+    max_messages: u64,
+    message_size: u64,
+) -> Result<i32, WasiError> {
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    let name = match name_ptr.read_utf8_string(&memory, name_len) {
+        Ok(name) => name,
+        Err(err) => return Ok(-mem_error_to_wasi(err).to_native()),
+    };
+    if !name.starts_with('/') || name.len() < 2 {
+        return Ok(-Errno::Inval.to_native());
+    }
+    if name.len() >= POSIX_MQUEUE_PATH_MAX || name[1..].len() > POSIX_MQUEUE_NAME_MAX {
+        return Ok(-Errno::Nametoolong.to_native());
+    }
+    if name[1..].contains('/') {
+        return Ok(-Errno::Access.to_native());
+    }
+    if mqueue_access_mode(flags).is_none() {
+        return Ok(-Errno::Inval.to_native());
+    }
+
+    let mut state = ctx.data().state.message_queues.lock().unwrap();
+    let existing = state.queues.get(&name).cloned();
+    let exists = existing.is_some();
+    if exists && create != 0 && exclusive != 0 {
+        return Ok(-Errno::Exist.to_native());
+    }
+    let queue = if let Some(queue) = existing {
+        queue
+    } else {
+        if create == 0 {
+            return Ok(-Errno::Noent.to_native());
+        }
+        let max_messages = if has_attr == 0 { 10 } else { max_messages };
+        let message_size = if has_attr == 0 { 8192 } else { message_size };
+        if max_messages == 0
+            || message_size == 0
+            || max_messages > i64::MAX as u64
+            || message_size > i64::MAX as u64
+        {
+            return Ok(-Errno::Inval.to_native());
+        }
+        sinomo_mqueue_debug(format_args!(
+            "open name={} flags={:#x} has_attr={} max_messages={} message_size={}",
+            name, flags, has_attr, max_messages, message_size
+        ));
+        let queue = Arc::new(WasiMessageQueueHandle {
+            state: Mutex::new(WasiMessageQueue {
+                max_messages,
+                message_size,
+                messages: Default::default(),
+                blocked_receivers: 0,
+                notification: None,
+            }),
+            send_waiters: std::sync::Condvar::new(),
+            receive_waiters: std::sync::Condvar::new(),
+        });
+        state.queues.insert(name.clone(), queue.clone());
+        queue
+    };
+
+    let descriptor = (1..=POSIX_MQUEUE_DESCRIPTOR_LIMIT)
+        .map(|offset| {
+            let next = state.next_descriptor.saturating_add(offset);
+            if next <= 0 { offset } else { next }
+        })
+        .find(|candidate| !state.descriptors.contains_key(candidate));
+    let Some(descriptor) = descriptor else {
+        return Ok(-Errno::Mfile.to_native());
+    };
+    state.next_descriptor = descriptor;
+    state.descriptors.insert(
+        descriptor,
+        WasiMessageQueueDescriptor {
+            flags,
+            queue,
+        },
+    );
+    Ok(descriptor)
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_send<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    message_ptr: WasmPtr<u8, M>,
+    message_len: M::Offset,
+    priority: u32,
+) -> Result<i32, WasiError> {
+    mqueue_send_internal(
+        ctx,
+        descriptor,
+        message_ptr,
+        message_len,
+        priority,
+        None,
+    )
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_timedsend<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    message_ptr: WasmPtr<u8, M>,
+    message_len: M::Offset,
+    priority: u32,
+    timeout_sec: i64,
+    timeout_nsec: i64,
+) -> Result<i32, WasiError> {
+    mqueue_send_internal(
+        ctx,
+        descriptor,
+        message_ptr,
+        message_len,
+        priority,
+        Some((timeout_sec, timeout_nsec)),
+    )
+}
+
+fn mqueue_send_internal<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    message_ptr: WasmPtr<u8, M>,
+    message_len: M::Offset,
+    priority: u32,
+    deadline: Option<(i64, i64)>,
+) -> Result<i32, WasiError> {
+    let message_len_usize = match usize::try_from(message_len.into()) {
+        Ok(len) => len,
+        Err(_) => return Ok(-Errno::Overflow.to_native()),
+    };
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    let message = match message_ptr
+        .slice(&memory, message_len)
+        .and_then(|slice| slice.read_to_vec())
+    {
+        Ok(message) => message,
+        Err(err) => return Ok(-mem_error_to_wasi(err).to_native()),
+    };
+    if message.len() != message_len_usize {
+        return Ok(-Errno::Inval.to_native());
+    }
+
+    let (queue, nonblock) = {
+        let state = ctx.data().state.message_queues.lock().unwrap();
+        let Some(descriptor) = state.descriptors.get(&descriptor) else {
+            return Ok(-Errno::Badf.to_native());
+        };
+        if mqueue_access_mode(descriptor.flags) == Some(MqueueAccessMode::ReadOnly) {
+            return Ok(-Errno::Badf.to_native());
+        }
+        (
+            descriptor.queue.clone(),
+            mqueue_nonblocking(descriptor.flags),
+        )
+    };
+
+    let mut waited_for_space = false;
+    loop {
+        let mut state = queue.state.lock().unwrap();
+        if priority >= POSIX_MQUEUE_PRIO_MAX {
+            return Ok(-Errno::Inval.to_native());
+        }
+        if message.len() > state.message_size as usize {
+            return Ok(-Errno::Msgsize.to_native());
+        }
+        if state.messages.len() < state.max_messages as usize {
+            sinomo_mqueue_debug(format_args!(
+                "send descriptor={} len={} priority={} before={} max={}",
+                descriptor,
+                message.len(),
+                priority,
+                state.messages.len(),
+                state.max_messages
+            ));
+            mqueue_insert_message(&mut state, priority, message.clone());
+            let notification = mqueue_take_notification(&mut state);
+            queue.receive_waiters.notify_one();
+            drop(state);
+            if let Some(notification) = notification {
+                mqueue_deliver_notification(&mut ctx, notification)?;
+            }
+            return Ok(0);
+        }
+        sinomo_mqueue_debug(format_args!(
+            "send-block descriptor={} len={} priority={} current={} max={} nonblock={}",
+            descriptor,
+            message.len(),
+            priority,
+            state.messages.len(),
+            state.max_messages,
+            nonblock
+        ));
+        if nonblock {
+            return Ok(-Errno::Again.to_native());
+        }
+        waited_for_space = true;
+        let wait_duration = match mqueue_wait_duration(&ctx, deadline) {
+            Ok(Some(wait_duration)) => wait_duration,
+            Ok(None) => return Ok(-Errno::Timedout.to_native()),
+            Err(err) => return Ok(-err.to_native()),
+        };
+        drop(
+            queue
+                .send_waiters
+                .wait_timeout(state, wait_duration)
+                .unwrap(),
+        );
+        if process_pending_operations_interruptibly(&mut ctx)? {
+            sinomo_mqueue_debug(format_args!("send-interrupted descriptor={}", descriptor));
+            return Ok(-Errno::Intr.to_native());
+        }
+    }
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_receive<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    buffer_ptr: WasmPtr<u8, M>,
+    buffer_len: M::Offset,
+    priority_ptr: WasmPtr<u32, M>,
+) -> Result<i32, WasiError> {
+    mqueue_receive_internal(ctx, descriptor, buffer_ptr, buffer_len, priority_ptr, None)
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_timedreceive<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    buffer_ptr: WasmPtr<u8, M>,
+    buffer_len: M::Offset,
+    priority_ptr: WasmPtr<u32, M>,
+    timeout_sec: i64,
+    timeout_nsec: i64,
+) -> Result<i32, WasiError> {
+    mqueue_receive_internal(
+        ctx,
+        descriptor,
+        buffer_ptr,
+        buffer_len,
+        priority_ptr,
+        Some((timeout_sec, timeout_nsec)),
+    )
+}
+
+fn mqueue_receive_internal<M: MemorySize>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    buffer_ptr: WasmPtr<u8, M>,
+    buffer_len: M::Offset,
+    priority_ptr: WasmPtr<u32, M>,
+    deadline: Option<(i64, i64)>,
+) -> Result<i32, WasiError> {
+    let buffer_len_usize = match usize::try_from(buffer_len.into()) {
+        Ok(len) => len,
+        Err(_) => return Ok(-Errno::Overflow.to_native()),
+    };
+    let (queue, nonblock) = {
+        let state = ctx.data().state.message_queues.lock().unwrap();
+        let Some(descriptor) = state.descriptors.get(&descriptor) else {
+            return Ok(-Errno::Badf.to_native());
+        };
+        if mqueue_access_mode(descriptor.flags) == Some(MqueueAccessMode::WriteOnly) {
+            return Ok(-Errno::Badf.to_native());
+        }
+        (
+            descriptor.queue.clone(),
+            mqueue_nonblocking(descriptor.flags),
+        )
+    };
+    let message = loop {
+        let mut state = queue.state.lock().unwrap();
+        if buffer_len_usize < state.message_size as usize {
+            return Ok(-Errno::Msgsize.to_native());
+        }
+        if let Some(message) = state.messages.pop_front() {
+            sinomo_mqueue_debug(format_args!(
+                "receive descriptor={} len={} priority={} remaining={} max={}",
+                descriptor,
+                message.bytes.len(),
+                message.priority,
+                state.messages.len(),
+                state.max_messages
+            ));
+            queue.send_waiters.notify_one();
+            break message;
+        }
+        if nonblock {
+            return Ok(-Errno::Again.to_native());
+        }
+        sinomo_mqueue_debug(format_args!(
+            "receive-block descriptor={} buffer_len={} max={}",
+            descriptor, buffer_len_usize, state.max_messages
+        ));
+        let wait_duration = match mqueue_wait_duration(&ctx, deadline) {
+            Ok(Some(wait_duration)) => wait_duration,
+            Ok(None) => return Ok(-Errno::Timedout.to_native()),
+            Err(err) => return Ok(-err.to_native()),
+        };
+        state.blocked_receivers = state.blocked_receivers.saturating_add(1);
+        let (mut state, _) = queue
+            .receive_waiters
+            .wait_timeout(state, wait_duration)
+            .unwrap();
+        state.blocked_receivers = state.blocked_receivers.saturating_sub(1);
+        drop(state);
+        if process_pending_operations_interruptibly(&mut ctx)? {
+            return Ok(-Errno::Intr.to_native());
+        }
+    };
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    let message_len = match to_offset::<M>(message.bytes.len()) {
+        Ok(len) => len,
+        Err(err) => return Ok(-err.to_native()),
+    };
+    if let Err(err) = buffer_ptr
+        .slice(&memory, message_len)
+        .map_err(mem_error_to_wasi)
+        .and_then(|slice| slice.write_slice(&message.bytes).map_err(mem_error_to_wasi))
+    {
+        return Ok(-err.to_native());
+    }
+    if !priority_ptr.is_null()
+        && let Err(err) = priority_ptr.write(&memory, message.priority)
+    {
+        return Ok(-mem_error_to_wasi(err).to_native());
+    }
+    Ok(message.bytes.len().min(i32::MAX as usize) as i32)
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_getattr<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    flags_ptr: WasmPtr<i64, M>,
+    maxmsg_ptr: WasmPtr<i64, M>,
+    msgsize_ptr: WasmPtr<i64, M>,
+    curmsgs_ptr: WasmPtr<i64, M>,
+) -> Result<i32, WasiError> {
+    let (flags, queue) = {
+        let state = ctx.data().state.message_queues.lock().unwrap();
+        let Some(descriptor) = state.descriptors.get(&descriptor) else {
+            return Ok(-Errno::Badf.to_native());
+        };
+        (descriptor.flags, descriptor.queue.clone())
+    };
+    let queue = queue.state.lock().unwrap();
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    for (ptr, value) in [
+        (flags_ptr, flags as i64),
+        (maxmsg_ptr, queue.max_messages.min(i64::MAX as u64) as i64),
+        (msgsize_ptr, queue.message_size.min(i64::MAX as u64) as i64),
+        (curmsgs_ptr, queue.messages.len().min(i64::MAX as usize) as i64),
+    ] {
+        if let Err(err) = ptr.write(&memory, value) {
+            return Ok(-mem_error_to_wasi(err).to_native());
+        }
+    }
+    Ok(0)
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_setattr(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    new_flags: i64,
+) -> Result<i32, WasiError> {
+    let mut state = ctx.data().state.message_queues.lock().unwrap();
+    let Some(descriptor) = state.descriptors.get_mut(&descriptor) else {
+        return Ok(-Errno::Badf.to_native());
+    };
+    descriptor.flags = mqueue_update_nonblocking_flags(descriptor.flags, new_flags);
+    Ok(0)
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_close(ctx: FunctionEnvMut<'_, WasiEnv>, descriptor: i32) -> Result<i32, WasiError> {
+    let removed = ctx
+        .data()
+        .state
+        .message_queues
+        .lock()
+        .unwrap()
+        .descriptors
+        .remove(&descriptor);
+    let Some(removed) = removed else {
+        return Ok(-Errno::Badf.to_native());
+    };
+    let mut queue = removed.queue.state.lock().unwrap();
+    if matches!(&queue.notification, Some(notification) if notification.descriptor == descriptor) {
+        queue.notification = None;
+    }
+    Ok(0)
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_notify(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    descriptor: i32,
+    has_notification: i32,
+    signal: u32,
+) -> Result<i32, WasiError> {
+    let queue = {
+        let state = ctx.data().state.message_queues.lock().unwrap();
+        let Some(descriptor) = state.descriptors.get(&descriptor) else {
+            return Ok(-Errno::Badf.to_native());
+        };
+        descriptor.queue.clone()
+    };
+    let mut queue = queue.state.lock().unwrap();
+    if has_notification == 0 {
+        let current_pid = ctx.data().pid().raw();
+        if matches!(&queue.notification, Some(notification) if notification.pid == current_pid) {
+            queue.notification = None;
+        }
+        return Ok(0);
+    }
+    if queue.notification.is_some() {
+        return Ok(-Errno::Busy.to_native());
+    }
+    let Ok(signal) = Signal::try_from(signal as u8) else {
+        return Ok(-Errno::Inval.to_native());
+    };
+    if signal == Signal::Sigwakeup {
+        return Ok(-Errno::Inval.to_native());
+    }
+    queue.notification = Some(WasiMessageQueueNotification {
+        pid: ctx.data().pid().raw(),
+        descriptor,
+        signal,
+    });
+    Ok(0)
+}
+
+#[instrument(level = "trace", skip_all, ret)]
+pub fn mqueue_unlink<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    name_ptr: WasmPtr<u8, M>,
+    name_len: M::Offset,
+) -> Result<i32, WasiError> {
+    let memory = unsafe { ctx.data().memory_view(&ctx) };
+    let name = match name_ptr.read_utf8_string(&memory, name_len) {
+        Ok(name) => name,
+        Err(err) => return Ok(-mem_error_to_wasi(err).to_native()),
+    };
+    if ctx
+        .data()
+        .state
+        .message_queues
+        .lock()
+        .unwrap()
+        .queues
+        .remove(&name)
+        .is_some()
+    {
+        Ok(0)
+    } else {
+        Ok(-Errno::Noent.to_native())
     }
 }
 

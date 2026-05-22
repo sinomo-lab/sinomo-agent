@@ -121,6 +121,66 @@ impl LocalStagedSandboxCommandRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn run_module_with_stdin_limits_preopens_output_sink_and_toolchain(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        toolchain_store: &LocalSandboxToolchainStore,
+        sandbox_id: &SandboxId,
+        wasm: impl AsRef<[u8]>,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        limits: Option<SandboxResourceLimits>,
+        mut extra_preopens: Vec<SandboxWasiPreopen>,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        let (manifest, layout) = store.load(sandbox_id)?;
+        let (extra_preopens, wasix_command_overrides) =
+            match toolchain_store.load_manifest(&manifest.toolchain_id) {
+                Ok((toolchain, _toolchain_layout)) => {
+                    let toolchain_artifacts =
+                        load_local_toolchain_artifacts(toolchain_store, &toolchain)?;
+                    let toolchain_commands =
+                        load_local_toolchain_commands(toolchain_store, &toolchain)?;
+                    let mut artifact_preopens = stage_toolchain_runtime_to_local(
+                        &layout,
+                        &toolchain_artifacts,
+                        &toolchain_commands,
+                    )?;
+                    artifact_preopens.append(&mut extra_preopens);
+                    (
+                        artifact_preopens,
+                        wasix_command_overrides_for_toolchain(&toolchain),
+                    )
+                }
+                Err(SandboxToolchainError::NotFound { .. }) => (extra_preopens, Vec::new()),
+                Err(error) => return Err(error.into()),
+            };
+
+        self.run_module_with_stdin_limits_preopens_output_sink_abi_and_env(
+            store,
+            sandbox_id,
+            wasm,
+            argv,
+            stdin,
+            timeout_ms,
+            limits,
+            extra_preopens,
+            output_sink,
+            default_sandbox_wasi_abi(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+            false,
+            true,
+            true,
+            true,
+            true,
+            wasix_command_overrides,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn run_module_with_stdin_limits_preopens_output_sink_and_abi(
         &self,
         store: &LocalSandboxInstanceStore,
@@ -569,19 +629,7 @@ impl LocalStagedSandboxCommandRunner {
         let toolchain_commands = load_local_toolchain_commands(toolchain_store, &toolchain)?;
         let artifact_preopens =
             stage_toolchain_runtime_to_local(&layout, &toolchain_artifacts, &toolchain_commands)?;
-        let wasix_command_overrides = toolchain
-            .commands
-            .values()
-            .filter(|command| {
-                command.effective_target_abi(&toolchain) == SandboxWasiAbi::Wasix
-                    && (!command.argv_prefix.is_empty() || command.exec_name.is_some())
-            })
-            .map(|command| SandboxWasixCommandOverride {
-                name: command.name.clone(),
-                argv_prefix: command.argv_prefix.clone(),
-                exec_name: command.exec_name.clone(),
-            })
-            .collect::<Vec<_>>();
+        let wasix_command_overrides = wasix_command_overrides_for_toolchain(&toolchain);
         self.run_module_with_stdin_limits_preopens_output_sink_abi_env_and_pipes(
             store,
             sandbox_id,
@@ -646,4 +694,22 @@ impl LocalStagedSandboxCommandRunner {
             .map_err(SandboxCommandExecutionError::PolicyDenied)?;
         self.run_module_with_stdin(store, sandbox_id, wasm, argv, stdin, timeout_ms)
     }
+}
+
+fn wasix_command_overrides_for_toolchain(
+    toolchain: &SandboxToolchainManifest,
+) -> Vec<SandboxWasixCommandOverride> {
+    toolchain
+        .commands
+        .values()
+        .filter(|command| {
+            command.effective_target_abi(toolchain) == SandboxWasiAbi::Wasix
+                && (!command.argv_prefix.is_empty() || command.exec_name.is_some())
+        })
+        .map(|command| SandboxWasixCommandOverride {
+            name: command.name.clone(),
+            argv_prefix: command.argv_prefix.clone(),
+            exec_name: command.exec_name.clone(),
+        })
+        .collect()
 }
