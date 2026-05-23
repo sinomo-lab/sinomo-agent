@@ -1,8 +1,0 @@
-#ifndef SINOMO_WASIX_SIGNAL_EXTENSIONS
-#define SINOMO_WASIX_SIGNAL_EXTENSIONS 1
-
-int sigignore(int sig);
-int siginterrupt(int sig, int flag);
-int sigpause(int sig);
-
-#endif

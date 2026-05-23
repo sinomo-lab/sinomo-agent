@@ -142,7 +142,7 @@ ninja -C "${WORKDIR}/llvm-native-build" -j"${JOBS}" llvm-tblgen clang-tblgen
     --target=wasm32-wasi \
     --sysroot="${WASIX_SYSROOT}" \
     -Os \
-    -c "${ROOT}/sysroot/libc/llvm-wasix-compat.c" \
+    -c "${REPO_ROOT}/crates/sinomo-sandbox/vendor/wasix-libc/sinomo/libc/llvm-wasix-compat.c" \
     -o "${WORKDIR}/llvm-wasix-compat.o"
 
 COMMON_C_FLAGS="-O2 -fno-ident -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -ftls-model=local-exec -DCLANG_BUILD_STATIC -D_GNU_SOURCE -DBYTE_ORDER=1234 -DLITTLE_ENDIAN=1234 -DBIG_ENDIAN=4321 -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_MMAN -Df_flags=f_flag -DMNT_LOCAL=0 -DF_GETLK=5 -DF_SETLK=6 -DF_SETLKW=7 -DF_RDLCK=0 -DF_WRLCK=1 -DF_UNLCK=2 -DSS_ONSTACK=1 -ffile-prefix-map=${WORKDIR}=sinomo-clang-build -ffile-prefix-map=${REPO_ROOT}=sinomo"

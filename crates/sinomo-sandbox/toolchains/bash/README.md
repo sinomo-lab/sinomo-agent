@@ -4,7 +4,7 @@ This package builds GNU Bash for the WASIX sandbox from unmodified upstream Bash
 
 ## Build Recipe
 
-The pinned recipe is `build-bash-wasix.sh`. It downloads and verifies GNU Bash 5.2.37, wasi-sdk 24.0, Binaryen 124, and wasix-libc `v2026-05-12.1`, prepares the shared Sinomo WASIX sysroot, configures upstream Bash for `wasm32-wasi`, builds it, runs Binaryen asyncify and function-pointer cast emulation, and writes a Sinomo `import-package` manifest for `bash` and `sh`.
+The pinned recipe is `build-bash-wasix.sh`. It downloads and verifies GNU Bash 5.2.37, wasi-sdk 24.0, and Binaryen 124, builds the shared Sinomo WASIX sysroot from the vendored `wasix-libc` source, configures upstream Bash for `wasm32-wasi`, builds it, runs Binaryen asyncify and function-pointer cast emulation, and writes a Sinomo `import-package` manifest for `bash` and `sh`.
 
 ```text
 crates/sinomo-sandbox/toolchains/bash/build-bash-wasix.sh
@@ -27,7 +27,7 @@ docker run --rm -v "$PWD/crates/sinomo-sandbox/toolchains/bash/out:/src/crates/s
 
 ## Sysroot Integration
 
-Bash uses the shared prepared WASIX sysroot from `toolchains/build-tools/prepare-wasix-sysroot.sh`. Bash-specific source patches are intentionally absent. The current compile integration relies on shared sysroot additions for POSIX declarations, `sigsetjmp`/`siglongjmp`, environment archive linkage, and the argc/argv `main` entry bridge. These changes are not Bash behavior changes; they make the common libc/toolchain surface match what upstream programs expect.
+Bash uses the shared prepared WASIX sysroot from `toolchains/build-tools/prepare-wasix-sysroot.sh`. Bash-specific source patches are intentionally absent. POSIX declarations, `sigsetjmp`/`siglongjmp`, environment tracking, and the argc/argv `main` entry bridge live in the vendored Sinomo WASIX libc source. These changes are not Bash behavior changes; they make the common libc/toolchain surface match what upstream programs expect.
 
 ## Verification
 

@@ -38,9 +38,7 @@ WASI_SDK_URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk
 BINARYEN_TARBALL="binaryen-version_${BINARYEN_VERSION}-${BINARYEN_ARCH}-${BINARYEN_OS}.tar.gz"
 BINARYEN_URL="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/${BINARYEN_TARBALL}"
 WASIX_LIBC_VERSION="${WASIX_LIBC_VERSION:-v2026-05-12.1}"
-WASIX_LIBC_TARBALL="${WASIX_LIBC_TARBALL:-sysroot.tar.gz}"
-WASIX_LIBC_SHA256="${WASIX_LIBC_SHA256:-e9f7435c0fdc050c1f813f83d3b22388ba3b16d1303ced510915eb028a38abb4}"
-WASIX_LIBC_URL="${WASIX_LIBC_URL:-https://github.com/wasix-org/wasix-libc/releases/download/${WASIX_LIBC_VERSION}/${WASIX_LIBC_TARBALL}}"
+WASIX_LIBC_SOURCE="${WASIX_LIBC_SOURCE:-vendor/wasix-libc}"
 
 download() {
     local url="$1"
@@ -96,9 +94,6 @@ WASI_SDK_ARCH="${WASI_SDK_ARCH}" \
 WASI_SDK_OS="${WASI_SDK_OS}" \
 WASI_SDK_SHA256="${WASI_SDK_SHA256}" \
 WASIX_LIBC_VERSION="${WASIX_LIBC_VERSION}" \
-WASIX_LIBC_TARBALL="${WASIX_LIBC_TARBALL}" \
-WASIX_LIBC_SHA256="${WASIX_LIBC_SHA256}" \
-WASIX_LIBC_URL="${WASIX_LIBC_URL}" \
     "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/prepare-wasix-sysroot.sh"
 
 BASH_SRC="${WORKDIR}/bash-${GNU_BASH_VERSION}"
@@ -121,8 +116,6 @@ export SOURCE_DATE_EPOCH
 export CC="${WASI_SDK}/bin/clang --target=wasm32-wasi --sysroot=${WASIX_SYSROOT}"
 export AR="${WASI_SDK}/bin/llvm-ar"
 export RANLIB="${WASI_SDK}/bin/llvm-ranlib"
-ENV_RM_ADD_OBJECT="${WORKDIR}/sinomo-wasix-env-rm-add.o"
-MAIN_ARGC_ARGV_OBJECT="${WORKDIR}/sinomo-wasix-main-argc-argv.o"
 
 export CFLAGS="-Os -fwrapv -fno-ident -Wno-error=implicit-function-declaration -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -fno-trapping-math -fno-exceptions -ftls-model=local-exec -msimd128 -mrelaxed-simd -mextended-const -ffile-prefix-map=${WORKDIR}=sinomo-bash-build -ffile-prefix-map=${REPO_ROOT}=sinomo -DNEED_EXTERN_PC -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS"
 export LDFLAGS="-Wl,--export-all -Wl,--export-dynamic -Wl,--shared-memory -Wl,--import-memory -Wl,--extra-features=atomics -Wl,--extra-features=bulk-memory -Wl,--extra-features=mutable-globals -Wl,--export=__wasm_call_ctors -Wl,--export=__wasm_init_tls -Wl,--export=__wasm_signal -Wl,--export=__tls_size -Wl,--export=__tls_align -Wl,--export=__tls_base -Wl,--export-if-defined=__indirect_function_table -Wl,--export-if-defined=__stack_pointer -Wl,--export-if-defined=__heap_base -Wl,--export-if-defined=__data_end -Wl,-z,stack-size=1048576 -Wl,--initial-memory=67108864 -Wl,--max-memory=268435456 -lwasi-emulated-getpid -lwasi-emulated-mman -lwasi-emulated-process-clocks -lresolv -lrt -lm -lpthread -lutil"
@@ -148,25 +141,6 @@ CONFIG_SITE=/dev/null ./configure \
     --enable-progcomp \
     --disable-nls \
     --with-installed-readline=no
-
-"${WASI_SDK}/bin/clang" \
-    --target=wasm32-wasi \
-    --sysroot="${WASIX_SYSROOT}" \
-    -Os \
-    -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-env-rm-add.c" \
-    -o "${ENV_RM_ADD_OBJECT}"
-"${WASI_SDK}/bin/clang" \
-    --target=wasm32-wasi \
-    --sysroot="${WASIX_SYSROOT}" \
-    -Os \
-    -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-main-argc-argv.c" \
-    -o "${MAIN_ARGC_ARGV_OBJECT}"
-"${WASI_SDK}/bin/llvm-ar" d "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" setenv.o putenv.o __main_void.o
-"${WASI_SDK}/bin/llvm-ar" r \
-    "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" \
-    "${ENV_RM_ADD_OBJECT}" \
-    "${MAIN_ARGC_ARGV_OBJECT}"
-"${WASI_SDK}/bin/llvm-ranlib" "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a"
 
 make -j"${JOBS}" CFLAGS_FOR_BUILD="${BUILD_CFLAGS}" BASE_CFLAGS_FOR_BUILD="${BUILD_CFLAGS}"
 
@@ -269,8 +243,7 @@ binaryen_sha256=${BINARYEN_SHA256}
 wasm_asyncify=true
 wasm_fpcast_emu=true
 wasix_libc_version=${WASIX_LIBC_VERSION}
-wasix_libc_source=${WASIX_LIBC_URL}
-wasix_libc_sha256=${WASIX_LIBC_SHA256}
+wasix_libc_source=${WASIX_LIBC_SOURCE}
 source_date_epoch=${SOURCE_DATE_EPOCH}
 wasm=${BASH_WASM}
 wasm_hash=${BASH_HASH}

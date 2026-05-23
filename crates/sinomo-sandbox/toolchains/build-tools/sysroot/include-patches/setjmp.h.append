@@ -1,7 +1,0 @@
-#ifndef SINOMO_WASIX_SETJMP_EXTENSIONS
-#define SINOMO_WASIX_SETJMP_EXTENSIONS 1
-
-int sigsetjmp(sigjmp_buf env, int savesigs);
-_Noreturn void siglongjmp(sigjmp_buf env, int val);
-
-#endif

@@ -14,8 +14,7 @@ BINARYEN_ARCH="${BINARYEN_ARCH:-x86_64}"
 BINARYEN_OS="${BINARYEN_OS:-linux}"
 BINARYEN_SHA256="${BINARYEN_SHA256:-0290c3779fedf592b8da0ded3032ff55c41a2b7bfa2d6bf7b7bac6f0e6e28963}"
 WASIX_LIBC_VERSION="${WASIX_LIBC_VERSION:-v2026-05-12.1}"
-WASIX_LIBC_TARBALL="${WASIX_LIBC_TARBALL:-sysroot.tar.gz}"
-WASIX_LIBC_SHA256="${WASIX_LIBC_SHA256:-e9f7435c0fdc050c1f813f83d3b22388ba3b16d1303ced510915eb028a38abb4}"
+WASIX_LIBC_SOURCE="${WASIX_LIBC_SOURCE:-vendor/wasix-libc}"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1566950400}"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
 
@@ -23,14 +22,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${ROOT}/../../../.." && pwd)"
 WORKDIR="${WORKDIR:-"${ROOT}/work"}"
 OUTDIR="${OUTDIR:-"${ROOT}/out"}"
+SINOMO_PREPARE_WASIX_SYSROOT="${ROOT}/prepare-wasix-sysroot.sh"
 
 TCC_TARBALL="tcc-${TCC_VERSION}.tar.bz2"
 TCC_URL="https://download-mirror.savannah.gnu.org/releases/tinycc/${TCC_TARBALL}"
-WASI_SDK_TARBALL="wasi-sdk-${WASI_SDK_VERSION_FULL}-${WASI_SDK_ARCH}-${WASI_SDK_OS}.tar.gz"
-WASI_SDK_URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/${WASI_SDK_TARBALL}"
 BINARYEN_TARBALL="binaryen-version_${BINARYEN_VERSION}-${BINARYEN_ARCH}-${BINARYEN_OS}.tar.gz"
 BINARYEN_URL="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/${BINARYEN_TARBALL}"
-WASIX_LIBC_URL="${WASIX_LIBC_URL:-https://github.com/wasix-org/wasix-libc/releases/download/${WASIX_LIBC_VERSION}/${WASIX_LIBC_TARBALL}}"
+WASI_SDK_URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION_FULL}-${WASI_SDK_ARCH}-${WASI_SDK_OS}.tar.gz"
 
 download() {
     local url="$1"
@@ -65,29 +63,37 @@ sinomo_hash() {
 mkdir -p "${WORKDIR}" "${OUTDIR}" "${WORKDIR}/downloads"
 
 download "${TCC_URL}" "${WORKDIR}/downloads/${TCC_TARBALL}"
-download "${WASI_SDK_URL}" "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 download "${BINARYEN_URL}" "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-download "${WASIX_LIBC_URL}" "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
 verify_sha256 "${TCC_SHA256}" "${WORKDIR}/downloads/${TCC_TARBALL}"
-verify_sha256 "${WASI_SDK_SHA256}" "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 verify_sha256 "${BINARYEN_SHA256}" "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-verify_sha256 "${WASIX_LIBC_SHA256}" "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
 
 rm -rf \
     "${WORKDIR}/tcc-${TCC_VERSION}" \
-    "${WORKDIR}"/wasi-sdk-${WASI_SDK_VERSION_FULL}* \
     "${WORKDIR}"/binaryen-version_${BINARYEN_VERSION} \
-    "${WORKDIR}/wasix-sysroot"
+    "${WORKDIR}/sinomo-wasix-sysroot" \
+    "${WORKDIR}/sinomo-wasix-sysroot-work"
 tar -C "${WORKDIR}" -xjf "${WORKDIR}/downloads/${TCC_TARBALL}"
-tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-mkdir -p "${WORKDIR}/wasix-sysroot"
-tar -C "${WORKDIR}/wasix-sysroot" -xzf "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
+
+WASIX_SYSROOT="${WORKDIR}/sinomo-wasix-sysroot/sysroot"
+SINOMO_WASIX_HOST_ENV="${WORKDIR}/sinomo-wasix-sysroot/host-env.sh"
+WORKDIR="${WORKDIR}/sinomo-wasix-sysroot-work" \
+SYSROOT_OUTDIR="${WASIX_SYSROOT}" \
+HOST_ENV_OUT="${SINOMO_WASIX_HOST_ENV}" \
+WASI_SDK_VERSION="${WASI_SDK_VERSION}" \
+WASI_SDK_VERSION_FULL="${WASI_SDK_VERSION_FULL}" \
+WASI_SDK_ARCH="${WASI_SDK_ARCH}" \
+WASI_SDK_OS="${WASI_SDK_OS}" \
+WASI_SDK_SHA256="${WASI_SDK_SHA256}" \
+WASIX_LIBC_VERSION="${WASIX_LIBC_VERSION}" \
+"${SINOMO_PREPARE_WASIX_SYSROOT}"
+# shellcheck source=/dev/null
+. "${SINOMO_WASIX_HOST_ENV}"
 
 TCC_SRC="${WORKDIR}/tcc-${TCC_VERSION}"
-WASI_SDK="$(find "${WORKDIR}" -maxdepth 1 -type d -name "wasi-sdk-${WASI_SDK_VERSION_FULL}*" | sort | head -n 1)"
+WASI_SDK="${SINOMO_WASI_SDK}"
 if [ -z "${WASI_SDK}" ] || [ ! -x "${WASI_SDK}/bin/clang" ]; then
-    echo "wasi-sdk clang not found after extracting ${WASI_SDK_TARBALL}" >&2
+    echo "wasi-sdk clang not found after preparing the Sinomo WASIX sysroot" >&2
     exit 1
 fi
 BINARYEN="${WORKDIR}/binaryen-version_${BINARYEN_VERSION}"
@@ -95,9 +101,8 @@ if [ ! -x "${BINARYEN}/bin/wasm-opt" ]; then
     echo "Binaryen wasm-opt not found after extracting ${BINARYEN_TARBALL}" >&2
     exit 1
 fi
-WASIX_SYSROOT="$(find "${WORKDIR}/wasix-sysroot" -type d -path "*/sysroot" | sort | head -n 1)"
 if [ -z "${WASIX_SYSROOT}" ] || [ ! -f "${WASIX_SYSROOT}/include/unistd.h" ] || [ ! -f "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" ]; then
-    echo "wasix-libc sysroot not found after extracting ${WASIX_LIBC_TARBALL}" >&2
+    echo "Sinomo WASIX sysroot not found after preparation" >&2
     exit 1
 fi
 
@@ -249,8 +254,7 @@ binaryen_sha256=${BINARYEN_SHA256}
 wasm_asyncify=true
 wasm_fpcast_emu=true
 wasix_libc_version=${WASIX_LIBC_VERSION}
-wasix_libc_source=${WASIX_LIBC_URL}
-wasix_libc_sha256=${WASIX_LIBC_SHA256}
+wasix_libc_source=${WASIX_LIBC_SOURCE}
 source_date_epoch=${SOURCE_DATE_EPOCH}
 wasm=${TCC_WASM}
 wasm_hash=${TCC_HASH}

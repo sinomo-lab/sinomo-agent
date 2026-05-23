@@ -1,0 +1,101 @@
+name: Build C/C++ Sysroot
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_call:
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  build_cxx_sysroot:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: ""
+          - variant: "-exnref-eh"
+          - variant: "-exnref-ehpic"
+          - variant: "-eh"
+          - variant: "-ehpic"
+    container:
+      image: archlinux:base-devel
+      options: --user root --workdir /
+    steps:
+      - name: Update and install dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -Sy --noconfirm --needed coreutils nodejs npm wget git cmake ninja llvm21 clang21 lld21 rsync make cargo python3 jq
+          mkdir -p /usr/local/bin
+          echo /usr/lib/llvm21/bin >> "$GITHUB_PATH"
+          link_llvm_tool() {
+            tool="$1"
+            for candidate in "/usr/lib/llvm21/bin/$tool" "/usr/bin/${tool}21" "/usr/bin/${tool}-21"; do
+              if [ -x "$candidate" ]; then
+                ln -sf "$candidate" "/usr/local/bin/$tool"
+                return
+              fi
+            done
+
+            echo "Could not find LLVM 21 tool for $tool" >&2
+            exit 1
+          }
+          for tool in clang clang++ llvm-ar llvm-nm llvm-ranlib llvm-config; do
+            link_llvm_tool "$tool"
+          done
+          # curl https://get.wasmer.io -sSfL | sh -s "prerelease"
+
+      - name: Log tool versions
+        run: |
+          echo git
+          git --version
+          echo "##########################"
+          # echo wasmer
+          # wasmer -V
+          # echo "##########################"
+          echo clang
+          clang -v
+          echo "##########################"
+          echo llvm-ar
+          llvm-ar -V
+          echo "##########################"
+          echo llvm-nm
+          llvm-nm -V
+          echo "##########################"
+          echo nodejs
+          node -v
+          echo "##########################"
+          echo npm
+          npm -v
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Build
+        run: |
+          git config --global --add safe.directory $(pwd)
+          rm -rf /opt/wasix-sysroot
+          mkdir /opt/wasix-sysroot
+          ./build32${{ matrix.variant }}.sh
+          cp -r sysroot32${{ matrix.variant }} /opt/wasix-sysroot/sysroot
+
+      # - name: Run WASIX tests
+      #   run: |
+      #     export CLANG_VERSION=$(clang --version | grep -i "clang version" | sed -n 's/.*version \([0-9.]*\).*/\1/p')
+      #     echo Detected clang version $CLANG_VERSION
+      #     mkdir -p /usr/lib/clang/19/lib/wasm32-wasmer-wasi
+      #     cp /opt/wasix-sysroot/lib/wasm32-wasi/libclang_rt.builtins-wasm32.a /usr/lib/clang/19/lib/wasm32-wasmer-wasi/libclang_rt.builtins.a
+      #     TOOLCHAIN=/opt/wasix-sysroot/clang-wasix.cmake_toolchain ./test/wasix/run_tests.sh
+
+      - name: Upload sysroot
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasix-sysroot${{ matrix.variant }}
+          path: /opt/wasix-sysroot

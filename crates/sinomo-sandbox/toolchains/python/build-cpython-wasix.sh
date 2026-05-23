@@ -20,8 +20,7 @@ BINARYEN_ARCH="${BINARYEN_ARCH:-x86_64}"
 BINARYEN_OS="${BINARYEN_OS:-linux}"
 BINARYEN_SHA256="${BINARYEN_SHA256:-0290c3779fedf592b8da0ded3032ff55c41a2b7bfa2d6bf7b7bac6f0e6e28963}"
 WASIX_LIBC_VERSION="${WASIX_LIBC_VERSION:-v2026-05-12.1}"
-WASIX_LIBC_TARBALL="${WASIX_LIBC_TARBALL:-sysroot.tar.gz}"
-WASIX_LIBC_SHA256="${WASIX_LIBC_SHA256:-e9f7435c0fdc050c1f813f83d3b22388ba3b16d1303ced510915eb028a38abb4}"
+WASIX_LIBC_SOURCE="${WASIX_LIBC_SOURCE:-vendor/wasix-libc}"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1778597230}"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
 
@@ -29,9 +28,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${ROOT}/../../../.." && pwd)"
 WORKDIR="${WORKDIR:-"${ROOT}/work-wasix"}"
 OUTDIR="${OUTDIR:-"${ROOT}/out-wasix"}"
-SINOMO_SYSROOT_INCLUDE_DIR="${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/include"
-SINOMO_SYSROOT_INCLUDE_PATCH_DIR="${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/include-patches"
 SINOMO_PYTHON_WASIX_DIR="${ROOT}/wasix"
+SINOMO_PREPARE_WASIX_SYSROOT="${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/prepare-wasix-sysroot.sh"
 mkdir -p "${WORKDIR}" "${OUTDIR}"
 WORKDIR="$(cd "${WORKDIR}" && pwd)"
 OUTDIR="$(cd "${OUTDIR}" && pwd)"
@@ -45,11 +43,9 @@ OPENSSL_TARBALL="openssl-${OPENSSL_VERSION}.tar.gz"
 OPENSSL_URL="https://www.openssl.org/source/${OPENSSL_TARBALL}"
 SETUPTOOLS_WHEEL="setuptools-${SETUPTOOLS_VERSION}-py3-none-any.whl"
 SETUPTOOLS_URL="https://files.pythonhosted.org/packages/a3/dc/17031897dae0efacfea57dfd3a82fdd2a2aeb58e0ff71b77b87e44edc772/${SETUPTOOLS_WHEEL}"
-WASI_SDK_TARBALL="wasi-sdk-${WASI_SDK_VERSION_FULL}-${WASI_SDK_ARCH}-${WASI_SDK_OS}.tar.gz"
-WASI_SDK_URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/${WASI_SDK_TARBALL}"
 BINARYEN_TARBALL="binaryen-version_${BINARYEN_VERSION}-${BINARYEN_ARCH}-${BINARYEN_OS}.tar.gz"
 BINARYEN_URL="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/${BINARYEN_TARBALL}"
-WASIX_LIBC_URL="${WASIX_LIBC_URL:-https://github.com/wasix-org/wasix-libc/releases/download/${WASIX_LIBC_VERSION}/${WASIX_LIBC_TARBALL}}"
+WASI_SDK_URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION_FULL}-${WASI_SDK_ARCH}-${WASI_SDK_OS}.tar.gz"
 
 download() {
     local url="$1"
@@ -87,16 +83,12 @@ download "${CPYTHON_URL}" "${WORKDIR}/downloads/${CPYTHON_TARBALL}"
 download "${ZLIB_URL}" "${WORKDIR}/downloads/${ZLIB_TARBALL}"
 download "${OPENSSL_URL}" "${WORKDIR}/downloads/${OPENSSL_TARBALL}"
 download "${SETUPTOOLS_URL}" "${WORKDIR}/downloads/${SETUPTOOLS_WHEEL}"
-download "${WASI_SDK_URL}" "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 download "${BINARYEN_URL}" "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-download "${WASIX_LIBC_URL}" "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
 verify_sha256 "${CPYTHON_SHA256}" "${WORKDIR}/downloads/${CPYTHON_TARBALL}"
 verify_sha256 "${ZLIB_SHA256}" "${WORKDIR}/downloads/${ZLIB_TARBALL}"
 verify_sha256 "${OPENSSL_SHA256}" "${WORKDIR}/downloads/${OPENSSL_TARBALL}"
 verify_sha256 "${SETUPTOOLS_SHA256}" "${WORKDIR}/downloads/${SETUPTOOLS_WHEEL}"
-verify_sha256 "${WASI_SDK_SHA256}" "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 verify_sha256 "${BINARYEN_SHA256}" "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-verify_sha256 "${WASIX_LIBC_SHA256}" "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
 
 rm -rf \
     "${WORKDIR}/Python-${CPYTHON_VERSION}" \
@@ -104,29 +96,40 @@ rm -rf \
     "${WORKDIR}/zlib-wasix" \
     "${WORKDIR}/openssl-${OPENSSL_VERSION}" \
     "${WORKDIR}/openssl-wasix" \
-    "${WORKDIR}"/wasi-sdk-${WASI_SDK_VERSION_FULL}* \
     "${WORKDIR}"/binaryen-version_${BINARYEN_VERSION} \
-    "${WORKDIR}/wasix-sysroot" \
+    "${WORKDIR}/sinomo-wasix-sysroot" \
+    "${WORKDIR}/sinomo-wasix-sysroot-work" \
     "${WORKDIR}/wasixcc-sysroot-prefix" \
     "${PACKAGE_ROOT}"
 tar -C "${WORKDIR}" -xJf "${WORKDIR}/downloads/${CPYTHON_TARBALL}"
 tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${ZLIB_TARBALL}"
 tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${OPENSSL_TARBALL}"
-tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${WASI_SDK_TARBALL}"
 tar -C "${WORKDIR}" -xzf "${WORKDIR}/downloads/${BINARYEN_TARBALL}"
-mkdir -p "${WORKDIR}/wasix-sysroot"
-tar -C "${WORKDIR}/wasix-sysroot" -xzf "${WORKDIR}/downloads/wasix-libc-${WASIX_LIBC_VERSION}-${WASIX_LIBC_TARBALL}"
+
+WASIX_SYSROOT="${WORKDIR}/sinomo-wasix-sysroot/sysroot"
+SINOMO_WASIX_HOST_ENV="${WORKDIR}/sinomo-wasix-sysroot/host-env.sh"
+WORKDIR="${WORKDIR}/sinomo-wasix-sysroot-work" \
+SYSROOT_OUTDIR="${WASIX_SYSROOT}" \
+HOST_ENV_OUT="${SINOMO_WASIX_HOST_ENV}" \
+WASI_SDK_VERSION="${WASI_SDK_VERSION}" \
+WASI_SDK_VERSION_FULL="${WASI_SDK_VERSION_FULL}" \
+WASI_SDK_ARCH="${WASI_SDK_ARCH}" \
+WASI_SDK_OS="${WASI_SDK_OS}" \
+WASI_SDK_SHA256="${WASI_SDK_SHA256}" \
+WASIX_LIBC_VERSION="${WASIX_LIBC_VERSION}" \
+"${SINOMO_PREPARE_WASIX_SYSROOT}"
+# shellcheck source=/dev/null
+. "${SINOMO_WASIX_HOST_ENV}"
 
 CPYTHON_SRC="${WORKDIR}/Python-${CPYTHON_VERSION}"
 ZLIB_SRC="${WORKDIR}/zlib-${ZLIB_VERSION}"
 ZLIB_OUT="${WORKDIR}/zlib-wasix"
 OPENSSL_SRC="${WORKDIR}/openssl-${OPENSSL_VERSION}"
 OPENSSL_OUT="${WORKDIR}/openssl-wasix"
-WASI_SDK="$(find "${WORKDIR}" -maxdepth 1 -type d -name "wasi-sdk-${WASI_SDK_VERSION_FULL}*" | sort | head -n 1)"
+WASI_SDK="${SINOMO_WASI_SDK}"
 BINARYEN="${WORKDIR}/binaryen-version_${BINARYEN_VERSION}"
-WASIX_SYSROOT="$(find "${WORKDIR}/wasix-sysroot" -type d -path "*/sysroot" | sort | head -n 1)"
 if [ -z "${WASI_SDK}" ] || [ ! -x "${WASI_SDK}/bin/clang" ]; then
-    echo "wasi-sdk clang not found after extracting ${WASI_SDK_TARBALL}" >&2
+    echo "wasi-sdk clang not found after preparing the Sinomo WASIX sysroot" >&2
     exit 1
 fi
 if [ ! -x "${BINARYEN}/bin/wasm-opt" ]; then
@@ -134,7 +137,7 @@ if [ ! -x "${BINARYEN}/bin/wasm-opt" ]; then
     exit 1
 fi
 if [ -z "${WASIX_SYSROOT}" ] || [ ! -f "${WASIX_SYSROOT}/include/unistd.h" ] || [ ! -f "${WASIX_SYSROOT}/lib/wasm32-wasi/libc.a" ]; then
-    echo "wasix-libc sysroot not found after extracting ${WASIX_LIBC_TARBALL}" >&2
+    echo "Sinomo WASIX sysroot not found after preparation" >&2
     exit 1
 fi
 WASIXCC_BIN="${WASIXCC_BIN:-$(command -v wasixcc || true)}"
@@ -159,187 +162,10 @@ fi
 WASIXCC_DEFAULT_SYSROOT_PREFIX="$(dirname "${WASIXCC_DEFAULT_SYSROOT}")"
 WASIXCC_SYSROOT_PREFIX="${WORKDIR}/wasixcc-sysroot-prefix"
 cp -a "${WASIXCC_DEFAULT_SYSROOT_PREFIX}" "${WASIXCC_SYSROOT_PREFIX}"
-
-patch_wasix_sysroot() {
-    local sysroot="$1"
-    local stem
-    local posix_object
-    local at_fdcwd_object
-    local futex_object
-    local semaphore_object
-    local pthread_mutex_object
-    local pthread_self_object
-    local pthread_cond_object
-
-    if [ ! -f "${sysroot}/include/unistd.h" ] || [ ! -f "${sysroot}/lib/wasm32-wasi/libc.a" ]; then
-        echo "WASIX sysroot is missing required files: ${sysroot}" >&2
-        exit 1
-    fi
-
-    stem="$(basename "${sysroot}")"
-    posix_object="${WORKDIR}/sinomo-${stem}-wasix-posix.o"
-    at_fdcwd_object="${WORKDIR}/sinomo-${stem}-wasix-at-fdcwd.o"
-    futex_object="${WORKDIR}/sinomo-${stem}-wasix-futex.o"
-    semaphore_object="${WORKDIR}/sinomo-${stem}-wasix-semaphore.o"
-    pthread_mutex_object="${WORKDIR}/sinomo-${stem}-wasix-pthread-mutex.o"
-    pthread_self_object="${WORKDIR}/sinomo-${stem}-wasix-pthread-self.o"
-    pthread_cond_object="${WORKDIR}/sinomo-${stem}-wasix-pthread-cond.o"
-    if [ -f "${sysroot}/include/__header_sys_socket.h" ]; then
-        python3 - "${sysroot}/include/__header_sys_socket.h" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-if "#define AF_PACKET" not in text:
-    marker = "#define SOMAXCONN"
-    additions = """#ifndef PF_PACKET
-#define PF_PACKET 17
-#endif
-#ifndef AF_PACKET
-#define AF_PACKET PF_PACKET
-#endif
-
-"""
-    if marker not in text:
-        raise SystemExit(f"{marker} not found in {path}")
-    text = text.replace(marker, additions + marker, 1)
-    path.write_text(text)
-PY
-    fi
-    rsync -a "${SINOMO_SYSROOT_INCLUDE_DIR}/" "${sysroot}/include/"
-    while IFS= read -r patch_file; do
-        relative="${patch_file#"${SINOMO_SYSROOT_INCLUDE_PATCH_DIR}/"}"
-        case "${relative}" in
-            *.append)
-                target="${sysroot}/include/${relative%.append}"
-                if [ ! -f "${target}" ]; then
-                    echo "sysroot header missing for patch: ${target}" >&2
-                    exit 1
-                fi
-                if ! grep -q "SINOMO_WASIX_" "${target}"; then
-                    cat "${patch_file}" >> "${target}"
-                fi
-                ;;
-            *)
-                mkdir -p "$(dirname "${sysroot}/include/${relative}")"
-                cp "${patch_file}" "${sysroot}/include/${relative}"
-                ;;
-        esac
-    done < <(find "${SINOMO_SYSROOT_INCLUDE_PATCH_DIR}" -type f | sort)
-    "${WASI_SDK}/bin/clang" \
-        --target=wasm32-wasi \
-        --sysroot="${sysroot}" \
-        -matomics \
-        -mbulk-memory \
-        -mmutable-globals \
-        -pthread \
-        -mthread-model posix \
-        -fPIC \
-        -Os \
-        -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-posix.c" \
-        -o "${posix_object}"
-    "${WASI_SDK}/bin/clang" \
-        --target=wasm32-wasi \
-        --sysroot="${sysroot}" \
-        -matomics \
-        -mbulk-memory \
-        -mmutable-globals \
-        -pthread \
-        -mthread-model posix \
-        -fPIC \
-        -Os \
-        -c "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-at-fdcwd.c" \
-        -o "${at_fdcwd_object}"
-    for source_and_output in \
-        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-futex.c:${futex_object}" \
-        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-semaphore.c:${semaphore_object}" \
-        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-pthread-mutex.c:${pthread_mutex_object}" \
-        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-pthread-self.c:${pthread_self_object}" \
-        "${REPO_ROOT}/crates/sinomo-sandbox/toolchains/build-tools/sysroot/libc/wasix-pthread-cond.c:${pthread_cond_object}"
-    do
-        "${WASI_SDK}/bin/clang" \
-            --target=wasm32-wasi \
-            --sysroot="${sysroot}" \
-            -matomics \
-            -mbulk-memory \
-            -mmutable-globals \
-            -pthread \
-            -mthread-model posix \
-            -fPIC \
-            -Os \
-            -c "${source_and_output%:*}" \
-            -o "${source_and_output#*:}"
-    done
-    "${WASI_SDK}/bin/llvm-ar" d "${sysroot}/lib/wasm32-wasi/libc.a" \
-        posix.o at_fdcwd.o chdir.o fchdir.o chown.o fchown.o fchownat.o lchown.o \
-        ftruncate.o truncate.o getegid.o geteuid.o getgid.o getuid.o setegid.o seteuid.o setgid.o setgroups.o setuid.o \
-        pthread_self.o pthread_mutex_destroy.o pthread_mutex_getprioceiling.o pthread_mutex_init.o \
-        pthread_mutex_lock.o pthread_mutex_setprioceiling.o pthread_mutex_timedlock.o \
-        pthread_mutex_trylock.o pthread_mutex_unlock.o pthread_mutexattr_destroy.o \
-        pthread_mutexattr_getprioceiling.o pthread_mutexattr_getprotocol.o pthread_mutexattr_getpshared.o \
-        pthread_mutexattr_getrobust.o pthread_mutexattr_gettype.o pthread_mutexattr_init.o \
-        pthread_mutexattr_setprioceiling.o pthread_mutexattr_setprotocol.o \
-        pthread_mutexattr_setpshared.o pthread_mutexattr_setrobust.o pthread_mutexattr_settype.o \
-        pthread_cond_broadcast.o pthread_cond_destroy.o pthread_cond_init.o pthread_cond_signal.o \
-        pthread_cond_timedwait.o pthread_cond_wait.o sem_close.o sem_destroy.o sem_getvalue.o \
-        sem_init.o sem_open.o sem_post.o sem_timedwait.o sem_trywait.o sem_unlink.o sem_wait.o \
-        clock_nanosleep.o getitimer.o getrlimit.o kill.o nanosleep.o pthread_atfork.o pthread_attr_get.o \
-        pthread_attr_setinheritsched.o pthread_attr_setschedparam.o pthread_attr_setschedpolicy.o \
-        pthread_attr_setstack.o pthread_attr_setstacksize.o pthread_barrier_destroy.o \
-        pthread_barrier_init.o pthread_barrier_wait.o pthread_barrierattr_destroy.o \
-        pthread_barrierattr_getpshared.o pthread_barrierattr_init.o pthread_barrierattr_setpshared.o pthread_cancel.o \
-        pthread_condattr_destroy.o pthread_condattr_init.o pthread_condattr_setclock.o \
-        pthread_condattr_setpshared.o pthread_detach.o pthread_getattr_np.o \
-        pthread_getcpuclockid.o pthread_getschedparam.o pthread_getspecific.o pthread_join.o \
-        pthread_kill.o pthread_mutexattr_destroy.o pthread_mutexattr_init.o \
-        pthread_mutexattr_setprioceiling.o pthread_mutexattr_setprotocol.o \
-        pthread_mutexattr_setpshared.o pthread_mutexattr_setrobust.o pthread_mutexattr_settype.o \
-        pthread_rwlock_destroy.o pthread_rwlock_init.o pthread_rwlock_rdlock.o \
-        pthread_rwlock_timedrdlock.o pthread_rwlock_timedwrlock.o pthread_rwlock_tryrdlock.o \
-        pthread_rwlock_trywrlock.o pthread_rwlock_unlock.o pthread_rwlock_wrlock.o \
-        pthread_rwlockattr_destroy.o pthread_rwlockattr_getpshared.o pthread_rwlockattr_init.o pthread_rwlockattr_setpshared.o \
-        pthread_setschedparam.o pthread_setschedprio.o pthread_sigmask.o pthread_spin_destroy.o \
-        pthread_spin_init.o pthread_spin_lock.o pthread_spin_trylock.o pthread_spin_unlock.o \
-        pthread_testcancel.o raise.o setitimer.o setrlimit.o sigpending.o sigprocmask.o sleep.o times.o \
-        usleep.o wait.o waitpid.o __wasilibc_futex.o >/dev/null 2>&1 || true
-    "${WASI_SDK}/bin/llvm-ar" r "${sysroot}/lib/wasm32-wasi/libc.a" \
-        "${posix_object}" \
-        "${at_fdcwd_object}" \
-        "${futex_object}" \
-        "${semaphore_object}" \
-        "${pthread_mutex_object}" \
-        "${pthread_self_object}" \
-        "${pthread_cond_object}"
-    "${WASI_SDK}/bin/llvm-ranlib" "${sysroot}/lib/wasm32-wasi/libc.a"
-    (
-        signal_archive_dir="${WORKDIR}/sinomo-${stem}-wasi-emulated-signal"
-        rm -rf "${signal_archive_dir}"
-        mkdir -p "${signal_archive_dir}"
-        cd "${signal_archive_dir}"
-        "${WASI_SDK}/bin/llvm-ar" x "${sysroot}/lib/wasm32-wasi/libc.a" \
-            psignal.o sigaction.o sigaddset.o sigaltstack.o sigandset.o \
-            sigdelset.o sigemptyset.o sigfillset.o sighold.o sigignore.o \
-            siginterrupt.o sigisemptyset.o sigismember.o siglongjmp.o \
-            signal.o sigorset.o sigpause.o sigqueue.o sigrelse.o sigrtmax.o \
-            sigrtmin.o sigset.o sigsetjmp.o sigsetjmp_tail.o sigsuspend.o \
-            sigtimedwait.o sigwait.o sigwaitinfo.o strsignal.o
-        "${WASI_SDK}/bin/llvm-ar" rcs "${sysroot}/lib/wasm32-wasi/libwasi-emulated-signal.a" ./*.o
-        "${WASI_SDK}/bin/llvm-ranlib" "${sysroot}/lib/wasm32-wasi/libwasi-emulated-signal.a"
-    )
-    "${WASI_SDK}/bin/llvm-ar" d "${sysroot}/lib/wasm32-wasi/libc.a" \
-        psignal.o sigaction.o sigaddset.o sigaltstack.o sigandset.o \
-        sigdelset.o sigemptyset.o sigfillset.o sighold.o sigignore.o \
-        siginterrupt.o sigisemptyset.o sigismember.o siglongjmp.o \
-        signal.o sigorset.o sigpause.o sigqueue.o sigrelse.o sigrtmax.o \
-        sigrtmin.o sigset.o sigsetjmp.o sigsetjmp_tail.o sigsuspend.o \
-        sigtimedwait.o sigwait.o sigwaitinfo.o strsignal.o >/dev/null 2>&1 || true
-    "${WASI_SDK}/bin/llvm-ranlib" "${sysroot}/lib/wasm32-wasi/libc.a"
-}
-
-patch_wasix_sysroot "${WASIX_SYSROOT}"
 while IFS= read -r sysroot; do
-    patch_wasix_sysroot "${sysroot}"
+    rm -rf "${sysroot}"
+    mkdir -p "$(dirname "${sysroot}")"
+    rsync -a "${WASIX_SYSROOT}/" "${sysroot}/"
 done < <(find "${WASIXCC_SYSROOT_PREFIX}" -mindepth 1 -maxdepth 1 -type d | sort)
 
 WASIXCC_SETTINGS=(
@@ -711,8 +537,7 @@ binaryen_version=${BINARYEN_VERSION}
 binaryen_source=${BINARYEN_URL}
 binaryen_sha256=${BINARYEN_SHA256}
 wasix_libc_version=${WASIX_LIBC_VERSION}
-wasix_libc_source=${WASIX_LIBC_URL}
-wasix_libc_sha256=${WASIX_LIBC_SHA256}
+wasix_libc_source=${WASIX_LIBC_SOURCE}
 source_date_epoch=${SOURCE_DATE_EPOCH}
 wasm=${PYTHON_WASM}
 wasm_hash=${PYTHON_HASH}
