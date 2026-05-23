@@ -514,6 +514,10 @@ uint32_t __sinomo_wasix_shared_memory_was_cross_process(void) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("shared_memory_was_cross_process")
 ));
+uint32_t __sinomo_wasix_shared_memory_has_direct_mapping(uintptr_t offset, uintptr_t len) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("shared_memory_has_direct_mapping")
+));
 
 static void sinomo_wasix_sync_from_guest_if_shared(void) {
     if (__sinomo_wasix_shared_memory_is_cross_process() != 0)
@@ -527,11 +531,15 @@ static void sinomo_wasix_sync_to_guest_if_shared(void) {
 }
 
 static void sinomo_wasix_sync_range_from_guest_if_shared(const void *ptr, size_t len) {
+    if (__sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)ptr, (uintptr_t)len) != 0)
+        return;
     if (__sinomo_wasix_shared_memory_is_cross_process() != 0)
         (void)__sinomo_wasix_shared_memory_range_sync_from((uintptr_t)ptr, (uintptr_t)len);
 }
 
 static void sinomo_wasix_sync_range_to_guest_if_shared(const void *ptr, size_t len) {
+    if (__sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)ptr, (uintptr_t)len) != 0)
+        return;
     if (__sinomo_wasix_shared_memory_is_cross_process() != 0)
         (void)__sinomo_wasix_shared_memory_range_sync_to((uintptr_t)ptr, (uintptr_t)len);
 }
@@ -1484,7 +1492,8 @@ int pthread_barrier_wait(pthread_barrier_t *barrier) {
     if (limit <= 0)
         return EINVAL;
 
-    if (__sinomo_wasix_shared_memory_is_cross_process() != 0) {
+    if (__sinomo_wasix_shared_memory_is_cross_process() != 0 &&
+        __sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)barrier, (uintptr_t)sizeof(*barrier)) == 0) {
         int generation = (int)__sinomo_wasix_shared_barrier_generation((uintptr_t)barrier);
         words[SINOMO_BARRIER_GEN_WORD] = generation;
         int32_t arrive = __sinomo_wasix_shared_barrier_arrive((uintptr_t)barrier, (uint32_t)limit);
@@ -1811,11 +1820,23 @@ int pthread_rwlockattr_getpshared(const pthread_rwlockattr_t *restrict attr, int
 #define SINOMO_RWLOCK_MAGIC_WORD 3
 #define SINOMO_RWLOCK_WRITER_PRIORITY_WORD 4
 #define SINOMO_RWLOCK_WRITER_POLICY_WORD 5
+#define SINOMO_RWLOCK_WRITER_OWNER_WORD 6
+#define SINOMO_RWLOCK_READER_PRIORITY_WORD 7
 
 static void sinomo_wasix_get_current_sched(int *policy, int *priority);
 
 static int rwlock_is_shared(volatile int *words) {
     return words[SINOMO_RWLOCK_PSHARED_WORD] == PTHREAD_PROCESS_SHARED;
+}
+
+static int rwlock_has_direct_mapping(pthread_rwlock_t *rwlock) {
+    return __sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)rwlock, (uintptr_t)sizeof(*rwlock)) != 0;
+}
+
+static int rwlock_needs_runtime_shared(pthread_rwlock_t *rwlock, volatile int *words) {
+    return rwlock_is_shared(words) &&
+           __sinomo_wasix_shared_memory_was_cross_process() != 0 &&
+           !rwlock_has_direct_mapping(rwlock);
 }
 
 static int rwlock_ensure_initialized(pthread_rwlock_t *rwlock) {
@@ -1832,25 +1853,17 @@ static int rwlock_ensure_initialized(pthread_rwlock_t *rwlock) {
     __atomic_store_n(&words[SINOMO_RWLOCK_PSHARED_WORD], PTHREAD_PROCESS_PRIVATE, __ATOMIC_SEQ_CST);
     __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_PRIORITY_WORD], 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_POLICY_WORD], SCHED_OTHER, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_OWNER_WORD], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&words[SINOMO_RWLOCK_READER_PRIORITY_WORD], 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&words[SINOMO_RWLOCK_MAGIC_WORD], SINOMO_RWLOCK_MAGIC, __ATOMIC_SEQ_CST);
     return 0;
 }
 
-static int rwlock_sync_to_if_shared(volatile int *words) {
-    if (!rwlock_is_shared(words) || __sinomo_wasix_shared_memory_is_cross_process() == 0)
+static int rwlock_is_initialized(pthread_rwlock_t *rwlock) {
+    if (rwlock == NULL)
         return 0;
-    int32_t publish = __sinomo_wasix_shared_memory_sync_from_preserving_futexes();
-    if (publish != 0)
-        return (int)publish;
-    int32_t err = __sinomo_wasix_shared_memory_sync_to();
-    return err == 0 ? 0 : (int)err;
-}
-
-static int rwlock_sync_from_if_shared(volatile int *words) {
-    if (!rwlock_is_shared(words) || __sinomo_wasix_shared_memory_is_cross_process() == 0)
-        return 0;
-    int32_t err = __sinomo_wasix_shared_memory_sync_from();
-    return err == 0 ? 0 : (int)err;
+    volatile int *words = rwlock->__u.__vi;
+    return __atomic_load_n(&words[SINOMO_RWLOCK_MAGIC_WORD], __ATOMIC_SEQ_CST) == SINOMO_RWLOCK_MAGIC;
 }
 
 static void rwlock_current_sched(int *policy, int *priority) {
@@ -1908,11 +1921,41 @@ static void rwlock_unregister_writer_waiter(volatile int *words) {
         __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_WAITERS_WORD], 0, __ATOMIC_SEQ_CST);
         __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_PRIORITY_WORD], 0, __ATOMIC_SEQ_CST);
         __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_POLICY_WORD], SCHED_OTHER, __ATOMIC_SEQ_CST);
+    } else {
+        int policy = SCHED_OTHER;
+        int priority = 0;
+        rwlock_current_sched(&policy, &priority);
+        int current_priority = __atomic_load_n(&words[SINOMO_RWLOCK_WRITER_PRIORITY_WORD], __ATOMIC_SEQ_CST);
+        if (priority >= current_priority)
+            __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_PRIORITY_WORD], 0, __ATOMIC_SEQ_CST);
     }
 }
 
-static int rwlock_wait(pthread_rwlock_t *rwlock, volatile int *state_word, int expected, int shared, int64_t wait_ns) {
-    if (shared && __sinomo_wasix_shared_memory_is_cross_process() != 0)
+static void rwlock_register_reader_waiter(volatile int *words) {
+    int policy = SCHED_OTHER;
+    int priority = 0;
+    rwlock_current_sched(&policy, &priority);
+    if (!rwlock_policy_orders_readers(policy))
+        return;
+    int current_priority = __atomic_load_n(&words[SINOMO_RWLOCK_READER_PRIORITY_WORD], __ATOMIC_SEQ_CST);
+    while (priority > current_priority &&
+           !__atomic_compare_exchange_n(&words[SINOMO_RWLOCK_READER_PRIORITY_WORD], &current_priority, priority, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    }
+}
+
+static void rwlock_unregister_reader_waiter(volatile int *words) {
+    int policy = SCHED_OTHER;
+    int priority = 0;
+    rwlock_current_sched(&policy, &priority);
+    if (!rwlock_policy_orders_readers(policy))
+        return;
+    int current_priority = __atomic_load_n(&words[SINOMO_RWLOCK_READER_PRIORITY_WORD], __ATOMIC_SEQ_CST);
+    if (priority >= current_priority)
+        __atomic_store_n(&words[SINOMO_RWLOCK_READER_PRIORITY_WORD], 0, __ATOMIC_SEQ_CST);
+}
+
+static int rwlock_wait(pthread_rwlock_t *rwlock, volatile int *state_word, int expected, int runtime_shared, int64_t wait_ns) {
+    if (runtime_shared)
         return (int)__sinomo_wasix_shared_rwlock_wait((uintptr_t)rwlock, wait_ns);
     int64_t futex_wait_ns = wait_ns < 0 || wait_ns > 10000000LL ? 10000000LL : wait_ns;
     int wait_ret = __wasilibc_futex_wait_wasix(state_word, 0, expected, futex_wait_ns);
@@ -1935,6 +1978,53 @@ static int64_t rwlock_abstime_to_wait_ns(const struct timespec *abstime) {
     return total <= 0 ? 0 : total;
 }
 
+static int rwlock_try_rdlock_local(volatile int *words) {
+    for (;;) {
+        int state = __atomic_load_n(&words[SINOMO_RWLOCK_STATE_WORD], __ATOMIC_SEQ_CST);
+        if (state < 0 || rwlock_reader_must_wait_for_writer(words))
+            return EBUSY;
+        if (__atomic_compare_exchange_n(&words[SINOMO_RWLOCK_STATE_WORD], &state, state + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return 0;
+    }
+}
+
+static int rwlock_try_wrlock_local(volatile int *words, int registered_waiter, int policy, int priority) {
+    int waiters = __atomic_load_n(&words[SINOMO_RWLOCK_WRITER_WAITERS_WORD], __ATOMIC_SEQ_CST);
+    int max_priority = __atomic_load_n(&words[SINOMO_RWLOCK_WRITER_PRIORITY_WORD], __ATOMIC_SEQ_CST);
+    int max_reader_priority = __atomic_load_n(&words[SINOMO_RWLOCK_READER_PRIORITY_WORD], __ATOMIC_SEQ_CST);
+    int max_policy = __atomic_load_n(&words[SINOMO_RWLOCK_WRITER_POLICY_WORD], __ATOMIC_SEQ_CST);
+    if (registered_waiter && waiters > 0 && rwlock_policy_orders_readers(max_policy) && rwlock_policy_orders_readers(policy) && priority < max_priority)
+        return EBUSY;
+    if (registered_waiter && rwlock_policy_orders_readers(policy) && priority < max_reader_priority)
+        return EBUSY;
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&words[SINOMO_RWLOCK_STATE_WORD], &expected, -1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_OWNER_WORD], (int)(uintptr_t)pthread_self(), __ATOMIC_SEQ_CST);
+        return 0;
+    }
+    return EBUSY;
+}
+
+static int rwlock_unlock_local(volatile int *words) {
+    for (;;) {
+        int state = __atomic_load_n(&words[SINOMO_RWLOCK_STATE_WORD], __ATOMIC_SEQ_CST);
+        if (state == -1) {
+            int expected = -1;
+            if (__atomic_compare_exchange_n(&words[SINOMO_RWLOCK_STATE_WORD], &expected, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                __atomic_store_n(&words[SINOMO_RWLOCK_WRITER_OWNER_WORD], 0, __ATOMIC_SEQ_CST);
+                return 0;
+            }
+            continue;
+        }
+        if (state > 0) {
+            if (__atomic_compare_exchange_n(&words[SINOMO_RWLOCK_STATE_WORD], &state, state - 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+                return 0;
+            continue;
+        }
+        return EPERM;
+    }
+}
+
 int pthread_rwlock_init(pthread_rwlock_t *restrict rwlock, const pthread_rwlockattr_t *restrict attr) {
     if (rwlock == NULL)
         return EINVAL;
@@ -1946,6 +2036,8 @@ int pthread_rwlock_init(pthread_rwlock_t *restrict rwlock, const pthread_rwlocka
     words[SINOMO_RWLOCK_MAGIC_WORD] = SINOMO_RWLOCK_MAGIC;
     words[SINOMO_RWLOCK_WRITER_PRIORITY_WORD] = 0;
     words[SINOMO_RWLOCK_WRITER_POLICY_WORD] = SCHED_OTHER;
+    words[SINOMO_RWLOCK_WRITER_OWNER_WORD] = 0;
+    words[SINOMO_RWLOCK_READER_PRIORITY_WORD] = 0;
     if (rwlock_is_shared(words)) {
         int32_t hint = __sinomo_wasix_shared_futex_hint((uintptr_t)rwlock, (uintptr_t)sizeof(*rwlock));
         if (hint != 0)
@@ -1959,9 +2051,11 @@ int pthread_rwlock_destroy(pthread_rwlock_t *rwlock) {
     if (init_ret != 0)
         return init_ret;
     volatile int *words = rwlock->__u.__vi;
-    int32_t destroy = __sinomo_wasix_shared_rwlock_destroy((uintptr_t)rwlock);
-    if (destroy != 0)
-        return (int)destroy;
+    if (rwlock_needs_runtime_shared(rwlock, words)) {
+        int32_t destroy = __sinomo_wasix_shared_rwlock_destroy((uintptr_t)rwlock);
+        if (destroy != 0)
+            return (int)destroy;
+    }
     if (rwlock_is_shared(words))
         (void)__sinomo_wasix_shared_futex_unhint((uintptr_t)rwlock, (uintptr_t)sizeof(*rwlock));
     memset(rwlock, 0, sizeof(*rwlock));
@@ -1977,7 +2071,9 @@ int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock) {
     int policy = SCHED_OTHER;
     int priority = 0;
     rwlock_current_sched(&policy, &priority);
-    int32_t ret = __sinomo_wasix_shared_rwlock_try_rdlock((uintptr_t)rwlock, policy, priority, 0);
+    int32_t ret = rwlock_needs_runtime_shared(rwlock, words)
+        ? __sinomo_wasix_shared_rwlock_try_rdlock((uintptr_t)rwlock, policy, priority, 0)
+        : rwlock_try_rdlock_local(words);
     SINOMO_PTHREAD_ENV_LOG("sinomo-debug rwlock_tryrd result rwlock=%p ret=%d words=[%d,%d,%d,%d]\n", (void *)rwlock, ret, words[0], words[1], words[2], words[3]);
     return ret == 0 ? 0 : (int)ret;
 }
@@ -1991,7 +2087,9 @@ int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock) {
     int policy = SCHED_OTHER;
     int priority = 0;
     rwlock_current_sched(&policy, &priority);
-    int32_t ret = __sinomo_wasix_shared_rwlock_try_wrlock((uintptr_t)rwlock, 0, policy, priority);
+    int32_t ret = rwlock_needs_runtime_shared(rwlock, words)
+        ? __sinomo_wasix_shared_rwlock_try_wrlock((uintptr_t)rwlock, 0, policy, priority)
+        : rwlock_try_wrlock_local(words, 0, policy, priority);
     SINOMO_PTHREAD_ENV_LOG("sinomo-debug rwlock_trywr acquired rwlock=%p ret=%d words=[%d,%d,%d,%d]\n", (void *)rwlock, ret, words[0], words[1], words[2], words[3]);
     return ret == 0 ? 0 : (int)ret;
 }
@@ -2004,14 +2102,22 @@ int pthread_rwlock_timedrdlock(pthread_rwlock_t *restrict rwlock, const struct t
     int policy = SCHED_OTHER;
     int priority = 0;
     rwlock_current_sched(&policy, &priority);
+    int runtime_shared = rwlock_needs_runtime_shared(rwlock, words);
     int registered_waiter = 0;
     for (;;) {
-        int ret = __sinomo_wasix_shared_rwlock_try_rdlock((uintptr_t)rwlock, policy, priority, registered_waiter ? 1U : 0U);
-        if (ret == 0)
+        int ret = runtime_shared
+            ? __sinomo_wasix_shared_rwlock_try_rdlock((uintptr_t)rwlock, policy, priority, registered_waiter ? 1U : 0U)
+            : rwlock_try_rdlock_local(words);
+        if (ret == 0) {
+            if (!runtime_shared && registered_waiter)
+                rwlock_unregister_reader_waiter(words);
             return 0;
+        }
         if (ret != EBUSY) {
-            if (registered_waiter)
+            if (runtime_shared && registered_waiter)
                 (void)__sinomo_wasix_shared_rwlock_unregister_reader((uintptr_t)rwlock, policy, priority);
+            else if (registered_waiter)
+                rwlock_unregister_reader_waiter(words);
             return ret;
         }
         int64_t wait_ns = rwlock_abstime_to_wait_ns(abstime);
@@ -2020,21 +2126,28 @@ int pthread_rwlock_timedrdlock(pthread_rwlock_t *restrict rwlock, const struct t
         if (wait_ns == INT64_MIN + 1)
             return errno == 0 ? EINVAL : errno;
         if (wait_ns == 0) {
-            if (registered_waiter)
+            if (runtime_shared && registered_waiter)
                 (void)__sinomo_wasix_shared_rwlock_unregister_reader((uintptr_t)rwlock, policy, priority);
+            else if (registered_waiter)
+                rwlock_unregister_reader_waiter(words);
             return ETIMEDOUT;
         }
-        if (!registered_waiter) {
+        if (runtime_shared && !registered_waiter) {
             ret = __sinomo_wasix_shared_rwlock_register_reader((uintptr_t)rwlock, policy, priority);
             if (ret != 0)
                 return ret;
             registered_waiter = 1;
+        } else if (!runtime_shared && !registered_waiter) {
+            rwlock_register_reader_waiter(words);
+            registered_waiter = 1;
         }
         int observed = __atomic_load_n(&words[SINOMO_RWLOCK_STATE_WORD], __ATOMIC_SEQ_CST);
-        ret = rwlock_wait(rwlock, &words[SINOMO_RWLOCK_STATE_WORD], observed, rwlock_is_shared(words), wait_ns);
+        ret = rwlock_wait(rwlock, &words[SINOMO_RWLOCK_STATE_WORD], observed, runtime_shared, wait_ns);
         if (ret != 0) {
-            if (registered_waiter)
+            if (runtime_shared && registered_waiter)
                 (void)__sinomo_wasix_shared_rwlock_unregister_reader((uintptr_t)rwlock, policy, priority);
+            else if (registered_waiter)
+                rwlock_unregister_reader_waiter(words);
             return ret;
         }
     }
@@ -2050,18 +2163,30 @@ int pthread_rwlock_timedwrlock(pthread_rwlock_t *restrict rwlock, const struct t
         return init_ret;
     volatile int *words = rwlock->__u.__vi;
     SINOMO_PTHREAD_ENV_LOG("sinomo-debug rwlock_wrlock enter rwlock=%p words=[%d,%d,%d,%d]\n", (void *)rwlock, words[0], words[1], words[2], words[3]);
+    int runtime_shared = rwlock_needs_runtime_shared(rwlock, words);
     int registered_waiter = 0;
     for (;;) {
+        if (!runtime_shared &&
+            __atomic_load_n(&words[SINOMO_RWLOCK_STATE_WORD], __ATOMIC_SEQ_CST) == -1 &&
+            __atomic_load_n(&words[SINOMO_RWLOCK_WRITER_OWNER_WORD], __ATOMIC_SEQ_CST) == (int)(uintptr_t)pthread_self()) {
+            return EDEADLK;
+        }
         int policy = SCHED_OTHER;
         int priority = 0;
         rwlock_current_sched(&policy, &priority);
-        int ret = __sinomo_wasix_shared_rwlock_try_wrlock((uintptr_t)rwlock, registered_waiter ? 1U : 0U, policy, priority);
+        int ret = runtime_shared
+            ? __sinomo_wasix_shared_rwlock_try_wrlock((uintptr_t)rwlock, registered_waiter ? 1U : 0U, policy, priority)
+            : rwlock_try_wrlock_local(words, registered_waiter, policy, priority);
         if (ret == 0) {
+            if (!runtime_shared && registered_waiter)
+                rwlock_unregister_writer_waiter(words);
             return 0;
         }
         if (ret != EBUSY) {
-            if (registered_waiter)
+            if (runtime_shared && registered_waiter)
                 (void)__sinomo_wasix_shared_rwlock_unregister_writer((uintptr_t)rwlock, policy, priority);
+            else if (registered_waiter)
+                rwlock_unregister_writer_waiter(words);
             return ret;
         }
         int64_t wait_ns = rwlock_abstime_to_wait_ns(abstime);
@@ -2070,21 +2195,29 @@ int pthread_rwlock_timedwrlock(pthread_rwlock_t *restrict rwlock, const struct t
         if (wait_ns == INT64_MIN + 1)
             return errno == 0 ? EINVAL : errno;
         if (wait_ns == 0) {
-            if (registered_waiter)
+            if (runtime_shared && registered_waiter)
                 (void)__sinomo_wasix_shared_rwlock_unregister_writer((uintptr_t)rwlock, policy, priority);
+            else if (registered_waiter)
+                rwlock_unregister_writer_waiter(words);
             return ETIMEDOUT;
         }
         if (!registered_waiter) {
-            ret = __sinomo_wasix_shared_rwlock_register_writer((uintptr_t)rwlock, policy, priority);
-            if (ret != 0)
-                return ret;
+            if (runtime_shared) {
+                ret = __sinomo_wasix_shared_rwlock_register_writer((uintptr_t)rwlock, policy, priority);
+                if (ret != 0)
+                    return ret;
+            } else {
+                rwlock_register_writer_waiter(words);
+            }
             registered_waiter = 1;
         }
         int observed = __atomic_load_n(&words[SINOMO_RWLOCK_STATE_WORD], __ATOMIC_SEQ_CST);
-        ret = rwlock_wait(rwlock, &words[SINOMO_RWLOCK_STATE_WORD], observed, rwlock_is_shared(words), wait_ns);
+        ret = rwlock_wait(rwlock, &words[SINOMO_RWLOCK_STATE_WORD], observed, runtime_shared, wait_ns);
         if (ret != 0) {
-            if (registered_waiter)
+            if (runtime_shared && registered_waiter)
                 (void)__sinomo_wasix_shared_rwlock_unregister_writer((uintptr_t)rwlock, policy, priority);
+            else if (registered_waiter)
+                rwlock_unregister_writer_waiter(words);
             return ret;
         }
     }
@@ -2095,12 +2228,16 @@ int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock) {
 }
 
 int pthread_rwlock_unlock(pthread_rwlock_t *rwlock) {
+    if (!rwlock_is_initialized(rwlock))
+        return EINVAL;
     int init_ret = rwlock_ensure_initialized(rwlock);
     if (init_ret != 0)
         return init_ret;
     volatile int *words = rwlock->__u.__vi;
     SINOMO_PTHREAD_ENV_LOG("sinomo-debug rwlock_unlock enter rwlock=%p words=[%d,%d,%d,%d]\n", (void *)rwlock, words[0], words[1], words[2], words[3]);
-    int32_t ret = __sinomo_wasix_shared_rwlock_unlock((uintptr_t)rwlock);
+    int32_t ret = rwlock_needs_runtime_shared(rwlock, words)
+        ? __sinomo_wasix_shared_rwlock_unlock((uintptr_t)rwlock)
+        : rwlock_unlock_local(words);
     if (ret == 0)
         (void)__wasilibc_futex_wake_wasix((int *)&words[SINOMO_RWLOCK_STATE_WORD], INT_MAX);
     return ret == 0 ? 0 : (int)ret;

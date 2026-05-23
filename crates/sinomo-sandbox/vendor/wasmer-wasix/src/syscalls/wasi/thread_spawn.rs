@@ -1,6 +1,6 @@
 use super::*;
 use crate::syscalls::*;
-use crate::syscalls::wasix::map_shared_memory_backing;
+use crate::syscalls::wasix::map_shared_memory_backing_best_effort;
 
 use crate::{
     WasiThreadHandle, os::task::thread::WasiMemoryLayout, runtime::task_manager::TaskWasm,
@@ -68,7 +68,7 @@ fn thread_spawn_legacy_internal_from_wasi<M: MemorySize>(
     if env.state.has_cross_process_shared_memory() && env.state.has_shared_memory_mappings() {
         let memory = unsafe { env.memory_view(&ctx) };
         for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
-            if let Err(err) = map_shared_memory_backing(env, &memory, &mapping) {
+            if let Err(err) = map_shared_memory_backing_best_effort(env, &memory, &mapping) {
                 env.process.remove_thread(&thread_handle.id());
                 return Err(err);
             }

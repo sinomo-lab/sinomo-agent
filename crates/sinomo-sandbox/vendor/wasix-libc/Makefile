@@ -80,6 +80,7 @@ LIBC_BOTTOM_HALF_ALL_SOURCES := $(filter-out \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/time/clock_nanosleep.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/sys/stat/fstat.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/sys/stat/fstatat.c \
+    $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/ftruncate.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/getegid.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/geteuid.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/getgid.c \
@@ -388,6 +389,7 @@ LIBC_TOP_HALF_MUSL_SOURCES := $(filter-out \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/misc/getrlimit.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/misc/setrlimit.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/process/fork.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/process/wait.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/process/waitpid.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/kill.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/raise.c \
@@ -395,6 +397,7 @@ LIBC_TOP_HALF_MUSL_SOURCES := $(filter-out \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/sigprocmask.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/thread/pthread_atfork.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/thread/pthread_sigmask.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/thread/pthread_setschedparam.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/clock.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/gettimeofday.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/clock_nanosleep.c \
@@ -404,6 +407,7 @@ LIBC_TOP_HALF_MUSL_SOURCES := $(filter-out \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/chown.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/fchown.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/fchownat.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/ftruncate.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/getegid.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/geteuid.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/getgid.c \

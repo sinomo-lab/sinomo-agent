@@ -49,6 +49,8 @@ uint32_t __sinomo_wasix_shared_memory_is_cross_process(void)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_is_cross_process")));
 uint32_t __sinomo_wasix_shared_memory_was_cross_process(void)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_was_cross_process")));
+uint32_t __sinomo_wasix_shared_memory_has_direct_mapping(uintptr_t offset, uintptr_t len)
+    __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_has_direct_mapping")));
 
 int __wasilibc_futex_wait_wasix(volatile void *addr, int op, int expected, int64_t max_wait_ns);
 int __wasilibc_futex_wake_wasix(int *futex, int cnt);
@@ -85,6 +87,8 @@ static int sync_to_if_shared(volatile int *words) {
     if (__sinomo_wasix_shared_memory_is_cross_process() == 0 &&
         __sinomo_wasix_shared_memory_was_cross_process() == 0)
         return 0;
+    if (__sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)words, (uintptr_t)SINOMO_MUTEX_RUNTIME_BYTES) != 0)
+        return 0;
     int32_t err = __sinomo_wasix_shared_memory_sync_to();
     return err == 0 ? 0 : (int)err;
 }
@@ -94,6 +98,8 @@ static int sync_from_if_shared(volatile int *words) {
         return 0;
     if (__sinomo_wasix_shared_memory_is_cross_process() == 0 &&
         __sinomo_wasix_shared_memory_was_cross_process() == 0)
+        return 0;
+    if (__sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)words, (uintptr_t)SINOMO_MUTEX_RUNTIME_BYTES) != 0)
         return 0;
     int32_t err = __sinomo_wasix_shared_memory_sync_from();
     return err == 0 ? 0 : (int)err;
@@ -105,6 +111,8 @@ static int sync_mutex_range_to_if_was_cross(volatile int *words) {
         return 0;
     if (__sinomo_wasix_shared_memory_was_cross_process() == 0)
         return 0;
+    if (__sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)words, (uintptr_t)SINOMO_MUTEX_RUNTIME_BYTES) != 0)
+        return 0;
     int32_t err = __sinomo_wasix_shared_memory_sync_to();
     return err == 0 ? 0 : (int)err;
 }
@@ -115,13 +123,16 @@ static int sync_mutex_range_from_if_was_cross(volatile int *words) {
         return 0;
     if (__sinomo_wasix_shared_memory_was_cross_process() == 0)
         return 0;
+    if (__sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)words, (uintptr_t)SINOMO_MUTEX_RUNTIME_BYTES) != 0)
+        return 0;
     int32_t err = __sinomo_wasix_shared_memory_sync_from();
     return err == 0 ? 0 : (int)err;
 }
 
 static int needs_runtime_shared_mutex(volatile int *words) {
     return (words[0] & SINOMO_MUTEX_PSHARED) != 0 &&
-           __sinomo_wasix_shared_memory_was_cross_process() != 0;
+           __sinomo_wasix_shared_memory_was_cross_process() != 0 &&
+           __sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)words, (uintptr_t)SINOMO_MUTEX_RUNTIME_BYTES) == 0;
 }
 
 static int mutex_default_prioceiling(void) {

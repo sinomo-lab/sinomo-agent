@@ -259,7 +259,7 @@ fn sync_shared_memory_from_guest_with_preserve_ranges<M: MemorySize>(
                 merged
             );
         }
-        publish_shared_memory_delta(&mapping, env.pid().raw(), &bytes, &merged)?;
+        mapping.publish_delta_from_guest(env.pid().raw(), &bytes, &merged)?;
     }
     Ok(())
 }
@@ -279,93 +279,6 @@ fn is_direct_shared_mapping_active(
         .lock()
         .unwrap()
         .contains(&(env.pid().raw(), env.tid().raw(), base)))
-}
-
-fn publish_shared_memory_delta(
-    mapping: &state::WasiSharedMemoryMapping,
-    pid: u32,
-    guest_bytes: &[u8],
-    preserve_ranges: &[(usize, usize)],
-) -> Result<(), Errno> {
-    let len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
-    if guest_bytes.len() != len {
-        return Err(Errno::Inval);
-    }
-
-    let mut shared = mapping.read_bytes()?;
-    if shared.len() != len {
-        return Err(Errno::Inval);
-    }
-    let mut snapshots = mapping.process_snapshots.lock().unwrap();
-    let snapshot = snapshots.entry(pid).or_insert_with(|| shared.clone());
-    if snapshot.len() != len {
-        *snapshot = shared.clone();
-    }
-
-    let mut cursor = 0usize;
-    for (start, end) in preserve_ranges {
-        if cursor < *start {
-            publish_shared_memory_delta_range(&mut shared, snapshot, guest_bytes, cursor, *start);
-        }
-        cursor = cursor.max(*end);
-    }
-    if cursor < len {
-        publish_shared_memory_delta_range(&mut shared, snapshot, guest_bytes, cursor, len);
-    }
-    mapping.write_bytes(&shared)?;
-    Ok(())
-}
-
-fn publish_shared_memory_delta_range(
-    shared: &mut [u8],
-    snapshot: &mut [u8],
-    guest_bytes: &[u8],
-    start: usize,
-    end: usize,
-) {
-    for index in start..end {
-        if guest_bytes[index] != snapshot[index] {
-            shared[index] = guest_bytes[index];
-        }
-        snapshot[index] = guest_bytes[index];
-    }
-}
-
-fn publish_shared_memory_ranges(
-    mapping: &state::WasiSharedMemoryMapping,
-    pid: u32,
-    guest_bytes: &[u8],
-    preserve_ranges: &[(usize, usize)],
-) -> Result<(), Errno> {
-    let len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
-    if guest_bytes.len() != len {
-        return Err(Errno::Inval);
-    }
-
-    let mut shared = mapping.read_bytes()?;
-    if shared.len() != len {
-        return Err(Errno::Inval);
-    }
-    let mut snapshots = mapping.process_snapshots.lock().unwrap();
-    let snapshot = snapshots.entry(pid).or_insert_with(|| shared.clone());
-    if snapshot.len() != len {
-        *snapshot = shared.clone();
-    }
-
-    let mut cursor = 0usize;
-    for (start, end) in preserve_ranges {
-        if cursor < *start {
-            shared[cursor..*start].copy_from_slice(&guest_bytes[cursor..*start]);
-            snapshot[cursor..*start].copy_from_slice(&guest_bytes[cursor..*start]);
-        }
-        cursor = cursor.max(*end);
-    }
-    if cursor < len {
-        shared[cursor..].copy_from_slice(&guest_bytes[cursor..]);
-        snapshot[cursor..].copy_from_slice(&guest_bytes[cursor..]);
-    }
-    mapping.write_bytes(&shared)?;
-    Ok(())
 }
 
 pub(crate) fn sync_shared_memory_range_from_guest<M: MemorySize>(
@@ -411,11 +324,15 @@ pub(crate) fn sync_shared_memory_range_from_guest<M: MemorySize>(
     let mapping_len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
     let mut shared_range = mapping.read_range(index, len)?;
     let mut snapshots = mapping.process_snapshots.lock().unwrap();
-    let snapshot = snapshots
-        .entry(env.pid().raw())
-        .or_insert_with(|| mapping.read_bytes().unwrap_or_else(|_| vec![0; mapping_len]));
+    let snapshot = snapshots.entry(env.pid().raw()).or_insert_with(|| {
+        mapping
+            .read_bytes()
+            .unwrap_or_else(|_| vec![0; mapping_len])
+    });
     if snapshot.len() != mapping_len {
-        *snapshot = mapping.read_bytes().unwrap_or_else(|_| vec![0; mapping_len]);
+        *snapshot = mapping
+            .read_bytes()
+            .unwrap_or_else(|_| vec![0; mapping_len]);
     }
     for (byte_index, guest_byte) in bytes.iter().enumerate() {
         let shared_index = index + byte_index;
@@ -471,11 +388,15 @@ pub(crate) fn sync_shared_memory_range_to_guest<M: MemorySize>(
 
     let mapping_len = usize::try_from(mapping.len).map_err(|_| Errno::Overflow)?;
     let mut snapshots = mapping.process_snapshots.lock().unwrap();
-    let snapshot = snapshots
-        .entry(env.pid().raw())
-        .or_insert_with(|| mapping.read_bytes().unwrap_or_else(|_| vec![0; mapping_len]));
+    let snapshot = snapshots.entry(env.pid().raw()).or_insert_with(|| {
+        mapping
+            .read_bytes()
+            .unwrap_or_else(|_| vec![0; mapping_len])
+    });
     if snapshot.len() != mapping_len {
-        *snapshot = mapping.read_bytes().unwrap_or_else(|_| vec![0; mapping_len]);
+        *snapshot = mapping
+            .read_bytes()
+            .unwrap_or_else(|_| vec![0; mapping_len]);
     }
     snapshot[index..index + len].copy_from_slice(&bytes);
     fence(Ordering::SeqCst);
@@ -531,7 +452,7 @@ pub(crate) fn sync_shared_memory_from_guest_preserving_ranges<M: MemorySize>(
             }
             merged.push((start, end));
         }
-        publish_shared_memory_delta(&mapping, env.pid().raw(), &guest_bytes, &merged)?;
+        mapping.publish_delta_from_guest(env.pid().raw(), &guest_bytes, &merged)?;
     }
     Ok(())
 }
@@ -547,7 +468,8 @@ pub(crate) fn is_registered_shared_memory_offset(env: &WasiEnv, offset: u64) -> 
 
 pub(crate) fn is_registered_shared_futex_offset(env: &WasiEnv, offset: u64) -> bool {
     has_live_cross_process_shared_memory(env)
-        && (is_registered_shared_memory_offset(env, offset) || env.state.is_shared_futex_offset(offset))
+        && (is_registered_shared_memory_offset(env, offset)
+            || env.state.is_shared_futex_offset(offset))
 }
 
 pub(crate) fn has_live_cross_process_shared_memory(env: &WasiEnv) -> bool {

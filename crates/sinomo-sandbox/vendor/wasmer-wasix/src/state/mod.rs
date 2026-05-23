@@ -49,9 +49,6 @@ pub use self::{
     types::*,
 };
 pub use crate::fs::{InodeGuard, InodeWeakGuard};
-pub(crate) use shared_memory::{
-    WasiSharedMemoryBacking, host_page_size, is_unsupported_error,
-};
 use crate::{
     fs::{WasiFs, WasiFsRoot, WasiInodes, WasiStateFileGuard, fs_error_into_wasi_err},
     syscalls::types::*,
@@ -59,6 +56,7 @@ use crate::{
 };
 pub(crate) use handles::*;
 pub(crate) use linker::*;
+pub(crate) use shared_memory::{WasiSharedMemoryBacking, host_page_size, is_unsupported_error};
 
 /// all the rights enabled
 pub const ALL_RIGHTS: Rights = Rights::all();
@@ -297,8 +295,22 @@ impl WasiSharedMemoryMapping {
         offset: usize,
         bytes: &[u8],
     ) -> Result<(), Errno> {
-        self.write_range(offset, bytes)?;
         let mapping_len = usize::try_from(self.len).map_err(|_| Errno::Overflow)?;
+        if offset.saturating_add(bytes.len()) > mapping_len {
+            return Err(Errno::Inval);
+        }
+        let mut cache = self.bytes.lock().unwrap();
+        self.backing.write_at(offset, bytes).map_err(|err| {
+            if is_unsupported_error(&err) {
+                Errno::Notsup
+            } else {
+                Errno::Io
+            }
+        })?;
+        if cache.len() != mapping_len {
+            cache.resize(mapping_len, 0);
+        }
+        cache[offset..offset + bytes.len()].copy_from_slice(bytes);
         let mut snapshots = self.process_snapshots.lock().unwrap();
         for snapshot in snapshots.values_mut() {
             if snapshot.len() != mapping_len {
@@ -307,6 +319,141 @@ impl WasiSharedMemoryMapping {
             snapshot[offset..offset + bytes.len()].copy_from_slice(bytes);
         }
         Ok(())
+    }
+
+    pub(crate) fn publish_delta_from_guest(
+        &self,
+        pid: u32,
+        guest_bytes: &[u8],
+        preserve_ranges: &[(usize, usize)],
+    ) -> Result<(), Errno> {
+        let mapping_len = usize::try_from(self.len).map_err(|_| Errno::Overflow)?;
+        if guest_bytes.len() != mapping_len {
+            return Err(Errno::Inval);
+        }
+
+        let mut cache = self.bytes.lock().unwrap();
+        let mut shared = self.backing.read(mapping_len).map_err(|err| {
+            if is_unsupported_error(&err) {
+                Errno::Notsup
+            } else {
+                Errno::Io
+            }
+        })?;
+        if shared.len() != mapping_len {
+            return Err(Errno::Inval);
+        }
+        if cache.len() != mapping_len {
+            cache.resize(mapping_len, 0);
+        }
+        cache.copy_from_slice(&shared);
+
+        let mut snapshots = self.process_snapshots.lock().unwrap();
+        let snapshot = snapshots.entry(pid).or_insert_with(|| shared.clone());
+        if snapshot.len() != mapping_len {
+            *snapshot = shared.clone();
+        }
+
+        let mut cursor = 0usize;
+        for (start, end) in preserve_ranges {
+            if *start > mapping_len || *end > mapping_len || *start > *end {
+                return Err(Errno::Inval);
+            }
+            if cursor < *start {
+                publish_delta_range(&mut shared, snapshot, guest_bytes, cursor, *start);
+            }
+            cursor = cursor.max(*end);
+        }
+        if cursor < mapping_len {
+            publish_delta_range(&mut shared, snapshot, guest_bytes, cursor, mapping_len);
+        }
+
+        self.backing.write(&shared).map_err(|err| {
+            if is_unsupported_error(&err) {
+                Errno::Notsup
+            } else {
+                Errno::Io
+            }
+        })?;
+        cache.copy_from_slice(&shared);
+        Ok(())
+    }
+}
+
+fn publish_delta_range(
+    shared: &mut [u8],
+    snapshot: &mut [u8],
+    guest_bytes: &[u8],
+    start: usize,
+    end: usize,
+) {
+    for index in start..end {
+        if guest_bytes[index] != snapshot[index] {
+            shared[index] = guest_bytes[index];
+        }
+        snapshot[index] = guest_bytes[index];
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod shared_memory_tests {
+    use super::*;
+    use std::{
+        collections::{BTreeSet, HashMap},
+        sync::{Arc, Barrier, Mutex},
+    };
+
+    fn test_mapping(len: usize) -> Arc<WasiSharedMemoryMapping> {
+        let initial = vec![0; len];
+        Arc::new(WasiSharedMemoryMapping {
+            offset: 0,
+            len: len as u64,
+            bytes: Arc::new(Mutex::new(initial.clone())),
+            process_snapshots: Arc::new(Mutex::new(HashMap::from([
+                (1, initial.clone()),
+                (2, initial.clone()),
+            ]))),
+            backing: Arc::new(WasiSharedMemoryBacking::new(&initial).unwrap()),
+            mapped_bases: Arc::new(Mutex::new(BTreeSet::new())),
+            fd: None,
+            file_key: None,
+            file_offset: 0,
+            owner_pid: 1,
+        })
+    }
+
+    #[test]
+    fn delta_publish_preserves_disjoint_concurrent_writes() {
+        let mapping = test_mapping(64);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let writer_one = {
+            let mapping = mapping.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut guest = vec![0; 64];
+                guest[7] = 1;
+                barrier.wait();
+                mapping.publish_delta_from_guest(1, &guest, &[]).unwrap();
+            })
+        };
+        let writer_two = {
+            let mapping = mapping.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut guest = vec![0; 64];
+                guest[41] = 2;
+                barrier.wait();
+                mapping.publish_delta_from_guest(2, &guest, &[]).unwrap();
+            })
+        };
+
+        writer_one.join().unwrap();
+        writer_two.join().unwrap();
+
+        let shared = mapping.read_bytes().unwrap();
+        assert_eq!(shared[7], 1);
+        assert_eq!(shared[41], 2);
     }
 }
 
@@ -481,7 +628,14 @@ impl WasiState {
         fd: i32,
         file_offset: u64,
     ) -> Result<(), Errno> {
-        self.register_shared_memory_mapping_inner(owner_pid, offset, len, bytes, Some(fd), file_offset)
+        self.register_shared_memory_mapping_inner(
+            owner_pid,
+            offset,
+            len,
+            bytes,
+            Some(fd),
+            file_offset,
+        )
     }
 
     fn register_shared_memory_mapping_inner(
@@ -587,10 +741,13 @@ impl WasiState {
             let mapping_end = mapping.offset.saturating_add(mapping.len);
             mapping.owner_pid != owner_pid || mapping_end <= offset || mapping.offset >= end
         });
-        self.memory_protections.lock().unwrap().retain(|protection| {
-            let protection_end = protection.offset.saturating_add(protection.len);
-            protection.pid != owner_pid || protection_end <= offset || protection.offset >= end
-        });
+        self.memory_protections
+            .lock()
+            .unwrap()
+            .retain(|protection| {
+                let protection_end = protection.offset.saturating_add(protection.len);
+                protection.pid != owner_pid || protection_end <= offset || protection.offset >= end
+            });
         mappings.push(WasiSharedMemoryMapping {
             offset,
             len,

@@ -1,7 +1,7 @@
 use std::f32::consts::E;
 
 use super::*;
-use super::proc_fork::map_shared_memory_backing;
+use super::proc_fork::map_shared_memory_backing_best_effort;
 #[cfg(feature = "journal")]
 use crate::journal::JournalEffector;
 use crate::{
@@ -135,7 +135,7 @@ pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
     if env.state.has_cross_process_shared_memory() && env.state.has_shared_memory_mappings() {
         let memory = unsafe { env.memory_view(&ctx) };
         for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
-            if let Err(err) = map_shared_memory_backing(env, &memory, &mapping) {
+            if let Err(err) = map_shared_memory_backing_best_effort(env, &memory, &mapping) {
                 env.process.remove_thread(&thread_handle.id());
                 return Err(err);
             }
@@ -342,7 +342,7 @@ fn call_module_internal<M: MemorySize>(
         if env.state.has_cross_process_shared_memory() && env.state.has_shared_memory_mappings() {
             let memory = unsafe { env.memory_view(&store) };
             for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
-                if let Err(err) = map_shared_memory_backing(env, &memory, &mapping) {
+                if let Err(err) = map_shared_memory_backing_best_effort(env, &memory, &mapping) {
                     let tid = env.tid();
                     warn!(%tid, ?err, "failed to map shared memory backing for spawned thread");
                     let exit_code = Some(err.into());

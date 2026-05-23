@@ -48,6 +48,8 @@ uint32_t __sinomo_wasix_shared_memory_is_cross_process(void)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_is_cross_process")));
 uint32_t __sinomo_wasix_shared_memory_was_cross_process(void)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_was_cross_process")));
+uint32_t __sinomo_wasix_shared_memory_has_direct_mapping(uintptr_t offset, uintptr_t len)
+    __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_has_direct_mapping")));
 
 int __wasilibc_futex_wait_wasix(volatile void *addr, int op, int expected, int64_t max_wait_ns);
 int __wasilibc_futex_wake_wasix(int *futex, int cnt);
@@ -88,8 +90,14 @@ static int cond_is_shared(const pthread_cond_t *cond) {
     return cond->__u.__i[SINOMO_COND_SHARED_WORD] == SINOMO_COND_SHARED;
 }
 
+static int cond_has_direct_mapping(const pthread_cond_t *cond) {
+    return __sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)cond, (uintptr_t)SINOMO_COND_RUNTIME_BYTES) != 0;
+}
+
 static int needs_runtime_shared_cond(const pthread_cond_t *cond) {
-    return cond_is_shared(cond) && __sinomo_wasix_shared_memory_was_cross_process() != 0;
+    return cond_is_shared(cond) &&
+           __sinomo_wasix_shared_memory_was_cross_process() != 0 &&
+           !cond_has_direct_mapping(cond);
 }
 
 static int needs_shared_memory_sync(void) {
@@ -102,6 +110,8 @@ static int sync_to_if_shared(const pthread_cond_t *cond) {
         return 0;
     if (!needs_shared_memory_sync())
         return 0;
+    if (cond_has_direct_mapping(cond))
+        return 0;
     int32_t err = __sinomo_wasix_shared_memory_range_sync_to((uintptr_t)cond, (uintptr_t)sizeof(*cond));
     return err == 0 ? 0 : (int)err;
 }
@@ -111,6 +121,8 @@ static int sync_from_if_shared(const pthread_cond_t *cond) {
         return 0;
     if (!needs_shared_memory_sync())
         return 0;
+    if (cond_has_direct_mapping(cond))
+        return 0;
     int32_t err = __sinomo_wasix_shared_memory_range_sync_from((uintptr_t)cond, (uintptr_t)sizeof(*cond));
     return err == 0 ? 0 : (int)err;
 }
@@ -119,6 +131,8 @@ static int sync_waiters_from_if_shared(const pthread_cond_t *cond) {
     if (!cond_is_shared(cond))
         return 0;
     if (!needs_shared_memory_sync())
+        return 0;
+    if (cond_has_direct_mapping(cond))
         return 0;
     int32_t err = __sinomo_wasix_shared_memory_range_sync_from(
         (uintptr_t)&cond->__u.__vi[SINOMO_COND_WAITERS_WORD],
@@ -130,6 +144,8 @@ static int sync_non_futex_state_from_guest_if_shared(const pthread_cond_t *cond)
     if (!cond_is_shared(cond))
         return 0;
     if (!needs_shared_memory_sync())
+        return 0;
+    if (cond_has_direct_mapping(cond))
         return 0;
     int32_t err = __sinomo_wasix_shared_memory_sync_from_preserving_futexes();
     return err == 0 ? 0 : (int)err;

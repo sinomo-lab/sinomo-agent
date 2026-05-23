@@ -3,7 +3,10 @@ use crate::{
     WasiThreadHandle, WasiVForkAsyncify, capture_store_snapshot,
     os::task::{OwnedTaskStatus, TaskStatus, thread::WasiMemoryLayout},
     runtime::task_manager::{TaskWasm, TaskWasmRunProperties},
-    state::{WasiMemoryProtection, WasiMemoryProtectionRegion, context_switching::ContextSwitchingEnvironment},
+    state::{
+        WasiMemoryProtection, WasiMemoryProtectionRegion,
+        context_switching::ContextSwitchingEnvironment,
+    },
     syscalls::*,
 };
 use serde::{Deserialize, Serialize};
@@ -75,7 +78,9 @@ fn debug_shared_mapping_words(env: &WasiEnv, offset: u64, label: &str) {
         .state
         .shared_memory_mappings_for_pid(env.pid().raw())
         .into_iter()
-        .find(|mapping| offset >= mapping.offset && offset < mapping.offset.saturating_add(mapping.len))
+        .find(|mapping| {
+            offset >= mapping.offset && offset < mapping.offset.saturating_add(mapping.len)
+        })
     else {
         return;
     };
@@ -217,10 +222,19 @@ pub fn memory_load_i32<M: MemorySize>(
     flags: u32,
 ) -> Result<i32, WasiError> {
     check_memory_access::<M>(&mut ctx, addr, offset, bytes, false)?;
-    let access = memory_access_bounds(addr, offset, bytes).ok_or_else(memory_access_sigsegv(&mut ctx))?;
+    let access =
+        memory_access_bounds(addr, offset, bytes).ok_or_else(memory_access_sigsegv(&mut ctx))?;
     let memory = unsafe { ctx.data().memory_view(&ctx) };
     if !memory_access_in_memory(&memory, access) {
-        memory_access_debug(ctx.data(), "load_i32_oob", addr, offset, bytes, false, Some(access));
+        memory_access_debug(
+            ctx.data(),
+            "load_i32_oob",
+            addr,
+            offset,
+            bytes,
+            false,
+            Some(access),
+        );
         drop(memory);
         return Err(memory_access_sigsegv(&mut ctx)());
     }
@@ -237,10 +251,19 @@ pub fn memory_load_i64<M: MemorySize>(
     flags: u32,
 ) -> Result<i64, WasiError> {
     check_memory_access::<M>(&mut ctx, addr, offset, bytes, false)?;
-    let access = memory_access_bounds(addr, offset, bytes).ok_or_else(memory_access_sigsegv(&mut ctx))?;
+    let access =
+        memory_access_bounds(addr, offset, bytes).ok_or_else(memory_access_sigsegv(&mut ctx))?;
     let memory = unsafe { ctx.data().memory_view(&ctx) };
     if !memory_access_in_memory(&memory, access) {
-        memory_access_debug(ctx.data(), "load_i64_oob", addr, offset, bytes, false, Some(access));
+        memory_access_debug(
+            ctx.data(),
+            "load_i64_oob",
+            addr,
+            offset,
+            bytes,
+            false,
+            Some(access),
+        );
         drop(memory);
         return Err(memory_access_sigsegv(&mut ctx)());
     }
@@ -255,10 +278,19 @@ pub fn memory_load_f32<M: MemorySize>(
     offset: u32,
 ) -> Result<f32, WasiError> {
     check_memory_access::<M>(&mut ctx, addr, offset, 4, false)?;
-    let access = memory_access_bounds(addr, offset, 4).ok_or_else(memory_access_sigsegv(&mut ctx))?;
+    let access =
+        memory_access_bounds(addr, offset, 4).ok_or_else(memory_access_sigsegv(&mut ctx))?;
     let memory = unsafe { ctx.data().memory_view(&ctx) };
     if !memory_access_in_memory(&memory, access) {
-        memory_access_debug(ctx.data(), "load_f32_oob", addr, offset, 4, false, Some(access));
+        memory_access_debug(
+            ctx.data(),
+            "load_f32_oob",
+            addr,
+            offset,
+            4,
+            false,
+            Some(access),
+        );
         drop(memory);
         return Err(memory_access_sigsegv(&mut ctx)());
     }
@@ -273,10 +305,19 @@ pub fn memory_load_f64<M: MemorySize>(
     offset: u32,
 ) -> Result<f64, WasiError> {
     check_memory_access::<M>(&mut ctx, addr, offset, 8, false)?;
-    let access = memory_access_bounds(addr, offset, 8).ok_or_else(memory_access_sigsegv(&mut ctx))?;
+    let access =
+        memory_access_bounds(addr, offset, 8).ok_or_else(memory_access_sigsegv(&mut ctx))?;
     let memory = unsafe { ctx.data().memory_view(&ctx) };
     if !memory_access_in_memory(&memory, access) {
-        memory_access_debug(ctx.data(), "load_f64_oob", addr, offset, 8, false, Some(access));
+        memory_access_debug(
+            ctx.data(),
+            "load_f64_oob",
+            addr,
+            offset,
+            8,
+            false,
+            Some(access),
+        );
         drop(memory);
         return Err(memory_access_sigsegv(&mut ctx)());
     }
@@ -331,10 +372,19 @@ fn memory_store_integer<M: MemorySize>(
     bytes: u32,
 ) -> Result<(), WasiError> {
     check_memory_access::<M>(ctx, addr, offset, bytes, true)?;
-    let access = memory_access_bounds(addr, offset, bytes).ok_or_else(memory_access_sigsegv(ctx))?;
+    let access =
+        memory_access_bounds(addr, offset, bytes).ok_or_else(memory_access_sigsegv(ctx))?;
     let memory = unsafe { ctx.data().memory_view(ctx) };
     if !memory_access_in_memory(&memory, access) {
-        memory_access_debug(ctx.data(), "store_oob", addr, offset, bytes, true, Some(access));
+        memory_access_debug(
+            ctx.data(),
+            "store_oob",
+            addr,
+            offset,
+            bytes,
+            true,
+            Some(access),
+        );
         drop(memory);
         return Err(memory_access_sigsegv(ctx)());
     }
@@ -351,15 +401,32 @@ fn check_memory_access<M: MemorySize>(
     write: bool,
 ) -> Result<(), WasiError> {
     let Some((start, len)) = memory_access_bounds(addr, offset, bytes) else {
-        memory_access_debug(ctx.data(), "bounds_overflow", addr, offset, bytes, write, None);
+        memory_access_debug(
+            ctx.data(),
+            "bounds_overflow",
+            addr,
+            offset,
+            bytes,
+            write,
+            None,
+        );
         return Err(memory_access_sigsegv(ctx)());
     };
-    if !ctx
-        .data()
-        .state
-        .memory_access_allowed(ctx.data().pid().raw(), start as u64, len as u64, write)
-    {
-        memory_access_debug(ctx.data(), "protection_denied", addr, offset, bytes, write, Some((start, len)));
+    if !ctx.data().state.memory_access_allowed(
+        ctx.data().pid().raw(),
+        start as u64,
+        len as u64,
+        write,
+    ) {
+        memory_access_debug(
+            ctx.data(),
+            "protection_denied",
+            addr,
+            offset,
+            bytes,
+            write,
+            Some((start, len)),
+        );
         return Err(memory_access_sigsegv(ctx)());
     }
     Ok(())
@@ -404,12 +471,17 @@ fn memory_access_debug(
         bytes,
         write,
         access,
-        env.state.memory_protections_for_pid_range(env.pid().raw(), 0, u64::MAX).len()
+        env.state
+            .memory_protections_for_pid_range(env.pid().raw(), 0, u64::MAX)
+            .len()
     );
 }
 
 fn memory_access_sigsegv(ctx: &mut FunctionEnvMut<'_, WasiEnv>) -> impl FnOnce() -> WasiError {
-    let exit_code = ctx.data().thread.set_or_get_exit_code_for_signal(Signal::Sigsegv);
+    let exit_code = ctx
+        .data()
+        .thread
+        .set_or_get_exit_code_for_signal(Signal::Sigsegv);
     move || WasiError::Exit(exit_code)
 }
 
@@ -468,10 +540,7 @@ fn mmap_protect<M: MemorySize>(
     }
 
     let host_page_size = region::page::size() as u64;
-    if host_page_size == 0
-        || offset_u64 % host_page_size != 0
-        || len_u64 % host_page_size != 0
-    {
+    if host_page_size == 0 || offset_u64 % host_page_size != 0 || len_u64 % host_page_size != 0 {
         return Ok(Errno::Inval);
     }
 
@@ -603,9 +672,24 @@ fn map_registered_shared_memory<M: MemorySize>(
     else {
         return Ok(Errno::Fault);
     };
-    match map_shared_memory_backing(env, memory, &mapping) {
+    match map_shared_memory_backing_best_effort(env, memory, &mapping) {
         Ok(()) => Ok(Errno::Success),
         Err(err) => Ok(err),
+    }
+}
+
+pub(crate) fn map_shared_memory_backing_best_effort(
+    env: &WasiEnv,
+    memory: &MemoryView,
+    mapping: &crate::state::WasiSharedMemoryMapping,
+) -> Result<(), Errno> {
+    match map_shared_memory_backing(env, memory, mapping) {
+        Ok(()) => Ok(()),
+        // A POSIX MAP_SHARED mapping is still valid when the host cannot remap
+        // the backing directly at this guest address. Keep the registered
+        // mapping and let the existing synchronization path handle it.
+        Err(Errno::Inval) => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -713,11 +797,10 @@ fn apply_recorded_memory_protections(
     base: *mut u8,
     mapping: &crate::state::WasiSharedMemoryMapping,
 ) -> Result<(), Errno> {
-    for protection in env.state.memory_protections_for_pid_range(
-        env.pid().raw(),
-        mapping.offset,
-        mapping.len,
-    ) {
+    for protection in
+        env.state
+            .memory_protections_for_pid_range(env.pid().raw(), mapping.offset, mapping.len)
+    {
         apply_recorded_memory_protection(base, mapping, protection)?;
     }
     Ok(())
@@ -806,6 +889,46 @@ pub fn shared_memory_is_cross_process(ctx: FunctionEnvMut<'_, WasiEnv>) -> u32 {
 
 pub fn shared_memory_was_cross_process(ctx: FunctionEnvMut<'_, WasiEnv>) -> u32 {
     u32::from(ctx.data().state.has_cross_process_shared_memory())
+}
+
+pub fn shared_memory_has_direct_mapping<M: MemorySize>(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    offset: M::Offset,
+    len: M::Offset,
+) -> u32 {
+    let env = ctx.data();
+    let memory = unsafe { env.memory_view(&ctx) };
+    let offset = offset.into();
+    let len = len.into();
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = offset.checked_add(len) else {
+        return 0;
+    };
+    let Ok(mapping_offset) = usize::try_from(offset) else {
+        return 0;
+    };
+    let Some(mapping) = env
+        .state
+        .shared_memory_mappings_for_pid(env.pid().raw())
+        .into_iter()
+        .find(|mapping| {
+            offset >= mapping.offset && end <= mapping.offset.saturating_add(mapping.len)
+        })
+    else {
+        return 0;
+    };
+    if mapping.offset.saturating_add(mapping.len) > memory.data_size() {
+        return 0;
+    }
+    let base = unsafe { memory.data_ptr().add(mapping_offset) as usize };
+    let mapped_base = base.saturating_sub((offset - mapping.offset) as usize);
+    u32::from(mapping.mapped_bases.lock().unwrap().contains(&(
+        env.pid().raw(),
+        env.tid().raw(),
+        mapped_base,
+    )))
 }
 
 #[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
@@ -1086,7 +1209,10 @@ pub fn shared_cond_wait<M: MemorySize>(
     }
 }
 
-pub(crate) fn wake_shared_cond_waiters_for_thread(state: &crate::state::WasiState, tid: u32) -> u32 {
+pub(crate) fn wake_shared_cond_waiters_for_thread(
+    state: &crate::state::WasiState,
+    tid: u32,
+) -> u32 {
     let waits = state
         .shared_cond_waits
         .lock()
@@ -1263,7 +1389,12 @@ pub fn shared_semaphore_wait<M: MemorySize>(
     } else {
         std::time::Duration::from_nanos(timeout_ns as u64).min(std::time::Duration::from_millis(10))
     };
-    drop(semaphore.waiters.wait_timeout(value, wait_duration).unwrap());
+    drop(
+        semaphore
+            .waiters
+            .wait_timeout(value, wait_duration)
+            .unwrap(),
+    );
     if process_pending_operations_interruptibly(&mut ctx)? {
         return Ok(guest_errno_i32(Errno::Intr));
     }
@@ -2256,7 +2387,14 @@ fn shared_semaphore<M: MemorySize>(
     memory: &MemoryView,
     offset: u64,
 ) -> Result<std::sync::Arc<crate::state::WasiSharedSemaphore>, WasiError> {
-    if let Some(semaphore) = env.state.shared_semaphores.lock().unwrap().get(&offset).cloned() {
+    if let Some(semaphore) = env
+        .state
+        .shared_semaphores
+        .lock()
+        .unwrap()
+        .get(&offset)
+        .cloned()
+    {
         return Ok(semaphore);
     }
 
@@ -2296,9 +2434,7 @@ fn shared_u32_word<M: MemorySize>(
     };
     let index = usize::try_from(offset - mapping.offset).map_err(|_| Errno::Overflow)?;
     let bytes = mapping.read_range(index, 4)?;
-    Ok(u32::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-    ]))
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn write_shared_semaphore_value<M: MemorySize>(
@@ -2313,10 +2449,14 @@ fn write_shared_semaphore_value<M: MemorySize>(
         })
         .map_err(|err| WasiError::Exit(err.into()))?;
     }
-    let ptr = WasmPtr::<u32, M>::new(to_offset::<M>(
-        offset.try_into().map_err(|_| WasiError::Exit(Errno::Overflow.into()))?,
-    )
-    .map_err(|err| WasiError::Exit(err.into()))?);
+    let ptr = WasmPtr::<u32, M>::new(
+        to_offset::<M>(
+            offset
+                .try_into()
+                .map_err(|_| WasiError::Exit(Errno::Overflow.into()))?,
+        )
+        .map_err(|err| WasiError::Exit(err.into()))?,
+    );
     ptr.write(memory, value)
         .map_err(mem_error_to_wasi)
         .map_err(|err| WasiError::Exit(err.into()))?;
@@ -2575,9 +2715,7 @@ fn import_guest_mutex_if_shared_unowned<M: MemorySize>(
     }
     let index = usize::try_from(offset - mapping.offset).map_err(|_| Errno::Overflow)?;
     let mut bytes = mapping.read_range(index, 16)?;
-    let shared_owner = u32::from_le_bytes([
-        bytes[4], bytes[5], bytes[6], bytes[7],
-    ]) & 0x7fffffff;
+    let shared_owner = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7fffffff;
     if shared_owner != 0 {
         return Ok(());
     }
@@ -2621,8 +2759,7 @@ fn import_runtime_mutex_owners_from_shared_memory(env: &WasiEnv) {
             .into_iter()
             .find(|mapping| {
                 range.start >= mapping.offset
-                    && range.start.saturating_add(16)
-                        <= mapping.offset.saturating_add(mapping.len)
+                    && range.start.saturating_add(16) <= mapping.offset.saturating_add(mapping.len)
             })
         else {
             continue;
@@ -2719,9 +2856,7 @@ fn shared_mutex_owner(env: &WasiEnv, offset: u64) -> Result<Option<u32>, Errno> 
     let index = usize::try_from(offset - mapping.offset).map_err(|_| Errno::Overflow)?;
     let bytes = mapping.read_range(index, 8)?;
     Ok(Some(
-        u32::from_le_bytes([
-            bytes[4], bytes[5], bytes[6], bytes[7],
-        ]) & 0x7fffffff,
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7fffffff,
     ))
 }
 
@@ -3273,7 +3408,7 @@ fn proc_fork_common<M: MemorySize>(
             env.pid().raw()
         );
         for mapping in env.state.shared_memory_mappings_for_pid(env.pid().raw()) {
-            if let Err(err) = map_shared_memory_backing(env, &memory, &mapping) {
+            if let Err(err) = map_shared_memory_backing_best_effort(env, &memory, &mapping) {
                 return Ok(ForkOutcome { pid: 0, ret: err });
             }
         }
@@ -3457,7 +3592,7 @@ fn proc_fork_common<M: MemorySize>(
                         let memory = unsafe { ctx.data().memory_view(&ctx) };
                         for mapping in child_state.shared_memory_mappings_for_pid(child_pid.raw()) {
                             if let Err(err) =
-                                map_shared_memory_backing(ctx.data(), &memory, &mapping)
+                                map_shared_memory_backing_best_effort(ctx.data(), &memory, &mapping)
                             {
                                 warn!(
                                     "failed to map child shared memory range - errno={}",
@@ -3597,16 +3732,20 @@ fn run<M: MemorySize>(
         let mut ctx = ctx.env.clone().into_mut(&mut store);
         if ctx.data().state.has_shared_memory_mappings() {
             let memory = unsafe { ctx.data().memory_view(&ctx) };
-            for mapping in ctx.data().state.shared_memory_mappings_for_pid(ctx.data().pid().raw()) {
+            for mapping in ctx
+                .data()
+                .state
+                .shared_memory_mappings_for_pid(ctx.data().pid().raw())
+            {
                 if let Ok(mapping_offset) = usize::try_from(mapping.offset) {
                     let base = unsafe { memory.data_ptr().add(mapping_offset) };
-                    mapping
-                        .mapped_bases
-                        .lock()
-                        .unwrap()
-                        .remove(&(ctx.data().pid().raw(), ctx.data().tid().raw(), base as usize));
+                    mapping.mapped_bases.lock().unwrap().remove(&(
+                        ctx.data().pid().raw(),
+                        ctx.data().tid().raw(),
+                        base as usize,
+                    ));
                 }
-                if let Err(err) = map_shared_memory_backing(ctx.data(), &memory, &mapping) {
+                if let Err(err) = map_shared_memory_backing_best_effort(ctx.data(), &memory, &mapping) {
                     warn!(
                         "failed to remap shared memory range before resuming process - errno={}",
                         err

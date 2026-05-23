@@ -29,6 +29,8 @@ int32_t __sinomo_wasix_shared_futex_hint(uintptr_t offset, uintptr_t len)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_futex_hint")));
 uint32_t __sinomo_wasix_shared_memory_is_cross_process(void)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_is_cross_process")));
+uint32_t __sinomo_wasix_shared_memory_has_direct_mapping(uintptr_t offset, uintptr_t len)
+    __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_memory_has_direct_mapping")));
 int32_t __sinomo_wasix_shared_semaphore_getvalue(uintptr_t offset)
     __attribute__((__import_module__("wasix_32v1"), __import_name__("shared_semaphore_getvalue")));
 int32_t __sinomo_wasix_shared_semaphore_post(uintptr_t offset, uint32_t max_value)
@@ -80,8 +82,12 @@ static int sem_is_named(const sem_t *sem) {
     return (sem->__val[SINOMO_SEM_PSHARED_WORD] & SINOMO_SEM_NAMED) != 0;
 }
 
+static int sem_has_direct_mapping(const sem_t *sem) {
+    return __sinomo_wasix_shared_memory_has_direct_mapping((uintptr_t)sem, (uintptr_t)sizeof(*sem)) != 0;
+}
+
 static int sem_uses_runtime_shared(const sem_t *sem) {
-    return sem_is_pshared(sem) || sem_is_named(sem);
+    return sem_is_named(sem) || (sem_is_pshared(sem) && !sem_has_direct_mapping(sem));
 }
 
 static int validate_named_sem_name(const char *name, size_t *len_out) {
@@ -136,12 +142,16 @@ static struct sinomo_named_sem_slot *alloc_named_sem_slot(void) {
 static int sync_from_shared_if_needed(sem_t *sem) {
     if (!sem_is_pshared(sem) || __sinomo_wasix_shared_memory_is_cross_process() == 0)
         return 0;
+    if (sem_has_direct_mapping(sem))
+        return 0;
     int32_t err = __sinomo_wasix_shared_memory_range_sync_to((uintptr_t)sem, (uintptr_t)sizeof(*sem));
     return err == 0 ? 0 : (int)err;
 }
 
 static int sync_to_shared_if_needed(sem_t *sem) {
     if (!sem_is_pshared(sem) || __sinomo_wasix_shared_memory_is_cross_process() == 0)
+        return 0;
+    if (sem_has_direct_mapping(sem))
         return 0;
     int32_t err = __sinomo_wasix_shared_memory_range_sync_from((uintptr_t)sem, (uintptr_t)sizeof(*sem));
     return err == 0 ? 0 : (int)err;
