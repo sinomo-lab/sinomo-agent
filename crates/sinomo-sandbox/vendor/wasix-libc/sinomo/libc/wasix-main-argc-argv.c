@@ -4,14 +4,9 @@
 #define SINOMO_WASIX_MAX_ARGC 128
 #define SINOMO_WASIX_MAX_ARGV_BYTES 16384
 
-extern char **environ;
-extern int main(int argc, char **argv, char **env);
+extern int __main_argc_argv(int argc, char **argv);
 extern int __wasi_args_sizes_get(uint32_t *argc, uint32_t *argv_buf_size);
 extern int __wasi_args_get(char **argv, char *argv_buf);
-
-int __main_argc_argv(int argc, char **argv) {
-    return main(argc, argv, environ);
-}
 
 int __main_void(void) {
     uint32_t argc = 0;

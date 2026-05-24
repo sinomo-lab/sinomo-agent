@@ -274,7 +274,7 @@ cat > "${OUTDIR}/package.json" <<PACKAGE
   "provenance": "Sinomo BusyBox WASIX recipe: BusyBox ${BUSYBOX_VERSION}, wasi-sdk ${WASI_SDK_VERSION_FULL}",
   "target_abi": "wasix",
   "commands": [
-    "awk", "cat", "chmod", "cp", "cmp", "date", "diff", "dirname", "echo", "env", "false", "find", "grep", "gzip", "head", "ln", "ls", "mkdir", "mv", "patch", "printf", "pwd", "rm", "rmdir", "sed", "sha256sum", "sh", "sort", "tail", "tar", "test", "touch", "true", "tr", "uniq", "uname", "wc"
+    "awk", "cat", "chmod", "cp", "cmp", "date", "diff", "dirname", "echo", "env", "false", "find", "grep", "gzip", "head", "ln", "ls", "mkdir", "mv", "patch", "printf", "pwd", "rm", "rmdir", "sed", "sha256sum", "sh", "sleep", "sort", "tail", "tar", "test", "touch", "true", "tr", "uniq", "uname", "wc"
   ],
   "artifacts": []
 }

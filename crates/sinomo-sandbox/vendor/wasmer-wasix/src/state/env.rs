@@ -817,7 +817,7 @@ impl WasiEnv {
         // (but only if a signal handler is registered)
         let ret = if inner.signal.as_ref().is_some() {
             env.process.signal_due_intervals();
-            let signals = env.thread.pop_signals();
+            let signals = env.thread.pop_unblocked_signals();
             Self::process_signals_internal(ctx, signals)?
         } else {
             false

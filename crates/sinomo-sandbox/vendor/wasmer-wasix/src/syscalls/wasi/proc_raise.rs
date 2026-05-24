@@ -164,6 +164,22 @@ pub fn signal_pending_get<M: MemorySize + 'static>(
     Ok(0)
 }
 
+/// ### `signal_pending_take()`
+/// Atomically consumes one pending signal matching the supplied POSIX mask.
+#[instrument(level = "trace", skip_all, ret)]
+pub fn signal_pending_take(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    mask_low: u64,
+    mask_high: u64,
+) -> Result<i32, WasiError> {
+    Ok(ctx
+        .data()
+        .process
+        .take_pending_signal_for_thread(&ctx.data().thread, mask_low, mask_high)
+        .map(|signal| signal.to_native())
+        .unwrap_or(0))
+}
+
 fn write_signal_stack<M: MemorySize>(
     ctx: &FunctionEnvMut<'_, WasiEnv>,
     old_sp: WasmPtr<i64, M>,

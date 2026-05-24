@@ -89,6 +89,8 @@ pub(crate) fn thread_sleep_internal<M: MemorySize + 'static>(
         };
         let tasks = env.tasks().clone();
         let thread = env.thread.clone();
+        let sleep_started = std::time::Instant::now();
+        let requested_duration = duration;
         let interrupted = block_on(async move {
             tokio::select! {
                 _ = tasks.sleep_now(duration) => false,
@@ -115,6 +117,12 @@ pub(crate) fn thread_sleep_internal<M: MemorySize + 'static>(
                 Ok(processed) if signal_handler_installed && processed => return Ok(Errno::Intr),
                 Ok(_) => {}
                 Err(err) => return Ok(err),
+            }
+            let elapsed = sleep_started.elapsed();
+            if elapsed < requested_duration {
+                let remaining = requested_duration - elapsed;
+                let remaining_ns = remaining.as_nanos().min(u128::from(u64::MAX)) as u64;
+                return thread_sleep_internal::<M>(ctx, remaining_ns);
             }
         }
         if interval_due_before_requested_end {

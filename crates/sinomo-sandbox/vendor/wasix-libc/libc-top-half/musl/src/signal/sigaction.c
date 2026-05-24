@@ -1,5 +1,6 @@
 #include <signal.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sysexits.h>
 #include "syscall.h"
@@ -133,7 +134,6 @@ static void __default_handler(int sig) {
 #endif
 		case SIGURG:
 		case SIGWINCH:
-			SIG_IGN(sig);
 			break;
 
 		// Default behavior: "continue".
@@ -183,13 +183,33 @@ void __wasm_signal(int sig) {
 	if (sig-32U < 3 || sig-1U >= _NSIG-1) {
 		return;
 	}
+	if (default_handler == NULL) default_handler = &__default_handler;
+	if (getenv("SINOMO_WASIX_DEBUG")) {
+		fprintf(stderr, "sinomo-debug wasm_signal sig=%d\n", sig);
+	}
 	LOCK(__eintr_handler_lock);
 	struct k_sigaction ksa = __eintr_handler_callbacks[sig];
 	UNLOCK(__eintr_handler_lock);
 
 	if (ksa.handler != 0) {
+		if (getenv("SINOMO_WASIX_DEBUG")) {
+			fprintf(stderr, "sinomo-debug wasm_signal handler sig=%d handler=%p\n", sig, (void *)ksa.handler);
+		}
+		sigset_t handler_mask;
+		sigset_t old_mask;
+		memcpy(&handler_mask, &ksa.mask, sizeof(handler_mask));
+		if (!(ksa.flags & SA_NODEFER)) {
+			sigaddset(&handler_mask, sig);
+		}
+		int mask_set = pthread_sigmask(SIG_BLOCK, &handler_mask, &old_mask) == 0;
 		ksa.handler(sig);
+		if (mask_set) {
+			(void)pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+		}
 	} else {
+		if (getenv("SINOMO_WASIX_DEBUG")) {
+			fprintf(stderr, "sinomo-debug wasm_signal default sig=%d\n", sig);
+		}
 		unsigned long set[_NSIG/(8*sizeof(long))];
 		__block_all_sigs(&set);
 		default_handler(sig);

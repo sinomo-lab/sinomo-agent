@@ -492,7 +492,11 @@ impl WasiThread {
     /// Returns all the signals that are waiting to be processed
     pub fn has_signals_or_subscribe(&self, waker: &Waker) -> bool {
         let mut guard = self.state.signals.lock().unwrap();
-        let has_signals = !guard.0.is_empty();
+        let (mask_low, mask_high) = self.signal_mask();
+        let has_signals = guard
+            .0
+            .iter()
+            .any(|signal| !signal_is_blocked(*signal, mask_low, mask_high));
         if !has_signals && !guard.1.iter().any(|w| w.will_wake(waker)) {
             guard.1.push(waker.clone());
         }
@@ -505,6 +509,24 @@ impl WasiThread {
         let mut ret = Vec::new();
         std::mem::swap(&mut ret, &mut guard.0);
         ret
+    }
+
+    /// Returns pending signals that are not blocked by this thread's POSIX
+    /// signal mask. Blocked signals remain pending for sigwait/sigpending.
+    pub fn pop_unblocked_signals(&self) -> Vec<Signal> {
+        let (mask_low, mask_high) = self.signal_mask();
+        let mut guard = self.state.signals.lock().unwrap();
+        let mut ready = Vec::new();
+        let mut pending = Vec::new();
+        for signal in guard.0.drain(..) {
+            if signal_is_blocked(signal, mask_low, mask_high) {
+                pending.push(signal);
+            } else {
+                ready.push(signal);
+            }
+        }
+        guard.0 = pending;
+        ready
     }
 
     /// Adds a stack snapshot and removes dead ones
@@ -636,6 +658,18 @@ impl WasiThread {
 
         let mut stack_guard = self.state.stack.lock().unwrap();
         std::mem::swap(stack_guard.deref_mut(), &mut stack);
+    }
+}
+
+fn signal_is_blocked(signal: Signal, mask_low: u64, mask_high: u64) -> bool {
+    let raw = signal as i32;
+    if raw <= 0 || raw > 128 {
+        return false;
+    }
+    if raw <= 64 {
+        (mask_low & (1u64 << (raw - 1))) != 0
+    } else {
+        (mask_high & (1u64 << (raw - 65))) != 0
     }
 }
 

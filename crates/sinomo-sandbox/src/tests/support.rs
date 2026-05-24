@@ -60,6 +60,7 @@ pub(super) fn busybox_applet_config_symbol(command: &str) -> Option<&'static str
         "sed" => "CONFIG_SED=y",
         "sha256sum" => "CONFIG_SHA256SUM=y",
         "sh" => "CONFIG_ASH=y",
+        "sleep" => "CONFIG_SLEEP=y",
         "sort" => "CONFIG_SORT=y",
         "tail" => "CONFIG_TAIL=y",
         "tar" => "CONFIG_TAR=y",

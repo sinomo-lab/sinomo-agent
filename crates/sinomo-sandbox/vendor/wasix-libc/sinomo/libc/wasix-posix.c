@@ -330,6 +330,11 @@ int32_t __imported_wasix_signal_pending_get(uint64_t *low, uint64_t *high) __att
     __import_name__("signal_pending_get")
 ));
 
+int32_t __imported_wasix_signal_pending_take(uint64_t low, uint64_t high) __attribute__((
+    __import_module__("wasix_32v1"),
+    __import_name__("signal_pending_take")
+));
+
 int32_t __imported_wasix_thread_signal(uint32_t tid, uint32_t sig) __attribute__((
     __import_module__("wasix_32v1"),
     __import_name__("thread_signal")
@@ -895,6 +900,16 @@ static void sinomo_wasix_unlock_orphaned_standard_streams(void) {
 int fork(void) {
     __wasi_pid_t pid = 0;
     __wasi_errno_t err = __wasi_proc_fork(1, &pid);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    return pid;
+}
+
+int vfork(void) {
+    __wasi_pid_t pid = 0;
+    __wasi_errno_t err = __wasi_proc_fork(0, &pid);
     if (err != 0) {
         errno = err;
         return -1;
@@ -2871,10 +2886,18 @@ static int sinomo_wasix_clock_now_ns(clockid_t clock_id, int64_t *now_out) {
 }
 
 static int sinomo_wasix_sleep_relative_ns(int64_t duration_ns, struct timespec *rem);
+static uint64_t signal_bit(int sig, uint64_t *high);
+static int take_signal_from_words(uint64_t *low, uint64_t *high, uint64_t mask_low, uint64_t mask_high);
 
 struct sinomo_wasix_posix_timer_slot {
     int allocated;
     unsigned generation;
+    clockid_t clock_id;
+    int64_t armed_at_ns;
+    int64_t value_ns;
+    int64_t interval_ns;
+    int notification_pending;
+    int64_t last_overrun_count;
     int notify;
     int signo;
     union sigval value;
@@ -2887,6 +2910,7 @@ struct sinomo_wasix_posix_timer_slot {
 
 static pthread_mutex_t sinomo_wasix_posix_timer_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct sinomo_wasix_posix_timer_slot sinomo_wasix_posix_timers[SINOMO_WASIX_POSIX_TIMER_MAX];
+static int sinomo_wasix_posix_timer_atexit_registered;
 
 struct sinomo_wasix_timer_thread_arg {
     uint32_t timer_id;
@@ -2913,6 +2937,19 @@ static int64_t sinomo_wasix_timer_duration_ns(int64_t sec, int64_t nsec) {
     return sec * 1000000000LL + nsec;
 }
 
+static int64_t sinomo_wasix_timer_overrun_count_at(
+    const struct sinomo_wasix_posix_timer_slot *slot,
+    int64_t now_ns
+) {
+    if (slot == NULL || slot->value_ns <= 0 || slot->interval_ns <= 0)
+        return 0;
+    int64_t elapsed_ns = now_ns - slot->armed_at_ns;
+    if (elapsed_ns <= slot->value_ns)
+        return 0;
+    int64_t overruns = (elapsed_ns - slot->value_ns) / slot->interval_ns;
+    return overruns < 0 ? 0 : overruns;
+}
+
 static int sinomo_wasix_timer_slot_snapshot(
     uint32_t timer_id,
     unsigned generation,
@@ -2929,6 +2966,66 @@ static int sinomo_wasix_timer_slot_snapshot(
     return active;
 }
 
+static void sinomo_wasix_clear_timer_notification_for_signal(int sig) {
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    for (size_t i = 0; i < SINOMO_WASIX_POSIX_TIMER_MAX; i++) {
+        struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[i];
+        if (slot->allocated && slot->notify == SIGEV_SIGNAL && slot->signo == sig) {
+            slot->notification_pending = 0;
+            slot->last_overrun_count = -1;
+        }
+    }
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+}
+
+static void sinomo_wasix_disarm_all_posix_timers(void) {
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    for (size_t i = 0; i < SINOMO_WASIX_POSIX_TIMER_MAX; i++) {
+        struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[i];
+        if (!slot->allocated)
+            continue;
+        slot->allocated = 0;
+        slot->generation++;
+        if (slot->generation == 0)
+            slot->generation = 1;
+        slot->notification_pending = 0;
+        slot->last_overrun_count = -1;
+    }
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+}
+
+static void sinomo_wasix_freeze_timer_notification_for_signal(int sig) {
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    for (size_t i = 0; i < SINOMO_WASIX_POSIX_TIMER_MAX; i++) {
+        struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[i];
+        if (!slot->allocated ||
+            slot->notify != SIGEV_SIGNAL ||
+            slot->signo != sig ||
+            !slot->notification_pending) {
+            continue;
+        }
+        int64_t now_ns = 0;
+        int error = sinomo_wasix_clock_now_ns(slot->clock_id, &now_ns);
+        slot->last_overrun_count =
+            error == 0 ? sinomo_wasix_timer_overrun_count_at(slot, now_ns) : 0;
+        slot->notification_pending = 0;
+    }
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+}
+
+static void sinomo_wasix_freeze_timer_notifications_for_words(uint64_t low, uint64_t high) {
+    while (low != 0) {
+        int sig = __builtin_ctzll(low) + 1;
+        low &= low - 1;
+        sinomo_wasix_freeze_timer_notification_for_signal(sig);
+    }
+    while (high != 0) {
+        int sig = __builtin_ctzll(high) + 65;
+        high &= high - 1;
+        sinomo_wasix_freeze_timer_notification_for_signal(sig);
+    }
+}
+
 static void *sinomo_wasix_timer_thread_main(void *arg_ptr) {
     struct sinomo_wasix_timer_thread_arg arg = *(struct sinomo_wasix_timer_thread_arg *)arg_ptr;
     free(arg_ptr);
@@ -2937,6 +3034,8 @@ static void *sinomo_wasix_timer_thread_main(void *arg_ptr) {
         int64_t sleep_ns = sinomo_wasix_timer_duration_ns(arg.value_sec, arg.value_nsec);
         if (sleep_ns <= 0)
             return NULL;
+        if (sleep_ns < 1000000LL)
+            sleep_ns = 1000000LL;
         if (sinomo_wasix_sleep_relative_ns(sleep_ns, NULL) != 0)
             return NULL;
 
@@ -2947,7 +3046,24 @@ static void *sinomo_wasix_timer_thread_main(void *arg_ptr) {
         if (slot.notify == SIGEV_THREAD && slot.notify_function != NULL) {
             slot.notify_function(slot.value);
         } else if (slot.notify == SIGEV_SIGNAL && slot.signo > 0) {
-            raise(slot.signo);
+            sigset_t timer_signal_set;
+            if (sigemptyset(&timer_signal_set) == 0 &&
+                sigaddset(&timer_signal_set, slot.signo) == 0) {
+                (void)pthread_sigmask(SIG_BLOCK, &timer_signal_set, NULL);
+            }
+            int should_signal = 0;
+            pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+            struct sinomo_wasix_posix_timer_slot *live_slot =
+                &sinomo_wasix_posix_timers[arg.timer_id - 1];
+            if (live_slot->allocated &&
+                live_slot->generation == arg.generation &&
+                !live_slot->notification_pending) {
+                live_slot->notification_pending = 1;
+                should_signal = 1;
+            }
+            pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+            if (should_signal)
+                (void)kill(getpid(), slot.signo);
         }
 
         if (arg.interval_sec == 0 && arg.interval_nsec == 0)
@@ -2995,29 +3111,48 @@ static void sinomo_wasix_start_timer_thread(
 }
 
 static int sinomo_wasix_sleep_relative_ns(int64_t duration_ns, struct timespec *rem) {
-    const int64_t chunk_ns = 100000000LL;
-    int64_t remaining = duration_ns;
-    if (remaining < 0)
+    const int64_t max_chunk_ns = 10000000LL;
+    const int64_t fine_chunk_ns = 1000000LL;
+    if (duration_ns < 0)
         return EINVAL;
-    while (remaining > 0) {
+    int64_t start_ns = 0;
+    int error = sinomo_wasix_clock_now_ns(CLOCK_MONOTONIC, &start_ns);
+    if (error != 0)
+        return error;
+    int64_t deadline_ns =
+        INT64_MAX - start_ns < duration_ns ? INT64_MAX : start_ns + duration_ns;
+    for (;;) {
+        int64_t now_ns = 0;
+        error = sinomo_wasix_clock_now_ns(CLOCK_MONOTONIC, &now_ns);
+        if (error != 0)
+            return error;
+        int64_t remaining = deadline_ns > now_ns ? deadline_ns - now_ns : 0;
+        if (remaining <= 0)
+            break;
         pthread_testcancel();
+        if (remaining <= 5000000LL)
+            continue;
+        int64_t chunk_ns = remaining <= 50000000LL ? fine_chunk_ns : max_chunk_ns;
         uint64_t chunk = remaining > chunk_ns ? (uint64_t)chunk_ns : (uint64_t)remaining;
         if (sinomo_wasix_publish_before_next_sleep) {
             sinomo_wasix_sync_from_guest_if_shared();
             sinomo_wasix_publish_before_next_sleep = 0;
         }
         sinomo_wasix_sync_to_guest_if_shared();
-        int32_t error = __imported_wasix_thread_sleep(chunk);
+        int32_t sleep_error = __imported_wasix_thread_sleep(chunk);
         pthread_testcancel();
         sinomo_wasix_sync_to_guest_if_shared();
-        if (error != 0) {
+        if (sleep_error != 0) {
             if (rem != NULL) {
+                int64_t interrupted_now_ns = 0;
+                int time_error = sinomo_wasix_clock_now_ns(CLOCK_MONOTONIC, &interrupted_now_ns);
+                if (time_error == 0)
+                    remaining = deadline_ns > interrupted_now_ns ? deadline_ns - interrupted_now_ns : 0;
                 rem->tv_sec = remaining / 1000000000LL;
                 rem->tv_nsec = remaining % 1000000000LL;
             }
-            return error < 0 ? -error : error;
+            return sleep_error < 0 ? -sleep_error : sleep_error;
         }
-        remaining -= (int64_t)chunk;
     }
     if (rem != NULL) {
         rem->tv_sec = 0;
@@ -3068,6 +3203,37 @@ unsigned sleep(unsigned seconds) {
     if (nanosleep(&req, &rem) != 0)
         return rem.tv_sec > 0 ? (unsigned)rem.tv_sec : 1;
     return 0;
+}
+
+static pthread_mutex_t sinomo_wasix_alarm_lock = PTHREAD_MUTEX_INITIALIZER;
+static timer_t sinomo_wasix_alarm_timer;
+static int sinomo_wasix_alarm_timer_created;
+
+unsigned alarm(unsigned seconds) {
+    pthread_mutex_lock(&sinomo_wasix_alarm_lock);
+    if (!sinomo_wasix_alarm_timer_created) {
+        struct sigevent event;
+        memset(&event, 0, sizeof(event));
+        event.sigev_notify = SIGEV_SIGNAL;
+        event.sigev_signo = SIGALRM;
+        if (timer_create(CLOCK_REALTIME, &event, &sinomo_wasix_alarm_timer) != 0) {
+            pthread_mutex_unlock(&sinomo_wasix_alarm_lock);
+            return 0;
+        }
+        sinomo_wasix_alarm_timer_created = 1;
+    }
+
+    struct itimerspec old_value;
+    struct itimerspec new_value;
+    memset(&old_value, 0, sizeof(old_value));
+    memset(&new_value, 0, sizeof(new_value));
+    new_value.it_value.tv_sec = (time_t)seconds;
+    if (timer_settime(sinomo_wasix_alarm_timer, 0, &new_value, &old_value) != 0) {
+        pthread_mutex_unlock(&sinomo_wasix_alarm_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&sinomo_wasix_alarm_lock);
+    return old_value.it_value.tv_sec + (old_value.it_value.tv_nsec != 0);
 }
 
 int usleep(useconds_t useconds) {
@@ -3153,18 +3319,24 @@ int timer_create(clockid_t clock_id, struct sigevent *restrict event, timer_t *r
     }
 
     pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    if (!sinomo_wasix_posix_timer_atexit_registered) {
+        if (atexit(sinomo_wasix_disarm_all_posix_timers) == 0)
+            sinomo_wasix_posix_timer_atexit_registered = 1;
+    }
     struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[ret - 1];
     memset(slot, 0, sizeof(*slot));
     slot->allocated = 1;
     slot->generation++;
     if (slot->generation == 0)
         slot->generation = 1;
+    slot->clock_id = clock_id;
+    slot->last_overrun_count = -1;
     if (event != NULL) {
         slot->notify = event->sigev_notify;
         slot->signo = event->sigev_signo;
         slot->value = event->sigev_value;
         slot->notify_function = event->sigev_notify_function;
-        if (event->sigev_notify_attributes != NULL) {
+        if (event->sigev_notify == SIGEV_THREAD && event->sigev_notify_attributes != NULL) {
             slot->notify_attributes = *event->sigev_notify_attributes;
             slot->has_notify_attributes = 1;
         }
@@ -3190,6 +3362,24 @@ int timer_settime(timer_t timer_id, int flags, const struct itimerspec *restrict
         return -1;
     }
 
+    clockid_t slot_clock_id = CLOCK_REALTIME;
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[id - 1];
+    if (!slot->allocated) {
+        pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+        errno = EINVAL;
+        return -1;
+    }
+    slot_clock_id = slot->clock_id;
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+
+    int64_t set_at_ns = 0;
+    int time_error = sinomo_wasix_clock_now_ns(slot_clock_id, &set_at_ns);
+    if (time_error != 0) {
+        errno = time_error;
+        return -1;
+    }
+
     int64_t old_value_sec = 0;
     int64_t old_value_nsec = 0;
     int64_t old_interval_sec = 0;
@@ -3210,8 +3400,10 @@ int timer_settime(timer_t timer_id, int flags, const struct itimerspec *restrict
         return -1;
     }
     unsigned generation = 0;
+    int notify = 0;
+    int signo = 0;
     pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
-    struct sinomo_wasix_posix_timer_slot *slot = &sinomo_wasix_posix_timers[id - 1];
+    slot = &sinomo_wasix_posix_timers[id - 1];
     if (!slot->allocated) {
         pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
         errno = EINVAL;
@@ -3221,6 +3413,9 @@ int timer_settime(timer_t timer_id, int flags, const struct itimerspec *restrict
     if (slot->generation == 0)
         slot->generation = 1;
     generation = slot->generation;
+    notify = slot->notify;
+    signo = slot->signo;
+    slot_clock_id = slot->clock_id;
     pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
 
     if (old_value != NULL) {
@@ -3229,7 +3424,68 @@ int timer_settime(timer_t timer_id, int flags, const struct itimerspec *restrict
         old_value->it_interval.tv_sec = old_interval_sec;
         old_value->it_interval.tv_nsec = old_interval_nsec;
     }
-    sinomo_wasix_start_timer_thread(id, generation, new_value);
+    if (new_value->it_value.tv_sec == 0 && new_value->it_value.tv_nsec == 0) {
+        if (notify == SIGEV_SIGNAL && signo > 0) {
+            uint64_t high = 0;
+            uint64_t low = signal_bit(signo, &high);
+            (void)take_signal_from_words(
+                &sinomo_wasix_pending_signal_low,
+                &sinomo_wasix_pending_signal_high,
+                low,
+                high);
+            (void)__imported_wasix_signal_pending_take(low, high);
+        }
+        pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+        slot = &sinomo_wasix_posix_timers[id - 1];
+        if (slot->allocated && slot->generation == generation) {
+            slot->notification_pending = 0;
+            slot->last_overrun_count = -1;
+            slot->value_ns = 0;
+            slot->interval_ns = 0;
+            slot->armed_at_ns = 0;
+        }
+        pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+        return 0;
+    }
+
+    struct itimerspec armed_value = *new_value;
+    if ((flags & TIMER_ABSTIME) != 0) {
+        int64_t target_ns = sinomo_wasix_timer_duration_ns(
+            new_value->it_value.tv_sec,
+            new_value->it_value.tv_nsec);
+        if (target_ns < 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        int64_t relative_ns = target_ns > set_at_ns ? target_ns - set_at_ns : 1;
+        armed_value.it_value.tv_sec = relative_ns / 1000000000LL;
+        armed_value.it_value.tv_nsec = relative_ns % 1000000000LL;
+    }
+    if (armed_value.it_value.tv_sec == 0 && armed_value.it_value.tv_nsec == 0)
+        armed_value.it_value.tv_nsec = 1;
+    int64_t armed_value_ns = sinomo_wasix_timer_duration_ns(
+        armed_value.it_value.tv_sec,
+        armed_value.it_value.tv_nsec);
+    int64_t armed_interval_ns = sinomo_wasix_timer_duration_ns(
+        armed_value.it_interval.tv_sec,
+        armed_value.it_interval.tv_nsec);
+    int64_t armed_at_ns = 0;
+    time_error = sinomo_wasix_clock_now_ns(slot_clock_id, &armed_at_ns);
+    if (time_error != 0) {
+        errno = time_error;
+        return -1;
+    }
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    slot = &sinomo_wasix_posix_timers[id - 1];
+    if (slot->allocated && slot->generation == generation) {
+        slot->armed_at_ns = armed_at_ns;
+        slot->value_ns = armed_value_ns;
+        slot->interval_ns = armed_interval_ns;
+        slot->notification_pending = 0;
+        slot->last_overrun_count = -1;
+    }
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+    sinomo_wasix_start_timer_thread(id, generation, &armed_value);
     return 0;
 }
 
@@ -3239,6 +3495,43 @@ int timer_gettime(timer_t timer_id, struct itimerspec *value) {
         return -1;
     }
     uint32_t id = sinomo_wasix_timer_id_from_timer(timer_id);
+    if (id == 0 || id > SINOMO_WASIX_POSIX_TIMER_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct sinomo_wasix_posix_timer_slot slot = {0};
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    struct sinomo_wasix_posix_timer_slot *live_slot = &sinomo_wasix_posix_timers[id - 1];
+    if (live_slot->allocated)
+        slot = *live_slot;
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+    if (!slot.allocated) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (slot.value_ns > 0) {
+        int64_t now_ns = 0;
+        int error = sinomo_wasix_clock_now_ns(slot.clock_id, &now_ns);
+        if (error != 0) {
+            errno = error;
+            return -1;
+        }
+        int64_t remaining_ns = 0;
+        int64_t elapsed_ns = now_ns - slot.armed_at_ns;
+        if (elapsed_ns < slot.value_ns) {
+            remaining_ns = slot.value_ns - elapsed_ns;
+        } else if (slot.interval_ns > 0) {
+            int64_t since_interval_start = (elapsed_ns - slot.value_ns) % slot.interval_ns;
+            remaining_ns = since_interval_start == 0
+                ? slot.interval_ns
+                : slot.interval_ns - since_interval_start;
+        }
+        value->it_value.tv_sec = remaining_ns / 1000000000LL;
+        value->it_value.tv_nsec = remaining_ns % 1000000000LL;
+        value->it_interval.tv_sec = slot.interval_ns / 1000000000LL;
+        value->it_interval.tv_nsec = slot.interval_ns % 1000000000LL;
+        return 0;
+    }
     int64_t value_sec = 0;
     int64_t value_nsec = 0;
     int64_t interval_sec = 0;
@@ -3262,6 +3555,46 @@ int timer_gettime(timer_t timer_id, struct itimerspec *value) {
 
 int timer_getoverrun(timer_t timer_id) {
     uint32_t id = sinomo_wasix_timer_id_from_timer(timer_id);
+    if (id == 0 || id > SINOMO_WASIX_POSIX_TIMER_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct sinomo_wasix_posix_timer_slot slot = {0};
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    struct sinomo_wasix_posix_timer_slot *live_slot = &sinomo_wasix_posix_timers[id - 1];
+    if (live_slot->allocated)
+        slot = *live_slot;
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+    if (!slot.allocated) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&sinomo_wasix_posix_timer_lock);
+    live_slot = &sinomo_wasix_posix_timers[id - 1];
+    if (live_slot->allocated) {
+        if (live_slot->last_overrun_count >= 0) {
+            int64_t overruns = live_slot->last_overrun_count;
+            live_slot->last_overrun_count = -1;
+            pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+            if (overruns > INT_MAX)
+                return INT_MAX;
+            return (int)overruns;
+        }
+        live_slot->notification_pending = 0;
+    }
+    pthread_mutex_unlock(&sinomo_wasix_posix_timer_lock);
+    if (slot.value_ns > 0 && slot.interval_ns > 0) {
+        int64_t now_ns = 0;
+        int error = sinomo_wasix_clock_now_ns(slot.clock_id, &now_ns);
+        if (error != 0) {
+            errno = error;
+            return -1;
+        }
+        int64_t overruns = sinomo_wasix_timer_overrun_count_at(&slot, now_ns);
+        if (overruns > INT_MAX)
+            return INT_MAX;
+        return (int)overruns;
+    }
     int32_t ret = __imported_wasix_posix_timer_getoverrun(id);
     if (ret < 0) {
         errno = -ret;
@@ -3684,16 +4017,32 @@ static void clear_signal_from_words(uint64_t *low, uint64_t *high, int sig) {
     *high &= ~bit_high;
 }
 
+static int take_signal_from_words(uint64_t *low, uint64_t *high, uint64_t mask_low, uint64_t mask_high) {
+    uint64_t matched_low = *low & mask_low;
+    if (matched_low != 0) {
+        int sig = __builtin_ctzll(matched_low) + 1;
+        *low &= ~(UINT64_C(1) << (sig - 1));
+        return sig;
+    }
+    uint64_t matched_high = *high & mask_high;
+    if (matched_high != 0) {
+        int sig = __builtin_ctzll(matched_high) + 65;
+        *high &= ~(UINT64_C(1) << (sig - 65));
+        return sig;
+    }
+    return 0;
+}
+
 static void clear_unmaskable_signals(uint64_t *low, uint64_t *high) {
     clear_signal_from_words(low, high, SIGKILL);
     clear_signal_from_words(low, high, SIGSTOP);
 }
 
-static int deliver_pending_unblocked(uint64_t new_low, uint64_t new_high) {
-    uint64_t deliver_low = sinomo_wasix_pending_signal_low & ~new_low;
-    uint64_t deliver_high = sinomo_wasix_pending_signal_high & ~new_high;
-    if (deliver_low == 0 && deliver_high == 0)
-        return 0;
+static int deliver_pending_unblocked(uint64_t old_low, uint64_t old_high, uint64_t new_low, uint64_t new_high) {
+    uint64_t unblocked_low = old_low & ~new_low;
+    uint64_t unblocked_high = old_high & ~new_high;
+    uint64_t deliver_low = sinomo_wasix_pending_signal_low & unblocked_low;
+    uint64_t deliver_high = sinomo_wasix_pending_signal_high & unblocked_high;
 
     sinomo_wasix_pending_signal_low &= ~deliver_low;
     sinomo_wasix_pending_signal_high &= ~deliver_high;
@@ -3706,6 +4055,7 @@ static int deliver_pending_unblocked(uint64_t new_low, uint64_t new_high) {
     while (deliver_low != 0) {
         int sig = __builtin_ctzll(deliver_low) + 1;
         deliver_low &= deliver_low - 1;
+        sinomo_wasix_freeze_timer_notification_for_signal(sig);
         error = __imported_wasix_thread_signal((uint32_t)tid, (uint32_t)sig);
         if (error != 0)
             return error < 0 ? -error : error;
@@ -3713,6 +4063,7 @@ static int deliver_pending_unblocked(uint64_t new_low, uint64_t new_high) {
     while (deliver_high != 0) {
         int sig = __builtin_ctzll(deliver_high) + 65;
         deliver_high &= deliver_high - 1;
+        sinomo_wasix_freeze_timer_notification_for_signal(sig);
         error = __imported_wasix_thread_signal((uint32_t)tid, (uint32_t)sig);
         if (error != 0)
             return error < 0 ? -error : error;
@@ -3766,14 +4117,25 @@ int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict ol
         return EINVAL;
     }
     clear_unmaskable_signals(&new_low, &new_high);
+    uint64_t newly_unblocked_low = old_low & ~new_low;
+    uint64_t newly_unblocked_high = old_high & ~new_high;
+    clear_unmaskable_signals(&newly_unblocked_low, &newly_unblocked_high);
+    sinomo_wasix_freeze_timer_notifications_for_words(
+        newly_unblocked_low,
+        newly_unblocked_high);
     error = __imported_wasix_signal_mask_set(new_low, new_high);
     if (error != 0)
         return error < 0 ? -error : error;
-    return deliver_pending_unblocked(new_low, new_high);
+    return deliver_pending_unblocked(old_low, old_high, new_low, new_high);
 }
 
 int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset) {
-    return pthread_sigmask(how, set, oldset);
+    int error = pthread_sigmask(how, set, oldset);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    return 0;
 }
 
 int sigpending(sigset_t *set) {
@@ -3793,6 +4155,123 @@ int sigpending(sigset_t *set) {
         sinomo_wasix_pending_signal_low | runtime_low,
         sinomo_wasix_pending_signal_high | runtime_high);
     return 0;
+}
+
+int sigtimedwait(const sigset_t *restrict mask, siginfo_t *restrict si, const struct timespec *restrict timeout) {
+    if (mask == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (timeout != NULL && (timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint64_t mask_low = 0;
+    uint64_t mask_high = 0;
+    sigset_to_words(mask, &mask_low, &mask_high);
+    if (mask_low == 0 && mask_high == 0) {
+        errno = EAGAIN;
+        return -1;
+    }
+
+    uint64_t old_mask_low = 0;
+    uint64_t old_mask_high = 0;
+    int32_t mask_error = __imported_wasix_signal_mask_get(&old_mask_low, &old_mask_high);
+    int restore_mask = 0;
+    if (mask_error != 0) {
+        errno = mask_error < 0 ? -mask_error : mask_error;
+        return -1;
+    }
+    uint64_t wait_mask_low = old_mask_low | mask_low;
+    uint64_t wait_mask_high = old_mask_high | mask_high;
+    clear_unmaskable_signals(&wait_mask_low, &wait_mask_high);
+    if (wait_mask_low != old_mask_low || wait_mask_high != old_mask_high) {
+        mask_error = __imported_wasix_signal_mask_set(wait_mask_low, wait_mask_high);
+        if (mask_error != 0) {
+            errno = mask_error < 0 ? -mask_error : mask_error;
+            return -1;
+        }
+        restore_mask = 1;
+    }
+
+    int64_t timeout_ns = -1;
+    int64_t deadline_ns = 0;
+    if (timeout != NULL) {
+        timeout_ns = sinomo_wasix_timespec_to_ns(timeout);
+        if (timeout_ns < 0) {
+            if (restore_mask)
+                (void)__imported_wasix_signal_mask_set(old_mask_low, old_mask_high);
+            errno = EINVAL;
+            return -1;
+        }
+        int error = sinomo_wasix_clock_now_ns(CLOCK_MONOTONIC, &deadline_ns);
+        if (error != 0) {
+            if (restore_mask)
+                (void)__imported_wasix_signal_mask_set(old_mask_low, old_mask_high);
+            errno = error;
+            return -1;
+        }
+        if (INT64_MAX - deadline_ns < timeout_ns)
+            deadline_ns = INT64_MAX;
+        else
+            deadline_ns += timeout_ns;
+    }
+
+    for (;;) {
+        int sig = take_signal_from_words(
+            &sinomo_wasix_pending_signal_low,
+            &sinomo_wasix_pending_signal_high,
+            mask_low,
+            mask_high);
+        if (sig == 0) {
+            int32_t taken = __imported_wasix_signal_pending_take(mask_low, mask_high);
+            if (taken < 0) {
+                errno = -taken;
+                return -1;
+            }
+            sig = taken;
+        }
+        if (sig > 0) {
+            if (si != NULL) {
+                memset(si, 0, sizeof(*si));
+                si->si_signo = sig;
+            }
+            sinomo_wasix_freeze_timer_notification_for_signal(sig);
+            if (restore_mask)
+                (void)__imported_wasix_signal_mask_set(old_mask_low, old_mask_high);
+            return sig;
+        }
+
+        int64_t sleep_ns = 10000000LL;
+        if (timeout != NULL) {
+            int64_t now_ns = 0;
+            int error = sinomo_wasix_clock_now_ns(CLOCK_MONOTONIC, &now_ns);
+            if (error != 0) {
+                if (restore_mask)
+                    (void)__imported_wasix_signal_mask_set(old_mask_low, old_mask_high);
+                errno = error;
+                return -1;
+            }
+            if (now_ns >= deadline_ns) {
+                if (restore_mask)
+                    (void)__imported_wasix_signal_mask_set(old_mask_low, old_mask_high);
+                errno = EAGAIN;
+                return -1;
+            }
+            int64_t remaining_ns = deadline_ns - now_ns;
+            if (sleep_ns > remaining_ns)
+                sleep_ns = remaining_ns;
+        }
+
+        int error = sinomo_wasix_sleep_relative_ns(sleep_ns, NULL);
+        if (error != 0 && error != EINTR && error != ECANCELED) {
+            if (restore_mask)
+                (void)__imported_wasix_signal_mask_set(old_mask_low, old_mask_high);
+            errno = error;
+            return -1;
+        }
+    }
 }
 
 int raise(int sig) {

@@ -31,6 +31,7 @@ pub const BUSYBOX_TOOLCHAIN_COMMANDS: &[&str] = &[
     "sed",
     "sha256sum",
     "sh",
+    "sleep",
     "sort",
     "tail",
     "tar",

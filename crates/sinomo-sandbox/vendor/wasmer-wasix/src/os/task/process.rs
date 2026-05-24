@@ -1770,6 +1770,31 @@ impl WasiProcess {
         (low, high)
     }
 
+    pub(crate) fn take_pending_signal_for_thread(
+        &self,
+        thread: &WasiThread,
+        mask_low: u64,
+        mask_high: u64,
+    ) -> Option<Signal> {
+        {
+            let mut guard = thread.signals().lock().unwrap();
+            if let Some(index) = guard
+                .0
+                .iter()
+                .position(|signal| signal_in_words(*signal, mask_low, mask_high))
+            {
+                return Some(guard.0.remove(index));
+            }
+        }
+
+        let mut guard = self.inner.0.lock().unwrap();
+        guard
+            .pending_process_signals
+            .iter()
+            .position(|signal| signal_in_words(*signal, mask_low, mask_high))
+            .map(|index| guard.pending_process_signals.remove(index))
+    }
+
     pub(crate) fn notify_parent_child_status_changed(&self) {
         let Some(parent_pid) = self.inner.0.lock().unwrap().parent_pid else {
             return;
@@ -2871,6 +2896,13 @@ fn add_signal_to_words(signal: Signal, low: &mut u64, high: &mut u64) {
     };
     *low |= low_bit;
     *high |= high_bit;
+}
+
+fn signal_in_words(signal: Signal, low: u64, high: u64) -> bool {
+    let Some((low_bit, high_bit)) = signal_mask_bit(signal) else {
+        return false;
+    };
+    (low & low_bit) != 0 || (high & high_bit) != 0
 }
 
 fn thread_blocks_signal(thread: &WasiThread, signal: Signal) -> bool {

@@ -78,6 +78,7 @@ LIBC_BOTTOM_HALF_ALL_SOURCES := $(filter-out \
     $(LIBC_BOTTOM_HALF_SOURCES)/__main_void.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/fcntl/openat.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/time/clock_nanosleep.c \
+    $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/time/nanosleep.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/sys/stat/fstat.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/sys/stat/fstatat.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/ftruncate.c \
@@ -85,6 +86,9 @@ LIBC_BOTTOM_HALF_ALL_SOURCES := $(filter-out \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/geteuid.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/getgid.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/getuid.c \
+    $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/setegid.c \
+    $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/seteuid.c \
+    $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/setgid.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/setuid.c \
     $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/unistd/sleep.c, \
     $(LIBC_BOTTOM_HALF_ALL_SOURCES))
@@ -389,11 +393,14 @@ LIBC_TOP_HALF_MUSL_SOURCES := $(filter-out \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/misc/getrlimit.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/misc/setrlimit.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/process/fork.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/process/vfork.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/process/wait.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/process/waitpid.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/kill.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/raise.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/setitimer.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/sigpending.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/sigtimedwait.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/sigprocmask.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/thread/pthread_atfork.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/thread/pthread_sigmask.c \
@@ -402,7 +409,13 @@ LIBC_TOP_HALF_MUSL_SOURCES := $(filter-out \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/gettimeofday.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/clock_nanosleep.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/nanosleep.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/timer_create.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/timer_delete.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/timer_getoverrun.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/timer_gettime.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/timer_settime.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/time/times.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/alarm.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/chdir.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/chown.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/fchown.c \
@@ -413,6 +426,9 @@ LIBC_TOP_HALF_MUSL_SOURCES := $(filter-out \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/getgid.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/getuid.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/lchown.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/setegid.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/seteuid.c \
+    $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/setgid.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/setuid.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/unistd/sleep.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/linux/setgroups.c \
