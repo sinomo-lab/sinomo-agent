@@ -1710,10 +1710,6 @@ impl WasiFs {
             }
             _ => {
                 let fd = self.get_fd(fd)?;
-                if !fd.inner.rights.contains(Rights::FD_DATASYNC) {
-                    return Err(Errno::Access);
-                }
-
                 let file = {
                     let guard = fd.inode.read();
                     match guard.deref() {

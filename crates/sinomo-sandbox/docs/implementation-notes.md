@@ -103,7 +103,7 @@ BusyBox WASIX and CPython WASIX recipes now lower POSIX `fork()` and `vfork()` c
 
 ### Filesystem
 
-The sandbox has local and SIFS virtual filesystem backends, staging helpers, path normalization, symlink escape checks, quota accounting, workspace diffing, logs, checkpoints, and read-write mount sync.
+The sandbox has local and SIFS virtual filesystem backends, staging helpers, path normalization, symlink escape checks, quota accounting, workspace diffing, logs, checkpoints, and read-write mount sync. WASIX `fd_sync` and `fd_datasync` now follow POSIX-facing descriptor behavior for the current runtime: a valid regular-file descriptor can be synced even when the original WASI rights set did not include explicit sync capability bits, while invalid descriptors and unsyncable descriptors such as pipes still report the expected POSIX errors.
 
 Generated virtual filesystem features include:
 
