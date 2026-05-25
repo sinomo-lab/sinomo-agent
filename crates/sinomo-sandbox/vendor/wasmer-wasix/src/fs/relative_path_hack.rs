@@ -30,6 +30,10 @@ impl<F: FileSystem> virtual_fs::FileSystem for RelativeOrAbsolutePathHack<F> {
         self.execute(path, |fs, p| fs.readlink(p))
     }
 
+    fn readlink_update_access(&self, path: &Path) -> virtual_fs::Result<std::path::PathBuf> {
+        self.execute(path, |fs, p| fs.readlink_update_access(p))
+    }
+
     fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
         self.execute(path, |fs, p| fs.read_dir(p))
     }

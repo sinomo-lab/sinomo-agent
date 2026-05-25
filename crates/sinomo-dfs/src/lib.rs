@@ -296,6 +296,24 @@ pub struct DfsObjectMetadata {
     pub current_locations: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target_object_id: Option<DfsObjectId>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub mode: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub uid: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gid: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub accessed_at_unix_nanos: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub modified_at_unix_nanos: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub created_at_unix_nanos: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub changed_at_unix_nanos: u64,
     pub version: DfsVersion,
     pub policy: DfsObjectPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,12 +322,21 @@ pub struct DfsObjectMetadata {
     pub last_modified_by_event_id: Option<EventId>,
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsObjectKind {
     File,
     Directory,
     Symlink,
+    Hardlink,
     Artifact,
     Mount,
     Tombstone,
@@ -880,6 +907,7 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
         }
 
         object.content_hash = Some(content_hash(&bytes));
+        object.content_size_bytes = Some(bytes.len() as u64);
         object.current_locations = vec![self.node_id.clone()];
         let object_id = object.object_id.clone();
         self.metadata.add_object(object)?;
@@ -1341,6 +1369,18 @@ pub enum NetworkedDfsServiceEvent {
         source_node_id: NodeId,
         reason: String,
     },
+    RemoteReadServed {
+        request_id: String,
+        object_id: DfsObjectId,
+        requester_node_id: NodeId,
+        result: DfsReadResult,
+    },
+    RemoteReadCompleted {
+        request_id: String,
+        object_id: DfsObjectId,
+        source_node_id: NodeId,
+        result: DfsReadResult,
+    },
     RepairRejected {
         intent_id: String,
         object_id: DfsObjectId,
@@ -1365,6 +1405,7 @@ struct PendingNetworkedWrite {
     object_id: DfsObjectId,
     version: DfsVersion,
     content_hash: String,
+    size_bytes: u64,
     repair_retries: BTreeMap<NodeId, RepairRetryState>,
     fetch_inflight_from: BTreeSet<NodeId>,
 }
@@ -1469,6 +1510,7 @@ pub struct NetworkedDfsService<T> {
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     metadata_backend: Option<Box<dyn DfsMetadataBackend>>,
     pending_writes: BTreeMap<String, PendingNetworkedWrite>,
+    pending_reads: BTreeMap<String, DfsObjectId>,
     incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
     transport: T,
     repair_retry_tick: u64,
@@ -1491,6 +1533,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             control_plane: None,
             metadata_backend: None,
             pending_writes: BTreeMap::new(),
+            pending_reads: BTreeMap::new(),
             incoming_blob_transfers: BTreeMap::new(),
             transport,
             repair_retry_tick: 0,
@@ -1500,14 +1543,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
     }
 
-    pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + 'static) -> Self {
+    pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + Send + 'static) -> Self {
         self.control_plane = Some(Box::new(kv));
         self
     }
 
     pub fn with_metadata_backend(
         mut self,
-        backend: impl DfsMetadataBackend + 'static,
+        backend: impl DfsMetadataBackend + Send + 'static,
     ) -> Result<Self, DfsError> {
         self.metadata_backend = Some(Box::new(backend));
         self.hydrate_from_metadata_backend()?;
@@ -1562,6 +1605,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         self.tombstones_by_metadata_path.clear();
         self.coordinator = DistributedEventualCoordinator::new();
         self.pending_writes.clear();
+        self.pending_reads.clear();
 
         for file_system in file_systems {
             self.metadata.add_file_system(file_system);
@@ -1575,7 +1619,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .add_file_system(DfsFileSystem::sifs(self.node_id.clone()));
         }
 
-        for object in objects {
+        for object in objects
+            .iter()
+            .filter(|object| object.kind == DfsObjectKind::Tombstone)
+            .chain(
+                objects
+                    .iter()
+                    .filter(|object| object.kind != DfsObjectKind::Tombstone),
+            )
+            .cloned()
+        {
             self.coordinator.set_committed_version(
                 object.file_system_id.clone(),
                 object.object_id.clone(),
@@ -1604,6 +1657,20 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         object_id: intent_record.object_id.clone(),
                         version: intent_record.target_version.clone(),
                         content_hash,
+                        size_bytes: self
+                            .metadata_backend
+                            .as_ref()
+                            .and_then(|backend| {
+                                backend
+                                    .get_version(
+                                        &intent_record.object_id,
+                                        &intent_record.target_version,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|version| version.size_bytes)
+                            })
+                            .unwrap_or(0),
                         repair_retries: BTreeMap::new(),
                         fetch_inflight_from: BTreeSet::new(),
                     },
@@ -1669,13 +1736,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
             return;
         }
-        if self
-            .tombstones_by_metadata_path
-            .get(&key)
-            .is_some_and(|existing| existing.object_id == object.object_id)
-        {
-            self.tombstones_by_metadata_path.remove(&key);
-        }
+        self.tombstones_by_metadata_path.remove(&key);
     }
 
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
@@ -1700,7 +1761,18 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
             backend.apply_namespace_transaction(&transaction)?;
         }
-        for object in transaction.objects {
+        for object in transaction
+            .objects
+            .iter()
+            .filter(|object| object.kind == DfsObjectKind::Tombstone)
+            .chain(
+                transaction
+                    .objects
+                    .iter()
+                    .filter(|object| object.kind != DfsObjectKind::Tombstone),
+            )
+            .cloned()
+        {
             self.coordinator.set_committed_version(
                 object.file_system_id.clone(),
                 object.object_id.clone(),
@@ -1723,10 +1795,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             bytes,
         )?;
         object.content_hash = Some(manifest.content_hash.clone());
+        object.content_size_bytes = Some(manifest.size_bytes);
         if !object.current_locations.contains(&self.node_id) {
             object.current_locations.push(self.node_id.clone());
         }
         self.put_visible_object_in_metadata_backend(&object)?;
+        self.put_object_version_size_in_metadata_backend(&object, Some(manifest.size_bytes))?;
         self.coordinator.set_committed_version(
             object.file_system_id.clone(),
             object.object_id.clone(),
@@ -1755,15 +1829,61 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         })
     }
 
+    pub fn request_remote_object_read(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<Vec<NodeId>, DfsError> {
+        let object =
+            self.metadata
+                .object(object_id)
+                .cloned()
+                .ok_or_else(|| DfsError::UnknownObject {
+                    object_id: object_id.clone(),
+                })?;
+        if object.content_hash.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut requested = Vec::new();
+        for node_id in object.current_locations {
+            if node_id == self.node_id {
+                continue;
+            }
+            let request_id = self.next_request_id();
+            let sent = self.send_dfs_message_if_routable(
+                &node_id,
+                DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                    request_id: request_id.clone(),
+                    object_id: object_id.clone(),
+                }),
+            )?;
+            if sent {
+                self.pending_reads.insert(request_id, object_id.clone());
+                requested.push(node_id);
+            }
+        }
+        Ok(requested)
+    }
+
     pub fn read_local_object_with_state(
         &self,
         object_id: &DfsObjectId,
         allow_stale: bool,
     ) -> Result<NetworkedDfsReadOutcome, DfsError> {
-        let Some(object) = self.metadata.object(object_id) else {
-            return Err(DfsError::UnknownObject {
-                object_id: object_id.clone(),
-            });
+        let memory_object = self.metadata.object(object_id).cloned();
+        let backend_object = if let Some(backend) = self.metadata_backend.as_ref() {
+            backend.get_object(object_id)?
+        } else {
+            None
+        };
+        let object = match (memory_object, backend_object) {
+            (_, Some(backend_object)) => backend_object,
+            (Some(memory_object), None) => memory_object,
+            (None, None) => {
+                return Err(DfsError::UnknownObject {
+                    object_id: object_id.clone(),
+                });
+            }
         };
         let open_conflicts = self.open_conflicts_for_object(object_id)?;
         if !open_conflicts.is_empty() {
@@ -1798,6 +1918,26 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     freshness: NetworkedDfsReadFreshness::Current,
                 });
             }
+        }
+
+        if let Some(expected_hash) = object.content_hash.as_ref()
+            && let Some(manifest) = self
+                .content
+                .manifests_for_object(object.object_id.as_str())?
+                .into_iter()
+                .rev()
+                .find(|manifest| &manifest.content_hash == expected_hash)
+        {
+            let bytes = self.content.read_blob(&manifest.content_hash)?;
+            return Ok(NetworkedDfsReadOutcome::Found {
+                data: DfsReadData {
+                    object_id: object.object_id.clone(),
+                    version: object.version.clone(),
+                    content_hash: Some(manifest.content_hash),
+                    bytes,
+                },
+                freshness: NetworkedDfsReadFreshness::Current,
+            });
         }
 
         if allow_stale {
@@ -1945,13 +2085,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let object = self
-            .metadata
-            .object(&request.object_id)
-            .cloned()
-            .ok_or_else(|| DfsError::UnknownObject {
-                object_id: request.object_id.clone(),
-            })?;
+        let object = self.current_object_for_write(&request.object_id)?;
         self.write_distributed_eventual_with_base(
             request,
             Some(object.version),
@@ -1969,13 +2103,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let object = self
-            .metadata
-            .object(&request.object_id)
-            .cloned()
-            .ok_or_else(|| DfsError::UnknownObject {
-                object_id: request.object_id.clone(),
-            })?;
+        let object = self.current_object_for_write(&request.object_id)?;
         if !matches!(
             object.policy,
             DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
@@ -1993,43 +2121,46 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
         let owner_epoch = self.ensure_file_system_write_authority(&request.file_system_id)?;
 
+        if expected_base_version
+            .as_ref()
+            .is_some_and(|expected| expected != &object.version)
+        {
+            let conflict = self.create_write_conflict(
+                &object,
+                expected_base_version,
+                request.target_version.clone(),
+                request.requesting_node_id.clone(),
+                None,
+                "base version conflict for distributed write".to_string(),
+                None,
+            )?;
+            return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
+        }
+
         if object.policy == DfsObjectPolicy::ReplicatedEventual
             && policy.min_commit_replicas == 1
             && desired_replica_nodes.len() == 1
             && desired_replica_nodes[0] == self.node_id
         {
-            if expected_base_version
-                .as_ref()
-                .is_some_and(|expected| expected != &object.version)
-            {
-                let manifest = self.content.put_object_version(
-                    request.object_id.as_str(),
-                    request.target_version.as_str(),
-                    &bytes,
-                )?;
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    Some(manifest.content_hash.clone()),
-                    "base version conflict for local eventual write".to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
-            }
-
             let mut committed_object = object.clone();
             let manifest = self.content.put_object_version(
                 request.object_id.as_str(),
                 request.target_version.as_str(),
                 &bytes,
             )?;
+            let write_time = dfs_now_unix_nanos();
             committed_object.version = request.target_version.clone();
             committed_object.content_hash = Some(manifest.content_hash.clone());
+            committed_object.content_size_bytes = Some(manifest.size_bytes);
+            committed_object.modified_at_unix_nanos = write_time;
+            committed_object.changed_at_unix_nanos = write_time;
             committed_object.current_locations = vec![self.node_id.clone()];
             committed_object.last_modified_by_event_id = Some(EventId::generate());
             self.put_visible_object_in_metadata_backend(&committed_object)?;
+            self.put_object_version_size_in_metadata_backend(
+                &committed_object,
+                Some(manifest.size_bytes),
+            )?;
             self.coordinator.set_committed_version(
                 committed_object.file_system_id.clone(),
                 committed_object.object_id.clone(),
@@ -2088,6 +2219,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 object_id: request.object_id.clone(),
                 version: request.target_version.clone(),
                 content_hash: manifest.content_hash.clone(),
+                size_bytes: manifest.size_bytes,
                 repair_retries: BTreeMap::new(),
                 fetch_inflight_from: BTreeSet::new(),
             },
@@ -2189,9 +2321,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 DfsNetworkMessage::FetchBlobResponse(response) => {
                     events.push(self.handle_fetch_blob_response(response)?);
                 }
+                DfsNetworkMessage::ReadRequest(request) => {
+                    events.push(self.handle_networked_read_request(source_node_id, request)?);
+                }
+                DfsNetworkMessage::ReadResponse(response) => {
+                    events.push(self.handle_networked_read_response(source_node_id, response)?);
+                }
                 DfsNetworkMessage::CommitVersionResponse(_)
-                | DfsNetworkMessage::ReadRequest(_)
-                | DfsNetworkMessage::ReadResponse(_)
                 | DfsNetworkMessage::WriteRequest(_)
                 | DfsNetworkMessage::WriteResponse(_) => {}
             }
@@ -2309,6 +2445,31 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 ))
             }
         }
+    }
+
+    fn current_object_for_write(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsObjectMetadata, DfsError> {
+        let memory_object = self.metadata.object(object_id).cloned();
+        if let Some(backend) = self.metadata_backend.as_ref()
+            && let Some(object) = backend.get_object(object_id)?
+        {
+            if let Some(memory_object) = memory_object
+                && (memory_object.version > object.version
+                    || (memory_object.version == object.version && memory_object != object))
+            {
+                return Ok(memory_object);
+            }
+            self.metadata.add_object(object.clone())?;
+            return Ok(object);
+        }
+        self.metadata
+            .object(object_id)
+            .cloned()
+            .ok_or_else(|| DfsError::UnknownObject {
+                object_id: object_id.clone(),
+            })
     }
 
     pub fn abort_pending_write(
@@ -2862,10 +3023,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 Ok(())
             })
             .and_then(|()| {
+                let write_time = dfs_now_unix_nanos();
                 self.commit_local_metadata(
                     &command.object_id,
                     &command.version,
                     &command.content_hash,
+                    write_time,
                 )
                 .and_then(|object| {
                     self.put_visible_object_in_metadata_backend(&object)?;
@@ -2941,7 +3104,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 )
             }) {
             Ok(()) => match self
-                .commit_local_metadata(&command.object_id, &command.version, &command.content_hash)
+                .commit_local_metadata(
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                    dfs_now_unix_nanos(),
+                )
                 .and_then(|object| {
                     self.put_visible_object_in_metadata_backend(&object)?;
                     let local_node_id = self.node_id.clone();
@@ -3261,6 +3429,128 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
     }
 
+    fn handle_networked_read_request(
+        &mut self,
+        requester_node_id: NodeId,
+        request: DfsReadRequest,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let result = match self.metadata.object(&request.object_id).cloned() {
+            Some(object) if !object.current_locations.contains(&self.node_id) => {
+                DfsReadResult::Rejected {
+                    reason: format!(
+                        "node {} is not a current location for DFS object {}",
+                        self.node_id, request.object_id
+                    ),
+                }
+            }
+            Some(_) => match self.read_local_object_with_state(&request.object_id, false)? {
+                NetworkedDfsReadOutcome::Found { data, .. } => DfsReadResult::Found(data),
+                NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => DfsReadResult::Rejected {
+                    reason: read_conflicts_reason(conflicts),
+                },
+                NetworkedDfsReadOutcome::PendingReplication { .. }
+                | NetworkedDfsReadOutcome::NotConfirmed { .. }
+                | NetworkedDfsReadOutcome::NotFound => DfsReadResult::NotFound,
+            },
+            None => DfsReadResult::NotFound,
+        };
+        self.send_dfs_message(
+            &requester_node_id,
+            DfsNetworkMessage::ReadResponse(DfsReadResponse {
+                request_id: request.request_id.clone(),
+                object_id: request.object_id.clone(),
+                result: result.clone(),
+            }),
+        )?;
+        Ok(NetworkedDfsServiceEvent::RemoteReadServed {
+            request_id: request.request_id,
+            object_id: request.object_id,
+            requester_node_id,
+            result,
+        })
+    }
+
+    fn handle_networked_read_response(
+        &mut self,
+        source_node_id: NodeId,
+        response: DfsReadResponse,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let Some(expected_object_id) = self.pending_reads.remove(&response.request_id) else {
+            return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id: response.request_id,
+                object_id: response.object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "unknown DFS read request".to_string(),
+                },
+            });
+        };
+        if expected_object_id != response.object_id {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_object_id.to_string(),
+                actual: response.object_id.to_string(),
+            });
+        }
+        if let DfsReadResult::Found(data) = &response.result {
+            self.store_remote_read_data(&source_node_id, data)?;
+        }
+        Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
+            request_id: response.request_id,
+            object_id: response.object_id,
+            source_node_id,
+            result: response.result,
+        })
+    }
+
+    fn store_remote_read_data(
+        &mut self,
+        source_node_id: &NodeId,
+        data: &DfsReadData,
+    ) -> Result<(), DfsError> {
+        let object = self
+            .metadata
+            .object(&data.object_id)
+            .cloned()
+            .ok_or_else(|| DfsError::UnknownObject {
+                object_id: data.object_id.clone(),
+            })?;
+        if object.version != data.version {
+            return Err(DfsError::ContentHashMismatch {
+                expected: object.version.to_string(),
+                actual: data.version.to_string(),
+            });
+        }
+        let Some(expected_hash) = object.content_hash.clone() else {
+            return Err(DfsError::ContentHashMismatch {
+                expected: "committed content hash".to_string(),
+                actual: data
+                    .content_hash
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+            });
+        };
+        if let Some(actual_hash) = data.content_hash.as_ref()
+            && actual_hash != &expected_hash
+        {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_hash,
+                actual: actual_hash.clone(),
+            });
+        }
+        self.store_command_bytes(&data.object_id, &data.version, &expected_hash, &data.bytes)?;
+        let mut object = object;
+        object.content_size_bytes = Some(data.bytes.len() as u64);
+        if !object.current_locations.contains(source_node_id) {
+            object.current_locations.push(source_node_id.clone());
+        }
+        if !object.current_locations.contains(&self.node_id) {
+            object.current_locations.push(self.node_id.clone());
+        }
+        self.put_visible_object_in_metadata_backend(&object)?;
+        self.metadata.add_object(object)?;
+        Ok(())
+    }
+
     fn repair_retry_is_due(&self, intent_id: &str, replica_node_id: &NodeId) -> bool {
         self.pending_writes
             .get(intent_id)
@@ -3380,9 +3670,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsError::Distributed {
                     message: format!("missing pending write for committed intent: {intent_id}"),
                 })?;
-        self.commit_visible_version_in_metadata_backend(&intent, &pending)?;
+        let write_time = dfs_now_unix_nanos();
+        self.commit_visible_version_in_metadata_backend(&intent, &pending, write_time)?;
         self.put_metadata_intent(&intent, Some(&pending.content_hash))?;
-        self.commit_local_metadata(&pending.object_id, &pending.version, &pending.content_hash)?;
+        self.commit_local_metadata(
+            &pending.object_id,
+            &pending.version,
+            &pending.content_hash,
+            write_time,
+        )?;
 
         let durable_nodes: BTreeSet<NodeId> = self
             .coordinator
@@ -3460,7 +3756,19 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         version: &DfsVersion,
         content_hash: &str,
+        write_time_unix_nanos: u64,
     ) -> Result<DfsObjectMetadata, DfsError> {
+        let content_size_bytes = self
+            .content
+            .read_manifest(object_id.as_str(), version.as_str())
+            .ok()
+            .filter(|manifest| manifest.content_hash == content_hash)
+            .map(|manifest| manifest.size_bytes);
+        if let Some(backend) = self.metadata_backend.as_ref()
+            && let Some(backend_object) = backend.get_object(object_id)?
+        {
+            self.metadata.add_object(backend_object)?;
+        }
         let object =
             self.metadata
                 .objects
@@ -3468,8 +3776,19 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsError::UnknownObject {
                     object_id: object_id.clone(),
                 })?;
+        let content_unchanged = object
+            .content_hash
+            .as_ref()
+            .is_some_and(|existing| existing == content_hash);
         object.version = version.clone();
         object.content_hash = Some(content_hash.to_string());
+        if content_size_bytes.is_some() {
+            object.content_size_bytes = content_size_bytes;
+        }
+        if !content_unchanged {
+            object.modified_at_unix_nanos = write_time_unix_nanos;
+            object.changed_at_unix_nanos = write_time_unix_nanos;
+        }
         object.last_modified_by_event_id = Some(EventId::generate());
         if !object.current_locations.contains(&self.node_id) {
             object.current_locations.push(self.node_id.clone());
@@ -3609,6 +3928,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         &mut self,
         object: &DfsObjectMetadata,
     ) -> Result<(), DfsError> {
+        let size_bytes = self.object_content_size_hint(object)?;
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
@@ -3621,14 +3941,72 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             })?;
         }
         backend.put_object(object)?;
-        backend.put_version(&object_version_record(object))?;
+        backend.put_version(&object_version_record(object, size_bytes))?;
         Ok(())
+    }
+
+    fn put_object_version_size_in_metadata_backend(
+        &mut self,
+        object: &DfsObjectMetadata,
+        size_bytes: Option<u64>,
+    ) -> Result<(), DfsError> {
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return Ok(());
+        };
+        backend.put_version(&object_version_record(object, size_bytes))?;
+        Ok(())
+    }
+
+    pub(crate) fn object_content_size_hint(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<Option<u64>, DfsError> {
+        if !matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Symlink) {
+            return Ok(None);
+        }
+        if let Ok(manifest) = self
+            .content
+            .read_manifest(object.object_id.as_str(), object.version.as_str())
+        {
+            return Ok(Some(manifest.size_bytes));
+        }
+        if let Some(expected_hash) = object.content_hash.as_ref()
+            && let Some(manifest) = self
+                .content
+                .manifests_for_object(object.object_id.as_str())?
+                .into_iter()
+                .rev()
+                .find(|manifest| &manifest.content_hash == expected_hash)
+        {
+            return Ok(Some(manifest.size_bytes));
+        }
+        if object.content_size_bytes.is_some() {
+            return Ok(object.content_size_bytes);
+        }
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            if let Some(version) = backend.get_version(&object.object_id, &object.version)?
+                && version.size_bytes.is_some()
+            {
+                return Ok(version.size_bytes);
+            }
+            if let Some(expected_hash) = object.content_hash.as_ref()
+                && let Some(version) = backend
+                    .versions_for_object(&object.object_id)?
+                    .into_iter()
+                    .rev()
+                    .find(|version| version.content_hash.as_ref() == Some(expected_hash))
+            {
+                return Ok(version.size_bytes);
+            }
+        }
+        Ok(None)
     }
 
     fn commit_visible_version_in_metadata_backend(
         &mut self,
         intent: &DistributedWriteIntent,
         pending: &PendingNetworkedWrite,
+        write_time_unix_nanos: u64,
     ) -> Result<(), DfsError> {
         let expected_object = self
             .metadata
@@ -3646,13 +4024,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let mut committed_object = expected_object.clone();
         committed_object.version = pending.version.clone();
         committed_object.content_hash = Some(pending.content_hash.clone());
+        committed_object.content_size_bytes = Some(pending.size_bytes);
+        committed_object.modified_at_unix_nanos = write_time_unix_nanos;
+        committed_object.changed_at_unix_nanos = write_time_unix_nanos;
         committed_object.last_modified_by_event_id = Some(EventId::generate());
         for node_id in &durable_nodes {
             if !committed_object.current_locations.contains(node_id) {
                 committed_object.current_locations.push(node_id.clone());
             }
         }
-        let visible_version = object_version_record(&committed_object);
+        let visible_version = object_version_record(&committed_object, Some(pending.size_bytes));
         let required_replica_node_ids: Vec<NodeId> = durable_nodes.into_iter().collect();
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
@@ -3718,7 +4099,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 subtree_policies: Vec::new(),
             })?;
         }
-        if self.metadata.object(&object.object_id).is_none() {
+        if let Some(backend) = self.metadata_backend.as_ref()
+            && let Some(existing) = backend.get_object(&object.object_id)?
+        {
+            self.metadata.add_object(existing)?;
+        } else if self.metadata.object(&object.object_id).is_none() {
             self.add_object_metadata(object.clone())?;
         }
         Ok(())
@@ -4043,12 +4428,31 @@ fn content_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
 }
 
-fn object_version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
+fn read_conflicts_reason(conflicts: Vec<DfsConflictReadView>) -> String {
+    conflicts
+        .into_iter()
+        .map(|conflict| format!("{}: {}", conflict.conflict_id, conflict.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn dfs_now_unix_nanos() -> u64 {
+    OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .try_into()
+        .unwrap_or(1_000_000_000)
+}
+
+fn object_version_record(
+    object: &DfsObjectMetadata,
+    size_bytes: Option<u64>,
+) -> DfsObjectVersionRecord {
     DfsObjectVersionRecord {
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
         content_hash: object.content_hash.clone(),
+        size_bytes: size_bytes.or(object.content_size_bytes),
         locations: object.current_locations.clone(),
         created_by_event_id: object.last_modified_by_event_id.clone(),
         created_at: OffsetDateTime::now_utc(),
@@ -4290,6 +4694,15 @@ mod tests {
             owner_node_id: owner.clone(),
             current_locations: vec![owner],
             content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
             version: DfsVersion::from_legacy_named("version_1").expect("version"),
             policy: DfsObjectPolicy::LocalOwned,
             created_by_event_id: None,
@@ -4338,6 +4751,15 @@ mod tests {
                 owner_node_id: owner.clone(),
                 current_locations: vec![owner.clone()],
                 content_hash: None,
+                content_size_bytes: None,
+                link_target_object_id: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
                 version: DfsVersion::from_legacy_named("version_1").expect("version"),
                 policy: DfsObjectPolicy::LocalOwned,
                 created_by_event_id: None,
@@ -4418,6 +4840,123 @@ mod tests {
     }
 
     #[test]
+    fn sifs_recursive_clear_preserves_hardlinks_outside_cleared_tree() {
+        let root = temp_root("sifs-recursive-clear-hardlink-outside");
+        let node_id = NodeId::from_legacy_named("node_sifs_clear_hardlink").expect("node");
+        let clear_root = "/services/sandbox/instances/sandbox_clear_hardlink/tmp/0";
+        let file_path = "/services/sandbox/instances/sandbox_clear_hardlink/tmp/0/cache.txt";
+        let outside_alias =
+            "/services/sandbox/instances/sandbox_clear_hardlink/work/cache-alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(clear_root).expect("mkdir clear root");
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_clear_hardlink/work")
+            .expect("mkdir work");
+        dfs.posix_write_file(
+            file_path,
+            b"cache",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write cache");
+        dfs.posix_set_times(file_path, Some(12_345), Some(67_890))
+            .expect("old file times");
+        let before = dfs.posix_stat(file_path).expect("file stat");
+        let object_id = before.object_id.clone();
+        dfs.posix_hardlink(file_path, outside_alias)
+            .expect("hardlink outside");
+
+        dfs.posix_clear_dir_recursive(clear_root)
+            .expect("clear recursive");
+
+        assert!(matches!(
+            dfs.posix_stat(file_path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        let alias_stat = dfs.posix_stat(outside_alias).expect("alias survives");
+        assert_eq!(alias_stat.object_id, object_id);
+        assert_eq!(alias_stat.link_count, 1);
+        assert_eq!(
+            alias_stat.modified_at_unix_nanos, before.modified_at_unix_nanos,
+            "clearing a hardlinked path must not change file content mtime"
+        );
+        assert!(
+            alias_stat.changed_at_unix_nanos > before.changed_at_unix_nanos,
+            "promoting a surviving hardlink alias must advance ctime because the canonical path changed"
+        );
+        assert_ne!(
+            alias_stat.version, before.version,
+            "promoting a surviving hardlink alias must advance the metadata version"
+        );
+        assert_eq!(
+            dfs.posix_read_file(outside_alias).expect("read alias"),
+            b"cache"
+        );
+
+        let reloaded = networked_sifs_with_backend(&root, node_id);
+        let alias_stat = reloaded
+            .posix_stat(outside_alias)
+            .expect("reloaded alias survives");
+        assert_eq!(alias_stat.object_id, object_id);
+        assert_eq!(alias_stat.link_count, 1);
+        assert_eq!(
+            reloaded
+                .posix_read_file(outside_alias)
+                .expect("reloaded read alias"),
+            b"cache"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_recursive_clear_follows_directory_symlink_argument() {
+        let root = temp_root("sifs-recursive-clear-directory-symlink");
+        let node_id = NodeId::from_legacy_named("node_sifs_clear_symlink").expect("node");
+        let base = "/services/sandbox/instances/sandbox_clear_symlink";
+        let real_dir = format!("{base}/tmp/0");
+        let link_dir = format!("{base}/work/current-tmp");
+        let file_path = format!("{real_dir}/session-cache.txt");
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(&real_dir).expect("mkdir real tmp");
+        dfs.posix_mkdir_all(&format!("{base}/work"))
+            .expect("mkdir work");
+        dfs.posix_write_file(
+            &file_path,
+            b"cache",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write cache");
+        dfs.posix_symlink(
+            "../tmp/0",
+            &link_dir,
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("symlink directory");
+
+        dfs.posix_clear_dir_recursive(&link_dir)
+            .expect("clear via directory symlink");
+
+        assert!(matches!(
+            dfs.posix_read_file(&file_path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(
+            dfs.posix_lstat(&link_dir)
+                .expect("link survives clear")
+                .kind,
+            DfsObjectKind::Symlink
+        );
+        assert!(
+            dfs.posix_list_dir(&real_dir)
+                .expect("real dir survives")
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn sifs_self_only_eventual_write_uses_local_fast_path() {
         let root = temp_root("sifs-self-only-eventual-fast-path");
         let node_id = NodeId::from_legacy_named("node_sifs_fast_path").expect("node");
@@ -4451,6 +4990,1576 @@ mod tests {
         assert!(
             journal_count < 64,
             "self-only write should not emit per-file distributed intent/receipt/commit journals"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_symlink_preserves_target_as_object_content() {
+        let root = temp_root("sifs-posix-symlink");
+        let node_id = NodeId::from_legacy_named("node_sifs_symlink").expect("node");
+        let link_path = "/services/sandbox/instances/sandbox_link/work/lib";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_link/work")
+            .expect("mkdir");
+        let stat = dfs
+            .posix_symlink(
+                "../shared/lib",
+                link_path,
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect("symlink");
+
+        assert_eq!(stat.kind, DfsObjectKind::Symlink);
+        assert_eq!(stat.size_bytes, Some("../shared/lib".len() as u64));
+        assert_eq!(
+            dfs.posix_readlink(link_path).expect("readlink"),
+            "../shared/lib"
+        );
+        dfs.posix_set_symlink_times(link_path, Some(12_345), Some(67_890))
+            .expect("old symlink times");
+        let before_readlink = dfs.posix_lstat(link_path).expect("before readlink lstat");
+        assert_eq!(
+            dfs.posix_readlink_update_access(link_path)
+                .expect("readlink update access"),
+            "../shared/lib"
+        );
+        let stat = dfs.posix_lstat(link_path).expect("symlink lstat");
+        assert!(stat.accessed_at_unix_nanos > 12_345);
+        assert_eq!(stat.modified_at_unix_nanos, 67_890);
+        assert_eq!(
+            stat.changed_at_unix_nanos, before_readlink.changed_at_unix_nanos,
+            "readlink access update must not advance symlink ctime"
+        );
+        assert_ne!(
+            stat.version, before_readlink.version,
+            "readlink access update must advance the DFS metadata version so it persists across distributed reconciliation"
+        );
+        assert!(matches!(
+            dfs.posix_symlink(
+                "other",
+                link_path,
+                DfsWriteOptions::replicated_eventual(vec![dfs.node_id().clone()])
+            ),
+            Err(DfsPosixError::AlreadyExists { .. })
+        ));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_trailing_slash_requires_directory() {
+        let root = temp_root("sifs-posix-trailing-slash-directory");
+        let node_id = NodeId::from_legacy_named("node_sifs_trailing_slash").expect("node");
+        let work = "/services/sandbox/instances/sandbox_trailing/work";
+        let real_dir = "/services/sandbox/instances/sandbox_trailing/work/real-dir";
+        let file_path = "/services/sandbox/instances/sandbox_trailing/work/file.txt";
+        let link_dir = "/services/sandbox/instances/sandbox_trailing/work/link-dir";
+        let link_file = "/services/sandbox/instances/sandbox_trailing/work/link-file";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(real_dir).expect("mkdir real dir");
+        dfs.posix_write_file(
+            file_path,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write file");
+        dfs.posix_symlink(
+            "real-dir",
+            link_dir,
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("symlink dir");
+        dfs.posix_symlink(
+            "file.txt",
+            link_file,
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("symlink file");
+
+        assert_eq!(
+            dfs.posix_lstat(link_dir).expect("plain lstat").kind,
+            DfsObjectKind::Symlink
+        );
+        assert_eq!(
+            dfs.posix_lstat(&format!("{link_dir}/"))
+                .expect("trailing slash lstat follows directory symlink")
+                .kind,
+            DfsObjectKind::Directory
+        );
+        assert!(matches!(
+            dfs.posix_read_file(&format!("{file_path}/")),
+            Err(DfsPosixError::NotDirectory { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_read_file(&format!("{link_file}/")),
+            Err(DfsPosixError::NotDirectory { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_readlink(&format!("{link_dir}/")),
+            Err(DfsPosixError::NotSymlink { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_rename(&format!("{file_path}/"), &format!("{work}/renamed.txt")),
+            Err(DfsPosixError::NotDirectory { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_rename(file_path, &format!("{work}/missing-destination/")),
+            Err(DfsPosixError::NotDirectory { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_hardlink(&format!("{file_path}/"), &format!("{work}/file-alias.txt")),
+            Err(DfsPosixError::NotDirectory { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_hardlink(file_path, &format!("{work}/missing-alias/")),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_symlink(
+                "file.txt",
+                &format!("{work}/missing-link/"),
+                DfsWriteOptions::replicated_eventual(vec![dfs.node_id().clone()])
+            ),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_symlink(
+                "file.txt",
+                &format!("{real_dir}/"),
+                DfsWriteOptions::replicated_eventual(vec![dfs.node_id().clone()])
+            ),
+            Err(DfsPosixError::AlreadyExists { .. })
+        ));
+        assert!(matches!(
+            dfs.posix_unlink(&format!("{link_dir}/")),
+            Err(DfsPosixError::IsDirectory { .. })
+        ));
+        assert_eq!(
+            dfs.posix_lstat(link_dir)
+                .expect("symlink survives failed unlink")
+                .kind,
+            DfsObjectKind::Symlink
+        );
+        assert_eq!(
+            dfs.posix_stat(real_dir).expect("target survives").kind,
+            DfsObjectKind::Directory
+        );
+        assert_eq!(
+            dfs.posix_list_dir(&format!("{work}/"))
+                .expect("list with trailing slash")
+                .len(),
+            4
+        );
+        dfs.posix_mkdir_all(&format!("{work}/rename-source-dir"))
+            .expect("mkdir rename source dir");
+        dfs.posix_rename(
+            &format!("{work}/rename-source-dir"),
+            &format!("{work}/renamed-dir/"),
+        )
+        .expect("rename directory to trailing slash missing path");
+        assert_eq!(
+            dfs.posix_stat(&format!("{work}/renamed-dir"))
+                .expect("renamed directory")
+                .kind,
+            DfsObjectKind::Directory
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rmdir_reports_directory_not_empty() {
+        let root = temp_root("sifs-posix-rmdir-not-empty");
+        let node_id = NodeId::from_legacy_named("node_sifs_rmdir").expect("node");
+        let dir_path = "/services/sandbox/instances/sandbox_rmdir/work";
+        let file_path = "/services/sandbox/instances/sandbox_rmdir/work/file.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(dir_path).expect("mkdir");
+        dfs.posix_write_file(
+            file_path,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write");
+
+        assert!(matches!(
+            dfs.posix_rmdir(dir_path),
+            Err(DfsPosixError::DirectoryNotEmpty { .. })
+        ));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_stat_reports_directory_link_counts() {
+        let root = temp_root("sifs-posix-link-count");
+        let node_id = NodeId::from_legacy_named("node_sifs_link_count").expect("node");
+        let parent = "/services/sandbox/instances/sandbox_links/work";
+        let child_dir = "/services/sandbox/instances/sandbox_links/work/child";
+        let nested_file = "/services/sandbox/instances/sandbox_links/work/file.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(child_dir).expect("mkdir child");
+        dfs.posix_write_file(
+            nested_file,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write");
+
+        assert_eq!(dfs.posix_stat(parent).expect("parent stat").link_count, 3);
+        assert_eq!(dfs.posix_stat(child_dir).expect("child stat").link_count, 2);
+        assert_eq!(
+            dfs.posix_stat(nested_file).expect("file stat").link_count,
+            1
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_hardlink_shares_content_and_link_count() {
+        let root = temp_root("sifs-posix-hardlink-shared-content");
+        let node_id = NodeId::from_legacy_named("node_sifs_hardlink").expect("node");
+        let original = "/services/sandbox/instances/sandbox_hardlink/work/file.txt";
+        let link = "/services/sandbox/instances/sandbox_hardlink/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_hardlink/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            original,
+            b"original",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write original");
+        dfs.posix_set_times(original, Some(12_345), Some(67_890))
+            .expect("set old times");
+        dfs.posix_hardlink(original, link).expect("hardlink");
+
+        let linked_ctime = dfs
+            .posix_stat(original)
+            .expect("original linked stat")
+            .changed_at_unix_nanos;
+        assert!(linked_ctime > 67_890);
+        assert_eq!(
+            dfs.posix_stat(original).expect("original stat").link_count,
+            2
+        );
+        assert_eq!(dfs.posix_stat(link).expect("link stat").link_count, 2);
+        dfs.posix_write_file(
+            link,
+            b"updated",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write link");
+        assert_eq!(
+            dfs.posix_read_file(original).expect("read original"),
+            b"updated"
+        );
+        assert_eq!(dfs.posix_read_file(link).expect("read link"), b"updated");
+
+        dfs.posix_unlink(link).expect("unlink alias");
+        let remaining_stat = dfs.posix_stat(original).expect("remaining stat");
+        assert_eq!(remaining_stat.link_count, 1);
+        assert!(remaining_stat.changed_at_unix_nanos >= linked_ctime);
+        assert!(matches!(
+            dfs.posix_read_file(link),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_hardlink_preserves_symlink_object() {
+        let root = temp_root("sifs-posix-hardlink-symlink");
+        let node_id = NodeId::from_legacy_named("node_sifs_hardlink_symlink").expect("node");
+        let work = "/services/sandbox/instances/sandbox_hardlink_symlink/work";
+        let target = "/services/sandbox/instances/sandbox_hardlink_symlink/work/target.txt";
+        let link = "/services/sandbox/instances/sandbox_hardlink_symlink/work/link.txt";
+        let alias = "/services/sandbox/instances/sandbox_hardlink_symlink/work/link-alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            target,
+            b"target",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write target");
+        dfs.posix_symlink(
+            "target.txt",
+            link,
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("symlink");
+        dfs.posix_hardlink(link, alias).expect("hardlink symlink");
+
+        let link_stat = dfs.posix_lstat(link).expect("link lstat");
+        let alias_stat = dfs.posix_lstat(alias).expect("alias lstat");
+        assert_eq!(link_stat.kind, DfsObjectKind::Symlink);
+        assert_eq!(alias_stat.kind, DfsObjectKind::Symlink);
+        assert_eq!(link_stat.object_id, alias_stat.object_id);
+        assert_eq!(link_stat.link_count, 2);
+        assert_eq!(alias_stat.link_count, 2);
+        assert_eq!(
+            dfs.posix_readlink(alias).expect("alias readlink"),
+            "target.txt"
+        );
+
+        dfs.posix_unlink(link).expect("unlink original symlink");
+        assert!(matches!(
+            dfs.posix_readlink(link),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(
+            dfs.posix_readlink(alias).expect("remaining alias readlink"),
+            "target.txt"
+        );
+        assert_eq!(
+            dfs.posix_lstat(alias).expect("remaining alias").link_count,
+            1
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_unlink_promotes_hardlink_when_canonical_removed() {
+        let root = temp_root("sifs-posix-hardlink-promote");
+        let node_id = NodeId::from_legacy_named("node_sifs_hardlink_promote").expect("node");
+        let original = "/services/sandbox/instances/sandbox_hardlink_promote/work/file.txt";
+        let link = "/services/sandbox/instances/sandbox_hardlink_promote/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_hardlink_promote/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            original,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write original");
+        let original_object_id = dfs.posix_stat(original).expect("original stat").object_id;
+        dfs.posix_hardlink(original, link).expect("hardlink");
+
+        dfs.posix_unlink(original).expect("unlink canonical");
+        assert!(matches!(
+            dfs.posix_read_file(original),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(
+            dfs.posix_read_file(link).expect("read promoted"),
+            b"content"
+        );
+        let promoted = dfs.posix_stat(link).expect("promoted stat");
+        assert_eq!(promoted.object_id, original_object_id);
+        assert_eq!(promoted.link_count, 1);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_records_old_path_tombstone() {
+        let root = temp_root("sifs-posix-rename-tombstone");
+        let node_id = NodeId::from_legacy_named("node_sifs_rename_tombstone").expect("node");
+        let old_path = "/services/sandbox/instances/sandbox_rename/work/old.txt";
+        let new_path = "/services/sandbox/instances/sandbox_rename/work/new.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_rename/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            old_path,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write old");
+        let old_version = dfs.posix_stat(old_path).expect("old stat").version;
+        dfs.posix_rename(old_path, new_path).expect("rename");
+
+        assert!(matches!(
+            dfs.posix_stat(old_path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(dfs.posix_read_file(new_path).expect("read new"), b"content");
+        let tombstone = dfs
+            .metadata
+            .objects
+            .values()
+            .find(|object| object.path == old_path && object.kind == DfsObjectKind::Tombstone)
+            .expect("old path tombstone");
+        assert_ne!(tombstone.version, old_version);
+
+        let reloaded = networked_sifs_with_backend(&root, node_id);
+        assert!(matches!(
+            reloaded.posix_stat(old_path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(
+            reloaded
+                .posix_read_file(new_path)
+                .expect("reloaded read new"),
+            b"content"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_directory_does_not_resurrect_deleted_children() {
+        let root = temp_root("sifs-posix-rename-dir-deleted-child");
+        let node_id =
+            NodeId::from_legacy_named("node_sifs_rename_dir_deleted_child").expect("node");
+        let old_dir = "/services/sandbox/instances/sandbox_rename_deleted/work/old";
+        let new_dir = "/services/sandbox/instances/sandbox_rename_deleted/work/new";
+        let old_child = format!("{old_dir}/deleted.txt");
+        let new_child = format!("{new_dir}/deleted.txt");
+
+        {
+            let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+            dfs.posix_mkdir_all(old_dir).expect("mkdir old dir");
+            dfs.posix_write_file(
+                &old_child,
+                b"deleted",
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("write child");
+            dfs.posix_unlink(&old_child).expect("unlink child");
+            dfs.posix_rename(old_dir, new_dir).expect("rename dir");
+
+            assert!(matches!(
+                dfs.posix_read_file(&new_child),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+            assert!(
+                dfs.posix_list_dir(new_dir)
+                    .expect("new dir listing")
+                    .is_empty()
+            );
+        }
+
+        let reloaded = networked_sifs_with_backend(&root, node_id);
+        assert!(matches!(
+            reloaded.posix_read_file(&new_child),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert!(
+            reloaded
+                .posix_list_dir(new_dir)
+                .expect("reloaded new dir listing")
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_over_existing_file_survives_reload() {
+        let root = temp_root("sifs-posix-rename-over-existing-file-reload");
+        let node_id =
+            NodeId::from_legacy_named("node_sifs_rename_over_existing_reload").expect("node");
+        let work = "/services/sandbox/instances/sandbox_rename_over_existing/work";
+        let source = "/services/sandbox/instances/sandbox_rename_over_existing/work/source.txt";
+        let dest = "/services/sandbox/instances/sandbox_rename_over_existing/work/dest.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            source,
+            b"source",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write source");
+        let source_object_id = dfs.posix_stat(source).expect("source stat").object_id;
+        dfs.posix_write_file(
+            dest,
+            b"dest",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write dest");
+
+        dfs.posix_rename(source, dest).expect("rename over dest");
+
+        assert!(matches!(
+            dfs.posix_stat(source),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(dfs.posix_read_file(dest).expect("read dest"), b"source");
+        assert_eq!(
+            dfs.posix_stat(dest).expect("dest stat").object_id,
+            source_object_id
+        );
+
+        let reloaded = networked_sifs_with_backend(&root, node_id);
+        assert!(matches!(
+            reloaded.posix_stat(source),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(
+            reloaded.posix_read_file(dest).expect("reloaded read dest"),
+            b"source"
+        );
+        assert_eq!(
+            reloaded
+                .posix_stat(dest)
+                .expect("reloaded dest stat")
+                .object_id,
+            source_object_id
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_hardlink_over_canonical_preserves_target() {
+        let root = temp_root("sifs-posix-rename-hardlink-over-canonical");
+        let node_id = NodeId::from_legacy_named("node_sifs_rename_hardlink").expect("node");
+        let canonical = "/services/sandbox/instances/sandbox_rename_hardlink/work/file.txt";
+        let alias = "/services/sandbox/instances/sandbox_rename_hardlink/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_rename_hardlink/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            canonical,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write canonical");
+        let canonical_object_id = dfs.posix_stat(canonical).expect("canonical stat").object_id;
+        dfs.posix_hardlink(canonical, alias).expect("hardlink");
+        assert_eq!(dfs.posix_stat(alias).expect("alias stat").link_count, 2);
+
+        dfs.posix_rename(alias, canonical)
+            .expect("rename alias over canonical");
+
+        let alias_stat = dfs.posix_stat(alias).expect("alias remains");
+        let canonical_stat = dfs.posix_stat(canonical).expect("canonical remains");
+        assert_eq!(canonical_stat.object_id, canonical_object_id);
+        assert_eq!(alias_stat.object_id, canonical_object_id);
+        assert_eq!(canonical_stat.link_count, 2);
+        assert_eq!(alias_stat.link_count, 2);
+        assert_eq!(
+            dfs.posix_read_file(canonical).expect("read canonical"),
+            b"content"
+        );
+        assert_eq!(dfs.posix_read_file(alias).expect("read alias"), b"content");
+
+        let reloaded = networked_sifs_with_backend(&root, node_id);
+        assert_eq!(
+            reloaded
+                .posix_stat(alias)
+                .expect("reloaded alias")
+                .link_count,
+            2
+        );
+        assert_eq!(
+            reloaded.posix_read_file(canonical).expect("reloaded read"),
+            b"content"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_over_canonical_preserves_other_hardlinks() {
+        let root = temp_root("sifs-posix-rename-over-canonical-hardlinks");
+        let node_id =
+            NodeId::from_legacy_named("node_sifs_rename_over_canonical_hardlinks").expect("node");
+        let work = "/services/sandbox/instances/sandbox_rename_over_hardlinks/work";
+        let source = "/services/sandbox/instances/sandbox_rename_over_hardlinks/work/source.txt";
+        let canonical =
+            "/services/sandbox/instances/sandbox_rename_over_hardlinks/work/canonical.txt";
+        let alias = "/services/sandbox/instances/sandbox_rename_over_hardlinks/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            canonical,
+            b"old",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write canonical");
+        let old_object_id = dfs.posix_stat(canonical).expect("canonical stat").object_id;
+        dfs.posix_hardlink(canonical, alias).expect("hardlink");
+        dfs.posix_write_file(
+            source,
+            b"new",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write source");
+        let source_object_id = dfs.posix_stat(source).expect("source stat").object_id;
+
+        dfs.posix_rename(source, canonical)
+            .expect("rename source over canonical");
+
+        assert!(matches!(
+            dfs.posix_stat(source),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        let canonical_stat = dfs
+            .posix_stat(canonical)
+            .expect("canonical stat after rename");
+        let alias_stat = dfs.posix_stat(alias).expect("alias stat after rename");
+        assert_eq!(canonical_stat.object_id, source_object_id);
+        assert_eq!(canonical_stat.link_count, 1);
+        assert_eq!(alias_stat.object_id, old_object_id);
+        assert_eq!(alias_stat.link_count, 1);
+        assert_eq!(
+            dfs.posix_read_file(canonical).expect("read canonical"),
+            b"new"
+        );
+        assert_eq!(dfs.posix_read_file(alias).expect("read alias"), b"old");
+
+        let reloaded = networked_sifs_with_backend(&root, node_id);
+        assert_eq!(
+            reloaded
+                .posix_stat(alias)
+                .expect("reloaded alias")
+                .object_id,
+            old_object_id
+        );
+        assert_eq!(
+            reloaded
+                .posix_read_file(canonical)
+                .expect("reloaded canonical"),
+            b"new"
+        );
+        assert_eq!(
+            reloaded.posix_read_file(alias).expect("reloaded alias"),
+            b"old"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_hardlink_over_canonical_preserves_both_targets() {
+        let root = temp_root("sifs-posix-rename-hardlink-over-other-canonical");
+        let node_id = NodeId::from_legacy_named("node_sifs_rename_hardlink_over_other_canonical")
+            .expect("node");
+        let work = "/services/sandbox/instances/sandbox_rename_hardlink_over_other/work";
+        let source_canonical =
+            "/services/sandbox/instances/sandbox_rename_hardlink_over_other/work/source.txt";
+        let source_alias =
+            "/services/sandbox/instances/sandbox_rename_hardlink_over_other/work/source-alias.txt";
+        let dest_canonical =
+            "/services/sandbox/instances/sandbox_rename_hardlink_over_other/work/dest.txt";
+        let dest_alias =
+            "/services/sandbox/instances/sandbox_rename_hardlink_over_other/work/dest-alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            source_canonical,
+            b"source",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write source");
+        dfs.posix_hardlink(source_canonical, source_alias)
+            .expect("source hardlink");
+        let source_object_id = dfs
+            .posix_stat(source_canonical)
+            .expect("source stat")
+            .object_id;
+        dfs.posix_write_file(
+            dest_canonical,
+            b"dest",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write dest");
+        dfs.posix_hardlink(dest_canonical, dest_alias)
+            .expect("dest hardlink");
+        let dest_object_id = dfs.posix_stat(dest_canonical).expect("dest stat").object_id;
+
+        dfs.posix_rename(source_alias, dest_canonical)
+            .expect("rename source alias over dest canonical");
+
+        let source_stat = dfs
+            .posix_stat(source_canonical)
+            .expect("source canonical remains");
+        let renamed_stat = dfs.posix_stat(dest_canonical).expect("renamed source");
+        let dest_alias_stat = dfs.posix_stat(dest_alias).expect("dest alias remains");
+        assert_eq!(source_stat.object_id, source_object_id);
+        assert_eq!(renamed_stat.object_id, source_object_id);
+        assert_eq!(source_stat.link_count, 2);
+        assert_eq!(renamed_stat.link_count, 2);
+        assert_eq!(dest_alias_stat.object_id, dest_object_id);
+        assert_eq!(dest_alias_stat.link_count, 1);
+        assert_eq!(
+            dfs.posix_read_file(source_canonical)
+                .expect("read source canonical"),
+            b"source"
+        );
+        assert_eq!(
+            dfs.posix_read_file(dest_canonical)
+                .expect("read renamed source"),
+            b"source"
+        );
+        assert_eq!(
+            dfs.posix_read_file(dest_alias).expect("read dest alias"),
+            b"dest"
+        );
+        assert!(matches!(
+            dfs.posix_stat(source_alias),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+
+        let reloaded = networked_sifs_with_backend(&root, node_id);
+        assert_eq!(
+            reloaded
+                .posix_stat(dest_canonical)
+                .expect("reloaded renamed source")
+                .object_id,
+            source_object_id
+        );
+        assert_eq!(
+            reloaded
+                .posix_stat(dest_alias)
+                .expect("reloaded dest alias")
+                .object_id,
+            dest_object_id
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_hardlink_alias_updates_target_ctime() {
+        let root = temp_root("sifs-posix-rename-hardlink-alias-ctime");
+        let node_id =
+            NodeId::from_legacy_named("node_sifs_rename_hardlink_alias_ctime").expect("node");
+        let work = "/services/sandbox/instances/sandbox_rename_alias_ctime/work";
+        let canonical = "/services/sandbox/instances/sandbox_rename_alias_ctime/work/canonical.txt";
+        let alias = "/services/sandbox/instances/sandbox_rename_alias_ctime/work/alias.txt";
+        let renamed =
+            "/services/sandbox/instances/sandbox_rename_alias_ctime/work/renamed-alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            canonical,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write canonical");
+        dfs.posix_hardlink(canonical, alias).expect("hardlink");
+        let before = dfs.posix_stat(canonical).expect("before stat");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        dfs.posix_rename(alias, renamed)
+            .expect("rename hardlink alias");
+
+        let canonical_after = dfs.posix_stat(canonical).expect("canonical remains");
+        let renamed_after = dfs.posix_stat(renamed).expect("renamed alias");
+        assert_eq!(canonical_after.object_id, before.object_id);
+        assert_eq!(renamed_after.object_id, before.object_id);
+        assert_eq!(canonical_after.link_count, 2);
+        assert_eq!(renamed_after.link_count, 2);
+        assert!(
+            canonical_after.changed_at_unix_nanos > before.changed_at_unix_nanos,
+            "renaming a hardlink alias must advance target inode ctime"
+        );
+        assert_eq!(
+            canonical_after.changed_at_unix_nanos,
+            renamed_after.changed_at_unix_nanos
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_over_hardlink_alias_updates_replaced_target_ctime() {
+        let root = temp_root("sifs-posix-rename-over-hardlink-alias-ctime");
+        let node_id =
+            NodeId::from_legacy_named("node_sifs_rename_over_hardlink_alias_ctime").expect("node");
+        let work = "/services/sandbox/instances/sandbox_rename_over_alias_ctime/work";
+        let source = "/services/sandbox/instances/sandbox_rename_over_alias_ctime/work/source.txt";
+        let canonical =
+            "/services/sandbox/instances/sandbox_rename_over_alias_ctime/work/canonical.txt";
+        let alias = "/services/sandbox/instances/sandbox_rename_over_alias_ctime/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            canonical,
+            b"old",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write canonical");
+        dfs.posix_hardlink(canonical, alias).expect("hardlink");
+        let old_before = dfs.posix_stat(canonical).expect("old before");
+        dfs.posix_write_file(
+            source,
+            b"new",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write source");
+        let source_object_id = dfs.posix_stat(source).expect("source stat").object_id;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        dfs.posix_rename(source, alias)
+            .expect("rename source over hardlink alias");
+
+        let canonical_after = dfs.posix_stat(canonical).expect("canonical remains");
+        let alias_after = dfs.posix_stat(alias).expect("alias replaced");
+        assert_eq!(canonical_after.object_id, old_before.object_id);
+        assert_eq!(canonical_after.link_count, 1);
+        assert!(
+            canonical_after.changed_at_unix_nanos > old_before.changed_at_unix_nanos,
+            "replacing a hardlink alias must advance the replaced target inode ctime"
+        );
+        assert_eq!(alias_after.object_id, source_object_id);
+        assert_eq!(alias_after.link_count, 1);
+        assert_eq!(dfs.posix_read_file(canonical).expect("read old"), b"old");
+        assert_eq!(dfs.posix_read_file(alias).expect("read new"), b"new");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_set_times_updates_hardlink_target_metadata() {
+        let root = temp_root("sifs-posix-set-times-hardlink");
+        let node_id = NodeId::from_legacy_named("node_sifs_set_times").expect("node");
+        let original = "/services/sandbox/instances/sandbox_set_times/work/file.txt";
+        let link = "/services/sandbox/instances/sandbox_set_times/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_set_times/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            original,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write original");
+        dfs.posix_hardlink(original, link).expect("hardlink");
+
+        dfs.posix_set_times(link, Some(12_345), Some(67_890))
+            .expect("set times through link");
+        let original_stat = dfs.posix_stat(original).expect("original stat");
+        let link_stat = dfs.posix_stat(link).expect("link stat");
+        assert_eq!(original_stat.accessed_at_unix_nanos, 12_345);
+        assert_eq!(original_stat.modified_at_unix_nanos, 67_890);
+        assert_eq!(link_stat.accessed_at_unix_nanos, 12_345);
+        assert_eq!(link_stat.modified_at_unix_nanos, 67_890);
+        assert!(original_stat.changed_at_unix_nanos > 67_890);
+        assert_eq!(
+            original_stat.changed_at_unix_nanos,
+            link_stat.changed_at_unix_nanos
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_set_times_without_fields_is_noop() {
+        let root = temp_root("sifs-posix-set-times-noop");
+        let node_id = NodeId::from_legacy_named("node_sifs_set_times_noop").expect("node");
+        let file = "/services/sandbox/instances/sandbox_set_times_noop/work/file.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_set_times_noop/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            file,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write file");
+        dfs.posix_set_times(file, Some(12_345), Some(67_890))
+            .expect("set baseline times");
+        let before = dfs.posix_stat(file).expect("before stat");
+
+        let after = dfs
+            .posix_set_times(file, None, None)
+            .expect("set no timestamp fields");
+
+        assert_eq!(after.accessed_at_unix_nanos, before.accessed_at_unix_nanos);
+        assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
+        assert_eq!(after.changed_at_unix_nanos, before.changed_at_unix_nanos);
+        assert_eq!(
+            after.version, before.version,
+            "omitting both timestamps must not churn the distributed metadata version"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_set_owner_updates_hardlink_target_metadata() {
+        let root = temp_root("sifs-posix-set-owner-hardlink");
+        let node_id = NodeId::from_legacy_named("node_sifs_set_owner").expect("node");
+        let original = "/services/sandbox/instances/sandbox_set_owner/work/file.txt";
+        let link = "/services/sandbox/instances/sandbox_set_owner/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_set_owner/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            original,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write original");
+        dfs.posix_hardlink(original, link).expect("hardlink");
+
+        dfs.posix_set_owner(link, 1001, 1002)
+            .expect("set owner through link");
+        let original_stat = dfs.posix_stat(original).expect("original stat");
+        let link_stat = dfs.posix_stat(link).expect("link stat");
+        assert_eq!(original_stat.uid, 1001);
+        assert_eq!(original_stat.gid, 1002);
+        assert_eq!(link_stat.uid, 1001);
+        assert_eq!(link_stat.gid, 1002);
+        assert_eq!(
+            original_stat.changed_at_unix_nanos,
+            link_stat.changed_at_unix_nanos
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_set_mode_zero_is_reported_as_zero() {
+        let root = temp_root("sifs-posix-set-mode-zero");
+        let node_id = NodeId::from_legacy_named("node_sifs_set_mode_zero").expect("node");
+        let file = "/services/sandbox/instances/sandbox_set_mode_zero/work/file.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_set_mode_zero/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            file,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write file");
+
+        let changed = dfs.posix_set_mode(file, 0).expect("chmod 0000");
+        assert_eq!(changed.mode, 0);
+        assert_eq!(dfs.posix_stat(file).expect("stat").mode, 0);
+        assert!(
+            dfs.posix_stat(file).expect("stat").changed_at_unix_nanos
+                >= changed.changed_at_unix_nanos
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_metadata_only_versions_preserve_content_size() {
+        let root = temp_root("sifs-posix-metadata-only-size");
+        let node_id = NodeId::from_legacy_named("node_sifs_metadata_only_size").expect("node");
+        let work = "/services/sandbox/instances/sandbox_metadata_size/work";
+        let file = "/services/sandbox/instances/sandbox_metadata_size/work/file.txt";
+        let renamed = "/services/sandbox/instances/sandbox_metadata_size/work/renamed.txt";
+        let link = "/services/sandbox/instances/sandbox_metadata_size/work/link.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            file,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write file");
+        assert_eq!(
+            dfs.posix_set_mode(file, 0o600).expect("chmod").size_bytes,
+            Some(7)
+        );
+        assert_eq!(
+            dfs.posix_rename(file, renamed).expect("rename").size_bytes,
+            Some(7)
+        );
+
+        dfs.posix_symlink(
+            "renamed.txt",
+            link,
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("symlink");
+        assert_eq!(
+            dfs.posix_set_symlink_times(link, Some(1), Some(2))
+                .expect("set symlink times")
+                .size_bytes,
+            Some("renamed.txt".len() as u64)
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_recreate_file_refreshes_creation_metadata() {
+        let root = temp_root("sifs-posix-recreate-file-times");
+        let node_id = NodeId::from_legacy_named("node_sifs_recreate_file").expect("node");
+        let file_path = "/services/sandbox/instances/sandbox_recreate/work/file.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_recreate/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            file_path,
+            b"old",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write old");
+        dfs.posix_set_times(file_path, Some(12_345), Some(67_890))
+            .expect("old times");
+        dfs.posix_unlink(file_path).expect("unlink");
+
+        let recreated = dfs
+            .posix_write_file(
+                file_path,
+                b"new",
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect("recreate");
+
+        assert_eq!(recreated.size_bytes, Some(3));
+        assert!(recreated.accessed_at_unix_nanos > 12_345);
+        assert!(recreated.modified_at_unix_nanos > 67_890);
+        assert!(recreated.created_at_unix_nanos > 67_890);
+        assert_eq!(dfs.posix_read_file(file_path).expect("read"), b"new");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_recreate_directory_refreshes_creation_metadata() {
+        let root = temp_root("sifs-posix-recreate-dir-times");
+        let node_id = NodeId::from_legacy_named("node_sifs_recreate_dir").expect("node");
+        let dir_path = "/services/sandbox/instances/sandbox_recreate_dir/work/dir";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id);
+        dfs.posix_mkdir_all(dir_path).expect("mkdir");
+        dfs.posix_set_times(dir_path, Some(12_345), Some(67_890))
+            .expect("old times");
+        dfs.posix_rmdir(dir_path).expect("rmdir");
+        let recreated = dfs.posix_mkdir(dir_path).expect("recreate dir");
+
+        assert!(recreated.accessed_at_unix_nanos > 12_345);
+        assert!(recreated.modified_at_unix_nanos > 67_890);
+        assert!(recreated.created_at_unix_nanos > 67_890);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_write_updates_mtime_without_changing_atime() {
+        let root = temp_root("sifs-posix-write-mtime");
+        let node_id = NodeId::from_legacy_named("node_sifs_write_mtime").expect("node");
+        let original = "/services/sandbox/instances/sandbox_write_mtime/work/file.txt";
+        let link = "/services/sandbox/instances/sandbox_write_mtime/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_write_mtime/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            original,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write original");
+        dfs.posix_hardlink(original, link).expect("hardlink");
+        dfs.posix_set_times(original, Some(12_345), Some(67_890))
+            .expect("set old times");
+
+        let stat = dfs
+            .posix_write_file(
+                link,
+                b"updated",
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect("write through hardlink");
+
+        assert_eq!(stat.accessed_at_unix_nanos, 12_345);
+        assert!(stat.modified_at_unix_nanos > 67_890);
+        let original_stat = dfs.posix_stat(original).expect("original stat");
+        let link_stat = dfs.posix_stat(link).expect("link stat");
+        assert_eq!(original_stat.accessed_at_unix_nanos, 12_345);
+        assert_eq!(link_stat.accessed_at_unix_nanos, 12_345);
+        assert_eq!(
+            original_stat.modified_at_unix_nanos,
+            link_stat.modified_at_unix_nanos
+        );
+        assert!(original_stat.modified_at_unix_nanos > 67_890);
+        assert_eq!(
+            original_stat.changed_at_unix_nanos,
+            original_stat.modified_at_unix_nanos
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_write_at_merges_bytes_and_preserves_hardlink_identity() {
+        let root = temp_root("sifs-posix-write-at-hardlink");
+        let node_id = NodeId::from_legacy_named("node_sifs_write_at").expect("node");
+        let work = "/services/sandbox/instances/sandbox_write_at/work";
+        let original = "/services/sandbox/instances/sandbox_write_at/work/file.txt";
+        let alias = "/services/sandbox/instances/sandbox_write_at/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            original,
+            b"abcdef",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write original");
+        dfs.posix_hardlink(original, alias).expect("hardlink");
+
+        let stat = dfs
+            .posix_write_file_at(
+                alias,
+                2,
+                b"XYZ",
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("write at hardlink");
+
+        assert_eq!(stat.size_bytes, Some(6));
+        assert_eq!(
+            dfs.posix_read_file(original).expect("read original"),
+            b"abXYZf"
+        );
+        assert_eq!(dfs.posix_read_file(alias).expect("read alias"), b"abXYZf");
+        let original_stat = dfs.posix_stat(original).expect("original stat");
+        let alias_stat = dfs.posix_stat(alias).expect("alias stat");
+        assert_eq!(original_stat.object_id, alias_stat.object_id);
+        assert_eq!(original_stat.link_count, 2);
+        assert_eq!(alias_stat.link_count, 2);
+
+        let stat = dfs
+            .posix_write_file_at(
+                original,
+                8,
+                b"!",
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect("sparse write");
+
+        assert_eq!(stat.size_bytes, Some(9));
+        assert_eq!(
+            dfs.posix_read_file(alias).expect("read sparse alias"),
+            b"abXYZf\0\0!"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_truncate_preserves_hardlink_identity() {
+        let root = temp_root("sifs-posix-truncate-hardlink");
+        let node_id = NodeId::from_legacy_named("node_sifs_truncate").expect("node");
+        let work = "/services/sandbox/instances/sandbox_truncate/work";
+        let original = "/services/sandbox/instances/sandbox_truncate/work/file.txt";
+        let alias = "/services/sandbox/instances/sandbox_truncate/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            original,
+            b"abcdef",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write original");
+        dfs.posix_hardlink(original, alias).expect("hardlink");
+
+        let stat = dfs
+            .posix_truncate_file(
+                alias,
+                3,
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("truncate through hardlink");
+        assert_eq!(stat.size_bytes, Some(3));
+        assert_eq!(dfs.posix_read_file(original).expect("read"), b"abc");
+        assert_eq!(dfs.posix_read_file(alias).expect("read alias"), b"abc");
+        assert_eq!(
+            dfs.posix_stat(original).expect("original stat").object_id,
+            dfs.posix_stat(alias).expect("alias stat").object_id
+        );
+
+        let stat = dfs
+            .posix_truncate_file(
+                original,
+                5,
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect("extend sparse through original");
+        assert_eq!(stat.size_bytes, Some(5));
+        assert_eq!(
+            dfs.posix_read_file(alias).expect("read sparse alias"),
+            b"abc\0\0"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_distributed_write_rejects_stale_backend_base_version() {
+        let root = temp_root("sifs-stale-write-base");
+        let node_id = NodeId::from_legacy_named("node_sifs_stale_write_base").expect("node");
+        let work = "/services/sandbox/instances/sandbox_stale_write/work";
+        let file_path = "/services/sandbox/instances/sandbox_stale_write/work/file.txt";
+
+        let mut writer = networked_sifs_with_backend(&root, node_id.clone());
+        writer.posix_mkdir_all(work).expect("mkdir");
+        writer
+            .posix_write_file(
+                file_path,
+                b"abcdef",
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("initial write");
+
+        let stale = networked_sifs_with_backend(&root, node_id.clone());
+        let stale_stat = stale.posix_stat(file_path).expect("stale stat");
+
+        writer
+            .posix_write_file_at(
+                file_path,
+                0,
+                b"XY",
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("fresh offset write");
+        let fresh_stat = writer.posix_stat(file_path).expect("fresh stat");
+
+        let mut stale_writer = stale;
+        let request = DfsWriteRequest {
+            file_system_id: stale_stat.file_system_id.clone(),
+            object_id: stale_stat.object_id.clone(),
+            target_version: crate::namespace::next_version(&stale_stat.version),
+            requesting_node_id: node_id.clone(),
+        };
+        let outcome = stale_writer
+            .write_distributed_eventual_with_base(
+                request,
+                Some(stale_stat.version.clone()),
+                b"stale overwrite".to_vec(),
+                vec![node_id.clone()],
+                DfsReplicationPolicy::new(1, 1).expect("policy"),
+            )
+            .expect("stale write is reported as conflict");
+        let conflict = match outcome {
+            NetworkedDfsWriteOutcome::Conflict { conflict } => conflict,
+            other => panic!("stale write must conflict instead of overwriting: {other:?}"),
+        };
+
+        let mut reloaded = networked_sifs_with_backend(&root, node_id);
+        assert_eq!(
+            reloaded
+                .posix_stat(file_path)
+                .expect("stat after conflict")
+                .content_hash,
+            fresh_stat.content_hash,
+            "stale conflict publication must not replace the committed content hash"
+        );
+        assert!(
+            matches!(
+                reloaded.posix_read_file(file_path),
+                Err(DfsPosixError::Conflict { .. })
+            ),
+            "open DFS conflicts must not be reported as missing files"
+        );
+        reloaded
+            .update_conflict_status(
+                &conflict.object_id,
+                &conflict.conflict_id,
+                DfsConflictStatus::Resolved,
+            )
+            .expect("resolve conflict");
+        assert_eq!(
+            reloaded.posix_read_file(file_path).expect("read winner"),
+            b"XYcdef"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_relink_after_canonical_unlink_does_not_create_hardlink_cycle() {
+        let root = temp_root("sifs-posix-relink-after-canonical-unlink");
+        let node_id = NodeId::from_legacy_named("node_sifs_relink_after_unlink").expect("node");
+        let work = "/services/sandbox/instances/sandbox_relink_after_unlink/work";
+        let original = "/services/sandbox/instances/sandbox_relink_after_unlink/work/file.txt";
+        let alias = "/services/sandbox/instances/sandbox_relink_after_unlink/work/alias.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir");
+        dfs.posix_write_file(
+            original,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write original");
+        dfs.posix_hardlink(original, alias).expect("hardlink alias");
+        dfs.posix_write_file(
+            alias,
+            b"updated",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write alias");
+        dfs.posix_unlink(original).expect("unlink canonical path");
+
+        dfs.posix_hardlink(alias, original)
+            .expect("relink original path");
+
+        let original_stat = dfs.posix_stat(original).expect("original stat");
+        let alias_stat = dfs.posix_stat(alias).expect("alias stat");
+        assert_eq!(original_stat.object_id, alias_stat.object_id);
+        assert_eq!(original_stat.link_count, 2);
+        assert_eq!(alias_stat.link_count, 2);
+        assert_eq!(
+            dfs.posix_read_file(original).expect("read original"),
+            b"updated"
+        );
+        assert_eq!(dfs.posix_read_file(alias).expect("read alias"), b"updated");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_read_updates_atime_without_changing_mtime() {
+        let root = temp_root("sifs-posix-read-atime");
+        let node_id = NodeId::from_legacy_named("node_sifs_read_atime").expect("node");
+        let file_path = "/services/sandbox/instances/sandbox_read_atime/work/file.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_read_atime/work")
+            .expect("mkdir");
+        dfs.posix_write_file(
+            file_path,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write");
+        dfs.posix_set_times(file_path, Some(12_345), Some(67_890))
+            .expect("old times");
+        let before = dfs.posix_stat(file_path).expect("before stat");
+
+        assert_eq!(
+            dfs.posix_read_file_update_access(file_path)
+                .expect("read update access"),
+            b"content"
+        );
+
+        let stat = dfs.posix_stat(file_path).expect("stat");
+        assert!(stat.accessed_at_unix_nanos > 12_345);
+        assert_eq!(stat.modified_at_unix_nanos, 67_890);
+        assert_ne!(
+            stat.version, before.version,
+            "atime update must advance the DFS metadata version so it persists across distributed reconciliation"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_list_updates_directory_atime_without_changing_mtime() {
+        let root = temp_root("sifs-posix-list-atime");
+        let node_id = NodeId::from_legacy_named("node_sifs_list_atime").expect("node");
+        let dir_path = "/services/sandbox/instances/sandbox_list_atime/work";
+        let file_path = "/services/sandbox/instances/sandbox_list_atime/work/file.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(dir_path).expect("mkdir");
+        dfs.posix_write_file(
+            file_path,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write");
+        dfs.posix_set_times(dir_path, Some(12_345), Some(67_890))
+            .expect("old times");
+
+        let entries = dfs
+            .posix_list_dir_update_access(dir_path)
+            .expect("list update access");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file.txt"]
+        );
+
+        let stat = dfs.posix_stat(dir_path).expect("stat");
+        assert!(stat.accessed_at_unix_nanos > 12_345);
+        assert_eq!(stat.modified_at_unix_nanos, 67_890);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
+        let root = temp_root("sifs-posix-parent-mtime");
+        let node_id = NodeId::from_legacy_named("node_sifs_parent_mtime").expect("node");
+        let work = "/services/sandbox/instances/sandbox_parent_mtime/work";
+        let other = "/services/sandbox/instances/sandbox_parent_mtime/other";
+        let file = "/services/sandbox/instances/sandbox_parent_mtime/work/file.txt";
+        let alias = "/services/sandbox/instances/sandbox_parent_mtime/work/alias.txt";
+        let link = "/services/sandbox/instances/sandbox_parent_mtime/work/link.txt";
+        let renamed = "/services/sandbox/instances/sandbox_parent_mtime/other/renamed.txt";
+        let dir = "/services/sandbox/instances/sandbox_parent_mtime/work/dir";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir work");
+        dfs.posix_mkdir_all(other).expect("mkdir other");
+
+        dfs.posix_set_times(work, Some(12_345), Some(67_890))
+            .expect("old work times");
+        let before_create = dfs.posix_stat(work).expect("work before create");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        dfs.posix_write_file(
+            file,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("create file");
+        let after_create = dfs.posix_stat(work).expect("work after create");
+        assert!(after_create.modified_at_unix_nanos > 67_890);
+        assert!(
+            after_create.changed_at_unix_nanos > before_create.changed_at_unix_nanos,
+            "creating a directory entry must advance parent directory ctime"
+        );
+
+        dfs.posix_set_times(work, Some(12_345), Some(67_890))
+            .expect("reset work times");
+        dfs.posix_write_file(
+            file,
+            b"updated",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("overwrite file");
+        assert_eq!(
+            dfs.posix_stat(work)
+                .expect("work after overwrite")
+                .modified_at_unix_nanos,
+            67_890,
+            "overwriting existing file content must not change parent directory mtime"
+        );
+
+        dfs.posix_hardlink(file, alias).expect("hardlink");
+        assert!(
+            dfs.posix_stat(work)
+                .expect("work after hardlink")
+                .modified_at_unix_nanos
+                > 67_890
+        );
+
+        dfs.posix_set_times(work, Some(12_345), Some(67_890))
+            .expect("reset work times");
+        dfs.posix_symlink(
+            "file.txt",
+            link,
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("symlink");
+        assert!(
+            dfs.posix_stat(work)
+                .expect("work after symlink")
+                .modified_at_unix_nanos
+                > 67_890
+        );
+
+        dfs.posix_set_times(work, Some(12_345), Some(67_890))
+            .expect("reset work times");
+        dfs.posix_mkdir(dir).expect("mkdir child");
+        assert!(
+            dfs.posix_stat(work)
+                .expect("work after mkdir")
+                .modified_at_unix_nanos
+                > 67_890
+        );
+
+        dfs.posix_set_times(work, Some(12_345), Some(67_890))
+            .expect("reset work times");
+        dfs.posix_rmdir(dir).expect("rmdir child");
+        assert!(
+            dfs.posix_stat(work)
+                .expect("work after rmdir")
+                .modified_at_unix_nanos
+                > 67_890
+        );
+
+        dfs.posix_set_times(work, Some(12_345), Some(67_890))
+            .expect("reset work times");
+        dfs.posix_unlink(alias).expect("unlink alias");
+        assert!(
+            dfs.posix_stat(work)
+                .expect("work after unlink")
+                .modified_at_unix_nanos
+                > 67_890
+        );
+
+        dfs.posix_set_times(work, Some(12_345), Some(67_890))
+            .expect("reset work times");
+        dfs.posix_set_times(other, Some(22_222), Some(88_888))
+            .expect("old other times");
+        dfs.posix_rename(file, renamed).expect("rename across dirs");
+        assert!(
+            dfs.posix_stat(work)
+                .expect("work after rename")
+                .modified_at_unix_nanos
+                > 67_890
+        );
+        assert!(
+            dfs.posix_stat(other)
+                .expect("other after rename")
+                .modified_at_unix_nanos
+                > 88_888
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sifs_posix_rename_updates_moved_object_ctime_without_changing_mtime() {
+        let root = temp_root("sifs-posix-rename-ctime");
+        let node_id = NodeId::from_legacy_named("node_sifs_rename_ctime").expect("node");
+        let work = "/services/sandbox/instances/sandbox_rename_ctime/work";
+        let source = "/services/sandbox/instances/sandbox_rename_ctime/work/source.txt";
+        let renamed = "/services/sandbox/instances/sandbox_rename_ctime/work/renamed.txt";
+
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(work).expect("mkdir work");
+        dfs.posix_write_file(
+            source,
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write source");
+        dfs.posix_set_times(source, Some(12_345), Some(67_890))
+            .expect("old source times");
+
+        let before = dfs.posix_stat(source).expect("before stat");
+        dfs.posix_rename(source, renamed).expect("rename");
+        let after = dfs.posix_stat(renamed).expect("after stat");
+
+        assert_eq!(after.object_id, before.object_id);
+        assert_eq!(after.created_at_unix_nanos, before.created_at_unix_nanos);
+        assert_eq!(
+            after.modified_at_unix_nanos, before.modified_at_unix_nanos,
+            "rename must not change file content mtime"
+        );
+        assert!(
+            after.changed_at_unix_nanos > before.changed_at_unix_nanos,
+            "rename must advance ctime because the path metadata changed"
+        );
+        assert_ne!(
+            after.version, before.version,
+            "rename metadata update must advance the object metadata version"
         );
 
         std::fs::remove_dir_all(root).ok();

@@ -2,7 +2,6 @@ use crate::{SANDBOX_WASIX_MAX_TASKS, SandboxWasiError};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use wasmer::{Global, Value};
 use wasmer_wasix::{
@@ -157,13 +156,6 @@ pub(super) fn wasix_exit_status(
             }
         }
     }
-}
-
-pub(crate) fn wasix_command_exceeded_requested_timeout(elapsed: Duration, timeout_ms: u64) -> bool {
-    if timeout_ms == crate::SANDBOX_UNLIMITED_WALL_TIME_MS {
-        return false;
-    }
-    elapsed >= Duration::from_millis(timeout_ms)
 }
 
 #[cfg(test)]

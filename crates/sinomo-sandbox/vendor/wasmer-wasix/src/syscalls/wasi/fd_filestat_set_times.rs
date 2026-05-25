@@ -65,37 +65,45 @@ pub(crate) fn fd_filestat_set_times_internal(
 
     let inode = fd_entry.inode;
 
+    let sets_atime = fst_flags.contains(Fstflags::SET_ATIM)
+        || fst_flags.contains(Fstflags::SET_ATIM_NOW);
+    let sets_mtime = fst_flags.contains(Fstflags::SET_MTIM)
+        || fst_flags.contains(Fstflags::SET_MTIM_NOW);
+    if !sets_atime && !sets_mtime {
+        return Ok(());
+    }
+
     let mut atime = None;
     let mut mtime = None;
 
-    if fst_flags.contains(Fstflags::SET_ATIM) || fst_flags.contains(Fstflags::SET_ATIM_NOW) {
+    if sets_atime {
         let time_to_set = if fst_flags.contains(Fstflags::SET_ATIM) {
             st_atim
         } else {
             get_current_time_in_nanos()?
         };
-        inode.stat.write().unwrap().st_atim = time_to_set;
         atime = Some(time_to_set);
     }
 
-    if fst_flags.contains(Fstflags::SET_MTIM) || fst_flags.contains(Fstflags::SET_MTIM_NOW) {
+    if sets_mtime {
         let time_to_set = if fst_flags.contains(Fstflags::SET_MTIM) {
             st_mtim
         } else {
             get_current_time_in_nanos()?
         };
-        inode.stat.write().unwrap().st_mtim = time_to_set;
         mtime = Some(time_to_set);
     }
 
-    if let Kind::File {
-        handle: Some(handle),
-        ..
-    } = inode.kind.write().unwrap().deref()
-    {
-        let mut handle = handle.write().unwrap();
+    let (next_atime, next_mtime) = {
+        let stat = inode.stat.read().unwrap();
+        (atime.unwrap_or(stat.st_atim), mtime.unwrap_or(stat.st_mtim))
+    };
+    fd_set_times(env, fd, next_atime, next_mtime)?;
 
-        handle.set_times(atime, mtime);
+    {
+        let mut stat = inode.stat.write().unwrap();
+        stat.st_atim = next_atime;
+        stat.st_mtim = next_mtime;
     }
 
     Ok(())

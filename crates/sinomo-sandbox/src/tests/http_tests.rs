@@ -360,7 +360,7 @@ fn sandbox_http_exchange_record_persists_to_local_logs() {
     persist_http_exchange_record(&mut sandbox_fs, &record).expect("persist");
 
     assert_eq!(
-        load_http_exchange_record(&sandbox_fs, &command_id, &request_id).expect("load"),
+        load_http_exchange_record(&mut sandbox_fs, &command_id, &request_id).expect("load"),
         record
     );
     fs::remove_dir_all(runtime_root).ok();
@@ -412,7 +412,8 @@ fn sandbox_http_fetch_recording_persists_successful_exchange() {
     assert_eq!(recorded.response.status, 200);
     assert_eq!(recorded.record.status, Some(200));
     assert_eq!(
-        load_http_exchange_record(&sandbox_fs, &command_id, &recorded.request_id).expect("load"),
+        load_http_exchange_record(&mut sandbox_fs, &command_id, &recorded.request_id)
+            .expect("load"),
         recorded.record
     );
     fs::remove_dir_all(runtime_root).ok();
@@ -466,8 +467,12 @@ fn sandbox_http_fetch_to_file_stores_response_body_and_audit_record() {
         b"package-bytes"
     );
     assert_eq!(
-        load_http_exchange_record(&sandbox_fs, &result.record.command_id, &result.request_id)
-            .expect("load audit"),
+        load_http_exchange_record(
+            &mut sandbox_fs,
+            &result.record.command_id,
+            &result.request_id
+        )
+        .expect("load audit"),
         result.record
     );
     fs::remove_dir_all(runtime_root).ok();
@@ -628,8 +633,12 @@ fn sandbox_http_fetch_to_file_stores_response_body_and_audit_record_in_sifs() {
         b"sifs-package-bytes"
     );
     assert_eq!(
-        load_http_exchange_record(&sandbox_fs, &result.record.command_id, &result.request_id)
-            .expect("load audit"),
+        load_http_exchange_record(
+            &mut sandbox_fs,
+            &result.record.command_id,
+            &result.request_id
+        )
+        .expect("load audit"),
         result.record
     );
     replica_dfs
@@ -644,18 +653,22 @@ fn sandbox_http_fetch_to_file_stores_response_body_and_audit_record_in_sifs() {
     )
     .with_metadata_backend(replica_backend)
     .expect("replica metadata backend reload");
-    let replica_store = SifsSandboxInstanceStore::new(replica_dfs);
+    let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store
         .load(&manifest.sandbox_id)
         .expect("replica load manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     assert_eq!(
         replica_fs.read(&output_path, None).expect("replica output"),
         b"sifs-package-bytes"
     );
     assert_eq!(
-        load_http_exchange_record(&replica_fs, &result.record.command_id, &result.request_id)
-            .expect("replica audit"),
+        load_http_exchange_record(
+            &mut replica_fs,
+            &result.record.command_id,
+            &result.request_id
+        )
+        .expect("replica audit"),
         result.record
     );
     fs::remove_dir_all(runtime_root).ok();
@@ -760,7 +773,7 @@ fn sandbox_http_exchange_record_persists_to_sifs_logs() {
     persist_http_exchange_record(&mut sandbox_fs, &record).expect("persist");
 
     assert_eq!(
-        load_http_exchange_record(&sandbox_fs, &command_id, &request_id).expect("load"),
+        load_http_exchange_record(&mut sandbox_fs, &command_id, &request_id).expect("load"),
         record
     );
     fs::remove_dir_all(runtime_root).ok();
@@ -831,7 +844,7 @@ fn http_exchange_events_append_from_sandbox_logs() {
     let node_id = NodeId::from_legacy_named("node_http_exchange_events").expect("node");
 
     let receipts =
-        append_sandbox_http_exchange_events(&sandbox_fs, node_id.clone(), &mut event_store)
+        append_sandbox_http_exchange_events(&mut sandbox_fs, node_id.clone(), &mut event_store)
             .expect("append events");
 
     assert_eq!(receipts.len(), 1);

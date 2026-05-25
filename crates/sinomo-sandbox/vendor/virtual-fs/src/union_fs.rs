@@ -134,6 +134,14 @@ impl UnionFileSystem {
             }
         }
 
+        if let Some(mount) = self.mounts.get(&PathBuf::from("/")) {
+            return Some((
+                PathBuf::from("/"),
+                PathBuf::from("/").join(path),
+                mount.fs.clone(),
+            ));
+        }
+
         None
     }
 }
@@ -152,27 +160,47 @@ impl FileSystem for UnionFileSystem {
         }
     }
 
+    fn readlink_update_access(&self, path: &Path) -> Result<PathBuf> {
+        let path = self.prepare_path(path);
+
+        if path.as_os_str().is_empty() {
+            Err(FsError::NotAFile)
+        } else {
+            match self.find_mount(path.to_owned()) {
+                Some((_, path, fs)) => fs.readlink_update_access(&path),
+                _ => Err(FsError::EntryNotFound),
+            }
+        }
+    }
+
     fn read_dir(&self, path: &Path) -> Result<ReadDir> {
         let path = self.prepare_path(path);
 
         if path.as_os_str().is_empty() {
-            let entries = self
-                .mounts
-                .iter()
-                .map(|i| DirEntry {
+            let mut entries = Vec::new();
+            if let Some(root_mount) = self.mounts.get(&PathBuf::from("/")) {
+                entries.extend(root_mount.fs.read_dir(Path::new("/"))?.data);
+            }
+            entries.extend(self.mounts.iter().filter_map(|i| {
+                (i.key() != &PathBuf::from("/")).then(|| DirEntry {
                     path: PathBuf::from("/").join(i.key()),
                     metadata: Ok(Metadata {
                         ft: FileType::new_dir(),
                         dev: 0,
                         ino: 1,
                         nlink: 1,
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
                         accessed: 0,
                         created: 0,
                         modified: 0,
                         len: 0,
                     }),
                 })
-                .collect::<Vec<_>>();
+            }));
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            entries.dedup_by(|left, right| left.path == right.path);
 
             Ok(ReadDir::new(entries))
         } else {
@@ -256,6 +284,9 @@ impl FileSystem for UnionFileSystem {
                 dev: 0,
                 ino: 1,
                 nlink: 1,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
                 accessed: 0,
                 created: 0,
                 modified: 0,
@@ -277,6 +308,9 @@ impl FileSystem for UnionFileSystem {
                 dev: 0,
                 ino: 1,
                 nlink: 1,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
                 accessed: 0,
                 created: 0,
                 modified: 0,
@@ -334,6 +368,58 @@ impl FileSystem for UnionFileSystem {
             }
             (Some(_), Some(_)) => Err(FsError::InvalidInput),
             _ => Err(FsError::EntryNotFound),
+        }
+    }
+
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let path = self.prepare_path(path);
+
+        if path.as_os_str().is_empty() {
+            Err(FsError::PermissionDenied)
+        } else {
+            match self.find_mount(path.to_owned()) {
+                Some((_, path, fs)) => fs.set_mode(&path, mode),
+                _ => Err(FsError::EntryNotFound),
+            }
+        }
+    }
+
+    fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<()> {
+        let path = self.prepare_path(path);
+
+        if path.as_os_str().is_empty() {
+            Err(FsError::PermissionDenied)
+        } else {
+            match self.find_mount(path.to_owned()) {
+                Some((_, path, fs)) => fs.set_owner(&path, uid, gid),
+                _ => Err(FsError::EntryNotFound),
+            }
+        }
+    }
+
+    fn set_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
+        let path = self.prepare_path(path);
+
+        if path.as_os_str().is_empty() {
+            Err(FsError::PermissionDenied)
+        } else {
+            match self.find_mount(path.to_owned()) {
+                Some((_, path, fs)) => fs.set_times(&path, atime, mtime),
+                _ => Err(FsError::EntryNotFound),
+            }
+        }
+    }
+
+    fn set_symlink_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
+        let path = self.prepare_path(path);
+
+        if path.as_os_str().is_empty() {
+            Err(FsError::PermissionDenied)
+        } else {
+            match self.find_mount(path.to_owned()) {
+                Some((_, path, fs)) => fs.set_symlink_times(&path, atime, mtime),
+                _ => Err(FsError::EntryNotFound),
+            }
         }
     }
 
@@ -579,6 +665,60 @@ mod tests {
             .map(|e| e.unwrap().path)
             .collect();
         assert_eq!(b_contents, vec![PathBuf::from("/app/b/data-b.txt")]);
+    }
+
+    #[tokio::test]
+    async fn root_read_dir_merges_root_mount_entries_and_explicit_mounts() {
+        let fs = UnionFileSystem::new();
+        let root = mem_fs::FileSystem::default();
+        crate::ops::create_dir_all(&root, "/work").unwrap();
+        crate::ops::create_dir_all(&root, "/opt").unwrap();
+        root.open(
+            &PathBuf::from("/work/file.txt"),
+            &OpenOptionsConfig {
+                read: true,
+                write: true,
+                create_new: false,
+                create: true,
+                append: false,
+                truncate: false,
+            },
+        )
+        .unwrap();
+        let opt = mem_fs::FileSystem::default();
+        crate::ops::create_dir_all(&opt, "/pkg").unwrap();
+        fs.mount("root".to_string(), Path::new("/"), Box::new(root))
+            .unwrap();
+        fs.mount("opt".to_string(), Path::new("/opt"), Box::new(opt))
+            .unwrap();
+
+        let root_contents: HashSet<PathBuf> = fs
+            .read_dir(Path::new("/"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path)
+            .collect();
+        assert!(
+            root_contents.contains(&PathBuf::from("/work")),
+            "root listing should include entries from the root mount: {root_contents:?}"
+        );
+        assert!(
+            root_contents.contains(&PathBuf::from("/opt")),
+            "root listing should include explicit system mounts: {root_contents:?}"
+        );
+        assert_eq!(
+            root_contents
+                .iter()
+                .filter(|path| **path == PathBuf::from("/opt"))
+                .count(),
+            1,
+            "explicit mount should not duplicate a root-mount entry"
+        );
+        let opt_contents: Vec<PathBuf> = fs
+            .read_dir(Path::new("/opt"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path)
+            .collect();
+        assert_eq!(opt_contents, vec![PathBuf::from("/opt/pkg")]);
     }
 
     #[tokio::test]

@@ -62,14 +62,19 @@ pub(crate) fn fd_allocate_internal(
             Kind::File { handle, .. } => {
                 if let Some(handle) = handle {
                     let mut handle = handle.write().unwrap();
-                    handle.set_len(new_size).map_err(fs_error_into_wasi_err)?;
+                    handle.refresh_metadata().map_err(fs_error_into_wasi_err)?;
+                    if new_size > handle.size() {
+                        handle.set_len(new_size).map_err(fs_error_into_wasi_err)?;
+                    }
                 } else {
                     return Err(Errno::Badf);
                 }
             }
             Kind::Buffer { buffer } => {
                 let new_size: usize = new_size.try_into().map_err(|_| Errno::Overflow)?;
-                buffer.resize(new_size, 0);
+                if new_size > buffer.len() {
+                    buffer.resize(new_size, 0);
+                }
             }
             Kind::Socket { .. }
             | Kind::PipeRx { .. }
@@ -81,7 +86,8 @@ pub(crate) fn fd_allocate_internal(
             Kind::Dir { .. } | Kind::Root { .. } => return Err(Errno::Isdir),
         }
     }
-    inode.stat.write().unwrap().st_size = new_size;
+    let mut stat = inode.stat.write().unwrap();
+    stat.st_size = stat.st_size.max(new_size);
     debug!(%new_size);
 
     Ok(())

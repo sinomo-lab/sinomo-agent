@@ -1,22 +1,20 @@
 use crate::{
-    LocalWasiVirtualDeviceDir, SandboxCommandRequest, SandboxMountMode, SandboxWasiError,
-    SandboxWasiPreopen,
+    SandboxCommandRequest, SandboxMountMode, SandboxWasiError, SandboxWasiPreopen,
+    SandboxWasiVirtualPreopen, WasiVirtualSystemMounts,
 };
 use std::{
+    future::Future,
     io,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
-use super::preopen::{
-    WasixReadOnlyPreopenGuard, validate_wasix_pinned_child_exec_preopens,
-    validate_wasix_preopen_tree,
-};
+use super::preopen::{validate_wasix_pinned_child_exec_preopens, validate_wasix_preopen_tree};
 
 pub(super) struct WasixRuntimeMounts {
-    _virtual_devices: Option<LocalWasiVirtualDeviceDir>,
-    _read_only_preopens: WasixReadOnlyPreopenGuard,
+    _virtual_devices: Option<WasiVirtualSystemMounts>,
 }
 
 pub(super) fn wasix_environment(
@@ -107,6 +105,7 @@ pub(super) fn configure_wasix_mapped_directories(
     argv: &[String],
     env: &[(String, String)],
     preopened_dirs: &[SandboxWasiPreopen],
+    virtual_preopened_dirs: &[SandboxWasiVirtualPreopen],
     pinned_child_exec_only: bool,
     enable_virtual_devices: bool,
     zero_device_bytes: usize,
@@ -114,147 +113,587 @@ pub(super) fn configure_wasix_mapped_directories(
     if pinned_child_exec_only {
         validate_wasix_pinned_child_exec_preopens(preopened_dirs)?;
     }
-    let mut mapped_dirs =
-        Vec::with_capacity(preopened_dirs.len() + usize::from(enable_virtual_devices));
-    let mut read_only_preopens = WasixReadOnlyPreopenGuard::default();
     for preopen in preopened_dirs {
         validate_wasix_preopen_tree(preopen)?;
-        if preopen.mode == SandboxMountMode::ReadOnly {
-            read_only_preopens
-                .add_tree(&preopen.host_path)
-                .map_err(|error| SandboxWasiError::Runtime {
-                    detail: format!(
-                        "prepare WASIX read-only preopen {}: {error}",
-                        preopen.guest_path
-                    ),
-                })?;
-        }
-        mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-            host: preopen.host_path.clone(),
-            guest: preopen.guest_path.as_str().to_string(),
-        });
     }
     let virtual_devices = if enable_virtual_devices {
         let mount_table = preopened_dirs
             .iter()
             .map(|preopen| (preopen.guest_path.clone(), preopen.mode.clone()))
+            .chain(
+                virtual_preopened_dirs
+                    .iter()
+                    .map(|preopen| (preopen.guest_path.clone(), preopen.mode.clone())),
+            )
             .collect::<Vec<_>>();
-        let devices =
-            LocalWasiVirtualDeviceDir::create(zero_device_bytes, argv, env, &mount_table)?;
-        mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-            host: devices.proc_path().to_path_buf(),
-            guest: "/proc".to_string(),
-        });
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/etc")
-        {
-            read_only_preopens
-                .add_tree(devices.etc_path())
-                .map_err(|error| SandboxWasiError::Runtime {
-                    detail: format!("prepare WASIX sandbox /etc: {error}"),
-                })?;
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.etc_path().to_path_buf(),
-                guest: "/etc".to_string(),
-            });
+        let devices = WasiVirtualSystemMounts::create(zero_device_bytes, argv, env, &mount_table)?;
+        let root_workspace_preopen = root_preopen_exists(preopened_dirs, virtual_preopened_dirs);
+        if !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/dev") {
+            mount_wasix_virtual_directory(
+                runner,
+                "/dev",
+                devices.fs(),
+                SandboxMountMode::ReadWrite,
+            );
         }
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/sys")
-        {
-            read_only_preopens
-                .add_tree(devices.sys_path())
-                .map_err(|error| SandboxWasiError::Runtime {
-                    detail: format!("prepare WASIX sandbox /sys: {error}"),
-                })?;
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.sys_path().to_path_buf(),
-                guest: "/sys".to_string(),
-            });
+        mount_wasix_virtual_directory(
+            runner,
+            "/proc",
+            devices.proc_fs(),
+            SandboxMountMode::ReadOnly,
+        );
+        if !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/etc") {
+            mount_wasix_virtual_directory(
+                runner,
+                "/etc",
+                devices.etc_fs(),
+                SandboxMountMode::ReadOnly,
+            );
         }
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/run")
-        {
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.run_path().to_path_buf(),
-                guest: "/run".to_string(),
-            });
+        if !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/sys") {
+            mount_wasix_virtual_directory(
+                runner,
+                "/sys",
+                devices.sys_fs(),
+                SandboxMountMode::ReadOnly,
+            );
         }
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/var")
-        {
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.var_path().to_path_buf(),
-                guest: "/var".to_string(),
-            });
+        if !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/run") {
+            mount_wasix_virtual_directory(
+                runner,
+                "/run",
+                devices.run_fs(),
+                SandboxMountMode::ReadWrite,
+            );
         }
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/tmp")
+        if !root_workspace_preopen
+            && !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/var")
         {
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.tmp_path().to_path_buf(),
-                guest: "/tmp".to_string(),
-            });
+            mount_wasix_virtual_directory(
+                runner,
+                "/var",
+                devices.var_fs(),
+                SandboxMountMode::ReadWrite,
+            );
         }
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/home")
+        if !root_workspace_preopen
+            && !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/tmp")
         {
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.home_path().to_path_buf(),
-                guest: "/home".to_string(),
-            });
+            mount_wasix_virtual_directory(
+                runner,
+                "/tmp",
+                devices.tmp_fs(),
+                SandboxMountMode::ReadWrite,
+            );
         }
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/root")
+        if !root_workspace_preopen
+            && !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/home")
         {
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.root_home_path().to_path_buf(),
-                guest: "/root".to_string(),
-            });
+            mount_wasix_virtual_directory(
+                runner,
+                "/home",
+                devices.home_fs(),
+                SandboxMountMode::ReadWrite,
+            );
         }
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/usr")
+        if !root_workspace_preopen
+            && !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/root")
         {
-            read_only_preopens
-                .add_tree(devices.usr_path())
-                .map_err(|error| SandboxWasiError::Runtime {
-                    detail: format!("prepare WASIX sandbox /usr: {error}"),
-                })?;
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.usr_path().to_path_buf(),
-                guest: "/usr".to_string(),
-            });
+            mount_wasix_virtual_directory(
+                runner,
+                "/root",
+                devices.root_home_fs(),
+                SandboxMountMode::ReadWrite,
+            );
         }
-        if !preopened_dirs
-            .iter()
-            .any(|preopen| preopen.guest_path.as_str() == "/opt")
-        {
-            read_only_preopens
-                .add_tree(devices.opt_path())
-                .map_err(|error| SandboxWasiError::Runtime {
-                    detail: format!("prepare WASIX sandbox /opt: {error}"),
-                })?;
-            mapped_dirs.push(wasmer_wasix::runners::MappedDirectory {
-                host: devices.opt_path().to_path_buf(),
-                guest: "/opt".to_string(),
-            });
+        if !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/usr") {
+            mount_wasix_virtual_directory(
+                runner,
+                "/usr",
+                devices.usr_fs(),
+                system_parent_mount_mode(preopened_dirs, virtual_preopened_dirs, "/usr"),
+            );
+        }
+        if !preopen_exists(preopened_dirs, virtual_preopened_dirs, "/opt") {
+            mount_wasix_virtual_directory(
+                runner,
+                "/opt",
+                devices.opt_fs(),
+                system_parent_mount_mode(preopened_dirs, virtual_preopened_dirs, "/opt"),
+            );
         }
         Some(devices)
     } else {
         None
     };
-    runner.with_mapped_directories(mapped_dirs);
+    for preopen in preopened_dirs {
+        if let Some(devices) = virtual_devices.as_ref()
+            && mount_nested_host_preopen_into_system_mount(devices, preopen)?
+        {
+            continue;
+        }
+        mount_wasix_host_directory(
+            runner,
+            preopen.guest_path.as_str(),
+            &preopen.host_path,
+            preopen.mode.clone(),
+        )?;
+    }
+    for preopen in virtual_preopened_dirs {
+        if let Some(devices) = virtual_devices.as_ref()
+            && mount_nested_virtual_preopen_into_system_mount(devices, preopen)?
+        {
+            continue;
+        }
+        mount_wasix_virtual_directory(
+            runner,
+            preopen.guest_path.as_str(),
+            Arc::clone(&preopen.fs),
+            preopen.mode.clone(),
+        );
+    }
     Ok(WasixRuntimeMounts {
         _virtual_devices: virtual_devices,
-        _read_only_preopens: read_only_preopens,
     })
+}
+
+fn root_preopen_exists(
+    host_preopens: &[SandboxWasiPreopen],
+    virtual_preopens: &[SandboxWasiVirtualPreopen],
+) -> bool {
+    preopen_exists(host_preopens, virtual_preopens, "/")
+}
+
+fn preopen_exists(
+    host_preopens: &[SandboxWasiPreopen],
+    virtual_preopens: &[SandboxWasiVirtualPreopen],
+    guest_path: &str,
+) -> bool {
+    host_preopens
+        .iter()
+        .any(|preopen| preopen_covers_system_mount(&preopen.guest_path, guest_path))
+        || virtual_preopens
+            .iter()
+            .any(|preopen| preopen_covers_system_mount(&preopen.guest_path, guest_path))
+}
+
+fn preopen_covers_system_mount(preopen_path: &crate::SandboxPath, guest_path: &str) -> bool {
+    preopen_path.as_str() == guest_path
+}
+
+fn system_parent_mount_mode(
+    host_preopens: &[SandboxWasiPreopen],
+    virtual_preopens: &[SandboxWasiVirtualPreopen],
+    guest_path: &str,
+) -> SandboxMountMode {
+    let has_read_write_child = host_preopens
+        .iter()
+        .any(|preopen| nested_read_write_preopen(&preopen.guest_path, &preopen.mode, guest_path))
+        || virtual_preopens.iter().any(|preopen| {
+            nested_read_write_preopen(&preopen.guest_path, &preopen.mode, guest_path)
+        });
+    if has_read_write_child {
+        SandboxMountMode::ReadWrite
+    } else {
+        SandboxMountMode::ReadOnly
+    }
+}
+
+fn nested_read_write_preopen(
+    preopen_path: &crate::SandboxPath,
+    mode: &SandboxMountMode,
+    guest_path: &str,
+) -> bool {
+    *mode == SandboxMountMode::ReadWrite
+        && preopen_path
+            .as_str()
+            .strip_prefix(guest_path)
+            .is_some_and(|tail| tail.starts_with('/'))
+}
+
+fn mount_nested_host_preopen_into_system_mount(
+    devices: &WasiVirtualSystemMounts,
+    preopen: &SandboxWasiPreopen,
+) -> Result<bool, SandboxWasiError> {
+    let Some((parent, relative_mount_path)) = nested_system_mount_path(&preopen.guest_path) else {
+        return Ok(false);
+    };
+    let fs: Arc<dyn virtual_fs::FileSystem + Send + Sync> = Arc::new(
+        virtual_fs::host_fs::FileSystem::new(tokio::runtime::Handle::current(), &preopen.host_path)
+            .map_err(|error| SandboxWasiError::Runtime {
+                detail: format!(
+                    "prepare WASIX nested mount {} from {}: {error}",
+                    preopen.guest_path,
+                    preopen.host_path.display()
+                ),
+            })?,
+    );
+    mount_nested_preopen_into_system_mount(
+        devices,
+        parent,
+        &relative_mount_path,
+        wrap_wasix_mount_fs(fs, preopen.mode.clone()),
+    )?;
+    Ok(true)
+}
+
+fn mount_nested_virtual_preopen_into_system_mount(
+    devices: &WasiVirtualSystemMounts,
+    preopen: &SandboxWasiVirtualPreopen,
+) -> Result<bool, SandboxWasiError> {
+    let Some((parent, relative_mount_path)) = nested_system_mount_path(&preopen.guest_path) else {
+        return Ok(false);
+    };
+    mount_nested_preopen_into_system_mount(
+        devices,
+        parent,
+        &relative_mount_path,
+        wrap_wasix_mount_fs(Arc::clone(&preopen.fs), preopen.mode.clone()),
+    )?;
+    Ok(true)
+}
+
+fn nested_system_mount_path(path: &crate::SandboxPath) -> Option<(&'static str, PathBuf)> {
+    for parent in [
+        "/dev", "/etc", "/sys", "/run", "/var", "/tmp", "/home", "/root", "/usr", "/opt",
+    ] {
+        if let Some(tail) = path.as_str().strip_prefix(parent)
+            && tail.starts_with('/')
+        {
+            return Some((
+                parent,
+                PathBuf::from("/").join(tail.trim_start_matches('/')),
+            ));
+        }
+    }
+    None
+}
+
+fn mount_nested_preopen_into_system_mount(
+    devices: &WasiVirtualSystemMounts,
+    parent: &str,
+    relative_mount_path: &Path,
+    fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+) -> Result<(), SandboxWasiError> {
+    let parent_fs = system_mount_fs(devices, parent).ok_or_else(|| SandboxWasiError::Runtime {
+        detail: format!("unknown WASIX system mount parent {parent}"),
+    })?;
+    parent_fs
+        .mount(
+            relative_mount_path.display().to_string(),
+            relative_mount_path,
+            Box::new(virtual_fs::ArcFileSystem::new(fs)),
+        )
+        .map_err(|error| SandboxWasiError::Runtime {
+            detail: format!(
+                "prepare WASIX nested mount {parent}{}: {error}",
+                relative_mount_path.display()
+            ),
+        })
+}
+
+fn system_mount_fs(
+    devices: &WasiVirtualSystemMounts,
+    parent: &str,
+) -> Option<Arc<dyn virtual_fs::FileSystem + Send + Sync>> {
+    match parent {
+        "/dev" => Some(devices.fs()),
+        "/etc" => Some(devices.etc_fs()),
+        "/sys" => Some(devices.sys_fs()),
+        "/run" => Some(devices.run_fs()),
+        "/var" => Some(devices.var_fs()),
+        "/tmp" => Some(devices.tmp_fs()),
+        "/home" => Some(devices.home_fs()),
+        "/root" => Some(devices.root_home_fs()),
+        "/usr" => Some(devices.usr_fs()),
+        "/opt" => Some(devices.opt_fs()),
+        _ => None,
+    }
+}
+
+fn mount_wasix_host_directory(
+    runner: &mut wasmer_wasix::runners::wasi::WasiRunner,
+    guest: &str,
+    host: &Path,
+    mode: SandboxMountMode,
+) -> Result<(), SandboxWasiError> {
+    let fs: Arc<dyn virtual_fs::FileSystem + Send + Sync> = Arc::new(
+        virtual_fs::host_fs::FileSystem::new(tokio::runtime::Handle::current(), host).map_err(
+            |error| SandboxWasiError::Runtime {
+                detail: format!(
+                    "prepare WASIX mount {guest} from {}: {error}",
+                    host.display()
+                ),
+            },
+        )?,
+    );
+    let fs = match mode {
+        SandboxMountMode::ReadOnly => wrap_wasix_mount_fs(fs, SandboxMountMode::ReadOnly),
+        SandboxMountMode::ReadWrite => wrap_wasix_mount_fs(fs, SandboxMountMode::ReadWrite),
+    };
+    runner.with_mount(guest.to_string(), fs);
+    Ok(())
+}
+
+fn mount_wasix_virtual_directory(
+    runner: &mut wasmer_wasix::runners::wasi::WasiRunner,
+    guest: &str,
+    fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    mode: SandboxMountMode,
+) {
+    let fs = wrap_wasix_mount_fs(fs, mode);
+    runner.with_mount(guest.to_string(), fs);
+}
+
+fn wrap_wasix_mount_fs(
+    fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    mode: SandboxMountMode,
+) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+    match mode {
+        SandboxMountMode::ReadOnly => Arc::new(WasixReadOnlyFileSystem::new(fs)),
+        SandboxMountMode::ReadWrite => fs,
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct WasixReadOnlyFileSystem {
+    inner: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+}
+
+impl WasixReadOnlyFileSystem {
+    pub(super) fn new(inner: Arc<dyn virtual_fs::FileSystem + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+impl virtual_fs::FileOpener for WasixReadOnlyFileSystem {
+    fn open(
+        &self,
+        path: &Path,
+        conf: &virtual_fs::OpenOptionsConfig,
+    ) -> virtual_fs::Result<Box<dyn virtual_fs::VirtualFile + Send + Sync + 'static>> {
+        if conf.would_mutate() {
+            return Err(virtual_fs::FsError::PermissionDenied);
+        }
+        let file = self
+            .inner
+            .new_open_options()
+            .options(conf.clone())
+            .open(path)?;
+        Ok(Box::new(WasixReadOnlyVirtualFile::new(file)))
+    }
+}
+
+#[derive(Debug)]
+struct WasixReadOnlyVirtualFile {
+    inner: Box<dyn virtual_fs::VirtualFile + Send + Sync + 'static>,
+}
+
+impl WasixReadOnlyVirtualFile {
+    fn new(inner: Box<dyn virtual_fs::VirtualFile + Send + Sync + 'static>) -> Self {
+        Self { inner }
+    }
+}
+
+impl virtual_fs::VirtualFile for WasixReadOnlyVirtualFile {
+    fn last_accessed(&self) -> u64 {
+        self.inner.last_accessed()
+    }
+
+    fn last_modified(&self) -> u64 {
+        self.inner.last_modified()
+    }
+
+    fn created_time(&self) -> u64 {
+        self.inner.created_time()
+    }
+
+    fn inode(&self) -> Option<u64> {
+        self.inner.inode()
+    }
+
+    fn link_count(&self) -> Option<u64> {
+        self.inner.link_count()
+    }
+
+    fn refresh_metadata(&mut self) -> virtual_fs::Result<()> {
+        self.inner.refresh_metadata()
+    }
+
+    fn note_link_added(&mut self) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn note_link_removed(&mut self) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn set_mode(&mut self, _mode: u32) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn set_owner(&mut self, _uid: u32, _gid: u32) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn set_times(&mut self, _atime: Option<u64>, _mtime: Option<u64>) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn set_len(&mut self, _new_size: u64) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn unlink(&mut self) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn is_open(&self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn get_special_fd(&self) -> Option<u32> {
+        self.inner.get_special_fd()
+    }
+
+    fn write_from_mmap(&mut self, _offset: u64, _len: u64) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+
+    fn poll_read_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_read_ready(cx)
+    }
+
+    fn poll_write_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::from(io::ErrorKind::PermissionDenied)))
+    }
+}
+
+impl virtual_fs::AsyncSeek for WasixReadOnlyVirtualFile {
+    fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        Pin::new(&mut *self.inner).start_seek(position)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Pin::new(&mut *self.inner).poll_complete(cx)
+    }
+}
+
+impl virtual_fs::AsyncRead for WasixReadOnlyVirtualFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl virtual_fs::AsyncWrite for WasixReadOnlyVirtualFile {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::from(io::ErrorKind::PermissionDenied)))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl virtual_fs::FileSystem for WasixReadOnlyFileSystem {
+    fn readlink(&self, path: &Path) -> virtual_fs::Result<std::path::PathBuf> {
+        self.inner.readlink(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
+        self.inner.read_dir(path)
+    }
+
+    fn create_dir(&self, _path: &Path) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn remove_dir(&self, _path: &Path) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        _from: &'a Path,
+        _to: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = virtual_fs::Result<()>> + Send + 'a>> {
+        Box::pin(async { Err(virtual_fs::FsError::PermissionDenied) })
+    }
+
+    fn metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        self.inner.metadata(path)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        self.inner.symlink_metadata(path)
+    }
+
+    fn remove_file(&self, _path: &Path) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn symlink(&self, _target: &Path, _link_path: &Path) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn hard_link(&self, _old_path: &Path, _new_path: &Path) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn set_mode(&self, _path: &Path, _mode: u32) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn set_owner(&self, _path: &Path, _uid: u32, _gid: u32) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn set_times(
+        &self,
+        _path: &Path,
+        _atime: Option<u64>,
+        _mtime: Option<u64>,
+    ) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn set_symlink_times(
+        &self,
+        _path: &Path,
+        _atime: Option<u64>,
+        _mtime: Option<u64>,
+    ) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
+
+    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
+        virtual_fs::OpenOptions::new(self)
+    }
+
+    fn mount(
+        &self,
+        _name: String,
+        _path: &Path,
+        _fs: Box<dyn virtual_fs::FileSystem + Send + Sync>,
+    ) -> virtual_fs::Result<()> {
+        Err(virtual_fs::FsError::PermissionDenied)
+    }
 }
 
 pub(super) fn configure_wasix_stdin(
@@ -466,5 +905,50 @@ impl virtual_fs::AsyncWrite for WasixBoundedInputFile {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_exact_preopen_covers_default_system_mount() {
+        assert!(!preopen_covers_system_mount(
+            &crate::SandboxPath::new("/opt/pkg").expect("preopen"),
+            "/opt",
+        ));
+        assert!(!preopen_covers_system_mount(
+            &crate::SandboxPath::new("/usr/local").expect("preopen"),
+            "/usr",
+        ));
+        assert!(preopen_covers_system_mount(
+            &crate::SandboxPath::new("/tmp").expect("preopen"),
+            "/tmp",
+        ));
+        assert!(preopen_covers_system_mount(
+            &crate::SandboxPath::new("/opt").expect("preopen"),
+            "/opt",
+        ));
+        assert!(!preopen_covers_system_mount(
+            &crate::SandboxPath::new("/optical").expect("preopen"),
+            "/opt",
+        ));
+        assert!(!preopen_covers_system_mount(
+            &crate::SandboxPath::new("/work/opt").expect("preopen"),
+            "/opt",
+        ));
+    }
+
+    #[test]
+    fn nested_virtual_preopen_does_not_suppress_parent_system_mount() {
+        let virtual_preopen = crate::SandboxWasiVirtualPreopen {
+            guest_path: crate::SandboxPath::new("/opt/pkg").expect("preopen"),
+            mode: SandboxMountMode::ReadOnly,
+            fs: std::sync::Arc::new(virtual_fs::mem_fs::FileSystem::default()),
+        };
+
+        assert!(!preopen_exists(&[], &[virtual_preopen.clone()], "/opt"));
+        assert!(preopen_exists(&[], &[virtual_preopen], "/opt/pkg"));
     }
 }

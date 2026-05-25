@@ -53,6 +53,115 @@ pub(in crate::execution) fn stage_toolchain_runtime_to_local(
     Ok(preopens)
 }
 
+#[cfg(feature = "wasix-runtime")]
+pub(in crate::execution) fn stage_toolchain_runtime_to_virtual(
+    artifacts: &[(String, Vec<u8>)],
+    commands: &[(String, Vec<u8>)],
+) -> Result<Vec<SandboxWasiVirtualPreopen>, SandboxCommandExecutionError> {
+    let mut preopens = BTreeMap::<String, virtual_fs::mem_fs::FileSystem>::new();
+
+    for (command_name, bytes) in commands {
+        validate_toolchain_command_name(command_name)?;
+        let fs = virtual_toolchain_preopen(&mut preopens, "bin")?;
+        write_virtual_toolchain_file(fs, Path::new(command_name), bytes, true)?;
+    }
+
+    for (relative_path, bytes) in artifacts {
+        let relative_path = validate_toolchain_artifact_relative_path(relative_path)?;
+        let (top_level, tail) =
+            relative_path
+                .split_once('/')
+                .ok_or_else(|| SandboxFsError::Unavailable {
+                    reason: format!("invalid staged toolchain artifact path `{relative_path}`"),
+                })?;
+        let fs = virtual_toolchain_preopen(&mut preopens, top_level)?;
+        write_virtual_toolchain_file(fs, Path::new(tail), bytes, top_level == "bin")?;
+    }
+
+    preopens
+        .into_iter()
+        .map(|(name, fs)| {
+            Ok(SandboxWasiVirtualPreopen {
+                guest_path: SandboxPath::new(format!("/{name}")).map_err(|source| {
+                    SandboxFsError::Unavailable {
+                        reason: format!(
+                            "invalid staged toolchain top-level path `{name}`: {source}"
+                        ),
+                    }
+                })?,
+                mode: SandboxMountMode::ReadOnly,
+                fs: Arc::new(fs),
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn virtual_toolchain_preopen<'a>(
+    preopens: &'a mut BTreeMap<String, virtual_fs::mem_fs::FileSystem>,
+    name: &str,
+) -> Result<&'a virtual_fs::mem_fs::FileSystem, SandboxCommandExecutionError> {
+    validate_toolchain_stage_top_level_name(name)?;
+    Ok(preopens
+        .entry(name.to_string())
+        .or_insert_with(virtual_fs::mem_fs::FileSystem::default))
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn write_virtual_toolchain_file(
+    fs: &virtual_fs::mem_fs::FileSystem,
+    path: &Path,
+    bytes: &[u8],
+    executable: bool,
+) -> Result<(), SandboxCommandExecutionError> {
+    use virtual_fs::FileSystem as _;
+
+    let virtual_path = PathBuf::from("/").join(path);
+    if let Some(parent) = virtual_path.parent() {
+        virtual_fs::create_dir_all(fs, parent).map_err(|source| SandboxFsError::Unavailable {
+            reason: format!(
+                "create virtual toolchain file parent {}: {source}",
+                parent.display()
+            ),
+        })?;
+    }
+    let mut file = fs
+        .new_open_options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&virtual_path)
+        .map_err(|source| SandboxFsError::Unavailable {
+            reason: format!(
+                "open virtual toolchain file {}: {source}",
+                virtual_path.display()
+            ),
+        })?;
+    virtual_mio::block_on(virtual_fs::AsyncWriteExt::write_all(&mut file, bytes)).map_err(
+        |source| SandboxFsError::Unavailable {
+            reason: format!(
+                "write virtual toolchain file {}: {source}",
+                virtual_path.display()
+            ),
+        },
+    )?;
+    if executable {
+        match fs.set_mode(&virtual_path, 0o555) {
+            Ok(()) | Err(virtual_fs::FsError::Unsupported) => {}
+            Err(source) => {
+                return Err(SandboxFsError::Unavailable {
+                    reason: format!(
+                        "mark virtual toolchain file executable {}: {source}",
+                        virtual_path.display()
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_local_toolchain_runtime_cache(
     layout: &LocalSandboxInstanceLayout,
     artifacts: &[(String, Vec<u8>)],
@@ -446,7 +555,34 @@ fn validate_toolchain_stage_top_level_name(name: &str) -> Result<(), SandboxComm
         }
         .into());
     }
+    if toolchain_stage_top_level_is_reserved(name) {
+        return Err(SandboxFsError::Unavailable {
+            reason: format!(
+                "staged toolchain top-level path `{name}` would shadow a sandbox filesystem mount"
+            ),
+        }
+        .into());
+    }
     Ok(())
+}
+
+fn toolchain_stage_top_level_is_reserved(name: &str) -> bool {
+    matches!(
+        name,
+        "artifacts"
+            | "dev"
+            | "etc"
+            | "home"
+            | "logs"
+            | "opt"
+            | "proc"
+            | "root"
+            | "run"
+            | "sys"
+            | "tmp"
+            | "var"
+            | "work"
+    )
 }
 
 #[cfg(unix)]

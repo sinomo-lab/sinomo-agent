@@ -34,6 +34,26 @@ pub struct SandboxWasiPreopen {
     pub mode: SandboxMountMode,
 }
 
+#[cfg(feature = "wasix-runtime")]
+#[derive(Clone)]
+pub struct SandboxWasiVirtualPreopen {
+    pub guest_path: SandboxPath,
+    pub mode: SandboxMountMode,
+    pub fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+}
+
+#[cfg(feature = "wasix-runtime")]
+impl fmt::Debug for SandboxWasiVirtualPreopen {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SandboxWasiVirtualPreopen")
+            .field("guest_path", &self.guest_path)
+            .field("mode", &self.mode)
+            .field("fs", &"<virtual-fs>")
+            .finish()
+    }
+}
+
 pub trait SandboxOutputSink: Send + Sync {
     fn output_chunk(&self, chunk: SandboxOutputChunk);
 }
@@ -64,8 +84,9 @@ pub(crate) struct SandboxWasixPipeOptions {
 #[derive(Clone)]
 pub struct SandboxWasiRunOptions {
     pub preopened_dirs: Vec<SandboxWasiPreopen>,
+    #[cfg(feature = "wasix-runtime")]
+    pub virtual_preopened_dirs: Vec<SandboxWasiVirtualPreopen>,
     pub working_directory_host_path: Option<PathBuf>,
-    pub metadata_host_path: Option<PathBuf>,
     #[cfg(feature = "wasix-runtime")]
     pub wasix_stdin_pipe: Option<virtual_fs::ArcFile<virtual_fs::Pipe>>,
     #[cfg(feature = "wasix-runtime")]
@@ -94,10 +115,16 @@ impl fmt::Debug for SandboxWasiRunOptions {
             .debug_struct("SandboxWasiRunOptions")
             .field("preopened_dirs", &self.preopened_dirs)
             .field(
+                "virtual_preopened_dirs",
+                #[cfg(feature = "wasix-runtime")]
+                &self.virtual_preopened_dirs,
+                #[cfg(not(feature = "wasix-runtime"))]
+                &Vec::<()>::new(),
+            )
+            .field(
                 "working_directory_host_path",
                 &self.working_directory_host_path,
             )
-            .field("metadata_host_path", &self.metadata_host_path)
             .field(
                 "wasix_stdin_pipe",
                 #[cfg(feature = "wasix-runtime")]
@@ -146,8 +173,9 @@ impl Default for SandboxWasiRunOptions {
         let limits = SandboxResourceLimits::default();
         Self {
             preopened_dirs: Vec::new(),
+            #[cfg(feature = "wasix-runtime")]
+            virtual_preopened_dirs: Vec::new(),
             working_directory_host_path: None,
-            metadata_host_path: None,
             #[cfg(feature = "wasix-runtime")]
             wasix_stdin_pipe: None,
             #[cfg(feature = "wasix-runtime")]
@@ -203,13 +231,13 @@ pub fn local_staged_sandbox_wasi_options_with_limits_and_preopens(
         local_staged_sandbox_preopen(&layout.home, "/home", SandboxMountMode::ReadWrite),
         local_staged_sandbox_preopen(&layout.tmp, "/tmp", SandboxMountMode::ReadWrite),
         local_staged_sandbox_preopen(&layout.work, "/work", SandboxMountMode::ReadWrite),
+        local_staged_sandbox_preopen(&layout.var, "/var", SandboxMountMode::ReadWrite),
         local_staged_sandbox_preopen(&layout.logs, "/logs", SandboxMountMode::ReadWrite),
         local_staged_sandbox_preopen(&layout.artifacts, "/artifacts", SandboxMountMode::ReadWrite),
     ];
     preopened_dirs.extend(extra_preopens);
     SandboxWasiRunOptions {
         preopened_dirs,
-        metadata_host_path: Some(layout.metadata.clone()),
         enable_virtual_devices: true,
         memory_limit_bytes: limits.memory_mb.saturating_mul(1024 * 1024) as usize,
         input_limit_bytes: limits.max_input_bytes as usize,

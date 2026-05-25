@@ -60,6 +60,22 @@ pub(crate) fn path_create_directory_internal(
         trace!("working directory (fd={fd}) has no rights to create a directory");
         return Err(Errno::Access);
     }
+    match path_parent_mutation_allowed_at(env, fd, path) {
+        Ok(true) => {}
+        Ok(false) => return Err(Errno::Access),
+        Err(err) => return Err(err),
+    }
+    if path_requires_directory(path)
+        && let Some(key) =
+            crate::syscalls::wasix::key_for_path_at(env, fd, path).map(std::path::PathBuf::from)
+    {
+        match state.fs.root_fs.metadata(&key) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Err(Errno::Exist),
+            Ok(_) => return Err(Errno::Notdir),
+            Err(virtual_fs::FsError::EntryNotFound) => {}
+            Err(error) => return Err(fs_error_into_wasi_err(error)),
+        }
+    }
 
     let (parent_inode, dir_name) =
         state
@@ -91,9 +107,18 @@ pub(crate) fn path_create_directory_internal(
                 Err(err) => return Err(err),
             }
             let mode = 0o777 & !env.process.umask();
-            match crate::syscalls::chmod_host_path(&new_dir_path, mode) {
-                Errno::Success | Errno::Noent => {}
-                err => return Err(err),
+            match state.fs.root_fs.set_mode(&new_dir_path, mode) {
+                Ok(()) => {}
+                Err(error) => return Err(fs_error_into_wasi_err(error)),
+            }
+            let identity = env.process.identity();
+            match state.fs.root_fs.set_owner(
+                &new_dir_path,
+                identity.effective_uid,
+                identity.effective_gid,
+            ) {
+                Ok(()) | Err(virtual_fs::FsError::Unsupported) => {}
+                Err(error) => return Err(fs_error_into_wasi_err(error)),
             }
 
             let kind = Kind::Dir {
@@ -104,7 +129,6 @@ pub(crate) fn path_create_directory_internal(
             let new_inode = state
                 .fs
                 .create_inode(inodes, kind, false, dir_name.clone())?;
-            let identity = env.process.identity();
             crate::syscalls::set_inode_owner(
                 new_inode.ino().as_u64(),
                 identity.effective_uid,
@@ -133,4 +157,8 @@ pub(crate) fn path_create_directory_internal(
     }
 
     Ok(())
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
 }

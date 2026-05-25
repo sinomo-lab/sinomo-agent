@@ -39,6 +39,18 @@ pub fn path_readlink<M: MemorySize>(
     }
     let path_str = unsafe { get_input_str_ok!(&memory, path, path_len) };
     Span::current().record("path", path_str.as_str());
+    if path_requires_directory(&path_str) {
+        let Some(key) =
+            crate::syscalls::wasix::key_for_path_at(env, dir_fd, &path_str).map(std::path::PathBuf::from)
+        else {
+            return Ok(Errno::Noent);
+        };
+        return match state.fs.root_fs.symlink_metadata(&key) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(Errno::Inval),
+            Ok(_) => Ok(Errno::Notdir),
+            Err(error) => Ok(super::path_link::io_error_into_wasi_err(error.into())),
+        };
+    }
 
     let processes = env.control_plane.processes();
     let process_tids = env
@@ -59,16 +71,30 @@ pub fn path_readlink<M: MemorySize>(
     }
 
     let inode = wasi_try_ok!(state.fs.get_inode_at_path(inodes, dir_fd, &path_str, false));
-
-    {
+    let rel_path = {
         let guard = inode.read();
-        if let Kind::Symlink { relative_path, .. } = guard.deref() {
-            let rel_path_str = relative_path.to_string_lossy();
-            return write_readlink_target(&memory, buf, buf_len, buf_used, &rel_path_str);
-        } else {
+        let Kind::Symlink { relative_path, .. } = guard.deref() else {
             return Ok(Errno::Inval);
-        }
+        };
+        relative_path.to_path_buf()
+    };
+    if let Some(key) = crate::syscalls::wasix::key_for_path_at(env, dir_fd, &path_str) {
+        let now = wasi_try_ok!(get_current_time_in_nanos());
+        let _ = state
+            .fs
+            .root_fs
+            .readlink_update_access(std::path::Path::new(&key));
+        let _ = state
+            .fs
+            .root_fs
+            .set_symlink_times(std::path::Path::new(&key), Some(now), None);
     }
+    let rel_path_str = rel_path.to_string_lossy();
+    write_readlink_target(&memory, buf, buf_len, buf_used, &rel_path_str)
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
 }
 
 fn fd_alias_readlink_target(

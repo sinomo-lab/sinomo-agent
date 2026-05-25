@@ -87,6 +87,9 @@ pub use ops::{copy_reference, copy_reference_ext, create_dir_all, walk};
 
 pub trait FileSystem: fmt::Debug + Send + Sync + 'static + Upcastable {
     fn readlink(&self, path: &Path) -> Result<PathBuf>;
+    fn readlink_update_access(&self, path: &Path) -> Result<PathBuf> {
+        self.readlink(path)
+    }
     fn read_dir(&self, path: &Path) -> Result<ReadDir>;
     fn create_dir(&self, path: &Path) -> Result<()>;
     fn remove_dir(&self, path: &Path) -> Result<()>;
@@ -104,6 +107,26 @@ pub trait FileSystem: fmt::Debug + Send + Sync + 'static + Upcastable {
     fn hard_link(&self, old_path: &Path, new_path: &Path) -> Result<()> {
         let _ = (old_path, new_path);
         Err(FsError::Unsupported)
+    }
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let _ = (path, mode);
+        Err(FsError::Unsupported)
+    }
+    fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<()> {
+        let _ = (path, uid, gid);
+        Err(FsError::Unsupported)
+    }
+    fn set_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
+        let _ = (path, atime, mtime);
+        Err(FsError::Unsupported)
+    }
+    fn set_symlink_times(
+        &self,
+        path: &Path,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> Result<()> {
+        self.set_times(path, atime, mtime)
     }
 
     fn new_open_options(&self) -> OpenOptions<'_>;
@@ -167,6 +190,27 @@ where
 
     fn hard_link(&self, old_path: &Path, new_path: &Path) -> Result<()> {
         (**self).hard_link(old_path, new_path)
+    }
+
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        (**self).set_mode(path, mode)
+    }
+
+    fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<()> {
+        (**self).set_owner(path, uid, gid)
+    }
+
+    fn set_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
+        (**self).set_times(path, atime, mtime)
+    }
+
+    fn set_symlink_times(
+        &self,
+        path: &Path,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> Result<()> {
+        (**self).set_symlink_times(path, atime, mtime)
     }
 
     fn new_open_options(&self) -> OpenOptions<'_> {
@@ -365,6 +409,43 @@ pub trait VirtualFile:
 
     /// the time at which the file was created in nanoseconds as a UNIX timestamp
     fn created_time(&self) -> u64;
+
+    /// Stable inode identity for this open file descriptor, when the backend has one.
+    fn inode(&self) -> Option<u64> {
+        None
+    }
+
+    /// Link count for this open file descriptor, when the backend has one.
+    fn link_count(&self) -> Option<u64> {
+        None
+    }
+
+    /// Refresh cached file metadata from the backing store before reporting it.
+    fn refresh_metadata(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Notify an open file descriptor that one directory link to its object was added.
+    fn note_link_added(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Notify an open file descriptor that one directory link to its object was removed.
+    fn note_link_removed(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Set POSIX mode bits on this open file descriptor's object.
+    fn set_mode(&mut self, mode: u32) -> Result<()> {
+        let _ = mode;
+        Ok(())
+    }
+
+    /// Set POSIX owner IDs on this open file descriptor's object.
+    fn set_owner(&mut self, uid: u32, gid: u32) -> Result<()> {
+        let _ = (uid, gid);
+        Ok(())
+    }
 
     #[allow(unused_variables)]
     /// sets accessed and modified time
@@ -580,13 +661,16 @@ impl From<io::Error> for FsError {
             io::ErrorKind::Interrupted => FsError::Interrupted,
             io::ErrorKind::InvalidData => FsError::InvalidData,
             io::ErrorKind::InvalidInput => FsError::InvalidInput,
+            io::ErrorKind::IsADirectory => FsError::NotAFile,
             io::ErrorKind::NotConnected => FsError::NotConnected,
             io::ErrorKind::NotFound => FsError::EntryNotFound,
+            io::ErrorKind::NotADirectory => FsError::BaseNotDirectory,
             io::ErrorKind::PermissionDenied => FsError::PermissionDenied,
             io::ErrorKind::TimedOut => FsError::TimedOut,
             io::ErrorKind::UnexpectedEof => FsError::UnexpectedEof,
             io::ErrorKind::WouldBlock => FsError::WouldBlock,
             io::ErrorKind::WriteZero => FsError::WriteZero,
+            io::ErrorKind::DirectoryNotEmpty => FsError::DirectoryNotEmpty,
             // NOTE: Add this once the "io_error_more" Rust feature is stabilized
             // io::ErrorKind::StorageFull => FsError::StorageFull,
             io::ErrorKind::Other => FsError::IOError,
@@ -617,12 +701,12 @@ impl From<FsError> for io::Error {
             FsError::WouldBlock => io::ErrorKind::WouldBlock,
             FsError::WriteZero => io::ErrorKind::WriteZero,
             FsError::IOError => io::ErrorKind::Other,
-            FsError::BaseNotDirectory => io::ErrorKind::Other,
-            FsError::NotAFile => io::ErrorKind::Other,
+            FsError::BaseNotDirectory => io::ErrorKind::NotADirectory,
+            FsError::NotAFile => io::ErrorKind::InvalidInput,
             FsError::InvalidFd => io::ErrorKind::Other,
             FsError::Lock => io::ErrorKind::Other,
             FsError::NoDevice => io::ErrorKind::Other,
-            FsError::DirectoryNotEmpty => io::ErrorKind::Other,
+            FsError::DirectoryNotEmpty => io::ErrorKind::DirectoryNotEmpty,
             FsError::UnknownError => io::ErrorKind::Other,
             FsError::StorageFull => io::ErrorKind::Other,
             FsError::Unsupported => io::ErrorKind::Unsupported,
@@ -690,6 +774,9 @@ pub struct Metadata {
     pub dev: u64,
     pub ino: u64,
     pub nlink: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub accessed: u64,
     pub created: u64,
     pub modified: u64,
@@ -731,6 +818,18 @@ impl Metadata {
 
     pub fn nlink(&self) -> u64 {
         self.nlink
+    }
+
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid
     }
 
     pub fn len(&self) -> u64 {
@@ -799,5 +898,37 @@ impl Iterator for ReadDir {
             return Some(Ok(v));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FsError;
+
+    #[test]
+    fn fs_error_io_conversion_preserves_posix_directory_errors() {
+        let not_directory: std::io::Error = FsError::BaseNotDirectory.into();
+        assert_eq!(
+            not_directory.kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert_eq!(
+            FsError::from(not_directory),
+            FsError::BaseNotDirectory
+        );
+
+        let not_file: std::io::Error = FsError::NotAFile.into();
+        assert_eq!(not_file.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(FsError::from(not_file), FsError::InvalidInput);
+
+        let directory_not_empty: std::io::Error = FsError::DirectoryNotEmpty.into();
+        assert_eq!(
+            directory_not_empty.kind(),
+            std::io::ErrorKind::DirectoryNotEmpty
+        );
+        assert_eq!(
+            FsError::from(directory_not_empty),
+            FsError::DirectoryNotEmpty
+        );
     }
 }

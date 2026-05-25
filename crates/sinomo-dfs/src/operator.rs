@@ -537,7 +537,7 @@ where
 }
 
 fn normalize_path(path: &str) -> String {
-    path.trim_matches('/').replace('\\', "/")
+    path.trim_matches('/').to_string()
 }
 
 fn path_hash(path: &str) -> String {
@@ -584,6 +584,15 @@ mod tests {
             owner_node_id: node("node_owner"),
             current_locations: vec![node("node_owner")],
             content_hash: Some("blake3:new".to_string()),
+            content_size_bytes: Some(1024),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
             version: version("version_2"),
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
@@ -597,6 +606,7 @@ mod tests {
                 object_id: object_id(),
                 version: version("version_2"),
                 content_hash: Some("blake3:new".to_string()),
+                size_bytes: Some(3),
                 locations: vec![node("node_owner")],
                 created_by_event_id: None,
                 created_at: OffsetDateTime::UNIX_EPOCH,
@@ -696,6 +706,46 @@ mod tests {
                 .expect("remove")
         );
         assert!(store.list_pins(None).expect("pins").is_empty());
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn local_pin_store_treats_backslash_as_filename_character() {
+        let root = temp_root("local_pin_store_treats_backslash_as_filename_character");
+        let store = LocalDfsPinStore::new(&root);
+        let owner = node("node_laptop");
+        let backslash = store
+            .add_pin(DfsPinAddRequest {
+                file_system_id: file_system_id(),
+                path: r"src\a.txt".to_string(),
+                object_id: Some(object_id()),
+                pinned_by_node_id: owner.clone(),
+                mode: DfsPinMode::Content,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("add backslash pin");
+        let slash = store
+            .add_pin(DfsPinAddRequest {
+                file_system_id: file_system_id(),
+                path: "src/a.txt".to_string(),
+                object_id: Some(object_id()),
+                pinned_by_node_id: owner.clone(),
+                mode: DfsPinMode::Content,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("add slash pin");
+
+        assert_eq!(
+            store.list_pins(None).expect("pins"),
+            vec![slash.clone(), backslash.clone()]
+        );
+        assert!(
+            store
+                .remove_pin(&file_system_id(), "src/a.txt", Some(&owner))
+                .expect("remove slash")
+        );
+        assert_eq!(store.list_pins(None).expect("pins"), vec![backslash]);
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

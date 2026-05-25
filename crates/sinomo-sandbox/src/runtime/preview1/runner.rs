@@ -39,6 +39,14 @@ impl LocalWasiCommandRunner {
         if options.cancellation.is_cancelled() {
             return Err(SandboxWasiError::Cancelled);
         }
+        #[cfg(feature = "wasix-runtime")]
+        if !options.virtual_preopened_dirs.is_empty() {
+            return Err(SandboxWasiError::InvalidRequest {
+                detail:
+                    "Preview1 execution cannot mount virtual filesystems; use WASIX for SIFS/VFS-backed sandbox filesystems"
+                        .to_string(),
+            });
+        }
 
         let wasm = Arc::<[u8]>::from(wasm.as_ref().to_vec());
         let module = wasmtime::Module::new(&self.engine, wasm.as_ref())

@@ -266,6 +266,49 @@ impl crate::FileSystem for FileSystem {
             .map_err(Into::into)
     }
 
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let path = self.prepare_path(path);
+
+        set_host_path_mode(&path, mode)
+    }
+
+    fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<()> {
+        let path = self.prepare_path(path);
+
+        set_host_path_owner(&path, uid, gid)
+    }
+
+    fn set_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
+        let path = self.prepare_path(path);
+        let metadata = fs::metadata(&path)?;
+        let atime = atime
+            .map(file_time_from_unix_nanos)
+            .unwrap_or_else(|| filetime::FileTime::from_last_access_time(&metadata));
+        let mtime = mtime
+            .map(file_time_from_unix_nanos)
+            .unwrap_or_else(|| filetime::FileTime::from_last_modification_time(&metadata));
+
+        filetime::set_file_times(path, atime, mtime).map_err(|_| FsError::IOError)
+    }
+
+    fn set_symlink_times(
+        &self,
+        path: &Path,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> Result<()> {
+        let path = self.prepare_path(path);
+        let metadata = fs::symlink_metadata(&path)?;
+        let atime = atime
+            .map(file_time_from_unix_nanos)
+            .unwrap_or_else(|| filetime::FileTime::from_last_access_time(&metadata));
+        let mtime = mtime
+            .map(file_time_from_unix_nanos)
+            .unwrap_or_else(|| filetime::FileTime::from_last_modification_time(&metadata));
+
+        filetime::set_symlink_file_times(path, atime, mtime).map_err(|_| FsError::IOError)
+    }
+
     fn mount(
         &self,
         _name: String,
@@ -281,10 +324,10 @@ impl TryInto<Metadata> for std::fs::Metadata {
 
     fn try_into(self) -> std::result::Result<Metadata, Self::Error> {
         let filetype = self.file_type();
-        let (char_device, block_device, socket, fifo, dev, ino, nlink) = {
+        let (char_device, block_device, socket, fifo, dev, ino, nlink, mode, uid, gid) = {
             #[cfg(unix)]
             {
-                use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
                 (
                     filetype.is_char_device(),
                     filetype.is_block_device(),
@@ -293,11 +336,14 @@ impl TryInto<Metadata> for std::fs::Metadata {
                     self.dev(),
                     self.ino(),
                     self.nlink(),
+                    self.permissions().mode() & 0o7777,
+                    self.uid(),
+                    self.gid(),
                 )
             }
             #[cfg(not(unix))]
             {
-                (false, false, false, false, 0, 1, 1)
+                (false, false, false, false, 0, 1, 1, 0, 0, 0)
             }
         };
 
@@ -314,6 +360,9 @@ impl TryInto<Metadata> for std::fs::Metadata {
             dev,
             ino,
             nlink,
+            mode,
+            uid,
+            gid,
             accessed: self
                 .accessed()
                 .and_then(|time| time.duration_since(UNIX_EPOCH).map_err(io::Error::other))
@@ -524,6 +573,46 @@ impl File {
     }
 }
 
+fn file_time_from_unix_nanos(value: u64) -> filetime::FileTime {
+    let seconds = (value / 1_000_000_000).min(i64::MAX as u64) as i64;
+    let nanos = (value % 1_000_000_000) as u32;
+    filetime::FileTime::from_unix_time(seconds, nanos)
+}
+
+#[cfg(unix)]
+fn set_host_path_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode((permissions.mode() & !0o7777) | (mode & 0o7777));
+    fs::set_permissions(path, permissions).map_err(Into::into)
+}
+
+#[cfg(not(unix))]
+fn set_host_path_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Err(FsError::Unsupported)
+}
+
+#[cfg(unix)]
+fn set_host_path_owner(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| FsError::InvalidInput)?;
+    let result = unsafe { libc::chown(path.as_ptr(), uid, gid) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_host_path_owner(_path: &Path, _uid: u32, _gid: u32) -> Result<()> {
+    Err(FsError::Unsupported)
+}
+
 //#[cfg_attr(feature = "enable-serde", typetag::serde)]
 #[async_trait::async_trait]
 impl VirtualFile for File {
@@ -555,11 +644,19 @@ impl VirtualFile for File {
     }
 
     fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> crate::Result<()> {
-        let atime = atime.map(|t| filetime::FileTime::from_unix_time(t as i64, 0));
-        let mtime = mtime.map(|t| filetime::FileTime::from_unix_time(t as i64, 0));
+        let atime = atime.map(file_time_from_unix_nanos);
+        let mtime = mtime.map(file_time_from_unix_nanos);
 
         filetime::set_file_handle_times(&self.inner_std, atime, mtime)
             .map_err(|_| crate::FsError::IOError)
+    }
+
+    fn set_mode(&mut self, mode: u32) -> crate::Result<()> {
+        set_host_path_mode(&self.host_path, mode)
+    }
+
+    fn set_owner(&mut self, uid: u32, gid: u32) -> crate::Result<()> {
+        set_host_path_owner(&self.host_path, uid, gid)
     }
 
     fn size(&self) -> u64 {

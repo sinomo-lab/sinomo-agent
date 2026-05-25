@@ -163,6 +163,23 @@ pub(crate) fn path_open_internal(
     let path = proc_pid_alias_target(env, state, inodes, path).unwrap_or_else(|| path.to_string());
     let path = path.as_str();
 
+    if path_requires_directory(path) {
+        if o_flags.contains(Oflags::CREATE) {
+            return Ok(Err(Errno::Isdir));
+        }
+        let Some(key) =
+            crate::syscalls::wasix::key_for_path_at(env, dirfd, path).map(PathBuf::from)
+        else {
+            return Ok(Err(Errno::Noent));
+        };
+        match state.fs.root_fs.metadata(&key) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Ok(Err(Errno::Notdir)),
+            Err(virtual_fs::FsError::EntryNotFound) => return Ok(Err(Errno::Noent)),
+            Err(error) => return Ok(Err(fs_error_into_wasi_err(error))),
+        }
+    }
+
     if let Some(file) = virtual_device_file(path) {
         let stat = Filestat {
             st_filetype: Filetype::CharacterDevice,
@@ -371,7 +388,7 @@ pub(crate) fn path_open_internal(
                 let open_options = open_options
                     .write(minimum_rights.write)
                     .create(minimum_rights.create)
-                    .append(false)
+                    .append(minimum_rights.append)
                     .truncate(minimum_rights.truncate);
 
                 if minimum_rights.read {
@@ -471,6 +488,11 @@ pub(crate) fn path_open_internal(
     } else {
         // less-happy path, we have to try to create the file
         if o_flags.contains(Oflags::CREATE) {
+            match path_parent_mutation_allowed_at(env, dirfd, path) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Err(Errno::Access)),
+                Err(err) => return Ok(Err(err)),
+            }
             if o_flags.contains(Oflags::DIRECTORY) {
                 return Ok(Err(Errno::Notdir));
             }
@@ -533,10 +555,19 @@ pub(crate) fn path_open_internal(
 
                 match open_options.open(&new_file_host_path) {
                     Ok(handle) => {
+                        let identity = env.process.identity();
+                        match state.fs.root_fs.set_owner(
+                            &new_file_host_path,
+                            identity.effective_uid,
+                            identity.effective_gid,
+                        ) {
+                            Ok(()) | Err(virtual_fs::FsError::Unsupported) => {}
+                            Err(error) => return Ok(Err(fs_error_into_wasi_err(error))),
+                        }
                         let mode = 0o666 & !env.process.umask();
-                        match crate::syscalls::chmod_host_path(&new_file_host_path, mode) {
-                            Errno::Success | Errno::Noent => {}
-                            err => return Ok(Err(err)),
+                        match state.fs.root_fs.set_mode(&new_file_host_path, mode) {
+                            Ok(()) => {}
+                            Err(error) => return Ok(Err(fs_error_into_wasi_err(error))),
                         }
                         (
                             Kind::File {
@@ -628,6 +659,10 @@ pub(crate) fn path_open_internal(
     sync_process_metadata(env);
 
     Ok(Ok(out_fd))
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
 }
 
 fn virtual_device_file(path: &str) -> Option<Box<dyn VirtualFile + Send + Sync + 'static>> {

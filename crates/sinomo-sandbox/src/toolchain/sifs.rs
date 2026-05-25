@@ -68,13 +68,13 @@ impl<T: NetworkTransport> SifsSandboxToolchainStore<T> {
     }
 
     pub fn load_manifest(
-        &self,
+        &mut self,
         toolchain_id: &SandboxToolchainId,
     ) -> Result<SandboxToolchainManifest, SandboxToolchainError> {
         let path = sandbox_toolchain_manifest_path(toolchain_id);
         let bytes = self
             .dfs
-            .posix_read_file(&path)
+            .posix_read_file_distributed(&path)
             .map_err(|source| match source {
                 DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. } => {
                     SandboxToolchainError::NotFound {
@@ -261,14 +261,14 @@ impl<T: NetworkTransport> SifsSandboxToolchainStore<T> {
     }
 
     pub fn load_artifact(
-        &self,
+        &mut self,
         manifest: &SandboxToolchainManifest,
         relative_path: &str,
     ) -> Result<Vec<u8>, SandboxToolchainError> {
         let artifact = manifest.artifact(relative_path)?;
         let bytes = self
             .dfs
-            .posix_read_file(&artifact.sifs_path)
+            .posix_read_file_distributed(&artifact.sifs_path)
             .map_err(|source| {
                 sandbox_toolchain_error_from_dfs(artifact.sifs_path.clone(), source)
             })?;
@@ -285,14 +285,14 @@ impl<T: NetworkTransport> SifsSandboxToolchainStore<T> {
     }
 
     pub fn load_artifacts(
-        &self,
+        &mut self,
         manifest: &SandboxToolchainManifest,
     ) -> Result<Vec<(String, Vec<u8>)>, SandboxToolchainError> {
         let mut loaded = BTreeMap::new();
         for bundle in &manifest.artifact_bundles {
             let bundle_bytes = self
                 .dfs
-                .posix_read_file(&bundle.bundle_path)
+                .posix_read_file_distributed(&bundle.bundle_path)
                 .map_err(|source| {
                     sandbox_toolchain_error_from_dfs(bundle.bundle_path.clone(), source)
                 })?;
@@ -340,14 +340,14 @@ impl<T: NetworkTransport> SifsSandboxToolchainStore<T> {
     }
 
     pub fn load_command_module(
-        &self,
+        &mut self,
         manifest: &SandboxToolchainManifest,
         command_name: &str,
     ) -> Result<Vec<u8>, SandboxToolchainError> {
         let command = manifest.command(command_name)?;
         let bytes = self
             .dfs
-            .posix_read_file(&command.module_path)
+            .posix_read_file_distributed(&command.module_path)
             .map_err(|source| {
                 sandbox_toolchain_error_from_dfs(command.module_path.clone(), source)
             })?;

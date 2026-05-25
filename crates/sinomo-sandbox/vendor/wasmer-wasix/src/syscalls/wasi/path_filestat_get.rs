@@ -130,12 +130,25 @@ pub(crate) fn path_filestat_get_internal(
         }
         return state.fs.filestat_fd(special_fd);
     }
-    let file_inode = state.fs.get_inode_at_path(
-        inodes,
-        fd,
-        path_string,
-        flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0,
-    )?;
+    if path_requires_directory(path_string) {
+        let Some(key) =
+            crate::syscalls::wasix::key_for_path_at(env, fd, path_string).map(std::path::PathBuf::from)
+        else {
+            return Err(Errno::Noent);
+        };
+        match state.fs.root_fs.metadata(&key) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                return Ok(filestat_from_virtual_metadata(&metadata));
+            }
+            Ok(_) => return Err(Errno::Notdir),
+            Err(error) => return Err(super::path_link::io_error_into_wasi_err(error.into())),
+        }
+    }
+    let follows_symlink =
+        path_requires_directory(path_string) || flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0;
+    let file_inode = state
+        .fs
+        .get_inode_at_path(inodes, fd, path_string, follows_symlink)?;
 
     let mut stat = if file_inode.is_preopened {
         *file_inode.stat.read().unwrap().deref()
@@ -143,13 +156,35 @@ pub(crate) fn path_filestat_get_internal(
         let guard = file_inode.read();
         state.fs.get_stat_for_kind(guard.deref())?
     };
-    if let Some((hardlink_ino, hardlink_nlink)) = path_hardlink_stat_at(env, fd, path_string) {
+    if let Some((hardlink_ino, hardlink_nlink)) = path_hardlink_stat_at(
+        env,
+        fd,
+        path_string,
+        follows_symlink,
+    ) {
         stat.st_ino = hardlink_ino;
         stat.st_nlink = hardlink_nlink;
     } else if stat.st_ino == 0 {
         stat.st_ino = file_inode.ino().as_u64();
     }
     Ok(stat)
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
+}
+
+fn filestat_from_virtual_metadata(metadata: &virtual_fs::Metadata) -> Filestat {
+    Filestat {
+        st_filetype: virtual_file_type_to_wasi_file_type(metadata.file_type()),
+        st_dev: metadata.dev(),
+        st_ino: metadata.ino(),
+        st_nlink: metadata.nlink(),
+        st_size: metadata.len(),
+        st_atim: metadata.accessed(),
+        st_mtim: metadata.modified(),
+        st_ctim: metadata.created(),
+    }
 }
 
 fn proc_generated_filestat(

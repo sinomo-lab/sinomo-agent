@@ -3,6 +3,8 @@ use crate::{
 };
 use std::{fs, path::Path, path::PathBuf};
 
+// Preview1 extensions are legacy host-staged helpers. Cluster-backed sandbox
+// execution must use the WASIX VFS/SIFS mount path instead of these host paths.
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 

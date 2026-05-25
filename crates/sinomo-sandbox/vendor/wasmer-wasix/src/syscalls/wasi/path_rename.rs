@@ -90,6 +90,11 @@ pub fn path_rename_internal(
         Errno::Noent => {}
         err => return Ok(err),
     }
+    if let Err(err) =
+        validate_rename_trailing_slash_at(env, source_fd, source_path, target_path)
+    {
+        return Ok(err);
+    }
 
     // this is to be sure the source file is fetched from the filesystem if needed
     wasi_try_ok!(
@@ -138,6 +143,44 @@ pub fn path_rename_internal(
             }
         }
     };
+
+    if let Some(target_entry) = &target_existing_entry {
+        let same_physical_object = crate::syscalls::wasix::key_for_path_at(
+            env,
+            source_fd,
+            source_path,
+        )
+        .zip(crate::syscalls::wasix::key_for_path_at(env, target_fd, target_path))
+        .and_then(|(source_key, target_key)| {
+            let source_metadata = state
+                .fs
+                .root_fs
+                .symlink_metadata(Path::new(&source_key))
+                .ok()?;
+            let target_metadata = state
+                .fs
+                .root_fs
+                .symlink_metadata(Path::new(&target_key))
+                .ok()?;
+            Some(source_metadata.ino() != 0 && source_metadata.ino() == target_metadata.ino())
+        })
+        .unwrap_or(false);
+        if same_physical_object {
+            return Ok(Errno::Success);
+        }
+        let source_guard = source_parent_inode.read();
+        let source_entry = match source_guard.deref() {
+            Kind::Dir { entries, .. } => entries.get(&source_entry_name).cloned(),
+            _ => None,
+        };
+        if let Some(source_entry) = source_entry
+            && (source_entry.ino() == target_entry.ino()
+                || source_entry.stat.read().unwrap().st_ino
+                    == target_entry.stat.read().unwrap().st_ino)
+        {
+            return Ok(Errno::Success);
+        }
+    }
 
     let source_entry = {
         let mut guard = source_parent_inode.write();
@@ -272,6 +315,23 @@ pub fn path_rename_internal(
                     "fatal error: race condition on filesystem detected or internal logic error"
                 );
             } else if let Some(previous) = previous {
+                if previous.ino() != source_entry.ino() {
+                    let open_handle = {
+                        let guard = previous.read();
+                        match guard.deref() {
+                            Kind::File {
+                                handle: Some(handle),
+                                ..
+                            } => Some(handle.clone()),
+                            _ => None,
+                        }
+                    };
+                    if let Some(handle) = open_handle
+                        && let Err(error) = handle.write().unwrap().note_link_removed()
+                    {
+                        return Ok(super::path_link::io_error_into_wasi_err(error.into()));
+                    }
+                }
                 let mut stat = previous.stat.write().unwrap();
                 if stat.st_nlink > 0 {
                     stat.st_nlink -= 1;
@@ -286,6 +346,34 @@ pub fn path_rename_internal(
     path_rename_metadata_at(env, source_fd, source_path, target_fd, target_path);
 
     Ok(Errno::Success)
+}
+
+fn validate_rename_trailing_slash_at(
+    env: &WasiEnv,
+    source_fd: WasiFd,
+    source_path: &str,
+    target_path: &str,
+) -> Result<(), Errno> {
+    if !path_requires_directory(source_path) && !path_requires_directory(target_path) {
+        return Ok(());
+    }
+    let source_key = crate::syscalls::wasix::key_for_path_at(env, source_fd, source_path)
+        .ok_or(Errno::Noent)?;
+    let source_metadata = env
+        .state
+        .fs
+        .root_fs
+        .symlink_metadata(std::path::Path::new(&source_key))
+        .map_err(|error| super::path_link::io_error_into_wasi_err(error.into()))?;
+    if source_metadata.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(Errno::Notdir)
+    }
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.len() > 1 && path.ends_with('/')
 }
 
 fn rename_inode_tree(inode: &InodeGuard, source_dir_path: &Path, target_dir_path: &Path) {

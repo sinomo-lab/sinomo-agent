@@ -295,7 +295,11 @@ impl LocalStagedSandboxCommandRunner {
         let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
         sandbox_fs.validate_resource_limits(&limits)?;
         validate_sandbox_working_directory(&sandbox_fs, &effective_cwd)?;
-        let working_directory_host_path = sandbox_fs.host_path(&effective_cwd)?;
+        let working_directory_host_path = if target_abi == SandboxWasiAbi::Preview1 {
+            Some(sandbox_fs.host_path(&effective_cwd)?)
+        } else {
+            None
+        };
         let before = sandbox_fs.snapshot()?;
         let rollback_checkpoint = store.create_checkpoint(sandbox_id, OffsetDateTime::now_utc())?;
         let started_at = OffsetDateTime::now_utc();
@@ -305,6 +309,23 @@ impl LocalStagedSandboxCommandRunner {
             &limits,
             extra_preopens,
         );
+        #[cfg(feature = "wasix-runtime")]
+        if target_abi == SandboxWasiAbi::Wasix {
+            wasi_options.preopened_dirs.retain(|preopen| {
+                !matches!(
+                    preopen.guest_path.as_str(),
+                    "/root" | "/home" | "/tmp" | "/work" | "/logs" | "/artifacts"
+                )
+            });
+            wasi_options.virtual_preopened_dirs.extend(
+                runtime::wasix_sandbox_workspace_filesystem_preopens(
+                    Arc::new(std::sync::Mutex::new(LocalSandboxFileSystem::new(
+                        layout.clone(),
+                    ))),
+                    SandboxMountMode::ReadWrite,
+                ),
+            );
+        }
         wasi_options.allow_preview1_pinned_subprocesses = allow_preview1_pinned_subprocesses;
         wasi_options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
         wasi_options.wasix_instruction_metering = wasix_instruction_metering;
@@ -317,7 +338,7 @@ impl LocalStagedSandboxCommandRunner {
             wasi_options.wasix_stdin_pipe = wasix_pipes.stdin_pipe;
             wasi_options.wasix_stdout_pipe = wasix_pipes.stdout_pipe;
         }
-        wasi_options.working_directory_host_path = Some(working_directory_host_path);
+        wasi_options.working_directory_host_path = working_directory_host_path;
         let mut env = default_env;
         env.extend(manifest.env.clone());
         env.extend(env_override);

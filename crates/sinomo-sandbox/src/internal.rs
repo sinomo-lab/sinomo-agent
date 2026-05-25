@@ -35,7 +35,7 @@ pub(crate) use std::fmt;
 pub(crate) use std::fs;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 pub(crate) use thiserror::Error;

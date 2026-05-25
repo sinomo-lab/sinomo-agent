@@ -57,6 +57,13 @@ pub(crate) fn path_remove_directory_internal(
         Err(err) => return Err(err),
     }
 
+    if let Some(key) = crate::syscalls::wasix::key_for_path_at(env, fd, path)
+        && let Ok(metadata) = state.fs.root_fs.symlink_metadata(Path::new(&key))
+        && metadata.file_type().is_symlink()
+    {
+        return Err(Errno::Notdir);
+    }
+
     let (parent_inode, dir_name) =
         state
             .fs
@@ -89,12 +96,16 @@ pub(crate) fn path_remove_directory_internal(
 
                 child_path.clone()
             };
+            drop(guard);
 
             if let Err(e) = state.fs_remove_dir(&child_path) {
                 if e == Errno::Noent {
-                    parent_entries.remove(&dir_name).expect(
-                        "Entry should exist since we checked before and have an exclusive write lock",
-                    );
+                    let mut guard = parent_inode.write();
+                    let Kind::Dir { entries, .. } = guard.deref_mut() else {
+                        unreachable!();
+                    };
+                    entries.remove(&dir_name);
+                    drop(guard);
                     path_remove_metadata_at(env, fd, path);
                     path_touch_parent_at(env, fd, path);
                     return Ok(());
@@ -103,9 +114,14 @@ pub(crate) fn path_remove_directory_internal(
                 return Err(e);
             }
 
-            parent_entries.remove(&dir_name).expect(
-                "Entry should exist since we checked before and have an exclusive write lock",
+            let mut guard = parent_inode.write();
+            let Kind::Dir { entries, .. } = guard.deref_mut() else {
+                unreachable!();
+            };
+            entries.remove(&dir_name).expect(
+                "Entry should exist since we checked before and removed it from the filesystem",
             );
+            drop(guard);
 
             path_remove_metadata_at(env, fd, path);
             path_touch_parent_at(env, fd, path);

@@ -16,3 +16,7 @@ pub use capabilities::{
 };
 pub use preview1::LocalWasiCommandRunner;
 pub(crate) use wasix::run_wasix_module;
+#[cfg(feature = "wasix-runtime")]
+pub(crate) use wasix::{
+    wasix_sandbox_filesystem_preopen, wasix_sandbox_workspace_filesystem_preopens,
+};

@@ -58,6 +58,27 @@ impl FileSystem for ArcFileSystem {
         self.fs.hard_link(old_path, new_path)
     }
 
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        self.fs.set_mode(path, mode)
+    }
+
+    fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<()> {
+        self.fs.set_owner(path, uid, gid)
+    }
+
+    fn set_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
+        self.fs.set_times(path, atime, mtime)
+    }
+
+    fn set_symlink_times(
+        &self,
+        path: &Path,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> Result<()> {
+        self.fs.set_symlink_times(path, atime, mtime)
+    }
+
     fn new_open_options(&self) -> OpenOptions<'_> {
         self.fs.new_open_options()
     }

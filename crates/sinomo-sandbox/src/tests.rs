@@ -98,15 +98,17 @@ fn sandbox_paths_normalize_without_host_escape() {
 }
 
 #[test]
-fn sandbox_paths_reject_relative_and_root_escape() {
+fn sandbox_paths_reject_relative_and_clamp_absolute_parent_traversal() {
     assert!(matches!(
         SandboxPath::new("work/file").expect_err("relative"),
         SandboxPathError::Relative { .. }
     ));
-    assert!(matches!(
-        SandboxPath::new("/../../etc/passwd").expect_err("escape"),
-        SandboxPathError::EscapesRoot { .. }
-    ));
+    assert_eq!(
+        SandboxPath::new("/../../etc/passwd")
+            .expect("absolute paths clamp at sandbox root")
+            .as_str(),
+        "/etc/passwd"
+    );
     assert_eq!(
         SandboxPath::new("/work")
             .expect("base")

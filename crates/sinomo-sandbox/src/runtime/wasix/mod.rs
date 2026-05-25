@@ -15,6 +15,8 @@ mod preopen;
 #[cfg(feature = "wasix-runtime")]
 mod process;
 #[cfg(feature = "wasix-runtime")]
+mod sandbox_fs;
+#[cfg(feature = "wasix-runtime")]
 mod setup;
 #[cfg(all(test, feature = "wasix-runtime"))]
 mod tests;
@@ -23,6 +25,8 @@ mod tunables;
 
 #[cfg(all(test, feature = "wasix-runtime"))]
 use process::sandbox_wasix_capabilities;
-#[cfg(all(test, feature = "wasix-runtime"))]
-use process::wasix_command_exceeded_requested_timeout;
 pub(crate) use runner::run_wasix_module;
+#[cfg(feature = "wasix-runtime")]
+pub(crate) use sandbox_fs::{
+    wasix_sandbox_filesystem_preopen, wasix_sandbox_workspace_filesystem_preopens,
+};

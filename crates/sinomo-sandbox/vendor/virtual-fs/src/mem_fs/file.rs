@@ -326,6 +326,9 @@ impl VirtualFile for FileHandle {
                         dev: 0,
                         ino: inode.inode() as u64,
                         nlink: 1,
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
                         accessed: src.last_accessed(),
                         created: src.created_time(),
                         modified: src.last_modified(),
@@ -361,6 +364,9 @@ impl VirtualFile for FileHandle {
                         dev: 0,
                         ino: inode.inode() as u64,
                         nlink: 1,
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
                         accessed: 1,
                         created: 1,
                         modified: 1,
@@ -1278,6 +1284,47 @@ mod test_read_write_seek {
         assert_eq!(string, "");
     }
 
+    #[tokio::test]
+    async fn test_seek_beyond_end_then_write_creates_sparse_gap() {
+        let fs = FileSystem::default();
+
+        let mut file = fs
+            .new_open_options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path!("/sparse.txt"))
+            .expect("failed to create a new file");
+
+        assert_eq!(file.write(b"hi").await.unwrap(), 2);
+        assert_eq!(file.seek(io::SeekFrom::Start(5)).await.unwrap(), 5);
+        assert_eq!(file.write(b"!").await.unwrap(), 1);
+        assert_eq!(file.seek(io::SeekFrom::Start(0)).await.unwrap(), 0);
+
+        let mut bytes = Vec::new();
+        assert_eq!(file.read_to_end(&mut bytes).await.unwrap(), 6);
+        assert_eq!(bytes, b"hi\0\0\0!");
+    }
+
+    #[tokio::test]
+    async fn test_read_after_seek_beyond_end_returns_eof() {
+        let fs = FileSystem::default();
+
+        let mut file = fs
+            .new_open_options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path!("/eof.txt"))
+            .expect("failed to create a new file");
+
+        assert_eq!(file.write(b"hi").await.unwrap(), 2);
+        assert_eq!(file.seek(io::SeekFrom::Start(5)).await.unwrap(), 5);
+        let mut bytes = Vec::new();
+        assert_eq!(file.read_to_end(&mut bytes).await.unwrap(), 0);
+        assert!(bytes.is_empty());
+    }
+
     #[test]
     pub fn writing_to_middle() {
         fn assert_contents(file: &File, expected: &[u8]) {
@@ -1508,7 +1555,11 @@ impl File {
 
 impl File {
     pub fn read(&self, buf: &mut [u8], cursor: &mut u64) -> io::Result<usize> {
-        let cur_pos = *cursor as usize;
+        let cur_pos = usize::try_from(*cursor)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cursor overflow"))?;
+        if cur_pos >= self.buffer.len() {
+            return Ok(0);
+        }
         let max_to_read = cmp::min(self.buffer.len() - cur_pos, buf.len());
         let data_to_copy = &self.buffer[cur_pos..][..max_to_read];
 
@@ -1550,10 +1601,8 @@ impl File {
             ));
         }
 
-        // In this implementation, it's an error to seek beyond the
-        // end of the buffer.
         let next_cursor = next_cursor.try_into().map_err(to_err)?;
-        *cursor = cmp::min(self.buffer.len() as u64, next_cursor);
+        *cursor = next_cursor;
 
         let cursor = *cursor;
         Ok(cursor)
@@ -1562,17 +1611,19 @@ impl File {
 
 impl File {
     pub fn write(&mut self, buf: &[u8], cursor: &mut u64) -> io::Result<usize> {
-        let position = *cursor as usize;
+        let position = usize::try_from(*cursor)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cursor overflow"))?;
+        let end = position
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "write overflow"))?;
 
-        if position + buf.len() > self.buffer.len() {
-            // Writing past the end of the current buffer, must reallocate
-            let len_after_end = (position + buf.len()) - self.buffer.len();
-            let let_to_end = buf.len() - len_after_end;
-            self.buffer[position..position + let_to_end].copy_from_slice(&buf[0..let_to_end]);
-            self.buffer.extend_from_slice(&buf[let_to_end..buf.len()])?;
-        } else {
-            self.buffer[position..position + buf.len()].copy_from_slice(buf);
+        if position > self.buffer.len() {
+            self.buffer.resize(position, 0)?;
         }
+        if end > self.buffer.len() {
+            self.buffer.resize(end, 0)?;
+        }
+        self.buffer[position..end].copy_from_slice(buf);
 
         *cursor += buf.len() as u64;
 

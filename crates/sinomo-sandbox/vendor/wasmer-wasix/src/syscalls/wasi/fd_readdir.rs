@@ -67,9 +67,26 @@ pub fn fd_readdir<M: MemorySize>(
             } => {
                 trace!("reading dir {:?}", path);
                 let current_ino = working_dir.inode.stat.read().unwrap().st_ino;
-                let parent_ino = parent
-                    .upgrade()
-                    .map(|parent| parent.stat.read().unwrap().st_ino)
+                let parent_ino = path
+                    .parent()
+                    .and_then(|parent_path| {
+                        let parent_path = if parent_path.as_os_str().is_empty() {
+                            std::path::Path::new("/")
+                        } else {
+                            parent_path
+                        };
+                        state
+                            .fs
+                            .root_fs
+                            .metadata(parent_path)
+                            .ok()
+                            .map(|metadata| metadata.ino())
+                    })
+                    .or_else(|| {
+                        parent
+                            .upgrade()
+                            .map(|parent| parent.stat.read().unwrap().st_ino)
+                    })
                     .unwrap_or(current_ino);
                 // TODO: refactor this code
                 // we need to support multiple calls,
@@ -84,23 +101,19 @@ pub fn fd_readdir<M: MemorySize>(
                     Err(Errno::Noent) => Vec::new(),
                     Err(err) => return Ok(err),
                 };
-                let mut entry_vec = wasi_try_ok!(
-                    fs_info
-                        .into_iter()
-                        .map(|entry| {
-                            let filename = entry.file_name().to_string_lossy().to_string();
-                            trace!("getting file: {:?}", filename);
-                            let filetype = virtual_file_type_to_wasi_file_type(
-                                entry.file_type().map_err(fs_error_into_wasi_err)?,
-                            );
-                            let ino = {
-                                let mut entry_path = path.clone();
-                                entry_path.push(&filename);
-                                Inode::from_path(entry_path.to_string_lossy().as_ref()).as_u64()
-                            };
-                            Ok((filename, filetype, ino))
-                        })
-                        .collect::<Result<Vec<(String, Filetype, u64)>, _>>()
+	                let mut entry_vec = wasi_try_ok!(
+	                    fs_info
+	                        .into_iter()
+	                        .map(|entry| {
+	                            let filename = entry.file_name().to_string_lossy().to_string();
+	                            trace!("getting file: {:?}", filename);
+	                            let metadata = entry.metadata().map_err(fs_error_into_wasi_err)?;
+	                            let filetype =
+	                                virtual_file_type_to_wasi_file_type(metadata.file_type());
+	                            let ino = metadata.ino();
+	                            Ok((filename, filetype, ino))
+	                        })
+	                        .collect::<Result<Vec<(String, Filetype, u64)>, _>>()
                 );
                 let mut seen = entry_vec
                     .iter()
@@ -169,9 +182,14 @@ pub fn fd_readdir<M: MemorySize>(
                     entries
                         .iter()
                         .filter(|(name, _)| seen.insert((*name).clone()))
-                        .map(|(name, inode)| {
-                            let stat = inode.stat.read().unwrap();
-                            (name.clone(), stat.st_filetype, stat.st_ino)
+                        .filter_map(|(name, _inode)| {
+                            let entry_path = path.join(name);
+                            if let Ok(metadata) = state.fs.root_fs.metadata(&entry_path) {
+                                let filetype =
+                                    virtual_file_type_to_wasi_file_type(metadata.file_type());
+                                return Some((name.clone(), filetype, metadata.ino()));
+                            }
+                            None
                         }),
                 );
                 // adding . and .. special folders
@@ -183,6 +201,38 @@ pub fn fd_readdir<M: MemorySize>(
             Kind::Root { entries } => {
                 trace!("reading root");
                 let current_ino = working_dir.inode.stat.read().unwrap().st_ino;
+                let fs_info = match state.fs_read_dir(Path::new("/")) {
+                    Ok(read_dir) => wasi_try_ok!(
+                        read_dir
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(fs_error_into_wasi_err)
+                    ),
+                    Err(Errno::Noent) => Vec::new(),
+                    Err(err) => return Ok(err),
+                };
+                let mut entry_vec = wasi_try_ok!(
+                    fs_info
+                        .into_iter()
+                        .filter_map(|entry| {
+                            let filename = entry.file_name().to_string_lossy().to_string();
+                            if filename == "/" {
+                                return None;
+                            }
+                            let metadata = match entry.metadata().map_err(fs_error_into_wasi_err) {
+                                Ok(metadata) => metadata,
+                                Err(error) => return Some(Err(error)),
+                            };
+                            let filetype =
+                                virtual_file_type_to_wasi_file_type(metadata.file_type());
+                            let ino = metadata.ino();
+                            Some(Ok((filename, filetype, ino)))
+                        })
+                        .collect::<Result<Vec<(String, Filetype, u64)>, _>>()
+                );
+                let mut seen = entry_vec
+                    .iter()
+                    .map(|(name, _, _)| name.clone())
+                    .collect::<HashSet<_>>();
                 let sorted_entries = {
                     let mut entry_vec: Vec<(String, InodeGuard)> = entries
                         .iter()
@@ -191,13 +241,21 @@ pub fn fd_readdir<M: MemorySize>(
                     entry_vec.sort_by(|a, b| a.0.cmp(&b.0));
                     entry_vec
                 };
-                let mut entry_vec = sorted_entries
-                    .into_iter()
-                    .map(|(name, inode)| {
-                        let stat = inode.stat.read().unwrap();
-                        (name, stat.st_filetype, stat.st_ino)
-                    })
-                    .collect::<Vec<_>>();
+                entry_vec.extend(sorted_entries.into_iter().filter_map(|(name, _inode)| {
+                    if name == "/" {
+                        return None;
+                    }
+                    if !seen.insert(name.clone()) {
+                        return None;
+                    }
+                    let entry_path = Path::new("/").join(&name);
+                    if let Ok(metadata) = state.fs.root_fs.metadata(&entry_path) {
+                        let filetype =
+                            virtual_file_type_to_wasi_file_type(metadata.file_type());
+                        return Some((name, filetype, metadata.ino()));
+                    }
+                    None
+                }));
                 entry_vec.push((".".to_string(), Filetype::Directory, current_ino));
                 entry_vec.push(("..".to_string(), Filetype::Directory, current_ino));
                 entry_vec.sort_by(|a, b| a.0.cmp(&b.0));

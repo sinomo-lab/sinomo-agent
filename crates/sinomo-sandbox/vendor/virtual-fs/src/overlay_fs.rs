@@ -142,6 +142,31 @@ where
         Err(FsError::EntryNotFound)
     }
 
+    fn readlink_update_access(&self, path: &Path) -> crate::Result<PathBuf> {
+        if ops::is_white_out(path).is_some() {
+            return Err(FsError::EntryNotFound);
+        }
+
+        match self.primary.readlink_update_access(path) {
+            Ok(meta) => return Ok(meta),
+            Err(e) if should_continue(e) => {}
+            Err(e) => return Err(e),
+        }
+
+        if ops::has_white_out(&self.primary, path) {
+            return Err(FsError::EntryNotFound);
+        }
+
+        for fs in self.secondaries.filesystems() {
+            match fs.readlink_update_access(path) {
+                Err(e) if should_continue(e) => continue,
+                other => return other,
+            }
+        }
+
+        Err(FsError::EntryNotFound)
+    }
+
     fn read_dir(&self, path: &Path) -> Result<ReadDir, FsError> {
         let mut entries = Vec::new();
         let mut had_at_least_one_success = false;
@@ -293,13 +318,14 @@ where
                 other => return other,
             }
 
-            // If we have not yet renamed the file it may still reside in
-            // the secondaries, in which case we need to copy it to the
-            // primary rather than rename it
+            // If we have not yet renamed the file it may still reside in a
+            // secondary. The secondary filesystem owns its namespace semantics
+            // and policy checks, so delegate the rename instead of satisfying
+            // it by copying into the primary overlay.
             if !had_at_least_one_success {
                 for fs in self.secondaries.filesystems() {
                     if fs.metadata(&from).is_ok() {
-                        ops::copy_reference_ext(fs, &self.primary, &from, &to).await?;
+                        fs.rename(&from, &to).await?;
                         had_at_least_one_success = true;
                         break;
                     }
@@ -458,6 +484,37 @@ where
         }
 
         self.permission_error_or_not_found(old_path)
+    }
+
+    fn set_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<(), FsError> {
+        if ops::is_white_out(path).is_some() {
+            return Err(FsError::InvalidInput);
+        }
+
+        match self.primary.set_times(path, atime, mtime) {
+            Err(e) if should_continue(e) => {}
+            other => return other,
+        }
+
+        self.permission_error_or_not_found(path)
+    }
+
+    fn set_symlink_times(
+        &self,
+        path: &Path,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> Result<(), FsError> {
+        if ops::is_white_out(path).is_some() {
+            return Err(FsError::InvalidInput);
+        }
+
+        match self.primary.set_symlink_times(path, atime, mtime) {
+            Err(e) if should_continue(e) => {}
+            other => return other,
+        }
+
+        self.permission_error_or_not_found(path)
     }
 
     fn new_open_options(&self) -> OpenOptions<'_> {

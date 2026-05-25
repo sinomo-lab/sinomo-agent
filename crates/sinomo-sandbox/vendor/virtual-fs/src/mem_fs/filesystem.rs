@@ -238,6 +238,9 @@ impl FileSystem {
                         dev: 0,
                         ino: inode_of_directory as u64,
                         nlink: 1,
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
                         accessed: time,
                         created: time,
                         modified: time,
@@ -372,6 +375,9 @@ impl crate::FileSystem for FileSystem {
                         dev: 0,
                         ino: inode_of_directory as u64,
                         nlink: 1,
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
                         accessed: time,
                         created: time,
                         modified: time,
@@ -616,12 +622,16 @@ impl crate::FileSystem for FileSystem {
         // Read lock.
         let guard = self.inner.read().map_err(|_| FsError::Lock)?;
         match guard.inode_of(path)? {
-            InodeResolution::Found(inode) => Ok(guard
-                .storage
-                .get(inode)
-                .ok_or(FsError::UnknownError)?
-                .metadata()
-                .clone()),
+            InodeResolution::Found(inode) => match guard.storage.get(inode) {
+                Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
+                    let fs = fs.clone();
+                    let path = path.clone();
+                    drop(guard);
+                    fs.metadata(path.as_path())
+                }
+                Some(node) => Ok(node.metadata().clone()),
+                None => Err(FsError::UnknownError),
+            },
             InodeResolution::Redirect(fs, path) => {
                 drop(guard);
                 fs.metadata(path.as_path())
@@ -633,12 +643,16 @@ impl crate::FileSystem for FileSystem {
         // Read lock.
         let guard = self.inner.read().map_err(|_| FsError::Lock)?;
         match guard.inode_of(path)? {
-            InodeResolution::Found(inode) => Ok(guard
-                .storage
-                .get(inode)
-                .ok_or(FsError::UnknownError)?
-                .metadata()
-                .clone()),
+            InodeResolution::Found(inode) => match guard.storage.get(inode) {
+                Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
+                    let fs = fs.clone();
+                    let path = path.clone();
+                    drop(guard);
+                    fs.symlink_metadata(path.as_path())
+                }
+                Some(node) => Ok(node.metadata().clone()),
+                None => Err(FsError::UnknownError),
+            },
             InodeResolution::Redirect(fs, path) => {
                 drop(guard);
                 fs.symlink_metadata(path.as_path())
@@ -730,7 +744,7 @@ impl crate::FileSystem for FileSystem {
     }
 
     fn hard_link(&self, old_path: &Path, new_path: &Path) -> Result<()> {
-        let (source_inode, target_parent_inode, target_name) = {
+        let (source_inode, target_parent_inode, _target_name) = {
             let guard = self.inner.read().map_err(|_| FsError::Lock)?;
             let source_inode = match guard.inode_of(old_path)? {
                 InodeResolution::Found(inode) => inode,
@@ -789,6 +803,139 @@ impl crate::FileSystem for FileSystem {
             return Err(FsError::EntryNotFound);
         }
         fs.add_child_to_node(target_parent_inode, source_inode)?;
+        Ok(())
+    }
+
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let target = {
+            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+            match guard.inode_of(path)? {
+                InodeResolution::Redirect(fs, path) => Some((fs, path)),
+                InodeResolution::Found(inode) => match guard.storage.get(inode) {
+                    Some(Node::ArcFile(ArcFileNode { fs, path, .. }))
+                    | Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
+                        Some((fs.clone(), path.clone()))
+                    }
+                    Some(_) => None,
+                    None => return Err(FsError::EntryNotFound),
+                },
+            }
+        };
+        if let Some((fs, path)) = target {
+            return fs.set_mode(path.as_path(), mode);
+        }
+
+        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
+        let inode = match guard.inode_of(path)? {
+            InodeResolution::Found(inode) => inode,
+            InodeResolution::Redirect(fs, path) => return fs.set_mode(path.as_path(), mode),
+        };
+        let node = guard.storage.get_mut(inode).ok_or(FsError::EntryNotFound)?;
+        node.metadata_mut().mode = mode;
+        node.metadata_mut().modified = time();
+        Ok(())
+    }
+
+    fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<()> {
+        let target = {
+            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+            match guard.inode_of(path)? {
+                InodeResolution::Redirect(fs, path) => Some((fs, path)),
+                InodeResolution::Found(inode) => match guard.storage.get(inode) {
+                    Some(Node::ArcFile(ArcFileNode { fs, path, .. }))
+                    | Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
+                        Some((fs.clone(), path.clone()))
+                    }
+                    Some(_) => None,
+                    None => return Err(FsError::EntryNotFound),
+                },
+            }
+        };
+        if let Some((fs, path)) = target {
+            return fs.set_owner(path.as_path(), uid, gid);
+        }
+
+        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
+        let inode = match guard.inode_of(path)? {
+            InodeResolution::Found(inode) => inode,
+            InodeResolution::Redirect(fs, path) => return fs.set_owner(path.as_path(), uid, gid),
+        };
+        let node = guard.storage.get_mut(inode).ok_or(FsError::EntryNotFound)?;
+        node.metadata_mut().uid = uid;
+        node.metadata_mut().gid = gid;
+        node.metadata_mut().modified = time();
+        Ok(())
+    }
+
+    fn set_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
+        let target = {
+            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+            match guard.inode_of(path)? {
+                InodeResolution::Redirect(fs, path) => Some((fs, path)),
+                InodeResolution::Found(inode) => match guard.storage.get(inode) {
+                    Some(Node::ArcFile(ArcFileNode { fs, path, .. }))
+                    | Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
+                        Some((fs.clone(), path.clone()))
+                    }
+                    Some(_) => None,
+                    None => return Err(FsError::EntryNotFound),
+                },
+            }
+        };
+        if let Some((fs, path)) = target {
+            return fs.set_times(path.as_path(), atime, mtime);
+        }
+
+        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
+        let inode = match guard.inode_of(path)? {
+            InodeResolution::Found(inode) => inode,
+            InodeResolution::Redirect(fs, path) => {
+                return fs.set_times(path.as_path(), atime, mtime);
+            }
+        };
+        let node = guard.storage.get_mut(inode).ok_or(FsError::EntryNotFound)?;
+        if let Some(atime) = atime {
+            node.metadata_mut().accessed = atime;
+        }
+        if let Some(mtime) = mtime {
+            node.metadata_mut().modified = mtime;
+        }
+        Ok(())
+    }
+
+    fn set_symlink_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
+        let target = {
+            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+            match guard.inode_of(path)? {
+                InodeResolution::Redirect(fs, path) => Some((fs, path)),
+                InodeResolution::Found(inode) => match guard.storage.get(inode) {
+                    Some(Node::ArcFile(ArcFileNode { fs, path, .. }))
+                    | Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
+                        Some((fs.clone(), path.clone()))
+                    }
+                    Some(_) => None,
+                    None => return Err(FsError::EntryNotFound),
+                },
+            }
+        };
+        if let Some((fs, path)) = target {
+            return fs.set_symlink_times(path.as_path(), atime, mtime);
+        }
+
+        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
+        let inode = match guard.inode_of(path)? {
+            InodeResolution::Found(inode) => inode,
+            InodeResolution::Redirect(fs, path) => {
+                return fs.set_symlink_times(path.as_path(), atime, mtime);
+            }
+        };
+        let node = guard.storage.get_mut(inode).ok_or(FsError::EntryNotFound)?;
+        if let Some(atime) = atime {
+            node.metadata_mut().accessed = atime;
+        }
+        if let Some(mtime) = mtime {
+            node.metadata_mut().modified = mtime;
+        }
         Ok(())
     }
 
@@ -1217,6 +1364,9 @@ impl Default for FileSystemInner {
                 dev: 0,
                 ino: ROOT_INODE as u64,
                 nlink: 1,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
                 accessed: time,
                 created: time,
                 modified: time,

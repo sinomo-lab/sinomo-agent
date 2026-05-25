@@ -67,12 +67,12 @@ pub(crate) fn record_local_command_history(
 }
 
 pub fn load_command_record<F: SandboxFileSystem>(
-    sandbox_fs: &F,
+    sandbox_fs: &mut F,
     command_id: &SandboxCommandId,
 ) -> Result<SandboxCommandRecord, SandboxStoreError> {
     let path = sandbox_command_record_log_path(command_id)?;
     let bytes = sandbox_fs
-        .read(&path, None)
+        .read_unchecked_mut(&path, None)
         .map_err(SandboxStoreError::from)?;
     decode_command_record(&bytes)
 }
@@ -115,13 +115,13 @@ pub fn persist_http_exchange_record<F: SandboxFileSystem>(
 }
 
 pub fn load_http_exchange_record<F: SandboxFileSystem>(
-    sandbox_fs: &F,
+    sandbox_fs: &mut F,
     command_id: &SandboxCommandId,
     request_id: &SandboxNetworkRequestId,
 ) -> Result<SandboxHttpExchangeRecord, SandboxStoreError> {
     let path = sandbox_http_exchange_record_log_path(command_id, request_id)?;
     let bytes = sandbox_fs
-        .read(&path, None)
+        .read_unchecked_mut(&path, None)
         .map_err(SandboxStoreError::from)?;
     decode_http_exchange_record(&bytes)
 }

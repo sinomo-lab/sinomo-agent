@@ -10,8 +10,8 @@ mod virtual_devices;
 pub use local::{LocalSandboxFileSnapshot, LocalSandboxFileSystem};
 pub use sifs::SifsSandboxFileSystem;
 pub(crate) use support::{
-    normalize_sandbox_sifs_root, reject_symlink_chain, sandbox_fs_error_from_dfs,
-    sandbox_store_error_from_dfs, sandbox_toolchain_error_from_dfs,
+    normalize_sandbox_sifs_root, reject_symlink_chain, sandbox_store_error_from_dfs,
+    sandbox_toolchain_error_from_dfs,
 };
 pub use types::*;
 pub use usage::{
@@ -29,7 +29,7 @@ pub fn validate_sandbox_working_directory(
             operation: format!("use virtual device path as sandbox cwd {cwd}"),
         });
     }
-    let metadata = fs.stat(cwd)?;
+    let metadata = fs.stat_follow(cwd)?;
     if !metadata.is_dir {
         return Err(SandboxFsError::Unsupported {
             operation: format!("use non-directory sandbox cwd {cwd}"),

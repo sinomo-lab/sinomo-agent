@@ -3,9 +3,11 @@ use crate::internal::*;
 use super::support::{ensure_host_path_is_within, reject_symlink_chain};
 use super::virtual_devices::*;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct LocalSandboxFileSystem {
     layout: LocalSandboxInstanceLayout,
+    owners: Arc<Mutex<BTreeMap<SandboxPath, (u32, u32)>>>,
+    times: Arc<Mutex<BTreeMap<SandboxPath, (u64, u64)>>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -49,7 +51,11 @@ struct LocalSandboxFileFingerprint {
 
 impl LocalSandboxFileSystem {
     pub fn new(layout: LocalSandboxInstanceLayout) -> Self {
-        Self { layout }
+        Self {
+            layout,
+            owners: Arc::new(Mutex::new(BTreeMap::new())),
+            times: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     pub fn snapshot(&self) -> Result<LocalSandboxFileSnapshot, SandboxFsError> {
@@ -59,6 +65,7 @@ impl LocalSandboxFileSystem {
             SandboxPath::new("/home").expect("static path"),
             SandboxPath::new("/tmp").expect("static path"),
             SandboxPath::new("/work").expect("static path"),
+            SandboxPath::new("/var").expect("static path"),
             SandboxPath::new("/logs").expect("static path"),
             SandboxPath::new("/artifacts").expect("static path"),
         ] {
@@ -157,6 +164,7 @@ impl LocalSandboxFileSystem {
             "home" => Ok((&self.layout.home, tail.to_string())),
             "tmp" => Ok((&self.layout.tmp, tail.to_string())),
             "work" => Ok((&self.layout.work, tail.to_string())),
+            "var" => Ok((&self.layout.var, tail.to_string())),
             "checkpoints" => Ok((&self.layout.checkpoints, tail.to_string())),
             "logs" => Ok((&self.layout.logs, tail.to_string())),
             "artifacts" => Ok((&self.layout.artifacts, tail.to_string())),
@@ -178,6 +186,21 @@ impl LocalSandboxFileSystem {
         Ok(host_path)
     }
 
+    fn host_path_follow_final(&self, path: &SandboxPath) -> Result<PathBuf, SandboxFsError> {
+        let host_path = self.host_path(path)?;
+        let parent = host_path
+            .parent()
+            .ok_or_else(|| SandboxFsError::NotFound { path: path.clone() })?;
+        reject_symlink_chain(parent, path)?;
+        let target = fs::canonicalize(&host_path)
+            .map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
+        let (base, _) = self.mount_for(path)?;
+        let base =
+            fs::canonicalize(base).map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
+        ensure_host_path_is_within(&base, &target, path)?;
+        Ok(target)
+    }
+
     fn metadata_for(
         &self,
         path: &SandboxPath,
@@ -188,7 +211,42 @@ impl LocalSandboxFileSystem {
         Ok(SandboxMetadata {
             path: path.clone(),
             is_dir: metadata.is_dir(),
+            is_symlink: metadata.file_type().is_symlink(),
             len: metadata.len(),
+            link_count: metadata_link_count(&metadata),
+            mode: metadata_mode(&metadata),
+            uid: self
+                .owners
+                .lock()
+                .ok()
+                .and_then(|owners| owners.get(path).copied())
+                .map(|(uid, _)| uid)
+                .unwrap_or_else(|| metadata_uid(&metadata)),
+            gid: self
+                .owners
+                .lock()
+                .ok()
+                .and_then(|owners| owners.get(path).copied())
+                .map(|(_, gid)| gid)
+                .unwrap_or_else(|| metadata_gid(&metadata)),
+            inode: metadata_inode(&metadata, path),
+            object_identity: None,
+            accessed_at_unix_nanos: self
+                .times
+                .lock()
+                .ok()
+                .and_then(|times| times.get(path).copied())
+                .map(|(accessed, _)| accessed)
+                .unwrap_or_else(|| metadata_time_nanos(metadata.accessed().ok())),
+            modified_at_unix_nanos: self
+                .times
+                .lock()
+                .ok()
+                .and_then(|times| times.get(path).copied())
+                .map(|(_, modified)| modified)
+                .unwrap_or_else(|| metadata_time_nanos(metadata.modified().ok())),
+            created_at_unix_nanos: metadata_time_nanos(metadata.created().ok()),
+            changed_at_unix_nanos: metadata_time_nanos(metadata.modified().ok()),
         })
     }
 
@@ -198,6 +256,7 @@ impl LocalSandboxFileSystem {
             ("home", &self.layout.home),
             ("tmp", &self.layout.tmp),
             ("work", &self.layout.work),
+            ("var", &self.layout.var),
             ("checkpoints", &self.layout.checkpoints),
             ("logs", &self.layout.logs),
             ("artifacts", &self.layout.artifacts),
@@ -225,13 +284,32 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
             return Ok(SandboxMetadata {
                 path: path.clone(),
                 is_dir: true,
+                is_symlink: false,
                 len: 0,
+                link_count: 2,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                inode: sandbox_inode_for_path(path),
+                object_identity: None,
+                accessed_at_unix_nanos: 1_000_000_000,
+                modified_at_unix_nanos: 1_000_000_000,
+                created_at_unix_nanos: 1_000_000_000,
+                changed_at_unix_nanos: 1_000_000_000,
             });
         }
         if let Some(metadata) = sandbox_virtual_device_metadata(path) {
             return Ok(metadata);
         }
         let host_path = self.host_path(path)?;
+        self.metadata_for(path, &host_path)
+    }
+
+    fn stat_follow(&self, path: &SandboxPath) -> Result<SandboxMetadata, SandboxFsError> {
+        if path.as_str() == "/" || sandbox_virtual_device_path(path).is_some() {
+            return self.stat(path);
+        }
+        let host_path = self.host_path_follow_final(path)?;
         self.metadata_for(path, &host_path)
     }
 
@@ -243,8 +321,7 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
         if sandbox_virtual_device_path(path).is_some() {
             return read_sandbox_virtual_device(path, range);
         }
-        let host_path = self.host_path(path)?;
-        reject_symlink_chain(&host_path, path)?;
+        let host_path = self.host_path_follow_final(path)?;
         let bytes = fs::read(&host_path).map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
                 SandboxFsError::NotFound { path: path.clone() }
@@ -273,6 +350,47 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
             return Ok(Vec::new());
         }
         Ok(bytes[start..end].to_vec())
+    }
+
+    fn create_dir(&mut self, path: &SandboxPath) -> Result<(), SandboxFsError> {
+        if path.as_str() == "/" {
+            return Err(SandboxFsError::AlreadyExists { path: path.clone() });
+        }
+        if matches!(
+            sandbox_virtual_device_path(path),
+            Some(
+                SandboxVirtualDevicePath::DevDirectory
+                    | SandboxVirtualDevicePath::FdDirectory
+                    | SandboxVirtualDevicePath::PtsDirectory
+                    | SandboxVirtualDevicePath::ShmDirectory
+            )
+        ) {
+            return Err(SandboxFsError::AlreadyExists { path: path.clone() });
+        }
+        if sandbox_virtual_device_path(path).is_some() {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        let host_path = self.host_path(path)?;
+        let parent = host_path
+            .parent()
+            .ok_or_else(|| SandboxFsError::NotFound { path: path.clone() })?;
+        reject_symlink_chain(parent, path)?;
+        if host_path.exists() {
+            reject_symlink_chain(&host_path, path)?;
+            return Err(SandboxFsError::AlreadyExists { path: path.clone() });
+        }
+        fs::create_dir(&host_path).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => SandboxFsError::NotFound { path: path.clone() },
+            std::io::ErrorKind::NotADirectory => {
+                SandboxFsError::NotDirectory { path: path.clone() }
+            }
+            std::io::ErrorKind::AlreadyExists => {
+                SandboxFsError::AlreadyExists { path: path.clone() }
+            }
+            _ => SandboxFsError::Unavailable {
+                reason: format!("create dir {}: {source}", path),
+            },
+        })
     }
 
     fn create_dir_all(&mut self, path: &SandboxPath) -> Result<(), SandboxFsError> {
@@ -331,6 +449,36 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
         })
     }
 
+    fn write_file(&mut self, path: &SandboxPath, bytes: &[u8]) -> Result<(), SandboxFsError> {
+        if path.as_str() == "/" {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        if sandbox_virtual_device_path(path).is_some() {
+            let _ = bytes;
+            return write_sandbox_virtual_device(path);
+        }
+        let host_path = self.host_path(path)?;
+        let parent = host_path
+            .parent()
+            .ok_or_else(|| SandboxFsError::NotFound { path: path.clone() })?;
+        reject_symlink_chain(parent, path)?;
+        if !parent.exists() {
+            return Err(SandboxFsError::NotFound { path: path.clone() });
+        }
+        if host_path.exists() {
+            reject_symlink_chain(&host_path, path)?;
+        }
+        fs::write(&host_path, bytes).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => SandboxFsError::NotFound { path: path.clone() },
+            std::io::ErrorKind::NotADirectory => {
+                SandboxFsError::NotDirectory { path: path.clone() }
+            }
+            _ => SandboxFsError::Unavailable {
+                reason: format!("write {}: {source}", path),
+            },
+        })
+    }
+
     fn list(&self, path: &SandboxPath) -> Result<Vec<SandboxDirEntry>, SandboxFsError> {
         if path.as_str() == "/" {
             return Ok(self.root_entries());
@@ -383,12 +531,14 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
         reject_symlink_chain(&from_host, from)?;
         if let Some(parent) = to_host.parent() {
             reject_symlink_chain(parent, to)?;
-            fs::create_dir_all(parent).map_err(|source| SandboxFsError::Unavailable {
-                reason: format!("create parent for {}: {source}", to),
-            })?;
         }
-        fs::rename(&from_host, &to_host).map_err(|source| SandboxFsError::Unavailable {
-            reason: format!("rename {from} to {to}: {source}"),
+        fs::rename(&from_host, &to_host).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => SandboxFsError::NotFound { path: to.clone() },
+            std::io::ErrorKind::NotADirectory => SandboxFsError::NotDirectory { path: to.clone() },
+            std::io::ErrorKind::AlreadyExists => SandboxFsError::AlreadyExists { path: to.clone() },
+            _ => SandboxFsError::Unavailable {
+                reason: format!("rename {from} to {to}: {source}"),
+            },
         })
     }
 
@@ -397,13 +547,14 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
             return Err(SandboxFsError::ReadOnly { path: path.clone() });
         }
         let host_path = self.host_path(path)?;
-        reject_symlink_chain(&host_path, path)?;
-        let metadata = fs::metadata(&host_path)
+        let parent = host_path
+            .parent()
+            .ok_or_else(|| SandboxFsError::NotFound { path: path.clone() })?;
+        reject_symlink_chain(parent, path)?;
+        let metadata = fs::symlink_metadata(&host_path)
             .map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
         if metadata.is_dir() {
-            fs::remove_dir_all(&host_path).map_err(|source| SandboxFsError::Unavailable {
-                reason: format!("remove dir {}: {source}", path),
-            })
+            Err(SandboxFsError::IsDirectory { path: path.clone() })
         } else {
             fs::remove_file(&host_path).map_err(|source| SandboxFsError::Unavailable {
                 reason: format!("remove file {}: {source}", path),
@@ -411,9 +562,319 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
         }
     }
 
+    fn remove_dir(&mut self, path: &SandboxPath) -> Result<(), SandboxFsError> {
+        if sandbox_virtual_device_path(path).is_some() {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        let host_path = self.host_path(path)?;
+        reject_symlink_chain(&host_path, path)?;
+        let metadata = fs::symlink_metadata(&host_path)
+            .map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
+        if !metadata.is_dir() {
+            return Err(SandboxFsError::NotDirectory { path: path.clone() });
+        }
+        fs::remove_dir(&host_path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                SandboxFsError::DirectoryNotEmpty { path: path.clone() }
+            } else {
+                SandboxFsError::Unavailable {
+                    reason: format!("remove dir {}: {source}", path),
+                }
+            }
+        })
+    }
+
+    fn readlink(&self, path: &SandboxPath) -> Result<PathBuf, SandboxFsError> {
+        if sandbox_virtual_device_path(path).is_some() || sandbox_path_is_dev_tree(path) {
+            return Err(SandboxFsError::NotFound { path: path.clone() });
+        }
+        let host_path = self.host_path(path)?;
+        let parent = host_path
+            .parent()
+            .ok_or_else(|| SandboxFsError::NotFound { path: path.clone() })?;
+        reject_symlink_chain(parent, path)?;
+        fs::read_link(&host_path).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => SandboxFsError::NotFound { path: path.clone() },
+            _ => SandboxFsError::Unavailable {
+                reason: format!("readlink {}: {source}", path),
+            },
+        })
+    }
+
+    fn symlink(&mut self, target: &Path, link_path: &SandboxPath) -> Result<(), SandboxFsError> {
+        if link_path.as_str() == "/" {
+            return Err(SandboxFsError::ReadOnly {
+                path: link_path.clone(),
+            });
+        }
+        if sandbox_virtual_device_path(link_path).is_some() || sandbox_path_is_dev_tree(link_path) {
+            return Err(SandboxFsError::ReadOnly {
+                path: link_path.clone(),
+            });
+        }
+        let host_path = self.host_path(link_path)?;
+        let parent = host_path.parent().ok_or_else(|| SandboxFsError::NotFound {
+            path: link_path.clone(),
+        })?;
+        reject_symlink_chain(parent, link_path)?;
+        if !parent.exists() {
+            return Err(SandboxFsError::NotFound {
+                path: link_path.clone(),
+            });
+        }
+        if host_path.exists() || fs::symlink_metadata(&host_path).is_ok() {
+            return Err(SandboxFsError::AlreadyExists {
+                path: link_path.clone(),
+            });
+        }
+        create_host_symlink(target, &host_path).map_err(|source| SandboxFsError::Unavailable {
+            reason: format!("symlink {} -> {}: {source}", target.display(), link_path),
+        })
+    }
+
+    fn hard_link(
+        &mut self,
+        old_path: &SandboxPath,
+        new_path: &SandboxPath,
+    ) -> Result<(), SandboxFsError> {
+        if sandbox_virtual_device_path(old_path).is_some()
+            || sandbox_virtual_device_path(new_path).is_some()
+            || sandbox_path_is_dev_tree(old_path)
+            || sandbox_path_is_dev_tree(new_path)
+        {
+            return Err(SandboxFsError::ReadOnly {
+                path: new_path.clone(),
+            });
+        }
+        let old_host = self.host_path(old_path)?;
+        let new_host = self.host_path(new_path)?;
+        let old_parent = old_host.parent().ok_or_else(|| SandboxFsError::NotFound {
+            path: old_path.clone(),
+        })?;
+        reject_symlink_chain(old_parent, old_path)?;
+        fs::symlink_metadata(&old_host).map_err(|_| SandboxFsError::NotFound {
+            path: old_path.clone(),
+        })?;
+        let parent = new_host.parent().ok_or_else(|| SandboxFsError::NotFound {
+            path: new_path.clone(),
+        })?;
+        reject_symlink_chain(parent, new_path)?;
+        if !parent.exists() {
+            return Err(SandboxFsError::NotFound {
+                path: new_path.clone(),
+            });
+        }
+        if new_host.exists() || fs::symlink_metadata(&new_host).is_ok() {
+            return Err(SandboxFsError::AlreadyExists {
+                path: new_path.clone(),
+            });
+        }
+        fs::hard_link(&old_host, &new_host).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => SandboxFsError::NotFound {
+                path: old_path.clone(),
+            },
+            std::io::ErrorKind::AlreadyExists => SandboxFsError::AlreadyExists {
+                path: new_path.clone(),
+            },
+            _ => SandboxFsError::Unavailable {
+                reason: format!("hard link {old_path} -> {new_path}: {source}"),
+            },
+        })
+    }
+
+    fn set_mode(&mut self, path: &SandboxPath, mode: u32) -> Result<(), SandboxFsError> {
+        if sandbox_virtual_device_path(path).is_some() || sandbox_path_is_dev_tree(path) {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        let host_path = self.host_path_follow_final(path)?;
+        set_host_mode(&host_path, mode).map_err(|source| SandboxFsError::Unavailable {
+            reason: format!("set mode {}: {source}", path),
+        })
+    }
+
+    fn set_times(
+        &mut self,
+        path: &SandboxPath,
+        accessed_at_unix_nanos: Option<u64>,
+        modified_at_unix_nanos: Option<u64>,
+    ) -> Result<(), SandboxFsError> {
+        if sandbox_virtual_device_path(path).is_some() || sandbox_path_is_dev_tree(path) {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        let host_path = self.host_path_follow_final(path)?;
+        let metadata = self.metadata_for(path, &host_path)?;
+        self.times
+            .lock()
+            .map_err(|_| SandboxFsError::Unavailable {
+                reason: "local sandbox time metadata lock poisoned".to_string(),
+            })?
+            .insert(
+                path.clone(),
+                (
+                    accessed_at_unix_nanos.unwrap_or(metadata.accessed_at_unix_nanos),
+                    modified_at_unix_nanos.unwrap_or(metadata.modified_at_unix_nanos),
+                ),
+            );
+        Ok(())
+    }
+
+    fn set_symlink_times(
+        &mut self,
+        path: &SandboxPath,
+        accessed_at_unix_nanos: Option<u64>,
+        modified_at_unix_nanos: Option<u64>,
+    ) -> Result<(), SandboxFsError> {
+        if sandbox_virtual_device_path(path).is_some() || sandbox_path_is_dev_tree(path) {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        let host_path = self.host_path(path)?;
+        let parent = host_path
+            .parent()
+            .ok_or_else(|| SandboxFsError::NotFound { path: path.clone() })?;
+        reject_symlink_chain(parent, path)?;
+        let metadata = self.metadata_for(path, &host_path)?;
+        self.times
+            .lock()
+            .map_err(|_| SandboxFsError::Unavailable {
+                reason: "local sandbox time metadata lock poisoned".to_string(),
+            })?
+            .insert(
+                path.clone(),
+                (
+                    accessed_at_unix_nanos.unwrap_or(metadata.accessed_at_unix_nanos),
+                    modified_at_unix_nanos.unwrap_or(metadata.modified_at_unix_nanos),
+                ),
+            );
+        Ok(())
+    }
+
+    fn set_owner(&mut self, path: &SandboxPath, uid: u32, gid: u32) -> Result<(), SandboxFsError> {
+        if sandbox_virtual_device_path(path).is_some() || sandbox_path_is_dev_tree(path) {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        self.host_path_follow_final(path)?;
+        self.owners
+            .lock()
+            .map_err(|_| SandboxFsError::Unavailable {
+                reason: "local sandbox owner metadata lock poisoned".to_string(),
+            })?
+            .insert(path.clone(), (uid, gid));
+        Ok(())
+    }
+
     fn checkpoint(&mut self) -> Result<SandboxCheckpoint, SandboxFsError> {
         Err(SandboxFsError::Unsupported {
             operation: "local sandbox filesystem checkpoint".to_string(),
         })
     }
+}
+
+fn create_host_symlink(target: &Path, link_path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link_path)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link_path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link_path);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host symlinks are not supported on this platform",
+        ))
+    }
+}
+
+fn metadata_link_count(metadata: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink()
+    }
+    #[cfg(not(unix))]
+    {
+        if metadata.is_dir() { 2 } else { 1 }
+    }
+}
+
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        if metadata.is_dir() { 0o755 } else { 0o644 }
+    }
+}
+
+fn metadata_uid(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.uid()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
+}
+
+fn metadata_gid(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.gid()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
+}
+
+fn set_host_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(path)?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode((permissions.mode() & !0o7777) | (mode & 0o7777));
+        fs::set_permissions(path, permissions)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
+}
+
+fn metadata_inode(metadata: &fs::Metadata, path: &SandboxPath) -> u64 {
+    #[cfg(unix)]
+    let _ = path;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        sandbox_inode_for_path(path)
+    }
+}
+
+fn sandbox_inode_for_path(path: &SandboxPath) -> u64 {
+    let hash = blake3::hash(path.as_str().as_bytes());
+    u64::from_le_bytes(hash.as_bytes()[0..8].try_into().expect("hash slice"))
+}
+
+fn metadata_time_nanos(time: Option<std::time::SystemTime>) -> u64 {
+    time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(1_000_000_000)
 }

@@ -1,66 +1,31 @@
-use crate::{SandboxMountMode, SandboxPath, SandboxWasiError, SandboxWasiPreopen};
+use crate::{
+    SandboxMountMode, SandboxPath, SandboxWasiError, SandboxWasiPreopen, SandboxWasiVirtualPreopen,
+};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
-#[derive(Default)]
-pub(super) struct WasixReadOnlyPreopenGuard {
-    entries: Vec<WasixReadOnlyPreopenEntry>,
-}
-
-struct WasixReadOnlyPreopenEntry {
-    path: std::path::PathBuf,
-    permissions: fs::Permissions,
-    is_dir: bool,
-}
-
-impl WasixReadOnlyPreopenGuard {
-    pub(super) fn add_tree(&mut self, root: &Path) -> Result<(), std::io::Error> {
-        self.collect_tree(root)?;
-        for entry in &self.entries {
-            if !entry.is_dir {
-                continue;
-            }
-            let mut permissions = entry.permissions.clone();
-            set_permissions_read_only(&mut permissions);
-            fs::set_permissions(&entry.path, permissions)?;
-        }
-        Ok(())
-    }
-
-    fn collect_tree(&mut self, path: &Path) -> Result<(), std::io::Error> {
-        let metadata = collect_wasix_preopen_entry(path)?;
-        self.entries.push(WasixReadOnlyPreopenEntry {
-            path: path.to_path_buf(),
-            permissions: metadata.permissions(),
-            is_dir: metadata.is_dir(),
-        });
-        if metadata.is_dir() {
-            for entry in fs::read_dir(path)? {
-                self.collect_tree(&entry?.path())?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for WasixReadOnlyPreopenGuard {
-    fn drop(&mut self) {
-        for entry in self.entries.iter().rev() {
-            let _ = fs::set_permissions(&entry.path, entry.permissions.clone());
-        }
-    }
-}
-
 pub(super) fn validate_wasix_current_dir(
     cwd: &SandboxPath,
     preopened_dirs: &[SandboxWasiPreopen],
+    virtual_preopened_dirs: &[SandboxWasiVirtualPreopen],
 ) -> Result<(), SandboxWasiError> {
-    if preopened_dirs.is_empty() {
+    if preopened_dirs.is_empty() && virtual_preopened_dirs.is_empty() {
+        return Ok(());
+    }
+    if let Some((preopen, virtual_path)) = wasix_virtual_path_for_guest(cwd, virtual_preopened_dirs)
+    {
+        let metadata = preopen.fs.metadata(&virtual_path).map_err(|error| {
+            SandboxWasiError::InvalidRequest {
+                detail: format!("WASIX cwd `{cwd}` is invalid: {error}"),
+            }
+        })?;
+        if !metadata.is_dir() {
+            return Err(SandboxWasiError::InvalidRequest {
+                detail: format!("WASIX cwd `{cwd}` is not a directory"),
+            });
+        }
         return Ok(());
     }
     let Some((preopen, host_path)) = wasix_host_path_for_guest(cwd, preopened_dirs) else {
@@ -89,6 +54,15 @@ pub(super) fn validate_wasix_current_dir(
         });
     }
     Ok(())
+}
+
+fn sandbox_path_is_inside_preopen(path: &SandboxPath, preopen: &SandboxPath) -> bool {
+    preopen.as_str() == "/"
+        || path == preopen
+        || path
+            .as_str()
+            .strip_prefix(preopen.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 pub(super) fn validate_wasix_preopen_tree(
@@ -177,12 +151,28 @@ fn wasix_host_path_for_guest<'a>(
     Some((preopen, preopen.host_path.join(relative)))
 }
 
-#[cfg(unix)]
-fn set_permissions_read_only(permissions: &mut fs::Permissions) {
-    permissions.set_mode(permissions.mode() & !0o222);
-}
-
-#[cfg(not(unix))]
-fn set_permissions_read_only(permissions: &mut fs::Permissions) {
-    permissions.set_readonly(true);
+fn wasix_virtual_path_for_guest<'a>(
+    path: &SandboxPath,
+    preopened_dirs: &'a [SandboxWasiVirtualPreopen],
+) -> Option<(&'a SandboxWasiVirtualPreopen, PathBuf)> {
+    let mut matches: Vec<_> = preopened_dirs
+        .iter()
+        .filter(|preopen| sandbox_path_is_inside_preopen(path, &preopen.guest_path))
+        .collect();
+    matches.sort_by_key(|preopen| std::cmp::Reverse(preopen.guest_path.as_str().len()));
+    let preopen = matches.into_iter().next()?;
+    let relative = if preopen.guest_path.as_str() == "/" {
+        path.as_str().trim_start_matches('/')
+    } else if path == &preopen.guest_path {
+        ""
+    } else {
+        path.as_str()
+            .strip_prefix(preopen.guest_path.as_str())
+            .and_then(|suffix| suffix.strip_prefix('/'))?
+    };
+    if relative.is_empty() {
+        Some((preopen, PathBuf::from("/")))
+    } else {
+        Some((preopen, PathBuf::from("/").join(relative)))
+    }
 }

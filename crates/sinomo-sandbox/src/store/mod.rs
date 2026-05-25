@@ -441,9 +441,29 @@ impl From<SandboxFsError> for SandboxStoreError {
                 path: path.to_string(),
                 detail: "sandbox filesystem path not found".to_string(),
             },
+            SandboxFsError::AlreadyExists { path } => Self::Io {
+                path: path.to_string(),
+                detail: "sandbox filesystem path already exists".to_string(),
+            },
             SandboxFsError::ReadOnly { path } => Self::Io {
                 path: path.to_string(),
                 detail: "sandbox filesystem path is read-only".to_string(),
+            },
+            SandboxFsError::NotDirectory { path } => Self::Io {
+                path: path.to_string(),
+                detail: "sandbox filesystem path is not a directory".to_string(),
+            },
+            SandboxFsError::IsDirectory { path } => Self::Io {
+                path: path.to_string(),
+                detail: "sandbox filesystem path is a directory".to_string(),
+            },
+            SandboxFsError::NotSymlink { path } => Self::Io {
+                path: path.to_string(),
+                detail: "sandbox filesystem path is not a symbolic link".to_string(),
+            },
+            SandboxFsError::DirectoryNotEmpty { path } => Self::Io {
+                path: path.to_string(),
+                detail: "sandbox filesystem directory is not empty".to_string(),
             },
             SandboxFsError::Unsupported { operation } => Self::Io {
                 path: "sandbox filesystem".to_string(),

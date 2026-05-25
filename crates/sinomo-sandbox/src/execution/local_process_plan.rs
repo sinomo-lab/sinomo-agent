@@ -180,12 +180,7 @@ impl LocalStagedSandboxCommandRunner {
             sandbox_fs.validate_resource_limits(&limits)?;
             let timeout_ms = effective_sandbox_timeout_ms(timeout_ms, limits.wall_time_ms);
             let effective_cwd = step.cwd.clone().unwrap_or_else(|| manifest.cwd.clone());
-            let working_directory_host_path = host_path_for_process_plan_cwd(
-                &sandbox_fs,
-                &artifact_preopens,
-                step_index,
-                &effective_cwd,
-            )?;
+            validate_process_plan_cwd(&sandbox_fs, &artifact_preopens, step_index, &effective_cwd)?;
             let module = toolchain_command_modules
                 .get(&step.command_name)
                 .cloned()
@@ -207,7 +202,6 @@ impl LocalStagedSandboxCommandRunner {
                 timeout_ms,
                 limits,
                 module,
-                working_directory_host_path,
                 allow_preview1_pinned_subprocesses: command
                     .required_capabilities
                     .iter()
@@ -263,8 +257,6 @@ impl LocalStagedSandboxCommandRunner {
                 wasi_options.wasix_command_overrides = wasix_command_overrides;
                 wasi_options.wasix_stdin_pipe = stdin_pipe;
                 wasi_options.wasix_stdout_pipe = stdout_pipe;
-                wasi_options.working_directory_host_path =
-                    Some(prepared.working_directory_host_path);
                 let request = SandboxCommandRequest {
                     sandbox_id: manifest.sandbox_id.clone(),
                     argv: prepared.argv.clone(),
@@ -442,6 +434,7 @@ impl LocalStagedSandboxCommandRunner {
 #[cfg(feature = "wasix-runtime")]
 impl LocalStagedSandboxCommandRunner {
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(super) fn run_toolchain_process_plan_with_policy_output_sink_and_preopens(
         &self,
         store: &LocalSandboxInstanceStore,
@@ -500,7 +493,6 @@ struct PreparedWasixProcessPlanStep {
     timeout_ms: u64,
     limits: SandboxResourceLimits,
     module: Vec<u8>,
-    working_directory_host_path: PathBuf,
     allow_preview1_pinned_subprocesses: bool,
     wasix_pinned_child_exec_only: bool,
 }
@@ -529,19 +521,17 @@ fn prepared_limit_for_step(
 }
 
 #[cfg(feature = "wasix-runtime")]
-fn host_path_for_process_plan_cwd(
+fn validate_process_plan_cwd(
     sandbox_fs: &LocalSandboxFileSystem,
     extra_preopens: &[SandboxWasiPreopen],
     step_index: usize,
     cwd: &SandboxPath,
-) -> Result<PathBuf, SandboxCommandExecutionError> {
+) -> Result<(), SandboxCommandExecutionError> {
     match validate_sandbox_working_directory(sandbox_fs, cwd) {
-        Ok(()) => return sandbox_fs.host_path(cwd).map_err(Into::into),
+        Ok(()) => return Ok(()),
         Err(local_error) => {
-            if let Some(host_path) =
-                mounted_process_plan_cwd_host_path(extra_preopens, step_index, cwd)?
-            {
-                return Ok(host_path);
+            if mounted_process_plan_cwd_is_valid(extra_preopens, step_index, cwd)? {
+                return Ok(());
             }
             Err(SandboxCommandExecutionError::Wasi(
                 SandboxWasiError::InvalidRequest {
@@ -555,11 +545,11 @@ fn host_path_for_process_plan_cwd(
 }
 
 #[cfg(feature = "wasix-runtime")]
-fn mounted_process_plan_cwd_host_path(
+fn mounted_process_plan_cwd_is_valid(
     extra_preopens: &[SandboxWasiPreopen],
     step_index: usize,
     cwd: &SandboxPath,
-) -> Result<Option<PathBuf>, SandboxCommandExecutionError> {
+) -> Result<bool, SandboxCommandExecutionError> {
     let Some((preopen, tail)) = extra_preopens
         .iter()
         .filter_map(|preopen| {
@@ -567,7 +557,7 @@ fn mounted_process_plan_cwd_host_path(
         })
         .max_by_key(|(preopen, _)| preopen.guest_path.as_str().len())
     else {
-        return Ok(None);
+        return Ok(false);
     };
     let host_path = tail
         .split('/')
@@ -588,7 +578,7 @@ fn mounted_process_plan_cwd_host_path(
             },
         ));
     }
-    Ok(Some(host_path))
+    Ok(true)
 }
 
 #[cfg(feature = "wasix-runtime")]

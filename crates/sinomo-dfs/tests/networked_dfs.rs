@@ -14,6 +14,7 @@ use sinomo_network::InProcessNetwork;
 use sinomo_node::NodeId;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -48,6 +49,15 @@ fn networked_dfs_commits_after_stage_ack_and_replica_reads_content() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -167,6 +177,15 @@ fn networked_dfs_transfers_large_writes_in_chunks() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1,
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -244,6 +263,15 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -370,6 +398,15 @@ fn networked_dfs_fetches_repair_blob_from_alternate_replica_after_restart() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -544,6 +581,15 @@ fn networked_dfs_rejects_stage_blob_from_non_owner() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1,
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -640,6 +686,15 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -894,6 +949,680 @@ fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
 }
 
 #[test]
+fn posix_rename_directory_over_empty_directory_moves_subtree_atomically() {
+    let owner = NodeId::from_legacy_named("node_posix_rename_dir_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_posix_rename_dir_replica").expect("node");
+    let root = temp_root("posix_rename_directory_over_empty_directory");
+    let network = InProcessNetwork::new();
+    let owner_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    );
+    owner_dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    replica_dfs
+        .bootstrap_distributed_sifs()
+        .expect("replica bootstrap");
+
+    owner_dfs
+        .posix_mkdir_all("/services/releases/current")
+        .expect("mkdir current");
+    owner_dfs
+        .posix_mkdir_all("/services/releases/next/nested")
+        .expect("mkdir next nested");
+    owner_dfs
+        .posix_write_file(
+            "/services/releases/next/nested/app.txt",
+            b"next",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone(), replica.clone()]),
+        )
+        .expect("write nested file");
+    replica_dfs
+        .process_incoming()
+        .expect("replicate nested file");
+
+    owner_dfs
+        .posix_rename("/services/releases/next", "/services/releases/current")
+        .expect("replace empty current directory");
+
+    assert_eq!(
+        owner_dfs
+            .posix_read_file("/services/releases/current/nested/app.txt")
+            .expect("read moved nested file"),
+        b"next"
+    );
+    assert!(matches!(
+        owner_dfs.posix_stat("/services/releases/next"),
+        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+    ));
+    assert!(matches!(
+        owner_dfs.posix_stat("/services/releases/next/nested/app.txt"),
+        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        owner_dfs
+            .posix_list_dir("/services/releases")
+            .expect("list releases")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["current".to_string()]
+    );
+
+    let mut reloaded_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("reload metadata"),
+    )
+    .expect("reload metadata backend");
+    reloaded_dfs
+        .bootstrap_distributed_sifs()
+        .expect("reload bootstrap");
+    assert_eq!(
+        reloaded_dfs
+            .posix_read_file("/services/releases/current/nested/app.txt")
+            .expect("read moved nested file after reload"),
+        b"next"
+    );
+    assert!(matches!(
+        reloaded_dfs.posix_stat("/services/releases/next/nested/app.txt"),
+        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+    ));
+
+    cleanup(&root);
+}
+
+#[test]
+fn posix_paths_treat_backslash_as_filename_character() {
+    let owner = NodeId::from_legacy_named("node_posix_backslash_owner").expect("node");
+    let root = temp_root("posix_backslash_filename");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    dfs.posix_mkdir_all("/services/names/a")
+        .expect("mkdir slash parent");
+
+    let backslash_stat = dfs
+        .posix_write_file(
+            r"/services/names/a\b.txt",
+            b"backslash",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("write backslash filename");
+    let slash_stat = dfs
+        .posix_write_file(
+            "/services/names/a/b.txt",
+            b"slash",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("write slash path");
+
+    assert_ne!(backslash_stat.object_id, slash_stat.object_id);
+    assert_eq!(
+        dfs.posix_read_file(r"/services/names/a\b.txt")
+            .expect("read backslash filename"),
+        b"backslash"
+    );
+    assert_eq!(
+        dfs.posix_read_file("/services/names/a/b.txt")
+            .expect("read slash path"),
+        b"slash"
+    );
+    assert_eq!(
+        dfs.posix_list_dir("/services/names")
+            .expect("list names")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["a".to_string(), r"a\b.txt".to_string()]
+    );
+
+    let mut reloaded = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("reload metadata"),
+    )
+    .expect("reload metadata backend");
+    reloaded
+        .bootstrap_distributed_sifs()
+        .expect("reload bootstrap");
+    assert_eq!(
+        reloaded
+            .posix_read_file(r"/services/names/a\b.txt")
+            .expect("read backslash after reload"),
+        b"backslash"
+    );
+    assert_eq!(
+        reloaded
+            .posix_read_file("/services/names/a/b.txt")
+            .expect("read slash after reload"),
+        b"slash"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn posix_paths_resolve_parent_components_within_sifs_root() {
+    let owner = NodeId::from_legacy_named("node_posix_parent_components_owner").expect("node");
+    let root = temp_root("posix_parent_components");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    dfs.posix_mkdir_all("/services/paths")
+        .expect("mkdir services paths");
+
+    let stat = dfs
+        .posix_write_file(
+            "/services/paths/tmp/../file.txt",
+            b"normalized",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("write through parent component");
+
+    assert_eq!(stat.path, "/services/paths/file.txt");
+    assert_eq!(
+        dfs.posix_read_file("/../services/paths/./file.txt")
+            .expect("read with root parent and current component"),
+        b"normalized"
+    );
+    assert!(
+        matches!(
+            dfs.posix_stat("/services/paths/tmp/file.txt"),
+            Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+        ),
+        "parent components must be resolved instead of becoming path data"
+    );
+    assert_eq!(
+        dfs.posix_list_dir("/services/paths/../paths")
+            .expect("list normalized path")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["file.txt".to_string()]
+    );
+
+    let mut reloaded = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("reload metadata"),
+    )
+    .expect("reload metadata backend");
+    reloaded
+        .bootstrap_distributed_sifs()
+        .expect("reload bootstrap");
+    assert_eq!(
+        reloaded
+            .posix_read_file("/services/paths/../paths/file.txt")
+            .expect("read normalized path after reload"),
+        b"normalized"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn posix_paths_reject_nul_bytes_before_metadata_mutation() {
+    let owner = NodeId::from_legacy_named("node_posix_nul_owner").expect("node");
+    let root = temp_root("posix_nul_path");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    dfs.posix_mkdir_all("/services/nul")
+        .expect("mkdir nul parent");
+
+    for result in [
+        dfs.posix_write_file(
+            "/services/nul/bad\0name.txt",
+            b"bad",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        ),
+        dfs.posix_mkdir("/services/nul/bad\0dir"),
+        dfs.posix_symlink(
+            "target",
+            "/services/nul/bad\0link",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        ),
+    ] {
+        assert!(matches!(
+            result,
+            Err(sinomo_dfs::DfsPosixError::InvalidPath { .. })
+        ));
+    }
+
+    assert!(
+        dfs.posix_list_dir("/services/nul")
+            .expect("list nul parent")
+            .is_empty(),
+        "invalid paths must not create metadata entries"
+    );
+
+    let reloaded = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("reload metadata"),
+    )
+    .expect("reload metadata backend");
+    assert!(
+        reloaded
+            .posix_list_dir("/services/nul")
+            .expect("reload list nul parent")
+            .is_empty()
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn posix_symlink_rejects_invalid_targets_before_metadata_mutation() {
+    let owner = NodeId::from_legacy_named("node_posix_bad_symlink_target_owner").expect("node");
+    let root = temp_root("posix_bad_symlink_target");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    dfs.posix_mkdir_all("/services/links")
+        .expect("mkdir links parent");
+
+    for (target, link_path) in [
+        ("", "/services/links/empty-target"),
+        ("bad\0target", "/services/links/nul-target"),
+    ] {
+        assert!(matches!(
+            dfs.posix_symlink(
+                target,
+                link_path,
+                sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()])
+            ),
+            Err(sinomo_dfs::DfsPosixError::InvalidPath { .. })
+        ));
+    }
+
+    assert!(
+        dfs.posix_list_dir("/services/links")
+            .expect("list links parent")
+            .is_empty(),
+        "invalid symlink targets must not create metadata entries"
+    );
+
+    let mut reloaded = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("reload metadata"),
+    )
+    .expect("reload metadata backend");
+    reloaded
+        .bootstrap_distributed_sifs()
+        .expect("reload bootstrap");
+    assert!(
+        reloaded
+            .posix_list_dir("/services/links")
+            .expect("reload list links parent")
+            .is_empty()
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn posix_stat_read_and_write_follow_symlink_targets() {
+    let owner = NodeId::from_legacy_named("node_posix_symlink_follow_owner").expect("node");
+    let root = temp_root("posix_symlink_follow_targets");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    dfs.posix_mkdir_all("/services/symlink-targets/real-dir")
+        .expect("mkdir symlink targets");
+    dfs.posix_write_file(
+        "/services/symlink-targets/target.txt",
+        b"target",
+        sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+    )
+    .expect("write target");
+    dfs.posix_symlink(
+        "target.txt",
+        "/services/symlink-targets/link.txt",
+        sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+    )
+    .expect("create file symlink");
+
+    assert_eq!(
+        dfs.posix_lstat("/services/symlink-targets/link.txt")
+            .expect("lstat link")
+            .kind,
+        DfsObjectKind::Symlink
+    );
+    assert_eq!(
+        dfs.posix_stat("/services/symlink-targets/link.txt")
+            .expect("stat follows link")
+            .kind,
+        DfsObjectKind::File
+    );
+    assert_eq!(
+        dfs.posix_read_file("/services/symlink-targets/link.txt")
+            .expect("read follows link"),
+        b"target"
+    );
+    dfs.posix_write_file(
+        "/services/symlink-targets/link.txt",
+        b"updated",
+        sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+    )
+    .expect("write follows link");
+    assert_eq!(
+        dfs.posix_read_file("/services/symlink-targets/target.txt")
+            .expect("read updated target"),
+        b"updated"
+    );
+    assert_eq!(
+        dfs.posix_readlink("/services/symlink-targets/link.txt")
+            .expect("readlink preserves target"),
+        "target.txt"
+    );
+    dfs.posix_set_mode("/services/symlink-targets/link.txt", 0o600)
+        .expect("chmod follows link");
+    assert_eq!(
+        dfs.posix_stat("/services/symlink-targets/target.txt")
+            .expect("target mode")
+            .mode,
+        0o600
+    );
+    assert_ne!(
+        dfs.posix_lstat("/services/symlink-targets/link.txt")
+            .expect("link mode remains independent")
+            .mode,
+        0o600
+    );
+    dfs.posix_set_times(
+        "/services/symlink-targets/link.txt",
+        Some(11_111),
+        Some(22_222),
+    )
+    .expect("utimens follows link");
+    assert_eq!(
+        dfs.posix_stat("/services/symlink-targets/target.txt")
+            .expect("target atime")
+            .accessed_at_unix_nanos,
+        11_111
+    );
+    dfs.posix_set_symlink_times(
+        "/services/symlink-targets/link.txt",
+        Some(33_333),
+        Some(44_444),
+    )
+    .expect("lutimens updates link");
+    assert_eq!(
+        dfs.posix_lstat("/services/symlink-targets/link.txt")
+            .expect("link atime")
+            .accessed_at_unix_nanos,
+        33_333
+    );
+    assert_eq!(
+        dfs.posix_stat("/services/symlink-targets/target.txt")
+            .expect("target atime unchanged by lutimens")
+            .accessed_at_unix_nanos,
+        11_111
+    );
+
+    dfs.posix_write_file(
+        "/services/symlink-targets/real-dir/nested.txt",
+        b"nested",
+        sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+    )
+    .expect("write nested target");
+    dfs.posix_symlink(
+        "real-dir",
+        "/services/symlink-targets/dir-link",
+        sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+    )
+    .expect("create directory symlink");
+    assert_eq!(
+        dfs.posix_read_file("/services/symlink-targets/dir-link/nested.txt")
+            .expect("read through intermediate symlink"),
+        b"nested"
+    );
+    assert_eq!(
+        dfs.posix_list_dir("/services/symlink-targets/dir-link")
+            .expect("list follows directory symlink")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["nested.txt".to_string()]
+    );
+
+    let mut reloaded = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("reload metadata"),
+    )
+    .expect("reload metadata backend");
+    reloaded
+        .bootstrap_distributed_sifs()
+        .expect("reload bootstrap");
+    assert_eq!(
+        reloaded
+            .posix_read_file("/services/symlink-targets/link.txt")
+            .expect("reloaded read follows link"),
+        b"updated"
+    );
+    assert_eq!(
+        reloaded
+            .posix_read_file("/services/symlink-targets/dir-link/nested.txt")
+            .expect("reloaded read through intermediate symlink"),
+        b"nested"
+    );
+    assert_eq!(
+        reloaded
+            .posix_list_dir("/services/symlink-targets/dir-link")
+            .expect("reloaded list follows directory symlink")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["nested.txt".to_string()]
+    );
+    assert_eq!(
+        reloaded
+            .posix_lstat("/services/symlink-targets/link.txt")
+            .expect("reloaded lstat link")
+            .kind,
+        DfsObjectKind::Symlink
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn posix_operations_follow_intermediate_parent_symlinks() {
+    let owner = NodeId::from_legacy_named("node_posix_parent_symlink_owner").expect("node");
+    let root = temp_root("posix_parent_symlink_operations");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    dfs.posix_mkdir_all("/services/parents/real")
+        .expect("mkdir real parent");
+    dfs.posix_symlink(
+        "real",
+        "/services/parents/link",
+        sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+    )
+    .expect("create parent symlink");
+
+    dfs.posix_mkdir("/services/parents/link/created")
+        .expect("mkdir through parent symlink");
+    dfs.posix_write_file(
+        "/services/parents/real/original.txt",
+        b"original",
+        sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+    )
+    .expect("write hardlink target");
+    dfs.posix_hardlink(
+        "/services/parents/link/original.txt",
+        "/services/parents/link/original-alias.txt",
+    )
+    .expect("hardlink through parent symlink");
+    assert_eq!(
+        dfs.posix_stat("/services/parents/real/original.txt")
+            .expect("original link count")
+            .link_count,
+        2
+    );
+    assert_eq!(
+        dfs.posix_read_file("/services/parents/real/original-alias.txt")
+            .expect("read hardlink alias"),
+        b"original"
+    );
+    assert_eq!(
+        dfs.posix_stat("/services/parents/real/created")
+            .expect("created target dir")
+            .kind,
+        DfsObjectKind::Directory
+    );
+    assert_eq!(
+        dfs.posix_stat("/services/parents/link/created")
+            .expect("stat through parent symlink")
+            .kind,
+        DfsObjectKind::Directory
+    );
+
+    dfs.posix_symlink(
+        "created",
+        "/services/parents/link/created-link",
+        sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+    )
+    .expect("create symlink through parent symlink");
+    assert_eq!(
+        dfs.posix_lstat("/services/parents/link/created-link")
+            .expect("lstat follows parent symlink only")
+            .kind,
+        DfsObjectKind::Symlink
+    );
+    assert_eq!(
+        dfs.posix_lstat("/services/parents/real/created-link")
+            .expect("canonical lstat")
+            .kind,
+        DfsObjectKind::Symlink
+    );
+
+    dfs.posix_rename(
+        "/services/parents/link/created",
+        "/services/parents/link/renamed",
+    )
+    .expect("rename through parent symlink");
+    assert!(matches!(
+        dfs.posix_stat("/services/parents/real/created"),
+        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        dfs.posix_stat("/services/parents/real/renamed")
+            .expect("renamed target dir")
+            .kind,
+        DfsObjectKind::Directory
+    );
+
+    dfs.posix_unlink("/services/parents/link/created-link")
+        .expect("unlink through parent symlink");
+    assert!(matches!(
+        dfs.posix_lstat("/services/parents/real/created-link"),
+        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+    ));
+
+    let mut reloaded = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("reload metadata"),
+    )
+    .expect("reload metadata backend");
+    reloaded
+        .bootstrap_distributed_sifs()
+        .expect("reload bootstrap");
+    assert_eq!(
+        reloaded
+            .posix_stat("/services/parents/link/renamed")
+            .expect("reloaded stat through parent symlink")
+            .kind,
+        DfsObjectKind::Directory
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_persists_committed_metadata_through_backend() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
@@ -930,6 +1659,15 @@ fn networked_dfs_persists_committed_metadata_through_backend() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -1055,6 +1793,15 @@ fn networked_dfs_threshold_commit_repairs_missing_desired_replica() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1,
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -1144,6 +1891,15 @@ fn networked_dfs_plans_replicas_from_candidates_before_write() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -1242,6 +1998,15 @@ fn networked_dfs_read_state_distinguishes_pending_and_stale_cache() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone(), replica.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -1263,6 +2028,15 @@ fn networked_dfs_read_state_distinguishes_pending_and_stale_cache() {
             owner_node_id: owner,
             current_locations: vec![NodeId::from_legacy_named("node_owner").expect("node")],
             content_hash: Some(format!("blake3:{}", blake3::hash(b"new bytes").to_hex())),
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
             version: version_2.clone(),
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
@@ -1301,6 +2075,432 @@ fn networked_dfs_read_state_distinguishes_pending_and_stale_cache() {
 }
 
 #[test]
+fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_reader").expect("node");
+    let root = temp_root("networked_sifs_remote_posix_read");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
+    );
+    owner_dfs
+        .bootstrap_distributed_sifs()
+        .expect("owner bootstrap");
+    reader_dfs
+        .bootstrap_distributed_sifs()
+        .expect("reader bootstrap");
+    owner_dfs
+        .posix_mkdir_all("/services/readthrough")
+        .expect("owner mkdir");
+    reader_dfs
+        .posix_mkdir_all("/services/readthrough")
+        .expect("reader mkdir");
+    let stat = owner_dfs
+        .posix_write_file(
+            "/services/readthrough/file.txt",
+            b"remote bytes",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("owner write");
+    let file_metadata = owner_dfs
+        .metadata()
+        .object(&stat.object_id)
+        .expect("owner metadata")
+        .clone();
+    let link_stat = owner_dfs
+        .posix_symlink(
+            "file.txt",
+            "/services/readthrough/link.txt",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("owner symlink");
+    let link_metadata = owner_dfs
+        .metadata()
+        .object(&link_stat.object_id)
+        .expect("owner symlink metadata")
+        .clone();
+    let dir_link_stat = owner_dfs
+        .posix_symlink(
+            "readthrough",
+            "/services/readthrough-link",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("owner directory symlink");
+    let dir_link_metadata = owner_dfs
+        .metadata()
+        .object(&dir_link_stat.object_id)
+        .expect("owner directory symlink metadata")
+        .clone();
+    let overwrite_stat = owner_dfs
+        .posix_write_file(
+            "/services/readthrough/overwrite.txt",
+            b"remote base",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("owner overwrite base");
+    let overwrite_metadata = owner_dfs
+        .metadata()
+        .object(&overwrite_stat.object_id)
+        .expect("owner overwrite metadata")
+        .clone();
+    let truncate_stat = owner_dfs
+        .posix_write_file(
+            "/services/readthrough/truncate.txt",
+            b"truncate me",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("owner truncate base");
+    let truncate_metadata = owner_dfs
+        .metadata()
+        .object(&truncate_stat.object_id)
+        .expect("owner truncate metadata")
+        .clone();
+    assert_eq!(file_metadata.current_locations, vec![owner.clone()]);
+    assert_eq!(link_metadata.current_locations, vec![owner.clone()]);
+    assert_eq!(dir_link_metadata.current_locations, vec![owner.clone()]);
+    assert_eq!(overwrite_metadata.current_locations, vec![owner.clone()]);
+    assert_eq!(truncate_metadata.current_locations, vec![owner.clone()]);
+    reader_dfs
+        .add_object_metadata(file_metadata)
+        .expect("replicate metadata");
+    reader_dfs
+        .add_object_metadata(link_metadata)
+        .expect("replicate symlink metadata");
+    reader_dfs
+        .add_object_metadata(dir_link_metadata)
+        .expect("replicate directory symlink metadata");
+    reader_dfs
+        .add_object_metadata(overwrite_metadata)
+        .expect("replicate overwrite metadata");
+    reader_dfs
+        .add_object_metadata(truncate_metadata)
+        .expect("replicate truncate metadata");
+    assert_eq!(
+        reader_dfs
+            .posix_stat("/services/readthrough/file.txt")
+            .expect("metadata-only remote file stat")
+            .size_bytes,
+        Some(b"remote bytes".len() as u64)
+    );
+    assert_eq!(
+        reader_dfs
+            .posix_lstat("/services/readthrough/link.txt")
+            .expect("metadata-only remote symlink stat")
+            .size_bytes,
+        Some("file.txt".len() as u64)
+    );
+
+    let owner_dfs = Arc::new(Mutex::new(owner_dfs));
+    let owner_worker = {
+        let owner_dfs = Arc::clone(&owner_dfs);
+        let stat = stat.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let events = owner_dfs
+                    .lock()
+                    .expect("owner dfs lock")
+                    .process_incoming()
+                    .expect("owner serves read");
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id,
+                            result: sinomo_dfs::DfsReadResult::Found(_),
+                            ..
+                        } if object_id == &stat.object_id
+                    )
+                }) {
+                    return events;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owner did not receive remote read request"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+    };
+    assert_eq!(
+        reader_dfs
+            .posix_read_file_update_access("/services/readthrough/file.txt")
+            .expect("distributed POSIX read with atime update fetches remote content"),
+        b"remote bytes"
+    );
+    let owner_events = owner_worker.join().expect("owner worker");
+    assert!(owner_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadServed {
+                object_id,
+                result: sinomo_dfs::DfsReadResult::Found(_),
+                ..
+            } if object_id == &stat.object_id
+        )
+    }));
+    assert_eq!(
+        reader_dfs
+            .posix_read_file("/services/readthrough/file.txt")
+            .expect("posix read after cached read-through"),
+        b"remote bytes"
+    );
+    assert!(
+        reader_dfs
+            .metadata()
+            .object(&stat.object_id)
+            .expect("reader metadata")
+            .current_locations
+            .contains(&reader)
+    );
+
+    let owner_worker = {
+        let owner_dfs = Arc::clone(&owner_dfs);
+        let dir_link_stat = dir_link_stat.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let events = owner_dfs
+                    .lock()
+                    .expect("owner dfs lock")
+                    .process_incoming()
+                    .expect("owner serves intermediate symlink read");
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id,
+                            result: sinomo_dfs::DfsReadResult::Found(_),
+                            ..
+                        } if object_id == &dir_link_stat.object_id
+                    )
+                }) {
+                    return events;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owner did not receive remote intermediate symlink read request"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+    };
+    assert_eq!(
+        reader_dfs
+            .posix_read_file_distributed("/services/readthrough-link/file.txt")
+            .expect("distributed POSIX path resolution fetches intermediate symlink content"),
+        b"remote bytes"
+    );
+    let owner_events = owner_worker
+        .join()
+        .expect("owner intermediate symlink worker");
+    assert!(owner_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadServed {
+                object_id,
+                result: sinomo_dfs::DfsReadResult::Found(_),
+                ..
+            } if object_id == &dir_link_stat.object_id
+        )
+    }));
+    assert_eq!(
+        reader_dfs
+            .posix_read_file("/services/readthrough-link/file.txt")
+            .expect("posix read through cached intermediate symlink"),
+        b"remote bytes"
+    );
+
+    let owner_worker = {
+        let owner_dfs = Arc::clone(&owner_dfs);
+        let link_stat = link_stat.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let events = owner_dfs
+                    .lock()
+                    .expect("owner dfs lock")
+                    .process_incoming()
+                    .expect("owner serves symlink read");
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id,
+                            result: sinomo_dfs::DfsReadResult::Found(_),
+                            ..
+                        } if object_id == &link_stat.object_id
+                    )
+                }) {
+                    return events;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owner did not receive remote symlink read request"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+    };
+    assert_eq!(
+        reader_dfs
+            .posix_readlink_update_access("/services/readthrough/link.txt")
+            .expect("distributed POSIX readlink with atime update fetches remote symlink content"),
+        "file.txt"
+    );
+    let owner_events = owner_worker.join().expect("owner symlink worker");
+    assert!(owner_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadServed {
+                object_id,
+                result: sinomo_dfs::DfsReadResult::Found(_),
+                ..
+            } if object_id == &link_stat.object_id
+        )
+    }));
+    assert_eq!(
+        reader_dfs
+            .posix_readlink("/services/readthrough/link.txt")
+            .expect("posix readlink after cached read-through"),
+        "file.txt"
+    );
+    assert!(
+        reader_dfs
+            .metadata()
+            .object(&link_stat.object_id)
+            .expect("reader symlink metadata")
+            .current_locations
+            .contains(&reader)
+    );
+
+    let owner_worker = {
+        let owner_dfs = Arc::clone(&owner_dfs);
+        let overwrite_stat = overwrite_stat.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let events = owner_dfs
+                    .lock()
+                    .expect("owner dfs lock")
+                    .process_incoming()
+                    .expect("owner serves overwrite base read");
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id,
+                            result: sinomo_dfs::DfsReadResult::Found(_),
+                            ..
+                        } if object_id == &overwrite_stat.object_id
+                    )
+                }) {
+                    return events;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owner did not receive remote overwrite base read request"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+    };
+    let overwrite_result = reader_dfs
+        .posix_write_file_at(
+            "/services/readthrough/overwrite.txt",
+            7,
+            b"DFS",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![reader.clone()]),
+        )
+        .expect("distributed POSIX write-at fetches remote base content");
+    let owner_events = owner_worker.join().expect("owner overwrite worker");
+    assert!(owner_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadServed {
+                object_id,
+                result: sinomo_dfs::DfsReadResult::Found(_),
+                ..
+            } if object_id == &overwrite_stat.object_id
+        )
+    }));
+    assert_eq!(
+        reader_dfs
+            .posix_read_file("/services/readthrough/overwrite.txt")
+            .expect("write-at result is locally readable"),
+        b"remote DFSe"
+    );
+    assert_eq!(
+        overwrite_result.size_bytes,
+        Some(b"remote DFSe".len() as u64)
+    );
+
+    let owner_worker = {
+        let owner_dfs = Arc::clone(&owner_dfs);
+        let truncate_stat = truncate_stat.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let events = owner_dfs
+                    .lock()
+                    .expect("owner dfs lock")
+                    .process_incoming()
+                    .expect("owner serves truncate base read");
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id,
+                            result: sinomo_dfs::DfsReadResult::Found(_),
+                            ..
+                        } if object_id == &truncate_stat.object_id
+                    )
+                }) {
+                    return events;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owner did not receive remote truncate base read request"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+    };
+    let truncate_result = reader_dfs
+        .posix_truncate_file(
+            "/services/readthrough/truncate.txt",
+            8,
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![reader.clone()]),
+        )
+        .expect("distributed POSIX truncate fetches remote base content");
+    let owner_events = owner_worker.join().expect("owner truncate worker");
+    assert!(owner_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadServed {
+                object_id,
+                result: sinomo_dfs::DfsReadResult::Found(_),
+                ..
+            } if object_id == &truncate_stat.object_id
+        )
+    }));
+    assert_eq!(
+        reader_dfs
+            .posix_read_file("/services/readthrough/truncate.txt")
+            .expect("truncate result is locally readable"),
+        b"truncate"
+    );
+    assert_eq!(truncate_result.size_bytes, Some(8));
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_retries_offline_repair_when_replica_appears() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
@@ -1328,6 +2528,15 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -1473,6 +2682,15 @@ fn networked_dfs_rejected_stage_blob_does_not_create_replica_metadata() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1,
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -1561,6 +2779,15 @@ fn networked_dfs_replicated_confirmed_commits_after_all_receipts_and_reads_confi
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedConfirmed,
         created_by_event_id: None,
@@ -1681,6 +2908,15 @@ fn networked_dfs_replicated_confirmed_timeout_can_abort_pending_intent() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedConfirmed,
         created_by_event_id: None,
@@ -1796,6 +3032,15 @@ fn networked_dfs_replicated_confirmed_can_downgrade_then_repair() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedConfirmed,
         created_by_event_id: None,
@@ -1923,6 +3168,15 @@ fn networked_dfs_stale_replicated_eventual_write_creates_conflict_read_view() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_2.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -2021,6 +3275,15 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict
         owner_node_id: node.clone(),
         current_locations: vec![node.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_2.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,
@@ -2116,6 +3379,15 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_fences_old_owner() {
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone(), candidate.clone()],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: version_1.clone(),
         policy: DfsObjectPolicy::ReplicatedEventual,
         created_by_event_id: None,

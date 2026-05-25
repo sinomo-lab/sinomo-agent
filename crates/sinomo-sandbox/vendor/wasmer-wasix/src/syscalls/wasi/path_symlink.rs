@@ -71,6 +71,20 @@ pub fn path_symlink_internal(
         Ok(false) => return Err(Errno::Access),
         Err(err) => return Err(err),
     }
+    if path_requires_directory(new_path) {
+        let Some(link_path) =
+            crate::syscalls::wasix::key_for_path_at(env, fd, new_path).map(std::path::PathBuf::from)
+        else {
+            return Err(Errno::Noent);
+        };
+        match state.fs.root_fs.symlink_metadata(&link_path) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Err(Errno::Exist),
+            Ok(_) => return Err(Errno::Notdir),
+            Err(error) => {
+                return Err(super::path_link::io_error_into_wasi_err(error.into()));
+            }
+        }
+    }
 
     let new_path_path = std::path::Path::new(new_path);
     let (target_parent_inode, entry_name) =
@@ -143,4 +157,8 @@ pub fn path_symlink_internal(
     }
 
     Ok(())
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
 }

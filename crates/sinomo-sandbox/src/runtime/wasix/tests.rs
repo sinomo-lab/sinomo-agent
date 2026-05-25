@@ -1,10 +1,12 @@
 use super::memory::validate_wasix_module_memory_budget;
 use super::output::WasixStreamingOutputCapture;
 use super::sandbox_wasix_capabilities;
+use super::setup::WasixReadOnlyFileSystem;
 use crate::{
-    SANDBOX_OUTPUT_CHUNK_BYTES, SANDBOX_WASIX_MAX_TASKS, SandboxCancellation, SandboxCommandId,
-    SandboxCommandRequest, SandboxMountMode, SandboxOutputChunk, SandboxOutputStream, SandboxPath,
-    SandboxWasiError, SandboxWasiPreopen, SandboxWasiRunOptions,
+    LocalSandboxFileSystem, LocalSandboxInstanceLayout, SANDBOX_OUTPUT_CHUNK_BYTES,
+    SANDBOX_WASIX_MAX_TASKS, SandboxCancellation, SandboxCommandId, SandboxCommandRequest,
+    SandboxFileSystem, SandboxId, SandboxMountMode, SandboxOutputChunk, SandboxOutputStream,
+    SandboxPath, SandboxWasiError, SandboxWasiPreopen, SandboxWasiRunOptions,
 };
 use std::collections::BTreeMap;
 use std::{
@@ -36,6 +38,73 @@ fn wasix_capabilities_disable_ambient_authority_and_cap_tasks() {
             .threading
             .enable_exponential_cpu_backoff
             .is_none()
+    );
+}
+
+#[test]
+fn wasix_read_only_filesystem_rejects_mutating_operations() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-wasix-read-only-fs-{}",
+        crate::SandboxId::generate()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("file.txt"), b"hello").unwrap();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let host_fs =
+        virtual_fs::host_fs::FileSystem::new(tokio::runtime::Handle::current(), &root).unwrap();
+    let read_only = WasixReadOnlyFileSystem::new(Arc::new(host_fs));
+
+    let mut read_options = virtual_fs::FileSystem::new_open_options(&read_only);
+    let mut file = read_options.read(true).open("/file.txt").unwrap();
+    let mut bytes = Vec::new();
+    virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes)).unwrap();
+    assert_eq!(bytes, b"hello");
+    assert!(matches!(
+        file.as_mut().set_len(0),
+        Err(virtual_fs::FsError::PermissionDenied)
+    ));
+    assert!(matches!(
+        file.as_mut().set_times(Some(1), Some(2)),
+        Err(virtual_fs::FsError::PermissionDenied)
+    ));
+    assert!(matches!(
+        file.as_mut().note_link_added(),
+        Err(virtual_fs::FsError::PermissionDenied)
+    ));
+    assert!(matches!(
+        file.as_mut().note_link_removed(),
+        Err(virtual_fs::FsError::PermissionDenied)
+    ));
+    let write_error = virtual_mio::block_on(virtual_fs::AsyncWriteExt::write(&mut file, b"x"))
+        .expect_err("read-only file handle must reject writes");
+    assert_eq!(write_error.kind(), io::ErrorKind::PermissionDenied);
+
+    let mut write_options = virtual_fs::FileSystem::new_open_options(&read_only);
+    let error = write_options.write(true).open("/file.txt").unwrap_err();
+    assert!(matches!(error, virtual_fs::FsError::PermissionDenied));
+    assert!(matches!(
+        virtual_fs::FileSystem::create_dir(&read_only, "/new".as_ref()),
+        Err(virtual_fs::FsError::PermissionDenied)
+    ));
+    assert_eq!(fs::read(root.join("file.txt")).unwrap(), b"hello");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wasix_virtual_fs_error_conversion_preserves_posix_directory_errors() {
+    let not_directory: std::io::Error = virtual_fs::FsError::BaseNotDirectory.into();
+    assert_eq!(not_directory.kind(), std::io::ErrorKind::NotADirectory);
+
+    let not_file: std::io::Error = virtual_fs::FsError::NotAFile.into();
+    assert_eq!(not_file.kind(), std::io::ErrorKind::InvalidInput);
+
+    let directory_not_empty: std::io::Error = virtual_fs::FsError::DirectoryNotEmpty.into();
+    assert_eq!(
+        directory_not_empty.kind(),
+        std::io::ErrorKind::DirectoryNotEmpty
     );
 }
 
@@ -172,26 +241,6 @@ fn wasix_streaming_output_capture_rejects_unrepresentable_resize() {
 
     assert!(matches!(error, virtual_fs::FsError::UnknownError));
     assert!(capture.output_limit_exceeded().unwrap());
-}
-
-#[test]
-fn wasix_timeout_classifier_marks_late_completion_as_timed_out() {
-    assert!(super::wasix_command_exceeded_requested_timeout(
-        Duration::from_millis(10),
-        10
-    ));
-    assert!(super::wasix_command_exceeded_requested_timeout(
-        Duration::from_millis(11),
-        10
-    ));
-    assert!(!super::wasix_command_exceeded_requested_timeout(
-        Duration::from_millis(9),
-        10
-    ));
-    assert!(!super::wasix_command_exceeded_requested_timeout(
-        Duration::from_secs(3600),
-        crate::SANDBOX_UNLIMITED_WALL_TIME_MS
-    ));
 }
 
 #[test]
@@ -461,8 +510,86 @@ fn wasix_runner_rejects_file_cwd() {
     )
     .expect_err("file cwd should be rejected before WASIX starts");
 
-    assert!(format!("{error}").contains("is not a directory"));
+    let message = format!("{error}");
+    assert!(
+        message.contains("is not a directory"),
+        "unexpected error: {message}"
+    );
     fs::remove_dir_all(host_dir).ok();
+}
+
+#[test]
+fn wasix_runner_rejects_file_cwd_inside_virtual_preopen() {
+    let runtime_root = wasix_unique_test_dir("sinomo-sandbox-wasix-virtual-cwd-file");
+    let sandbox_id =
+        SandboxId::from_legacy_named("sandbox_wasix_virtual_cwd_file").expect("sandbox id");
+    let layout = LocalSandboxInstanceLayout::new(&runtime_root, &sandbox_id);
+    for dir in layout.required_dirs() {
+        fs::create_dir_all(dir).expect("instance dir");
+    }
+    let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
+    local_fs
+        .write(&SandboxPath::new("/work/not-a-dir").expect("path"), b"file")
+        .expect("cwd file");
+    let local_fs = Arc::new(Mutex::new(local_fs));
+    let mut request = wasix_test_request(1_000);
+    request.cwd = SandboxPath::new("/work/not-a-dir").expect("cwd");
+
+    let error = super::run_wasix_module(
+        wasix_noop_module().as_slice(),
+        request,
+        SandboxWasiRunOptions {
+            preopened_dirs: Vec::new(),
+            virtual_preopened_dirs: vec![super::wasix_sandbox_filesystem_preopen(
+                SandboxPath::new("/work").expect("guest"),
+                Arc::clone(&local_fs),
+                SandboxPath::new("/work").expect("root"),
+                SandboxMountMode::ReadWrite,
+            )],
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect_err("virtual file cwd should be rejected before WASIX starts");
+
+    let message = format!("{error}");
+    assert!(
+        message.contains("is not a directory"),
+        "unexpected error: {message}"
+    );
+    fs::remove_dir_all(runtime_root).ok();
+}
+
+#[test]
+fn wasix_runner_rejects_missing_cwd_inside_virtual_preopen() {
+    let runtime_root = wasix_unique_test_dir("sinomo-sandbox-wasix-virtual-cwd-missing");
+    let sandbox_id =
+        SandboxId::from_legacy_named("sandbox_wasix_virtual_cwd_missing").expect("sandbox id");
+    let layout = LocalSandboxInstanceLayout::new(&runtime_root, &sandbox_id);
+    for dir in layout.required_dirs() {
+        fs::create_dir_all(dir).expect("instance dir");
+    }
+    let local_fs = Arc::new(Mutex::new(LocalSandboxFileSystem::new(layout)));
+    let mut request = wasix_test_request(1_000);
+    request.cwd = SandboxPath::new("/work/missing").expect("cwd");
+
+    let error = super::run_wasix_module(
+        wasix_noop_module().as_slice(),
+        request,
+        SandboxWasiRunOptions {
+            preopened_dirs: Vec::new(),
+            virtual_preopened_dirs: vec![super::wasix_sandbox_filesystem_preopen(
+                SandboxPath::new("/work").expect("guest"),
+                Arc::clone(&local_fs),
+                SandboxPath::new("/work").expect("root"),
+                SandboxMountMode::ReadWrite,
+            )],
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect_err("missing virtual cwd should be rejected before WASIX starts");
+
+    assert!(format!("{error}").contains("is invalid"));
+    fs::remove_dir_all(runtime_root).ok();
 }
 
 #[cfg(unix)]

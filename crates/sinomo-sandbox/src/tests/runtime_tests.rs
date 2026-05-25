@@ -35,6 +35,95 @@ fn local_wasi_runner_captures_stdout_and_chunks() {
     assert_eq!(outcome.output_chunks[0].bytes, b"hello\n");
 }
 
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn local_wasi_runner_rejects_virtual_preopens() {
+    let runner = LocalWasiCommandRunner::new().expect("runner");
+    let request = test_wasi_request(1_000);
+
+    let error = runner
+        .run_module(
+            wasi_stdout_module(),
+            request,
+            SandboxWasiRunOptions {
+                virtual_preopened_dirs: vec![SandboxWasiVirtualPreopen {
+                    guest_path: SandboxPath::new("/work").expect("work"),
+                    mode: SandboxMountMode::ReadWrite,
+                    fs: Arc::new(virtual_fs::mem_fs::FileSystem::default()),
+                }],
+                ..SandboxWasiRunOptions::default()
+            },
+        )
+        .expect_err("Preview1 must not silently ignore virtual preopens");
+
+    assert!(matches!(error, SandboxWasiError::InvalidRequest { .. }));
+    assert!(
+        error.to_string().contains("use WASIX"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn virtual_mem_fs_seek_beyond_end_then_write_creates_sparse_gap() {
+    virtual_mio::block_on(async {
+        use virtual_fs::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, FileSystem as _};
+
+        let fs = virtual_fs::mem_fs::FileSystem::default();
+        let mut file = fs
+            .new_open_options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(std::path::Path::new("/sparse.txt"))
+            .expect("create sparse file");
+
+        file.write_all(b"hi").await.expect("write prefix");
+        assert_eq!(
+            file.seek(std::io::SeekFrom::Start(5))
+                .await
+                .expect("seek past end"),
+            5
+        );
+        file.write_all(b"!").await.expect("write sparse suffix");
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .expect("rewind");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await.expect("read sparse");
+        assert_eq!(bytes, b"hi\0\0\0!");
+    });
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn virtual_mem_fs_read_after_seek_beyond_end_returns_eof() {
+    virtual_mio::block_on(async {
+        use virtual_fs::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, FileSystem as _};
+
+        let fs = virtual_fs::mem_fs::FileSystem::default();
+        let mut file = fs
+            .new_open_options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(std::path::Path::new("/eof.txt"))
+            .expect("create eof file");
+
+        file.write_all(b"hi").await.expect("write prefix");
+        assert_eq!(
+            file.seek(std::io::SeekFrom::Start(5))
+                .await
+                .expect("seek past end"),
+            5
+        );
+        let mut bytes = Vec::new();
+        let read = file.read_to_end(&mut bytes).await.expect("read eof");
+        assert_eq!(read, 0);
+        assert!(bytes.is_empty());
+    });
+}
+
 #[test]
 fn local_wasi_subprocess_resolves_child_from_pinned_bin() {
     let runner = LocalWasiCommandRunner::new().expect("runner");
@@ -6160,6 +6249,140 @@ fn wasix_runner_rejects_write_to_read_only_preopen() {
     assert_ne!(outcome.response.exit_status, 0);
     assert!(!host_dir.join("out.txt").exists());
     fs::remove_dir_all(host_dir).ok();
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn wasix_runner_denies_create_when_parent_mode_disallows_mutation() {
+    let (_manifest, layout, runtime_root) =
+        create_test_instance("sandbox_wasix_parent_create_permission");
+    let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
+    let work_path = SandboxPath::new("/work").expect("work path");
+    sandbox_fs
+        .set_owner(&work_path, 0, 0)
+        .expect("set work owner");
+    sandbox_fs
+        .set_mode(&work_path, 0o555)
+        .expect("set work mode");
+    let sandbox_fs = Arc::new(Mutex::new(sandbox_fs));
+
+    let module = r#"
+        (module
+          (import "wasix_32v1" "setuid"
+            (func $setuid (param i32) (result i32)))
+          (import "wasix_32v1" "path_open2"
+            (func $path_open2 (param i32 i32 i32 i32 i32 i64 i64 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_close"
+            (func $fd_close (param i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $proc_exit (param i32)))
+          (memory (export "memory") 1 128)
+          (data (i32.const 96) "/work/blocked.txt")
+          (func $exit_if_errno (param $errno i32) (param $code i32)
+            local.get $errno
+            i32.eqz
+            if
+            else
+              local.get $code
+              call $proc_exit
+            end)
+          (func (export "_start") (local $errno i32)
+            i32.const 1001
+            call $setuid
+            i32.const 80
+            call $exit_if_errno
+
+            i32.const 3
+            i32.const 0
+            i32.const 96
+            i32.const 17
+            i32.const 9
+            i64.const 64
+            i64.const 0
+            i32.const 0
+            i32.const 0
+            i32.const 64
+            call $path_open2
+            local.set $errno
+
+            local.get $errno
+            i32.eqz
+            if
+              i32.const 64
+              i32.load
+              call $fd_close
+              drop
+              i32.const 90
+              call $proc_exit
+            end
+
+            local.get $errno
+            i32.const 2
+            i32.ne
+            if
+              local.get $errno
+              call $proc_exit
+            end))
+        "#;
+
+    let outcome = runtime::run_wasix_module(
+        wat::parse_str(module).expect("module").as_slice(),
+        test_wasi_request(5_000),
+        SandboxWasiRunOptions {
+            virtual_preopened_dirs: runtime::wasix_sandbox_workspace_filesystem_preopens(
+                Arc::clone(&sandbox_fs),
+                SandboxMountMode::ReadWrite,
+            ),
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect("run");
+
+    assert_eq!(
+        outcome.response.exit_status,
+        0,
+        "stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&outcome.stdout),
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+    assert!(matches!(
+        sandbox_fs
+            .lock()
+            .expect("fs")
+            .read(
+                &SandboxPath::new("/work/blocked.txt").expect("blocked path"),
+                None
+            )
+            .expect_err("denied create should not persist"),
+        SandboxFsError::NotFound { .. }
+    ));
+    fs::remove_dir_all(runtime_root).ok();
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn wasix_runner_uses_virtual_cwd_without_host_cwd_path() {
+    let (_manifest, layout, runtime_root) =
+        create_test_instance("sandbox_wasix_virtual_cwd_no_host_path");
+    let sandbox_fs = Arc::new(Mutex::new(LocalSandboxFileSystem::new(layout)));
+
+    let outcome = runtime::run_wasix_module(
+        wasi_stdout_module().as_bytes(),
+        test_wasi_request(5_000),
+        SandboxWasiRunOptions {
+            virtual_preopened_dirs: runtime::wasix_sandbox_workspace_filesystem_preopens(
+                Arc::clone(&sandbox_fs),
+                SandboxMountMode::ReadWrite,
+            ),
+            working_directory_host_path: Some(runtime_root.join("not-a-mounted-cwd")),
+            ..SandboxWasiRunOptions::default()
+        },
+    )
+    .expect("WASIX virtual cwd should not need a host cwd path");
+
+    assert_eq!(outcome.response.exit_status, 0);
+    assert_eq!(outcome.stdout, b"hello\n");
+    fs::remove_dir_all(runtime_root).ok();
 }
 
 #[cfg(not(feature = "wasix-runtime"))]

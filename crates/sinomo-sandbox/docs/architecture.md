@@ -68,13 +68,15 @@ The runtime sees a virtual Unix tree. Typical mounts include:
 
 All sandbox filesystem operations should go through the virtual filesystem layer. The local host-backed filesystem is a development backend and staging implementation detail. Runtime code should not assume host paths are available or stable, because production state is expected to be SIFS-backed.
 
+SIFS-backed WASIX execution mounts the sandbox workspace and declared SIFS mounts as virtual preopens backed directly by `SandboxFileSystem`; it must not copy SIFS state into host directories for the actual command run. Toolchain artifacts are provided through read-only virtual preopens built from the SIFS toolchain objects. WASI Preview1 remains a local-only compatibility runner and must not be used for cluster-backed SIFS execution.
+
 The virtual filesystem layer owns:
 
 - path normalization and escape checks,
 - read-only and read-write mount behavior,
 - symlink and hardlink semantics,
 - file metadata and usage accounting,
-- local-to-SIFS staging and writeback,
+- direct SIFS-backed WASIX mounts and local development backends,
 - generated device and procfs entries.
 
 ## Runtime Model

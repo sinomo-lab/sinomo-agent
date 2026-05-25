@@ -85,7 +85,6 @@ pub(crate) mod prelude {
         daemon_loopback_endpoint_id, main_daemon_capabilities, shadow_daemon_capabilities,
         shadow_daemon_node_id,
     };
-    pub(crate) use std::cell::RefCell;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
     pub(crate) use std::fs;
     pub(crate) use std::io::{self, Write};
@@ -93,9 +92,9 @@ pub(crate) mod prelude {
     #[cfg(feature = "iroh-transport")]
     pub(crate) use std::net::{Shutdown, TcpStream, ToSocketAddrs};
     pub(crate) use std::path::PathBuf;
-    pub(crate) use std::rc::Rc;
     #[cfg(feature = "iroh-transport")]
     pub(crate) use std::sync::mpsc;
+    pub(crate) use std::sync::{Arc, Mutex};
     #[cfg(feature = "iroh-transport")]
     pub(crate) use std::thread;
     pub(crate) use std::time::Duration;

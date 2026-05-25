@@ -2,21 +2,11 @@ use super::*;
 use crate::VIRTUAL_ROOT_FD;
 use crate::syscalls::*;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 const AT_FDCWD_AS_WASI_FD: WasiFd = (-100i32) as WasiFd;
-const POSIX_METADATA_DIR: &str = "posix";
-const POSIX_MODE_SIDECAR: &str = "modes";
-const POSIX_OWNER_SIDECAR: &str = "owners";
-const POSIX_TIME_SIDECAR: &str = "times";
-const POSIX_SYMLINK_SIDECAR: &str = "symlinks";
-const POSIX_HARDLINK_SIDECAR: &str = "hardlinks";
 const POSIX_ID_UNCHANGED: u32 = u32::MAX;
 static POSIX_MODE_OVERRIDES: LazyLock<Mutex<HashMap<u64, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -383,7 +373,7 @@ pub fn path_read_symlink_at<M: MemorySize>(
 }
 
 /// ### `path_is_symlink_at()`
-/// Tests whether a path is a POSIX symlink sidecar entry.
+/// Tests whether a path is a POSIX symlink.
 #[instrument(level = "trace", skip_all, fields(%fd, path = field::Empty), ret)]
 pub fn path_is_symlink_at<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
@@ -404,7 +394,7 @@ pub fn path_is_symlink_at<M: MemorySize>(
 }
 
 /// ### `path_unlink_symlink_at()`
-/// Removes a persisted POSIX symlink mapping.
+/// Removes a POSIX symlink.
 #[instrument(level = "trace", skip_all, fields(%fd, path = field::Empty), ret)]
 pub fn path_unlink_symlink_at<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
@@ -426,33 +416,29 @@ fn path_chmod_internal(env: &WasiEnv, path: &str, mode: u32) -> Errno {
 }
 
 fn path_chmod_at_internal(env: &WasiEnv, fd: WasiFd, path: &str, mode: u32) -> Errno {
-    if let Some(target) = resolve_sidecar_symlink_path_at(env, fd, path) {
+    if let Err(err) = validate_trailing_directory_path(env, fd, path) {
+        return err;
+    }
+    if let Some(target) = resolve_symlink_path_at(env, fd, path) {
         return path_chmod_at_internal(env, VIRTUAL_ROOT_FD, &target, mode);
     }
     let mode = match validate_chmod_request(env, fd, path, mode) {
         Ok(mode) => mode,
         Err(err) => return err,
     };
-    let inode = sandbox_inode_at(env, fd, path).ok();
-    let host_path = match sandbox_host_path_at(env, fd, path) {
-        Ok(host_path) => host_path,
-        Err(err) => {
-            if let Some(inode) = inode {
-                set_inode_mode(inode.ino().as_u64(), mode);
-                return Errno::Success;
-            }
-            return err;
-        }
+    let inode = match sandbox_inode_at(env, fd, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
     };
-
-    match chmod_host_path(&host_path, mode) {
-        Errno::Success | Errno::Noent => {
-            if let Some(inode) = inode {
-                set_inode_mode(inode.ino().as_u64(), mode);
-            }
+    let Some(key) = mode_key_for_inode(&inode) else {
+        return Errno::Notsup;
+    };
+    match env.state.fs.root_fs.set_mode(Path::new(&key), mode) {
+        Ok(()) => {
+            set_inode_mode(inode.ino().as_u64(), mode);
             Errno::Success
         }
-        err => err,
+        Err(error) => fs_error_into_errno(error),
     }
 }
 
@@ -461,17 +447,18 @@ fn path_mode_internal(env: &WasiEnv, path: &str) -> Result<u32, Errno> {
 }
 
 fn path_mode_at_internal(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<u32, Errno> {
-    if let Ok(inode) = sandbox_inode_at(env, fd, path) {
-        if let Some(mode) = inode_mode(inode.ino().as_u64()) {
-            return Ok(mode);
-        }
-        if let Ok(host_path) = inode_host_path(&inode) {
-            return host_path_mode(&host_path).or_else(|_| Ok(default_inode_mode(&inode)));
-        }
-        return Ok(default_inode_mode(&inode));
+    validate_trailing_directory_path(env, fd, path)?;
+    let inode = sandbox_inode_at(env, fd, path)?;
+    if let Some(mode) = inode_mode(inode.ino().as_u64()) {
+        return Ok(mode);
     }
-    let host_path = sandbox_host_path_at(env, fd, path)?;
-    host_path_mode(&host_path)
+    if let Some(key) = mode_key_for_inode(&inode)
+        && let Ok(metadata) = env.state.fs.root_fs.metadata(Path::new(&key))
+        && metadata.mode() != 0
+    {
+        return Ok(metadata.mode() & 0o7777);
+    }
+    Ok(default_inode_mode(&inode))
 }
 
 fn fd_chmod_internal(env: &WasiEnv, fd: WasiFd, mode: u32) -> Errno {
@@ -479,20 +466,45 @@ fn fd_chmod_internal(env: &WasiEnv, fd: WasiFd, mode: u32) -> Errno {
         Ok(inode) => inode,
         Err(err) => return err,
     };
-
-    let host_result = match inode_host_path(&inode) {
-        Ok(path) => chmod_host_path(&path, mode),
-        Err(Errno::Access | Errno::Notsup) => Errno::Success,
-        Err(err) => err,
+    let mode = match validate_fd_chmod_request(env, &inode, mode) {
+        Ok(mode) => mode,
+        Err(err) => return err,
     };
 
-    match host_result {
-        Errno::Success | Errno::Noent => {
-            set_inode_mode(inode.ino().as_u64(), mode);
-            Errno::Success
+    let open_file_handle = {
+        let guard = inode.read();
+        match guard.deref() {
+            Kind::File {
+                handle: Some(handle),
+                ..
+            } => Some(handle.clone()),
+            _ => None,
         }
-        err => err,
+    };
+    if let Some(handle) = open_file_handle {
+        match handle
+            .write()
+            .map_err(|_| Errno::Io)
+            .and_then(|mut handle| handle.set_mode(mode).map_err(fs_error_into_errno))
+        {
+            Ok(()) => {
+                set_inode_mode(inode.ino().as_u64(), mode);
+                return Errno::Success;
+            }
+            Err(err) => return err,
+        }
     }
+
+    if let Some(key) = mode_key_for_inode(&inode) {
+        match env.state.fs.root_fs.set_mode(Path::new(&key), mode) {
+            Ok(()) => {
+                set_inode_mode(inode.ino().as_u64(), mode);
+                return Errno::Success;
+            }
+            Err(error) => return fs_error_into_errno(error),
+        }
+    }
+    Errno::Notsup
 }
 
 fn fd_mode_internal(env: &WasiEnv, fd: WasiFd) -> Result<u32, Errno> {
@@ -500,14 +512,20 @@ fn fd_mode_internal(env: &WasiEnv, fd: WasiFd) -> Result<u32, Errno> {
     if let Some(mode) = inode_mode(inode.ino().as_u64()) {
         return Ok(mode);
     }
-    if let Ok(host_path) = inode_host_path(&inode) {
-        return host_path_mode(&host_path).or_else(|_| Ok(default_inode_mode(&inode)));
+    if let Some(key) = mode_key_for_inode(&inode)
+        && let Ok(metadata) = env.state.fs.root_fs.metadata(Path::new(&key))
+        && metadata.mode() != 0
+    {
+        return Ok(metadata.mode() & 0o7777);
     }
     Ok(default_inode_mode(&inode))
 }
 
 fn path_chown_at_internal(env: &WasiEnv, fd: WasiFd, path: &str, uid: u32, gid: u32) -> Errno {
-    if let Some(target) = resolve_sidecar_symlink_path_at(env, fd, path) {
+    if let Err(err) = validate_trailing_directory_path(env, fd, path) {
+        return err;
+    }
+    if let Some(target) = resolve_symlink_path_at(env, fd, path) {
         return path_chown_at_internal(env, VIRTUAL_ROOT_FD, &target, uid, gid);
     }
     let inode = match sandbox_inode_at(env, fd, path) {
@@ -517,18 +535,39 @@ fn path_chown_at_internal(env: &WasiEnv, fd: WasiFd, path: &str, uid: u32, gid: 
     let key = mode_key_for_inode(&inode);
     let current = key
         .as_deref()
-        .and_then(|key| persistent_owner(env, key))
+        .and_then(|key| owner_from_metadata(env, key))
         .or_else(|| inode_owner(inode.ino().as_u64()))
         .unwrap_or((0, 0));
     let (uid, gid) = match validate_chown_request(env, current, uid, gid) {
         Ok(owner) => owner,
         Err(err) => return err,
     };
-    set_inode_owner(inode.ino().as_u64(), uid, gid);
-    if let Some(key) = mode_key_for_inode(&inode) {
-        set_persistent_owner_for_key(env, &key, uid, gid);
+    let Some(key) = mode_key_for_inode(&inode) else {
+        return Errno::Notsup;
+    };
+    match env.state.fs.root_fs.set_owner(Path::new(&key), uid, gid) {
+        Ok(()) => {
+            set_inode_owner(inode.ino().as_u64(), uid, gid);
+            Errno::Success
+        }
+        Err(error) => fs_error_into_errno(error),
     }
-    Errno::Success
+}
+
+fn validate_trailing_directory_path(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<(), Errno> {
+    if !path_requires_directory(path) {
+        return Ok(());
+    }
+    let key = key_for_path_at(env, fd, path).ok_or(Errno::Noent)?;
+    match env.state.fs.root_fs.metadata(Path::new(&key)) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(Errno::Notdir),
+        Err(error) => Err(fs_error_into_errno(error)),
+    }
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
 }
 
 fn fd_chown_internal(env: &WasiEnv, fd: WasiFd, uid: u32, gid: u32) -> Errno {
@@ -536,21 +575,44 @@ fn fd_chown_internal(env: &WasiEnv, fd: WasiFd, uid: u32, gid: u32) -> Errno {
         Ok(inode) => inode,
         Err(err) => return err,
     };
-    let key = mode_key_for_inode(&inode);
-    let current = key
-        .as_deref()
-        .and_then(|key| persistent_owner(env, key))
-        .or_else(|| inode_owner(inode.ino().as_u64()))
-        .unwrap_or((0, 0));
+    let current = fd_owner_for_chown(env, &inode);
     let (uid, gid) = match validate_chown_request(env, current, uid, gid) {
         Ok(owner) => owner,
         Err(err) => return err,
     };
-    set_inode_owner(inode.ino().as_u64(), uid, gid);
-    if let Some(key) = mode_key_for_inode(&inode) {
-        set_persistent_owner_for_key(env, &key, uid, gid);
+    let open_file_handle = {
+        let guard = inode.read();
+        match guard.deref() {
+            Kind::File {
+                handle: Some(handle),
+                ..
+            } => Some(handle.clone()),
+            _ => None,
+        }
+    };
+    if let Some(handle) = open_file_handle {
+        match handle
+            .write()
+            .map_err(|_| Errno::Io)
+            .and_then(|mut handle| handle.set_owner(uid, gid).map_err(fs_error_into_errno))
+        {
+            Ok(()) => {
+                set_inode_owner(inode.ino().as_u64(), uid, gid);
+                return Errno::Success;
+            }
+            Err(err) => return err,
+        }
     }
-    Errno::Success
+    if let Some(key) = mode_key_for_inode(&inode) {
+        match env.state.fs.root_fs.set_owner(Path::new(&key), uid, gid) {
+            Ok(()) => {
+                set_inode_owner(inode.ino().as_u64(), uid, gid);
+                return Errno::Success;
+            }
+            Err(error) => return fs_error_into_errno(error),
+        }
+    }
+    Errno::Notsup
 }
 
 fn path_owner_at_internal(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<(u32, u32), Errno> {
@@ -559,7 +621,7 @@ fn path_owner_at_internal(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<(u32,
         return Ok(owner);
     }
     if let Some(key) = mode_key_for_inode(&inode) {
-        if let Some(owner) = persistent_owner(env, &key) {
+        if let Some(owner) = owner_from_metadata(env, &key) {
             return Ok(owner);
         }
     }
@@ -572,7 +634,7 @@ fn fd_owner_internal(env: &WasiEnv, fd: WasiFd) -> Result<(u32, u32), Errno> {
         return Ok(owner);
     }
     if let Some(key) = mode_key_for_inode(&inode) {
-        if let Some(owner) = persistent_owner(env, &key) {
+        if let Some(owner) = owner_from_metadata(env, &key) {
             return Ok(owner);
         }
     }
@@ -586,18 +648,31 @@ fn path_touch_at_internal(
     touch_self: bool,
     touch_parent: bool,
 ) -> Errno {
+    if let Err(err) = validate_trailing_directory_path(env, fd, path) {
+        return err;
+    }
     let now = current_time_ns();
     let mut touched = false;
     if touch_self {
-        if let Ok(inode) = sandbox_inode_at(env, fd, path) {
-            set_inode_times(inode.ino().as_u64(), now, now, now);
-            touched = true;
+        match path_set_times_at(env, fd, path, true, now, now) {
+            Ok(()) => touched = true,
+            Err(Errno::Noent) => {}
+            Err(err) => return err,
         }
     }
     if touch_parent {
         if let Some(parent) = parent_key_for_path(env, fd, path)
             && let Ok(parent_inode) = sandbox_inode_at(env, VIRTUAL_ROOT_FD, &parent)
         {
+            match env
+                .state
+                .fs
+                .root_fs
+                .set_times(Path::new(&parent), Some(now), Some(now))
+            {
+                Ok(()) => {}
+                Err(error) => return fs_error_into_errno(error),
+            }
             set_inode_times(parent_inode.ino().as_u64(), now, now, now);
             touched = true;
         }
@@ -610,22 +685,65 @@ fn path_touch_at_internal(
 }
 
 fn fd_touch_internal(env: &WasiEnv, fd: WasiFd) -> Errno {
-    let inode = match fd_inode(env, fd) {
-        Ok(inode) => inode,
-        Err(err) => return err,
-    };
-    if mode_key_for_inode(&inode).is_none() {
-        return Errno::Notsup;
-    }
     let now = current_time_ns();
-    set_inode_times(inode.ino().as_u64(), now, now, now);
-    Errno::Success
+    match fd_set_times(env, fd, now, now) {
+        Ok(()) => Errno::Success,
+        Err(err) => err,
+    }
+}
+
+pub(crate) fn fd_set_times(
+    env: &WasiEnv,
+    fd: WasiFd,
+    atime: u64,
+    mtime: u64,
+) -> Result<(), Errno> {
+    let inode = fd_inode(env, fd)?;
+    let open_file_handle = {
+        let guard = inode.read();
+        match guard.deref() {
+            Kind::File {
+                handle: Some(handle),
+                ..
+            } => Some(handle.clone()),
+            _ => None,
+        }
+    };
+    if let Some(handle) = open_file_handle {
+        handle
+            .write()
+            .map_err(|_| Errno::Io)?
+            .set_times(Some(atime), Some(mtime))
+            .map_err(fs_error_into_errno)?;
+        set_inode_times(inode.ino().as_u64(), atime, mtime, current_time_ns());
+        return Ok(());
+    }
+    if let Some(key) = mode_key_for_inode(&inode) {
+        match env
+            .state
+            .fs
+            .root_fs
+            .set_times(Path::new(&key), Some(atime), Some(mtime))
+        {
+            Ok(()) => {}
+            Err(error) => return Err(fs_error_into_errno(error)),
+        }
+    } else {
+        return Err(Errno::Notsup);
+    }
+    set_inode_times(inode.ino().as_u64(), atime, mtime, current_time_ns());
+    Ok(())
 }
 
 fn path_times_at_internal(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<(u64, u64, u64), Errno> {
     let inode = sandbox_inode_at(env, fd, path)?;
     if let Some(times) = inode_times(inode.ino().as_u64()) {
         return Ok(times);
+    }
+    if let Some(key) = mode_key_for_inode(&inode)
+        && let Ok(metadata) = env.state.fs.root_fs.metadata(Path::new(&key))
+    {
+        return Ok((metadata.accessed(), metadata.modified(), metadata.created()));
     }
     let stat = inode.stat.read().map_err(|_| Errno::Io)?;
     Ok((stat.st_atim, stat.st_mtim, stat.st_ctim))
@@ -645,11 +763,14 @@ pub(crate) fn path_parent_mutation_allowed_at(
     fd: WasiFd,
     path: &str,
 ) -> Result<bool, Errno> {
-    let key = key_for_path_at(env, fd, path).ok_or(Errno::Noent)?;
-    let parent = Path::new(&key).parent().ok_or(Errno::Noent)?;
-    let parent_key = normalize_absolute_virtual_path(&parent.to_string_lossy());
-    let mode = path_mode_at_internal(env, VIRTUAL_ROOT_FD, &parent_key).unwrap_or(0o777);
-    let (uid, gid) = path_owner_at_internal(env, VIRTUAL_ROOT_FD, &parent_key).unwrap_or((0, 0));
+    let parent_path = Path::new(path).parent().ok_or(Errno::Noent)?;
+    let parent_key = if parent_path.as_os_str().is_empty() {
+        "."
+    } else {
+        parent_path.to_str().ok_or(Errno::Inval)?
+    };
+    let mode = path_mode_at_internal(env, fd, parent_key).unwrap_or(0o777);
+    let (uid, gid) = path_owner_at_internal(env, fd, parent_key).unwrap_or((0, 0));
     let identity = env.process.identity();
     Ok(identity_allows_mode(
         &identity, mode, uid, gid, 0o300, 0o030, 0o003,
@@ -662,20 +783,52 @@ pub(crate) fn path_touch_parent_at(env: &WasiEnv, fd: WasiFd, path: &str) {
         if let Ok(inode) = sandbox_inode_at(env, VIRTUAL_ROOT_FD, &parent) {
             set_inode_times(inode.ino().as_u64(), now, now, now);
         }
+        let _ = env
+            .state
+            .fs
+            .root_fs
+            .set_times(Path::new(&parent), Some(now), Some(now));
     }
 }
 
-pub(crate) fn path_set_times_at(env: &WasiEnv, fd: WasiFd, path: &str, atime: u64, mtime: u64) {
-    if let Ok(inode) = sandbox_inode_at(env, fd, path) {
+pub(crate) fn path_set_times_at(
+    env: &WasiEnv,
+    fd: WasiFd,
+    path: &str,
+    follow_symlink: bool,
+    atime: u64,
+    mtime: u64,
+) -> Result<(), Errno> {
+    let result = key_for_path_at(env, fd, path).map(|key| {
+        if follow_symlink {
+            env.state
+                .fs
+                .root_fs
+                .set_times(Path::new(&key), Some(atime), Some(mtime))
+        } else {
+            env.state
+                .fs
+                .root_fs
+                .set_symlink_times(Path::new(&key), Some(atime), Some(mtime))
+        }
+    });
+    if let Some(result) = result {
+        match result {
+            Ok(()) => {}
+            Err(error) => return Err(fs_error_into_errno(error)),
+        };
+    } else {
+        return Err(Errno::Notsup);
+    }
+
+    if let Ok(inode) = sandbox_inode_at_with_follow(env, fd, path, follow_symlink) {
         set_inode_times(inode.ino().as_u64(), atime, mtime, current_time_ns());
     }
+    Ok(())
 }
 
 pub(crate) fn path_remove_metadata_at(env: &WasiEnv, fd: WasiFd, path: &str) {
-    let Some(key) = key_for_path_at(env, fd, path) else {
-        return;
-    };
-    remove_metadata_key(env, &key);
+    let _ = (env, fd, path);
 }
 
 pub(crate) fn path_register_hardlink_at(
@@ -685,9 +838,6 @@ pub(crate) fn path_register_hardlink_at(
     target_fd: WasiFd,
     target_path: &str,
 ) {
-    let Some(target_key) = key_for_path_at(env, target_fd, target_path) else {
-        return;
-    };
     let now = current_time_ns();
     if let Ok(inode) = sandbox_inode_at(env, source_fd, source_path) {
         set_inode_times(inode.ino().as_u64(), now, now, now);
@@ -703,17 +853,34 @@ pub(crate) fn path_register_hardlink_at(
     }
     if let Ok((uid, gid)) = path_owner_at_internal(env, source_fd, source_path) {
         if (uid, gid) != (0, 0) {
-            set_persistent_owner(env, &target_key, uid, gid);
+            if let Some(target_key) = key_for_path_at(env, target_fd, target_path)
+                && env
+                    .state
+                    .fs
+                    .root_fs
+                    .set_owner(Path::new(&target_key), uid, gid)
+                    .is_ok()
+                && let Ok(inode) = sandbox_inode_at(env, target_fd, target_path)
+            {
+                set_inode_owner(inode.ino().as_u64(), uid, gid);
+            }
         }
     }
 }
 
 pub(crate) fn path_hardlink_stat_at(
-    _env: &WasiEnv,
-    _fd: WasiFd,
-    _path: &str,
+    env: &WasiEnv,
+    fd: WasiFd,
+    path: &str,
+    follow_symlink: bool,
 ) -> Option<(u64, u64)> {
-    None
+    let key = key_for_path_at(env, fd, path)?;
+    let metadata = if follow_symlink {
+        env.state.fs.root_fs.metadata(Path::new(&key)).ok()?
+    } else {
+        env.state.fs.root_fs.symlink_metadata(Path::new(&key)).ok()?
+    };
+    Some((metadata.ino(), metadata.nlink().max(1)))
 }
 
 pub(crate) fn path_rename_metadata_at(
@@ -723,13 +890,6 @@ pub(crate) fn path_rename_metadata_at(
     target_fd: WasiFd,
     target_path: &str,
 ) {
-    let Some(source_key) = key_for_path_at(env, source_fd, source_path) else {
-        return;
-    };
-    let Some(target_key) = key_for_path_at(env, target_fd, target_path) else {
-        return;
-    };
-    move_metadata_key(env, &source_key, &target_key);
     path_touch_parent_at(env, source_fd, source_path);
     path_touch_parent_at(env, target_fd, target_path);
 }
@@ -784,11 +944,6 @@ pub(crate) fn path_rename_symlink_at(
     ) {
         return fs_error_into_errno(error);
     }
-    let mut times = load_persistent_times(env);
-    if let Some(time) = times.remove(&source_key) {
-        times.insert(target_key, time);
-        save_persistent_times(env, &times);
-    }
     path_touch_parent_at(env, source_fd, source_path);
     path_touch_parent_at(env, target_fd, target_path);
     Errno::Success
@@ -838,6 +993,38 @@ fn validate_chmod_request(
     Ok(mode)
 }
 
+fn validate_fd_chmod_request(
+    env: &WasiEnv,
+    inode: &crate::fs::InodeGuard,
+    requested_mode: u32,
+) -> Result<u32, Errno> {
+    let identity = env.process.identity();
+    if identity.effective_uid == 0 {
+        return Ok(requested_mode);
+    }
+    let (uid, gid) = fd_owner_for_chown(env, inode);
+    if identity.effective_uid != uid {
+        return Err(Errno::Perm);
+    }
+    let mut mode = requested_mode;
+    let group_matches =
+        identity.effective_gid == gid || identity.groups.iter().any(|group| *group == gid);
+    if !group_matches {
+        mode &= !0o2000;
+    }
+    Ok(mode)
+}
+
+fn fd_owner_for_chown(env: &WasiEnv, inode: &crate::fs::InodeGuard) -> (u32, u32) {
+    inode_owner(inode.ino().as_u64())
+        .or_else(|| {
+            mode_key_for_inode(inode)
+                .as_deref()
+                .and_then(|key| owner_from_metadata(env, key))
+        })
+        .unwrap_or((0, 0))
+}
+
 fn validate_chown_request(
     env: &WasiEnv,
     current: (u32, u32),
@@ -876,7 +1063,7 @@ fn validate_chown_request(
     Ok((next_uid, next_gid))
 }
 
-fn resolve_sidecar_symlink_path_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Option<String> {
+fn resolve_symlink_path_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Option<String> {
     let target = path_symlink_target_at_internal(env, fd, path).ok()?;
     if target.starts_with('/') {
         return Some(normalize_absolute_virtual_path(&target));
@@ -909,18 +1096,14 @@ fn path_symlink_at_internal(env: &WasiEnv, fd: WasiFd, path: &str, target: &str)
     if let Err(error) = env.state.fs.root_fs.symlink(Path::new(target), &link_path) {
         return fs_error_into_errno(error);
     }
-    let now = current_time_ns();
-    if let Some(key) = key_for_path_at(env, fd, path) {
-        set_persistent_times(env, &key, now, now, now);
-    }
     if let Some(parent) = link_path.parent() {
-        set_persistent_times(
-            env,
-            &normalize_absolute_virtual_path(&parent.to_string_lossy()),
-            now,
-            now,
-            now,
-        );
+        let parent = normalize_absolute_virtual_path(&parent.to_string_lossy());
+        let now = current_time_ns();
+        let _ = env
+            .state
+            .fs
+            .root_fs
+            .set_times(Path::new(&parent), Some(now), Some(now));
     }
     Errno::Success
 }
@@ -952,20 +1135,14 @@ fn path_unlink_symlink_at_internal(env: &WasiEnv, fd: WasiFd, path: &str) -> Err
     if let Err(error) = env.state.fs.root_fs.remove_file(&link_path) {
         return fs_error_into_errno(error);
     }
-    let mut times = load_persistent_times(env);
-    if let Some(key) = key_for_path_at(env, fd, path) {
-        times.remove(&key);
-    }
-    save_persistent_times(env, &times);
     if let Some(parent) = link_path.parent() {
         let now = current_time_ns();
-        set_persistent_times(
-            env,
-            &normalize_absolute_virtual_path(&parent.to_string_lossy()),
-            now,
-            now,
-            now,
-        );
+        let parent = normalize_absolute_virtual_path(&parent.to_string_lossy());
+        let _ = env
+            .state
+            .fs
+            .root_fs
+            .set_times(Path::new(&parent), Some(now), Some(now));
     }
     Errno::Success
 }
@@ -1013,12 +1190,24 @@ fn inode_host_path(inode: &crate::fs::InodeGuard) -> Result<PathBuf, Errno> {
     let guard = inode.read();
     match guard.deref() {
         Kind::File { path, .. } | Kind::Dir { path, .. } => Ok(path.clone()),
+        Kind::Symlink {
+            path_to_symlink, ..
+        } => Ok(path_to_symlink.clone()),
         Kind::Root { .. } => Err(Errno::Access),
         _ => Err(Errno::Notsup),
     }
 }
 
 fn sandbox_inode_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<crate::fs::InodeGuard, Errno> {
+    sandbox_inode_at_with_follow(env, fd, path, true)
+}
+
+fn sandbox_inode_at_with_follow(
+    env: &WasiEnv,
+    fd: WasiFd,
+    path: &str,
+    follow_symlink: bool,
+) -> Result<crate::fs::InodeGuard, Errno> {
     if path.is_empty() {
         return Err(Errno::Noent);
     }
@@ -1036,7 +1225,10 @@ fn sandbox_inode_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Result<crate::fs::
     } else {
         fd
     };
-    let inode = match state.fs.get_inode_at_path(&state.inodes, fd, &path, true) {
+    let inode = match state
+        .fs
+        .get_inode_at_path(&state.inodes, fd, &path, follow_symlink)
+    {
         Ok(inode) => inode,
         Err(err) if !path.starts_with('/') && fd != VIRTUAL_ROOT_FD => {
             let _ = sandbox_fd_relative_host_path(env, fd, &path).ok_or(err)?;
@@ -1052,6 +1244,9 @@ fn fd_host_path(env: &WasiEnv, fd: WasiFd) -> Result<PathBuf, Errno> {
     let guard = inode.read();
     match guard.deref() {
         Kind::File { path, .. } | Kind::Dir { path, .. } => Ok(path.clone()),
+        Kind::Symlink {
+            path_to_symlink, ..
+        } => Ok(path_to_symlink.clone()),
         Kind::Root { .. } => Err(Errno::Access),
         _ => Err(Errno::Notsup),
     }
@@ -1085,7 +1280,7 @@ fn inode_times(ino: u64) -> Option<(u64, u64, u64)> {
     POSIX_TIME_OVERRIDES.lock().ok()?.get(&ino).copied()
 }
 
-fn set_inode_times(ino: u64, atime: u64, mtime: u64, ctime: u64) {
+pub(crate) fn set_inode_times(ino: u64, atime: u64, mtime: u64, ctime: u64) {
     if let Ok(mut times) = POSIX_TIME_OVERRIDES.lock() {
         times.insert(ino, (atime, mtime, ctime));
     }
@@ -1109,6 +1304,11 @@ fn mode_key_for_inode(inode: &crate::fs::InodeGuard) -> Option<String> {
     }
 }
 
+fn owner_from_metadata(env: &WasiEnv, key: &str) -> Option<(u32, u32)> {
+    let metadata = env.state.fs.root_fs.metadata(Path::new(key)).ok()?;
+    Some((metadata.uid(), metadata.gid()))
+}
+
 fn normalize_mode_key(path: &Path) -> String {
     normalize_absolute_virtual_path(&path.to_string_lossy())
 }
@@ -1126,7 +1326,7 @@ fn parent_key_for_mutation(env: &WasiEnv, fd: WasiFd, path: &str) -> Option<Stri
     Some(normalize_absolute_virtual_path(&parent.to_string_lossy()))
 }
 
-fn key_for_path_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Option<String> {
+pub(crate) fn key_for_path_at(env: &WasiEnv, fd: WasiFd, path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
@@ -1159,315 +1359,6 @@ fn current_time_ns() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn persistent_metadata_path(env: &WasiEnv, name: &str) -> Option<PathBuf> {
-    Some(
-        env.sinomo_metadata_root
-            .as_ref()?
-            .join(POSIX_METADATA_DIR)
-            .join(name),
-    )
-}
-
-fn read_persistent_metadata(env: &WasiEnv, name: &str) -> Option<String> {
-    persistent_metadata_path(env, name).and_then(|path| fs::read_to_string(path).ok())
-}
-
-fn write_persistent_metadata(env: &WasiEnv, name: &str, data: &str) {
-    let Some(path) = persistent_metadata_path(env, name) else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    let _ = fs::write(path, data);
-}
-
-fn remove_persistent_metadata(env: &WasiEnv, name: &str) {
-    let Some(path) = persistent_metadata_path(env, name) else {
-        return;
-    };
-    let _ = fs::remove_file(path);
-}
-
-fn persistent_mode(env: &WasiEnv, key: &str) -> Option<u32> {
-    load_persistent_modes(env).get(key).copied()
-}
-
-fn set_persistent_mode(env: &WasiEnv, key: &str, mode: u32) {
-    let mut modes = load_persistent_modes(env);
-    modes.insert(key.to_string(), mode & 0o7777);
-    save_persistent_modes(env, &modes);
-}
-
-fn set_persistent_mode_for_key(env: &WasiEnv, key: &str, mode: u32) {
-    let mut modes = load_persistent_modes(env);
-    let keys = hardlink_group_keys(env, key);
-    for key in keys {
-        modes.insert(key, mode & 0o7777);
-    }
-    save_persistent_modes(env, &modes);
-}
-
-fn remove_metadata_key(env: &WasiEnv, key: &str) {
-    let mut owners = load_persistent_owners(env);
-    if owners.remove(key).is_some() {
-        save_persistent_owners(env, &owners);
-    }
-
-    let mut symlinks = load_persistent_symlinks(env);
-    if symlinks.remove(key).is_some() {
-        save_persistent_symlinks(env, &symlinks);
-    }
-}
-
-fn move_metadata_key(env: &WasiEnv, source: &str, target: &str) {
-    if source == target {
-        return;
-    }
-
-    let mut owners = load_persistent_owners(env);
-    let owner = owners.remove(source);
-    let removed_target_owner = owners.remove(target);
-    let owner_changed = owner.is_some() || removed_target_owner.is_some();
-    if let Some(owner) = owner {
-        owners.insert(target.to_string(), owner);
-    }
-    if owner_changed {
-        save_persistent_owners(env, &owners);
-    }
-
-    let mut symlinks = load_persistent_symlinks(env);
-    let target_path = symlinks.remove(source);
-    let removed_target_symlink = symlinks.remove(target);
-    let symlink_changed = target_path.is_some() || removed_target_symlink.is_some();
-    if let Some(target_path) = target_path {
-        symlinks.insert(target.to_string(), target_path);
-    }
-    if symlink_changed {
-        save_persistent_symlinks(env, &symlinks);
-    }
-}
-
-fn load_persistent_modes(env: &WasiEnv) -> HashMap<String, u32> {
-    let Some(data) = read_persistent_metadata(env, POSIX_MODE_SIDECAR) else {
-        return HashMap::new();
-    };
-
-    let mut modes = HashMap::new();
-    for line in data.lines() {
-        let Some((mode, path)) = line.split_once('\t') else {
-            continue;
-        };
-        let Ok(mode) = u32::from_str_radix(mode, 8) else {
-            continue;
-        };
-        modes.insert(path.to_string(), mode & 0o7777);
-    }
-    modes
-}
-
-fn save_persistent_modes(env: &WasiEnv, modes: &HashMap<String, u32>) {
-    if modes.is_empty() {
-        remove_persistent_metadata(env, POSIX_MODE_SIDECAR);
-        return;
-    }
-    let mut entries = modes.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let mut data = String::new();
-    for (path, mode) in entries {
-        data.push_str(&format!("{mode:04o}\t{path}\n"));
-    }
-
-    write_persistent_metadata(env, POSIX_MODE_SIDECAR, &data);
-}
-
-fn persistent_owner(env: &WasiEnv, key: &str) -> Option<(u32, u32)> {
-    load_persistent_owners(env).get(key).copied()
-}
-
-fn set_persistent_owner(env: &WasiEnv, key: &str, uid: u32, gid: u32) {
-    let mut owners = load_persistent_owners(env);
-    owners.insert(key.to_string(), (uid, gid));
-    save_persistent_owners(env, &owners);
-}
-
-fn set_persistent_owner_for_key(env: &WasiEnv, key: &str, uid: u32, gid: u32) {
-    let mut owners = load_persistent_owners(env);
-    let keys = hardlink_group_keys(env, key);
-    for key in keys {
-        owners.insert(key, (uid, gid));
-    }
-    save_persistent_owners(env, &owners);
-}
-
-fn load_persistent_owners(env: &WasiEnv) -> HashMap<String, (u32, u32)> {
-    let Some(data) = read_persistent_metadata(env, POSIX_OWNER_SIDECAR) else {
-        return HashMap::new();
-    };
-
-    let mut owners = HashMap::new();
-    for line in data.lines() {
-        let mut fields = line.splitn(3, '\t');
-        let (Some(uid), Some(gid), Some(path)) = (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let (Ok(uid), Ok(gid)) = (uid.parse::<u32>(), gid.parse::<u32>()) else {
-            continue;
-        };
-        owners.insert(path.to_string(), (uid, gid));
-    }
-    owners
-}
-
-fn save_persistent_owners(env: &WasiEnv, owners: &HashMap<String, (u32, u32)>) {
-    if owners.is_empty() {
-        remove_persistent_metadata(env, POSIX_OWNER_SIDECAR);
-        return;
-    }
-    let mut entries = owners.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let mut data = String::new();
-    for (path, (uid, gid)) in entries {
-        data.push_str(&format!("{uid}\t{gid}\t{path}\n"));
-    }
-
-    write_persistent_metadata(env, POSIX_OWNER_SIDECAR, &data);
-}
-
-fn persistent_times(env: &WasiEnv, key: &str) -> Option<(u64, u64, u64)> {
-    load_persistent_times(env).get(key).copied()
-}
-
-fn set_persistent_times(env: &WasiEnv, key: &str, atime: u64, mtime: u64, ctime: u64) {
-    let mut times = load_persistent_times(env);
-    times.insert(key.to_string(), (atime, mtime, ctime));
-    save_persistent_times(env, &times);
-}
-
-fn load_persistent_times(env: &WasiEnv) -> HashMap<String, (u64, u64, u64)> {
-    let Some(data) = read_persistent_metadata(env, POSIX_TIME_SIDECAR) else {
-        return HashMap::new();
-    };
-
-    let mut times = HashMap::new();
-    for line in data.lines() {
-        let mut fields = line.splitn(4, '\t');
-        let (Some(atime), Some(mtime), Some(ctime), Some(path)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let (Ok(atime), Ok(mtime), Ok(ctime)) = (
-            atime.parse::<u64>(),
-            mtime.parse::<u64>(),
-            ctime.parse::<u64>(),
-        ) else {
-            continue;
-        };
-        times.insert(path.to_string(), (atime, mtime, ctime));
-    }
-    times
-}
-
-fn save_persistent_times(env: &WasiEnv, times: &HashMap<String, (u64, u64, u64)>) {
-    if times.is_empty() {
-        remove_persistent_metadata(env, POSIX_TIME_SIDECAR);
-        return;
-    }
-    let mut entries = times.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let mut data = String::new();
-    for (path, (atime, mtime, ctime)) in entries {
-        data.push_str(&format!("{atime}\t{mtime}\t{ctime}\t{path}\n"));
-    }
-
-    write_persistent_metadata(env, POSIX_TIME_SIDECAR, &data);
-}
-
-fn load_persistent_symlinks(env: &WasiEnv) -> HashMap<String, String> {
-    let Some(data) = read_persistent_metadata(env, POSIX_SYMLINK_SIDECAR) else {
-        return HashMap::new();
-    };
-
-    let mut symlinks = HashMap::new();
-    for line in data.lines() {
-        let Some((path, target)) = line.split_once('\t') else {
-            continue;
-        };
-        symlinks.insert(path.to_string(), target.to_string());
-    }
-    symlinks
-}
-
-fn save_persistent_symlinks(env: &WasiEnv, symlinks: &HashMap<String, String>) {
-    if symlinks.is_empty() {
-        remove_persistent_metadata(env, POSIX_SYMLINK_SIDECAR);
-        return;
-    }
-    let mut entries = symlinks.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let mut data = String::new();
-    for (path, target) in entries {
-        data.push_str(path);
-        data.push('\t');
-        data.push_str(target);
-        data.push('\n');
-    }
-
-    write_persistent_metadata(env, POSIX_SYMLINK_SIDECAR, &data);
-}
-
-fn load_persistent_hardlinks(env: &WasiEnv) -> HashMap<String, String> {
-    let Some(data) = read_persistent_metadata(env, POSIX_HARDLINK_SIDECAR) else {
-        return HashMap::new();
-    };
-
-    let mut hardlinks = HashMap::new();
-    for line in data.lines() {
-        let Some((path, group)) = line.split_once('\t') else {
-            continue;
-        };
-        hardlinks.insert(path.to_string(), group.to_string());
-    }
-    hardlinks
-}
-
-fn hardlink_group_keys(env: &WasiEnv, key: &str) -> Vec<String> {
-    let hardlinks = load_persistent_hardlinks(env);
-    let Some(group) = hardlinks.get(key) else {
-        return vec![key.to_string()];
-    };
-    let mut keys = hardlinks
-        .iter()
-        .filter_map(|(path, candidate)| (candidate == group).then_some(path.clone()))
-        .collect::<Vec<_>>();
-    if keys.is_empty() {
-        keys.push(key.to_string());
-    }
-    keys
-}
-
-fn save_persistent_hardlinks(env: &WasiEnv, hardlinks: &HashMap<String, String>) {
-    if hardlinks.is_empty() {
-        remove_persistent_metadata(env, POSIX_HARDLINK_SIDECAR);
-        return;
-    }
-    let mut entries = hardlinks.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let mut data = String::new();
-    for (path, group) in entries {
-        data.push_str(path);
-        data.push('\t');
-        data.push_str(group);
-        data.push('\n');
-    }
-
-    write_persistent_metadata(env, POSIX_HARDLINK_SIDECAR, &data);
-}
-
 fn sandbox_fd_relative_host_path(env: &WasiEnv, fd: WasiFd, path: &str) -> Option<PathBuf> {
     let inode = env.state.fs.get_fd_inode(fd).ok()?;
     let guard = inode.read();
@@ -1494,44 +1385,6 @@ fn normalize_relative_host_path(base: &Path, path: &str) -> Option<PathBuf> {
         }
     }
     Some(normalized)
-}
-
-#[cfg(unix)]
-pub(crate) fn chmod_host_path(path: &Path, mode: u32) -> Errno {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Errno::Noent,
-        Err(_) => return Errno::Io,
-    };
-    let mut permissions = metadata.permissions();
-    permissions.set_mode((permissions.mode() & !0o7777) | (mode & 0o7777));
-    match std::fs::set_permissions(path, permissions) {
-        Ok(()) => Errno::Success,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Errno::Noent,
-        Err(_) => Errno::Io,
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn chmod_host_path(_path: &Path, _mode: u32) -> Errno {
-    Errno::Perm
-}
-
-#[cfg(unix)]
-fn host_path_mode(path: &Path) -> Result<u32, Errno> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Errno::Noent
-        } else {
-            Errno::Io
-        }
-    })?;
-    Ok(metadata.permissions().mode() & 0o7777)
-}
-
-#[cfg(not(unix))]
-fn host_path_mode(_path: &Path) -> Result<u32, Errno> {
-    Err(Errno::Perm)
 }
 
 fn normalize_absolute_virtual_path(path: &str) -> String {

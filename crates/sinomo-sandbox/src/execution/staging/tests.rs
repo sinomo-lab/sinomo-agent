@@ -156,3 +156,57 @@ fn toolchain_runtime_cache_repairs_stale_complete_manifest() {
 
     fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn toolchain_runtime_cache_rejects_reserved_sandbox_mount_top_level() {
+    let (layout, root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-reserved");
+    let error = stage_toolchain_runtime_to_local(
+        &layout,
+        &[("etc/resolv.conf".to_string(), b"shadow".to_vec())],
+        &[],
+    )
+    .expect_err("reserved top-level rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("would shadow a sandbox filesystem mount"),
+        "{error}"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+#[cfg(feature = "wasix-runtime")]
+#[test]
+fn toolchain_runtime_virtual_preopens_do_not_depend_on_host_cache_after_staging() {
+    use virtual_fs::FileSystem as _;
+
+    let (layout, root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-virtual");
+    let preopens = stage_toolchain_runtime_to_virtual(
+        &[("share/pkg/data.txt".to_string(), b"support".to_vec())],
+        &[("echo".to_string(), b"echo module".to_vec())],
+    )
+    .expect("stage virtual toolchain");
+    let cache_root = layout.toolchain_runtime_cache_root();
+    assert!(
+        !cache_root.exists(),
+        "virtual toolchain preopens should be built directly from SIFS toolchain objects without creating a host cache"
+    );
+
+    let share = preopens
+        .iter()
+        .find(|preopen| preopen.guest_path.as_str() == "/share")
+        .expect("share preopen");
+    let mut file = share
+        .fs
+        .new_open_options()
+        .read(true)
+        .open(Path::new("/pkg/data.txt"))
+        .expect("open virtual artifact");
+    let mut bytes = Vec::new();
+    virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes))
+        .expect("read virtual artifact");
+    assert_eq!(bytes, b"support");
+
+    fs::remove_dir_all(root).ok();
+}

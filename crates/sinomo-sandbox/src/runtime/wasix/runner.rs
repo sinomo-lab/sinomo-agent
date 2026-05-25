@@ -15,8 +15,7 @@ use super::preopen::{validate_wasix_current_dir, validate_wasix_preopen_tree};
 #[cfg(feature = "wasix-runtime")]
 use super::process::{
     effective_sandbox_wasix_task_limit, run_wasix_process_tree,
-    sandbox_wasix_capabilities_with_task_limit, wasix_command_exceeded_requested_timeout,
-    wasix_exit_status,
+    sandbox_wasix_capabilities_with_task_limit, wasix_exit_status,
 };
 #[cfg(feature = "wasix-runtime")]
 use super::setup::{configure_wasix_mapped_directories, configure_wasix_stdin, wasix_environment};
@@ -256,7 +255,6 @@ fn run_wasix_module_on_worker_thread(
         });
     };
     let command_id = SandboxCommandId::generate();
-    let started = Instant::now();
     let transformed_wasm =
         transform_wasix_wasm(wasm, options.wasix_auto_asyncify, options.wasix_fpcast_emu)?;
     let wasm = transformed_wasm.as_deref().unwrap_or(wasm);
@@ -299,11 +297,12 @@ fn run_wasix_module_on_worker_thread(
     for preopen in &options.preopened_dirs {
         validate_wasix_preopen_tree(preopen)?;
     }
-    validate_wasix_current_dir(&request.cwd, &options.preopened_dirs)?;
+    validate_wasix_current_dir(
+        &request.cwd,
+        &options.preopened_dirs,
+        &options.virtual_preopened_dirs,
+    )?;
     let mut runner = wasmer_wasix::runners::wasi::WasiRunner::new();
-    if let Some(metadata_host_path) = &options.metadata_host_path {
-        runner.with_sinomo_metadata_root(metadata_host_path.clone());
-    }
     let task_limit = effective_sandbox_wasix_task_limit();
     if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
         eprintln!("sinomo-debug wasix task_limit={task_limit}");
@@ -342,6 +341,7 @@ fn run_wasix_module_on_worker_thread(
         &request.argv,
         &env,
         &options.preopened_dirs,
+        &options.virtual_preopened_dirs,
         options.wasix_pinned_child_exec_only,
         options.enable_virtual_devices,
         options.zero_device_bytes,
@@ -375,6 +375,7 @@ fn run_wasix_module_on_worker_thread(
         .with_stdout(Box::new(stdout_file.clone()))
         .with_stderr(Box::new(stderr_file.clone()));
 
+    let started = Instant::now();
     let run_result = run_wasix_process_tree(
         &runner,
         RuntimeOrEngine::Runtime(runtime),
@@ -400,11 +401,6 @@ fn run_wasix_module_on_worker_thread(
             return Err(SandboxWasiError::InputLimitExceeded { limit });
         }
     }
-    if wasix_command_exceeded_requested_timeout(elapsed, request.timeout_ms) {
-        return Err(SandboxWasiError::TimedOut {
-            timeout_ms: request.timeout_ms,
-        });
-    }
 
     let exit_status = wasix_exit_status(run_result?, request.timeout_ms)?;
 
@@ -427,7 +423,7 @@ fn run_wasix_module_on_worker_thread(
             stderr_ref,
             changed_paths: Vec::new(),
             resource_usage: SandboxResourceUsage {
-                wall_time_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                wall_time_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
                 peak_memory_bytes: 0,
                 stdout_bytes: stdout.len() as u64,
                 stderr_bytes: stderr.len() as u64,

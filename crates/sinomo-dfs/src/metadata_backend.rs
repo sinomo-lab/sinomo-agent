@@ -139,6 +139,8 @@ pub struct DfsObjectVersionRecord {
     pub version: DfsVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -322,7 +324,7 @@ struct DfsVisibleVersionCommitRecord {
     created_at: OffsetDateTime,
 }
 
-pub trait DfsMetadataBackend: std::fmt::Debug {
+pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry>;
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>>;
     fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>>;
@@ -917,7 +919,7 @@ impl LocalJsonMetadataBackend {
                 continue;
             }
             let transaction: DfsNamespaceTransaction = read_json(&path)?;
-            self.materialize_namespace_transaction(&transaction)?;
+            self.materialize_namespace_transaction_for_recovery(&transaction)?;
             self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
                 file_system_id: transaction.file_system_id.clone(),
                 transaction_id: transaction.transaction_id.clone(),
@@ -946,6 +948,34 @@ impl LocalJsonMetadataBackend {
             self.materialize_object_indexes(object)?;
         }
         Ok(())
+    }
+
+    fn materialize_namespace_transaction_for_recovery(
+        &self,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<()> {
+        for object in transaction
+            .objects
+            .iter()
+            .filter(|object| object.kind == DfsObjectKind::Tombstone)
+        {
+            self.materialize_object_indexes_if_current(object)?;
+        }
+        for object in transaction
+            .objects
+            .iter()
+            .filter(|object| object.kind != DfsObjectKind::Tombstone)
+        {
+            self.materialize_object_indexes_if_current(object)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_object_indexes_if_current(&self, object: &DfsObjectMetadata) -> Result<()> {
+        if let Some(current) = self.get_object(&object.object_id)? {
+            return self.materialize_object_indexes(&current);
+        }
+        self.materialize_object_indexes(object)
     }
 
     fn materialize_object_indexes(&self, object: &DfsObjectMetadata) -> Result<()> {
@@ -1068,7 +1098,6 @@ impl LocalJsonMetadataBackend {
         if current.as_ref().is_some_and(|object| {
             object.version != commit.expected_version
                 && object.version != commit.committed_object.version
-                && dfs_version_after(&object.version, &commit.committed_object.version)
         }) {
             return Ok(());
         }
@@ -1143,19 +1172,6 @@ fn path_record_for_object(object: &DfsObjectMetadata) -> DfsPathRecord {
     }
 }
 
-fn dfs_version_after(left: &DfsVersion, right: &DfsVersion) -> bool {
-    match (
-        left.as_str().strip_prefix("version_"),
-        right.as_str().strip_prefix("version_"),
-    ) {
-        (Some(left), Some(right)) => match (left.parse::<u64>(), right.parse::<u64>()) {
-            (Ok(left), Ok(right)) => left > right,
-            _ => left > right,
-        },
-        _ => left.as_str() > right.as_str(),
-    }
-}
-
 fn object_inode_id(object_id: &DfsObjectId) -> DfsInodeId {
     DfsInodeId::new(format!("obj:{}", object_id))
 }
@@ -1173,7 +1189,7 @@ fn parent_inode_id(file_system_id: &DfsFileSystemId, normalized_path: &str) -> D
 }
 
 fn normalize_path(path: &str) -> String {
-    path.trim_matches('/').replace('\\', "/")
+    path.trim_matches('/').to_string()
 }
 
 fn path_hash(path: &str) -> String {
@@ -1374,6 +1390,15 @@ mod tests {
             owner_node_id: node("node_owner"),
             current_locations: vec![node("node_owner")],
             content_hash: Some("blake3:old".to_string()),
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
             version,
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
@@ -1495,6 +1520,7 @@ mod tests {
             object_id: committed.object_id.clone(),
             version: committed.version.clone(),
             content_hash: committed.content_hash.clone(),
+            size_bytes: Some(3),
             locations: committed.current_locations.clone(),
             created_by_event_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1581,6 +1607,7 @@ mod tests {
             object_id: committed.object_id.clone(),
             version: committed.version.clone(),
             content_hash: committed.content_hash.clone(),
+            size_bytes: Some(3),
             locations: committed.current_locations.clone(),
             created_by_event_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1654,6 +1681,7 @@ mod tests {
             object_id: version_2.object_id.clone(),
             version: version_2.version.clone(),
             content_hash: version_2.content_hash.clone(),
+            size_bytes: Some(3),
             locations: version_2.current_locations.clone(),
             created_by_event_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1689,6 +1717,7 @@ mod tests {
             object_id: version_3.object_id.clone(),
             version: version_3.version.clone(),
             content_hash: version_3.content_hash.clone(),
+            size_bytes: Some(5),
             locations: version_3.current_locations.clone(),
             created_by_event_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
@@ -1737,6 +1766,7 @@ mod tests {
         tombstone.kind = DfsObjectKind::Tombstone;
         tombstone.version = version("version_4");
         tombstone.content_hash = None;
+        tombstone.content_size_bytes = None;
         backend.put_object(&tombstone).expect("tombstone");
         drop(backend);
 

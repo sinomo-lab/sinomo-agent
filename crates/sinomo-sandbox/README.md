@@ -29,7 +29,7 @@ It does not define global cluster storage layout outside the sandbox service pre
 
 WASIX is the default runtime because shell, Python, compiler, package manager, subprocess, pipe, threading, and filesystem workflows need process-oriented semantics. WASI Preview1 remains available as a compatibility runner for simple single-process modules.
 
-Filesystem behavior should go through the sandbox virtual filesystem layer. Local host-backed storage is useful for development, but production sandbox state is expected to be backed by SIFS.
+Filesystem behavior should go through the sandbox virtual filesystem layer. Local host-backed storage is useful for development, but production sandbox state is expected to be backed by SIFS. SIFS-backed WASIX runs use direct virtual preopens backed by the sandbox filesystem; Preview1 is local-only legacy compatibility and is rejected for SIFS-backed execution.
 
 ## Common Commands
 

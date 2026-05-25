@@ -82,8 +82,44 @@ pub(super) fn sandbox_virtual_device_metadata(path: &SandboxPath) -> Option<Sand
                 | SandboxVirtualDevicePath::PtsDirectory
                 | SandboxVirtualDevicePath::ShmDirectory
         ),
+        is_symlink: false,
         len: 0,
+        link_count: if matches!(
+            device,
+            SandboxVirtualDevicePath::DevDirectory
+                | SandboxVirtualDevicePath::FdDirectory
+                | SandboxVirtualDevicePath::PtsDirectory
+                | SandboxVirtualDevicePath::ShmDirectory
+        ) {
+            2
+        } else {
+            1
+        },
+        mode: if matches!(
+            device,
+            SandboxVirtualDevicePath::DevDirectory
+                | SandboxVirtualDevicePath::FdDirectory
+                | SandboxVirtualDevicePath::PtsDirectory
+                | SandboxVirtualDevicePath::ShmDirectory
+        ) {
+            0o755
+        } else {
+            0o666
+        },
+        uid: 0,
+        gid: 0,
+        inode: virtual_device_inode(path),
+        object_identity: None,
+        accessed_at_unix_nanos: 1_000_000_000,
+        modified_at_unix_nanos: 1_000_000_000,
+        created_at_unix_nanos: 1_000_000_000,
+        changed_at_unix_nanos: 1_000_000_000,
     })
+}
+
+fn virtual_device_inode(path: &SandboxPath) -> u64 {
+    let hash = blake3::hash(path.as_str().as_bytes());
+    u64::from_le_bytes(hash.as_bytes()[0..8].try_into().expect("hash slice"))
 }
 
 pub(super) fn sandbox_virtual_device_dir_entries(path: &SandboxPath) -> Vec<SandboxDirEntry> {

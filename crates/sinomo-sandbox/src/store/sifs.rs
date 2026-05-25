@@ -39,7 +39,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
         now: OffsetDateTime,
     ) -> Result<SandboxInstanceManifest, SandboxStoreError> {
         let manifest_path = sandbox_manifest_path(&sandbox_id);
-        match self.dfs.posix_stat(&manifest_path) {
+        match self.dfs.posix_stat_distributed(&manifest_path) {
             Ok(_) => return Err(SandboxStoreError::AlreadyExists { sandbox_id }),
             Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. }) => {}
             Err(source) => {
@@ -54,13 +54,13 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
     }
 
     pub fn load(
-        &self,
+        &mut self,
         sandbox_id: &SandboxId,
     ) -> Result<SandboxInstanceManifest, SandboxStoreError> {
         let path = sandbox_manifest_path(sandbox_id);
         let bytes = self
             .dfs
-            .posix_read_file(&path)
+            .posix_read_file_distributed(&path)
             .map_err(|source| match source {
                 DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. } => {
                     SandboxStoreError::NotFound {
@@ -78,7 +78,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
     ) -> Result<(), SandboxStoreError> {
         let path = sandbox_manifest_path(&manifest.sandbox_id);
         self.dfs
-            .posix_stat(&manifest.workspace_root)
+            .posix_stat_distributed(&manifest.workspace_root)
             .map_err(|source| match source {
                 DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. } => {
                     SandboxStoreError::NotFound {
@@ -112,10 +112,12 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
         self.dfs
             .posix_mkdir_all(&checkpoint_root)
             .map_err(|source| sandbox_store_error_from_dfs(checkpoint_root.clone(), source))?;
+        let mut hardlink_targets = BTreeMap::new();
         for name in sifs_checkpoint_root_names() {
-            self.copy_sifs_tree(
+            self.copy_sifs_tree_preserving_hardlinks(
                 &format!("{}/{}", manifest.workspace_root.trim_end_matches('/'), name),
                 &format!("{checkpoint_root}/{name}"),
+                &mut hardlink_targets,
             )?;
         }
         let manifest_ref = format!("{checkpoint_root}/manifest.sobj");
@@ -146,7 +148,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
         let checkpoint_manifest_path = format!("{checkpoint_root}/manifest.sobj");
         let bytes = self
             .dfs
-            .posix_read_file(&checkpoint_manifest_path)
+            .posix_read_file_distributed(&checkpoint_manifest_path)
             .map_err(|source| match source {
                 DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. } => {
                     SandboxStoreError::CheckpointNotFound {
@@ -165,10 +167,11 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
             self.write_manifest(&manifest)?;
             return Ok(manifest);
         }
+        let mut hardlink_targets = BTreeMap::new();
         for name in sifs_checkpoint_root_names() {
             let destination = format!("{}/{}", current.workspace_root.trim_end_matches('/'), name);
             let source = format!("{checkpoint_root}/{name}");
-            match self.dfs.posix_stat(&source) {
+            match self.dfs.posix_stat_distributed(&source) {
                 Ok(stat) if stat.kind == DfsObjectKind::Directory => {}
                 Ok(_) => {
                     return Err(SandboxStoreError::Io {
@@ -181,7 +184,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
                 }
             }
             self.clear_sifs_directory(&destination)?;
-            self.copy_sifs_directory_contents(&source, &destination)?;
+            self.copy_sifs_directory_contents(&source, &destination, &mut hardlink_targets)?;
         }
         manifest.updated_at = now;
         self.write_manifest(&manifest)?;
@@ -258,6 +261,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
             "home",
             "tmp",
             "work",
+            "var",
             "checkpoints",
             "logs",
             "artifacts",
@@ -294,10 +298,15 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
         DfsWriteOptions::replicated_eventual(self.replica_candidates.clone())
     }
 
-    fn copy_sifs_tree(&mut self, source: &str, destination: &str) -> Result<(), SandboxStoreError> {
+    fn copy_sifs_tree_preserving_hardlinks(
+        &mut self,
+        source: &str,
+        destination: &str,
+        hardlink_targets: &mut BTreeMap<String, String>,
+    ) -> Result<(), SandboxStoreError> {
         let stat = self
             .dfs
-            .posix_stat(source)
+            .posix_lstat_distributed(source)
             .map_err(|error| sandbox_store_error_from_dfs(source.to_string(), error))?;
         match stat.kind {
             DfsObjectKind::Directory => {
@@ -306,23 +315,60 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
                 })?;
                 let entries = self
                     .dfs
-                    .posix_list_dir(source)
+                    .posix_list_dir_distributed(source)
                     .map_err(|error| sandbox_store_error_from_dfs(source.to_string(), error))?;
                 for entry in entries {
-                    self.copy_sifs_tree(
+                    self.copy_sifs_tree_preserving_hardlinks(
                         &entry.path,
                         &format!("{}/{}", destination.trim_end_matches('/'), entry.name),
+                        hardlink_targets,
                     )?;
                 }
                 Ok(())
             }
             DfsObjectKind::File | DfsObjectKind::Artifact => {
+                if stat.link_count > 1 {
+                    let identity = stat.object_id.to_string();
+                    if let Some(existing_destination) = hardlink_targets.get(&identity) {
+                        return self
+                            .dfs
+                            .posix_hardlink(existing_destination, destination)
+                            .map(|_| ())
+                            .map_err(|error| {
+                                sandbox_store_error_from_dfs(destination.to_string(), error)
+                            });
+                    }
+                    hardlink_targets.insert(identity, destination.to_string());
+                }
                 let bytes = self
                     .dfs
-                    .posix_read_file(source)
+                    .posix_read_file_distributed(source)
                     .map_err(|error| sandbox_store_error_from_dfs(source.to_string(), error))?;
                 self.dfs
                     .posix_write_file(destination, &bytes, self.write_options())
+                    .map(|_| ())
+                    .map_err(|error| sandbox_store_error_from_dfs(destination.to_string(), error))
+            }
+            DfsObjectKind::Symlink => {
+                if stat.link_count > 1 {
+                    let identity = stat.object_id.to_string();
+                    if let Some(existing_destination) = hardlink_targets.get(&identity) {
+                        return self
+                            .dfs
+                            .posix_hardlink(existing_destination, destination)
+                            .map(|_| ())
+                            .map_err(|error| {
+                                sandbox_store_error_from_dfs(destination.to_string(), error)
+                            });
+                    }
+                    hardlink_targets.insert(identity, destination.to_string());
+                }
+                let target = self
+                    .dfs
+                    .posix_readlink_distributed(source)
+                    .map_err(|error| sandbox_store_error_from_dfs(source.to_string(), error))?;
+                self.dfs
+                    .posix_symlink(&target, destination, self.write_options())
                     .map(|_| ())
                     .map_err(|error| sandbox_store_error_from_dfs(destination.to_string(), error))
             }
@@ -337,18 +383,23 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
         &mut self,
         source: &str,
         destination: &str,
+        hardlink_targets: &mut BTreeMap<String, String>,
     ) -> Result<(), SandboxStoreError> {
         self.dfs
             .posix_mkdir_all(destination)
             .map_err(|error| sandbox_store_error_from_dfs(destination.to_string(), error))?;
         let entries = self
             .dfs
-            .posix_list_dir(source)
+            .posix_list_dir_distributed(source)
             .map_err(|error| sandbox_store_error_from_dfs(source.to_string(), error))?;
         for entry in entries {
             let destination_child = format!("{}/{}", destination.trim_end_matches('/'), entry.name);
             self.remove_sifs_tree_if_exists(&destination_child)?;
-            self.copy_sifs_tree(&entry.path, &destination_child)?;
+            self.copy_sifs_tree_preserving_hardlinks(
+                &entry.path,
+                &destination_child,
+                hardlink_targets,
+            )?;
         }
         Ok(())
     }
@@ -375,9 +426,9 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
     ) -> Result<bool, SandboxStoreError> {
         let source_stat = self
             .dfs
-            .posix_stat(source)
+            .posix_lstat_distributed(source)
             .map_err(|error| sandbox_store_error_from_dfs(source.to_string(), error))?;
-        let destination_stat = match self.dfs.posix_stat(destination) {
+        let destination_stat = match self.dfs.posix_lstat_distributed(destination) {
             Ok(stat) => stat,
             Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. }) => {
                 return Ok(false);
@@ -388,14 +439,14 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
             (DfsObjectKind::Directory, DfsObjectKind::Directory) => {
                 let source_entries = self
                     .dfs
-                    .posix_list_dir(source)
+                    .posix_list_dir_distributed(source)
                     .map_err(|error| sandbox_store_error_from_dfs(source.to_string(), error))?
                     .into_iter()
                     .map(|entry| (entry.name, entry.path))
                     .collect::<BTreeMap<_, _>>();
                 let destination_entries = self
                     .dfs
-                    .posix_list_dir(destination)
+                    .posix_list_dir_distributed(destination)
                     .map_err(|error| sandbox_store_error_from_dfs(destination.to_string(), error))?
                     .into_iter()
                     .map(|entry| (entry.name, entry.path))
@@ -418,6 +469,19 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
                 DfsObjectKind::File | DfsObjectKind::Artifact,
             ) => Ok(source_stat.content_hash == destination_stat.content_hash
                 && source_stat.size_bytes == destination_stat.size_bytes),
+            (DfsObjectKind::Symlink, DfsObjectKind::Symlink) => {
+                let source_target = self
+                    .dfs
+                    .posix_readlink_distributed(source)
+                    .map_err(|error| sandbox_store_error_from_dfs(source.to_string(), error))?;
+                let destination_target =
+                    self.dfs
+                        .posix_readlink_distributed(destination)
+                        .map_err(|error| {
+                            sandbox_store_error_from_dfs(destination.to_string(), error)
+                        })?;
+                Ok(source_target == destination_target)
+            }
             _ => Ok(false),
         }
     }
@@ -428,7 +492,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
             .map_err(|error| sandbox_store_error_from_dfs(path.to_string(), error))?;
         let entries = self
             .dfs
-            .posix_list_dir(path)
+            .posix_list_dir_distributed(path)
             .map_err(|error| sandbox_store_error_from_dfs(path.to_string(), error))?;
         for entry in entries {
             self.remove_sifs_tree_if_exists(&entry.path)?;
@@ -437,7 +501,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
     }
 
     fn remove_sifs_tree_if_exists(&mut self, path: &str) -> Result<bool, SandboxStoreError> {
-        let stat = match self.dfs.posix_stat(path) {
+        let stat = match self.dfs.posix_lstat_distributed(path) {
             Ok(stat) => stat,
             Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. }) => {
                 return Ok(false);
@@ -448,7 +512,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
             DfsObjectKind::Directory => {
                 let entries = self
                     .dfs
-                    .posix_list_dir(path)
+                    .posix_list_dir_distributed(path)
                     .map_err(|error| sandbox_store_error_from_dfs(path.to_string(), error))?;
                 for entry in entries {
                     self.remove_sifs_tree_if_exists(&entry.path)?;
@@ -458,7 +522,7 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
                     .map(|_| true)
                     .map_err(|error| sandbox_store_error_from_dfs(path.to_string(), error))
             }
-            DfsObjectKind::File | DfsObjectKind::Artifact => self
+            DfsObjectKind::File | DfsObjectKind::Artifact | DfsObjectKind::Symlink => self
                 .dfs
                 .posix_unlink(path)
                 .map(|_| true)
@@ -471,6 +535,6 @@ impl<T: NetworkTransport> SifsSandboxInstanceStore<T> {
     }
 }
 
-fn sifs_checkpoint_root_names() -> [&'static str; 6] {
-    ["root", "home", "tmp", "work", "logs", "artifacts"]
+fn sifs_checkpoint_root_names() -> [&'static str; 7] {
+    ["root", "home", "tmp", "work", "var", "logs", "artifacts"]
 }

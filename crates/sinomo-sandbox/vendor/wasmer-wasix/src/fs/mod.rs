@@ -394,6 +394,14 @@ impl FileSystem for WasiFsRoot {
         }
     }
 
+    fn readlink_update_access(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        match self {
+            Self::Sandbox(fs) => fs.readlink_update_access(path),
+            Self::Overlay(overlay) => overlay.readlink_update_access(path),
+            Self::Backing(fs) => fs.readlink_update_access(path),
+        }
+    }
+
     fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
         match self {
             Self::Sandbox(fs) => fs.read_dir(path),
@@ -468,6 +476,48 @@ impl FileSystem for WasiFsRoot {
             Self::Sandbox(fs) => fs.hard_link(old_path, new_path),
             Self::Overlay(overlay) => overlay.hard_link(old_path, new_path),
             Self::Backing(fs) => fs.hard_link(old_path, new_path),
+        }
+    }
+
+    fn set_mode(&self, path: &Path, mode: u32) -> virtual_fs::Result<()> {
+        match self {
+            Self::Sandbox(fs) => fs.set_mode(path, mode),
+            Self::Overlay(overlay) => overlay.set_mode(path, mode),
+            Self::Backing(fs) => fs.set_mode(path, mode),
+        }
+    }
+
+    fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> virtual_fs::Result<()> {
+        match self {
+            Self::Sandbox(fs) => fs.set_owner(path, uid, gid),
+            Self::Overlay(overlay) => overlay.set_owner(path, uid, gid),
+            Self::Backing(fs) => fs.set_owner(path, uid, gid),
+        }
+    }
+
+    fn set_times(
+        &self,
+        path: &Path,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> virtual_fs::Result<()> {
+        match self {
+            Self::Sandbox(fs) => fs.set_times(path, atime, mtime),
+            Self::Overlay(overlay) => overlay.set_times(path, atime, mtime),
+            Self::Backing(fs) => fs.set_times(path, atime, mtime),
+        }
+    }
+
+    fn set_symlink_times(
+        &self,
+        path: &Path,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> virtual_fs::Result<()> {
+        match self {
+            Self::Sandbox(fs) => fs.set_symlink_times(path, atime, mtime),
+            Self::Overlay(overlay) => overlay.set_symlink_times(path, atime, mtime),
+            Self::Backing(fs) => fs.set_symlink_times(path, atime, mtime),
         }
     }
 
@@ -1033,7 +1083,8 @@ impl WasiFs {
         match guard.deref_mut() {
             Kind::File { handle, .. } => {
                 if let Some(h) = handle {
-                    let h = h.read().unwrap();
+                    let mut h = h.write().unwrap();
+                    h.refresh_metadata().map_err(fs_error_into_wasi_err)?;
                     let new_size = h.size();
                     drop(h);
                     drop(guard);
@@ -1567,6 +1618,10 @@ impl WasiFs {
         }
     }
 
+    pub(crate) fn is_preopen_fd(&self, fd: WasiFd) -> bool {
+        self.preopen_fds.read().unwrap().contains(&fd)
+    }
+
     pub fn get_fd_inode(&self, fd: WasiFd) -> Result<InodeGuard, Errno> {
         // see `VIRTUAL_ROOT_FD` for details as to why this exists
         if fd == VIRTUAL_ROOT_FD {
@@ -1585,7 +1640,7 @@ impl WasiFs {
         let live_stat = {
             let guard = inode.read();
             match guard.deref() {
-                Kind::File { .. } | Kind::Buffer { .. } => {
+                Kind::File { .. } | Kind::Dir { .. } | Kind::Buffer { .. } => {
                     Some(self.get_stat_for_kind(guard.deref())?)
                 }
                 _ => None,
@@ -1593,6 +1648,10 @@ impl WasiFs {
         };
         if let Some(live_stat) = live_stat {
             let mut cached_stat = inode.stat.write().unwrap();
+            cached_stat.st_filetype = live_stat.st_filetype;
+            cached_stat.st_dev = live_stat.st_dev;
+            cached_stat.st_ino = live_stat.st_ino;
+            cached_stat.st_nlink = live_stat.st_nlink;
             cached_stat.st_size = live_stat.st_size;
             cached_stat.st_atim = live_stat.st_atim;
             cached_stat.st_mtim = live_stat.st_mtim;
@@ -1788,8 +1847,10 @@ impl WasiFs {
             _ => {}
         }
 
-        let st_ino = Inode::from_path(&name);
-        stat.st_ino = st_ino.as_u64();
+        if stat.st_ino == 0 {
+            let st_ino = Inode::from_path(&name);
+            stat.st_ino = st_ino.as_u64();
+        }
         if stat.st_filetype == Filetype::Unknown {
             stat.st_filetype = filetype_for_kind(&kind);
         }
@@ -2031,6 +2092,9 @@ impl WasiFs {
         ignore_duplicates: bool,
     ) -> Result<(), String> {
         for preopen_name in self.init_vfs_preopens.iter() {
+            if Path::new(preopen_name) == Path::new("/") {
+                continue;
+            }
             let kind = Kind::Dir {
                 parent: self.root_inode.downgrade(),
                 path: PathBuf::from(preopen_name),
@@ -2257,10 +2321,16 @@ impl WasiFs {
         let md = match kind {
             Kind::File { handle, path, .. } => match handle {
                 Some(wf) => {
-                    let wf = wf.read().unwrap();
+                    let mut wf = wf.write().unwrap();
+                    wf.refresh_metadata().map_err(fs_error_into_wasi_err)?;
+                    let inode = wf
+                        .inode()
+                        .unwrap_or_else(|| Inode::from_path(path.to_string_lossy().as_ref()).as_u64());
+                    let nlink = wf.link_count().unwrap_or(1);
                     let mut stat = Filestat {
                         st_filetype: Filetype::RegularFile,
-                        st_ino: Inode::from_path(path.to_string_lossy().as_ref()).as_u64(),
+                        st_ino: inode,
+                        st_nlink: nlink,
                         st_size: wf.size(),
                         st_atim: wf.last_accessed(),
                         st_mtim: wf.last_modified(),
@@ -2268,7 +2338,11 @@ impl WasiFs {
 
                         ..Filestat::default()
                     };
-                    fill_virtual_filestat(&self.root_fs, path, &mut stat);
+                    if wf.inode().is_none() {
+                        fill_virtual_filestat(&self.root_fs, path, &mut stat);
+                    } else if stat.st_dev == 0 {
+                        stat.st_dev = 1;
+                    }
                     return Ok(stat);
                 }
                 None => self

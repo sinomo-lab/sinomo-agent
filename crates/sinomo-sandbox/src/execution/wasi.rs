@@ -1,20 +1,166 @@
 use crate::internal::*;
 
 use super::SandboxWasiError;
+use virtual_fs::FileSystem as _;
 
 #[derive(Clone)]
 pub(crate) struct LocalWasiVirtualDeviceDir {
     root: PathBuf,
+    root_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     proc_root: PathBuf,
+    proc_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     etc_root: PathBuf,
+    etc_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     sys_root: PathBuf,
+    sys_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     run_root: PathBuf,
+    run_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     var_root: PathBuf,
+    var_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     tmp_root: PathBuf,
+    tmp_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     home_root: PathBuf,
+    home_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     root_home: PathBuf,
+    root_home_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     usr_root: PathBuf,
+    usr_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
     opt_root: PathBuf,
+    opt_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WasiVirtualSystemMounts {
+    root_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    proc_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    etc_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    sys_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    run_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    var_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    tmp_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    home_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    root_home_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    usr_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    opt_fs: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+}
+
+impl WasiVirtualSystemMounts {
+    pub(crate) fn create(
+        zero_device_bytes: usize,
+        argv: &[String],
+        env: &[(String, String)],
+        mounts: &[(SandboxPath, SandboxMountMode)],
+    ) -> Result<Self, SandboxWasiError> {
+        let zero_device_bytes = zero_device_bytes.min(SANDBOX_WASI_ZERO_DEVICE_BYTES);
+        let dev = virtual_fs::mem_fs::FileSystem::default();
+        let proc = virtual_fs::mem_fs::FileSystem::default();
+        let etc = virtual_fs::mem_fs::FileSystem::default();
+        let sys = virtual_fs::mem_fs::FileSystem::default();
+        let run = virtual_fs::mem_fs::FileSystem::default();
+        let var = virtual_fs::mem_fs::FileSystem::default();
+        let tmp = virtual_fs::mem_fs::FileSystem::default();
+        let home = virtual_fs::mem_fs::FileSystem::default();
+        let root_home = virtual_fs::mem_fs::FileSystem::default();
+        let usr = virtual_fs::mem_fs::FileSystem::default();
+        let opt = virtual_fs::mem_fs::FileSystem::default();
+
+        populate_virtual_dev_mount(&dev, zero_device_bytes)?;
+        populate_virtual_proc_mount(&proc, argv, env, mounts)?;
+        populate_virtual_etc_mount(&etc, mounts)?;
+        populate_virtual_sys_mount(&sys)?;
+        for dir in ["user/1000", "lock"] {
+            virtual_mount_create_dir_all(&run, dir, "/run")?;
+        }
+        for dir in ["tmp", "log", "cache", "lib"] {
+            virtual_mount_create_dir_all(&var, dir, "/var")?;
+        }
+        for dir in [
+            "sinomo",
+            "sinomo/.cache",
+            "sinomo/.config",
+            "sinomo/.local/share",
+        ] {
+            virtual_mount_create_dir_all(&home, dir, "/home")?;
+        }
+        for dir in [".cache", ".config", ".local/share"] {
+            virtual_mount_create_dir_all(&root_home, dir, "/root")?;
+        }
+        for dir in [
+            "bin",
+            "lib",
+            "local/bin",
+            "local/lib",
+            "share",
+            "share/terminfo/d",
+            "share/terminfo/x",
+            "share/zoneinfo/Etc",
+        ] {
+            virtual_mount_create_dir_all(&usr, dir, "/usr")?;
+        }
+        for (usr_file, content) in usr_system_files() {
+            virtual_mount_write_file(&usr, &usr_file, content, "/usr")?;
+        }
+        virtual_mount_create_dir_all(&tmp, "/", "/tmp")?;
+        virtual_mount_create_dir_all(&opt, "/", "/opt")?;
+
+        Ok(Self {
+            root_fs: Arc::new(dev),
+            proc_fs: Arc::new(proc),
+            etc_fs: Arc::new(etc),
+            sys_fs: Arc::new(sys),
+            run_fs: Arc::new(run),
+            var_fs: Arc::new(var),
+            tmp_fs: Arc::new(tmp),
+            home_fs: Arc::new(home),
+            root_home_fs: Arc::new(root_home),
+            usr_fs: Arc::new(usr),
+            opt_fs: Arc::new(opt),
+        })
+    }
+
+    pub(crate) fn fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.root_fs)
+    }
+
+    pub(crate) fn proc_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.proc_fs)
+    }
+
+    pub(crate) fn etc_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.etc_fs)
+    }
+
+    pub(crate) fn sys_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.sys_fs)
+    }
+
+    pub(crate) fn run_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.run_fs)
+    }
+
+    pub(crate) fn var_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.var_fs)
+    }
+
+    pub(crate) fn tmp_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.tmp_fs)
+    }
+
+    pub(crate) fn home_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.home_fs)
+    }
+
+    pub(crate) fn root_home_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.root_home_fs)
+    }
+
+    pub(crate) fn usr_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.usr_fs)
+    }
+
+    pub(crate) fn opt_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.opt_fs)
+    }
 }
 
 impl LocalWasiVirtualDeviceDir {
@@ -305,18 +451,29 @@ impl LocalWasiVirtualDeviceDir {
                 detail: format!("create sandbox virtual proc sys directory: {error}"),
             })?;
         }
-        let devices = Self {
+        let mut devices = Self {
             root,
+            root_fs: empty_virtual_mount(),
             proc_root,
+            proc_fs: empty_virtual_mount(),
             etc_root,
+            etc_fs: empty_virtual_mount(),
             sys_root,
+            sys_fs: empty_virtual_mount(),
             run_root,
+            run_fs: empty_virtual_mount(),
             var_root,
+            var_fs: empty_virtual_mount(),
             tmp_root,
+            tmp_fs: empty_virtual_mount(),
             home_root,
+            home_fs: empty_virtual_mount(),
             root_home,
+            root_home_fs: empty_virtual_mount(),
             usr_root,
+            usr_fs: empty_virtual_mount(),
             opt_root,
+            opt_fs: empty_virtual_mount(),
         };
         fs::write(devices.root.join("null"), []).map_err(|error| SandboxWasiError::Runtime {
             detail: format!("create sandbox /dev/null: {error}"),
@@ -526,7 +683,44 @@ impl LocalWasiVirtualDeviceDir {
                 }
             })?;
         }
+        devices.freeze_to_virtual_mounts()?;
         Ok(devices)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proc_fs(&self) -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+        Arc::clone(&self.proc_fs)
+    }
+
+    fn freeze_to_virtual_mounts(&mut self) -> Result<(), SandboxWasiError> {
+        self.root_fs = load_virtual_mount(&self.root, "/dev")?;
+        self.proc_fs = load_virtual_mount(&self.proc_root, "/proc")?;
+        self.etc_fs = load_virtual_mount(&self.etc_root, "/etc")?;
+        self.sys_fs = load_virtual_mount(&self.sys_root, "/sys")?;
+        self.run_fs = load_virtual_mount(&self.run_root, "/run")?;
+        self.var_fs = load_virtual_mount(&self.var_root, "/var")?;
+        self.tmp_fs = load_virtual_mount(&self.tmp_root, "/tmp")?;
+        self.home_fs = load_virtual_mount(&self.home_root, "/home")?;
+        self.root_home_fs = load_virtual_mount(&self.root_home, "/root")?;
+        self.usr_fs = load_virtual_mount(&self.usr_root, "/usr")?;
+        self.opt_fs = load_virtual_mount(&self.opt_root, "/opt")?;
+        Ok(())
+    }
+
+    fn staging_paths(&self) -> [&Path; 11] {
+        [
+            self.root.as_path(),
+            self.proc_root.as_path(),
+            self.etc_root.as_path(),
+            self.sys_root.as_path(),
+            self.run_root.as_path(),
+            self.var_root.as_path(),
+            self.tmp_root.as_path(),
+            self.home_root.as_path(),
+            self.root_home.as_path(),
+            self.usr_root.as_path(),
+            self.opt_root.as_path(),
+        ]
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -572,6 +766,472 @@ impl LocalWasiVirtualDeviceDir {
     pub(crate) fn opt_path(&self) -> &Path {
         &self.opt_root
     }
+}
+
+impl Drop for LocalWasiVirtualDeviceDir {
+    fn drop(&mut self) {
+        for path in self.staging_paths() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn empty_virtual_mount() -> Arc<dyn virtual_fs::FileSystem + Send + Sync> {
+    Arc::new(virtual_fs::mem_fs::FileSystem::default())
+}
+
+fn virtual_mount_path(path: &str) -> PathBuf {
+    if path == "/" || path.is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from("/").join(path)
+    }
+}
+
+fn virtual_mount_create_dir_all(
+    fs: &virtual_fs::mem_fs::FileSystem,
+    path: &str,
+    guest_path: &str,
+) -> Result<(), SandboxWasiError> {
+    virtual_fs::create_dir_all(fs, &virtual_mount_path(path)).map_err(|error| {
+        SandboxWasiError::Runtime {
+            detail: format!("create generated {guest_path} virtual directory {path}: {error}"),
+        }
+    })
+}
+
+fn virtual_mount_write_file(
+    fs: &virtual_fs::mem_fs::FileSystem,
+    path: &str,
+    bytes: impl AsRef<[u8]>,
+    guest_path: &str,
+) -> Result<(), SandboxWasiError> {
+    let path_buf = virtual_mount_path(path);
+    if let Some(parent) = path_buf.parent() {
+        virtual_fs::create_dir_all(fs, parent).map_err(|error| SandboxWasiError::Runtime {
+            detail: format!(
+                "create generated {guest_path} virtual file parent {}: {error}",
+                parent.display()
+            ),
+        })?;
+    }
+    let mut file = fs
+        .new_open_options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path_buf)
+        .map_err(|error| SandboxWasiError::Runtime {
+            detail: format!(
+                "open generated {guest_path} virtual file {}: {error}",
+                path_buf.display()
+            ),
+        })?;
+    virtual_mio::block_on(virtual_fs::AsyncWriteExt::write_all(
+        &mut file,
+        bytes.as_ref(),
+    ))
+    .map_err(|error| SandboxWasiError::Runtime {
+        detail: format!(
+            "write generated {guest_path} virtual file {}: {error}",
+            path_buf.display()
+        ),
+    })
+}
+
+fn populate_virtual_dev_mount(
+    dev: &virtual_fs::mem_fs::FileSystem,
+    zero_device_bytes: usize,
+) -> Result<(), SandboxWasiError> {
+    virtual_mount_write_file(dev, "null", [], "/dev")?;
+    virtual_mount_write_file(dev, "zero", vec![0; zero_device_bytes], "/dev")?;
+    let mut random = vec![0; 64 * 1024];
+    getrandom::getrandom(&mut random).map_err(|error| SandboxWasiError::Runtime {
+        detail: format!("seed sandbox random devices: {error}"),
+    })?;
+    virtual_mount_write_file(dev, "random", &random, "/dev")?;
+    virtual_mount_write_file(dev, "urandom", &random, "/dev")?;
+    virtual_mount_write_file(dev, "full", vec![0; zero_device_bytes], "/dev")?;
+    for device in ["stdin", "stdout", "stderr", "tty", "console", "ptmx"] {
+        virtual_mount_write_file(dev, device, [], "/dev")?;
+    }
+    for dir in ["fd", "pts", "shm"] {
+        virtual_mount_create_dir_all(dev, dir, "/dev")?;
+    }
+    for fd in ["0", "1", "2"] {
+        virtual_mount_write_file(dev, &format!("fd/{fd}"), [], "/dev")?;
+    }
+    Ok(())
+}
+
+fn populate_virtual_proc_mount(
+    proc: &virtual_fs::mem_fs::FileSystem,
+    argv: &[String],
+    env: &[(String, String)],
+    mounts: &[(SandboxPath, SandboxMountMode)],
+) -> Result<(), SandboxWasiError> {
+    for dir in [
+        "self/fd",
+        "self/fdinfo",
+        "self/net",
+        "self/attr",
+        "self/ns",
+        "self/task",
+        "thread-self",
+        "1/fd",
+        "1/fdinfo",
+        "1/net",
+        "1/attr",
+        "1/ns",
+        "1/task/1/fd",
+        "1/task/1/fdinfo",
+        "1/task/1/net",
+        "1/task/1/attr",
+        "1/task/1/ns",
+        "self/task/1/fd",
+        "self/task/1/fdinfo",
+        "self/task/1/net",
+        "self/task/1/attr",
+        "self/task/1/ns",
+        "net",
+        "pressure",
+        "sys/crypto",
+        "sys/fs/epoll",
+        "sys/fs/inotify",
+        "sys/fs/mqueue",
+        "sys/kernel/keys",
+        "sys/kernel/random",
+        "sys/kernel/yama",
+        "sys/net/core",
+        "sys/net/ipv4",
+        "sys/net/ipv6/conf/all",
+        "sys/net/ipv6/conf/default",
+        "sys/net/unix",
+        "sys/user",
+        "sys/vm",
+    ] {
+        virtual_mount_create_dir_all(proc, dir, "/proc")?;
+    }
+    for fd in ["0", "1", "2"] {
+        virtual_mount_write_file(proc, &format!("self/fd/{fd}"), [], "/proc")?;
+        virtual_mount_write_file(
+            proc,
+            &format!("self/fdinfo/{fd}"),
+            proc_self_fdinfo(fd),
+            "/proc",
+        )?;
+    }
+    for link in ["cwd", "root", "exe"] {
+        virtual_mount_write_file(proc, &format!("self/{link}"), [], "/proc")?;
+    }
+    for (proc_file, content) in proc_self_files(argv) {
+        virtual_mount_write_file(proc, &format!("self/{proc_file}"), content, "/proc")?;
+    }
+    virtual_mount_write_file(proc, "self/cmdline", proc_cmdline(argv), "/proc")?;
+    virtual_mount_write_file(proc, "self/environ", proc_environ(env), "/proc")?;
+    let mounts = proc_mounts(mounts);
+    virtual_mount_write_file(proc, "mounts", &mounts, "/proc")?;
+    virtual_mount_write_file(proc, "self/mounts", &mounts, "/proc")?;
+    let mountinfo = proc_mountinfo(&mounts);
+    virtual_mount_write_file(proc, "mountinfo", &mountinfo, "/proc")?;
+    virtual_mount_write_file(proc, "self/mountinfo", &mountinfo, "/proc")?;
+    for (proc_file, content) in proc_system_files() {
+        virtual_mount_write_file(proc, &proc_file, content, "/proc")?;
+    }
+    for (proc_file, content) in proc_self_net_files() {
+        virtual_mount_write_file(proc, &format!("self/net/{proc_file}"), content, "/proc")?;
+    }
+    for (proc_file, content) in proc_self_attr_files() {
+        virtual_mount_write_file(proc, &format!("self/attr/{proc_file}"), content, "/proc")?;
+    }
+    for proc_file in proc_self_ns_files() {
+        virtual_mount_write_file(proc, &format!("self/ns/{proc_file}"), [], "/proc")?;
+    }
+    populate_virtual_proc_pid_view(proc, "1", argv, env, &mounts, &mountinfo)?;
+    populate_virtual_proc_task_view(proc, "self/task/1", argv, env, &mounts, &mountinfo)?;
+    Ok(())
+}
+
+fn populate_virtual_proc_pid_view(
+    proc: &virtual_fs::mem_fs::FileSystem,
+    pid: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    mounts: &str,
+    mountinfo: &str,
+) -> Result<(), SandboxWasiError> {
+    for fd in ["0", "1", "2"] {
+        virtual_mount_write_file(proc, &format!("{pid}/fd/{fd}"), [], "/proc")?;
+        virtual_mount_write_file(
+            proc,
+            &format!("{pid}/fdinfo/{fd}"),
+            proc_self_fdinfo(fd),
+            "/proc",
+        )?;
+    }
+    for link in ["cwd", "root", "exe"] {
+        virtual_mount_write_file(proc, &format!("{pid}/{link}"), [], "/proc")?;
+    }
+    for (proc_file, content) in proc_self_files(argv) {
+        virtual_mount_write_file(proc, &format!("{pid}/{proc_file}"), content, "/proc")?;
+    }
+    virtual_mount_write_file(proc, &format!("{pid}/cmdline"), proc_cmdline(argv), "/proc")?;
+    virtual_mount_write_file(proc, &format!("{pid}/environ"), proc_environ(env), "/proc")?;
+    virtual_mount_write_file(proc, &format!("{pid}/mounts"), mounts, "/proc")?;
+    virtual_mount_write_file(proc, &format!("{pid}/mountinfo"), mountinfo, "/proc")?;
+    for (proc_file, content) in proc_self_net_files() {
+        virtual_mount_write_file(proc, &format!("{pid}/net/{proc_file}"), content, "/proc")?;
+    }
+    for (proc_file, content) in proc_self_attr_files() {
+        virtual_mount_write_file(proc, &format!("{pid}/attr/{proc_file}"), content, "/proc")?;
+    }
+    for proc_file in proc_self_ns_files() {
+        virtual_mount_write_file(proc, &format!("{pid}/ns/{proc_file}"), [], "/proc")?;
+    }
+    populate_virtual_proc_task_view(proc, &format!("{pid}/task/1"), argv, env, mounts, mountinfo)
+}
+
+fn populate_virtual_proc_task_view(
+    proc: &virtual_fs::mem_fs::FileSystem,
+    task_path: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    mounts: &str,
+    mountinfo: &str,
+) -> Result<(), SandboxWasiError> {
+    for fd in ["0", "1", "2"] {
+        virtual_mount_write_file(proc, &format!("{task_path}/fd/{fd}"), [], "/proc")?;
+        virtual_mount_write_file(
+            proc,
+            &format!("{task_path}/fdinfo/{fd}"),
+            proc_self_fdinfo(fd),
+            "/proc",
+        )?;
+    }
+    for link in ["cwd", "root", "exe"] {
+        virtual_mount_write_file(proc, &format!("{task_path}/{link}"), [], "/proc")?;
+    }
+    virtual_mount_write_file(proc, &format!("{task_path}/children"), [], "/proc")?;
+    for (proc_file, content) in proc_self_files(argv) {
+        virtual_mount_write_file(proc, &format!("{task_path}/{proc_file}"), content, "/proc")?;
+    }
+    virtual_mount_write_file(
+        proc,
+        &format!("{task_path}/cmdline"),
+        proc_cmdline(argv),
+        "/proc",
+    )?;
+    virtual_mount_write_file(
+        proc,
+        &format!("{task_path}/environ"),
+        proc_environ(env),
+        "/proc",
+    )?;
+    virtual_mount_write_file(proc, &format!("{task_path}/mounts"), mounts, "/proc")?;
+    virtual_mount_write_file(proc, &format!("{task_path}/mountinfo"), mountinfo, "/proc")?;
+    for (proc_file, content) in proc_self_net_files() {
+        virtual_mount_write_file(
+            proc,
+            &format!("{task_path}/net/{proc_file}"),
+            content,
+            "/proc",
+        )?;
+    }
+    for (proc_file, content) in proc_self_attr_files() {
+        virtual_mount_write_file(
+            proc,
+            &format!("{task_path}/attr/{proc_file}"),
+            content,
+            "/proc",
+        )?;
+    }
+    for proc_file in proc_self_ns_files() {
+        virtual_mount_write_file(proc, &format!("{task_path}/ns/{proc_file}"), [], "/proc")?;
+    }
+    Ok(())
+}
+
+fn populate_virtual_etc_mount(
+    etc: &virtual_fs::mem_fs::FileSystem,
+    mounts: &[(SandboxPath, SandboxMountMode)],
+) -> Result<(), SandboxWasiError> {
+    for dir in ["ssl/certs", "pki/tls/certs", "default"] {
+        virtual_mount_create_dir_all(etc, dir, "/etc")?;
+    }
+    let mounts = proc_mounts(mounts);
+    virtual_mount_write_file(etc, "mtab", mounts, "/etc")?;
+    for (etc_file, content) in etc_system_files() {
+        virtual_mount_write_file(etc, &etc_file, content, "/etc")?;
+    }
+    Ok(())
+}
+
+fn populate_virtual_sys_mount(
+    sys: &virtual_fs::mem_fs::FileSystem,
+) -> Result<(), SandboxWasiError> {
+    for dir in [
+        "block",
+        "class/block",
+        "class/mem",
+        "class/net/lo",
+        "class/tty/console",
+        "class/tty/tty",
+        "devices/system/cpu",
+        "devices/system/node",
+        "fs/cgroup",
+        "devices/virtual/mem/null",
+        "devices/virtual/mem/zero",
+        "devices/virtual/mem/full",
+        "devices/virtual/mem/random",
+        "devices/virtual/mem/urandom",
+        "devices/virtual/net/lo",
+        "devices/virtual/tty/console",
+        "devices/virtual/tty/tty",
+        "kernel/mm/transparent_hugepage",
+    ] {
+        virtual_mount_create_dir_all(sys, dir, "/sys")?;
+    }
+    for processor in 0..sandbox_cpu_count() {
+        virtual_mount_create_dir_all(
+            sys,
+            &format!("devices/system/cpu/cpu{processor}/topology"),
+            "/sys",
+        )?;
+        virtual_mount_create_dir_all(
+            sys,
+            &format!("devices/system/cpu/cpu{processor}/cache/index0"),
+            "/sys",
+        )?;
+    }
+    for (sys_file, content) in sys_system_files() {
+        virtual_mount_write_file(sys, &sys_file, content, "/sys")?;
+    }
+    Ok(())
+}
+
+fn proc_cmdline(argv: &[String]) -> Vec<u8> {
+    let mut cmdline = Vec::new();
+    for arg in argv {
+        cmdline.extend_from_slice(arg.as_bytes());
+        cmdline.push(0);
+    }
+    cmdline
+}
+
+fn proc_environ(env: &[(String, String)]) -> Vec<u8> {
+    let mut environ = Vec::new();
+    for (key, value) in env {
+        environ.extend_from_slice(key.as_bytes());
+        environ.push(b'=');
+        environ.extend_from_slice(value.as_bytes());
+        environ.push(0);
+    }
+    environ
+}
+
+fn load_virtual_mount(
+    root: &Path,
+    guest_path: &str,
+) -> Result<Arc<dyn virtual_fs::FileSystem + Send + Sync>, SandboxWasiError> {
+    let fs = virtual_fs::mem_fs::FileSystem::default();
+    copy_host_tree_to_virtual_mount(&fs, root, root, guest_path)?;
+    Ok(Arc::new(fs))
+}
+
+fn copy_host_tree_to_virtual_mount(
+    destination: &virtual_fs::mem_fs::FileSystem,
+    root: &Path,
+    path: &Path,
+    guest_path: &str,
+) -> Result<(), SandboxWasiError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|error| SandboxWasiError::Runtime {
+            detail: format!(
+                "resolve generated {guest_path} entry {}: {error}",
+                path.display()
+            ),
+        })?;
+    let virtual_path = if relative.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from("/").join(relative)
+    };
+    let metadata = fs::symlink_metadata(path).map_err(|error| SandboxWasiError::Runtime {
+        detail: format!(
+            "inspect generated {guest_path} entry {}: {error}",
+            path.display()
+        ),
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(SandboxWasiError::Runtime {
+            detail: format!(
+                "generated {guest_path} entry must not be a symlink: {}",
+                path.display()
+            ),
+        });
+    }
+    if metadata.is_dir() {
+        virtual_fs::create_dir_all(destination, &virtual_path).map_err(|error| {
+            SandboxWasiError::Runtime {
+                detail: format!(
+                    "create generated {guest_path} virtual directory {}: {error}",
+                    virtual_path.display()
+                ),
+            }
+        })?;
+        for entry in fs::read_dir(path).map_err(|error| SandboxWasiError::Runtime {
+            detail: format!(
+                "list generated {guest_path} directory {}: {error}",
+                path.display()
+            ),
+        })? {
+            let entry = entry.map_err(|error| SandboxWasiError::Runtime {
+                detail: format!("read generated {guest_path} directory entry: {error}"),
+            })?;
+            copy_host_tree_to_virtual_mount(destination, root, &entry.path(), guest_path)?;
+        }
+        return Ok(());
+    }
+    if metadata.is_file() {
+        if let Some(parent) = virtual_path.parent() {
+            virtual_fs::create_dir_all(destination, parent).map_err(|error| {
+                SandboxWasiError::Runtime {
+                    detail: format!(
+                        "create generated {guest_path} virtual file parent {}: {error}",
+                        parent.display()
+                    ),
+                }
+            })?;
+        }
+        let bytes = fs::read(path).map_err(|error| SandboxWasiError::Runtime {
+            detail: format!(
+                "read generated {guest_path} file {}: {error}",
+                path.display()
+            ),
+        })?;
+        let mut file = destination
+            .new_open_options()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&virtual_path)
+            .map_err(|error| SandboxWasiError::Runtime {
+                detail: format!(
+                    "open generated {guest_path} virtual file {}: {error}",
+                    virtual_path.display()
+                ),
+            })?;
+        virtual_mio::block_on(virtual_fs::AsyncWriteExt::write_all(&mut file, &bytes)).map_err(
+            |error| SandboxWasiError::Runtime {
+                detail: format!(
+                    "write generated {guest_path} virtual file {}: {error}",
+                    virtual_path.display()
+                ),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn proc_mounts(mounts: &[(SandboxPath, SandboxMountMode)]) -> String {
@@ -1055,85 +1715,97 @@ fn proc_self_fdinfo(fd: &str) -> String {
 }
 
 fn proc_system_files() -> Vec<(&'static str, String)> {
+    mod sandbox_policy {
+        pub(super) fn configured_value(_path: &str) -> Option<String> {
+            None
+        }
+    }
     vec![
         (
             "cpuinfo",
-            fs::read_to_string("/proc/cpuinfo").unwrap_or_else(|_| proc_cpuinfo_fallback()),
+            sandbox_policy::configured_value("/proc/cpuinfo")
+                .unwrap_or_else(|| proc_cpuinfo_fallback()),
         ),
         (
             "meminfo",
-            fs::read_to_string("/proc/meminfo").unwrap_or_else(|_| proc_meminfo_fallback()),
+            sandbox_policy::configured_value("/proc/meminfo")
+                .unwrap_or_else(|| proc_meminfo_fallback()),
         ),
         (
             "stat",
-            fs::read_to_string("/proc/stat").unwrap_or_else(|_| proc_stat_fallback()),
+            sandbox_policy::configured_value("/proc/stat").unwrap_or_else(|| proc_stat_fallback()),
         ),
         (
             "uptime",
-            fs::read_to_string("/proc/uptime").unwrap_or_else(|_| "0.00 0.00\n".to_string()),
+            sandbox_policy::configured_value("/proc/uptime")
+                .unwrap_or_else(|| "0.00 0.00\n".to_string()),
         ),
         (
             "loadavg",
-            fs::read_to_string("/proc/loadavg")
-                .unwrap_or_else(|_| "0.00 0.00 0.00 1/1 1\n".to_string()),
+            sandbox_policy::configured_value("/proc/loadavg")
+                .unwrap_or_else(|| "0.00 0.00 0.00 1/1 1\n".to_string()),
         ),
         (
             "version",
-            fs::read_to_string("/proc/version")
-                .unwrap_or_else(|_| "Sinomo sandbox WASIX\n".to_string()),
+            sandbox_policy::configured_value("/proc/version")
+                .unwrap_or_else(|| "Sinomo sandbox WASIX\n".to_string()),
         ),
         (
             "buddyinfo",
-            fs::read_to_string("/proc/buddyinfo").unwrap_or_else(|_| String::new()),
+            sandbox_policy::configured_value("/proc/buddyinfo").unwrap_or_else(|| String::new()),
         ),
         (
             "crypto",
-            fs::read_to_string("/proc/crypto").unwrap_or_else(|_| proc_crypto()),
+            sandbox_policy::configured_value("/proc/crypto").unwrap_or_else(|| proc_crypto()),
         ),
         (
             "devices",
-            fs::read_to_string("/proc/devices").unwrap_or_else(|_| proc_devices()),
+            sandbox_policy::configured_value("/proc/devices").unwrap_or_else(|| proc_devices()),
         ),
         (
             "diskstats",
-            fs::read_to_string("/proc/diskstats").unwrap_or_else(|_| String::new()),
+            sandbox_policy::configured_value("/proc/diskstats").unwrap_or_else(|| String::new()),
         ),
         ("filesystems", proc_filesystems()),
         (
             "locks",
-            fs::read_to_string("/proc/locks").unwrap_or_else(|_| String::new()),
+            sandbox_policy::configured_value("/proc/locks").unwrap_or_else(|| String::new()),
         ),
         (
             "modules",
-            fs::read_to_string("/proc/modules").unwrap_or_else(|_| String::new()),
+            sandbox_policy::configured_value("/proc/modules").unwrap_or_else(|| String::new()),
         ),
         (
             "partitions",
-            fs::read_to_string("/proc/partitions").unwrap_or_else(|_| proc_partitions()),
+            sandbox_policy::configured_value("/proc/partitions")
+                .unwrap_or_else(|| proc_partitions()),
         ),
         (
             "swaps",
-            fs::read_to_string("/proc/swaps").unwrap_or_else(|_| proc_swaps()),
+            sandbox_policy::configured_value("/proc/swaps").unwrap_or_else(|| proc_swaps()),
         ),
         (
             "vmstat",
-            fs::read_to_string("/proc/vmstat").unwrap_or_else(|_| proc_vmstat()),
+            sandbox_policy::configured_value("/proc/vmstat").unwrap_or_else(|| proc_vmstat()),
         ),
         (
             "zoneinfo",
-            fs::read_to_string("/proc/zoneinfo").unwrap_or_else(|_| proc_zoneinfo()),
+            sandbox_policy::configured_value("/proc/zoneinfo").unwrap_or_else(|| proc_zoneinfo()),
         ),
         (
             "pressure/cpu",
-            fs::read_to_string("/proc/pressure/cpu").unwrap_or_else(|_| proc_pressure()),
+            sandbox_policy::configured_value("/proc/pressure/cpu")
+                .unwrap_or_else(|| proc_pressure()),
         ),
         (
             "pressure/io",
-            fs::read_to_string("/proc/pressure/io").unwrap_or_else(|_| proc_pressure()),
+            sandbox_policy::configured_value("/proc/pressure/io")
+                .unwrap_or_else(|| proc_pressure()),
         ),
         (
             "pressure/memory",
-            fs::read_to_string("/proc/pressure/memory").unwrap_or_else(|_| proc_pressure()),
+            sandbox_policy::configured_value("/proc/pressure/memory")
+                .unwrap_or_else(|| proc_pressure()),
         ),
         ("net/dev", proc_net_dev()),
         ("net/route", proc_net_route()),
@@ -1145,522 +1817,538 @@ fn proc_system_files() -> Vec<(&'static str, String)> {
         ("net/unix", proc_net_unix()),
         (
             "sys/kernel/ostype",
-            fs::read_to_string("/proc/sys/kernel/ostype").unwrap_or_else(|_| "Linux\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/ostype")
+                .unwrap_or_else(|| "Linux\n".to_string()),
         ),
         (
             "sys/kernel/osrelease",
-            fs::read_to_string("/proc/sys/kernel/osrelease")
-                .unwrap_or_else(|_| "6.0.0-sinomo-sandbox\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/osrelease")
+                .unwrap_or_else(|| "6.0.0-sinomo-sandbox\n".to_string()),
         ),
         (
             "sys/kernel/version",
-            fs::read_to_string("/proc/sys/kernel/version")
-                .unwrap_or_else(|_| "Sinomo sandbox WASIX\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/version")
+                .unwrap_or_else(|| "Sinomo sandbox WASIX\n".to_string()),
         ),
         (
             "sys/kernel/hostname",
-            fs::read_to_string("/proc/sys/kernel/hostname")
-                .unwrap_or_else(|_| "sinomo-sandbox\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/hostname")
+                .unwrap_or_else(|| "sinomo-sandbox\n".to_string()),
         ),
         (
             "sys/kernel/domainname",
-            fs::read_to_string("/proc/sys/kernel/domainname")
-                .unwrap_or_else(|_| "(none)\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/domainname")
+                .unwrap_or_else(|| "(none)\n".to_string()),
         ),
         (
             "sys/kernel/pid_max",
-            fs::read_to_string("/proc/sys/kernel/pid_max")
-                .unwrap_or_else(|_| "4194304\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/pid_max")
+                .unwrap_or_else(|| "4194304\n".to_string()),
         ),
         (
             "sys/kernel/threads-max",
-            fs::read_to_string("/proc/sys/kernel/threads-max")
-                .unwrap_or_else(|_| "4194304\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/threads-max")
+                .unwrap_or_else(|| "4194304\n".to_string()),
         ),
         (
             "sys/kernel/ngroups_max",
-            fs::read_to_string("/proc/sys/kernel/ngroups_max")
-                .unwrap_or_else(|_| "65536\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/ngroups_max")
+                .unwrap_or_else(|| "65536\n".to_string()),
         ),
         (
             "sys/kernel/cap_last_cap",
-            fs::read_to_string("/proc/sys/kernel/cap_last_cap")
-                .unwrap_or_else(|_| "40\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/cap_last_cap")
+                .unwrap_or_else(|| "40\n".to_string()),
         ),
         (
             "sys/kernel/shmmax",
-            fs::read_to_string("/proc/sys/kernel/shmmax")
-                .unwrap_or_else(|_| "18446744073692774399\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/shmmax")
+                .unwrap_or_else(|| "18446744073692774399\n".to_string()),
         ),
         (
             "sys/kernel/shmall",
-            fs::read_to_string("/proc/sys/kernel/shmall")
-                .unwrap_or_else(|_| "18446744073692774399\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/shmall")
+                .unwrap_or_else(|| "18446744073692774399\n".to_string()),
         ),
         (
             "sys/kernel/shmmni",
-            fs::read_to_string("/proc/sys/kernel/shmmni").unwrap_or_else(|_| "4096\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/shmmni")
+                .unwrap_or_else(|| "4096\n".to_string()),
         ),
         (
             "sys/kernel/msgmax",
-            fs::read_to_string("/proc/sys/kernel/msgmax").unwrap_or_else(|_| "8192\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/msgmax")
+                .unwrap_or_else(|| "8192\n".to_string()),
         ),
         (
             "sys/kernel/msgmnb",
-            fs::read_to_string("/proc/sys/kernel/msgmnb").unwrap_or_else(|_| "16384\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/msgmnb")
+                .unwrap_or_else(|| "16384\n".to_string()),
         ),
         (
             "sys/kernel/msgmni",
-            fs::read_to_string("/proc/sys/kernel/msgmni").unwrap_or_else(|_| "32000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/msgmni")
+                .unwrap_or_else(|| "32000\n".to_string()),
         ),
         (
             "sys/kernel/sem",
-            fs::read_to_string("/proc/sys/kernel/sem")
-                .unwrap_or_else(|_| "32000\t1024000000\t500\t32000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/sem")
+                .unwrap_or_else(|| "32000\t1024000000\t500\t32000\n".to_string()),
         ),
         (
             "sys/kernel/core_pattern",
-            fs::read_to_string("/proc/sys/kernel/core_pattern")
-                .unwrap_or_else(|_| "core\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/core_pattern")
+                .unwrap_or_else(|| "core\n".to_string()),
         ),
         (
             "sys/kernel/core_uses_pid",
-            fs::read_to_string("/proc/sys/kernel/core_uses_pid")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/core_uses_pid")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/kernel/hotplug",
-            fs::read_to_string("/proc/sys/kernel/hotplug").unwrap_or_else(|_| "\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/hotplug")
+                .unwrap_or_else(|| "\n".to_string()),
         ),
         (
             "sys/kernel/kptr_restrict",
-            fs::read_to_string("/proc/sys/kernel/kptr_restrict")
-                .unwrap_or_else(|_| "1\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/kptr_restrict")
+                .unwrap_or_else(|| "1\n".to_string()),
         ),
         (
             "sys/kernel/keys/gc_delay",
-            fs::read_to_string("/proc/sys/kernel/keys/gc_delay")
-                .unwrap_or_else(|_| "300\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/keys/gc_delay")
+                .unwrap_or_else(|| "300\n".to_string()),
         ),
         (
             "sys/kernel/keys/maxbytes",
-            fs::read_to_string("/proc/sys/kernel/keys/maxbytes")
-                .unwrap_or_else(|_| "20000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/keys/maxbytes")
+                .unwrap_or_else(|| "20000\n".to_string()),
         ),
         (
             "sys/kernel/keys/maxkeys",
-            fs::read_to_string("/proc/sys/kernel/keys/maxkeys")
-                .unwrap_or_else(|_| "200\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/keys/maxkeys")
+                .unwrap_or_else(|| "200\n".to_string()),
         ),
         (
             "sys/kernel/keys/root_maxbytes",
-            fs::read_to_string("/proc/sys/kernel/keys/root_maxbytes")
-                .unwrap_or_else(|_| "25000000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/keys/root_maxbytes")
+                .unwrap_or_else(|| "25000000\n".to_string()),
         ),
         (
             "sys/kernel/keys/root_maxkeys",
-            fs::read_to_string("/proc/sys/kernel/keys/root_maxkeys")
-                .unwrap_or_else(|_| "1000000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/keys/root_maxkeys")
+                .unwrap_or_else(|| "1000000\n".to_string()),
         ),
         (
             "sys/kernel/kstack_depth_to_print",
-            fs::read_to_string("/proc/sys/kernel/kstack_depth_to_print")
-                .unwrap_or_else(|_| "24\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/kstack_depth_to_print")
+                .unwrap_or_else(|| "24\n".to_string()),
         ),
         (
             "sys/kernel/modules_disabled",
-            fs::read_to_string("/proc/sys/kernel/modules_disabled")
-                .unwrap_or_else(|_| "1\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/modules_disabled")
+                .unwrap_or_else(|| "1\n".to_string()),
         ),
         (
             "sys/kernel/nmi_watchdog",
-            fs::read_to_string("/proc/sys/kernel/nmi_watchdog")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/nmi_watchdog")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/kernel/panic",
-            fs::read_to_string("/proc/sys/kernel/panic").unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/panic")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/kernel/panic_on_oops",
-            fs::read_to_string("/proc/sys/kernel/panic_on_oops")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/panic_on_oops")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/kernel/perf_event_paranoid",
-            fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
-                .unwrap_or_else(|_| "3\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/perf_event_paranoid")
+                .unwrap_or_else(|| "3\n".to_string()),
         ),
         (
             "sys/kernel/perf_event_max_sample_rate",
-            fs::read_to_string("/proc/sys/kernel/perf_event_max_sample_rate")
-                .unwrap_or_else(|_| "100000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/perf_event_max_sample_rate")
+                .unwrap_or_else(|| "100000\n".to_string()),
         ),
         (
             "sys/kernel/sched_child_runs_first",
-            fs::read_to_string("/proc/sys/kernel/sched_child_runs_first")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/sched_child_runs_first")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/kernel/sched_rr_timeslice_ms",
-            fs::read_to_string("/proc/sys/kernel/sched_rr_timeslice_ms")
-                .unwrap_or_else(|_| "100\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/sched_rr_timeslice_ms")
+                .unwrap_or_else(|| "100\n".to_string()),
         ),
         (
             "sys/kernel/sched_rt_period_us",
-            fs::read_to_string("/proc/sys/kernel/sched_rt_period_us")
-                .unwrap_or_else(|_| "1000000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/sched_rt_period_us")
+                .unwrap_or_else(|| "1000000\n".to_string()),
         ),
         (
             "sys/kernel/sched_rt_runtime_us",
-            fs::read_to_string("/proc/sys/kernel/sched_rt_runtime_us")
-                .unwrap_or_else(|_| "950000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/sched_rt_runtime_us")
+                .unwrap_or_else(|| "950000\n".to_string()),
         ),
         (
             "sys/kernel/sysrq",
-            fs::read_to_string("/proc/sys/kernel/sysrq").unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/sysrq")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/kernel/yama/ptrace_scope",
-            fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
-                .unwrap_or_else(|_| "1\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/yama/ptrace_scope")
+                .unwrap_or_else(|| "1\n".to_string()),
         ),
         (
             "sys/fs/file-max",
-            fs::read_to_string("/proc/sys/fs/file-max")
-                .unwrap_or_else(|_| "9223372036854775807\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/file-max")
+                .unwrap_or_else(|| "9223372036854775807\n".to_string()),
         ),
         (
             "sys/fs/file-nr",
-            fs::read_to_string("/proc/sys/fs/file-nr")
-                .unwrap_or_else(|_| "0\t0\t9223372036854775807\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/file-nr")
+                .unwrap_or_else(|| "0\t0\t9223372036854775807\n".to_string()),
         ),
         (
             "sys/fs/inode-nr",
-            fs::read_to_string("/proc/sys/fs/inode-nr").unwrap_or_else(|_| "0\t0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/inode-nr")
+                .unwrap_or_else(|| "0\t0\n".to_string()),
         ),
         (
             "sys/fs/inode-state",
-            fs::read_to_string("/proc/sys/fs/inode-state")
-                .unwrap_or_else(|_| "0\t0\t0\t0\t0\t0\t0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/inode-state")
+                .unwrap_or_else(|| "0\t0\t0\t0\t0\t0\t0\n".to_string()),
         ),
         (
             "sys/fs/aio-max-nr",
-            fs::read_to_string("/proc/sys/fs/aio-max-nr").unwrap_or_else(|_| "65536\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/aio-max-nr")
+                .unwrap_or_else(|| "65536\n".to_string()),
         ),
         (
             "sys/fs/aio-nr",
-            fs::read_to_string("/proc/sys/fs/aio-nr").unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/aio-nr")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/fs/dentry-state",
-            fs::read_to_string("/proc/sys/fs/dentry-state")
-                .unwrap_or_else(|_| "0\t0\t45\t0\t0\t0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/dentry-state")
+                .unwrap_or_else(|| "0\t0\t45\t0\t0\t0\n".to_string()),
         ),
         (
             "sys/fs/epoll/max_user_watches",
-            fs::read_to_string("/proc/sys/fs/epoll/max_user_watches")
-                .unwrap_or_else(|_| "1048576\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/epoll/max_user_watches")
+                .unwrap_or_else(|| "1048576\n".to_string()),
         ),
         (
             "sys/fs/mqueue/msg_default",
-            fs::read_to_string("/proc/sys/fs/mqueue/msg_default")
-                .unwrap_or_else(|_| "10\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/mqueue/msg_default")
+                .unwrap_or_else(|| "10\n".to_string()),
         ),
         (
             "sys/fs/mqueue/msg_max",
-            fs::read_to_string("/proc/sys/fs/mqueue/msg_max")
-                .unwrap_or_else(|_| "10\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/mqueue/msg_max")
+                .unwrap_or_else(|| "10\n".to_string()),
         ),
         (
             "sys/fs/mqueue/msgsize_default",
-            fs::read_to_string("/proc/sys/fs/mqueue/msgsize_default")
-                .unwrap_or_else(|_| "8192\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/mqueue/msgsize_default")
+                .unwrap_or_else(|| "8192\n".to_string()),
         ),
         (
             "sys/fs/mqueue/msgsize_max",
-            fs::read_to_string("/proc/sys/fs/mqueue/msgsize_max")
-                .unwrap_or_else(|_| "8192\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/mqueue/msgsize_max")
+                .unwrap_or_else(|| "8192\n".to_string()),
         ),
         (
             "sys/fs/nr_open",
-            fs::read_to_string("/proc/sys/fs/nr_open").unwrap_or_else(|_| "1048576\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/nr_open")
+                .unwrap_or_else(|| "1048576\n".to_string()),
         ),
         (
             "sys/fs/pipe-max-size",
-            fs::read_to_string("/proc/sys/fs/pipe-max-size")
-                .unwrap_or_else(|_| "1048576\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/pipe-max-size")
+                .unwrap_or_else(|| "1048576\n".to_string()),
         ),
         (
             "sys/fs/pipe-user-pages-hard",
-            fs::read_to_string("/proc/sys/fs/pipe-user-pages-hard")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/pipe-user-pages-hard")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/fs/pipe-user-pages-soft",
-            fs::read_to_string("/proc/sys/fs/pipe-user-pages-soft")
-                .unwrap_or_else(|_| "16384\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/pipe-user-pages-soft")
+                .unwrap_or_else(|| "16384\n".to_string()),
         ),
         (
             "sys/fs/inotify/max_user_watches",
-            fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
-                .unwrap_or_else(|_| "1048576\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/inotify/max_user_watches")
+                .unwrap_or_else(|| "1048576\n".to_string()),
         ),
         (
             "sys/fs/inotify/max_user_instances",
-            fs::read_to_string("/proc/sys/fs/inotify/max_user_instances")
-                .unwrap_or_else(|_| "1024\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/inotify/max_user_instances")
+                .unwrap_or_else(|| "1024\n".to_string()),
         ),
         (
             "sys/fs/inotify/max_queued_events",
-            fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
-                .unwrap_or_else(|_| "16384\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/fs/inotify/max_queued_events")
+                .unwrap_or_else(|| "16384\n".to_string()),
         ),
         (
             "sys/crypto/fips_enabled",
-            fs::read_to_string("/proc/sys/crypto/fips_enabled")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/crypto/fips_enabled")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/kernel/random/boot_id",
-            fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .unwrap_or_else(|_| format!("{}\n", proc_uuid())),
+            sandbox_policy::configured_value("/proc/sys/kernel/random/boot_id")
+                .unwrap_or_else(|| format!("{}\n", proc_uuid())),
         ),
         (
             "sys/kernel/random/entropy_avail",
-            fs::read_to_string("/proc/sys/kernel/random/entropy_avail")
-                .unwrap_or_else(|_| "256\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/random/entropy_avail")
+                .unwrap_or_else(|| "256\n".to_string()),
         ),
         (
             "sys/kernel/random/poolsize",
-            fs::read_to_string("/proc/sys/kernel/random/poolsize")
-                .unwrap_or_else(|_| "256\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/random/poolsize")
+                .unwrap_or_else(|| "256\n".to_string()),
         ),
         (
             "sys/kernel/random/urandom_min_reseed_secs",
-            fs::read_to_string("/proc/sys/kernel/random/urandom_min_reseed_secs")
-                .unwrap_or_else(|_| "60\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/random/urandom_min_reseed_secs")
+                .unwrap_or_else(|| "60\n".to_string()),
         ),
         (
             "sys/kernel/random/write_wakeup_threshold",
-            fs::read_to_string("/proc/sys/kernel/random/write_wakeup_threshold")
-                .unwrap_or_else(|_| "256\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/kernel/random/write_wakeup_threshold")
+                .unwrap_or_else(|| "256\n".to_string()),
         ),
         (
             "sys/kernel/random/uuid",
-            fs::read_to_string("/proc/sys/kernel/random/uuid")
-                .unwrap_or_else(|_| format!("{}\n", proc_uuid())),
+            sandbox_policy::configured_value("/proc/sys/kernel/random/uuid")
+                .unwrap_or_else(|| format!("{}\n", proc_uuid())),
         ),
         (
             "sys/net/core/somaxconn",
-            fs::read_to_string("/proc/sys/net/core/somaxconn")
-                .unwrap_or_else(|_| "4096\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/core/somaxconn")
+                .unwrap_or_else(|| "4096\n".to_string()),
         ),
         (
             "sys/net/core/rmem_default",
-            fs::read_to_string("/proc/sys/net/core/rmem_default")
-                .unwrap_or_else(|_| "212992\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/core/rmem_default")
+                .unwrap_or_else(|| "212992\n".to_string()),
         ),
         (
             "sys/net/core/wmem_default",
-            fs::read_to_string("/proc/sys/net/core/wmem_default")
-                .unwrap_or_else(|_| "212992\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/core/wmem_default")
+                .unwrap_or_else(|| "212992\n".to_string()),
         ),
         (
             "sys/net/core/rmem_max",
-            fs::read_to_string("/proc/sys/net/core/rmem_max")
-                .unwrap_or_else(|_| "212992\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/core/rmem_max")
+                .unwrap_or_else(|| "212992\n".to_string()),
         ),
         (
             "sys/net/core/wmem_max",
-            fs::read_to_string("/proc/sys/net/core/wmem_max")
-                .unwrap_or_else(|_| "212992\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/core/wmem_max")
+                .unwrap_or_else(|| "212992\n".to_string()),
         ),
         (
             "sys/net/core/netdev_max_backlog",
-            fs::read_to_string("/proc/sys/net/core/netdev_max_backlog")
-                .unwrap_or_else(|_| "1000\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/core/netdev_max_backlog")
+                .unwrap_or_else(|| "1000\n".to_string()),
         ),
         (
             "sys/net/core/optmem_max",
-            fs::read_to_string("/proc/sys/net/core/optmem_max")
-                .unwrap_or_else(|_| "20480\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/core/optmem_max")
+                .unwrap_or_else(|| "20480\n".to_string()),
         ),
         (
             "sys/net/ipv4/ip_local_port_range",
-            fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
-                .unwrap_or_else(|_| "32768\t60999\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/ip_local_port_range")
+                .unwrap_or_else(|| "32768\t60999\n".to_string()),
         ),
         (
             "sys/net/ipv4/ip_forward",
-            fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/ip_forward")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_syncookies",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_syncookies")
-                .unwrap_or_else(|_| "1\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_syncookies")
+                .unwrap_or_else(|| "1\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_fin_timeout",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_fin_timeout")
-                .unwrap_or_else(|_| "60\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_fin_timeout")
+                .unwrap_or_else(|| "60\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_keepalive_time",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_keepalive_time")
-                .unwrap_or_else(|_| "7200\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_keepalive_time")
+                .unwrap_or_else(|| "7200\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_keepalive_intvl",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_keepalive_intvl")
-                .unwrap_or_else(|_| "75\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_keepalive_intvl")
+                .unwrap_or_else(|| "75\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_keepalive_probes",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_keepalive_probes")
-                .unwrap_or_else(|_| "9\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_keepalive_probes")
+                .unwrap_or_else(|| "9\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_max_syn_backlog",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_max_syn_backlog")
-                .unwrap_or_else(|_| "4096\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_max_syn_backlog")
+                .unwrap_or_else(|| "4096\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_retries1",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_retries1")
-                .unwrap_or_else(|_| "3\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_retries1")
+                .unwrap_or_else(|| "3\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_retries2",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_retries2")
-                .unwrap_or_else(|_| "15\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_retries2")
+                .unwrap_or_else(|| "15\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_rmem",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_rmem")
-                .unwrap_or_else(|_| "4096\t131072\t6291456\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_rmem")
+                .unwrap_or_else(|| "4096\t131072\t6291456\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_wmem",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_wmem")
-                .unwrap_or_else(|_| "4096\t16384\t4194304\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_wmem")
+                .unwrap_or_else(|| "4096\t16384\t4194304\n".to_string()),
         ),
         (
             "sys/net/ipv4/tcp_window_scaling",
-            fs::read_to_string("/proc/sys/net/ipv4/tcp_window_scaling")
-                .unwrap_or_else(|_| "1\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv4/tcp_window_scaling")
+                .unwrap_or_else(|| "1\n".to_string()),
         ),
         (
             "sys/net/ipv6/conf/all/disable_ipv6",
-            fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
-                .unwrap_or_else(|_| "1\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+                .unwrap_or_else(|| "1\n".to_string()),
         ),
         (
             "sys/net/ipv6/conf/default/disable_ipv6",
-            fs::read_to_string("/proc/sys/net/ipv6/conf/default/disable_ipv6")
-                .unwrap_or_else(|_| "1\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/ipv6/conf/default/disable_ipv6")
+                .unwrap_or_else(|| "1\n".to_string()),
         ),
         (
             "sys/net/unix/max_dgram_qlen",
-            fs::read_to_string("/proc/sys/net/unix/max_dgram_qlen")
-                .unwrap_or_else(|_| "512\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/net/unix/max_dgram_qlen")
+                .unwrap_or_else(|| "512\n".to_string()),
         ),
         (
             "sys/user/max_cgroup_namespaces",
-            fs::read_to_string("/proc/sys/user/max_cgroup_namespaces")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/user/max_cgroup_namespaces")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/user/max_ipc_namespaces",
-            fs::read_to_string("/proc/sys/user/max_ipc_namespaces")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/user/max_ipc_namespaces")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/user/max_mnt_namespaces",
-            fs::read_to_string("/proc/sys/user/max_mnt_namespaces")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/user/max_mnt_namespaces")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/user/max_net_namespaces",
-            fs::read_to_string("/proc/sys/user/max_net_namespaces")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/user/max_net_namespaces")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/user/max_pid_namespaces",
-            fs::read_to_string("/proc/sys/user/max_pid_namespaces")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/user/max_pid_namespaces")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/user/max_time_namespaces",
-            fs::read_to_string("/proc/sys/user/max_time_namespaces")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/user/max_time_namespaces")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/user/max_user_namespaces",
-            fs::read_to_string("/proc/sys/user/max_user_namespaces")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/user/max_user_namespaces")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/user/max_uts_namespaces",
-            fs::read_to_string("/proc/sys/user/max_uts_namespaces")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/user/max_uts_namespaces")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/vm/overcommit_memory",
-            fs::read_to_string("/proc/sys/vm/overcommit_memory")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/overcommit_memory")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/vm/overcommit_ratio",
-            fs::read_to_string("/proc/sys/vm/overcommit_ratio")
-                .unwrap_or_else(|_| "50\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/overcommit_ratio")
+                .unwrap_or_else(|| "50\n".to_string()),
         ),
         (
             "sys/vm/max_map_count",
-            fs::read_to_string("/proc/sys/vm/max_map_count")
-                .unwrap_or_else(|_| "1048576\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/max_map_count")
+                .unwrap_or_else(|| "1048576\n".to_string()),
         ),
         (
             "sys/vm/mmap_min_addr",
-            fs::read_to_string("/proc/sys/vm/mmap_min_addr")
-                .unwrap_or_else(|_| "65536\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/mmap_min_addr")
+                .unwrap_or_else(|| "65536\n".to_string()),
         ),
         (
             "sys/vm/drop_caches",
-            fs::read_to_string("/proc/sys/vm/drop_caches").unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/drop_caches")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/vm/min_free_kbytes",
-            fs::read_to_string("/proc/sys/vm/min_free_kbytes")
-                .unwrap_or_else(|_| "67584\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/min_free_kbytes")
+                .unwrap_or_else(|| "67584\n".to_string()),
         ),
         (
             "sys/vm/stat_interval",
-            fs::read_to_string("/proc/sys/vm/stat_interval").unwrap_or_else(|_| "1\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/stat_interval")
+                .unwrap_or_else(|| "1\n".to_string()),
         ),
         (
             "sys/vm/swappiness",
-            fs::read_to_string("/proc/sys/vm/swappiness").unwrap_or_else(|_| "60\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/swappiness")
+                .unwrap_or_else(|| "60\n".to_string()),
         ),
         (
             "sys/vm/vfs_cache_pressure",
-            fs::read_to_string("/proc/sys/vm/vfs_cache_pressure")
-                .unwrap_or_else(|_| "100\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/vfs_cache_pressure")
+                .unwrap_or_else(|| "100\n".to_string()),
         ),
         (
             "sys/vm/zone_reclaim_mode",
-            fs::read_to_string("/proc/sys/vm/zone_reclaim_mode")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/zone_reclaim_mode")
+                .unwrap_or_else(|| "0\n".to_string()),
         ),
         (
             "sys/vm/dirty_ratio",
-            fs::read_to_string("/proc/sys/vm/dirty_ratio").unwrap_or_else(|_| "20\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/dirty_ratio")
+                .unwrap_or_else(|| "20\n".to_string()),
         ),
         (
             "sys/vm/dirty_background_ratio",
-            fs::read_to_string("/proc/sys/vm/dirty_background_ratio")
-                .unwrap_or_else(|_| "10\n".to_string()),
+            sandbox_policy::configured_value("/proc/sys/vm/dirty_background_ratio")
+                .unwrap_or_else(|| "10\n".to_string()),
         ),
     ]
 }
@@ -1872,88 +2560,48 @@ fn sys_system_files() -> Vec<(String, String)> {
     let mut files = vec![
         (
             "devices/system/cpu/online".to_string(),
-            fs::read_to_string("/sys/devices/system/cpu/online")
-                .unwrap_or_else(|_| format!("{cpu_range}\n")),
+            format!("{cpu_range}\n"),
         ),
         (
             "devices/system/cpu/possible".to_string(),
-            fs::read_to_string("/sys/devices/system/cpu/possible")
-                .unwrap_or_else(|_| format!("{cpu_range}\n")),
+            format!("{cpu_range}\n"),
         ),
         (
             "devices/system/cpu/present".to_string(),
-            fs::read_to_string("/sys/devices/system/cpu/present")
-                .unwrap_or_else(|_| format!("{cpu_range}\n")),
+            format!("{cpu_range}\n"),
         ),
         (
             "devices/system/cpu/kernel_max".to_string(),
-            fs::read_to_string("/sys/devices/system/cpu/kernel_max")
-                .unwrap_or_else(|_| format!("{}\n", sandbox_cpu_count().saturating_sub(1))),
+            format!("{}\n", sandbox_cpu_count().saturating_sub(1)),
         ),
-        (
-            "devices/system/node/online".to_string(),
-            fs::read_to_string("/sys/devices/system/node/online")
-                .unwrap_or_else(|_| "0\n".to_string()),
-        ),
+        ("devices/system/node/online".to_string(), "0\n".to_string()),
         (
             "devices/system/node/possible".to_string(),
-            fs::read_to_string("/sys/devices/system/node/possible")
-                .unwrap_or_else(|_| "0\n".to_string()),
+            "0\n".to_string(),
         ),
         (
             "fs/cgroup/cgroup.controllers".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")
-                .unwrap_or_else(|_| "cpu io memory pids\n".to_string()),
+            "cpu io memory pids\n".to_string(),
         ),
         (
             "fs/cgroup/cgroup.subtree_control".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/cgroup.subtree_control")
-                .unwrap_or_else(|_| String::new()),
+            String::new(),
         ),
-        (
-            "fs/cgroup/cgroup.procs".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/cgroup.procs").unwrap_or_else(|_| "1\n".to_string()),
-        ),
-        (
-            "fs/cgroup/cgroup.type".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/cgroup.type")
-                .unwrap_or_else(|_| "domain\n".to_string()),
-        ),
-        (
-            "fs/cgroup/cpu.max".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/cpu.max")
-                .unwrap_or_else(|_| "max 100000\n".to_string()),
-        ),
-        (
-            "fs/cgroup/cpu.weight".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/cpu.weight").unwrap_or_else(|_| "100\n".to_string()),
-        ),
-        (
-            "fs/cgroup/memory.current".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/memory.current")
-                .unwrap_or_else(|_| "0\n".to_string()),
-        ),
-        (
-            "fs/cgroup/memory.max".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/memory.max").unwrap_or_else(|_| "max\n".to_string()),
-        ),
-        (
-            "fs/cgroup/pids.current".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/pids.current").unwrap_or_else(|_| "1\n".to_string()),
-        ),
-        (
-            "fs/cgroup/pids.max".to_string(),
-            fs::read_to_string("/sys/fs/cgroup/pids.max").unwrap_or_else(|_| "max\n".to_string()),
-        ),
+        ("fs/cgroup/cgroup.procs".to_string(), "1\n".to_string()),
+        ("fs/cgroup/cgroup.type".to_string(), "domain\n".to_string()),
+        ("fs/cgroup/cpu.max".to_string(), "max 100000\n".to_string()),
+        ("fs/cgroup/cpu.weight".to_string(), "100\n".to_string()),
+        ("fs/cgroup/memory.current".to_string(), "0\n".to_string()),
+        ("fs/cgroup/memory.max".to_string(), "max\n".to_string()),
+        ("fs/cgroup/pids.current".to_string(), "1\n".to_string()),
+        ("fs/cgroup/pids.max".to_string(), "max\n".to_string()),
         (
             "kernel/mm/transparent_hugepage/enabled".to_string(),
-            fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
-                .unwrap_or_else(|_| "always madvise [never]\n".to_string()),
+            "always madvise [never]\n".to_string(),
         ),
         (
             "kernel/mm/transparent_hugepage/hpage_pmd_size".to_string(),
-            fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
-                .unwrap_or_else(|_| "2097152\n".to_string()),
+            "2097152\n".to_string(),
         ),
         (
             "class/net/lo/address".to_string(),
@@ -2014,75 +2662,41 @@ fn sys_system_files() -> Vec<(String, String)> {
     ];
     for processor in 0..sandbox_cpu_count() {
         let cpu = format!("devices/system/cpu/cpu{processor}");
-        files.push((
-            format!("{cpu}/online"),
-            read_sys_cpu_file(processor, "online").unwrap_or_else(|| "1\n".to_string()),
-        ));
+        files.push((format!("{cpu}/online"), "1\n".to_string()));
         files.push((
             format!("{cpu}/topology/physical_package_id"),
-            read_sys_cpu_file(processor, "topology/physical_package_id")
-                .unwrap_or_else(|| "0\n".to_string()),
+            "0\n".to_string(),
         ));
-        files.push((
-            format!("{cpu}/topology/core_id"),
-            read_sys_cpu_file(processor, "topology/core_id")
-                .unwrap_or_else(|| format!("{processor}\n")),
-        ));
+        files.push((format!("{cpu}/topology/core_id"), format!("{processor}\n")));
         files.push((
             format!("{cpu}/topology/thread_siblings_list"),
-            read_sys_cpu_file(processor, "topology/thread_siblings_list")
-                .unwrap_or_else(|| format!("{processor}\n")),
+            format!("{processor}\n"),
         ));
         files.push((
             format!("{cpu}/topology/core_siblings_list"),
-            read_sys_cpu_file(processor, "topology/core_siblings_list")
-                .unwrap_or_else(|| format!("{}\n", sandbox_cpu_range())),
+            format!("{}\n", sandbox_cpu_range()),
         ));
         files.push((
             format!("{cpu}/cache/index0/coherency_line_size"),
-            read_sys_cpu_file(processor, "cache/index0/coherency_line_size")
-                .unwrap_or_else(|| "64\n".to_string()),
+            "64\n".to_string(),
         ));
-        files.push((
-            format!("{cpu}/cache/index0/level"),
-            read_sys_cpu_file(processor, "cache/index0/level").unwrap_or_else(|| "1\n".to_string()),
-        ));
-        files.push((
-            format!("{cpu}/cache/index0/type"),
-            read_sys_cpu_file(processor, "cache/index0/type")
-                .unwrap_or_else(|| "Data\n".to_string()),
-        ));
-        files.push((
-            format!("{cpu}/cache/index0/size"),
-            read_sys_cpu_file(processor, "cache/index0/size")
-                .unwrap_or_else(|| "32K\n".to_string()),
-        ));
+        files.push((format!("{cpu}/cache/index0/level"), "1\n".to_string()));
+        files.push((format!("{cpu}/cache/index0/type"), "Data\n".to_string()));
+        files.push((format!("{cpu}/cache/index0/size"), "32K\n".to_string()));
         files.push((
             format!("{cpu}/cache/index0/shared_cpu_list"),
-            read_sys_cpu_file(processor, "cache/index0/shared_cpu_list")
-                .unwrap_or_else(|| format!("{processor}\n")),
+            format!("{processor}\n"),
         ));
         files.push((
             format!("{cpu}/cache/index0/shared_cpu_map"),
-            read_sys_cpu_file(processor, "cache/index0/shared_cpu_map").unwrap_or_else(|| {
-                format!("{:x}\n", 1usize << processor.min(usize::BITS as usize - 1))
-            }),
+            format!("{:x}\n", 1usize << processor.min(usize::BITS as usize - 1)),
         ));
     }
     files
 }
 
-fn read_sys_cpu_file(processor: usize, relative_path: &str) -> Option<String> {
-    fs::read_to_string(format!(
-        "/sys/devices/system/cpu/cpu{processor}/{relative_path}"
-    ))
-    .ok()
-}
-
 fn sandbox_cpu_count() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
+    1
 }
 
 fn sandbox_cpu_range() -> String {
@@ -2165,10 +2779,7 @@ fn etc_hosts() -> String {
 }
 
 fn etc_resolv_conf() -> String {
-    fs::read_to_string("/etc/resolv.conf")
-        .ok()
-        .filter(|content| !content.trim().is_empty())
-        .unwrap_or_else(|| "options edns0 trust-ad\n".to_string())
+    "options edns0 trust-ad\n".to_string()
 }
 
 fn etc_services() -> String {
@@ -2231,42 +2842,21 @@ fn etc_ld_so_conf() -> String {
 }
 
 fn etc_os_release() -> String {
-    fs::read_to_string("/etc/os-release")
-        .ok()
-        .filter(|content| !content.trim().is_empty())
-        .unwrap_or_else(|| {
-            [
-                "NAME=\"Sinomo Sandbox\"",
-                "ID=sinomo-sandbox",
-                "PRETTY_NAME=\"Sinomo Sandbox WASIX\"",
-            ]
-            .join("\n")
-                + "\n"
-        })
+    [
+        "NAME=\"Sinomo Sandbox\"",
+        "ID=sinomo-sandbox",
+        "PRETTY_NAME=\"Sinomo Sandbox WASIX\"",
+    ]
+    .join("\n")
+        + "\n"
 }
 
 fn etc_ca_bundle() -> Vec<u8> {
-    for path in [
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/etc/ssl/cert.pem",
-    ] {
-        if let Ok(content) = fs::read(path)
-            && !content.is_empty()
-        {
-            return content;
-        }
-    }
     Vec::new()
 }
 
 fn etc_localtime() -> Vec<u8> {
-    read_first_nonempty_binary(&[
-        "/etc/localtime",
-        "/usr/share/zoneinfo/UTC",
-        "/usr/share/zoneinfo/Etc/UTC",
-    ])
-    .unwrap_or_else(|| b"UTC\n".to_vec())
+    b"UTC\n".to_vec()
 }
 
 fn usr_system_files() -> Vec<(String, Vec<u8>)> {
@@ -2275,59 +2865,114 @@ fn usr_system_files() -> Vec<(String, Vec<u8>)> {
     files.push(("share/zoneinfo/UTC".to_string(), utc.clone()));
     files.push(("share/zoneinfo/Etc/UTC".to_string(), utc));
 
-    for (guest_path, host_candidates) in [
-        (
-            "share/terminfo/d/dumb",
-            &[
-                "/usr/share/terminfo/d/dumb",
-                "/lib/terminfo/d/dumb",
-                "/etc/terminfo/d/dumb",
-            ][..],
-        ),
-        (
-            "share/terminfo/x/xterm",
-            &[
-                "/usr/share/terminfo/x/xterm",
-                "/lib/terminfo/x/xterm",
-                "/etc/terminfo/x/xterm",
-            ][..],
-        ),
-        (
-            "share/terminfo/x/xterm-256color",
-            &[
-                "/usr/share/terminfo/x/xterm-256color",
-                "/lib/terminfo/x/xterm-256color",
-                "/etc/terminfo/x/xterm-256color",
-            ][..],
-        ),
-    ] {
-        if let Some(content) = read_first_nonempty_binary(host_candidates) {
-            files.push((guest_path.to_string(), content));
-        }
-    }
-
     files
 }
 
-fn read_first_nonempty_binary(paths: &[&str]) -> Option<Vec<u8>> {
-    paths
-        .iter()
-        .find_map(|path| fs::read(path).ok().filter(|content| !content.is_empty()))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Drop for LocalWasiVirtualDeviceDir {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.root).ok();
-        fs::remove_dir_all(&self.proc_root).ok();
-        fs::remove_dir_all(&self.etc_root).ok();
-        fs::remove_dir_all(&self.sys_root).ok();
-        fs::remove_dir_all(&self.run_root).ok();
-        fs::remove_dir_all(&self.var_root).ok();
-        fs::remove_dir_all(&self.tmp_root).ok();
-        fs::remove_dir_all(&self.home_root).ok();
-        fs::remove_dir_all(&self.root_home).ok();
-        fs::remove_dir_all(&self.usr_root).ok();
-        fs::remove_dir_all(&self.opt_root).ok();
+    #[test]
+    fn virtual_device_proc_files_are_policy_generated() {
+        let files = proc_system_files()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(files.get("cpuinfo").unwrap(), &proc_cpuinfo_fallback());
+        assert_eq!(files.get("meminfo").unwrap(), &proc_meminfo_fallback());
+        assert_eq!(
+            files.get("sys/kernel/hostname").unwrap(),
+            "sinomo-sandbox\n"
+        );
+        assert_eq!(files.get("sys/net/ipv4/ip_forward").unwrap(), "0\n");
+    }
+
+    #[test]
+    fn virtual_device_etc_and_usr_do_not_copy_host_files() {
+        let etc = etc_system_files()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let usr = usr_system_files()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(etc.get("resolv.conf").unwrap(), b"options edns0 trust-ad\n");
+        assert!(!etc.contains_key("ssl/certs/ca-certificates.crt"));
+        assert!(!etc.contains_key("ssl/cert.pem"));
+        assert!(!etc.contains_key("pki/tls/certs/ca-bundle.crt"));
+        assert_eq!(etc.get("localtime").unwrap(), b"UTC\n");
+        assert!(
+            std::str::from_utf8(etc.get("os-release").unwrap())
+                .unwrap()
+                .contains("Sinomo Sandbox")
+        );
+        assert_eq!(usr.get("share/zoneinfo/UTC").unwrap(), b"UTC\n");
+        assert!(!usr.keys().any(|path| path.starts_with("share/terminfo/")));
+    }
+
+    #[test]
+    fn virtual_device_sys_files_are_policy_generated() {
+        let files = sys_system_files()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(files.get("devices/system/cpu/online").unwrap(), "0\n");
+        assert_eq!(files.get("devices/system/cpu/kernel_max").unwrap(), "0\n");
+        assert_eq!(files.get("fs/cgroup/memory.max").unwrap(), "max\n");
+        assert_eq!(
+            files.get("kernel/mm/transparent_hugepage/enabled").unwrap(),
+            "always madvise [never]\n"
+        );
+    }
+
+    #[test]
+    fn virtual_device_mounts_are_available_after_host_staging_is_dropped() {
+        let devices = LocalWasiVirtualDeviceDir::create(
+            64,
+            &["test.wasm".to_string()],
+            &[],
+            &[(
+                SandboxPath::new("/work").unwrap(),
+                SandboxMountMode::ReadWrite,
+            )],
+        )
+        .expect("devices");
+        let proc_staging = devices.proc_path().to_path_buf();
+        let proc_fs = devices.proc_fs();
+        assert!(proc_staging.exists());
+        assert!(proc_fs.metadata(Path::new("/cpuinfo")).is_ok());
+
+        drop(devices);
+
+        assert!(!proc_staging.exists());
+        assert!(
+            proc_fs.metadata(Path::new("/cpuinfo")).is_ok(),
+            "WASIX generated system mounts must be backed by virtual-fs, not live host paths"
+        );
+    }
+
+    #[test]
+    fn wasix_virtual_system_mounts_are_built_without_host_staging() {
+        let devices = WasiVirtualSystemMounts::create(
+            64,
+            &["test.wasm".to_string()],
+            &[],
+            &[(
+                SandboxPath::new("/work").unwrap(),
+                SandboxMountMode::ReadWrite,
+            )],
+        )
+        .expect("devices");
+
+        assert!(devices.proc_fs().metadata(Path::new("/cpuinfo")).is_ok());
+        assert!(devices.etc_fs().metadata(Path::new("/os-release")).is_ok());
+        assert!(
+            devices
+                .sys_fs()
+                .metadata(Path::new("/devices/system/cpu/online"))
+                .is_ok()
+        );
+        assert!(devices.fs().metadata(Path::new("/zero")).is_ok());
     }
 }
 

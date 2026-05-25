@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::*;
 use crate::syscalls::*;
 
@@ -60,6 +62,45 @@ pub(crate) fn path_unlink_file_internal(
         Ok(false) => return Ok(Errno::Access),
         Err(err) => return Ok(err),
     }
+    if path_requires_directory(path) {
+        let Some(key) = crate::syscalls::wasix::key_for_path_at(env, fd, path).map(PathBuf::from)
+        else {
+            return Ok(Errno::Noent);
+        };
+        match state.fs.root_fs.symlink_metadata(&key) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Ok(Errno::Isdir),
+            Ok(_) => return Ok(Errno::Notdir),
+            Err(error) => return Ok(super::path_link::io_error_into_wasi_err(error.into())),
+        }
+    }
+
+    if let Some(link_path) = crate::syscalls::wasix::key_for_path_at(env, fd, path).map(PathBuf::from)
+        && let Ok(metadata) = state.fs.root_fs.symlink_metadata(&link_path)
+        && metadata.file_type().is_symlink()
+    {
+        if let Err(error) = state.fs.root_fs.remove_file(&link_path) {
+            return Ok(super::path_link::io_error_into_wasi_err(error.into()));
+        }
+        if let Ok((parent_inode, childs_name)) = state.fs.get_parent_inode_at_path(
+            inodes,
+            fd,
+            std::path::Path::new(path),
+            false,
+        ) {
+            let mut guard = parent_inode.write();
+            if let Kind::Dir { entries, .. } = guard.deref_mut()
+                && let Some(removed_inode) = entries.remove(&childs_name)
+            {
+                let mut stat = removed_inode.stat.write().unwrap();
+                if stat.st_nlink > 0 {
+                    stat.st_nlink -= 1;
+                }
+            }
+        }
+        path_remove_metadata_at(env, fd, path);
+        path_touch_parent_at(env, fd, path);
+        return Ok(Errno::Success);
+    }
 
     let inode = wasi_try_ok!(state.fs.get_inode_at_path(inodes, fd, path, false));
     let (parent_inode, childs_name) = wasi_try_ok!(state.fs.get_parent_inode_at_path(
@@ -90,13 +131,26 @@ pub(crate) fn path_unlink_file_internal(
         let guard = removed_inode.read();
         match guard.deref() {
             Kind::File { handle, path, .. } => {
+                let handle = handle.clone();
                 let path = path.clone();
                 drop(guard);
                 wasi_try_ok!(state.fs_remove_file(path));
+                if let Some(handle) = handle
+                    && let Err(error) = handle.write().unwrap().note_link_removed()
+                {
+                    return Ok(super::path_link::io_error_into_wasi_err(error.into()));
+                }
             }
             Kind::Dir { .. } | Kind::Root { .. } => return Ok(Errno::Isdir),
             Kind::Symlink { .. } => {
-                // TODO: actually delete real symlinks and do nothing for virtual symlinks
+                let Some(link_path) =
+                    crate::syscalls::wasix::key_for_path_at(env, fd, path).map(PathBuf::from)
+                else {
+                    return Ok(Errno::Noent);
+                };
+                if let Err(error) = state.fs.root_fs.remove_file(&link_path) {
+                    return Ok(super::path_link::io_error_into_wasi_err(error.into()));
+                }
             }
             Kind::Buffer { .. } => {}
             Kind::Socket { .. }
@@ -118,4 +172,8 @@ pub(crate) fn path_unlink_file_internal(
     path_touch_parent_at(env, fd, path);
 
     Ok(Errno::Success)
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
 }

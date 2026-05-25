@@ -45,7 +45,7 @@ sinomo-storage = { path = "../sinomo-storage" }
 wasmtime = { version = "41.0.4", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
 wasmtime-wasi = { version = "41.0.4", default-features = false, features = ["p1"] }
 tokio = { version = "1.44", features = ["rt-multi-thread", "time"], optional = true }
-virtual-fs = { version = "0.700.0-alpha.2", default-features = false, optional = true }
+virtual-fs = { version = "0.700.0-alpha.2", default-features = false, features = ["host-fs"], optional = true }
 virtual-mio = { version = "0.700.0-alpha.2", default-features = false, optional = true }
 wasmer = { version = "=7.0.0-alpha.2", default-features = false, features = ["sys-default", "cranelift", "experimental-async"], optional = true }
 wasmer-types = { version = "=7.0.0-alpha.2", default-features = false, optional = true }

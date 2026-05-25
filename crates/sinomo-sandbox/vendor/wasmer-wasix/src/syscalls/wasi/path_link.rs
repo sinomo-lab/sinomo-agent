@@ -97,6 +97,31 @@ pub(crate) fn path_link_internal(
     Span::current().record("old_path", old_path);
     Span::current().record("new_path", new_path);
 
+    if path_requires_directory(old_path) {
+        let Some(source_path) =
+            crate::syscalls::wasix::key_for_path_at(env, old_fd, old_path).map(std::path::PathBuf::from)
+        else {
+            return Err(Errno::Noent);
+        };
+        match state.fs.root_fs.symlink_metadata(&source_path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(Errno::Notdir),
+            Err(error) => return Err(io_error_into_wasi_err(error.into())),
+        }
+    }
+    if path_requires_directory(new_path) {
+        let Some(target_path) =
+            crate::syscalls::wasix::key_for_path_at(env, new_fd, new_path).map(std::path::PathBuf::from)
+        else {
+            return Err(Errno::Noent);
+        };
+        match state.fs.root_fs.symlink_metadata(&target_path) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Err(Errno::Exist),
+            Ok(_) => return Err(Errno::Notdir),
+            Err(error) => return Err(io_error_into_wasi_err(error.into())),
+        }
+    }
+
     let source_inode = state.fs.get_inode_at_path(
         inodes,
         old_fd,
@@ -148,8 +173,21 @@ pub(crate) fn path_link_internal(
     }
     {
         let guard = source_inode.read();
-        if matches!(guard.deref(), Kind::File { .. }) {
-            let source_path = sandbox_host_path_at(env, old_fd, old_path)?;
+        if matches!(guard.deref(), Kind::File { .. } | Kind::Symlink { .. }) {
+            let follow_symlink = old_flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0;
+            let source_path = if follow_symlink {
+                match guard.deref() {
+                    Kind::File { path, .. } => path.clone(),
+                    Kind::Symlink {
+                        path_to_symlink, ..
+                    } => path_to_symlink.clone(),
+                    _ => unreachable!("source inode was already checked as file-like"),
+                }
+            } else {
+                crate::syscalls::wasix::key_for_path_at(env, old_fd, old_path)
+                    .map(std::path::PathBuf::from)
+                    .ok_or(Errno::Noent)?
+            };
             let target_path = host_target_path.clone();
             let root_fs = state.fs.root_fs.clone();
             __asyncify_light(env, None, async move {
@@ -159,6 +197,21 @@ pub(crate) fn path_link_internal(
             })
             .map_err(|_| Errno::Io)??;
         }
+    }
+    let open_handle = {
+        let guard = source_inode.read();
+        match guard.deref() {
+            Kind::File {
+                handle: Some(handle),
+                ..
+            } => Some(handle.clone()),
+            _ => None,
+        }
+    };
+    if let Some(handle) = open_handle
+        && let Err(error) = handle.write().unwrap().note_link_added()
+    {
+        return Err(io_error_into_wasi_err(error.into()));
     }
     {
         let mut guard = target_parent_inode.write();
@@ -188,6 +241,10 @@ pub(crate) fn path_link_internal(
     Ok(())
 }
 
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
+}
+
 pub(crate) fn io_error_into_wasi_err(error: std::io::Error) -> Errno {
     match error.kind() {
         std::io::ErrorKind::AlreadyExists => Errno::Exist,
@@ -196,6 +253,7 @@ pub(crate) fn io_error_into_wasi_err(error: std::io::Error) -> Errno {
         std::io::ErrorKind::InvalidInput => Errno::Inval,
         std::io::ErrorKind::NotADirectory => Errno::Notdir,
         std::io::ErrorKind::IsADirectory => Errno::Isdir,
+        std::io::ErrorKind::DirectoryNotEmpty => Errno::Notempty,
         _ => Errno::Io,
     }
 }

@@ -581,7 +581,7 @@ pub trait NetworkStreamTransport: NetworkTransport {
 
 #[derive(Clone, Debug, Default)]
 pub struct InProcessNetwork {
-    inner: Rc<RefCell<InProcessNetworkState>>,
+    inner: Arc<Mutex<InProcessNetworkState>>,
 }
 
 impl InProcessNetwork {
@@ -591,14 +591,15 @@ impl InProcessNetwork {
 
     pub fn add_node(&self, node_id: NodeId) -> InProcessTransport {
         self.inner
-            .borrow_mut()
+            .lock()
+            .expect("in-process network lock")
             .mailboxes
             .entry(node_id.clone())
             .or_default();
 
         InProcessTransport {
             local_node_id: node_id,
-            inner: Rc::clone(&self.inner),
+            inner: Arc::clone(&self.inner),
         }
     }
 }
@@ -611,7 +612,7 @@ struct InProcessNetworkState {
 #[derive(Clone, Debug)]
 pub struct InProcessTransport {
     local_node_id: NodeId,
-    inner: Rc<RefCell<InProcessNetworkState>>,
+    inner: Arc<Mutex<InProcessNetworkState>>,
 }
 
 impl NetworkTransport for InProcessTransport {
@@ -634,7 +635,9 @@ impl NetworkTransport for InProcessTransport {
             });
         }
 
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().map_err(|_| NetworkError::Serialization {
+            detail: "in-process network lock poisoned".to_string(),
+        })?;
         let mailbox =
             inner
                 .mailboxes
@@ -651,7 +654,9 @@ impl NetworkTransport for InProcessTransport {
     }
 
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().map_err(|_| NetworkError::Serialization {
+            detail: "in-process network lock poisoned".to_string(),
+        })?;
         let mailbox = inner
             .mailboxes
             .get_mut(&self.local_node_id)

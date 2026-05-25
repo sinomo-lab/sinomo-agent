@@ -987,7 +987,7 @@ fn sifs_sandbox_toolchain_store_can_replicate_to_candidate_node() {
     )
     .with_metadata_backend(replica_backend)
     .expect("replica metadata backend reload");
-    let replica_store = SifsSandboxToolchainStore::new(replica_dfs);
+    let mut replica_store = SifsSandboxToolchainStore::new(replica_dfs);
     let loaded = replica_store
         .load_manifest(&toolchain_id)
         .expect("replica manifest");
@@ -1044,7 +1044,7 @@ fn sifs_sandbox_toolchain_store_rejects_tampered_module() {
         DfsWriteOptions::replicated_eventual(vec![dfs.node_id().clone()]),
     )
     .expect("tamper");
-    let store = SifsSandboxToolchainStore::new(dfs);
+    let mut store = SifsSandboxToolchainStore::new(dfs);
 
     assert!(matches!(
         store

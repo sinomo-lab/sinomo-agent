@@ -225,7 +225,10 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                 if !is_stdio {
                                     if fd_entry.inner.flags.contains(Fdflags::APPEND) {
                                         // `fdflags::append` means we need to seek to the end before writing.
-                                        offset = fd_entry.inode.stat.read().unwrap().st_size;
+                                        handle
+                                            .refresh_metadata()
+                                            .map_err(fs_error_into_wasi_err)?;
+                                        offset = handle.size();
                                         fd_entry.inner.offset.store(offset, Ordering::Release);
                                     }
 

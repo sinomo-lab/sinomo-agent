@@ -78,7 +78,7 @@ pub enum DfsMetadataShardAssignment {
     },
 }
 
-pub trait DfsControlPlaneKvClient: std::fmt::Debug {
+pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError>;
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError>;
@@ -105,7 +105,7 @@ impl<C> SharedDfsControlPlaneKvClient<C> {
 
 impl<C> DfsControlPlaneKvClient for SharedDfsControlPlaneKvClient<C>
 where
-    C: DfsControlPlaneKvClient,
+    C: DfsControlPlaneKvClient + Send,
 {
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
         self.inner

@@ -29,7 +29,13 @@ pub fn fd_datasync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<E
             Kind::File {
                 handle: Some(handle),
                 ..
-            } => Some(handle.read().unwrap().size()),
+            } => {
+                let mut handle = handle.write().unwrap();
+                if let Err(error) = handle.refresh_metadata() {
+                    return Ok(fs_error_into_wasi_err(error));
+                }
+                Some(handle.size())
+            }
             Kind::Buffer { buffer } => Some(buffer.len() as u64),
             _ => None,
         }

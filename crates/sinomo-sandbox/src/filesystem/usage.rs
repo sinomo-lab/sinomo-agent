@@ -30,6 +30,7 @@ pub fn sandbox_filesystem_workspace_usage<F: SandboxFileSystem>(
         SandboxPath::new("/home").expect("static path"),
         SandboxPath::new("/tmp").expect("static path"),
         SandboxPath::new("/work").expect("static path"),
+        SandboxPath::new("/var").expect("static path"),
         SandboxPath::new("/logs").expect("static path"),
         SandboxPath::new("/artifacts").expect("static path"),
     ] {

@@ -11,7 +11,7 @@ pub enum SandboxEventEmissionError {
 }
 
 pub fn append_sandbox_command_record_events<F, S>(
-    sandbox_fs: &F,
+    sandbox_fs: &mut F,
     origin_node_id: NodeId,
     event_store: &mut S,
 ) -> Result<Vec<AppendReceipt>, SandboxEventEmissionError>
@@ -21,14 +21,14 @@ where
 {
     let logs_path = SandboxPath::new("/logs").expect("static sandbox path");
     let mut receipts = Vec::new();
-    let mut entries = sandbox_fs.list(&logs_path)?;
+    let mut entries = sandbox_fs.list_unchecked_mut(&logs_path)?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     for entry in entries {
         let path = entry.path;
         if !path.as_str().ends_with(".record.sobj") {
             continue;
         }
-        let bytes = sandbox_fs.read(&path, None)?;
+        let bytes = sandbox_fs.read_unchecked_mut(&path, None)?;
         let record = decode_command_record(&bytes)?;
         receipts.push(
             event_store.append(sandbox_command_started_event_from_record(
@@ -49,7 +49,7 @@ where
 }
 
 pub fn append_sandbox_command_record_event<F, S>(
-    sandbox_fs: &F,
+    sandbox_fs: &mut F,
     origin_node_id: NodeId,
     command_id: &SandboxCommandId,
     event_store: &mut S,
@@ -60,7 +60,7 @@ where
 {
     let record_path = SandboxPath::new(format!("/logs/{command_id}.record.sobj"))
         .map_err(SandboxFsError::from)?;
-    let bytes = sandbox_fs.read(&record_path, None)?;
+    let bytes = sandbox_fs.read_unchecked_mut(&record_path, None)?;
     let record = decode_command_record(&bytes)?;
     event_store.append(sandbox_command_started_event_from_record(
         origin_node_id.clone(),
@@ -77,7 +77,7 @@ where
 }
 
 fn append_sandbox_command_output_events_for_record<F, S>(
-    sandbox_fs: &F,
+    sandbox_fs: &mut F,
     origin_node_id: NodeId,
     record: &SandboxCommandRecord,
     event_store: &mut S,
@@ -89,7 +89,7 @@ where
     let mut receipts = Vec::new();
     let stdout_path =
         sandbox_command_stdout_log_path(&record.command_id).map_err(SandboxFsError::from)?;
-    if let Ok(stdout) = sandbox_fs.read(&stdout_path, None) {
+    if let Ok(stdout) = sandbox_fs.read_unchecked_mut(&stdout_path, None) {
         for chunk in sandbox_output_chunks(
             &record.sandbox_id,
             &record.command_id,
@@ -103,7 +103,7 @@ where
     }
     let stderr_path =
         sandbox_command_stderr_log_path(&record.command_id).map_err(SandboxFsError::from)?;
-    if let Ok(stderr) = sandbox_fs.read(&stderr_path, None) {
+    if let Ok(stderr) = sandbox_fs.read_unchecked_mut(&stderr_path, None) {
         for chunk in sandbox_output_chunks(
             &record.sandbox_id,
             &record.command_id,
@@ -138,7 +138,7 @@ pub(crate) fn sandbox_output_chunks(
 }
 
 pub fn append_sandbox_http_exchange_events<F, S>(
-    sandbox_fs: &F,
+    sandbox_fs: &mut F,
     origin_node_id: NodeId,
     event_store: &mut S,
 ) -> Result<Vec<AppendReceipt>, SandboxEventEmissionError>
@@ -148,14 +148,14 @@ where
 {
     let logs_path = SandboxPath::new("/logs").expect("static sandbox path");
     let mut receipts = Vec::new();
-    let mut entries = sandbox_fs.list(&logs_path)?;
+    let mut entries = sandbox_fs.list_unchecked_mut(&logs_path)?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     for entry in entries {
         let path = entry.path;
         if !path.as_str().ends_with(".http.sobj") {
             continue;
         }
-        let bytes = sandbox_fs.read(&path, None)?;
+        let bytes = sandbox_fs.read_unchecked_mut(&path, None)?;
         let record = decode_http_exchange_record(&bytes)?;
         let event = sandbox_http_exchange_event(origin_node_id.clone(), &record);
         receipts.push(event_store.append(event)?);

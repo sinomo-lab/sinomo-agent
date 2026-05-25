@@ -33,8 +33,15 @@ pub(crate) fn sandbox_fs_error_from_dfs(
         DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. } => {
             SandboxFsError::NotFound { path: path.clone() }
         }
+        DfsPosixError::AlreadyExists { .. } => SandboxFsError::AlreadyExists { path: path.clone() },
         DfsPosixError::InvalidPath { path: invalid_path } => {
             SandboxFsError::Path(SandboxPathError::EscapesRoot { path: invalid_path })
+        }
+        DfsPosixError::NotDirectory { .. } => SandboxFsError::NotDirectory { path: path.clone() },
+        DfsPosixError::IsDirectory { .. } => SandboxFsError::IsDirectory { path: path.clone() },
+        DfsPosixError::NotSymlink { .. } => SandboxFsError::NotSymlink { path: path.clone() },
+        DfsPosixError::DirectoryNotEmpty { .. } => {
+            SandboxFsError::DirectoryNotEmpty { path: path.clone() }
         }
         other => SandboxFsError::Unavailable {
             reason: other.to_string(),

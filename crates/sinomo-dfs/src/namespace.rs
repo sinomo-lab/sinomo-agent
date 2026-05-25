@@ -77,6 +77,15 @@ pub fn directory_object_with_policy(
         owner_node_id: owner_node_id.clone(),
         current_locations: vec![owner_node_id],
         content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
         version: initial_version(),
         policy,
         created_by_event_id: None,
@@ -98,9 +107,8 @@ pub fn object_id_for_path(path: &str) -> DfsObjectId {
 }
 
 pub fn normalize_sifs_path(path: &str) -> String {
-    let replaced = path.replace('\\', "/");
     let mut parts = Vec::new();
-    for part in replaced.split('/') {
+    for part in path.split('/') {
         match part {
             "" | "." => {}
             ".." => {

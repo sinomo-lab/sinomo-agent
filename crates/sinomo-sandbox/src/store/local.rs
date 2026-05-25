@@ -11,6 +11,7 @@ pub struct LocalSandboxInstanceLayout {
     pub home: PathBuf,
     pub tmp: PathBuf,
     pub work: PathBuf,
+    pub var: PathBuf,
     pub checkpoints: PathBuf,
     pub logs: PathBuf,
     pub artifacts: PathBuf,
@@ -29,6 +30,7 @@ impl LocalSandboxInstanceLayout {
             home: root.join("home"),
             tmp: root.join("tmp"),
             work: root.join("work"),
+            var: root.join("var"),
             checkpoints: root.join("checkpoints"),
             logs: root.join("logs"),
             artifacts: root.join("artifacts"),
@@ -38,12 +40,13 @@ impl LocalSandboxInstanceLayout {
         }
     }
 
-    pub fn required_dirs(&self) -> [&PathBuf; 9] {
+    pub fn required_dirs(&self) -> [&PathBuf; 10] {
         [
             &self.root_dir,
             &self.home,
             &self.tmp,
             &self.work,
+            &self.var,
             &self.checkpoints,
             &self.logs,
             &self.artifacts,
@@ -251,12 +254,13 @@ impl LocalSandboxInstanceStore {
     }
 }
 
-fn local_checkpoint_roots(layout: &LocalSandboxInstanceLayout) -> [(&'static str, &PathBuf); 6] {
+fn local_checkpoint_roots(layout: &LocalSandboxInstanceLayout) -> [(&'static str, &PathBuf); 7] {
     [
         ("root", &layout.root_dir),
         ("home", &layout.home),
         ("tmp", &layout.tmp),
         ("work", &layout.work),
+        ("var", &layout.var),
         ("logs", &layout.logs),
         ("artifacts", &layout.artifacts),
     ]

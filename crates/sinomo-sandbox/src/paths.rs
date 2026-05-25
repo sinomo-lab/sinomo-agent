@@ -197,11 +197,7 @@ fn normalize_sandbox_path(path: &str) -> Result<String, SandboxPathError> {
         match component {
             "" | "." => {}
             ".." => {
-                if components.pop().is_none() {
-                    return Err(SandboxPathError::EscapesRoot {
-                        path: path.to_string(),
-                    });
-                }
+                components.pop();
             }
             value => components.push(value),
         }

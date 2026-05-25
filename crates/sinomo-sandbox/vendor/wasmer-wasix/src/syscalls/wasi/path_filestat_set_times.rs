@@ -96,44 +96,101 @@ pub(crate) fn path_filestat_set_times_internal(
     {
         return Err(Errno::Inval);
     }
+    let mut trailing_directory_metadata = None;
+    if path_requires_directory(path) {
+        let Some(key) =
+            crate::syscalls::wasix::key_for_path_at(env, fd, path).map(std::path::PathBuf::from)
+        else {
+            return Err(Errno::Noent);
+        };
+        match state.fs.root_fs.metadata(&key) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                trailing_directory_metadata = Some(metadata);
+            }
+            Ok(_) => return Err(Errno::Notdir),
+            Err(error) => return Err(super::path_link::io_error_into_wasi_err(error.into())),
+        }
+    }
 
-    let file_inode =
-        state
-            .fs
-            .get_inode_at_path(inodes, fd, path, flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0)?;
+    let follows_symlink = path_requires_directory(path) || flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0;
+    let file_inode = state.fs.get_inode_at_path(inodes, fd, path, follows_symlink);
+    let file_inode = match file_inode {
+        Ok(inode) => Some(inode),
+        Err(err) if trailing_directory_metadata.is_some() => {
+            tracing::trace!(
+                ?err,
+                path,
+                "using VFS metadata for trailing-directory path outside inode cache"
+            );
+            None
+        }
+        Err(err) => return Err(err),
+    };
+
+    let sets_atime = fst_flags.contains(Fstflags::SET_ATIM)
+        || fst_flags.contains(Fstflags::SET_ATIM_NOW);
+    let sets_mtime = fst_flags.contains(Fstflags::SET_MTIM)
+        || fst_flags.contains(Fstflags::SET_MTIM_NOW);
+    if !sets_atime && !sets_mtime {
+        return Ok(());
+    }
 
     let mut atime = None;
     let mut mtime = None;
 
-    if fst_flags.contains(Fstflags::SET_ATIM) || fst_flags.contains(Fstflags::SET_ATIM_NOW) {
+    if sets_atime {
         let time_to_set = if fst_flags.contains(Fstflags::SET_ATIM) {
             st_atim
         } else {
             get_current_time_in_nanos()?
         };
-        file_inode.stat.write().unwrap().st_atim = time_to_set;
         atime = Some(time_to_set);
     }
-    if fst_flags.contains(Fstflags::SET_MTIM) || fst_flags.contains(Fstflags::SET_MTIM_NOW) {
+    if sets_mtime {
         let time_to_set = if fst_flags.contains(Fstflags::SET_MTIM) {
             st_mtim
         } else {
             get_current_time_in_nanos()?
         };
-        file_inode.stat.write().unwrap().st_mtim = time_to_set;
         mtime = Some(time_to_set);
     }
 
-    if let Kind::File {
-        handle: Some(handle),
-        ..
-    } = file_inode.kind.write().unwrap().deref()
-    {
-        let mut handle = handle.write().unwrap();
-        handle.set_times(atime, mtime);
+    let (next_atime, next_mtime) = {
+        if let Some(file_inode) = &file_inode {
+            let stat = file_inode.stat.read().unwrap();
+            (atime.unwrap_or(stat.st_atim), mtime.unwrap_or(stat.st_mtim))
+        } else {
+            let metadata = trailing_directory_metadata
+                .as_ref()
+                .expect("metadata exists when inode lookup is skipped");
+            (
+                atime.unwrap_or(metadata.accessed()),
+                mtime.unwrap_or(metadata.modified()),
+            )
+        }
+    };
+    path_set_times_at(env, fd, path, follows_symlink, next_atime, next_mtime)?;
+
+    if let Some(file_inode) = file_inode {
+        {
+            let mut stat = file_inode.stat.write().unwrap();
+            stat.st_atim = next_atime;
+            stat.st_mtim = next_mtime;
+        }
+
+        if let Kind::File {
+            handle: Some(handle),
+            ..
+        } = file_inode.kind.write().unwrap().deref()
+        {
+            let mut handle = handle.write().unwrap();
+            handle.set_times(atime, mtime);
+        }
     }
-    let stat = file_inode.stat.read().unwrap();
-    path_set_times_at(env, fd, path, stat.st_atim, stat.st_mtim);
 
     Ok(())
+}
+
+fn path_requires_directory(path: &str) -> bool {
+    path.ends_with('/') && path != "/"
 }
