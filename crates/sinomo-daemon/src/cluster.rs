@@ -54,6 +54,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const DAEMON_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
 pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DAEMON_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(300);
+pub const DAEMON_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
+pub const DAEMON_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2837,17 +2840,16 @@ fn cluster_endpoint_command_timeout(
 fn cluster_endpoint_fair_command_timeout(
     endpoint: &ClusterEndpointRecord,
     remaining: Duration,
-    attempts_left: usize,
+    _attempts_left: usize,
 ) -> Duration {
-    let Some(fair_share) = remaining.checked_div(attempts_left.max(1) as u32) else {
-        return cluster_endpoint_command_timeout(endpoint, remaining);
+    let attempt_cap = match endpoint.transport {
+        ClusterTransportKind::Iroh => DAEMON_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
+        _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::InternetDirect) => {
+            DAEMON_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT
+        }
+        _ => DAEMON_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
     };
-    let budget = if fair_share.is_zero() {
-        remaining
-    } else {
-        fair_share
-    };
-    cluster_endpoint_command_timeout(endpoint, budget)
+    cluster_endpoint_command_timeout(endpoint, remaining.min(attempt_cap))
 }
 
 pub fn handle_daemon_cluster_raft_append_request(
@@ -3695,6 +3697,57 @@ mod tests {
         assert_eq!(
             cluster_endpoint_command_timeout(&endpoint, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT),
             DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn foreground_raft_attempts_preserve_budget_for_fallback_routes() {
+        let node_id =
+            NodeId::from_legacy_named("node_daemon_raft_foreground_timeout").expect("node");
+        let lan = sinomo_network::daemon_lan_endpoint(&node_id, "10.0.0.41:21353".to_string(), 10);
+        let public = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_raft_foreground_public",
+            )
+            .expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "203.0.113.41:21353".to_string(),
+            source: sinomo_core::ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: None,
+        };
+        let iroh = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
+                &node_id,
+                "iroh_public_key_daemon_raft_foreground",
+            ),
+            node_id,
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://iroh_public_key_daemon_raft_foreground?relay=https://relay.example./"
+                .to_string(),
+            source: sinomo_core::ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        };
+
+        assert_eq!(
+            cluster_endpoint_fair_command_timeout(&lan, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT, 8),
+            DAEMON_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(
+            cluster_endpoint_fair_command_timeout(&public, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT, 8),
+            DAEMON_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(
+            cluster_endpoint_fair_command_timeout(&iroh, DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT, 8),
+            DAEMON_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(
+            cluster_endpoint_fair_command_timeout(&lan, Duration::from_millis(50), 8),
+            Duration::from_millis(50)
         );
     }
 }
