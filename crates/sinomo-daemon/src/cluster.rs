@@ -1785,10 +1785,7 @@ fn current_cluster_kv_store(
     if let Ok(snapshot) = sinomo_network::read_cluster_kv_snapshot(paths) {
         snapshots.push(snapshot);
     }
-    let mut targets = sinomo_network::cluster_raft_command_targets(paths, state)
-        .into_iter()
-        .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
-        .collect::<Vec<_>>();
+    let mut targets = cluster_raft_live_voter_targets(paths, state);
     if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
         && !cluster_node_status_is_offline(paths, state, &leader_id)
         && let Some(position) = targets
@@ -2580,10 +2577,7 @@ fn forward_cluster_kv_txn_to_voter(
     state: &ClusterBootstrapState,
     txn: &KvTxn,
 ) -> Option<Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError>> {
-    let mut targets = sinomo_network::cluster_raft_command_targets(paths, state)
-        .into_iter()
-        .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
-        .collect::<Vec<_>>();
+    let mut targets = cluster_raft_live_voter_targets(paths, state);
     if targets.is_empty() {
         return None;
     }
@@ -2640,6 +2634,17 @@ fn forward_cluster_kv_txn_to_voter(
             }
         ),
     }))
+}
+
+fn cluster_raft_live_voter_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    sinomo_network::cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
+        .filter(|endpoint| !cluster_node_status_is_offline(paths, state, &endpoint.node_id))
+        .collect()
 }
 
 fn cluster_node_status_is_offline(
@@ -3625,6 +3630,10 @@ mod tests {
         assert!(
             cluster_node_status_is_offline(&paths, &state, &remote_node),
             "a stale online status for a probeable remote member must not be trusted for leader forwarding"
+        );
+        assert!(
+            cluster_raft_live_voter_targets(&paths, &state).is_empty(),
+            "KV forwarding should not spend the command budget on stale-dead voters"
         );
         std::fs::remove_dir_all(root).ok();
     }
