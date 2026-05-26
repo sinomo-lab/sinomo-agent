@@ -359,6 +359,12 @@ fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
     fs::File::open(path)
         .and_then(|dir| dir.sync_all())
         .map_err(|source| ContentStoreError::Io {

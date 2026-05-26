@@ -169,6 +169,10 @@ pub(super) fn print_dfs_help() {
     println!("      List inferred missing replica repairs.");
     println!("  sinomo dfs services [--json]");
     println!("      List DFS metadata and content service advertisements from cluster KV.");
+    println!("  sinomo dfs smoke [--json]");
+    println!(
+        "      Write a small SIFS file with two content replicas and report the committed locations."
+    );
     println!("  sinomo dfs metadata publish [--json]");
     println!("      Publish the local primary metadata shard journal to configured replicas.");
     println!("  sinomo dfs pin list [--filesystem <file_system_id>] [--pin-root <path>] [--json]");

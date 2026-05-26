@@ -20,6 +20,9 @@ pub(crate) enum DfsCliCommand {
     },
     Conflicts(DfsFilterOptions),
     Repair(DfsFilterOptions),
+    Smoke {
+        json: bool,
+    },
     MetadataPublish {
         json: bool,
     },
@@ -139,6 +142,7 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
         Some((command, rest)) if command == "repair" => {
             Ok(DfsCliCommand::Repair(parse_dfs_filter_options(rest)?))
         }
+        Some((command, rest)) if command == "smoke" => parse_dfs_smoke_command(rest),
         Some((command, rest)) if command == "services" => parse_dfs_services_command(rest),
         Some((command, rest)) if command == "metadata" => parse_dfs_metadata_command(rest),
         Some((command, rest)) if command == "pin" => {
@@ -248,6 +252,17 @@ pub(crate) fn parse_dfs_services_command(args: &[String]) -> Result<DfsCliComman
         }
     }
     Ok(DfsCliCommand::Services { json })
+}
+
+pub(crate) fn parse_dfs_smoke_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(DfsCliCommand::Smoke { json })
 }
 
 pub(crate) fn parse_dfs_metadata_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
@@ -676,6 +691,46 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                         option_label(&repair.content_hash)
                     );
                 }
+            }
+            Ok(())
+        }
+        DfsCliCommand::Smoke { json } => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            data_dir.ensure_root_layout()?;
+            let report = daemon_run_daemon_dfs_smoke(&DaemonPaths::new(&data_dir))?;
+            if json {
+                print_json("<dfs-smoke>", &report)?;
+            } else {
+                println!("DFS smoke write:");
+                println!("  path: {}", report.path);
+                println!("  object: {}", report.object_id);
+                println!("  version: {}", report.version);
+                println!(
+                    "  size: {}",
+                    report
+                        .size_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                println!(
+                    "  requested replicas: {}",
+                    report.requested_replica_node_ids.len()
+                );
+                for node_id in &report.requested_replica_node_ids {
+                    println!("    {node_id}");
+                }
+                println!(
+                    "  committed replicas: {}",
+                    report.committed_replica_node_ids.len()
+                );
+                for node_id in &report.committed_replica_node_ids {
+                    println!("    {node_id}");
+                }
+                println!("  pending repairs: {}", report.pending_repair_count);
+                println!(
+                    "  metadata replication outcomes: {}",
+                    report.metadata_replication.outcomes.len()
+                );
             }
             Ok(())
         }

@@ -6311,6 +6311,10 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         parse_dfs_command(&["services".to_string(), "--json".to_string()]).expect("dfs services"),
         DfsCliCommand::Services { json: true }
     );
+    assert_eq!(
+        parse_dfs_command(&["smoke".to_string(), "--json".to_string()]).expect("dfs smoke"),
+        DfsCliCommand::Smoke { json: true }
+    );
     assert!(matches!(
         parse_dfs_command(&[
             "pin".to_string(),

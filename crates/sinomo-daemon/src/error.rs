@@ -128,6 +128,22 @@ impl From<sinomo_dfs::DfsError> for DaemonError {
     }
 }
 
+impl From<sinomo_dfs::DfsDistributedError> for DaemonError {
+    fn from(error: sinomo_dfs::DfsDistributedError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_dfs::DfsPosixError> for DaemonError {
+    fn from(error: sinomo_dfs::DfsPosixError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl From<sinomo_sandbox::SandboxStoreError> for DaemonError {
     fn from(error: sinomo_sandbox::SandboxStoreError) -> Self {
         Self::Parse {

@@ -1277,6 +1277,7 @@ pub struct NetworkedDfsService<T> {
     incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
     metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
     pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
+    last_events: Vec<NetworkedDfsServiceEvent>,
     transport: T,
     repair_retry_tick: u64,
     next_frame_id: u64,
@@ -1304,6 +1305,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             incoming_blob_transfers: BTreeMap::new(),
             metadata_replication_cursors: BTreeMap::new(),
             pending_metadata_replications: BTreeMap::new(),
+            last_events: Vec::new(),
             transport,
             repair_retry_tick: 0,
             next_frame_id: 1,
@@ -1336,6 +1338,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     pub fn content(&self) -> &LocalContentStore {
         &self.content
+    }
+
+    pub fn last_events(&self) -> &[NetworkedDfsServiceEvent] {
+        &self.last_events
     }
 
     pub fn into_transport(self) -> T {
@@ -2510,6 +2516,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
 
         self.prune_expired_pending_remote_reads();
+        self.last_events = events.clone();
         Ok(events)
     }
 

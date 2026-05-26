@@ -11,8 +11,9 @@ use sinomo_dfs::{
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, LocalContentStore, LocalJsonMetadataBackend,
-    NetworkedDfsService, content_service_key, distributed_sifs, distributed_sifs_bootstrap_objects,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy, DfsWriteOptions,
+    LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService, content_service_key,
+    content_services_prefix, distributed_sifs, distributed_sifs_bootstrap_objects,
     fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
 };
 use sinomo_local::SinomoDataDir;
@@ -70,6 +71,29 @@ pub enum DaemonDfsMetadataReplicationOutcome {
         shard_id: DfsMetadataShardId,
         reason: String,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsSmokeReport {
+    pub path: String,
+    pub file_system_id: sinomo_dfs::DfsFileSystemId,
+    pub object_id: sinomo_dfs::DfsObjectId,
+    pub version: sinomo_dfs::DfsVersion,
+    pub content_hash: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub requested_replica_node_ids: Vec<sinomo_node::NodeId>,
+    pub committed_replica_node_ids: Vec<sinomo_node::NodeId>,
+    pub pending_repair_count: usize,
+    pub metadata_replication: DaemonDfsMetadataReplicationReport,
+    pub attempts: Vec<DaemonDfsSmokeAttempt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsSmokeAttempt {
+    pub replica_node_ids: Vec<sinomo_node::NodeId>,
+    pub path: String,
+    pub committed: bool,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -644,11 +668,157 @@ pub fn publish_default_dfs_metadata_journal(
     Ok(DaemonDfsMetadataReplicationReport { outcomes })
 }
 
+pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Err(DaemonError::ClusterOrphan);
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let store = sinomo_network::read_cluster_kv_store(&cluster_paths)?;
+    let mut content_nodes = store
+        .range_prefix(content_services_prefix())
+        .into_iter()
+        .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
+        .filter(|advertisement| advertisement.accepts_content)
+        .map(|advertisement| advertisement.node_id)
+        .collect::<Vec<_>>();
+    content_nodes.sort();
+    content_nodes.dedup();
+
+    let endpoints = sinomo_network::cluster_sync_targets_with_connectivity(&cluster_paths, &state);
+    let endpoint_node_ids = endpoints
+        .iter()
+        .map(|endpoint| endpoint.node_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let remote_candidates = content_nodes
+        .into_iter()
+        .filter(|node_id| node_id != &state.local_node_id)
+        .filter(|node_id| endpoint_node_ids.contains(node_id))
+        .collect::<Vec<_>>();
+    if remote_candidates.is_empty() {
+        return Err(DaemonError::Parse {
+            detail: "DFS smoke requires an advertised remote content node with a daemon endpoint"
+                .to_string(),
+        });
+    }
+
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let metadata = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        data_dir.dfs_dir().join("metadata").join("root"),
+    )?;
+    let mut service = NetworkedDfsService::new(
+        DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
+        content,
+    )
+    .with_metadata_backend(metadata)?;
+    service.bootstrap_distributed_sifs()?;
+    service.posix_mkdir_all("/services/dfs-smoke")?;
+
+    let nonce = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let mut attempts = Vec::new();
+    let mut successful = None;
+    for remote_node_id in remote_candidates {
+        let replica_candidates = vec![state.local_node_id.clone(), remote_node_id.clone()];
+        let path = format!("/services/dfs-smoke/{nonce}-{remote_node_id}.txt");
+        let body = format!("sinomo dfs smoke {nonce} {remote_node_id}\n");
+        match service.posix_write_file(
+            &path,
+            body.as_bytes(),
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2)?,
+                replica_candidates: replica_candidates.clone(),
+                wait_for_commit: true,
+            },
+        ) {
+            Ok(stat) => {
+                attempts.push(DaemonDfsSmokeAttempt {
+                    replica_node_ids: replica_candidates.clone(),
+                    path: path.clone(),
+                    committed: true,
+                    detail: "committed".to_string(),
+                });
+                successful = Some((stat, replica_candidates));
+                break;
+            }
+            Err(error) => {
+                let event_detail = dfs_event_summary(service.last_events());
+                let detail = if event_detail.is_empty() {
+                    error.to_string()
+                } else {
+                    format!("{error}; events: {}", event_detail.join("; "))
+                };
+                attempts.push(DaemonDfsSmokeAttempt {
+                    replica_node_ids: replica_candidates,
+                    path,
+                    committed: false,
+                    detail,
+                });
+            }
+        }
+    }
+    let Some((stat, replica_candidates)) = successful else {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "DFS smoke did not commit on any remote content node: {}",
+                attempts
+                    .iter()
+                    .map(|attempt| format!("{} => {}", attempt.replica_node_ids[1], attempt.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        });
+    };
+    let metadata_root = data_dir.dfs_dir().join("metadata").join("root");
+    let status = sinomo_dfs::inspect_dfs_status(&metadata_root)?;
+    let metadata_replication = publish_default_dfs_metadata_journal(paths)?;
+    Ok(DaemonDfsSmokeReport {
+        path: stat.path,
+        file_system_id: stat.file_system_id,
+        object_id: stat.object_id,
+        version: stat.version,
+        content_hash: stat.content_hash,
+        size_bytes: stat.size_bytes,
+        requested_replica_node_ids: replica_candidates,
+        committed_replica_node_ids: stat.current_locations,
+        pending_repair_count: status.pending_repair_count,
+        metadata_replication,
+        attempts,
+    })
+}
+
 fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError> {
     paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon root has no data directory parent".to_string(),
     })
+}
+
+fn dfs_event_summary(events: &[sinomo_dfs::NetworkedDfsServiceEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            sinomo_dfs::NetworkedDfsServiceEvent::BlobStageRejected {
+                replica_node_id,
+                reason,
+                ..
+            } => Some(format!("stage rejected by {replica_node_id}: {reason}")),
+            sinomo_dfs::NetworkedDfsServiceEvent::BlobFetchRejected {
+                source_node_id,
+                reason,
+                ..
+            } => Some(format!("fetch rejected by {source_node_id}: {reason}")),
+            sinomo_dfs::NetworkedDfsServiceEvent::RepairRejected {
+                replica_node_id,
+                reason,
+                ..
+            } => Some(format!("repair rejected by {replica_node_id}: {reason}")),
+            _ => None,
+        })
+        .collect()
 }
 
 fn local_dfs_protocol_node_id(
