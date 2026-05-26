@@ -299,7 +299,7 @@ fn explicit_iroh_invite_introducer_only_treats_top_level_direct_query_as_direct(
 }
 
 #[test]
-fn default_invite_compaction_keeps_fresh_iroh_before_later_peers() {
+fn default_invite_compaction_keeps_lan_public_iroh_order() {
     let local = NodeId::from_legacy_named("node_invite_compact_local").expect("local");
     let peer = NodeId::from_legacy_named("node_invite_compact_peer").expect("peer");
     let mut introducers = vec![
@@ -321,7 +321,8 @@ fn default_invite_compaction_keeps_fresh_iroh_before_later_peers() {
     compact_default_invite_introducers(&mut introducers);
 
     assert_eq!(introducers.len(), 3);
-    assert_eq!(introducers[0].address, "203.0.113.41:21353");
+    assert_eq!(introducers[0].address, "10.0.0.41:21353");
+    assert_eq!(introducers[1].address, "203.0.113.41:21353");
     assert_eq!(introducers[2].node_id, local);
     assert!(
         introducers[2]
@@ -331,47 +332,47 @@ fn default_invite_compaction_keeps_fresh_iroh_before_later_peers() {
 }
 
 #[test]
-fn default_invite_sort_prefers_public_direct_over_private_direct() {
-    let node = NodeId::from_legacy_named("node_invite_public_direct").expect("node");
+fn default_invite_sort_prefers_lan_direct_over_public_direct() {
+    let node = NodeId::from_legacy_named("node_invite_lan_direct").expect("node");
     let private = invite_introducer_endpoint(&node, "10.0.0.41:21353".to_string());
     let public = invite_introducer_endpoint(&node, "203.0.113.41:21353".to_string());
-    let mut introducers = vec![private, public.clone()];
+    let mut introducers = vec![public, private.clone()];
 
     sort_default_invite_introducers(&mut introducers);
 
-    assert_eq!(introducers.first(), Some(&public));
+    assert_eq!(introducers.first(), Some(&private));
 }
 
 #[test]
-fn join_registration_channels_prioritize_iroh_before_direct_lan() {
-    let cluster_id = ClusterId::from_legacy_named("cluster_invite_iroh_first").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_invite_iroh_first").expect("node");
+fn join_registration_channels_keep_lan_before_iroh_fallback() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_invite_lan_first").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_invite_lan_first").expect("node");
     let lan_endpoint = ClusterEndpointRecord {
-        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_iroh_first_lan")
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_lan_first_lan")
             .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::LanTcp,
-        address: "192.0.2.10:21353".to_string(),
+        address: "10.0.0.10:21353".to_string(),
         source: ClusterEndpointSource::Static,
         privacy: ClusterEndpointPrivacy::Lan,
         priority: 20,
         last_observed_latency_ms: None,
     };
     let iroh_endpoint = ClusterEndpointRecord {
-        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_iroh_first_iroh")
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_lan_first_iroh")
             .expect("endpoint"),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::Iroh,
-        address: "iroh://iroh_public_key_first?relay=https://relay.example./".to_string(),
+        address: "iroh://iroh_public_key_lan_first?relay=https://relay.example./".to_string(),
         source: ClusterEndpointSource::Rendezvous,
         privacy: ClusterEndpointPrivacy::Relayed,
         priority: 90,
         last_observed_latency_ms: None,
     };
     let invite = ClusterJoinInvite {
-        invite_id: ClusterInviteId::from_legacy_named("invite_iroh_first").expect("invite"),
+        invite_id: ClusterInviteId::from_legacy_named("invite_lan_first").expect("invite"),
         cluster_id,
-        cluster_name: Some("iroh first".to_string()),
+        cluster_name: Some("lan first".to_string()),
         cluster_public_key: "cluster-pk".to_string(),
         invitation_secret: "secret".to_string(),
         communication_channels: vec![
@@ -397,8 +398,8 @@ fn join_registration_channels_prioritize_iroh_before_direct_lan() {
     let channels = invite_channels_for_join_registration(&invite);
 
     assert_eq!(channels.len(), 2);
-    assert_eq!(channels[0].endpoint.transport, ClusterTransportKind::Iroh);
-    assert_eq!(channels[1].endpoint.transport, ClusterTransportKind::LanTcp);
+    assert_eq!(channels[0].endpoint.transport, ClusterTransportKind::LanTcp);
+    assert_eq!(channels[1].endpoint.transport, ClusterTransportKind::Iroh);
 }
 
 #[test]

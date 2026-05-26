@@ -138,7 +138,7 @@ Invite payload fields:
 - `public_key`: the cluster's current public key for invite challenge verification.
 - `invite_id`: the invitation ID the invited node uses when contacting an introducer.
 - `secret`: the short-lived secret presented to prove possession of the invite.
-- repeated `channel`: communication channels containing transport, address, and responder public key. The invite URI does not need to disclose peer node IDs. Default invites include direct channels when available and an Iroh channel as a cross-network fallback.
+- repeated `channel`: communication channels containing transport, address, and responder public key. The invite URI does not need to disclose peer node IDs. Default invites keep the fixed fallback order: LAN direct channels first when available, public direct channels next, and Iroh last as the cross-network fallback. Runtime route choice uses the `sinomo-network` connectivity graph to avoid endpoints this node already knows are unavailable; it does not reorder invite channels to guess the remote topology.
 
 The persisted invitation record is larger than the URI. It contains the cluster identity, expiry, allowed roles, issuer identity, signature, and any other policy needed by introducers to validate and register the join.
 

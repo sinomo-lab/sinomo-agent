@@ -11587,7 +11587,7 @@ fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
 }
 
 #[test]
-fn rollout_target_prefers_shadow_iroh_over_unknown_private_tcp() {
+fn rollout_target_prefers_unknown_private_tcp_over_shadow_iroh() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-rollout-shadow-iroh-private-{}",
         SystemTime::now()
@@ -11625,12 +11625,12 @@ fn rollout_target_prefers_shadow_iroh_over_unknown_private_tcp() {
         &paths,
         &state,
         &main_node_id,
-        &[private_shadow, iroh_shadow.clone()],
+        &[iroh_shadow, private_shadow.clone()],
     )
     .expect("rollout target");
 
     assert_eq!(selected.node_id, shadow_node_id);
-    assert_eq!(selected.endpoint_id, iroh_shadow.endpoint_id);
+    assert_eq!(selected.endpoint_id, private_shadow.endpoint_id);
     std::fs::remove_dir_all(root).ok();
 }
 

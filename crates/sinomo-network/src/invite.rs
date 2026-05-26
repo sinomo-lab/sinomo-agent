@@ -205,7 +205,7 @@ pub fn invite_channels_for_join_registration(
     }
     channels.sort_by_key(|channel| {
         (
-            !matches!(channel.endpoint.transport, ClusterTransportKind::Iroh),
+            invite_endpoint_fallback_rank(&channel.endpoint),
             channel.endpoint.priority,
             channel.endpoint.address.clone(),
         )
@@ -241,40 +241,72 @@ pub fn sort_default_invite_introducers(introducers: &mut [ClusterEndpointRecord]
     introducers.sort_by_key(|endpoint| {
         (
             !is_remote_usable_invite_endpoint(endpoint),
-            invite_endpoint_address_rank(endpoint),
+            invite_endpoint_fallback_rank(endpoint),
             endpoint.priority,
+            endpoint.address.clone(),
         )
     });
 }
 
-fn invite_endpoint_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
-    if !matches!(
-        endpoint.transport,
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-    ) {
-        return 1;
+fn invite_endpoint_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    match endpoint.transport {
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            invite_direct_endpoint_fallback_rank(endpoint)
+        }
+        ClusterTransportKind::Iroh => 2,
+        _ => 3,
     }
+}
+
+fn invite_direct_endpoint_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8 {
     let Ok(address) = endpoint.address.parse::<std::net::SocketAddr>() else {
-        return 1;
+        return if matches!(endpoint.privacy, ClusterEndpointPrivacy::Lan) {
+            0
+        } else {
+            1
+        };
     };
     match address.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 2,
-        std::net::IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 2,
+        std::net::IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
+        std::net::IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
         ip if ip.is_loopback() || ip.is_unspecified() => 3,
-        _ => 0,
+        _ => 1,
     }
 }
 
 pub fn compact_default_invite_introducers(introducers: &mut Vec<ClusterEndpointRecord>) {
-    let remote_direct = introducers
+    let remote_lan = introducers
         .iter()
         .filter(|endpoint| {
             is_remote_usable_invite_endpoint(endpoint)
                 && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
+                && invite_direct_endpoint_fallback_rank(endpoint) == 0
         })
-        .take(2)
+        .next()
+        .cloned();
+    let remote_public = introducers
+        .iter()
+        .filter(|endpoint| {
+            is_remote_usable_invite_endpoint(endpoint)
+                && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
+                && invite_direct_endpoint_fallback_rank(endpoint) == 1
+        })
+        .next()
         .cloned()
-        .collect::<Vec<_>>();
+        .or_else(|| {
+            introducers
+                .iter()
+                .filter(|endpoint| {
+                    is_remote_usable_invite_endpoint(endpoint)
+                        && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
+                })
+                .find(|endpoint| {
+                    remote_lan
+                        .as_ref()
+                        .is_none_or(|lan| lan.endpoint_id != endpoint.endpoint_id)
+                })
+                .cloned()
+        });
     let remote_iroh = introducers
         .iter()
         .find(|endpoint| {
@@ -282,6 +314,23 @@ pub fn compact_default_invite_introducers(introducers: &mut Vec<ClusterEndpointR
                 && matches!(endpoint.transport, ClusterTransportKind::Iroh)
         })
         .cloned();
+    let mut remote_direct = Vec::new();
+    if let Some(lan) = remote_lan {
+        push_unique_introducer(&mut remote_direct, lan);
+    }
+    if let Some(public) = remote_public {
+        push_unique_introducer(&mut remote_direct, public);
+    }
+    for endpoint in introducers.iter().filter(|endpoint| {
+        is_remote_usable_invite_endpoint(endpoint)
+            && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
+    }) {
+        if remote_direct.len() >= 2 {
+            break;
+        }
+        push_unique_introducer(&mut remote_direct, endpoint.clone());
+    }
+
     if !remote_direct.is_empty() {
         *introducers = remote_direct;
         if let Some(iroh) = remote_iroh {
@@ -340,6 +389,20 @@ pub fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterE
         }
     }
     let is_loopback = is_loopback_connect_address(&address);
+    let privacy = if is_loopback {
+        ClusterEndpointPrivacy::LocalOnly
+    } else {
+        address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|address| address.ip())
+            .filter(|ip| match ip {
+                std::net::IpAddr::V4(ip) => !(ip.is_private() || ip.is_link_local()),
+                std::net::IpAddr::V6(ip) => !(ip.is_unique_local() || ip.is_unicast_link_local()),
+            })
+            .map(|_| ClusterEndpointPrivacy::InternetDirect)
+            .unwrap_or(ClusterEndpointPrivacy::Lan)
+    };
     ClusterEndpointRecord {
         endpoint_id: ClusterEndpointId::generate(),
         node_id: node_id.clone(),
@@ -350,11 +413,7 @@ pub fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterE
         },
         address,
         source: ClusterEndpointSource::Static,
-        privacy: if is_loopback {
-            ClusterEndpointPrivacy::LocalOnly
-        } else {
-            ClusterEndpointPrivacy::Lan
-        },
+        privacy,
         priority: if is_loopback { 100 } else { 20 },
         last_observed_latency_ms: None,
     }
