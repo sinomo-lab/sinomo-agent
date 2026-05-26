@@ -207,6 +207,20 @@ impl<'a> DfsControlPlaneStore<'a> {
         self.get_serde(&metadata_shard_key(file_system_id, shard_id))
     }
 
+    pub fn list_metadata_shards(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Vec<DfsMetadataShardConfig>, KvError> {
+        let mut shards: Vec<DfsMetadataShardConfig> = self
+            .kv
+            .range_prefix(&format!("{}/", metadata_shards_prefix(file_system_id)))?
+            .into_iter()
+            .map(|entry| entry.decode())
+            .collect::<Result<Vec<_>, _>>()?;
+        shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+        Ok(shards)
+    }
+
     pub fn transfer_metadata_shard_primary(
         &mut self,
         file_system_id: &DfsFileSystemId,

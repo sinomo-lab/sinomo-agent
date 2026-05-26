@@ -16,7 +16,7 @@ pub use content_store::{ContentManifest, ContentStoreError, LocalContentStore};
 pub use control_plane::{
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, SharedDfsControlPlaneKvClient, file_system_config_key,
-    metadata_shard_key,
+    metadata_shard_key, metadata_shards_prefix,
 };
 pub use discovery::{
     DfsClusterView, DfsNodeAdvertisement, content_service_key, content_services_prefix,
@@ -1136,6 +1136,26 @@ pub enum DfsOwnerHandoffOutcome {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum DfsMetadataReplicationOutcome {
+    Sent {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        entries: usize,
+        next_after_sequence: u64,
+    },
+    NoChanges {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+    },
+    Unroutable {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum NetworkedDfsServiceEvent {
     BlobStaged {
         intent_id: String,
@@ -1234,6 +1254,7 @@ pub struct NetworkedDfsService<T> {
     incoming_read_transfers: BTreeMap<String, InProgressReadTransfer>,
     incoming_fetch_transfers: BTreeMap<String, InProgressFetchBlobTransfer>,
     incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
+    metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
     transport: T,
     repair_retry_tick: u64,
     next_frame_id: u64,
@@ -1259,6 +1280,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             incoming_read_transfers: BTreeMap::new(),
             incoming_fetch_transfers: BTreeMap::new(),
             incoming_blob_transfers: BTreeMap::new(),
+            metadata_replication_cursors: BTreeMap::new(),
             transport,
             repair_retry_tick: 0,
             next_frame_id: 1,
@@ -1306,17 +1328,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         after_sequence: u64,
     ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
-        let Some(backend) = self.metadata_backend.as_ref() else {
+        let Some(batch) = self.metadata_journal_batch_since(after_sequence)? else {
             return Ok(None);
-        };
-        let entries = backend.journal_since(after_sequence)?;
-        let Some(last_entry) = entries.last() else {
-            return Ok(None);
-        };
-        let batch = DfsMetadataJournalBatch {
-            shard_id: last_entry.shard_id.clone(),
-            next_after_sequence: last_entry.sequence,
-            entries,
         };
         let request_id = self.next_request_id();
         let sent = self.send_dfs_message_if_routable(
@@ -1327,6 +1340,103 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }),
         )?;
         Ok(sent.then_some(batch))
+    }
+
+    pub fn replicate_metadata_shard_to_configured_replicas(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<Vec<DfsMetadataReplicationOutcome>, DfsError> {
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let Some(shard) = DfsControlPlaneStore::new(control_plane.as_mut())
+            .get_metadata_shard(file_system_id, shard_id)?
+        else {
+            return Ok(Vec::new());
+        };
+        if shard.primary_node_id != self.node_id {
+            return Err(DfsError::StaleOwnerEpoch {
+                file_system_id: shard.file_system_id,
+                local_node_id: self.node_id.clone(),
+                primary_node_id: shard.primary_node_id,
+                epoch: shard.epoch,
+            });
+        }
+
+        let shard_id = DfsMetadataShardId::new(shard.shard_id);
+        let local_node_id = self.node_id.clone();
+        let mut outcomes = Vec::new();
+        for target_node_id in shard
+            .replica_node_ids
+            .into_iter()
+            .filter(|target_node_id| target_node_id != &local_node_id)
+        {
+            let cursor_key = (target_node_id.clone(), shard_id.clone());
+            let after_sequence = self
+                .metadata_replication_cursors
+                .get(&cursor_key)
+                .copied()
+                .unwrap_or(0);
+            let Some(batch) = self.metadata_journal_batch_since(after_sequence)? else {
+                outcomes.push(DfsMetadataReplicationOutcome::NoChanges {
+                    target_node_id,
+                    shard_id: shard_id.clone(),
+                    after_sequence,
+                });
+                continue;
+            };
+            let entries = batch.entries.len();
+            let next_after_sequence = batch.next_after_sequence;
+            let request_id = self.next_request_id();
+            let sent = self.send_dfs_message_if_routable(
+                &target_node_id,
+                DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
+                    request_id,
+                    batch,
+                }),
+            )?;
+            if sent {
+                self.metadata_replication_cursors
+                    .insert(cursor_key, next_after_sequence);
+                outcomes.push(DfsMetadataReplicationOutcome::Sent {
+                    target_node_id,
+                    shard_id: shard_id.clone(),
+                    entries,
+                    next_after_sequence,
+                });
+            } else {
+                outcomes.push(DfsMetadataReplicationOutcome::Unroutable {
+                    target_node_id,
+                    shard_id: shard_id.clone(),
+                    after_sequence,
+                });
+            }
+        }
+        Ok(outcomes)
+    }
+
+    pub fn replicate_configured_metadata_shards(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Vec<DfsMetadataReplicationOutcome>, DfsError> {
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let shard_ids = DfsControlPlaneStore::new(control_plane.as_mut())
+            .list_metadata_shards(file_system_id)?
+            .into_iter()
+            .filter(|shard| shard.primary_node_id == self.node_id)
+            .map(|shard| shard.shard_id)
+            .collect::<Vec<_>>();
+
+        let mut outcomes = Vec::new();
+        for shard_id in shard_ids {
+            outcomes.extend(
+                self.replicate_metadata_shard_to_configured_replicas(file_system_id, &shard_id)?,
+            );
+        }
+        Ok(outcomes)
     }
 
     pub fn hydrate_from_metadata_backend(&mut self) -> Result<(), DfsError> {
@@ -2382,6 +2492,24 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             self.pending_reads.remove(&request_id);
             self.incoming_read_transfers.remove(&request_id);
         }
+    }
+
+    fn metadata_journal_batch_since(
+        &self,
+        after_sequence: u64,
+    ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        let entries = backend.journal_since(after_sequence)?;
+        let Some(last_entry) = entries.last() else {
+            return Ok(None);
+        };
+        Ok(Some(DfsMetadataJournalBatch {
+            shard_id: last_entry.shard_id.clone(),
+            next_after_sequence: last_entry.sequence,
+            entries,
+        }))
     }
 
     fn handle_metadata_journal_batch(

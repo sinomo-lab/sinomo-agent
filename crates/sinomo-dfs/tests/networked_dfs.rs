@@ -3,16 +3,16 @@ use sinomo_dfs::{
     DFS_PROTOCOL, DfsBlobTransferResult, DfsCommitVersionCommand, DfsConfirmedTimeoutAction,
     DfsConfirmedTimeoutOutcome, DfsConflictStatus, DfsControlPlaneStore, DfsFetchBlobResponse,
     DfsFetchBlobResponseChunk, DfsFetchBlobResult, DfsFileSystem, DfsFileSystemId,
-    DfsMetadataBackend, DfsMetadataMutation, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsObjectVersionRecord, DfsOwnerHandoffOutcome, DfsReadData,
-    DfsReadResponse, DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand,
-    DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsReplicaReceiptRecord,
-    DfsReplicationPolicy, DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse,
-    DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus, LocalJsonMetadataBackend,
-    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
-    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient,
-    file_system_config_key, sifs_node_files_path,
+    DfsMetadataBackend, DfsMetadataMutation, DfsMetadataReplicationOutcome,
+    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId, DfsNetworkMessage,
+    DfsNodeAdvertisement, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
+    DfsOwnerHandoffOutcome, DfsReadData, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
+    DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsStageBlobChunkCommand, DfsStageBlobCommand,
+    DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
+    LocalJsonMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
+    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
 };
 use sinomo_events::EventId;
 use sinomo_kv::InProcessRaftKvCluster;
@@ -2501,6 +2501,136 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
             } if source_node_id == &owner
         )
     }));
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
+    let owner = NodeId::from_legacy_named("node_metadata_config_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_metadata_config_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_metadata_config").expect("object");
+    let version = DfsVersion::from_legacy_named("version_1").expect("version");
+    let root = temp_root("networked_metadata_configured_replicas");
+    let network = InProcessNetwork::new();
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![owner.clone(), replica.clone()])
+            .expect("control-plane kv cluster"),
+    );
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: vec![replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard config");
+    });
+
+    let owner_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let replica_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
+            .expect("replica metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(replica_backend)
+    .expect("replica metadata backend");
+
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "/services/configured-metadata.txt".to_string(),
+        kind: DfsObjectKind::File,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: Some("blake3:configured-metadata".to_string()),
+        content_size_bytes: Some(19),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    owner_dfs
+        .add_file_system(file_system)
+        .expect("owner filesystem");
+    owner_dfs
+        .add_object_metadata(metadata.clone())
+        .expect("owner metadata");
+
+    let outcomes = owner_dfs
+        .replicate_configured_metadata_shards(&file_system_id)
+        .expect("replicate metadata shard");
+    assert_eq!(
+        outcomes,
+        vec![DfsMetadataReplicationOutcome::Sent {
+            target_node_id: replica.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+            entries: 3,
+            next_after_sequence: 3,
+        }]
+    );
+    let events = replica_dfs.process_incoming().expect("replica incoming");
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                source_node_id,
+                applied_entries: 3,
+                ..
+            } if source_node_id == &owner
+        )
+    }));
+    assert_eq!(
+        replica_dfs
+            .metadata_backend()
+            .expect("replica metadata backend")
+            .get_object(&object_id)
+            .expect("replica object"),
+        Some(metadata)
+    );
+
+    let second_outcomes = owner_dfs
+        .replicate_metadata_shard_to_configured_replicas(&file_system_id, "root")
+        .expect("replicate metadata shard again");
+    assert_eq!(
+        second_outcomes,
+        vec![DfsMetadataReplicationOutcome::NoChanges {
+            target_node_id: replica,
+            shard_id: DfsMetadataShardId::new("root"),
+            after_sequence: 3,
+        }]
+    );
 
     cleanup(&root);
 }
