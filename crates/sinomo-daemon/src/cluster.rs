@@ -904,14 +904,12 @@ impl ClusterNetworkMaintenance {
 
         if probe_due {
             self.last_probe = now;
-            if sinomo_network::cluster_raft_local_is_voter(&state) {
-                let records = self.probe_connectivity(&cluster_paths, &state);
-                let _ = sync_cluster_connectivity_records_to_kv(
-                    &cluster_paths,
-                    &state.local_node_id,
-                    records,
-                );
-            }
+            let records = self.probe_connectivity(&cluster_paths, &state);
+            let _ = sync_cluster_connectivity_records_to_kv(
+                &cluster_paths,
+                &state.local_node_id,
+                records,
+            );
         }
 
         if discovered
@@ -3070,6 +3068,84 @@ mod tests {
 
         std::fs::remove_dir_all(root_a).ok();
         std::fs::remove_dir_all(root_b).ok();
+    }
+
+    #[test]
+    fn connectivity_probe_state_is_source_local_even_for_non_voters() {
+        let root = unique_cluster_test_root("sinomo-daemon-connectivity-non-voter");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_connectivity_non_voter")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_daemon_connectivity_non_voter_local")
+            .expect("local node");
+        let remote_node = NodeId::from_legacy_named("node_daemon_connectivity_non_voter_remote")
+            .expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity non voter",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_network::apply_cluster_raft_role(
+            &mut state.members[0],
+            ClusterMemberRole::NonVoting,
+            now,
+        );
+        let endpoint =
+            sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.41:21353".to_string(), 10);
+        let mut remote_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities = sinomo_node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+
+        let record = sinomo_network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(7),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            600,
+        );
+        let maintenance_now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: std::collections::BTreeMap::from([(
+                sinomo_network::cluster_connectivity_probe_key(&local_node, &endpoint),
+                ClusterConnectivityProbeState {
+                    record: record.clone(),
+                },
+            )]),
+            connectivity_cursor: 0,
+            environment_id: None,
+            tick: 0,
+            last_publish: maintenance_now,
+            last_discovery: maintenance_now,
+            last_probe: maintenance_now,
+        };
+
+        let records = maintenance.probe_connectivity(&paths, &state);
+
+        assert_eq!(records, vec![record]);
+        assert_eq!(records[0].source_node_id, local_node);
+        assert_eq!(records[0].target_node_id, remote_node);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
