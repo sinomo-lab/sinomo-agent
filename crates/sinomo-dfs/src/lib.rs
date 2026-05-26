@@ -2281,7 +2281,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             });
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let owner_epoch = self.ensure_file_system_write_authority(&request.file_system_id)?;
+        let owner_epoch = self.ensure_object_write_authority(&object)?;
 
         if expected_base_version
             .as_ref()
@@ -3247,21 +3247,28 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         })
     }
 
-    fn ensure_file_system_write_authority(
+    fn select_metadata_shard_for_object(
         &mut self,
-        file_system_id: &DfsFileSystemId,
-    ) -> Result<u64, DfsError> {
+        object: &DfsObjectMetadata,
+    ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
         let Some(kv) = self.control_plane.as_mut() else {
-            return Ok(0);
+            return Ok(None);
         };
-        let Some(shard) =
-            DfsControlPlaneStore::new(kv.as_mut()).get_metadata_shard(file_system_id, "root")?
-        else {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .select_metadata_shard_for_path(&object.file_system_id, &object.path)
+            .map_err(DfsError::from)
+    }
+
+    fn ensure_object_write_authority(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<u64, DfsError> {
+        let Some(shard) = self.select_metadata_shard_for_object(object)? else {
             return Ok(0);
         };
         if shard.primary_node_id != self.node_id {
             return Err(DfsError::StaleOwnerEpoch {
-                file_system_id: file_system_id.clone(),
+                file_system_id: object.file_system_id.clone(),
                 local_node_id: self.node_id.clone(),
                 primary_node_id: shard.primary_node_id,
                 epoch: shard.epoch,
@@ -3274,12 +3281,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         &mut self,
         intent: &DistributedWriteIntent,
     ) -> Result<(), DfsError> {
-        let Some(kv) = self.control_plane.as_mut() else {
-            return Ok(());
-        };
-        let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
-            .get_metadata_shard(&intent.file_system_id, "root")?
-        else {
+        let object = self.current_read_object_metadata(&intent.object_id)?;
+        let Some(shard) = self.select_metadata_shard_for_object(&object)? else {
             return Ok(());
         };
         if shard.primary_node_id != self.node_id || shard.epoch != intent.owner_epoch {
@@ -6935,20 +6938,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error),
         };
-        if let Some(kv) = self.control_plane.as_mut() {
-            if let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
-                .get_metadata_shard(&object.file_system_id, "root")?
-            {
-                if &shard.primary_node_id != requester_node_id {
-                    return Err(DfsError::UnauthorizedReplicaCommand {
-                        source_node_id: requester_node_id.clone(),
-                        reason: format!(
-                            "source is not current metadata shard primary for {}; primary is {} at epoch {}",
-                            object.file_system_id, shard.primary_node_id, shard.epoch
-                        ),
-                    });
-                }
-            }
+        if let Some(shard) = self.select_metadata_shard_for_object(&object)?
+            && &shard.primary_node_id != requester_node_id
+        {
+            return Err(DfsError::UnauthorizedReplicaCommand {
+                source_node_id: requester_node_id.clone(),
+                reason: format!(
+                    "source is not current metadata shard primary for {}; primary is {} at epoch {}",
+                    object.file_system_id, shard.primary_node_id, shard.epoch
+                ),
+            });
         }
         if let Some(backend) = self.metadata_backend.as_ref() {
             if let Some(intent) = backend.get_intent(object_id, intent_id)? {
@@ -7893,6 +7892,95 @@ mod tests {
             }] if source_node_id == &replica && *next_after_sequence >= 3
         ));
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn distributed_write_uses_path_selected_metadata_shard_epoch() {
+        let root = temp_root("distributed-write-path-shard-epoch");
+        let owner = NodeId::from_legacy_named("node_path_shard_owner").expect("owner");
+        let root_primary =
+            NodeId::from_legacy_named("node_path_shard_root_primary").expect("root primary");
+        let replica = NodeId::from_legacy_named("node_path_shard_replica").expect("replica");
+        let object_id = DfsObjectId::from_legacy_named("obj_path_shard_epoch").expect("object");
+        let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+        let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+        let file_system = file_system(owner.clone());
+        let shared_kv = SharedDfsControlPlaneKvClient::new(
+            InProcessRaftKvCluster::new(vec![owner.clone()]).expect("kv"),
+        );
+        shared_kv.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_metadata_shard(&DfsMetadataShardConfig {
+                    file_system_id: file_system.file_system_id.clone(),
+                    shard_id: "root".to_string(),
+                    primary_node_id: root_primary.clone(),
+                    replica_node_ids: Vec::new(),
+                    epoch: 1,
+                    assignment: DfsMetadataShardAssignment::Root,
+                    default_policy: DfsObjectPolicy::ReplicatedEventual,
+                })
+                .expect("root shard");
+            control
+                .put_metadata_shard(&DfsMetadataShardConfig {
+                    file_system_id: file_system.file_system_id.clone(),
+                    shard_id: "services".to_string(),
+                    primary_node_id: owner.clone(),
+                    replica_node_ids: Vec::new(),
+                    epoch: 7,
+                    assignment: DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                    default_policy: DfsObjectPolicy::ReplicatedEventual,
+                })
+                .expect("services shard");
+        });
+
+        let content = LocalContentStore::new(root.join("content")).expect("content");
+        let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+        let mut dfs = NetworkedDfsService::new(
+            FailingSendTransport {
+                local_node_id: owner.clone(),
+            },
+            content,
+        )
+        .with_control_plane(shared_kv)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+        dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+        let mut metadata = file_metadata(owner.clone());
+        metadata.object_id = object_id.clone();
+        metadata.file_system_id = file_system.file_system_id.clone();
+        metadata.path = "/services/path-shard.txt".to_string();
+        metadata.version = version_1;
+        metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+        dfs.add_object_metadata(metadata).expect("object");
+
+        let write = dfs
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id: file_system.file_system_id,
+                    object_id: object_id.clone(),
+                    target_version: version_2,
+                    requesting_node_id: owner.clone(),
+                },
+                b"path shard bytes".to_vec(),
+                vec![owner, replica],
+                DfsReplicationPolicy::new(1, 2).expect("policy"),
+            )
+            .expect("path shard write");
+
+        let NetworkedDfsWriteOutcome::Committed { intent_id, .. } = write else {
+            panic!("expected committed write, got {write:?}");
+        };
+        let intent = dfs
+            .metadata_backend()
+            .expect("metadata backend")
+            .get_intent(&object_id, &intent_id)
+            .expect("read intent")
+            .expect("intent");
+        assert_eq!(intent.owner_epoch, 7);
         std::fs::remove_dir_all(root).ok();
     }
 
