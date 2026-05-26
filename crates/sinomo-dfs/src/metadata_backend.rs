@@ -598,6 +598,14 @@ impl LocalJsonMetadataBackend {
                     if &existing == receipt {
                         return Ok(None);
                     }
+                    if existing.receipt.file_system_id == receipt.receipt.file_system_id
+                        && existing.receipt.object_id == receipt.receipt.object_id
+                        && existing.receipt.committed_version == receipt.receipt.committed_version
+                        && existing.replica_node_id == receipt.replica_node_id
+                        && existing.content_hash == receipt.content_hash
+                    {
+                        return Ok(None);
+                    }
                     return Err(MetadataBackendError::Serde(format!(
                         "metadata journal entry {}:{} conflicts with an existing receipt for replica {}",
                         entry.shard_id.0, entry.sequence, replica_node_id
@@ -3637,6 +3645,62 @@ mod tests {
 
         cleanup(&leader_root);
         cleanup(&follower_root);
+    }
+
+    #[test]
+    fn local_backend_replays_semantically_duplicate_receipt_as_idempotent() {
+        let root = temp_root("local_backend_duplicate_receipt_semantic_idempotent");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: file_system.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                committed_version: object.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_receipt_a").expect("event"),
+            },
+            replica_node_id: node("node_replica"),
+            content_hash: object.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend.put_receipt(&receipt).expect("receipt");
+        let mut replayed = receipt.clone();
+        replayed.receipt.event_id = EventId::from_legacy_named("evt_receipt_b").expect("event");
+        replayed.received_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        let batch = DfsMetadataJournalBatch {
+            shard_id: DfsMetadataShardId::new("shard-root"),
+            entries: vec![DfsMetadataJournalEntry {
+                shard_id: DfsMetadataShardId::new("shard-root"),
+                sequence: 2,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                mutation: DfsMetadataMutation::PutReceipt {
+                    file_system_id: file_system.file_system_id,
+                    object_id: object.object_id.clone(),
+                    version: object.version.clone(),
+                    replica_node_id: receipt.replica_node_id.clone(),
+                    receipt: Some(replayed),
+                },
+            }],
+            next_after_sequence: 2,
+        };
+
+        assert_eq!(
+            backend
+                .apply_journal_batch(&batch)
+                .expect("duplicate receipt replay"),
+            0
+        );
+        assert_eq!(
+            backend
+                .receipts_for_version(&object.object_id, &object.version)
+                .expect("receipts"),
+            vec![receipt]
+        );
+        cleanup(&root);
     }
 
     #[test]
