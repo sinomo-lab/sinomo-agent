@@ -174,14 +174,14 @@ fn cluster_raft_endpoint_connectivity_rank(
     match connectivity_state {
         Some(sinomo_network::ClusterConnectivityState::Healthy) => 0,
         Some(sinomo_network::ClusterConnectivityState::Degraded) => 1,
-        None if endpoint.transport == ClusterTransportKind::Iroh => 2,
         None if matches!(
             endpoint.transport,
             ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
         ) && cluster_raft_direct_address_rank(endpoint) <= 1 =>
         {
-            3
+            2
         }
+        None if endpoint.transport == ClusterTransportKind::Iroh => 3,
         None => 4,
         Some(sinomo_network::ClusterConnectivityState::Unreachable)
             if endpoint.transport == ClusterTransportKind::Iroh =>
@@ -3271,7 +3271,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_command_targets_try_unknown_iroh_before_unknown_tcp_fallbacks() {
+    fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
         let root = unique_cluster_test_root("sinomo-daemon-raft-unknown-tcp-order");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -3330,8 +3330,8 @@ mod tests {
 
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
-            Some(&iroh.endpoint_id),
-            "raft/KV forwarding should not spend the command budget on an unverified TCP endpoint before an available Iroh fallback"
+            Some(&private_tcp.endpoint_id),
+            "raft/KV forwarding should try bounded TCP before spending the command budget on relay fallback when neither path has current connectivity data"
         );
         let iroh_position = targets
             .iter()
@@ -3341,7 +3341,7 @@ mod tests {
             .iter()
             .position(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
             .expect("public tcp target");
-        assert!(iroh_position < public_position);
+        assert!(public_position < iroh_position);
         assert!(
             targets
                 .iter()

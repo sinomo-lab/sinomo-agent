@@ -46,6 +46,17 @@ pub struct DaemonDfsMetadataReplicationReport {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DaemonDfsMetadataReplicationOutcome {
+    MissingShard {
+        file_system_id: sinomo_dfs::DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+    },
+    NotPrimary {
+        file_system_id: sinomo_dfs::DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        local_node_id: sinomo_node::NodeId,
+        primary_node_id: sinomo_node::NodeId,
+        epoch: u64,
+    },
     Applied {
         target_node_id: sinomo_node::NodeId,
         shard_id: DfsMetadataShardId,
@@ -321,7 +332,9 @@ pub fn log_dfs_metadata_replication_report(report: DaemonDfsMetadataReplicationR
                 );
             }
             DaemonDfsMetadataReplicationOutcome::NoChanges { .. }
-            | DaemonDfsMetadataReplicationOutcome::MissingEndpoint { .. } => {}
+            | DaemonDfsMetadataReplicationOutcome::MissingEndpoint { .. }
+            | DaemonDfsMetadataReplicationOutcome::MissingShard { .. }
+            | DaemonDfsMetadataReplicationOutcome::NotPrimary { .. } => {}
         }
     }
 }
@@ -723,12 +736,21 @@ pub fn publish_default_dfs_metadata_journal(
     )?
     else {
         return Ok(DaemonDfsMetadataReplicationReport {
-            outcomes: Vec::new(),
+            outcomes: vec![DaemonDfsMetadataReplicationOutcome::MissingShard {
+                file_system_id: file_system.file_system_id,
+                shard_id: DfsMetadataShardId::new("root"),
+            }],
         });
     };
     if shard.primary_node_id != state.local_node_id {
         return Ok(DaemonDfsMetadataReplicationReport {
-            outcomes: Vec::new(),
+            outcomes: vec![DaemonDfsMetadataReplicationOutcome::NotPrimary {
+                file_system_id: shard.file_system_id,
+                shard_id: DfsMetadataShardId::new(shard.shard_id),
+                local_node_id: state.local_node_id,
+                primary_node_id: shard.primary_node_id,
+                epoch: shard.epoch,
+            }],
         });
     }
 
