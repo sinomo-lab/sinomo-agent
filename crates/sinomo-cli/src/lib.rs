@@ -199,7 +199,7 @@ use sinomo_runtime::dfs::{
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
-use sinomo_runtime::kv::{InProcessKvStore, KvError, KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{InProcessKvStore, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::ClusterId;
 #[cfg(test)]

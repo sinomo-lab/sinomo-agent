@@ -237,6 +237,20 @@ pub struct ClusterRolloutDesiredRecord {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bundle_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_repo: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
@@ -1464,6 +1478,13 @@ pub fn sync_cluster_state_to_local_raft_unchecked(
                 state: "idle".to_string(),
                 source: None,
                 mode: None,
+                source_head: None,
+                source_bundle_base64: None,
+                remote_repo: None,
+                host: None,
+                port: None,
+                shadow_port: None,
+                requested_at: None,
                 updated_at: state.updated_at,
             },
         )?;
@@ -2709,6 +2730,30 @@ pub fn cluster_rollout_desired_key() -> String {
 
 pub fn cluster_rollout_node_key(node_id: &NodeId) -> String {
     format!("/cluster/rollout/nodes/{node_id}")
+}
+
+pub fn read_cluster_rollout_desired_from_kv(
+    paths: &ClusterPaths,
+) -> Result<Option<ClusterRolloutDesiredRecord>, NetworkError> {
+    let store = read_cluster_kv_store(paths)?;
+    let key = cluster_rollout_desired_key();
+    let Some(entry) = store.get(&key) else {
+        return Ok(None);
+    };
+    entry.decode().map(Some).map_err(Into::into)
+}
+
+pub fn sync_cluster_rollout_desired_to_kv(
+    paths: &ClusterPaths,
+    desired: &ClusterRolloutDesiredRecord,
+) -> Result<KvSnapshot, NetworkError> {
+    let state = read_cluster_state_without_kv(paths)?;
+    put_cluster_kv_value(
+        paths,
+        &state.local_node_id,
+        cluster_rollout_desired_key(),
+        desired,
+    )
 }
 
 pub fn read_cluster_invitation_from_kv(

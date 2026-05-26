@@ -432,7 +432,11 @@ pub fn read_rollout_status(
     if !rollout_paths.state.exists() {
         return Ok(None);
     }
-    read_object(&rollout_paths.state).map(Some)
+    match read_object(&rollout_paths.state) {
+        Ok(status) => Ok(Some(status)),
+        Err(RolloutError::Object { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn write_rollout_status(
@@ -597,6 +601,38 @@ mod tests {
         assert!(report.contains("[build log]"));
         assert!(report.contains("build log"));
         assert!(report.contains("[last main exit]"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn read_rollout_status_ignores_corrupt_state_object() {
+        let root = unique_temp("sinomo-rollout-corrupt-state");
+        let paths = SelfRolloutPaths::new(&root);
+        fs::create_dir_all(&paths.root).expect("rollout root");
+        fs::write(&paths.state, b"not-a-sinomo-object").expect("corrupt state");
+
+        assert_eq!(read_rollout_status(&paths).expect("status"), None);
+
+        let replacement = ClusterNodeRolloutStatus {
+            status: "accepted".to_string(),
+            mode: Some("cluster-remote-build".to_string()),
+            detail: Some("recovered".to_string()),
+            source: None,
+            requested_at: None,
+            staged_at: None,
+            updated_at: None,
+            failed_at: None,
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        };
+        write_rollout_status(&paths, &replacement).expect("rewrite state");
+        assert_eq!(
+            read_rollout_status(&paths).expect("status"),
+            Some(replacement)
+        );
         fs::remove_dir_all(root).ok();
     }
 

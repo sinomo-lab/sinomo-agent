@@ -1,21 +1,25 @@
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterRegistration, DaemonClusterStatus, DaemonError,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, authenticated_signer_matches_cluster_node,
-    cluster_node_status_from_daemon_status, current_shadow_daemon_options,
-    daemon_cluster_options_from_status, daemon_cluster_process_from_paths, daemon_cluster_status,
-    daemon_cluster_status_matches, daemon_connect_address, daemon_options_from_status,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, SINOMO_DAEMON_DEFAULT_HOST,
+    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    authenticated_signer_matches_cluster_node, cluster_node_status_from_daemon_status,
+    current_shadow_daemon_options, daemon_cluster_options_from_status,
+    daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
+    daemon_connect_address, daemon_options_from_status, daemon_paths_are_shadow,
     default_main_daemon_status, ensure_daemon_cluster_members, ensure_default_distributed_dfs,
     fetch_cluster_kv_snapshot_from_endpoint, fetch_daemon_status_from_endpoint,
-    invite_introducers_from_daemon_status, probe_daemon_status, read_daemon_status,
-    send_cluster_join_registration_to_channel, send_cluster_kv_txn, send_cluster_kv_watch_events,
-    send_cluster_member_publish, send_cluster_raft_append, send_cluster_raft_vote,
-    unknown_cluster_node_status, write_daemon_status,
+    handle_daemon_rollout_build_request, invite_introducers_from_daemon_status,
+    probe_daemon_status, read_daemon_status, send_cluster_join_registration_to_channel,
+    send_cluster_kv_txn, send_cluster_kv_watch_events, send_cluster_member_publish,
+    send_cluster_raft_append, send_cluster_raft_vote, unknown_cluster_node_status,
+    write_daemon_status,
 };
 use serde::Serialize;
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterJoinInvite,
     ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
-    ClusterNodeRole, ClusterNodeStatusRecord, ClusterTransportKind, TrustDomain,
+    ClusterNodeRole, ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind,
+    TrustDomain,
 };
 use sinomo_kv::{
     InProcessKvStore, KvCommand, KvCompare, KvEntry, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
@@ -35,7 +39,10 @@ use sinomo_network::{
 use sinomo_node::NodeId;
 use sinomo_node::shadow_daemon_node_id;
 use sinomo_node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
-use sinomo_rollout::{SelfRolloutPaths, read_rollout_status};
+use sinomo_rollout::{
+    ClusterRolloutBuildRequest, SelfRolloutPaths, managed_source_status, read_rollout_status,
+    source_heads_match,
+};
 use std::collections::BTreeMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,6 +162,22 @@ fn cached_connectivity_matches(paths: &ClusterPaths, record: &ClusterConnectivit
                     && !sinomo_network::cluster_network_record_should_refresh(known.expires_at, now)
             })
         })
+}
+
+fn rollout_status_matches_desired(
+    status: Option<&ClusterNodeRolloutStatus>,
+    mode: Option<&str>,
+    requested_at: Option<&str>,
+) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    status.mode.as_deref() == mode
+        && status.requested_at.as_deref() == requested_at
+        && matches!(
+            status.status.as_str(),
+            "accepted" | "main-staged" | "healthy" | "recovered"
+        )
 }
 
 fn remember_connectivity_records(paths: &ClusterPaths, records: &[ClusterConnectivityRecord]) {
@@ -745,6 +768,7 @@ pub struct ClusterNetworkMaintenance {
     pub connectivity: std::collections::BTreeMap<String, ClusterConnectivityProbeState>,
     pub connectivity_cursor: usize,
     pub environment_id: Option<String>,
+    pub last_desired_rollout_attempt: Option<String>,
     pub tick: u64,
     pub last_publish: Instant,
     pub last_discovery: Instant,
@@ -765,6 +789,7 @@ impl ClusterNetworkMaintenance {
             connectivity: std::collections::BTreeMap::new(),
             connectivity_cursor: 0,
             environment_id: None,
+            last_desired_rollout_attempt: None,
             tick: 0,
             last_publish: now,
             last_discovery: now,
@@ -889,6 +914,12 @@ impl ClusterNetworkMaintenance {
                         publish_failed = true;
                     }
                 }
+                if daemon_paths_are_shadow(paths)
+                    && let Err(error) =
+                        self.reconcile_desired_rollout(paths, &cluster_paths, &state)
+                {
+                    eprintln!("sinomo daemon desired rollout reconcile failed: {error}");
+                }
             } else if !sinomo_network::cluster_raft_local_is_voter(&state) {
                 if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
                     eprintln!("sinomo daemon cluster member publish via voter failed: {error}");
@@ -916,6 +947,96 @@ impl ClusterNetworkMaintenance {
             || !sinomo_network::cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state)
         {
             sinomo_network::write_cluster_state(&cluster_paths, &state)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_desired_rollout(
+        &mut self,
+        paths: &DaemonPaths,
+        cluster_paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<(), DaemonError> {
+        let Some(desired) = sinomo_network::read_cluster_rollout_desired_from_kv(cluster_paths)?
+        else {
+            return Ok(());
+        };
+        if desired.state != "active"
+            || desired.mode.as_deref() != Some("cluster-remote-build")
+            || (desired.source_bundle_base64.is_none() && desired.remote_repo.is_none())
+        {
+            return Ok(());
+        }
+        let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+            path: paths.root.display().to_string(),
+            detail: "daemon paths have no data directory parent".to_string(),
+        })?;
+        let rollout_paths = SelfRolloutPaths::new(data_dir);
+        if rollout_status_matches_desired(
+            read_rollout_status(&rollout_paths)?.as_ref(),
+            desired.mode.as_deref(),
+            desired.requested_at.as_deref(),
+        ) {
+            return Ok(());
+        }
+        if let Some(source_head) = desired.source_head.as_deref()
+            && managed_source_status(&rollout_paths)
+                .ok()
+                .and_then(|status| status.head)
+                .as_deref()
+                .is_some_and(|current_head| source_heads_match(Some(current_head), source_head))
+        {
+            return Ok(());
+        }
+
+        let attempt_key = format!(
+            "{}:{}",
+            desired.requested_at.as_deref().unwrap_or("unknown-request"),
+            desired
+                .source_head
+                .as_deref()
+                .or(desired.source.as_deref())
+                .unwrap_or("unknown-source")
+        );
+        if self.last_desired_rollout_attempt.as_deref() == Some(attempt_key.as_str()) {
+            return Ok(());
+        }
+        self.last_desired_rollout_attempt = Some(attempt_key);
+
+        let requested_at = desired.requested_at.clone().unwrap_or_else(|| {
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string())
+        });
+        let response = handle_daemon_rollout_build_request(
+            paths,
+            ClusterRolloutBuildRequest {
+                source: desired
+                    .source
+                    .unwrap_or_else(|| "cluster desired rollout".to_string()),
+                remote_repo: desired.remote_repo,
+                source_bundle_base64: desired.source_bundle_base64,
+                source_head: desired.source_head,
+                host: desired
+                    .host
+                    .unwrap_or_else(|| SINOMO_DAEMON_DEFAULT_HOST.to_string()),
+                port: desired.port.unwrap_or(SINOMO_DAEMON_DEFAULT_PORT),
+                shadow_port: desired
+                    .shadow_port
+                    .unwrap_or(SINOMO_SHADOW_DAEMON_DEFAULT_PORT),
+                requested_at,
+            },
+        )?;
+        if response.status == "accepted" {
+            eprintln!(
+                "sinomo daemon desired rollout accepted: {}",
+                response.detail
+            );
+        } else {
+            eprintln!(
+                "sinomo daemon desired rollout {}: {}",
+                response.status, response.detail
+            );
         }
         Ok(())
     }
@@ -3137,6 +3258,7 @@ mod tests {
             )]),
             connectivity_cursor: 0,
             environment_id: None,
+            last_desired_rollout_attempt: None,
             tick: 0,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,

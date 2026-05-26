@@ -404,6 +404,12 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
     );
     let mut binary_request: Option<ClusterRolloutBinaryRequest> = None;
     let mut source_bundle: Option<(String, String)> = None;
+    if options.targets.is_empty() && options.remote_build && options.remote_repo.is_none() {
+        source_bundle = Some(rollout_source_bundle_base64(&options)?);
+    }
+    if options.targets.is_empty() && options.remote_build {
+        publish_cluster_rollout_desired(&options, &source, &requested_at, source_bundle.as_ref())?;
+    }
 
     for target in targets {
         let target_status = match read_rollout_target_status(&target) {
@@ -489,6 +495,57 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             Err(error) => println!("{}: failed: {error}", target.label()),
         }
     }
+    Ok(())
+}
+
+fn publish_cluster_rollout_desired(
+    options: &RolloutOptions,
+    source: &str,
+    requested_at: &str,
+    source_bundle: Option<&(String, String)>,
+) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    let state = read_cluster_state(&paths)?;
+    let desired = network::ClusterRolloutDesiredRecord {
+        cluster_id: state.cluster_id,
+        state: "active".to_string(),
+        source: Some(source.to_string()),
+        mode: Some("cluster-remote-build".to_string()),
+        source_head: source_bundle.map(|(_, head)| head.clone()),
+        source_bundle_base64: source_bundle.map(|(bundle, _)| bundle.clone()),
+        remote_repo: options.remote_repo.clone(),
+        host: Some(options.host.clone()),
+        port: Some(options.port),
+        shadow_port: Some(options.shadow_port),
+        requested_at: Some(requested_at.to_string()),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let Some(status) = daemon_default_main_daemon_status(DAEMON_PROBE_TIMEOUT)? else {
+        return Err(CliError::DaemonNotRunning {
+            detail: "cluster rollout desired state requires the local daemon".to_string(),
+        });
+    };
+    let txn = KvTxn {
+        compares: Vec::new(),
+        success: vec![KvOp::put_serde(
+            network::cluster_rollout_desired_key(),
+            &desired,
+            None,
+        )?],
+        failure: Vec::new(),
+    };
+    let request = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_KV_TXN_ROUTE,
+        network::CLUSTER_KV_RPC_CATEGORY,
+        &txn,
+    )
+    .map_err(CliError::from)?;
+    let response = sinomo_runtime::daemon::send_daemon_rpc(
+        &status.address,
+        &request,
+        DAEMON_CLUSTER_KV_TXN_TIMEOUT,
+    )?;
+    let _: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
     Ok(())
 }
 
