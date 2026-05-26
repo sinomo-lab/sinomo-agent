@@ -2912,6 +2912,30 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
         .expect("replicate metadata shard again");
     assert_eq!(
         second_outcomes,
+        vec![DfsMetadataReplicationOutcome::InFlight {
+            target_node_id: replica.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+            next_after_sequence: 3,
+        }]
+    );
+    let owner_events = owner_dfs
+        .process_incoming()
+        .expect("owner applies metadata ack");
+    assert!(owner_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                source_node_id,
+                next_after_sequence: 3,
+                ..
+            } if source_node_id == &replica
+        )
+    }));
+    let third_outcomes = owner_dfs
+        .replicate_metadata_shard_to_configured_replicas(&file_system_id, "root")
+        .expect("replicate metadata shard after ack");
+    assert_eq!(
+        third_outcomes,
         vec![DfsMetadataReplicationOutcome::NoChanges {
             target_node_id: replica,
             shard_id: DfsMetadataShardId::new("root"),

@@ -1158,6 +1158,11 @@ pub enum DfsMetadataReplicationOutcome {
         entries: usize,
         next_after_sequence: u64,
     },
+    InFlight {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        next_after_sequence: u64,
+    },
     NoChanges {
         target_node_id: NodeId,
         shard_id: DfsMetadataShardId,
@@ -1427,6 +1432,24 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 });
                 continue;
             };
+            let pending_next_after_sequence = self
+                .pending_metadata_replications
+                .values()
+                .filter(|pending| {
+                    pending.target_node_id == target_node_id && pending.shard_id == shard_id
+                })
+                .map(|pending| pending.next_after_sequence)
+                .max();
+            if let Some(pending_next_after_sequence) = pending_next_after_sequence
+                && pending_next_after_sequence >= batch.next_after_sequence
+            {
+                outcomes.push(DfsMetadataReplicationOutcome::InFlight {
+                    target_node_id,
+                    shard_id: shard_id.clone(),
+                    next_after_sequence: pending_next_after_sequence,
+                });
+                continue;
+            }
             let entries = batch.entries.len();
             let next_after_sequence = batch.next_after_sequence;
             let request_id = self.next_request_id();
@@ -2421,7 +2444,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
                 }
             }
-            self.process_incoming()?;
         }
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
