@@ -20,11 +20,11 @@ pub use auth::{
 pub use client::{
     fetch_cluster_kv_snapshot, fetch_cluster_kv_snapshot_from_endpoint,
     fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
-    send_cluster_join_registration, send_cluster_join_registration_to_channel,
-    send_cluster_join_registration_to_endpoint, send_cluster_kv_txn, send_cluster_kv_watch_events,
-    send_cluster_member_publish, send_cluster_raft_append, send_cluster_raft_vote,
-    send_daemon_finalize_shadow_rollout_request, send_daemon_rollout_binary,
-    send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_build,
+    fetch_dfs_status_from_endpoint, send_cluster_join_registration,
+    send_cluster_join_registration_to_channel, send_cluster_join_registration_to_endpoint,
+    send_cluster_kv_txn, send_cluster_kv_watch_events, send_cluster_member_publish,
+    send_cluster_raft_append, send_cluster_raft_vote, send_daemon_finalize_shadow_rollout_request,
+    send_daemon_rollout_binary, send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_build,
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_diagnostics, send_daemon_rpc,
     send_daemon_rpc_stream, send_daemon_rpc_to_endpoint, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint, send_dfs_protocol_frame_to_endpoint,
@@ -82,8 +82,8 @@ pub use dfs::{
     DaemonDfsMetadataReplicationReport, DaemonDfsSmokeReport, ensure_default_distributed_dfs,
     ensure_default_local_dfs_expose, handle_daemon_dfs_expose_config,
     handle_daemon_dfs_metadata_journal_batch, handle_daemon_dfs_protocol_frame,
-    log_dfs_metadata_replication_report, publish_default_dfs_metadata_journal,
-    run_daemon_dfs_maintenance_tick, run_daemon_dfs_smoke,
+    handle_daemon_dfs_status, log_dfs_metadata_replication_report,
+    publish_default_dfs_metadata_journal, run_daemon_dfs_maintenance_tick, run_daemon_dfs_smoke,
 };
 pub use error::DaemonError;
 pub use install::{

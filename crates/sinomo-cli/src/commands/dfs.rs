@@ -560,7 +560,13 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Status(options) => {
-            let status = inspect_dfs_status(dfs_metadata_root(options.metadata_root.clone())?)?;
+            let status = if let Some(metadata_root) = options.metadata_root.clone() {
+                inspect_dfs_status(dfs_metadata_root(Some(metadata_root))?)?
+            } else {
+                let data_dir = SinomoDataDir::from_env_or_home()?;
+                data_dir.ensure_root_layout()?;
+                daemon_handle_daemon_dfs_status(&DaemonPaths::new(&data_dir))?
+            };
             if options.json {
                 print_json("<dfs-status>", &status)?;
             } else {

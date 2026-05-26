@@ -99,6 +99,7 @@ use sinomo_runtime::daemon::{
     git_is_available as daemon_git_is_available,
     handle_daemon_cluster_kv_range_prefix as daemon_handle_daemon_cluster_kv_range_prefix,
     handle_daemon_connection as daemon_handle_daemon_connection,
+    handle_daemon_dfs_status as daemon_handle_daemon_dfs_status,
     initialize_local_cluster as daemon_initialize_local_cluster,
     install_managed_source_repo as daemon_install_managed_source_repo,
     installed_daemon_paths as daemon_installed_daemon_paths,

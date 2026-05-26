@@ -6,8 +6,8 @@ use crate::{
 };
 use sinomo_core::{ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_dfs::{
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsOperatorStatus,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse,
 };
 use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_network::{
@@ -109,6 +109,19 @@ pub fn fetch_daemon_status_from_endpoint(
         &(),
     )?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn fetch_dfs_status_from_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<DfsOperatorStatus, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        sinomo_network::DFS_STATUS_ROUTE,
+        sinomo_network::DFS_RPC_CATEGORY,
+        &(),
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 

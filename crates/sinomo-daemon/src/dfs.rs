@@ -157,6 +157,16 @@ pub fn handle_daemon_dfs_expose_config(paths: &DaemonPaths) -> Result<String, Da
     })
 }
 
+pub fn handle_daemon_dfs_status(
+    paths: &DaemonPaths,
+) -> Result<sinomo_dfs::DfsOperatorStatus, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    sinomo_dfs::inspect_dfs_status(data_dir.dfs_dir().join("metadata").join("root"))
+        .map_err(DaemonError::from)
+}
+
 pub fn handle_daemon_dfs_metadata_journal_batch(
     paths: &DaemonPaths,
     command: DfsMetadataJournalBatchCommand,
@@ -1215,6 +1225,49 @@ mod tests {
             target.get_object(&object.object_id).expect("target object"),
             Some(object)
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_status_reads_default_metadata_backend() {
+        let root = temp_root("daemon_dfs_status");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let node_id = NodeId::from_legacy_named("node_daemon_dfs_status").expect("node");
+        let file_system = distributed_sifs(node_id.clone());
+        let object = distributed_sifs_bootstrap_objects(node_id)
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        let mut backend = LocalJsonMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        backend
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                content_hash: object.content_hash.clone(),
+                size_bytes: object.content_size_bytes,
+                locations: object.current_locations.clone(),
+                created_by_event_id: object.created_by_event_id.clone(),
+                created_at: OffsetDateTime::now_utc(),
+                visible: true,
+            })
+            .expect("version");
+
+        let status = handle_daemon_dfs_status(&paths).expect("dfs status");
+
+        assert_eq!(status.file_system_count, 1);
+        assert_eq!(status.object_count, 1);
+        assert_eq!(status.version_count, 1);
 
         cleanup(&root);
     }
