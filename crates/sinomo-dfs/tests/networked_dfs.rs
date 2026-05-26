@@ -2600,6 +2600,175 @@ fn networked_dfs_sends_metadata_journal_in_bounded_batches() {
 }
 
 #[test]
+fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
+    let owner = NodeId::from_legacy_named("node_metadata_bounded_config_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_metadata_bounded_config_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let root = temp_root("networked_metadata_bounded_configured");
+    let network = InProcessNetwork::new();
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![owner.clone(), replica.clone()])
+            .expect("control-plane kv cluster"),
+    );
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: vec![replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let owner_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let replica_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
+            .expect("replica metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_metadata_backend(replica_backend)
+    .expect("replica metadata backend");
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    let object_count = DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT / 2 + 4;
+    let mut last_object_id = None;
+    for index in 0..object_count {
+        let object_id =
+            DfsObjectId::from_legacy_named(format!("obj_metadata_config_batch_{index}"))
+                .expect("object");
+        let metadata = DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: file_system_id.clone(),
+            path: format!("/services/config-bounded-{index}.txt"),
+            kind: DfsObjectKind::File,
+            owner_node_id: owner.clone(),
+            current_locations: vec![owner.clone()],
+            content_hash: Some(format!("blake3:config-bounded-{index}")),
+            content_size_bytes: Some(index as u64),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: DfsVersion::from_legacy_named(format!("version_config_bounded_{index}"))
+                .expect("version"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        owner_dfs
+            .add_object_metadata(metadata)
+            .expect("owner metadata");
+        last_object_id = Some(object_id);
+    }
+
+    let expected_entries = 1 + object_count * 2;
+    let mut replicated_entries = 0usize;
+    let mut batches = 0usize;
+    while replicated_entries < expected_entries {
+        let outcomes = owner_dfs
+            .replicate_metadata_shard_to_configured_replicas(&file_system_id, "root")
+            .expect("metadata replication send");
+        let [
+            DfsMetadataReplicationOutcome::Sent {
+                entries,
+                next_after_sequence,
+                ..
+            },
+        ] = outcomes.as_slice()
+        else {
+            panic!("unexpected replication outcomes: {outcomes:?}");
+        };
+        assert!(*entries <= DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT);
+        assert!(*next_after_sequence as usize > replicated_entries);
+        replicated_entries = *next_after_sequence as usize;
+        batches += 1;
+
+        let replica_events = replica_dfs
+            .process_incoming()
+            .expect("replica applies metadata batch");
+        assert!(replica_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                    source_node_id,
+                    next_after_sequence: applied_after,
+                    ..
+                } if source_node_id == &owner && applied_after == next_after_sequence
+            )
+        }));
+        let owner_events = owner_dfs
+            .process_incoming()
+            .expect("owner applies metadata ack");
+        assert!(owner_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                    source_node_id,
+                    next_after_sequence: ack_after,
+                    ..
+                } if source_node_id == &replica && ack_after == next_after_sequence
+            )
+        }));
+    }
+    assert!(
+        batches > 1,
+        "the configured replication backlog should require multiple bounded batches"
+    );
+    assert_eq!(replicated_entries, expected_entries);
+    assert_eq!(
+        replica_dfs
+            .metadata_backend()
+            .expect("replica metadata backend")
+            .get_file_system(&file_system_id)
+            .expect("replica filesystem"),
+        Some(file_system)
+    );
+    assert!(
+        replica_dfs
+            .metadata_backend()
+            .expect("replica metadata backend")
+            .get_object(&last_object_id.expect("last object"))
+            .expect("replica last object")
+            .is_some()
+    );
+    let final_outcomes = owner_dfs
+        .replicate_metadata_shard_to_configured_replicas(&file_system_id, "root")
+        .expect("final metadata replication check");
+    assert!(matches!(
+        final_outcomes.as_slice(),
+        [DfsMetadataReplicationOutcome::NoChanges { after_sequence, .. }]
+            if *after_sequence as usize == expected_entries
+    ));
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
     let owner = NodeId::from_legacy_named("node_metadata_config_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_metadata_config_replica").expect("node");
