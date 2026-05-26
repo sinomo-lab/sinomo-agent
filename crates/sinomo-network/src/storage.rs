@@ -1038,8 +1038,14 @@ pub fn apply_cluster_raft_append(
             && (append.prev_log_index != snapshot.last_included_index
                 || append.prev_log_term == snapshot.last_included_term);
         let snapshot_is_newer = snapshot.last_included_index > node.applied_index();
+        let snapshot_repairs_divergent_compaction = snapshot.last_included_term
+            > node.last_log_term()
+            && snapshot.kv.revision >= node.store().revision();
         let append_term_is_current = append.term >= node.hard_state().current_term;
-        if append_term_is_current && snapshot_matches_append && snapshot_is_newer {
+        if append_term_is_current
+            && snapshot_matches_append
+            && (snapshot_is_newer || snapshot_repairs_divergent_compaction)
+        {
             node.restore_snapshot(snapshot)?;
         }
     }
