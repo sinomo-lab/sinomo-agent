@@ -515,6 +515,7 @@ impl LocalJsonMetadataBackend {
         backend.ensure_secondary_index_dirs()?;
         backend.recover_namespace_transactions()?;
         backend.recover_visible_version_commits()?;
+        backend.recover_object_locations_from_visible_versions()?;
         Ok(backend)
     }
 
@@ -1686,6 +1687,33 @@ impl LocalJsonMetadataBackend {
         });
         for commit in commits {
             self.recover_visible_version_commit(&commit)?;
+        }
+        Ok(())
+    }
+
+    fn recover_object_locations_from_visible_versions(&self) -> Result<()> {
+        for mut object in self.object_records()? {
+            if object.kind == DfsObjectKind::Tombstone {
+                continue;
+            }
+            let Some(version) = self.get_version(&object.object_id, &object.version)? else {
+                continue;
+            };
+            if !version.visible || version.locations.is_empty() {
+                continue;
+            }
+            if object.content_hash != version.content_hash {
+                continue;
+            }
+            let mut object_locations = object.current_locations.clone();
+            let mut version_locations = version.locations.clone();
+            normalize_node_locations(&mut object_locations);
+            normalize_node_locations(&mut version_locations);
+            if object_locations == version_locations {
+                continue;
+            }
+            object.current_locations = version_locations;
+            self.materialize_object_indexes(&object)?;
         }
         Ok(())
     }
@@ -3699,6 +3727,46 @@ mod tests {
                 .receipts_for_version(&object.object_id, &object.version)
                 .expect("receipts"),
             vec![receipt]
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_recovers_object_locations_from_visible_version() {
+        let root = temp_root("local_backend_recovers_object_locations_from_visible_version");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let owner = node("node_owner");
+        let replica = node("node_replica");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        let mut object = object(version("version_2"));
+        object.current_locations = vec![owner.clone()];
+        object.content_hash = Some("blake3:recover-locations".to_string());
+        backend.put_object(&object).expect("object");
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: Some(18),
+            locations: vec![owner.clone(), replica.clone()],
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        backend.put_version(&version_record).expect("version");
+
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen");
+
+        assert_eq!(
+            reopened
+                .get_object(&object.object_id)
+                .expect("object")
+                .expect("object")
+                .current_locations,
+            vec![owner, replica]
         );
         cleanup(&root);
     }
