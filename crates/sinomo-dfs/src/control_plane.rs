@@ -221,6 +221,14 @@ impl<'a> DfsControlPlaneStore<'a> {
         Ok(shards)
     }
 
+    pub fn select_metadata_shard_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+        select_metadata_shard_for_path(self.list_metadata_shards(file_system_id)?, path)
+    }
+
     pub fn transfer_metadata_shard_primary(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -273,6 +281,126 @@ impl<'a> DfsControlPlaneStore<'a> {
 
 fn normalize_segment(segment: &str) -> String {
     segment.trim_matches('/').replace('/', "_")
+}
+
+fn select_metadata_shard_for_path(
+    shards: Vec<DfsMetadataShardConfig>,
+    path: &str,
+) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+    let path = normalize_metadata_selection_path(path)?;
+    let path_hash = metadata_name_hash(&path);
+    let mut root = None;
+    let mut prefix_match = None::<(usize, String, DfsMetadataShardConfig)>;
+    let mut hash_match = None::<(u128, String, DfsMetadataShardConfig)>;
+
+    for shard in shards {
+        match &shard.assignment {
+            DfsMetadataShardAssignment::Root => {
+                if root
+                    .as_ref()
+                    .is_none_or(|current: &DfsMetadataShardConfig| {
+                        shard.shard_id < current.shard_id
+                    })
+                {
+                    root = Some(shard);
+                }
+            }
+            DfsMetadataShardAssignment::PathPrefix { prefix } => {
+                let prefix = normalize_metadata_selection_path(prefix)?;
+                if metadata_path_matches_prefix(&path, &prefix) {
+                    let candidate = (prefix.len(), shard.shard_id.clone(), shard);
+                    if prefix_match.as_ref().is_none_or(|current| {
+                        candidate.0 > current.0
+                            || (candidate.0 == current.0 && candidate.1 < current.1)
+                    }) {
+                        prefix_match = Some(candidate);
+                    }
+                }
+            }
+            DfsMetadataShardAssignment::NameHashRange {
+                start_inclusive,
+                end_exclusive,
+            } => {
+                if metadata_hash_in_range(path_hash, *start_inclusive, *end_exclusive) {
+                    let candidate = (
+                        metadata_hash_range_width(*start_inclusive, *end_exclusive),
+                        shard.shard_id.clone(),
+                        shard,
+                    );
+                    if hash_match
+                        .as_ref()
+                        .is_none_or(|current| candidate.0 < current.0 || candidate.1 < current.1)
+                    {
+                        hash_match = Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(prefix_match
+        .map(|(_, _, shard)| shard)
+        .or_else(|| hash_match.map(|(_, _, shard)| shard))
+        .or(root))
+}
+
+fn normalize_metadata_selection_path(path: &str) -> Result<String, KvError> {
+    if path.bytes().any(|byte| byte == 0) {
+        return Err(KvError::Serialization {
+            detail: format!("metadata shard path contains a nul byte: {path:?}"),
+        });
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    if parts.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", parts.join("/")))
+    }
+}
+
+fn metadata_path_matches_prefix(path: &str, prefix: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn metadata_name_hash(path: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn metadata_hash_in_range(hash: u64, start_inclusive: u64, end_exclusive: u64) -> bool {
+    if start_inclusive == end_exclusive {
+        return false;
+    }
+    if start_inclusive < end_exclusive {
+        hash >= start_inclusive && hash < end_exclusive
+    } else {
+        hash >= start_inclusive || hash < end_exclusive
+    }
+}
+
+fn metadata_hash_range_width(start_inclusive: u64, end_exclusive: u64) -> u128 {
+    if start_inclusive <= end_exclusive {
+        u128::from(end_exclusive - start_inclusive)
+    } else {
+        (u128::from(u64::MAX) - u128::from(start_inclusive) + 1) + u128::from(end_exclusive)
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +516,145 @@ mod tests {
                 .expect("stale transfer")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn metadata_shard_selection_prefers_longest_path_prefix() {
+        let node_owner = node("node_shard_select_owner");
+        let node_replica = node("node_shard_select_replica");
+        let mut kv = InProcessRaftKvCluster::new(vec![node_owner.clone(), node_replica.clone()])
+            .expect("kv cluster");
+        let file_system_id = file_system_id();
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        for shard in [
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: node_owner.clone(),
+                replica_node_ids: vec![node_replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: node_owner.clone(),
+                replica_node_ids: vec![node_replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services-sandbox".to_string(),
+                primary_node_id: node_owner.clone(),
+                replica_node_ids: vec![node_replica],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services/sandbox".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ] {
+            control.put_metadata_shard(&shard).expect("put shard");
+        }
+
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, "/services/sandbox/instances/one")
+                .expect("select sandbox")
+                .map(|shard| shard.shard_id),
+            Some("services-sandbox".to_string())
+        );
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, "/services/api")
+                .expect("select services")
+                .map(|shard| shard.shard_id),
+            Some("services".to_string())
+        );
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, "/services2/api")
+                .expect("select root")
+                .map(|shard| shard.shard_id),
+            Some("root".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_shard_selection_uses_hash_range_before_root() {
+        let node_owner = node("node_shard_hash_owner");
+        let node_replica = node("node_shard_hash_replica");
+        let mut kv = InProcessRaftKvCluster::new(vec![node_owner.clone(), node_replica.clone()])
+            .expect("kv cluster");
+        let file_system_id = file_system_id();
+        let selected_path = "/users/alice/project";
+        let hash = metadata_name_hash(selected_path);
+        let (start_inclusive, end_exclusive) = if hash == u64::MAX {
+            (hash, 0)
+        } else {
+            (hash, hash + 1)
+        };
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        for shard in [
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: node_owner.clone(),
+                replica_node_ids: vec![node_replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "hash-selected".to_string(),
+                primary_node_id: node_owner,
+                replica_node_ids: vec![node_replica],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::NameHashRange {
+                    start_inclusive,
+                    end_exclusive,
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ] {
+            control.put_metadata_shard(&shard).expect("put shard");
+        }
+
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, selected_path)
+                .expect("select hash")
+                .map(|shard| shard.shard_id),
+            Some("hash-selected".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_shard_selection_rejects_nul_paths() {
+        let node_owner = node("node_shard_invalid_owner");
+        let mut kv = InProcessRaftKvCluster::new(vec![node_owner.clone()]).expect("kv cluster");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: node_owner,
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        control.put_metadata_shard(&shard).expect("put shard");
+
+        assert!(matches!(
+            control.select_metadata_shard_for_path(&file_system_id, "/bad\0path"),
+            Err(KvError::Serialization { .. })
+        ));
     }
 }

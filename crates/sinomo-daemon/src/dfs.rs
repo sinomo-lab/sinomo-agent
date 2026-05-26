@@ -180,7 +180,7 @@ pub fn handle_daemon_dfs_metadata_journal_batch(
         data_dir
             .dfs_dir()
             .join("metadata")
-            .join(command.batch.shard_id.0.clone()),
+            .join(path_safe_segment(&command.batch.shard_id.0)),
     )?;
     let shard_id = command.batch.shard_id.clone();
     let next_after_sequence = command.batch.next_after_sequence;
@@ -1231,6 +1231,62 @@ mod tests {
         assert_eq!(
             target.get_object(&object.object_id).expect("target object"),
             Some(object)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_journal_batch_uses_path_safe_shard_directory() {
+        let root = temp_root("daemon_dfs_metadata_journal_batch_safe_shard");
+        let paths = DaemonPaths::with_root(root.join("data").join("daemon"));
+        let source_root = root.join("source-meta");
+        let node_id = NodeId::from_legacy_named("node_daemon_dfs_metadata_safe").expect("node");
+        let file_system = distributed_sifs(node_id.clone());
+        let object = distributed_sifs_bootstrap_objects(node_id)
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        let shard_id = DfsMetadataShardId::new("root/frag");
+        let mut source =
+            LocalJsonMetadataBackend::new(shard_id.clone(), source_root).expect("source backend");
+        source.put_file_system(&file_system).expect("filesystem");
+        source.put_object(&object).expect("object");
+        let mut subscription = source.subscribe(0);
+        let batch = source
+            .poll_subscription(&mut subscription)
+            .expect("source batch");
+
+        let response = handle_daemon_dfs_metadata_journal_batch(
+            &paths,
+            DfsMetadataJournalBatchCommand {
+                request_id: "dfs_meta_req_safe".to_string(),
+                batch,
+            },
+        )
+        .expect("apply batch");
+        assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+
+        let target = LocalJsonMetadataBackend::new(
+            shard_id,
+            root.join("data")
+                .join("dfs")
+                .join("metadata")
+                .join("root_frag"),
+        )
+        .expect("target backend");
+        assert_eq!(
+            target.get_object(&object.object_id).expect("target object"),
+            Some(object)
+        );
+        assert!(
+            !root
+                .join("data")
+                .join("dfs")
+                .join("metadata")
+                .join("root")
+                .join("frag")
+                .exists()
         );
 
         cleanup(&root);
