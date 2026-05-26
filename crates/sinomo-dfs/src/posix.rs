@@ -19,6 +19,8 @@ use sinomo_node::NodeId;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+const POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT: usize = 8;
+
 #[derive(Debug, Error)]
 pub enum DfsPosixError {
     #[error("DFS error: {0}")]
@@ -103,6 +105,28 @@ impl DfsWriteOptions {
 }
 
 impl<T: NetworkTransport> NetworkedDfsService<T> {
+    fn settle_ready_write_outcome(
+        &mut self,
+        outcome: NetworkedDfsWriteOutcome,
+    ) -> std::result::Result<NetworkedDfsWriteOutcome, DfsError> {
+        let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome else {
+            return Ok(outcome);
+        };
+        let intent_id = intent_id.clone();
+        let mut outcome = outcome;
+        for _ in 0..POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
+            let events = self.process_incoming()?;
+            if events.is_empty() {
+                break;
+            }
+            outcome = self.write_outcome(&intent_id)?;
+            if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
+                break;
+            }
+        }
+        Ok(outcome)
+    }
+
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
         let file_system = crate::namespace::distributed_sifs(self.node_id.clone());
         self.add_file_system(file_system)?;
@@ -247,6 +271,19 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 return Err(error.into());
             }
         };
+        let outcome = if options.wait_for_commit {
+            match self.settle_ready_write_outcome(outcome) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if transient_create {
+                        self.remove_transient_object_metadata(&object.object_id);
+                    }
+                    return Err(error.into());
+                }
+            }
+        } else {
+            outcome
+        };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
                 if transient_create {
@@ -378,6 +415,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             options.policy,
         )?;
+        let outcome = if options.wait_for_commit {
+            self.settle_ready_write_outcome(outcome)?
+        } else {
+            outcome
+        };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
                 let object = self.stat_target_for_path(&path)?;
@@ -477,6 +519,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             options.policy,
         )?;
+        let outcome = if options.wait_for_commit {
+            self.settle_ready_write_outcome(outcome)?
+        } else {
+            outcome
+        };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
                 let object = self.stat_target_for_path(&path)?;
@@ -734,6 +781,17 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 self.remove_transient_object_metadata(&object.object_id);
                 return Err(error.into());
             }
+        };
+        let outcome = if options.wait_for_commit {
+            match self.settle_ready_write_outcome(outcome) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.remove_transient_object_metadata(&object.object_id);
+                    return Err(error.into());
+                }
+            }
+        } else {
+            outcome
         };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {

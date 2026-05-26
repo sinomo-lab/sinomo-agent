@@ -450,12 +450,28 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>>;
     fn put_receipt(&mut self, receipt: &DfsReplicaReceiptRecord)
     -> Result<DfsMetadataJournalEntry>;
+    fn put_receipt_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        receipt: &DfsReplicaReceiptRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let _ = object;
+        self.put_receipt(receipt)
+    }
     fn receipts_for_version(
         &self,
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Vec<DfsReplicaReceiptRecord>>;
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry>;
+    fn put_intent_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let _ = object;
+        self.put_intent(intent)
+    }
     fn get_intent(
         &self,
         object_id: &DfsObjectId,
@@ -696,6 +712,28 @@ impl LocalShardedMetadataBackend {
             })
     }
 
+    fn shard_id_for_pending_object_record(
+        &self,
+        object_id: &DfsObjectId,
+        file_system_id: &DfsFileSystemId,
+        object: Option<&DfsObjectMetadata>,
+    ) -> Result<DfsMetadataShardId> {
+        if let Some(shard_id) = self.shard_id_for_object(object_id)? {
+            return Ok(shard_id);
+        }
+        let Some(object) = object else {
+            return Err(MetadataBackendError::UnknownObject {
+                object_id: object_id.clone(),
+            });
+        };
+        if object.object_id != *object_id || object.file_system_id != *file_system_id {
+            return Err(MetadataBackendError::UnknownObject {
+                object_id: object_id.clone(),
+            });
+        }
+        self.select_shard_id_for_path(file_system_id, &object.path)
+    }
+
     fn put_cross_shard_tombstone(
         &mut self,
         object: &DfsObjectMetadata,
@@ -860,6 +898,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend_mut(&shard_id)?.put_receipt(receipt)
     }
 
+    fn put_receipt_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        receipt: &DfsReplicaReceiptRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = self.shard_id_for_pending_object_record(
+            &receipt.receipt.object_id,
+            &receipt.receipt.file_system_id,
+            object,
+        )?;
+        self.shard_backend_mut(&shard_id)?.put_receipt(receipt)
+    }
+
     fn receipts_for_version(
         &self,
         object_id: &DfsObjectId,
@@ -874,6 +925,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry> {
         let shard_id = self.require_shard_id_for_object(&intent.object_id)?;
+        self.shard_backend_mut(&shard_id)?.put_intent(intent)
+    }
+
+    fn put_intent_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = self.shard_id_for_pending_object_record(
+            &intent.object_id,
+            &intent.file_system_id,
+            object,
+        )?;
         self.shard_backend_mut(&shard_id)?.put_intent(intent)
     }
 
