@@ -1787,7 +1787,7 @@ fn current_cluster_kv_store(
     }
     let mut targets = cluster_raft_live_voter_targets(paths, state);
     if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
-        && !cluster_node_status_is_offline(paths, state, &leader_id)
+        && !cluster_node_status_blocks_leader_preference(paths, state, &leader_id)
         && let Some(position) = targets
             .iter()
             .position(|endpoint| endpoint.node_id == leader_id)
@@ -1801,14 +1801,16 @@ fn current_cluster_kv_store(
         DAEMON_CLUSTER_RPC_TIMEOUT
     };
     let deadline = Instant::now() + refresh_budget;
-    for endpoint in targets {
+    for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
         if remaining.is_zero() {
             break;
         }
-        let snapshot_timeout = remaining.min(DAEMON_CLUSTER_RPC_TIMEOUT);
+        let snapshot_timeout =
+            cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index)
+                .min(DAEMON_CLUSTER_RPC_TIMEOUT);
         if let Ok(snapshot) = fetch_cluster_kv_snapshot_from_endpoint(&endpoint, snapshot_timeout) {
             snapshots.push(snapshot);
         }
@@ -2367,7 +2369,8 @@ pub fn cluster_reachable_voter_count(paths: &ClusterPaths, state: &ClusterBootst
         }
     }
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in cluster_raft_live_voter_targets(paths, state) {
+    let targets = cluster_raft_live_voter_targets(paths, state);
+    for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -2376,11 +2379,11 @@ pub fn cluster_reachable_voter_count(paths: &ClusterPaths, state: &ClusterBootst
         }
         if fetch_daemon_status_from_endpoint(
             &endpoint,
-            cluster_endpoint_command_timeout(&endpoint, remaining),
+            cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index),
         )
         .is_ok()
         {
-            voters.insert(endpoint.node_id);
+            voters.insert(endpoint.node_id.clone());
             if voters.len() >= quorum_size {
                 break;
             }
@@ -2409,7 +2412,8 @@ pub fn commit_cluster_raft_command_with_quorum(
     let quorum_size = sinomo_network::cluster_raft_quorum_size(state);
     let mut failures = Vec::new();
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in cluster_raft_live_voter_targets(paths, state) {
+    let targets = cluster_raft_live_voter_targets(paths, state);
+    for (index, endpoint) in targets.iter().enumerate() {
         if voter_acks.len() >= quorum_size {
             break;
         }
@@ -2423,7 +2427,14 @@ pub fn commit_cluster_raft_command_with_quorum(
             ));
             break;
         }
-        match replicate_cluster_raft_to_endpoint_with_timeout(paths, state, &endpoint, remaining) {
+        let attempt_timeout =
+            cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index);
+        match replicate_cluster_raft_to_endpoint_with_timeout(
+            paths,
+            state,
+            endpoint,
+            attempt_timeout,
+        ) {
             Ok(response) if response.accepted => {
                 voter_acks.insert(endpoint.node_id.clone());
                 sinomo_network::merge_cluster_state_from_peer(state, response.state);
@@ -2576,7 +2587,7 @@ fn forward_cluster_kv_txn_to_voter(
         return None;
     }
     if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
-        && !cluster_node_status_is_offline(paths, state, &leader_id)
+        && !cluster_node_status_blocks_leader_preference(paths, state, &leader_id)
         && let Some(position) = targets
             .iter()
             .position(|endpoint| endpoint.node_id == leader_id)
@@ -2587,7 +2598,7 @@ fn forward_cluster_kv_txn_to_voter(
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in targets {
+    for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -2601,13 +2612,17 @@ fn forward_cluster_kv_txn_to_voter(
         match send_cluster_kv_txn(
             &endpoint,
             txn,
-            cluster_endpoint_command_timeout(&endpoint, remaining),
+            cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index),
         ) {
             Ok(response) => {
                 return Some(
                     fetch_cluster_kv_snapshot_from_endpoint(
                         &endpoint,
-                        cluster_endpoint_command_timeout(&endpoint, remaining),
+                        cluster_endpoint_fair_command_timeout(
+                            endpoint,
+                            remaining,
+                            targets.len() - index,
+                        ),
                     )
                     .map(|snapshot| (snapshot, Some(response))),
                 );
@@ -2637,11 +2652,11 @@ fn cluster_raft_live_voter_targets(
     sinomo_network::cluster_raft_command_targets(paths, state)
         .into_iter()
         .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
-        .filter(|endpoint| !cluster_node_status_is_offline(paths, state, &endpoint.node_id))
+        .filter(|endpoint| !cluster_node_status_is_offline(paths, &endpoint.node_id))
         .collect()
 }
 
-fn cluster_node_status_is_offline(
+fn cluster_node_status_blocks_leader_preference(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     node_id: &NodeId,
@@ -2662,6 +2677,14 @@ fn cluster_node_status_is_offline(
                             sinomo_network::live_cluster_member_probe_possible(state, member)
                         }))
         })
+}
+
+fn cluster_node_status_is_offline(paths: &ClusterPaths, node_id: &NodeId) -> bool {
+    sinomo_network::read_cluster_node_statuses_from_kv(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|status| status.node_id == *node_id)
+        .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
 }
 
 pub fn elect_cluster_raft_leader(
@@ -2702,7 +2725,8 @@ pub fn elect_cluster_raft_leader(
         granted.insert(state.local_node_id.clone());
     }
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in cluster_raft_live_voter_targets(paths, state) {
+    let targets = cluster_raft_live_voter_targets(paths, state);
+    for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -2712,7 +2736,7 @@ pub fn elect_cluster_raft_leader(
         let Ok(response) = send_cluster_raft_vote(
             &endpoint,
             &vote_request,
-            cluster_endpoint_command_timeout(&endpoint, remaining),
+            cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index),
         ) else {
             continue;
         };
@@ -2808,6 +2832,22 @@ fn cluster_endpoint_command_timeout(
         ClusterTransportKind::Iroh => remaining.min(DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT),
         _ => remaining.min(DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT),
     }
+}
+
+fn cluster_endpoint_fair_command_timeout(
+    endpoint: &ClusterEndpointRecord,
+    remaining: Duration,
+    attempts_left: usize,
+) -> Duration {
+    let Some(fair_share) = remaining.checked_div(attempts_left.max(1) as u32) else {
+        return cluster_endpoint_command_timeout(endpoint, remaining);
+    };
+    let budget = if fair_share.is_zero() {
+        remaining
+    } else {
+        fair_share
+    };
+    cluster_endpoint_command_timeout(endpoint, budget)
 }
 
 pub fn handle_daemon_cluster_raft_append_request(
@@ -3559,7 +3599,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_online_status_is_offline_for_probeable_remote_leader() {
+    fn stale_online_status_blocks_leader_preference_without_hiding_voter() {
         let root = unique_cluster_test_root("sinomo-daemon-stale-leader-status");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -3619,12 +3659,17 @@ mod tests {
         .expect("sync stale node status");
 
         assert!(
-            cluster_node_status_is_offline(&paths, &state, &remote_node),
-            "a stale online status for a probeable remote member must not be trusted for leader forwarding"
+            cluster_node_status_blocks_leader_preference(&paths, &state, &remote_node),
+            "a stale online status for a probeable remote member must not be trusted for leader preference"
         );
         assert!(
-            cluster_raft_live_voter_targets(&paths, &state).is_empty(),
-            "KV forwarding should not spend the command budget on stale-dead voters"
+            !cluster_node_status_is_offline(&paths, &remote_node),
+            "a stale online status is unknown, not explicit offline"
+        );
+        assert_eq!(
+            cluster_raft_live_voter_targets(&paths, &state).len(),
+            1,
+            "stale status alone must not hide a voter while KV is recovering"
         );
         std::fs::remove_dir_all(root).ok();
     }
