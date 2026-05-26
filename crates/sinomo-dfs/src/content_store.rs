@@ -49,6 +49,24 @@ pub struct LocalContentStore {
     root: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct BlobReader {
+    file: fs::File,
+    size_bytes: u64,
+}
+
+impl BlobReader {
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+}
+
+impl Read for BlobReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
 impl LocalContentStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -112,6 +130,20 @@ impl LocalContentStore {
         let bytes = read_file(&path)?;
         ensure_bytes_match_hash(hash, &bytes)?;
         Ok(bytes)
+    }
+
+    pub fn open_blob_reader(&self, hash: &str) -> Result<BlobReader> {
+        let path = self.blob_path(hash)?;
+        let (actual_hash, size_bytes) = file_content_hash_and_size(&path)?;
+        if actual_hash != hash {
+            return Err(ContentStoreError::BlobHashMismatch {
+                expected: hash.to_owned(),
+                actual: actual_hash,
+            });
+        }
+        let file =
+            fs::File::open(&path).map_err(|source| ContentStoreError::Io { path, source })?;
+        Ok(BlobReader { file, size_bytes })
     }
 
     pub fn read_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
@@ -664,6 +696,32 @@ mod tests {
                 .is_none(),
             "streaming writes must not leave temporary staging files"
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn open_blob_reader_validates_hash_and_streams_bytes() {
+        let root = temp_root("open_blob_reader_validates_hash_and_streams_bytes");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let manifest = store
+            .put_object_version("object-reader", "v1", b"streamed reader bytes")
+            .expect("put object version");
+
+        let mut reader = store
+            .open_blob_reader(&manifest.content_hash)
+            .expect("open reader");
+        assert_eq!(reader.size_bytes(), manifest.size_bytes);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read blob reader");
+        assert_eq!(bytes, b"streamed reader bytes");
+
+        let blob_path = store.blob_path(&manifest.content_hash).expect("blob path");
+        write_file_atomic(&blob_path, b"corrupt reader bytes").expect("corrupt blob");
+        assert!(matches!(
+            store.open_blob_reader(&manifest.content_hash),
+            Err(ContentStoreError::BlobHashMismatch { .. })
+        ));
 
         cleanup(&root);
     }

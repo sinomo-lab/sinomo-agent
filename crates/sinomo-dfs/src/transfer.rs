@@ -214,7 +214,12 @@ impl InProgressBlobTransfer {
 }
 
 pub(crate) fn blob_chunk_count(bytes: &[u8]) -> Result<u32, DfsError> {
-    let chunks = bytes.len().div_ceil(DFS_BLOB_CHUNK_BYTES);
+    blob_chunk_count_for_size(bytes.len() as u64)
+}
+
+pub(crate) fn blob_chunk_count_for_size(size_bytes: u64) -> Result<u32, DfsError> {
+    let chunk_size = DFS_BLOB_CHUNK_BYTES as u64;
+    let chunks = size_bytes.div_ceil(chunk_size);
     u32::try_from(chunks).map_err(|_| DfsError::Distributed {
         message: format!("DFS blob is too large to transfer in {DFS_BLOB_CHUNK_BYTES}-byte chunks"),
     })

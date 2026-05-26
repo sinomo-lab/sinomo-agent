@@ -12,7 +12,7 @@ pub mod posix;
 pub mod protocol;
 mod transfer;
 
-pub use content_store::{ContentManifest, ContentStoreError, LocalContentStore};
+pub use content_store::{BlobReader, ContentManifest, ContentStoreError, LocalContentStore};
 pub use control_plane::{
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, SharedDfsControlPlaneKvClient, file_system_config_key,
@@ -91,8 +91,8 @@ use time::OffsetDateTime;
 use transfer::RepairRetryState;
 use transfer::{
     InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressReadTransfer,
-    PendingNetworkedRead, PendingNetworkedWrite, blob_chunk_count, blob_transfer_key,
-    validate_chunk_bytes,
+    PendingNetworkedRead, PendingNetworkedWrite, blob_chunk_count, blob_chunk_count_for_size,
+    blob_transfer_key, validate_chunk_bytes,
 };
 
 pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
@@ -4559,7 +4559,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsFetchBlobCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let result = match self
+        let manifest_result = self
             .ensure_blob_fetch_authorized(
                 &requester_node_id,
                 &command.intent_id,
@@ -4584,12 +4584,34 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         actual: manifest.content_hash,
                     });
                 }
-                let bytes = self.content.read_blob(&command.content_hash)?;
-                Ok(bytes)
-            }) {
-            Ok(bytes) => DfsFetchBlobResult::Found {
-                content_hash: command.content_hash.clone(),
-                bytes,
+                Ok(manifest)
+            });
+
+        let mut sent_chunked_response = false;
+        let result = match manifest_result {
+            Ok(manifest) if manifest.size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 => {
+                match self.content.open_blob_reader(&command.content_hash) {
+                    Ok(reader) => {
+                        self.send_fetch_blob_response_chunks_from_reader(
+                            &requester_node_id,
+                            &command,
+                            reader,
+                        )?;
+                        sent_chunked_response = true;
+                        DfsFetchBlobResult::Found {
+                            content_hash: command.content_hash.clone(),
+                            bytes: Vec::new(),
+                        }
+                    }
+                    Err(_) => DfsFetchBlobResult::NotFound,
+                }
+            }
+            Ok(_) => match self.content.read_blob(&command.content_hash) {
+                Ok(bytes) => DfsFetchBlobResult::Found {
+                    content_hash: command.content_hash.clone(),
+                    bytes,
+                },
+                Err(_) => DfsFetchBlobResult::NotFound,
             },
             Err(DfsError::ContentStore { .. }) => DfsFetchBlobResult::NotFound,
             Err(error) => DfsFetchBlobResult::Rejected {
@@ -4597,11 +4619,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             },
         };
         match &result {
-            DfsFetchBlobResult::Found { bytes, .. }
-                if bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES =>
-            {
-                self.send_fetch_blob_response_chunks(&requester_node_id, &command, bytes)?;
-            }
+            DfsFetchBlobResult::Found { .. } if sent_chunked_response => {}
             _ => {
                 self.send_dfs_message_if_routable(
                     &requester_node_id,
@@ -4643,6 +4661,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         })
     }
 
+    #[cfg(test)]
     fn send_fetch_blob_response_chunks(
         &mut self,
         requester_node_id: &NodeId,
@@ -4664,6 +4683,51 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     chunk_index: chunk_index as u32,
                     total_chunks,
                     bytes: chunk.to_vec(),
+                }),
+            )?;
+            if !sent {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_fetch_blob_response_chunks_from_reader(
+        &mut self,
+        requester_node_id: &NodeId,
+        command: &DfsFetchBlobCommand,
+        mut reader: BlobReader,
+    ) -> Result<(), DfsError> {
+        let total_size_bytes = reader.size_bytes();
+        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
+        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
+        for chunk_index in 0..total_chunks {
+            let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
+            let chunk_len = (total_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
+            let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
+                message: format!("DFS blob chunk is too large to fit in memory: {chunk_len} bytes"),
+            })?;
+            reader
+                .read_exact(&mut buffer[..chunk_len])
+                .map_err(|source| DfsError::ContentStore {
+                    message: format!(
+                        "failed to read verified blob {} chunk {}: {}",
+                        command.content_hash, chunk_index, source
+                    ),
+                })?;
+            let sent = self.send_dfs_message_if_routable(
+                requester_node_id,
+                DfsNetworkMessage::FetchBlobResponseChunk(DfsFetchBlobResponseChunk {
+                    request_id: command.request_id.clone(),
+                    intent_id: command.intent_id.clone(),
+                    object_id: command.object_id.clone(),
+                    version: command.version.clone(),
+                    source_node_id: self.node_id.clone(),
+                    content_hash: command.content_hash.clone(),
+                    total_size_bytes,
+                    chunk_index,
+                    total_chunks,
+                    bytes: buffer[..chunk_len].to_vec(),
                 }),
             )?;
             if !sent {
