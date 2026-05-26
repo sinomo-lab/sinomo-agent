@@ -1121,6 +1121,53 @@ fn rollout_target_selection_prefers_shadow_route_until_shadow_is_unreachable() {
 }
 
 #[test]
+fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_network_probe_shadow").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_probe_shadow_local").expect("local");
+    let main = NodeId::from_legacy_named("node_network_probe_shadow_main").expect("main");
+    let shadow = shadow_daemon_node_id(&main);
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network probe shadow",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+
+    let main_endpoint = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
+    let shadow_endpoint = daemon_lan_endpoint(&shadow, "10.0.0.41:21354".to_string(), 10);
+    let mut main_member =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), main, "main", "pk-main", now);
+    main_member.capabilities = main_daemon_capabilities(&main_member.role);
+    main_member.allowed_capabilities = main_member.capabilities.clone();
+    main_member.endpoints = vec![main_endpoint.clone()];
+
+    let mut shadow_member =
+        ClusterMemberRecord::local_voter(cluster_id, shadow, "shadow", "pk-shadow", now);
+    shadow_member.role = ClusterMemberRole::NonVoting;
+    shadow_member.state = ClusterMemberState::NonVoting;
+    shadow_member.capabilities = shadow_daemon_capabilities();
+    shadow_member.allowed_capabilities = shadow_member.capabilities.clone();
+    shadow_member.endpoints = vec![shadow_endpoint.clone()];
+    state.members.push(main_member);
+    state.members.push(shadow_member);
+
+    let targets = cluster_network_probe_targets(&state);
+    let endpoint_ids = targets
+        .into_iter()
+        .map(|endpoint| endpoint.endpoint_id)
+        .collect::<BTreeSet<_>>();
+
+    assert!(endpoint_ids.contains(&main_endpoint.endpoint_id));
+    assert!(
+        endpoint_ids.contains(&shadow_endpoint.endpoint_id),
+        "connectivity graph probing must cover shadow endpoints used by rollout"
+    );
+}
+
+#[test]
 fn public_ip_endpoint_is_marked_internet_direct() {
     let node_id = NodeId::from_legacy_named("node_public_endpoint").expect("node");
     let endpoints = daemon_advertised_endpoints_from_addresses(

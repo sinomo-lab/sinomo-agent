@@ -2002,10 +2002,29 @@ fn cluster_raft_route_order_key(
 }
 
 pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints = cluster_sync_targets(state)
-        .into_iter()
-        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-        .collect::<Vec<_>>();
+    let mut endpoint_ids = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for member in &state.members {
+        if cluster_member_is_local_process(state, member) || !member.state.is_authorized() {
+            continue;
+        }
+        endpoints.extend(
+            member
+                .endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+                        && matches!(
+                            endpoint.transport,
+                            ClusterTransportKind::LanTcp
+                                | ClusterTransportKind::Loopback
+                                | ClusterTransportKind::Iroh
+                        )
+                        && endpoint_ids.insert(endpoint.endpoint_id.clone())
+                })
+                .cloned(),
+        );
+    }
     endpoints.sort_by_key(|endpoint| {
         (
             endpoint.node_id.clone(),
