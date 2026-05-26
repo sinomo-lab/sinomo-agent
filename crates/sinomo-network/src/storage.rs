@@ -1650,6 +1650,129 @@ pub fn cluster_sync_targets_with_connectivity(
     endpoints
 }
 
+pub fn cluster_raft_command_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let connectivity = read_cluster_connectivity_graph_from_kv(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| {
+            (
+                (record.source_node_id.clone(), record.endpoint_id.clone()),
+                record,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut endpoints_by_node = BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
+    for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
+        endpoints_by_node
+            .entry(endpoint.node_id.clone())
+            .or_default()
+            .push(endpoint);
+    }
+    for endpoints in endpoints_by_node.values_mut() {
+        endpoints
+            .sort_by_key(|endpoint| cluster_raft_route_order_key(state, &connectivity, endpoint));
+        let mut seen = BTreeSet::new();
+        endpoints.retain(|endpoint| {
+            seen.insert((
+                format!("{:?}", endpoint.transport),
+                endpoint.address.clone(),
+            ))
+        });
+    }
+    let mut node_order = endpoints_by_node
+        .iter()
+        .filter_map(|(node_id, endpoints)| {
+            endpoints.first().map(|endpoint| {
+                (
+                    cluster_raft_route_order_key(state, &connectivity, endpoint),
+                    node_id.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    node_order.sort_by_key(|(rank, node_id)| (rank.clone(), node_id.clone()));
+    let ordered_node_ids = node_order
+        .into_iter()
+        .map(|(_, node_id)| node_id)
+        .collect::<Vec<_>>();
+    let max_endpoint_count = endpoints_by_node.values().map(Vec::len).max().unwrap_or(0);
+    let mut targets = Vec::new();
+    for endpoint_index in 0..max_endpoint_count {
+        for node_id in &ordered_node_ids {
+            if let Some(endpoints) = endpoints_by_node.get(node_id)
+                && let Some(endpoint) = endpoints.get(endpoint_index)
+            {
+                targets.push(endpoint.clone());
+            }
+        }
+    }
+    targets
+}
+
+fn cluster_raft_route_order_key(
+    state: &ClusterBootstrapState,
+    connectivity: &BTreeMap<(NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+    endpoint: &ClusterEndpointRecord,
+) -> (u8, u8, u8, u16, String) {
+    (
+        cluster_raft_route_connectivity_rank(state, connectivity, endpoint),
+        cluster_daemon_command_transport_rank(endpoint),
+        cluster_raft_direct_address_rank(endpoint),
+        endpoint.priority,
+        endpoint.address.clone(),
+    )
+}
+
+fn cluster_raft_route_connectivity_rank(
+    state: &ClusterBootstrapState,
+    connectivity: &BTreeMap<(NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+    endpoint: &ClusterEndpointRecord,
+) -> u8 {
+    let connectivity_state = connectivity
+        .get(&(state.local_node_id.clone(), endpoint.endpoint_id.clone()))
+        .map(|record| &record.state);
+    match connectivity_state {
+        Some(ClusterConnectivityState::Healthy) => 0,
+        Some(ClusterConnectivityState::Degraded) => 1,
+        None if matches!(
+            endpoint.transport,
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+        ) && cluster_raft_direct_address_rank(endpoint) <= 1 =>
+        {
+            2
+        }
+        None if endpoint.transport == ClusterTransportKind::Iroh => 3,
+        None => 4,
+        Some(ClusterConnectivityState::Unreachable)
+            if endpoint.transport == ClusterTransportKind::Iroh =>
+        {
+            5
+        }
+        Some(ClusterConnectivityState::Unreachable) => 6,
+    }
+}
+
+fn cluster_raft_direct_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    if !matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) {
+        return 0;
+    }
+    let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
+        return 2;
+    };
+    match address.ip() {
+        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
+        IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
+        ip if ip.is_loopback() || ip.is_unspecified() => 3,
+        _ => 1,
+    }
+}
+
 pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = cluster_sync_targets(state)
         .into_iter()

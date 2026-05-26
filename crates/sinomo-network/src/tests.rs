@@ -689,6 +689,156 @@ fn connectivity_sort_prefers_private_tcp_over_unknown_public_tcp() {
 }
 
 #[test]
+fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-raft-route-unknown-tcp-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_raft_unknown_tcp").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_raft_unknown_tcp_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_network_raft_unknown_tcp_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network raft routes",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let public_tcp = daemon_lan_endpoint(&remote, "203.0.113.41:21353".to_string(), 10);
+    let private_tcp = daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 20);
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&remote, "iroh_public_key_network_raft_unknown_tcp"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_network_raft_unknown_tcp?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![public_tcp.clone(), private_tcp.clone(), iroh.clone()];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let targets = cluster_raft_command_targets(&paths, &state);
+
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&private_tcp.endpoint_id)
+    );
+    let public_position = targets
+        .iter()
+        .position(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
+        .expect("public tcp");
+    let iroh_position = targets
+        .iter()
+        .position(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
+        .expect("iroh");
+    assert!(public_position < iroh_position);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-raft-route-connectivity-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_raft_connectivity").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_raft_connectivity_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_network_raft_connectivity_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network raft connectivity",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let tcp = daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10);
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&remote, "iroh_public_key_network_raft_connectivity"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_network_raft_connectivity?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![tcp.clone(), iroh.clone()];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &tcp,
+                ClusterConnectivityState::Unreachable,
+                None,
+                4,
+                None,
+                Some("timed out".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &iroh,
+                ClusterConnectivityState::Healthy,
+                Some(40),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+
+    let targets = cluster_raft_command_targets(&paths, &state);
+
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&iroh.endpoint_id)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn public_ip_endpoint_is_marked_internet_direct() {
     let node_id = NodeId::from_legacy_named("node_public_endpoint").expect("node");
     let endpoints = daemon_advertised_endpoints_from_addresses(
