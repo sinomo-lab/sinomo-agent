@@ -1472,7 +1472,10 @@ impl LocalJsonMetadataBackend {
         {
             return Ok(false);
         }
-        if !self.inode_path(&object_inode_id(&object.object_id)).is_file() {
+        if !self
+            .inode_path(&object_inode_id(&object.object_id))
+            .is_file()
+        {
             return Ok(false);
         }
         if read_json_optional::<DfsPathRecord>(

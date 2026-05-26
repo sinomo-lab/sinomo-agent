@@ -745,42 +745,38 @@ pub fn write_cluster_state(
 }
 
 pub fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, NetworkError> {
-    read_object_file(&paths.kv_snapshot)
+    cluster_kv_materialized_cache(paths)
+        .read_snapshot()
+        .map_err(Into::into)
 }
 
 pub fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), NetworkError> {
-    write_object_file(&paths.kv_snapshot, snapshot)
+    cluster_kv_materialized_cache(paths)
+        .write_snapshot(snapshot)
+        .map_err(Into::into)
 }
 
 pub fn write_cluster_kv_snapshot_if_changed(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    if read_cluster_kv_snapshot(paths).is_ok_and(|existing| existing == *snapshot) {
-        return Ok(false);
-    }
-    write_cluster_kv_snapshot(paths, snapshot)?;
-    Ok(true)
+    cluster_kv_materialized_cache(paths)
+        .write_snapshot_if_changed(snapshot)
+        .map_err(Into::into)
 }
 
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
+    let cache = cluster_kv_materialized_cache(paths);
+    if cache.exists() {
+        return cache.read_store().map_err(Into::into);
+    }
     if paths.kv_raft.exists() {
         let state = read_cluster_state_without_kv(paths)?;
         match open_cluster_raft_kv_node(paths, &state.local_node_id) {
             Ok(node) => return Ok(node.store().clone()),
-            Err(error) if paths.kv_snapshot.exists() => {
-                eprintln!(
-                    "warning: ignoring unreadable local cluster raft view and using materialized snapshot: {error}"
-                );
-                let snapshot = read_cluster_kv_snapshot(paths)?;
-                if !cluster_raft_error_is_busy(&error) {
-                    quarantine_unreadable_cluster_raft_view(paths, &state.local_node_id);
-                }
-                return Ok(InProcessKvStore::restore(snapshot));
-            }
             Err(error) => {
                 eprintln!(
                     "warning: ignoring unreadable local cluster raft view with no materialized snapshot: {error}"
@@ -789,50 +785,19 @@ pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, N
             }
         }
     }
-    if paths.kv_snapshot.exists() {
-        return read_cluster_kv_snapshot(paths).map(InProcessKvStore::restore);
-    }
     Ok(InProcessKvStore::new())
 }
 
 pub fn read_cluster_kv_snapshot_store(
     paths: &ClusterPaths,
 ) -> Result<InProcessKvStore, NetworkError> {
-    read_cluster_kv_snapshot(paths).map(InProcessKvStore::restore)
+    cluster_kv_materialized_cache(paths)
+        .read_store()
+        .map_err(Into::into)
 }
 
-fn quarantine_unreadable_cluster_raft_view(paths: &ClusterPaths, node_id: &NodeId) {
-    let wal_paths = cluster_raft_wal_paths(paths, node_id);
-    if !wal_paths.root.exists() {
-        return;
-    }
-    for suffix in 0..10 {
-        let candidate = wal_paths.root.with_file_name(format!(
-            "{}.corrupt-{}-{suffix}",
-            wal_paths
-                .root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("raft"),
-            std::process::id()
-        ));
-        if candidate.exists() {
-            continue;
-        }
-        if let Err(error) = fs::rename(&wal_paths.root, &candidate) {
-            eprintln!(
-                "warning: could not quarantine unreadable local cluster raft view {} -> {}: {}",
-                wal_paths.root.display(),
-                candidate.display(),
-                error
-            );
-        }
-        return;
-    }
-}
-
-fn cluster_raft_error_is_busy(error: &NetworkError) -> bool {
-    matches!(error, NetworkError::Kv(KvError::Busy { .. }))
+fn cluster_kv_materialized_cache(paths: &ClusterPaths) -> KvMaterializedCache {
+    KvMaterializedCache::new(paths.kv_snapshot.clone())
 }
 
 pub fn cluster_raft_wal_paths(paths: &ClusterPaths, node_id: &NodeId) -> KvWalPaths {
@@ -844,15 +809,9 @@ pub fn open_cluster_raft_kv_node(
     node_id: &NodeId,
 ) -> Result<DurableRaftKvNode, NetworkError> {
     let wal_paths = cluster_raft_wal_paths(paths, node_id);
-    let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths)?;
-    if node.hard_state().commit_index == 0 && paths.kv_snapshot.exists() {
-        let snapshot = read_cluster_kv_snapshot(paths)?;
-        node.restore_snapshot(RaftSnapshot {
-            last_included_index: 0,
-            last_included_term: 0,
-            kv: snapshot,
-        })?;
-    }
+    let cache = cluster_kv_materialized_cache(paths);
+    let mut node =
+        DurableRaftKvNode::open_with_materialized_cache(node_id.clone(), wal_paths, &cache)?;
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
     Ok(node)
 }
@@ -884,15 +843,10 @@ pub async fn open_cluster_raft_kv_node_async(
     node_id: &NodeId,
 ) -> Result<DurableRaftKvNode, NetworkError> {
     let wal_paths = cluster_raft_wal_paths(paths, node_id);
-    let mut node = DurableRaftKvNode::open_async(node_id.clone(), wal_paths).await?;
-    if node.hard_state().commit_index == 0 && paths.kv_snapshot.exists() {
-        let snapshot = read_cluster_kv_snapshot(paths)?;
-        node.restore_snapshot(RaftSnapshot {
-            last_included_index: 0,
-            last_included_term: 0,
-            kv: snapshot,
-        })?;
-    }
+    let cache = cluster_kv_materialized_cache(paths);
+    let mut node =
+        DurableRaftKvNode::open_async_with_materialized_cache(node_id.clone(), wal_paths, cache)
+            .await?;
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
     Ok(node)
 }

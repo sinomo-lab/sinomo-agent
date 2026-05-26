@@ -397,6 +397,48 @@ impl KvWalPaths {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvMaterializedCache {
+    path: PathBuf,
+}
+
+impl KvMaterializedCache {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
+    pub fn read_snapshot(&self) -> Result<KvSnapshot, KvError> {
+        read_object_file(&self.path)
+    }
+
+    pub fn read_store(&self) -> Result<InProcessKvStore, KvError> {
+        self.read_snapshot().map(InProcessKvStore::restore)
+    }
+
+    pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
+        write_object_file(&self.path, snapshot)
+    }
+
+    pub fn write_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
+        if self
+            .read_snapshot()
+            .is_ok_and(|existing| existing == *snapshot)
+        {
+            return Ok(false);
+        }
+        self.write_snapshot(snapshot)?;
+        Ok(true)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum KvCommand {
     Op(KvOp),
@@ -1514,6 +1556,45 @@ impl DurableRaftKvNode {
             })?
     }
 
+    pub fn open_with_materialized_cache(
+        node_id: NodeId,
+        paths: KvWalPaths,
+        cache: &KvMaterializedCache,
+    ) -> Result<Self, KvError> {
+        let mut node = match Self::open(node_id.clone(), paths.clone()) {
+            Ok(node) => node,
+            Err(error) if cache.exists() && !kv_error_is_busy(&error) => {
+                quarantine_unreadable_raft_view(&paths);
+                Self::open(node_id, paths)?
+            }
+            Err(error) => return Err(error),
+        };
+        if node.hard_state().commit_index == 0 && cache.exists() {
+            node.restore_snapshot(RaftSnapshot {
+                last_included_index: 0,
+                last_included_term: 0,
+                kv: cache.read_snapshot()?,
+            })?;
+        }
+        Ok(node)
+    }
+
+    pub async fn open_async_with_materialized_cache(
+        node_id: NodeId,
+        paths: KvWalPaths,
+        cache: KvMaterializedCache,
+    ) -> Result<Self, KvError> {
+        let error_path = paths.root.display().to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::open_with_materialized_cache(node_id, paths, &cache)
+        })
+        .await
+        .map_err(|source| KvError::Io {
+            path: error_path,
+            detail: source.to_string(),
+        })?
+    }
+
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }
@@ -1783,15 +1864,17 @@ fn read_optional_object<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Opt
     if !path.exists() {
         return Ok(None);
     }
+    read_object_file(path).map(Some)
+}
+
+fn read_object_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, KvError> {
     let bytes = fs::read(path).map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
-    sinomo_object_serde::from_bytes(&bytes)
-        .map(Some)
-        .map_err(|source| KvError::Serialization {
-            detail: format!("{}: {source}", path.display()),
-        })
+    sinomo_object_serde::from_bytes(&bytes).map_err(|source| KvError::Serialization {
+        detail: format!("{}: {source}", path.display()),
+    })
 }
 
 fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> {
@@ -1847,6 +1930,39 @@ fn open_node_lock(paths: &KvWalPaths) -> Result<File, KvError> {
             path: paths.lock.display().to_string(),
             detail: source.to_string(),
         })
+}
+
+fn kv_error_is_busy(error: &KvError) -> bool {
+    matches!(error, KvError::Busy { .. })
+}
+
+fn quarantine_unreadable_raft_view(paths: &KvWalPaths) {
+    if !paths.root.exists() {
+        return;
+    }
+    for suffix in 0..10 {
+        let candidate = paths.root.with_file_name(format!(
+            "{}.corrupt-{}-{suffix}",
+            paths
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("raft"),
+            std::process::id()
+        ));
+        if candidate.exists() {
+            continue;
+        }
+        if let Err(error) = fs::rename(&paths.root, &candidate) {
+            eprintln!(
+                "warning: could not quarantine unreadable local kv raft view {} -> {}: {}",
+                paths.root.display(),
+                candidate.display(),
+                error
+            );
+        }
+        return;
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<(), KvError> {
@@ -2099,6 +2215,38 @@ mod tests {
             restored.get("/dfs/workspaces/w1").expect("entry").value,
             b"meta"
         );
+    }
+
+    #[test]
+    fn materialized_cache_round_trips_snapshot_as_store() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-materialized-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
+        let mut store = InProcessKvStore::new();
+        store
+            .put("alpha", b"one".to_vec(), None)
+            .expect("seed cache");
+
+        assert!(!cache.exists());
+        assert!(
+            cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("write cache")
+        );
+        assert!(cache.exists());
+        assert!(
+            !cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("skip unchanged cache")
+        );
+        let restored = cache.read_store().expect("read cache");
+        assert_eq!(restored.get("alpha").expect("alpha").value, b"one");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

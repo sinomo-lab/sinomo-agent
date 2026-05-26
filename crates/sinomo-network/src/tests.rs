@@ -878,6 +878,43 @@ fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
 }
 
 #[test]
+fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-store-snapshot-first-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_snapshot_first").expect("node");
+
+    append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/raft-only".to_string(),
+            value: b"raft".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed raft");
+
+    let mut snapshot_store = InProcessKvStore::new();
+    snapshot_store
+        .put("/snapshot-only", b"snapshot".to_vec(), None)
+        .expect("seed snapshot store");
+    write_cluster_kv_snapshot(&paths, &snapshot_store.snapshot()).expect("write snapshot");
+
+    let store = read_cluster_kv_store(&paths).expect("read cluster kv store");
+    assert!(store.get("/snapshot-only").is_some());
+    assert!(store.get("/raft-only").is_none());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-raft-append-compacted-{}",
