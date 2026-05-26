@@ -1,4 +1,7 @@
-use crate::{DfsFileSystemId, DfsObjectId, DfsObjectMetadata, DfsVersion};
+use crate::{
+    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardId, DfsObjectId, DfsObjectMetadata,
+    DfsVersion,
+};
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
 use sinomo_node::NodeId;
@@ -234,6 +237,28 @@ pub enum DfsFetchBlobResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataJournalBatchCommand {
+    pub request_id: String,
+    pub batch: DfsMetadataJournalBatch,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataJournalBatchResponse {
+    pub request_id: String,
+    pub shard_id: DfsMetadataShardId,
+    pub next_after_sequence: u64,
+    pub applied_entries: usize,
+    pub result: DfsMetadataJournalBatchResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsMetadataJournalBatchResult {
+    Applied,
+    Rejected { reason: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsBlobTransferResult {
     Durable { content_hash: String },
@@ -260,4 +285,6 @@ pub enum DfsNetworkMessage {
     FetchBlob(DfsFetchBlobCommand),
     FetchBlobResponse(DfsFetchBlobResponse),
     FetchBlobResponseChunk(DfsFetchBlobResponseChunk),
+    MetadataJournalBatch(DfsMetadataJournalBatchCommand),
+    MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse),
 }

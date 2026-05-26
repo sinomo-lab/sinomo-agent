@@ -2380,6 +2380,132 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
 }
 
 #[test]
+fn networked_dfs_applies_metadata_journal_batches_from_peer() {
+    let owner = NodeId::from_legacy_named("node_metadata_journal_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_metadata_journal_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_metadata_journal").expect("object");
+    let version = DfsVersion::from_legacy_named("version_1").expect("version");
+    let root = temp_root("networked_metadata_journal_batches");
+    let network = InProcessNetwork::new();
+    let owner_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let replica_backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("replica"),
+        root.join("replica-meta"),
+    )
+    .expect("replica metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_metadata_backend(replica_backend)
+    .expect("replica metadata backend");
+
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "/services/metadata-journal.txt".to_string(),
+        kind: DfsObjectKind::File,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: Some("blake3:metadata-journal".to_string()),
+        content_size_bytes: Some(16),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    owner_dfs
+        .add_object_metadata(metadata.clone())
+        .expect("owner metadata");
+    assert!(
+        replica_dfs
+            .metadata_backend()
+            .expect("replica metadata backend")
+            .get_object(&object_id)
+            .expect("replica object before replay")
+            .is_none()
+    );
+
+    let batch = owner_dfs
+        .send_metadata_journal_since(&replica, 0)
+        .expect("send journal")
+        .expect("nonempty batch");
+    assert_eq!(batch.entries.len(), 3);
+    let events = replica_dfs.process_incoming().expect("replica incoming");
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                source_node_id,
+                applied_entries: 3,
+                ..
+            } if source_node_id == &owner
+        )
+    }));
+    assert_eq!(
+        replica_dfs
+            .metadata_backend()
+            .expect("replica metadata backend")
+            .get_file_system(&file_system_id)
+            .expect("replica filesystem"),
+        Some(file_system)
+    );
+    assert_eq!(
+        replica_dfs
+            .metadata_backend()
+            .expect("replica metadata backend")
+            .get_object(&object_id)
+            .expect("replica object"),
+        Some(metadata.clone())
+    );
+    assert_eq!(replica_dfs.metadata().object(&object_id), Some(&metadata));
+
+    owner_dfs
+        .send_metadata_journal_since(&replica, 0)
+        .expect("resend journal")
+        .expect("nonempty repeated batch");
+    let repeat_events = replica_dfs.process_incoming().expect("repeat incoming");
+    assert!(repeat_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                source_node_id,
+                applied_entries: 0,
+                ..
+            } if source_node_id == &owner
+        )
+    }));
+
+    cleanup(&root);
+}
+
+#[test]
 fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");

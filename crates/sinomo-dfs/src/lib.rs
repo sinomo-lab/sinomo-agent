@@ -54,9 +54,10 @@ pub use operator::{
 pub use posix::{DfsDirEntry, DfsPosixError, DfsStat, DfsWriteOptions};
 pub use protocol::{
     DfsBlobTransferResult, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsFetchBlobCommand,
-    DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult, DfsNetworkMessage,
-    DfsReadData, DfsReadRequest, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
-    DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsNetworkMessage, DfsReadData, DfsReadRequest, DfsReadResponse, DfsReadResponseChunk,
+    DfsReadResult, DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
     DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse, DfsWriteCommand,
     DfsWriteResponse, DfsWriteResult,
 };
@@ -845,6 +846,8 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
                 | DfsNetworkMessage::FetchBlob(_)
                 | DfsNetworkMessage::FetchBlobResponse(_)
                 | DfsNetworkMessage::FetchBlobResponseChunk(_)
+                | DfsNetworkMessage::MetadataJournalBatch(_)
+                | DfsNetworkMessage::MetadataJournalBatchResponse(_)
                 | DfsNetworkMessage::ReadResponseChunk(_) => {}
             }
         }
@@ -1194,6 +1197,19 @@ pub enum NetworkedDfsServiceEvent {
     WriteConflictCreated {
         conflict: DfsConflictRecord,
     },
+    MetadataJournalBatchApplied {
+        request_id: String,
+        source_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        applied_entries: usize,
+        next_after_sequence: u64,
+    },
+    MetadataJournalBatchRejected {
+        request_id: String,
+        source_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        reason: String,
+    },
     OwnerHandoffCompleted {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
@@ -1283,6 +1299,34 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     pub fn metadata_backend(&self) -> Option<&dyn DfsMetadataBackend> {
         self.metadata_backend.as_deref()
+    }
+
+    pub fn send_metadata_journal_since(
+        &mut self,
+        target_node_id: &NodeId,
+        after_sequence: u64,
+    ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        let entries = backend.journal_since(after_sequence)?;
+        let Some(last_entry) = entries.last() else {
+            return Ok(None);
+        };
+        let batch = DfsMetadataJournalBatch {
+            shard_id: last_entry.shard_id.clone(),
+            next_after_sequence: last_entry.sequence,
+            entries,
+        };
+        let request_id = self.next_request_id();
+        let sent = self.send_dfs_message_if_routable(
+            target_node_id,
+            DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
+                request_id,
+                batch: batch.clone(),
+            }),
+        )?;
+        Ok(sent.then_some(batch))
     }
 
     pub fn hydrate_from_metadata_backend(&mut self) -> Result<(), DfsError> {
@@ -2304,7 +2348,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         events.push(event);
                     }
                 }
+                DfsNetworkMessage::MetadataJournalBatch(command) => {
+                    events.push(self.handle_metadata_journal_batch(source_node_id, command)?);
+                }
                 DfsNetworkMessage::CommitVersionResponse(_)
+                | DfsNetworkMessage::MetadataJournalBatchResponse(_)
                 | DfsNetworkMessage::WriteRequest(_)
                 | DfsNetworkMessage::WriteResponse(_) => {}
             }
@@ -2333,6 +2381,84 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         for request_id in expired_request_ids {
             self.pending_reads.remove(&request_id);
             self.incoming_read_transfers.remove(&request_id);
+        }
+    }
+
+    fn handle_metadata_journal_batch(
+        &mut self,
+        source_node_id: NodeId,
+        command: DfsMetadataJournalBatchCommand,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let shard_id = command.batch.shard_id.clone();
+        let next_after_sequence = command.batch.next_after_sequence;
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            let reason = "local DFS metadata backend is not configured".to_string();
+            let _ = self.send_dfs_message_if_routable(
+                &source_node_id,
+                DfsNetworkMessage::MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id.clone(),
+                    shard_id: shard_id.clone(),
+                    next_after_sequence,
+                    applied_entries: 0,
+                    result: DfsMetadataJournalBatchResult::Rejected {
+                        reason: reason.clone(),
+                    },
+                }),
+            )?;
+            return Ok(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                request_id: command.request_id,
+                source_node_id,
+                shard_id,
+                reason,
+            });
+        };
+
+        match backend.apply_journal_batch(&command.batch) {
+            Ok(applied_entries) => {
+                self.hydrate_from_metadata_backend()?;
+                let _ = self.send_dfs_message_if_routable(
+                    &source_node_id,
+                    DfsNetworkMessage::MetadataJournalBatchResponse(
+                        DfsMetadataJournalBatchResponse {
+                            request_id: command.request_id.clone(),
+                            shard_id: shard_id.clone(),
+                            next_after_sequence,
+                            applied_entries,
+                            result: DfsMetadataJournalBatchResult::Applied,
+                        },
+                    ),
+                )?;
+                Ok(NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                    request_id: command.request_id,
+                    source_node_id,
+                    shard_id,
+                    applied_entries,
+                    next_after_sequence,
+                })
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                let _ = self.send_dfs_message_if_routable(
+                    &source_node_id,
+                    DfsNetworkMessage::MetadataJournalBatchResponse(
+                        DfsMetadataJournalBatchResponse {
+                            request_id: command.request_id.clone(),
+                            shard_id: shard_id.clone(),
+                            next_after_sequence,
+                            applied_entries: 0,
+                            result: DfsMetadataJournalBatchResult::Rejected {
+                                reason: reason.clone(),
+                            },
+                        },
+                    ),
+                )?;
+                Ok(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                    request_id: command.request_id,
+                    source_node_id,
+                    shard_id,
+                    reason,
+                })
+            }
         }
     }
 

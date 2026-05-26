@@ -335,6 +335,12 @@ struct DfsMetadataJournalHead {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsMetadataReplayCursor {
+    shard_id: DfsMetadataShardId,
+    last_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceTransaction {
     pub transaction_id: String,
     pub file_system_id: DfsFileSystemId,
@@ -466,6 +472,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         status: DfsConflictStatus,
     ) -> Result<Option<DfsConflictRecord>>;
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>>;
+    fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription;
     fn poll_subscription(
         &self,
@@ -501,6 +508,175 @@ impl LocalJsonMetadataBackend {
 
     pub fn shard_id(&self) -> &DfsMetadataShardId {
         &self.shard_id
+    }
+
+    pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
+        let mut applied = 0usize;
+        for entry in &batch.entries {
+            let replay_cursor_path = self.replay_cursor_path(&entry.shard_id);
+            let mut cursor = read_json_optional::<DfsMetadataReplayCursor>(&replay_cursor_path)?
+                .unwrap_or(DfsMetadataReplayCursor {
+                    shard_id: entry.shard_id.clone(),
+                    last_sequence: 0,
+                });
+            if entry.sequence <= cursor.last_sequence {
+                continue;
+            }
+            if self.apply_journal_entry(entry)?.is_some() {
+                applied = applied.saturating_add(1);
+            }
+            cursor.last_sequence = entry.sequence;
+            write_json_atomic(&replay_cursor_path, &cursor)?;
+        }
+        Ok(applied)
+    }
+
+    pub fn apply_journal_entry(
+        &mut self,
+        entry: &DfsMetadataJournalEntry,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        match &entry.mutation {
+            DfsMetadataMutation::PutFileSystem {
+                file_system_id,
+                file_system,
+            } => {
+                let file_system =
+                    required_replay_payload(entry, "put-file-system", file_system.as_ref())?;
+                if self.get_file_system(file_system_id)?.as_ref() == Some(file_system) {
+                    return Ok(None);
+                }
+                self.put_file_system(file_system).map(Some)
+            }
+            DfsMetadataMutation::PutObject {
+                object_id, object, ..
+            } => {
+                let object = required_replay_payload(entry, "put-object", object.as_ref())?;
+                if self.get_object(object_id)? == Some(normalized_object_metadata(object)) {
+                    return Ok(None);
+                }
+                self.put_object(object).map(Some)
+            }
+            DfsMetadataMutation::PutVersion {
+                object_id,
+                version,
+                version_record,
+                ..
+            } => {
+                let version_record =
+                    required_replay_payload(entry, "put-version", version_record.as_ref())?;
+                if self.get_version(object_id, version)?
+                    == Some(normalized_version_record(version_record))
+                {
+                    return Ok(None);
+                }
+                self.put_version(version_record).map(Some)
+            }
+            DfsMetadataMutation::PutReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                receipt,
+                ..
+            } => {
+                let receipt = required_replay_payload(entry, "put-receipt", receipt.as_ref())?;
+                for existing in self.receipts_for_version(object_id, version)? {
+                    if &existing.replica_node_id != replica_node_id {
+                        continue;
+                    }
+                    if &existing == receipt {
+                        return Ok(None);
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} conflicts with an existing receipt for replica {}",
+                        entry.shard_id.0, entry.sequence, replica_node_id
+                    )));
+                }
+                self.put_receipt(receipt).map(Some)
+            }
+            DfsMetadataMutation::PutIntent {
+                object_id,
+                intent_id,
+                intent,
+                ..
+            } => {
+                let intent = required_replay_payload(entry, "put-intent", intent.as_ref())?;
+                if self.get_intent(object_id, intent_id)?.as_ref() == Some(intent) {
+                    return Ok(None);
+                }
+                self.put_intent(intent).map(Some)
+            }
+            DfsMetadataMutation::CommitVisibleVersion {
+                object_id,
+                previous_version,
+                committed_version,
+                committed_object,
+                visible_version,
+                required_replica_node_ids,
+                ..
+            } => {
+                let committed_object = required_replay_payload(
+                    entry,
+                    "commit-visible-version committed object",
+                    committed_object.as_ref(),
+                )?;
+                let visible_version = required_replay_payload(
+                    entry,
+                    "commit-visible-version visible version",
+                    visible_version.as_ref(),
+                )?;
+                if self
+                    .get_object(object_id)?
+                    .as_ref()
+                    .is_some_and(|object| &object.version == committed_version)
+                    && self.get_version(object_id, committed_version)?.as_ref()
+                        == Some(&normalized_version_record(visible_version))
+                {
+                    return Ok(None);
+                }
+                self.commit_visible_version(
+                    previous_version,
+                    committed_object,
+                    visible_version,
+                    required_replica_node_ids,
+                )
+                .map(Some)
+            }
+            DfsMetadataMutation::PutConflict {
+                object_id,
+                conflict_id,
+                conflict,
+                ..
+            } => {
+                let conflict = required_replay_payload(entry, "put-conflict", conflict.as_ref())?;
+                if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
+                    return Ok(None);
+                }
+                self.put_conflict(conflict).map(Some)
+            }
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction_id,
+                transaction,
+                ..
+            } => {
+                let transaction = required_replay_payload(
+                    entry,
+                    "apply-namespace-transaction",
+                    transaction.as_ref(),
+                )?;
+                let normalized = normalized_namespace_transaction(transaction);
+                if read_json_optional::<DfsNamespaceTransaction>(
+                    &self.namespace_transaction_path(transaction_id),
+                )? == Some(normalized.clone())
+                    && normalized.objects.iter().all(|object| {
+                        self.get_object(&object.object_id)
+                            .is_ok_and(|stored| stored == Some(normalized_object_metadata(object)))
+                    })
+                {
+                    return Ok(None);
+                }
+                self.apply_namespace_transaction(transaction).map(Some)
+            }
+        }
     }
 
     fn write_journal(&mut self, mutation: DfsMetadataMutation) -> Result<DfsMetadataJournalEntry> {
@@ -695,6 +871,12 @@ impl LocalJsonMetadataBackend {
 
     fn namespace_transaction_root(&self) -> PathBuf {
         self.records_root().join("namespace-transactions")
+    }
+
+    fn replay_cursor_path(&self, shard_id: &DfsMetadataShardId) -> PathBuf {
+        self.records_root()
+            .join("replay-cursors")
+            .join(format!("{}.sobj", key_segment(&shard_id.0)))
     }
 
     fn journal_head_path(&self) -> PathBuf {
@@ -1087,6 +1269,10 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
 
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
         journal_entries_since(&self.root, after_sequence)
+    }
+
+    fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
+        LocalJsonMetadataBackend::apply_journal_batch(self, batch)
     }
 
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {
@@ -1591,6 +1777,19 @@ fn normalized_namespace_transaction(
         normalize_node_locations(&mut object.current_locations);
     }
     transaction
+}
+
+fn required_replay_payload<'a, T>(
+    entry: &DfsMetadataJournalEntry,
+    mutation: &str,
+    payload: Option<&'a T>,
+) -> Result<&'a T> {
+    payload.ok_or_else(|| {
+        MetadataBackendError::Serde(format!(
+            "metadata journal entry {}:{} cannot replay {mutation} without its record payload",
+            entry.shard_id.0, entry.sequence
+        ))
+    })
 }
 
 fn normalized_node_location_list(nodes: &[NodeId]) -> Vec<NodeId> {
@@ -3111,6 +3310,139 @@ mod tests {
                 .expect("receipts")
                 .len(),
             1
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_replays_journal_batch_into_follower_backend() {
+        let leader_root = temp_root("local_backend_replays_journal_batch_into_follower_leader");
+        let follower_root = temp_root("local_backend_replays_journal_batch_into_follower_follower");
+        let mut leader =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-leader"), &leader_root)
+                .expect("leader backend");
+        let mut follower = LocalJsonMetadataBackend::new(
+            DfsMetadataShardId::new("shard-follower"),
+            &follower_root,
+        )
+        .expect("follower backend");
+
+        let file_system = file_system();
+        let initial = object(version("version_1"));
+        leader.put_file_system(&file_system).expect("filesystem");
+        leader.put_object(&initial).expect("object");
+
+        let mut committed = initial.clone();
+        committed.version = version("version_2");
+        committed.content_hash = Some("blake3:new".to_string());
+        committed.current_locations.push(node("node_replica"));
+        let visible_version = DfsObjectVersionRecord {
+            file_system_id: committed.file_system_id.clone(),
+            object_id: committed.object_id.clone(),
+            version: committed.version.clone(),
+            content_hash: committed.content_hash.clone(),
+            size_bytes: Some(3),
+            locations: committed.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: committed.file_system_id.clone(),
+                object_id: committed.object_id.clone(),
+                committed_version: committed.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_replay_commit").expect("event"),
+            },
+            replica_node_id: node("node_replica"),
+            content_hash: committed.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        leader.put_receipt(&receipt).expect("receipt");
+        leader
+            .commit_visible_version(
+                &initial.version,
+                &committed,
+                &visible_version,
+                std::slice::from_ref(&receipt.replica_node_id),
+            )
+            .expect("commit");
+
+        let mut subscription = leader.subscribe(0);
+        let batch = leader
+            .poll_subscription(&mut subscription)
+            .expect("journal batch");
+        assert_eq!(batch.entries.len(), 4);
+
+        assert_eq!(
+            follower
+                .apply_journal_batch(&batch)
+                .expect("apply journal batch"),
+            4
+        );
+        assert_eq!(
+            follower
+                .get_file_system(&file_system.file_system_id)
+                .expect("filesystem"),
+            Some(file_system)
+        );
+        assert_eq!(
+            follower
+                .get_object(&committed.object_id)
+                .expect("object")
+                .expect("object")
+                .version,
+            committed.version
+        );
+        assert_eq!(
+            follower
+                .get_version(&committed.object_id, &committed.version)
+                .expect("version"),
+            Some(normalized_version_record(&visible_version))
+        );
+        assert_eq!(
+            follower
+                .receipts_for_version(&committed.object_id, &committed.version)
+                .expect("receipt"),
+            vec![receipt]
+        );
+
+        assert_eq!(
+            follower
+                .apply_journal_batch(&batch)
+                .expect("reapply journal batch"),
+            0
+        );
+
+        cleanup(&leader_root);
+        cleanup(&follower_root);
+    }
+
+    #[test]
+    fn local_backend_rejects_replay_entries_without_record_payloads() {
+        let root = temp_root("local_backend_rejects_replay_entries_without_record_payloads");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let entry = DfsMetadataJournalEntry {
+            shard_id: DfsMetadataShardId::new("shard-leader"),
+            sequence: 7,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            mutation: DfsMetadataMutation::PutFileSystem {
+                file_system_id: file_system_id(),
+                file_system: None,
+            },
+        };
+
+        let error = backend
+            .apply_journal_entry(&entry)
+            .expect_err("missing payload should fail replay");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot replay put-file-system without its record payload")
         );
 
         cleanup(&root);
