@@ -173,15 +173,24 @@ fn inspect_daemon_dfs_status(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
 ) -> Result<sinomo_dfs::DfsOperatorStatus, DaemonError> {
+    let metadata = open_daemon_dfs_metadata_backend(data_dir, cluster_paths)?;
+    DfsOperatorInspector::new(metadata.as_ref())
+        .status()
+        .map_err(DaemonError::from)
+}
+
+pub(crate) fn open_daemon_dfs_metadata_backend(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<Box<dyn DfsMetadataBackend>, DaemonError> {
     if cluster_paths.state.exists()
         && let Some(metadata) = open_daemon_sharded_dfs_metadata_backend(data_dir, cluster_paths)?
     {
-        return DfsOperatorInspector::new(&metadata)
-            .status()
-            .map_err(DaemonError::from);
+        return Ok(Box::new(metadata));
     }
-    sinomo_dfs::inspect_dfs_status(data_dir.dfs_dir().join("metadata").join("root"))
-        .map_err(DaemonError::from)
+    sinomo_dfs::open_root_local_metadata_backend(sinomo_dfs::default_dfs_metadata_root(data_dir))
+        .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
+        .map_err(Into::into)
 }
 
 pub(crate) fn open_daemon_sharded_dfs_metadata_backend(
@@ -260,14 +269,12 @@ pub fn handle_daemon_dfs_protocol_frame(
             ),
         });
     }
-    let metadata_backend = LocalJsonMetadataBackend::new(
-        DfsMetadataShardId::new("root"),
-        data_dir.dfs_dir().join("metadata").join("root"),
-    )?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let metadata_backend = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let content_store = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let transport = DaemonDfsProtocolTransport::new(local_node_id, command.frame);
     let mut service = NetworkedDfsService::new(transport, content_store)
-        .with_metadata_backend(metadata_backend)?;
+        .with_boxed_metadata_backend(metadata_backend)?;
     service.process_incoming()?;
     let outbound_frames = service.into_transport().outbound_frames;
     Ok(DfsProtocolFrameResponse {
@@ -294,10 +301,7 @@ pub fn ensure_default_distributed_dfs(
         sinomo_network::read_cluster_state_without_kv(&cluster_paths)?
     };
     let file_system = default_cluster_sifs(&state);
-    let mut backend = LocalJsonMetadataBackend::new(
-        DfsMetadataShardId::new("root"),
-        data_dir.dfs_dir().join("metadata").join("root"),
-    )?;
+    let mut backend = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     if backend.get_file_system(&file_system.file_system_id)? != Some(file_system.clone()) {
         backend.put_file_system(&file_system)?;
     }
@@ -351,16 +355,13 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
     }
     let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let metadata = LocalJsonMetadataBackend::new(
-        DfsMetadataShardId::new("root"),
-        data_dir.dfs_dir().join("metadata").join("root"),
-    )?;
+    let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
     let mut service = NetworkedDfsService::new(
         DaemonDfsEndpointTransport::new(state.local_node_id, endpoints),
         content,
     )
-    .with_metadata_backend(metadata)?;
+    .with_boxed_metadata_backend(metadata)?;
     let scheduled_repairs = service.retry_pending_repairs()?;
     if !scheduled_repairs.is_empty() {
         service.process_incoming()?;
@@ -969,15 +970,12 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
     }
 
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let metadata = LocalJsonMetadataBackend::new(
-        DfsMetadataShardId::new("root"),
-        data_dir.dfs_dir().join("metadata").join("root"),
-    )?;
+    let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let mut service = NetworkedDfsService::new(
         DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
         content,
     )
-    .with_metadata_backend(metadata)?;
+    .with_boxed_metadata_backend(metadata)?;
     service.bootstrap_distributed_sifs()?;
     service.posix_mkdir_all("/services/dfs-smoke")?;
 

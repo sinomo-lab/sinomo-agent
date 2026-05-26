@@ -1349,6 +1349,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(self)
     }
 
+    pub fn with_boxed_metadata_backend(
+        mut self,
+        backend: Box<dyn DfsMetadataBackend>,
+    ) -> Result<Self, DfsError> {
+        self.metadata_backend = Some(backend);
+        self.hydrate_from_metadata_backend()?;
+        Ok(self)
+    }
+
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }

@@ -2813,22 +2813,12 @@ pub fn open_daemon_sandbox_dfs_service(
         DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
         content,
     );
-    let mut dfs = if let Some(metadata) =
-        crate::dfs::open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)?
-    {
-        dfs.with_metadata_backend(metadata)
-            .map_err(|source| DaemonError::Parse {
-                detail: source.to_string(),
-            })?
-    } else {
-        let metadata = sinomo_dfs::open_root_local_metadata_backend(
-            data_dir.dfs_dir().join("metadata").join("root"),
-        )?;
-        dfs.with_metadata_backend(metadata)
-            .map_err(|source| DaemonError::Parse {
-                detail: source.to_string(),
-            })?
-    };
+    let metadata = crate::dfs::open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
+    let mut dfs = dfs
+        .with_boxed_metadata_backend(metadata)
+        .map_err(|source| DaemonError::Parse {
+            detail: source.to_string(),
+        })?;
     dfs.bootstrap_distributed_sifs()
         .map_err(|source| DaemonError::Parse {
             detail: source.to_string(),
