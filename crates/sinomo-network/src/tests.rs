@@ -1064,6 +1064,82 @@ fn raft_command_targets_keep_degraded_direct_before_iroh() {
 }
 
 #[test]
+fn raft_command_targets_prefer_fresh_online_voter_before_stale_voter() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-raft-route-stale-voter-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_raft_stale_voter").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_raft_stale_voter_local").expect("local");
+    let fresh = NodeId::from_legacy_named("node_network_raft_stale_voter_fresh").expect("fresh");
+    let stale = NodeId::from_legacy_named("node_network_raft_stale_voter_stale").expect("stale");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network raft stale voter",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let fresh_endpoint = daemon_lan_endpoint(&fresh, "129.146.106.76:21353".to_string(), 10);
+    let stale_endpoint = daemon_lan_endpoint(&stale, "10.14.5.15:21353".to_string(), 10);
+    for (node_id, endpoint) in [
+        (fresh.clone(), fresh_endpoint.clone()),
+        (stale.clone(), stale_endpoint.clone()),
+    ] {
+        let mut member =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_id, "remote", "pk", now);
+        member.capabilities = main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![endpoint];
+        state.members.push(member);
+    }
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    for (node_id, observed_at) in [
+        (fresh.clone(), now),
+        (stale.clone(), now - time::Duration::seconds(300)),
+    ] {
+        sync_cluster_node_status_to_kv(
+            &paths,
+            ClusterNodeStatusRecord {
+                cluster_id: state.cluster_id.clone(),
+                node_id,
+                process: "daemon-main".to_string(),
+                availability: ClusterNodeAvailability::Online,
+                daemon_version: "0.1.0-test".to_string(),
+                target_os: Some("test-os".to_string()),
+                target_arch: Some("test-arch".to_string()),
+                pid: Some(42),
+                address: Some("127.0.0.1:21353".to_string()),
+                bind_address: Some("0.0.0.0:21353".to_string()),
+                executable: Some("sinomo".to_string()),
+                rollout: None,
+                daemon_started_at: None,
+                observed_at,
+            },
+        )
+        .expect("sync status");
+    }
+
+    let targets = cluster_raft_command_targets(&paths, &state);
+
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.node_id),
+        Some(&fresh)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn main_daemon_command_targets_select_one_route_per_remote_main() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-main-daemon-targets-{}",

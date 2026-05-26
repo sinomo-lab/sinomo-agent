@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
+const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1802,14 +1803,10 @@ pub fn cluster_sync_targets_with_connectivity(
     let node_statuses = read_cluster_node_statuses_from_kv(paths)
         .unwrap_or_default()
         .into_iter()
-        .map(|status| (status.node_id, status.availability))
+        .map(|status| (status.node_id.clone(), status))
         .collect::<BTreeMap<_, _>>();
     endpoints.sort_by_key(|endpoint| {
-        let node_status_rank = match node_statuses.get(&endpoint.node_id) {
-            Some(sinomo_core::ClusterNodeAvailability::Online) => 0,
-            Some(sinomo_core::ClusterNodeAvailability::Unknown) | None => 1,
-            Some(sinomo_core::ClusterNodeAvailability::Offline) => 2,
-        };
+        let node_status_rank = cluster_node_status_route_rank(node_statuses.get(&endpoint.node_id));
         (
             node_status_rank,
             graph.unavailability_rank(endpoint),
@@ -1827,6 +1824,11 @@ pub fn cluster_raft_command_targets(
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    let node_statuses = read_cluster_node_statuses_from_kv(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|status| (status.node_id.clone(), status))
+        .collect::<BTreeMap<_, _>>();
     let mut endpoints_by_node = BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
     for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
         endpoints_by_node
@@ -1849,16 +1851,19 @@ pub fn cluster_raft_command_targets(
         .filter_map(|(node_id, endpoints)| {
             endpoints.first().map(|endpoint| {
                 (
+                    cluster_node_status_route_rank(node_statuses.get(node_id)),
                     cluster_raft_route_order_key(&graph, endpoint),
                     node_id.clone(),
                 )
             })
         })
         .collect::<Vec<_>>();
-    node_order.sort_by_key(|(rank, node_id)| (rank.clone(), node_id.clone()));
+    node_order.sort_by_key(|(status_rank, route_rank, node_id)| {
+        (*status_rank, route_rank.clone(), node_id.clone())
+    });
     let ordered_node_ids = node_order
         .into_iter()
-        .map(|(_, node_id)| node_id)
+        .map(|(_, _, node_id)| node_id)
         .collect::<Vec<_>>();
     let max_endpoint_count = endpoints_by_node.values().map(Vec::len).max().unwrap_or(0);
     let mut targets = Vec::new();
@@ -2077,6 +2082,23 @@ fn cluster_route_unavailability_rank(connectivity: Option<&ClusterConnectivitySt
     match connectivity {
         Some(ClusterConnectivityState::Unreachable) => 1,
         _ => 0,
+    }
+}
+
+fn cluster_node_status_route_rank(status: Option<&ClusterNodeStatusRecord>) -> u8 {
+    let Some(status) = status else {
+        return 1;
+    };
+    match status.availability {
+        sinomo_core::ClusterNodeAvailability::Online
+            if (OffsetDateTime::now_utc() - status.observed_at).whole_seconds()
+                <= CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS =>
+        {
+            0
+        }
+        sinomo_core::ClusterNodeAvailability::Unknown => 1,
+        sinomo_core::ClusterNodeAvailability::Online => 2,
+        sinomo_core::ClusterNodeAvailability::Offline => 3,
     }
 }
 
