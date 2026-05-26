@@ -17,6 +17,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
+use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -2316,12 +2318,27 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
-    fs::File::open(path)
+    open_dir_for_sync(path)
         .and_then(|dir| dir.sync_all())
         .map_err(|source| MetadataBackendError::Io {
             path: path.to_owned(),
             source,
         })
+}
+
+#[cfg(not(windows))]
+fn open_dir_for_sync(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+#[cfg(windows)]
+fn open_dir_for_sync(path: &Path) -> io::Result<fs::File> {
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 fn temporary_path_for(path: &Path) -> PathBuf {
@@ -2640,6 +2657,16 @@ mod tests {
                 ..
             }
         ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_syncs_metadata_directories() {
+        let root = temp_root("local_backend_syncs_metadata_directories");
+        fs::create_dir_all(&root).expect("root dir");
+
+        sync_dir(&root).expect("directory sync should work on supported host filesystems");
 
         cleanup(&root);
     }
