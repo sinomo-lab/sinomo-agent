@@ -6027,7 +6027,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let committed_metadata = Some(self.current_read_object_metadata(&pending.object_id)?);
         for replica_node_id in commit_targets {
             let request_id = self.next_request_id();
-            self.send_dfs_message_if_routable(
+            self.send_best_effort_message_if_routable(
                 &replica_node_id,
                 DfsNetworkMessage::CommitVersion(DfsCommitVersionCommand {
                     request_id,
@@ -6790,7 +6790,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<bool, DfsError> {
         if bytes.len() <= DFS_BLOB_INLINE_LIMIT_BYTES {
-            return self.send_dfs_message_if_routable(
+            return self.send_best_effort_message_if_routable(
                 target_node_id,
                 DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
                     request_id,
@@ -6808,7 +6808,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
         let total_chunks = blob_chunk_count(bytes)?;
         for (chunk_index, chunk) in bytes.chunks(DFS_BLOB_CHUNK_BYTES).enumerate() {
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 target_node_id,
                 DfsNetworkMessage::StageBlobChunk(DfsStageBlobChunkCommand {
                     request_id: request_id.clone(),
@@ -6832,6 +6832,18 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(true)
     }
 
+    fn send_best_effort_message_if_routable(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsNetworkMessage,
+    ) -> Result<bool, DfsError> {
+        match self.send_dfs_message_if_routable(target_node_id, message) {
+            Ok(sent) => Ok(sent),
+            Err(DfsError::Network { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn send_repair_replica_if_routable(
         &mut self,
         target_node_id: &NodeId,
@@ -6846,7 +6858,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<bool, DfsError> {
         if bytes.len() <= DFS_BLOB_INLINE_LIMIT_BYTES {
-            return self.send_dfs_message_if_routable(
+            return self.send_best_effort_message_if_routable(
                 target_node_id,
                 DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
                     request_id,
@@ -6864,7 +6876,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
         let total_chunks = blob_chunk_count(bytes)?;
         for (chunk_index, chunk) in bytes.chunks(DFS_BLOB_CHUNK_BYTES).enumerate() {
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 target_node_id,
                 DfsNetworkMessage::RepairReplicaChunk(DfsRepairReplicaChunkCommand {
                     request_id: request_id.clone(),
@@ -7232,6 +7244,31 @@ mod tests {
         }
     }
 
+    struct FailingSendTransport {
+        local_node_id: NodeId,
+    }
+
+    impl NetworkTransport for FailingSendTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+
+        fn send(
+            &mut self,
+            _target_node_id: &NodeId,
+            _frame: NetworkFrame,
+        ) -> Result<(), NetworkError> {
+            Err(NetworkError::Io {
+                operation: "test send".to_string(),
+                detail: "unreachable".to_string(),
+            })
+        }
+
+        fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
+            Ok(Vec::new())
+        }
+    }
+
     fn file_system(owner: NodeId) -> DfsFileSystem {
         DfsFileSystem {
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
@@ -7288,6 +7325,54 @@ mod tests {
             .expect("metadata backend");
         dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
         dfs
+    }
+
+    #[test]
+    fn eventual_write_with_local_receipt_tolerates_unreachable_desired_replica() {
+        let root = temp_root("eventual-write-tolerates-unreachable-replica");
+        let owner = NodeId::from_legacy_named("node_eventual_tolerates_owner").expect("owner node");
+        let replica =
+            NodeId::from_legacy_named("node_eventual_tolerates_replica").expect("replica node");
+        let object_id = DfsObjectId::from_legacy_named("obj_eventual_tolerates").expect("object");
+        let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+        let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+        let content = LocalContentStore::new(root.join("content")).expect("content");
+        let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+        let mut dfs = NetworkedDfsService::new(
+            FailingSendTransport {
+                local_node_id: owner.clone(),
+            },
+            content,
+        )
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+        dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+        let mut metadata = file_metadata(owner.clone());
+        metadata.object_id = object_id.clone();
+        metadata.version = version_1.clone();
+        metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+        dfs.add_object_metadata(metadata).expect("object");
+
+        let write = dfs
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    target_version: version_2,
+                    requesting_node_id: owner.clone(),
+                },
+                b"eventual bytes".to_vec(),
+                vec![owner, replica.clone()],
+                DfsReplicationPolicy::new(1, 2).expect("policy"),
+            )
+            .expect("write should commit locally");
+
+        let NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } = write else {
+            panic!("expected committed write, got {write:?}");
+        };
+        assert_eq!(repair_jobs.len(), 1);
+        assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
