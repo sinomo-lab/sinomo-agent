@@ -1,9 +1,10 @@
 use crate::{
     DaemonError, DaemonPaths, DaemonRunOptions, cluster_has_local_quorum,
     put_cluster_kv_control_record, send_dfs_metadata_journal_batch_to_endpoint,
+    send_dfs_protocol_frame_to_endpoint,
 };
 use serde::{Deserialize, Serialize};
-use sinomo_core::DfsObjectPolicy;
+use sinomo_core::{ClusterEndpointRecord, DfsObjectPolicy};
 use sinomo_dfs::{
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
@@ -14,11 +15,24 @@ use sinomo_dfs::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 
 const DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
+const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+type DfsProtocolFrameSender = Arc<
+    dyn Fn(
+            &ClusterEndpointRecord,
+            &DfsProtocolFrameCommand,
+            Duration,
+        ) -> Result<DfsProtocolFrameResponse, DaemonError>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsMetadataReplicationReport {
@@ -285,6 +299,138 @@ impl NetworkTransport for DaemonDfsProtocolTransport {
     }
 }
 
+#[derive(Clone)]
+pub struct DaemonDfsEndpointTransport {
+    local_node_id: sinomo_node::NodeId,
+    endpoints_by_node_id: BTreeMap<sinomo_node::NodeId, Vec<ClusterEndpointRecord>>,
+    incoming_frames: VecDeque<InboundFrame>,
+    timeout: Duration,
+    sender: DfsProtocolFrameSender,
+}
+
+impl std::fmt::Debug for DaemonDfsEndpointTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonDfsEndpointTransport")
+            .field("local_node_id", &self.local_node_id)
+            .field("endpoints_by_node_id", &self.endpoints_by_node_id)
+            .field("incoming_frames", &self.incoming_frames)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DaemonDfsEndpointTransport {
+    pub fn new(
+        local_node_id: sinomo_node::NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+    ) -> Self {
+        Self::with_sender(
+            local_node_id,
+            endpoints,
+            DFS_PROTOCOL_FRAME_TIMEOUT,
+            Arc::new(send_dfs_protocol_frame_to_endpoint),
+        )
+    }
+
+    fn with_sender(
+        local_node_id: sinomo_node::NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        timeout: Duration,
+        sender: DfsProtocolFrameSender,
+    ) -> Self {
+        let mut endpoints_by_node_id: BTreeMap<sinomo_node::NodeId, Vec<ClusterEndpointRecord>> =
+            BTreeMap::new();
+        for endpoint in endpoints {
+            if endpoint.node_id != local_node_id {
+                endpoints_by_node_id
+                    .entry(endpoint.node_id.clone())
+                    .or_default()
+                    .push(endpoint);
+            }
+        }
+        for endpoints in endpoints_by_node_id.values_mut() {
+            *endpoints =
+                sinomo_network::prefer_bounded_daemon_command_targets(std::mem::take(endpoints));
+        }
+        Self {
+            local_node_id,
+            endpoints_by_node_id,
+            incoming_frames: VecDeque::new(),
+            timeout,
+            sender,
+        }
+    }
+
+    fn deliver_returned_frame(&mut self, frame: NetworkFrame) -> Result<(), NetworkError> {
+        let target_node_id = frame.target_node_id.clone();
+        if target_node_id == self.local_node_id {
+            self.incoming_frames.push_back(InboundFrame {
+                received_by: self.local_node_id.clone(),
+                frame,
+            });
+            return Ok(());
+        }
+        self.send(&target_node_id, frame)
+    }
+}
+
+impl NetworkTransport for DaemonDfsEndpointTransport {
+    fn local_node_id(&self) -> &sinomo_node::NodeId {
+        &self.local_node_id
+    }
+
+    fn send(
+        &mut self,
+        target_node_id: &sinomo_node::NodeId,
+        frame: NetworkFrame,
+    ) -> Result<(), NetworkError> {
+        if &frame.source_node_id != self.local_node_id() {
+            return Err(NetworkError::FrameSourceMismatch {
+                local_node_id: self.local_node_id.clone(),
+                source_node_id: frame.source_node_id,
+            });
+        }
+        if &frame.target_node_id != target_node_id {
+            return Err(NetworkError::FrameTargetMismatch {
+                requested_target_node_id: target_node_id.clone(),
+                frame_target_node_id: frame.target_node_id,
+            });
+        }
+        let endpoints = self
+            .endpoints_by_node_id
+            .get(target_node_id)
+            .cloned()
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })?;
+        let command = DfsProtocolFrameCommand {
+            request_id: format!("dfs_protocol_frame_{}", frame.frame_id.0),
+            frame,
+        };
+        let mut failures = Vec::new();
+        for endpoint in &endpoints {
+            match (self.sender)(endpoint, &command, self.timeout) {
+                Ok(response) => {
+                    for returned_frame in response.outbound_frames {
+                        self.deliver_returned_frame(returned_frame)?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            }
+        }
+        Err(NetworkError::Io {
+            operation: format!("send DFS protocol frame to {target_node_id}"),
+            detail: failures.join("; "),
+        })
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+        Ok(self.incoming_frames.drain(..).collect())
+    }
+}
+
 pub fn publish_default_dfs_metadata_journal(
     paths: &DaemonPaths,
 ) -> Result<DaemonDfsMetadataReplicationReport, DaemonError> {
@@ -499,7 +645,10 @@ fn path_safe_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::DfsObjectPolicy;
+    use sinomo_core::{
+        ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
+        DfsObjectPolicy,
+    };
     use sinomo_dfs::{
         DfsBlobTransferResult, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
         DfsProtocolFrameCommand, DfsStageBlobCommand, DfsVersion,
@@ -510,6 +659,7 @@ mod tests {
     use sinomo_node::NodeId;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -703,6 +853,69 @@ mod tests {
         cleanup(&root);
     }
 
+    #[test]
+    fn daemon_dfs_endpoint_transport_sends_rpc_and_queues_returned_frames() {
+        let local = NodeId::from_legacy_named("node_dfs_endpoint_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_endpoint_remote").expect("remote");
+        let endpoint = test_endpoint(&remote, "192.0.2.10:21353");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_sender = Arc::clone(&calls);
+        let local_for_sender = local.clone();
+        let remote_for_sender = remote.clone();
+        let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+            calls_for_sender
+                .lock()
+                .expect("calls lock")
+                .push((endpoint.node_id.clone(), command.frame.clone()));
+            Ok(DfsProtocolFrameResponse {
+                request_id: command.request_id.clone(),
+                outbound_frames: vec![NetworkFrame {
+                    frame_id: NetworkFrameId(100),
+                    source_node_id: remote_for_sender.clone(),
+                    target_node_id: local_for_sender.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(100),
+                        origin_node_id: remote_for_sender.clone(),
+                        target_node_id: local_for_sender.clone(),
+                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                            node_id: remote_for_sender.clone(),
+                            tick: 1,
+                        }),
+                    },
+                }],
+            })
+        });
+        let mut transport = DaemonDfsEndpointTransport::with_sender(
+            local.clone(),
+            vec![endpoint],
+            Duration::from_millis(1),
+            sender,
+        );
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(7),
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(7),
+                origin_node_id: local.clone(),
+                target_node_id: remote.clone(),
+                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                    node_id: local.clone(),
+                    tick: 7,
+                }),
+            },
+        };
+
+        transport.send(&remote, frame.clone()).expect("send frame");
+        let recorded = calls.lock().expect("calls lock");
+        assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
+        drop(recorded);
+        let incoming = transport.drain_incoming().expect("incoming frames");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].received_by, local);
+        assert_eq!(incoming[0].frame.source_node_id, remote);
+    }
+
     fn write_test_cluster_state(data_root: &std::path::Path, node_id: &NodeId) {
         let data_dir = SinomoDataDir::new(data_root);
         let cluster_paths = ClusterPaths::new(&data_dir);
@@ -719,6 +932,22 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+    }
+
+    fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: sinomo_network::ClusterEndpointId::derived(
+                "sinomo.test.endpoint",
+                format!("{}\0{address}", node_id.as_str()),
+            ),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        }
     }
 
     fn temp_root(name: &str) -> PathBuf {

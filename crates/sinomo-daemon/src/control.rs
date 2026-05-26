@@ -1,10 +1,10 @@
 use crate::DaemonSignerAuthority;
 use crate::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeRequest, ClusterNetworkMaintenance,
-    DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
-    authenticate_daemon_control_request, create_cluster_invite_challenge_proof,
-    daemon_paths_are_shadow, daemon_rpc_command, ensure_daemon_status_cluster,
-    ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
+    DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonDfsEndpointTransport, DaemonError,
+    DaemonLock, DaemonPaths, authenticate_daemon_control_request,
+    create_cluster_invite_challenge_proof, daemon_paths_are_shadow, daemon_rpc_command,
+    ensure_daemon_status_cluster, ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
     handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
@@ -2767,13 +2767,12 @@ fn daemon_sandbox_replica_candidates_from_content_advertisements(
 
 pub fn open_daemon_sandbox_dfs_service(
     paths: &DaemonPaths,
-) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_network::InProcessTransport>, DaemonError> {
+) -> Result<sinomo_dfs::NetworkedDfsService<DaemonDfsEndpointTransport>, DaemonError> {
     let data_dir = daemon_data_dir_path(paths)?;
     let data_dir = sinomo_local::SinomoDataDir::new(&data_dir);
     data_dir.ensure_root_layout()?;
     let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
     let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    let network = sinomo_network::InProcessNetwork::new();
     let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(
         |source| DaemonError::Io {
             path: data_dir.dfs_dir().join("content").display().to_string(),
@@ -2783,8 +2782,9 @@ pub fn open_daemon_sandbox_dfs_service(
     let metadata = sinomo_dfs::open_root_local_metadata_backend(
         data_dir.dfs_dir().join("metadata").join("root"),
     )?;
+    let endpoints = sinomo_network::cluster_sync_targets_with_connectivity(&cluster_paths, &state);
     let mut dfs = sinomo_dfs::NetworkedDfsService::new(
-        network.add_node(state.local_node_id.clone()),
+        DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
         content,
     )
     .with_metadata_backend(metadata)
