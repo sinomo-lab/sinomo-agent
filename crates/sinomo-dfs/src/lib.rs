@@ -35,12 +35,12 @@ pub use local_owned::{
     DfsExposeStoreError, DfsExposedDirectory, LocalOwnedDfsError,
 };
 pub use metadata_backend::{
-    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsConflictRecord, DfsConflictStatus,
-    DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId, DfsInodeRecord, DfsMetadataBackend,
-    DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation, DfsMetadataShardId,
-    DfsMetadataSubscription, DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord,
-    DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalJsonMetadataBackend,
-    MetadataBackendError,
+    DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+    DfsConflictRecord, DfsConflictStatus, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId,
+    DfsInodeRecord, DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
+    DfsMetadataMutation, DfsMetadataShardId, DfsMetadataSubscription, DfsNamespaceTransaction,
+    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
+    DfsWriteIntentStatus, LocalJsonMetadataBackend, MetadataBackendError,
 };
 use namespace::metadata_path;
 pub use namespace::{
@@ -2662,16 +2662,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(None);
         };
-        let entries = backend
-            .journal_since_limited(after_sequence, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT)?;
-        let Some(last_entry) = entries.last() else {
-            return Ok(None);
-        };
-        Ok(Some(DfsMetadataJournalBatch {
-            shard_id: last_entry.shard_id.clone(),
-            next_after_sequence: last_entry.sequence,
-            entries,
-        }))
+        backend
+            .journal_batch_since_limited(
+                after_sequence,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .map_err(Into::into)
     }
 
     fn handle_metadata_journal_batch(

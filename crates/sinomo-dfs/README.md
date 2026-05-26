@@ -67,6 +67,8 @@ Object versions are protected by hash. Rewriting the same `(object_id, version)`
 
 Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation.
 
+Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever.
+
 ### Networked DFS Service
 
 `NetworkedDfsService<T>` is the distributed object service over a `sinomo-network` transport. It combines:

@@ -8,15 +8,15 @@ use sinomo_core::{
     ClusterMemberRole, DfsObjectPolicy,
 };
 use sinomo_dfs::{
-    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsExposeStore, DfsFileSystemConfig,
-    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataJournalBatchResult, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy, DfsWriteOptions,
-    LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService, content_service_key,
-    content_services_prefix, distributed_sifs, distributed_sifs_bootstrap_objects,
-    fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
-    sifs_node_files_path,
+    DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+    DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy,
+    DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService,
+    content_service_key, content_services_prefix, distributed_sifs,
+    distributed_sifs_bootstrap_objects, fallback_dfs_node_id, file_system_config_key,
+    metadata_service_key, metadata_shard_key, sifs_node_files_path,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
@@ -29,6 +29,7 @@ use time::OffsetDateTime;
 const DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
 const DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES: usize =
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT;
+const DFS_METADATA_REPLICATION_MAX_BATCH_BYTES: usize = DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT;
 const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
 type DfsProtocolFrameSender = Arc<
@@ -801,12 +802,12 @@ fn publish_default_dfs_metadata_journal_with_sender(
             &target_node_id,
             &shard_id,
         )?;
-        let entries =
-            backend.hydrate_journal_entry_payloads(backend.journal_since_limited(
-                after_sequence,
-                DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
-            )?)?;
-        let Some(last_entry) = entries.last() else {
+        let Some(batch) = backend.journal_batch_since_limited(
+            after_sequence,
+            DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+            DFS_METADATA_REPLICATION_MAX_BATCH_BYTES,
+        )?
+        else {
             outcomes.push(DaemonDfsMetadataReplicationOutcome::NoChanges {
                 target_node_id,
                 shard_id: shard_id.clone(),
@@ -826,18 +827,14 @@ fn publish_default_dfs_metadata_journal_with_sender(
             });
             continue;
         }
-        let next_after_sequence = last_entry.sequence;
-        let entry_count = entries.len();
+        let next_after_sequence = batch.next_after_sequence;
+        let entry_count = batch.entries.len();
         let command = DfsMetadataJournalBatchCommand {
             request_id: format!(
                 "dfs_meta_{}_{}_{}",
                 state.local_node_id, target_node_id, next_after_sequence
             ),
-            batch: sinomo_dfs::DfsMetadataJournalBatch {
-                shard_id: shard_id.clone(),
-                entries,
-                next_after_sequence,
-            },
+            batch,
         };
         let mut failures = Vec::new();
         let mut delivered = false;

@@ -26,6 +26,7 @@ use time::OffsetDateTime;
 
 pub const DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT: u64 = 4096;
 pub const DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT: usize = 512;
+pub const DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
 const SECONDARY_INDEX_DIRS: &[&str] = &[
@@ -494,6 +495,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         entries.truncate(max_entries);
         Ok(entries)
     }
+    fn journal_batch_since_limited(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<DfsMetadataJournalBatch>> {
+        let entries = self.journal_since_limited(after_sequence, max_entries)?;
+        bounded_metadata_journal_batch(
+            DfsMetadataShardId::new("default"),
+            after_sequence,
+            entries,
+            max_entries,
+            max_encoded_bytes,
+        )
+    }
     fn metadata_replication_cursor(
         &self,
         _target_node_id: &NodeId,
@@ -759,6 +775,26 @@ impl LocalJsonMetadataBackend {
         max_entries: usize,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         journal_entries_since_limited(&self.root, after_sequence, max_entries)
+    }
+
+    pub fn journal_batch_since_limited(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<DfsMetadataJournalBatch>> {
+        let entries = self.journal_since_limited(after_sequence, max_entries)?;
+        let mut hydrated = Vec::with_capacity(entries.len().min(max_entries));
+        for entry in entries {
+            hydrated.push(self.hydrate_journal_entry_payload(entry)?);
+        }
+        bounded_metadata_journal_batch(
+            self.shard_id.clone(),
+            after_sequence,
+            hydrated,
+            max_entries,
+            max_encoded_bytes,
+        )
     }
 
     fn hydrate_journal_entry_payload(
@@ -1707,6 +1743,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         LocalJsonMetadataBackend::journal_since_limited(self, after_sequence, max_entries)
     }
 
+    fn journal_batch_since_limited(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<DfsMetadataJournalBatch>> {
+        LocalJsonMetadataBackend::journal_batch_since_limited(
+            self,
+            after_sequence,
+            max_entries,
+            max_encoded_bytes,
+        )
+    }
+
     fn metadata_replication_cursor(
         &self,
         target_node_id: &NodeId,
@@ -2510,6 +2560,56 @@ fn journal_entries_since_limited(
     segmented_journal_entries_since_limited(root, after_sequence, max_entries)
 }
 
+fn bounded_metadata_journal_batch(
+    shard_id: DfsMetadataShardId,
+    after_sequence: u64,
+    entries: Vec<DfsMetadataJournalEntry>,
+    max_entries: usize,
+    max_encoded_bytes: usize,
+) -> Result<Option<DfsMetadataJournalBatch>> {
+    if max_entries == 0 {
+        return Ok(None);
+    }
+    let max_encoded_bytes = max_encoded_bytes.max(1);
+    let mut selected = Vec::new();
+    let mut next_after_sequence = after_sequence;
+    for entry in entries.into_iter().take(max_entries) {
+        let candidate_sequence = entry.sequence;
+        selected.push(entry);
+        let candidate = DfsMetadataJournalBatch {
+            shard_id: selected
+                .last()
+                .map(|entry| entry.shard_id.clone())
+                .unwrap_or_else(|| shard_id.clone()),
+            entries: selected.clone(),
+            next_after_sequence: candidate_sequence,
+        };
+        if selected.len() > 1 && metadata_journal_batch_encoded_len(&candidate)? > max_encoded_bytes
+        {
+            selected.pop();
+            break;
+        }
+        next_after_sequence = candidate_sequence;
+    }
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DfsMetadataJournalBatch {
+        shard_id: selected
+            .first()
+            .map(|entry| entry.shard_id.clone())
+            .unwrap_or(shard_id),
+        entries: selected,
+        next_after_sequence,
+    }))
+}
+
+fn metadata_journal_batch_encoded_len(batch: &DfsMetadataJournalBatch) -> Result<usize> {
+    sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
+        .map(|bytes| bytes.len())
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))
+}
+
 fn migrate_legacy_journal_entries(root: &Path) -> Result<()> {
     let existing_segment_sequences = segmented_journal_entries_since(root, 0)?
         .into_iter()
@@ -3285,6 +3385,65 @@ mod tests {
                 .expect("empty bounded batch")
                 .is_empty()
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reads_byte_bounded_journal_batches() {
+        let root = temp_root("local_backend_reads_byte_bounded_journal_batches");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        for index in 0..3 {
+            let mut object = object(version("version_1"));
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_byte_bounded_journal_{index}"))
+                    .expect("object");
+            object.path = format!("/docs/{}/bounded-{index}.md", "wide".repeat(128));
+            backend.put_object(&object).expect("object");
+        }
+
+        let first_unbounded = backend
+            .journal_batch_since_limited(1, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, usize::MAX)
+            .expect("unbounded batch")
+            .expect("batch");
+        let first_entry = first_unbounded.entries[0].clone();
+        let one_entry_limit = metadata_journal_batch_encoded_len(&DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            next_after_sequence: first_entry.sequence,
+            entries: vec![first_entry],
+        })
+        .expect("encoded length");
+
+        let first_batch = backend
+            .journal_batch_since_limited(
+                1,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                one_entry_limit,
+            )
+            .expect("byte bounded batch")
+            .expect("batch");
+        assert_eq!(
+            first_batch
+                .entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(first_batch.next_after_sequence, 2);
+        assert!(
+            metadata_journal_batch_encoded_len(&first_batch).expect("encoded length")
+                <= one_entry_limit
+        );
+
+        let oversized_first = backend
+            .journal_batch_since_limited(1, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, 1)
+            .expect("oversized first batch")
+            .expect("batch");
+        assert_eq!(oversized_first.entries.len(), 1);
+        assert_eq!(oversized_first.next_after_sequence, 2);
 
         cleanup(&root);
     }
