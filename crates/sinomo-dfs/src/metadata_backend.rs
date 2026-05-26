@@ -679,6 +679,73 @@ impl LocalJsonMetadataBackend {
         }
     }
 
+    pub fn hydrate_journal_entry_payloads(
+        &self,
+        entries: Vec<DfsMetadataJournalEntry>,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        entries
+            .into_iter()
+            .map(|entry| self.hydrate_journal_entry_payload(entry))
+            .collect()
+    }
+
+    fn hydrate_journal_entry_payload(
+        &self,
+        mut entry: DfsMetadataJournalEntry,
+    ) -> Result<DfsMetadataJournalEntry> {
+        match &mut entry.mutation {
+            DfsMetadataMutation::PutFileSystem {
+                file_system_id,
+                file_system,
+            } if file_system.is_none() => {
+                *file_system = self.get_file_system(file_system_id)?;
+            }
+            DfsMetadataMutation::PutObject {
+                object_id, object, ..
+            } if object.is_none() => {
+                *object = self.get_object(object_id)?;
+            }
+            DfsMetadataMutation::PutVersion {
+                object_id,
+                version,
+                version_record,
+                ..
+            } if version_record.is_none() => {
+                *version_record = self.get_version(object_id, version)?;
+            }
+            DfsMetadataMutation::PutReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                receipt,
+                ..
+            } if receipt.is_none() => {
+                *receipt = self
+                    .receipts_for_version(object_id, version)?
+                    .into_iter()
+                    .find(|record| &record.replica_node_id == replica_node_id);
+            }
+            DfsMetadataMutation::PutIntent {
+                object_id,
+                intent_id,
+                intent,
+                ..
+            } if intent.is_none() => {
+                *intent = self.get_intent(object_id, intent_id)?;
+            }
+            DfsMetadataMutation::PutConflict {
+                object_id,
+                conflict_id,
+                conflict,
+                ..
+            } if conflict.is_none() => {
+                *conflict = self.get_conflict(object_id, conflict_id)?;
+            }
+            _ => {}
+        }
+        Ok(entry)
+    }
+
     fn write_journal(&mut self, mutation: DfsMetadataMutation) -> Result<DfsMetadataJournalEntry> {
         let sequence = self
             .next_sequence
@@ -2500,6 +2567,79 @@ mod tests {
             next.sequence, 2,
             "sequence allocation should continue after migrated legacy entries"
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_hydrates_legacy_journal_payloads_from_records() {
+        let root = temp_root("local_backend_hydrates_legacy_journal_payloads_from_records");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend
+            .put_object(&object(version("version_1")))
+            .expect("object");
+        backend
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: file_system_id(),
+                object_id: object_id(),
+                version: version("version_1"),
+                content_hash: Some("blake3:old".to_string()),
+                size_bytes: None,
+                locations: vec![node("node_owner")],
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: true,
+            })
+            .expect("version");
+
+        let legacy_entries = backend
+            .journal_since(0)
+            .expect("journal")
+            .into_iter()
+            .map(|mut entry| {
+                match &mut entry.mutation {
+                    DfsMetadataMutation::PutFileSystem { file_system, .. } => {
+                        *file_system = None;
+                    }
+                    DfsMetadataMutation::PutObject { object, .. } => {
+                        *object = None;
+                    }
+                    DfsMetadataMutation::PutVersion { version_record, .. } => {
+                        *version_record = None;
+                    }
+                    _ => {}
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+
+        let hydrated = backend
+            .hydrate_journal_entry_payloads(legacy_entries)
+            .expect("hydrate legacy entries");
+        assert!(matches!(
+            &hydrated[0].mutation,
+            DfsMetadataMutation::PutFileSystem {
+                file_system: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &hydrated[1].mutation,
+            DfsMetadataMutation::PutObject {
+                object: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &hydrated[2].mutation,
+            DfsMetadataMutation::PutVersion {
+                version_record: Some(_),
+                ..
+            }
+        ));
 
         cleanup(&root);
     }

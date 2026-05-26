@@ -257,7 +257,8 @@ pub fn publish_default_dfs_metadata_journal(
         let after_sequence = read_dfs_metadata_replication_cursor(&cursor_path)?
             .map(|cursor| cursor.next_after_sequence)
             .unwrap_or(0);
-        let entries = backend.journal_since(after_sequence)?;
+        let entries =
+            backend.hydrate_journal_entry_payloads(backend.journal_since(after_sequence)?)?;
         let Some(last_entry) = entries.last() else {
             outcomes.push(DaemonDfsMetadataReplicationOutcome::NoChanges {
                 target_node_id,
