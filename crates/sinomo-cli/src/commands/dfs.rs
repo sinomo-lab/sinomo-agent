@@ -14,6 +14,9 @@ pub(crate) enum DfsCliCommand {
     },
     Conflicts(DfsFilterOptions),
     Repair(DfsFilterOptions),
+    MetadataPublish {
+        json: bool,
+    },
     Pin(DfsPinCliCommand),
     Expose(DfsExposeCliCommand),
 }
@@ -126,6 +129,7 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
         Some((command, rest)) if command == "repair" => {
             Ok(DfsCliCommand::Repair(parse_dfs_filter_options(rest)?))
         }
+        Some((command, rest)) if command == "metadata" => parse_dfs_metadata_command(rest),
         Some((command, rest)) if command == "pin" => {
             Ok(DfsCliCommand::Pin(parse_dfs_pin_command(rest)?))
         }
@@ -188,6 +192,22 @@ pub(crate) fn parse_dfs_filter_options(args: &[String]) -> Result<DfsFilterOptio
         index += 1;
     }
     Ok(options)
+}
+
+pub(crate) fn parse_dfs_metadata_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "publish" => {
+            let mut json = false;
+            for arg in rest {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    _ => return Err(CliError::Usage),
+                }
+            }
+            Ok(DfsCliCommand::MetadataPublish { json })
+        }
+        _ => Err(CliError::Usage),
+    }
 }
 
 pub(crate) fn parse_dfs_pin_command(args: &[String]) -> Result<DfsPinCliCommand, CliError> {
@@ -603,6 +623,21 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                         repair.missing_replica_node_id,
                         option_label(&repair.content_hash)
                     );
+                }
+            }
+            Ok(())
+        }
+        DfsCliCommand::MetadataPublish { json } => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            data_dir.ensure_root_layout()?;
+            let report = daemon_publish_default_dfs_metadata_journal(&DaemonPaths::new(&data_dir))?;
+            if json {
+                print_json("<dfs-metadata-publish>", &report)?;
+            } else if report.outcomes.is_empty() {
+                println!("No DFS metadata journal replication work.");
+            } else {
+                for outcome in report.outcomes {
+                    println!("{outcome:?}");
                 }
             }
             Ok(())

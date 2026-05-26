@@ -326,6 +326,16 @@ pub fn authorize_authenticated_daemon_command(
         command if command == daemon_rpc_command(sinomo_network::DFS_EXPOSE_CONFIG_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }
+        command
+            if command == daemon_rpc_command(sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE) =>
+        {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         command if is_local_sandbox_rpc_command(command) => {
             authenticated.signer.can_run_local_command()
         }
@@ -763,5 +773,19 @@ mod tests {
 
         authorize_authenticated_daemon_command(&authenticated)
             .expect("cluster members must be able to forward KV txns to voters");
+    }
+
+    #[test]
+    fn dfs_metadata_journal_batch_authorizes_cluster_members() {
+        let command = daemon_rpc_command(sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE);
+        for signer in [
+            DaemonSignerAuthority::Local,
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+        ] {
+            let authenticated = authenticated_command(command.clone(), signer);
+            authorize_authenticated_daemon_command(&authenticated)
+                .expect("cluster members must be able to replicate DFS metadata journals");
+        }
     }
 }

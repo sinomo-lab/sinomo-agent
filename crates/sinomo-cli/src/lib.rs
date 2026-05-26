@@ -110,6 +110,7 @@ use sinomo_runtime::daemon::{
     prepare_local_shadow_rollout_restart as daemon_prepare_local_shadow_rollout_restart,
     prepare_pending_cluster_join_state as daemon_prepare_pending_cluster_join_state,
     probe_daemon_status, publish_cluster_invitation_to_quorum,
+    publish_default_dfs_metadata_journal as daemon_publish_default_dfs_metadata_journal,
     read_cluster_connectivity_graph_from_kv as daemon_read_cluster_connectivity_graph_from_kv,
     read_local_cluster_state as daemon_read_local_cluster_state,
     reconcile_cluster_join_with_introducers as daemon_reconcile_cluster_join_with_introducers,
