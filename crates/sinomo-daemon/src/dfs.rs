@@ -266,17 +266,18 @@ pub fn publish_default_dfs_metadata_journal(
             });
             continue;
         };
-        let Some(endpoint) = endpoints
+        let target_endpoints = endpoints
             .iter()
-            .find(|endpoint| endpoint.node_id == target_node_id)
-        else {
+            .filter(|endpoint| endpoint.node_id == target_node_id)
+            .collect::<Vec<_>>();
+        if target_endpoints.is_empty() {
             outcomes.push(DaemonDfsMetadataReplicationOutcome::MissingEndpoint {
                 target_node_id,
                 shard_id: shard_id.clone(),
                 after_sequence,
             });
             continue;
-        };
+        }
         let next_after_sequence = last_entry.sequence;
         let entry_count = entries.len();
         let command = DfsMetadataJournalBatchCommand {
@@ -290,43 +291,54 @@ pub fn publish_default_dfs_metadata_journal(
                 next_after_sequence,
             },
         };
-        match send_dfs_metadata_journal_batch_to_endpoint(
-            endpoint,
-            &command,
-            DFS_METADATA_REPLICATION_TIMEOUT,
-        ) {
-            Ok(response) => match response.result {
-                DfsMetadataJournalBatchResult::Applied => {
-                    write_dfs_metadata_replication_cursor(
-                        &cursor_path,
-                        &DaemonDfsMetadataReplicationCursor {
+        let mut failures = Vec::new();
+        let mut delivered = false;
+        for endpoint in target_endpoints {
+            match send_dfs_metadata_journal_batch_to_endpoint(
+                endpoint,
+                &command,
+                DFS_METADATA_REPLICATION_TIMEOUT,
+            ) {
+                Ok(response) => match response.result {
+                    DfsMetadataJournalBatchResult::Applied => {
+                        write_dfs_metadata_replication_cursor(
+                            &cursor_path,
+                            &DaemonDfsMetadataReplicationCursor {
+                                target_node_id: target_node_id.clone(),
+                                shard_id: shard_id.clone(),
+                                next_after_sequence,
+                            },
+                        )?;
+                        outcomes.push(DaemonDfsMetadataReplicationOutcome::Applied {
                             target_node_id: target_node_id.clone(),
                             shard_id: shard_id.clone(),
+                            entries: entry_count,
                             next_after_sequence,
-                        },
-                    )?;
-                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Applied {
-                        target_node_id,
-                        shard_id: shard_id.clone(),
-                        entries: entry_count,
-                        next_after_sequence,
-                    });
+                        });
+                        delivered = true;
+                        break;
+                    }
+                    DfsMetadataJournalBatchResult::Rejected { reason } => {
+                        outcomes.push(DaemonDfsMetadataReplicationOutcome::Rejected {
+                            target_node_id: target_node_id.clone(),
+                            shard_id: shard_id.clone(),
+                            reason,
+                        });
+                        delivered = true;
+                        break;
+                    }
+                },
+                Err(error) => {
+                    failures.push(format!("{} failed: {error}", endpoint.address));
                 }
-                DfsMetadataJournalBatchResult::Rejected { reason } => {
-                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Rejected {
-                        target_node_id,
-                        shard_id: shard_id.clone(),
-                        reason,
-                    });
-                }
-            },
-            Err(error) => {
-                outcomes.push(DaemonDfsMetadataReplicationOutcome::Failed {
-                    target_node_id,
-                    shard_id: shard_id.clone(),
-                    reason: error.to_string(),
-                });
             }
+        }
+        if !delivered {
+            outcomes.push(DaemonDfsMetadataReplicationOutcome::Failed {
+                target_node_id,
+                shard_id: shard_id.clone(),
+                reason: failures.join("; "),
+            });
         }
     }
     Ok(DaemonDfsMetadataReplicationReport { outcomes })
