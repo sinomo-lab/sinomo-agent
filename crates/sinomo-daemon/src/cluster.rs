@@ -2830,9 +2830,13 @@ pub fn elect_cluster_raft_leader(
         if local_vote.vote_granted {
             granted.insert(state.local_node_id.clone());
         }
+        let quorum_size = sinomo_network::cluster_raft_quorum_size(state);
         let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
         let targets = cluster_raft_live_voter_targets(paths, state);
         for (index, endpoint) in targets.iter().enumerate() {
+            if granted.len() >= quorum_size {
+                break;
+            }
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_default();
@@ -2860,7 +2864,7 @@ pub fn elect_cluster_raft_leader(
             )?;
             continue;
         }
-        if granted.len() < sinomo_network::cluster_raft_quorum_size(state) {
+        if granted.len() < quorum_size {
             return Ok(false);
         }
         {
