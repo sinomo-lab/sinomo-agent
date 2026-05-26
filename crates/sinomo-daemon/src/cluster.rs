@@ -55,6 +55,7 @@ pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(
 pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_secs(15);
 pub const DAEMON_CLUSTER_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
+pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration = Duration::from_secs(600);
 pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 600;
@@ -957,20 +958,26 @@ impl ClusterNetworkMaintenance {
 
         if publish_due {
             self.last_publish = now;
+            let mut publish_failed = false;
             if sinomo_network::cluster_raft_local_is_voter(&state) {
                 if let Err(error) = ensure_default_distributed_dfs(paths, options, true) {
                     eprintln!("sinomo daemon distributed DFS control publish failed: {error}");
+                    publish_failed = true;
                 }
                 if !sinomo_network::cluster_bootstrap_state_stable_eq(
                     &state_before_maintenance,
                     &state,
                 ) {
-                    let _ = sync_cluster_state_to_kv(&cluster_paths, &state);
+                    if let Err(error) = sync_cluster_state_to_kv(&cluster_paths, &state) {
+                        eprintln!("sinomo daemon cluster state publish failed: {error}");
+                        publish_failed = true;
+                    }
                 }
                 if let Err(error) =
                     publish_local_members_to_quorum_if_needed(&cluster_paths, &state)
                 {
                     eprintln!("sinomo daemon cluster member publish failed: {error}");
+                    publish_failed = true;
                 }
                 let local_network_info = sinomo_network::build_cluster_network_info_record(
                     &state,
@@ -986,14 +993,25 @@ impl ClusterNetworkMaintenance {
                     self.connectivity.clear();
                 }
                 self.environment_id = Some(local_network_info.environment_id.clone());
-                let _ = sync_cluster_network_info_to_kv(&cluster_paths, local_network_info);
-                let _ = refresh_daemon_node_status_in_kv(paths);
+                if let Err(error) =
+                    sync_cluster_network_info_to_kv(&cluster_paths, local_network_info)
+                {
+                    eprintln!("sinomo daemon network info publish failed: {error}");
+                    publish_failed = true;
+                }
+                if let Err(error) = refresh_daemon_node_status_in_kv(paths) {
+                    eprintln!("sinomo daemon node status publish failed: {error}");
+                    publish_failed = true;
+                }
                 let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
                 if matches!(
                     probe_daemon_status(&shadow_paths, DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT),
                     DaemonProbeStatus::Running(_)
                 ) {
-                    let _ = refresh_daemon_node_status_in_kv(&shadow_paths);
+                    if let Err(error) = refresh_daemon_node_status_in_kv(&shadow_paths) {
+                        eprintln!("sinomo daemon shadow status publish failed: {error}");
+                        publish_failed = true;
+                    }
                 }
                 match publish_default_dfs_metadata_journal(paths) {
                     Ok(report) => {
@@ -1033,12 +1051,19 @@ impl ClusterNetworkMaintenance {
                     }
                     Err(error) => {
                         eprintln!("sinomo daemon DFS metadata replication failed: {error}");
+                        publish_failed = true;
                     }
                 }
             } else if !sinomo_network::cluster_raft_local_is_voter(&state) {
                 if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
                     eprintln!("sinomo daemon cluster member publish via voter failed: {error}");
+                    publish_failed = true;
                 }
+            }
+            if publish_failed {
+                self.last_publish = now
+                    .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
+                    .unwrap_or(now);
             }
         }
 
