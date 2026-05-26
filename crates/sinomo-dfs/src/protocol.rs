@@ -4,6 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
+use sinomo_network::NetworkFrame;
 use sinomo_node::NodeId;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -249,6 +250,18 @@ pub struct DfsMetadataJournalBatchResponse {
     pub next_after_sequence: u64,
     pub applied_entries: usize,
     pub result: DfsMetadataJournalBatchResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DfsProtocolFrameCommand {
+    pub request_id: String,
+    pub frame: NetworkFrame,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DfsProtocolFrameResponse {
+    pub request_id: String,
+    pub outbound_frames: Vec<NetworkFrame>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

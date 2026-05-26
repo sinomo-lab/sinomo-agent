@@ -11,10 +11,11 @@ use crate::{
     handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
     handle_daemon_cluster_member_publish_request, handle_daemon_cluster_raft_append_request,
     handle_daemon_cluster_raft_vote_request, handle_daemon_dfs_expose_config,
-    handle_daemon_dfs_metadata_journal_batch, handle_daemon_finalize_shadow_rollout,
-    handle_daemon_rollout_binary_request, handle_daemon_rollout_build_request,
-    handle_daemon_rollout_diagnostics, handle_forwarded_daemon_cluster_kv_txn_request,
-    read_daemon_status, start_daemon_iroh_proxy_if_clustered,
+    handle_daemon_dfs_metadata_journal_batch, handle_daemon_dfs_protocol_frame,
+    handle_daemon_finalize_shadow_rollout, handle_daemon_rollout_binary_request,
+    handle_daemon_rollout_build_request, handle_daemon_rollout_diagnostics,
+    handle_forwarded_daemon_cluster_kv_txn_request, read_daemon_status,
+    start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
 use sinomo_rollout::{SelfRolloutPaths, read_rollout_status};
@@ -522,6 +523,22 @@ pub fn handle_daemon_connection(
                 let result = handle_daemon_dfs_metadata_journal_batch(paths, request)?;
                 let response = sinomo_network::ObjectRpcResponse::encode_body(
                     sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                    &result,
+                )
+                .map_err(DaemonError::from)?;
+                write_daemon_rpc_response_frame(stream, response)?;
+                Ok(false)
+            }
+            command if command == daemon_rpc_command(sinomo_network::DFS_PROTOCOL_FRAME_ROUTE) => {
+                let request = require_daemon_rpc_request(
+                    rpc_request,
+                    sinomo_network::DFS_PROTOCOL_FRAME_ROUTE,
+                    sinomo_network::DFS_RPC_CATEGORY,
+                )?;
+                let request = request.decode_body().map_err(DaemonError::from)?;
+                let result = handle_daemon_dfs_protocol_frame(paths, request)?;
+                let response = sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_network::DFS_PROTOCOL_FRAME_ROUTE,
                     &result,
                 )
                 .map_err(DaemonError::from)?;

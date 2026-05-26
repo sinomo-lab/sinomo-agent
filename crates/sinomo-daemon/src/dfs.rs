@@ -8,12 +8,12 @@ use sinomo_dfs::{
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
-    LocalJsonMetadataBackend, content_service_key, distributed_sifs,
-    distributed_sifs_bootstrap_objects, fallback_dfs_node_id, file_system_config_key,
-    metadata_service_key, metadata_shard_key,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, LocalContentStore, LocalJsonMetadataBackend,
+    NetworkedDfsService, content_service_key, distributed_sifs, distributed_sifs_bootstrap_objects,
+    fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
 };
 use sinomo_local::SinomoDataDir;
-use sinomo_network::ClusterPaths;
+use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
 use std::fs;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -128,6 +128,38 @@ pub fn handle_daemon_dfs_metadata_journal_batch(
     }
 }
 
+pub fn handle_daemon_dfs_protocol_frame(
+    paths: &DaemonPaths,
+    command: DfsProtocolFrameCommand,
+) -> Result<DfsProtocolFrameResponse, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    let local_node_id = local_dfs_protocol_node_id(&data_dir)?;
+    if command.frame.target_node_id != local_node_id {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "dfs protocol frame target {} does not match local node {}",
+                command.frame.target_node_id, local_node_id
+            ),
+        });
+    }
+    let metadata_backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        data_dir.dfs_dir().join("metadata").join("root"),
+    )?;
+    let content_store = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let transport = DaemonDfsProtocolTransport::new(local_node_id, command.frame);
+    let mut service = NetworkedDfsService::new(transport, content_store)
+        .with_metadata_backend(metadata_backend)?;
+    service.process_incoming()?;
+    let outbound_frames = service.into_transport().outbound_frames;
+    Ok(DfsProtocolFrameResponse {
+        request_id: command.request_id,
+        outbound_frames,
+    })
+}
+
 pub fn ensure_default_distributed_dfs(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
@@ -212,6 +244,45 @@ pub fn ensure_default_distributed_dfs(
         &DfsNodeAdvertisement::content(state.local_node_id.clone(), endpoint),
     )?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct DaemonDfsProtocolTransport {
+    local_node_id: sinomo_node::NodeId,
+    inbound_frames: Vec<InboundFrame>,
+    outbound_frames: Vec<NetworkFrame>,
+}
+
+impl DaemonDfsProtocolTransport {
+    fn new(local_node_id: sinomo_node::NodeId, inbound_frame: NetworkFrame) -> Self {
+        Self {
+            local_node_id: local_node_id.clone(),
+            inbound_frames: vec![InboundFrame {
+                received_by: local_node_id,
+                frame: inbound_frame,
+            }],
+            outbound_frames: Vec::new(),
+        }
+    }
+}
+
+impl NetworkTransport for DaemonDfsProtocolTransport {
+    fn local_node_id(&self) -> &sinomo_node::NodeId {
+        &self.local_node_id
+    }
+
+    fn send(
+        &mut self,
+        _target_node_id: &sinomo_node::NodeId,
+        frame: NetworkFrame,
+    ) -> Result<(), NetworkError> {
+        self.outbound_frames.push(frame);
+        Ok(())
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+        Ok(std::mem::take(&mut self.inbound_frames))
+    }
 }
 
 pub fn publish_default_dfs_metadata_journal(
@@ -352,6 +423,16 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError>
     })
 }
 
+fn local_dfs_protocol_node_id(
+    data_dir: &SinomoDataDir,
+) -> Result<sinomo_node::NodeId, DaemonError> {
+    let cluster_paths = ClusterPaths::new(data_dir);
+    if !cluster_paths.state.exists() {
+        return Err(DaemonError::ClusterOrphan);
+    }
+    Ok(sinomo_network::read_cluster_state_without_kv(&cluster_paths)?.local_node_id)
+}
+
 fn dfs_metadata_replication_cursor_path(
     data_dir: &SinomoDataDir,
     target_node_id: &sinomo_node::NodeId,
@@ -418,7 +499,14 @@ fn path_safe_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_dfs::DfsMetadataJournalBatchResult;
+    use sinomo_core::DfsObjectPolicy;
+    use sinomo_dfs::{
+        DfsBlobTransferResult, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+        DfsProtocolFrameCommand, DfsStageBlobCommand, DfsVersion,
+    };
+    use sinomo_network::{
+        MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
+    };
     use sinomo_node::NodeId;
     use std::fs;
     use std::path::PathBuf;
@@ -480,6 +568,157 @@ mod tests {
         );
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_protocol_frame_processes_stage_blob_and_returns_response_frame() {
+        let root = temp_root("daemon_dfs_protocol_frame_stage_blob");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let owner = NodeId::from_legacy_named("node_dfs_protocol_owner").expect("owner");
+        let replica = NodeId::from_legacy_named("node_dfs_protocol_replica").expect("replica");
+        write_test_cluster_state(&data_root, &replica);
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let object_id = DfsObjectId::from_legacy_named("obj_dfs_protocol_stage").expect("object");
+        let version = DfsVersion::from_legacy_named("version_dfs_protocol_stage").expect("version");
+        let bytes = b"daemon dfs protocol frame bytes".to_vec();
+        let content_hash = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+        let object = DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: file_system_id.clone(),
+            path: "services/daemon-dfs-protocol.bin".to_string(),
+            kind: DfsObjectKind::File,
+            owner_node_id: owner.clone(),
+            current_locations: vec![owner.clone()],
+            content_hash: Some(content_hash.clone()),
+            content_size_bytes: Some(bytes.len() as u64),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let message = DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
+            request_id: "dfs_stage_rpc_1".to_string(),
+            intent_id: "dfs_intent_protocol_stage".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            expected_base_version: None,
+            version: version.clone(),
+            content_hash: content_hash.clone(),
+            bytes: bytes.clone(),
+            object_metadata: Some(object),
+        });
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: owner.clone(),
+            target_node_id: replica.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: owner.clone(),
+                target_node_id: replica.clone(),
+                body: MeshMessageBody::Protocol(
+                    ProtocolMessage::encode(sinomo_dfs::DFS_PROTOCOL, &message)
+                        .expect("protocol message"),
+                ),
+            },
+        };
+
+        let response = handle_daemon_dfs_protocol_frame(
+            &paths,
+            DfsProtocolFrameCommand {
+                request_id: "dfs_protocol_frame_rpc_1".to_string(),
+                frame,
+            },
+        )
+        .expect("protocol frame");
+
+        assert_eq!(response.request_id, "dfs_protocol_frame_rpc_1");
+        assert_eq!(response.outbound_frames.len(), 1);
+        let MeshMessageBody::Protocol(protocol) = &response.outbound_frames[0].message.body else {
+            panic!("expected protocol response frame");
+        };
+        let response_message: DfsNetworkMessage = protocol.decode().expect("decode response");
+        assert!(matches!(
+            response_message,
+            DfsNetworkMessage::StageBlobResponse(response)
+                if response.request_id == "dfs_stage_rpc_1"
+                    && response.object_id == object_id
+                    && response.version == version
+                    && response.replica_node_id == replica
+                    && response.result == DfsBlobTransferResult::Durable { content_hash }
+        ));
+
+        let store = LocalContentStore::new(root.join("data").join("dfs").join("content"))
+            .expect("content store");
+        let manifest = store
+            .read_manifest(object_id.as_str(), version.as_str())
+            .expect("read staged manifest");
+        let read = store.read_blob(&manifest.content_hash).expect("read blob");
+        assert_eq!(read, bytes);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_protocol_frame_rejects_wrong_target_node() {
+        let root = temp_root("daemon_dfs_protocol_frame_wrong_target");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let local = NodeId::from_legacy_named("node_dfs_protocol_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_protocol_remote").expect("remote");
+        write_test_cluster_state(&data_root, &local);
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: remote.clone(),
+            target_node_id: remote.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: remote.clone(),
+                target_node_id: remote.clone(),
+                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                    node_id: remote.clone(),
+                    tick: 1,
+                }),
+            },
+        };
+
+        let error = handle_daemon_dfs_protocol_frame(
+            &paths,
+            DfsProtocolFrameCommand {
+                request_id: "dfs_protocol_frame_rpc_wrong_target".to_string(),
+                frame,
+            },
+        )
+        .expect_err("wrong target rejected");
+        assert!(error.to_string().contains("does not match local node"));
+
+        cleanup(&root);
+    }
+
+    fn write_test_cluster_state(data_root: &std::path::Path, node_id: &NodeId) {
+        let data_dir = SinomoDataDir::new(data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
+                .expect("cluster");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "daemon dfs protocol",
+            node_id.clone(),
+            "daemon dfs protocol node",
+            format!("pk-{node_id}"),
+            now,
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
     }
 
     fn temp_root(name: &str) -> PathBuf {

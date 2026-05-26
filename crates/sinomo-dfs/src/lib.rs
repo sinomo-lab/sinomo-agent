@@ -56,8 +56,9 @@ pub use protocol::{
     DfsBlobTransferResult, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsFetchBlobCommand,
     DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
-    DfsNetworkMessage, DfsReadData, DfsReadRequest, DfsReadResponse, DfsReadResponseChunk,
-    DfsReadResult, DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsNetworkMessage, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReadData,
+    DfsReadRequest, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
+    DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
     DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse, DfsWriteCommand,
     DfsWriteResponse, DfsWriteResult,
 };
@@ -1317,6 +1318,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     pub fn content(&self) -> &LocalContentStore {
         &self.content
+    }
+
+    pub fn into_transport(self) -> T {
+        self.transport
     }
 
     pub fn coordinator(&self) -> &DistributedEventualCoordinator {

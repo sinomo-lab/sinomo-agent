@@ -106,6 +106,28 @@ impl From<sinomo_dfs::MetadataBackendError> for DaemonError {
     }
 }
 
+impl From<sinomo_dfs::ContentStoreError> for DaemonError {
+    fn from(error: sinomo_dfs::ContentStoreError) -> Self {
+        match error {
+            sinomo_dfs::ContentStoreError::Io { path, source } => Self::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            },
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<sinomo_dfs::DfsError> for DaemonError {
+    fn from(error: sinomo_dfs::DfsError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl From<sinomo_sandbox::SandboxStoreError> for DaemonError {
     fn from(error: sinomo_sandbox::SandboxStoreError) -> Self {
         Self::Parse {
