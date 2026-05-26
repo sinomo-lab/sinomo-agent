@@ -880,7 +880,7 @@ fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
 #[test]
 fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
     let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-store-snapshot-first-{}",
+        "sinomo-network-kv-store-cache-only-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -889,7 +889,43 @@ fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    let node_id = NodeId::from_legacy_named("node_snapshot_first").expect("node");
+
+    let mut snapshot_store = InProcessKvStore::new();
+    snapshot_store
+        .put("/snapshot-only", b"snapshot".to_vec(), None)
+        .expect("seed snapshot store");
+    write_cluster_kv_snapshot(&paths, &snapshot_store.snapshot()).expect("write snapshot");
+
+    let store = read_cluster_kv_store(&paths).expect("read cluster kv store");
+    assert!(store.get("/snapshot-only").is_some());
+    assert!(!paths.kv_raft.exists());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-store-raft-over-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_raft_over_cache").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_raft_over_cache").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "raft over cache",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
 
     append_cluster_raft_command(
         &paths,
@@ -902,15 +938,17 @@ fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
     )
     .expect("seed raft");
 
-    let mut snapshot_store = InProcessKvStore::new();
-    snapshot_store
-        .put("/snapshot-only", b"snapshot".to_vec(), None)
-        .expect("seed snapshot store");
-    write_cluster_kv_snapshot(&paths, &snapshot_store.snapshot()).expect("write snapshot");
+    let mut stale_store = InProcessKvStore::new();
+    stale_store
+        .put("/stale-cache-only", b"cache".to_vec(), None)
+        .expect("seed stale cache");
+    write_cluster_kv_snapshot(&paths, &stale_store.snapshot()).expect("write stale snapshot");
 
     let store = read_cluster_kv_store(&paths).expect("read cluster kv store");
-    assert!(store.get("/snapshot-only").is_some());
-    assert!(store.get("/raft-only").is_none());
+    assert!(store.get("/raft-only").is_some());
+    assert!(store.get("/stale-cache-only").is_none());
+    let refreshed = read_cluster_kv_snapshot(&paths).expect("read refreshed cache");
+    assert_eq!(refreshed.revision, store.revision());
     std::fs::remove_dir_all(root).ok();
 }
 

@@ -770,22 +770,20 @@ pub fn write_cluster_kv_snapshot_if_changed(
 
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
     let cache = cluster_kv_materialized_cache(paths);
-    if cache.exists() {
-        return cache.read_store().map_err(Into::into);
-    }
-    if paths.kv_raft.exists() {
-        let state = read_cluster_state_without_kv(paths)?;
-        match open_cluster_raft_kv_node(paths, &state.local_node_id) {
-            Ok(node) => return Ok(node.store().clone()),
-            Err(error) => {
-                eprintln!(
-                    "warning: ignoring unreadable local cluster raft view with no materialized snapshot: {error}"
-                );
-                return Ok(InProcessKvStore::new());
+    let node_id = read_cluster_state_without_kv(paths)
+        .map(|state| state.local_node_id)
+        .or_else(|error| {
+            if paths.kv_raft.exists() {
+                Err(error)
+            } else {
+                Ok(NodeId::from_legacy_named("cluster_kv_cache_reader")
+                    .expect("static cache reader node id"))
             }
-        }
-    }
-    Ok(InProcessKvStore::new())
+        })?;
+    let wal_paths = cluster_raft_wal_paths(paths, &node_id);
+    cache
+        .read_store_with_raft_view(node_id, wal_paths)
+        .map_err(Into::into)
 }
 
 pub fn read_cluster_kv_snapshot_store(

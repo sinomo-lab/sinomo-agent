@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -23,6 +24,7 @@ pub const KV_OBJECT_VERSION_ID: u16 = 1;
 pub const KV_WAL_OBJECT_VERSION_ID: u16 = 2;
 const MAX_RETAINED_EVENTS: usize = 4096;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
+static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
@@ -436,6 +438,23 @@ impl KvMaterializedCache {
         }
         self.write_snapshot(snapshot)?;
         Ok(true)
+    }
+
+    pub fn read_store_with_raft_view(
+        &self,
+        node_id: NodeId,
+        paths: KvWalPaths,
+    ) -> Result<InProcessKvStore, KvError> {
+        if paths.root.exists() {
+            let node = DurableRaftKvNode::open_with_materialized_cache(node_id, paths, self)?;
+            let store = node.store().clone();
+            self.write_snapshot_if_changed(&store.snapshot())?;
+            return Ok(store);
+        }
+        if self.exists() {
+            return self.read_store();
+        }
+        Ok(InProcessKvStore::new())
     }
 }
 
@@ -1893,7 +1912,11 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("json");
-    let temp_path = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     {
         let mut file = OpenOptions::new()
             .create(true)
