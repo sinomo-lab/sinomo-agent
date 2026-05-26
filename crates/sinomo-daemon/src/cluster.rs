@@ -1790,7 +1790,7 @@ fn current_cluster_kv_store(
         .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
         .collect::<Vec<_>>();
     if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
-        && !cluster_node_status_is_offline(paths, &leader_id)
+        && !cluster_node_status_is_offline(paths, state, &leader_id)
         && let Some(position) = targets
             .iter()
             .position(|endpoint| endpoint.node_id == leader_id)
@@ -2588,7 +2588,7 @@ fn forward_cluster_kv_txn_to_voter(
         return None;
     }
     if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
-        && !cluster_node_status_is_offline(paths, &leader_id)
+        && !cluster_node_status_is_offline(paths, state, &leader_id)
         && let Some(position) = targets
             .iter()
             .position(|endpoint| endpoint.node_id == leader_id)
@@ -2642,12 +2642,26 @@ fn forward_cluster_kv_txn_to_voter(
     }))
 }
 
-fn cluster_node_status_is_offline(paths: &ClusterPaths, node_id: &NodeId) -> bool {
+fn cluster_node_status_is_offline(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+) -> bool {
     sinomo_network::read_cluster_node_statuses_from_kv(paths)
         .unwrap_or_default()
         .into_iter()
-        .any(|status| {
-            status.node_id == *node_id && status.availability == ClusterNodeAvailability::Offline
+        .find(|status| status.node_id == *node_id)
+        .is_some_and(|status| {
+            status.availability == ClusterNodeAvailability::Offline
+                || (status.availability == ClusterNodeAvailability::Online
+                    && crate::cluster_node_status_is_stale(&status)
+                    && state
+                        .members
+                        .iter()
+                        .find(|member| member.node_id == *node_id)
+                        .is_some_and(|member| {
+                            sinomo_network::live_cluster_member_probe_possible(state, member)
+                        }))
         })
 }
 
@@ -3544,6 +3558,73 @@ mod tests {
         assert!(
             second_tcp_position < first_iroh_position,
             "raft/KV forwarding should try another voter's best endpoint before fallbacks for one voter"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stale_online_status_is_offline_for_probeable_remote_leader() {
+        let root = unique_cluster_test_root("sinomo-daemon-stale-leader-status");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_stale_leader").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_daemon_stale_leader_local").expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_daemon_stale_leader_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "stale leader status",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint =
+            sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.41:21353".to_string(), 10);
+        let mut remote_member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities = sinomo_node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint];
+        state.members.push(remote_member);
+
+        sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state to raft kv");
+        sinomo_network::sync_cluster_node_status_to_kv(
+            &paths,
+            ClusterNodeStatusRecord {
+                cluster_id,
+                node_id: remote_node.clone(),
+                process: "daemon-main".to_string(),
+                availability: ClusterNodeAvailability::Online,
+                daemon_version: "0.1.0-test".to_string(),
+                target_os: Some("test-os".to_string()),
+                target_arch: Some("test-arch".to_string()),
+                pid: Some(42),
+                address: Some("10.0.0.41:21353".to_string()),
+                bind_address: Some("0.0.0.0:21353".to_string()),
+                executable: Some("sinomo".to_string()),
+                rollout: None,
+                daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
+                observed_at: now - time::Duration::seconds(3600),
+            },
+        )
+        .expect("sync stale node status");
+
+        assert!(
+            cluster_node_status_is_offline(&paths, &state, &remote_node),
+            "a stale online status for a probeable remote member must not be trusted for leader forwarding"
         );
         std::fs::remove_dir_all(root).ok();
     }
