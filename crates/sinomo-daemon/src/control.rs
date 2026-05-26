@@ -15,8 +15,8 @@ use crate::{
     handle_daemon_dfs_status, handle_daemon_finalize_shadow_rollout,
     handle_daemon_rollout_binary_request, handle_daemon_rollout_build_request,
     handle_daemon_rollout_diagnostics, handle_forwarded_daemon_cluster_kv_txn_request,
-    read_daemon_status, run_daemon_dfs_maintenance_tick, run_daemon_dfs_smoke,
-    start_daemon_iroh_proxy_if_clustered,
+    prune_local_cluster_raft_uncommitted_tail, read_daemon_status, run_daemon_dfs_maintenance_tick,
+    run_daemon_dfs_smoke, start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
 use sinomo_rollout::{SelfRolloutPaths, read_rollout_status};
@@ -245,6 +245,9 @@ pub fn run_daemon_control_loop(
     cluster: Option<DaemonClusterStatus>,
 ) -> Result<(), DaemonError> {
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
+    if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
+        eprintln!("sinomo {label} cluster raft startup repair skipped: {error}");
+    }
     if label == "daemon" {
         ensure_default_local_dfs_expose(&paths)?;
     }

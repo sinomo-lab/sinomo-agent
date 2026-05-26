@@ -496,6 +496,16 @@ pub fn handle_daemon_cluster_kv_snapshot(paths: &DaemonPaths) -> Result<KvSnapsh
         .map_err(Into::into)
 }
 
+pub fn prune_local_cluster_raft_uncommitted_tail(paths: &DaemonPaths) -> Result<(), DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
+        return Ok(());
+    };
+    let _raft_guard = lock_cluster_raft_operation()?;
+    sinomo_network::discard_cluster_raft_uncommitted_tail(&cluster_paths, &state.local_node_id)?;
+    Ok(())
+}
+
 pub fn handle_daemon_cluster_kv_range_prefix(
     paths: &DaemonPaths,
     prefix: &str,
