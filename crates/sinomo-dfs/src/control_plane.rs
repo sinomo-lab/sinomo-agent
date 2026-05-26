@@ -327,10 +327,10 @@ fn select_metadata_shard_for_path(
                         shard.shard_id.clone(),
                         shard,
                     );
-                    if hash_match
-                        .as_ref()
-                        .is_none_or(|current| candidate.0 < current.0 || candidate.1 < current.1)
-                    {
+                    if hash_match.as_ref().is_none_or(|current| {
+                        candidate.0 < current.0
+                            || (candidate.0 == current.0 && candidate.1 < current.1)
+                    }) {
                         hash_match = Some(candidate);
                     }
                 }
@@ -632,6 +632,52 @@ mod tests {
                 .expect("select hash")
                 .map(|shard| shard.shard_id),
             Some("hash-selected".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_shard_selection_prefers_narrower_hash_range() {
+        let node_owner = node("node_shard_hash_width_owner");
+        let mut kv = InProcessRaftKvCluster::new(vec![node_owner.clone()]).expect("kv cluster");
+        let file_system_id = file_system_id();
+        let selected_path = "/users/bob/project";
+        let hash = metadata_name_hash(selected_path);
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        for shard in [
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "aaa-broad".to_string(),
+                primary_node_id: node_owner.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::NameHashRange {
+                    start_inclusive: hash.wrapping_sub(100),
+                    end_exclusive: hash.wrapping_add(101),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "zzz-narrow".to_string(),
+                primary_node_id: node_owner.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::NameHashRange {
+                    start_inclusive: hash,
+                    end_exclusive: hash.wrapping_add(1),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ] {
+            control.put_metadata_shard(&shard).expect("put shard");
+        }
+
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, selected_path)
+                .expect("select hash")
+                .map(|shard| shard.shard_id),
+            Some("zzz-narrow".to_string())
         );
     }
 
