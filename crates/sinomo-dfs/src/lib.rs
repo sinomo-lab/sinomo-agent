@@ -82,6 +82,7 @@ use sinomo_network::{
 };
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -1830,7 +1831,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     pub fn put_local_object_version(
         &mut self,
-        mut object: DfsObjectMetadata,
+        object: DfsObjectMetadata,
         bytes: &[u8],
     ) -> Result<String, DfsError> {
         let manifest = self.content.put_object_version(
@@ -1838,6 +1839,27 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             object.version.as_str(),
             bytes,
         )?;
+        self.publish_local_object_manifest(object, manifest)
+    }
+
+    pub fn put_local_object_version_from_reader<R: Read>(
+        &mut self,
+        object: DfsObjectMetadata,
+        reader: R,
+    ) -> Result<String, DfsError> {
+        let manifest = self.content.put_object_version_from_reader(
+            object.object_id.as_str(),
+            object.version.as_str(),
+            reader,
+        )?;
+        self.publish_local_object_manifest(object, manifest)
+    }
+
+    fn publish_local_object_manifest(
+        &mut self,
+        mut object: DfsObjectMetadata,
+        manifest: ContentManifest,
+    ) -> Result<String, DfsError> {
         object.content_hash = Some(manifest.content_hash.clone());
         object.content_size_bytes = Some(manifest.size_bytes);
         if !object.current_locations.contains(&self.node_id) {
@@ -7458,6 +7480,41 @@ mod tests {
             .expect("metadata backend");
         dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
         dfs
+    }
+
+    #[test]
+    fn put_local_object_version_from_reader_streams_to_content_store() {
+        let root = temp_root("put-local-object-version-from-reader");
+        let node_id = NodeId::from_legacy_named("node_stream_local_object").expect("node");
+        let object_id = DfsObjectId::from_legacy_named("obj_stream_local_object").expect("object");
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        let mut metadata = file_metadata(node_id);
+        metadata.object_id = object_id.clone();
+        metadata.path = "/services/streamed.bin".to_string();
+        let size = 256 * 1024 + 31;
+        let reader = std::io::repeat(0x42).take(size);
+
+        let content_hash = dfs
+            .put_local_object_version_from_reader(metadata, reader)
+            .expect("stream object");
+
+        let object = dfs
+            .current_read_object_metadata(&object_id)
+            .expect("streamed object metadata");
+        assert_eq!(object.content_hash.as_deref(), Some(content_hash.as_str()));
+        assert_eq!(object.content_size_bytes, Some(size));
+        let bytes = dfs.content.read_blob(&content_hash).expect("streamed blob");
+        assert_eq!(bytes.len() as u64, size);
+        assert!(bytes.iter().all(|byte| *byte == 0x42));
+        assert!(
+            std::fs::read_dir(root.join("content/staging"))
+                .expect("content staging")
+                .next()
+                .is_none(),
+            "streaming local object writes must clean temporary staging files"
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

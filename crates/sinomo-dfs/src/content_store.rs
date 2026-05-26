@@ -76,8 +76,7 @@ impl LocalContentStore {
             return Err(ContentStoreError::MissingStaged(intent_id.to_owned()));
         }
 
-        let bytes = read_file(&staging_path)?;
-        let manifest = self.write_object_version(object_id, version, &bytes)?;
+        let manifest = self.write_object_version_from_file(object_id, version, &staging_path)?;
         remove_file(&staging_path)?;
         Ok(manifest)
     }
@@ -89,6 +88,23 @@ impl LocalContentStore {
         bytes: &[u8],
     ) -> Result<ContentManifest> {
         self.write_object_version(object_id, version, bytes)
+    }
+
+    pub fn put_object_version_from_reader<R: Read>(
+        &self,
+        object_id: &str,
+        version: &str,
+        mut reader: R,
+    ) -> Result<ContentManifest> {
+        let staging_anchor = self.root.join("staging").join("streamed-object-version");
+        let tmp_path = temporary_path_for(&staging_anchor);
+        if let Err(error) = write_reader_to_file(&tmp_path, &mut reader) {
+            remove_file_if_exists(&tmp_path).ok();
+            return Err(error);
+        }
+        let result = self.write_object_version_from_file(object_id, version, &tmp_path);
+        remove_file_if_exists(&tmp_path).ok();
+        result
     }
 
     pub fn read_blob(&self, hash: &str) -> Result<Vec<u8>> {
@@ -186,6 +202,63 @@ impl LocalContentStore {
         Ok(manifest)
     }
 
+    fn write_object_version_from_file(
+        &self,
+        object_id: &str,
+        version: &str,
+        source_path: &Path,
+    ) -> Result<ContentManifest> {
+        let (hash, size_bytes) = file_content_hash_and_size(source_path)?;
+        let manifest_path = self.manifest_path(object_id, version);
+        if manifest_path.is_file() {
+            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            if existing.content_hash != hash {
+                return Err(ContentStoreError::VersionHashConflict {
+                    object_id: object_id.to_owned(),
+                    version: version.to_owned(),
+                    existing_hash: existing.content_hash,
+                    new_hash: hash,
+                });
+            }
+            let blob_path = self.blob_path(&hash)?;
+            if !self.has_blob(&hash)? {
+                publish_file_as_blob(source_path, &blob_path, &hash)?;
+            }
+            return Ok(existing);
+        }
+
+        let blob_path = self.blob_path(&hash)?;
+        if !self.has_blob(&hash)? {
+            publish_file_as_blob(source_path, &blob_path, &hash)?;
+        }
+
+        let manifest = ContentManifest {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: hash,
+            size_bytes,
+        };
+        let manifest_bytes = encode_manifest(&manifest)?;
+        if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
+            if let ContentStoreError::Io { source, .. } = &error
+                && source.kind() == io::ErrorKind::AlreadyExists
+            {
+                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                if existing.content_hash != manifest.content_hash {
+                    return Err(ContentStoreError::VersionHashConflict {
+                        object_id: object_id.to_owned(),
+                        version: version.to_owned(),
+                        existing_hash: existing.content_hash,
+                        new_hash: manifest.content_hash,
+                    });
+                }
+                return Ok(existing);
+            }
+            return Err(error);
+        }
+        Ok(manifest)
+    }
+
     fn blob_path(&self, hash: &str) -> Result<PathBuf> {
         let hex = hash_hex(hash)?;
         Ok(self.root.join("blobs").join(&hex[..2]).join(hex))
@@ -230,12 +303,17 @@ fn ensure_bytes_match_hash(hash: &str, bytes: &[u8]) -> Result<()> {
 }
 
 fn file_content_hash(path: &Path) -> Result<String> {
+    file_content_hash_and_size(path).map(|(hash, _)| hash)
+}
+
+fn file_content_hash_and_size(path: &Path) -> Result<(String, u64)> {
     let mut file = fs::File::open(path).map_err(|source| ContentStoreError::Io {
         path: path.to_owned(),
         source,
     })?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
+    let mut size_bytes = 0u64;
     loop {
         let read = file
             .read(&mut buffer)
@@ -246,9 +324,18 @@ fn file_content_hash(path: &Path) -> Result<String> {
         if read == 0 {
             break;
         }
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| ContentStoreError::Io {
+                path: path.to_owned(),
+                source: io::Error::new(io::ErrorKind::InvalidData, "content size overflow"),
+            })?;
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{HASH_PREFIX}{}", hasher.finalize().to_hex()))
+    Ok((
+        format!("{HASH_PREFIX}{}", hasher.finalize().to_hex()),
+        size_bytes,
+    ))
 }
 
 fn hash_hex(hash: &str) -> Result<&str> {
@@ -295,6 +382,122 @@ fn remove_file(path: &Path) -> Result<()> {
         path: path.to_owned(),
         source,
     })
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn write_reader_to_file<R: Read>(path: &Path, reader: &mut R) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    let mut file = fs::File::create(path).map_err(|source| ContentStoreError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|source| ContentStoreError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+    }
+    file.sync_all().map_err(|source| ContentStoreError::Io {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn publish_file_as_blob(source_path: &Path, blob_path: &Path, expected_hash: &str) -> Result<()> {
+    if let Some(parent) = blob_path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    if blob_path.exists() {
+        if file_content_hash(blob_path).is_ok_and(|actual| actual == expected_hash) {
+            return Ok(());
+        }
+        remove_file_if_exists(blob_path)?;
+    }
+
+    match fs::hard_link(source_path, blob_path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            if file_content_hash(blob_path).is_ok_and(|actual| actual == expected_hash) {
+                return Ok(());
+            }
+            remove_file_if_exists(blob_path)?;
+            copy_file_create_new_or_existing(source_path, blob_path, expected_hash)?;
+        }
+        Err(_) => {
+            copy_file_create_new_or_existing(source_path, blob_path, expected_hash)?;
+        }
+    }
+    if let Some(parent) = blob_path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn copy_file_create_new_or_existing(
+    source_path: &Path,
+    target_path: &Path,
+    expected_hash: &str,
+) -> Result<()> {
+    match copy_file_create_new(source_path, target_path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let ContentStoreError::Io { source, .. } = &error
+                && source.kind() == io::ErrorKind::AlreadyExists
+                && file_content_hash(target_path).is_ok_and(|actual| actual == expected_hash)
+            {
+                return Ok(());
+            }
+            Err(error)
+        }
+    }
+}
+
+fn copy_file_create_new(source_path: &Path, target_path: &Path) -> Result<()> {
+    let mut source_file = fs::File::open(source_path).map_err(|source| ContentStoreError::Io {
+        path: source_path.to_owned(),
+        source,
+    })?;
+    let mut target_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target_path)
+        .map_err(|source| ContentStoreError::Io {
+            path: target_path.to_owned(),
+            source,
+        })?;
+    io::copy(&mut source_file, &mut target_file).map_err(|source| ContentStoreError::Io {
+        path: target_path.to_owned(),
+        source,
+    })?;
+    target_file
+        .sync_all()
+        .map_err(|source| ContentStoreError::Io {
+            path: target_path.to_owned(),
+            source,
+        })
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -425,6 +628,41 @@ mod tests {
                 .manifests_for_object("object-a")
                 .expect("object manifests"),
             vec![manifest]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_version_from_reader_streams_blob_and_manifest() {
+        let root = temp_root("put_object_version_from_reader_streams_blob_and_manifest");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let size = 192 * 1024 + 17;
+        let reader = std::io::repeat(0x5a).take(size);
+
+        let manifest = store
+            .put_object_version_from_reader("object-large", "v1", reader)
+            .expect("put object version from reader");
+
+        assert_eq!(manifest.object_id, "object-large");
+        assert_eq!(manifest.version, "v1");
+        assert_eq!(manifest.size_bytes, size);
+        assert!(store.has_blob(&manifest.content_hash).expect("has blob"));
+        let bytes = store.read_blob(&manifest.content_hash).expect("read blob");
+        assert_eq!(bytes.len() as u64, size);
+        assert!(bytes.iter().all(|byte| *byte == 0x5a));
+        assert_eq!(
+            store
+                .read_manifest("object-large", "v1")
+                .expect("read manifest"),
+            manifest
+        );
+        assert!(
+            std::fs::read_dir(root.join("staging"))
+                .expect("staging dir")
+                .next()
+                .is_none(),
+            "streaming writes must not leave temporary staging files"
         );
 
         cleanup(&root);
