@@ -54,7 +54,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const DAEMON_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
 pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
-pub const DAEMON_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT: Duration = DAEMON_CLUSTER_RPC_TIMEOUT;
+pub const DAEMON_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 pub const DAEMON_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
