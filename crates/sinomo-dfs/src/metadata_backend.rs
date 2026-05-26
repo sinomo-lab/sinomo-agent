@@ -25,6 +25,13 @@ use time::OffsetDateTime;
 pub const DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT: u64 = 4096;
 const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
+const SECONDARY_INDEX_DIRS: &[&str] = &[
+    "filesystem-objects",
+    "paths",
+    "dentries",
+    "dirfrags",
+    "hardlinks",
+];
 
 #[derive(Debug, Error)]
 pub enum MetadataBackendError {
@@ -502,7 +509,10 @@ impl LocalJsonMetadataBackend {
             root,
             next_sequence,
         };
-        backend.recover_secondary_indexes()?;
+        if backend.secondary_indexes_need_recovery() {
+            backend.recover_secondary_indexes()?;
+        }
+        backend.ensure_secondary_index_dirs()?;
         backend.recover_namespace_transactions()?;
         backend.recover_visible_version_commits()?;
         Ok(backend)
@@ -1448,17 +1458,24 @@ impl LocalJsonMetadataBackend {
                 .then_with(|| left.path.cmp(&right.path))
                 .then_with(|| left.object_id.cmp(&right.object_id))
         });
-        for index_dir in [
-            "filesystem-objects",
-            "paths",
-            "dentries",
-            "dirfrags",
-            "hardlinks",
-        ] {
+        for index_dir in SECONDARY_INDEX_DIRS {
             remove_dir_all_if_exists(&self.records_root().join(index_dir))?;
         }
         for object in objects {
             self.materialize_object_indexes_with_previous(&object, None)?;
+        }
+        Ok(())
+    }
+
+    fn secondary_indexes_need_recovery(&self) -> bool {
+        SECONDARY_INDEX_DIRS
+            .iter()
+            .any(|index_dir| !self.records_root().join(index_dir).is_dir())
+    }
+
+    fn ensure_secondary_index_dirs(&self) -> Result<()> {
+        for index_dir in SECONDARY_INDEX_DIRS {
+            create_dir_all(self.records_root().join(index_dir))?;
         }
         Ok(())
     }
@@ -2477,6 +2494,29 @@ mod tests {
             .expect("reopen");
         assert_eq!(reopened.journal_since(1).expect("journal").len(), 1);
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_open_does_not_rebuild_existing_secondary_indexes() {
+        let root = temp_root("local_backend_open_preserves_secondary_indexes");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend
+            .put_object(&object(version("version_1")))
+            .expect("object");
+        let sentinel = root.join("records/filesystem-objects/.sentinel");
+        fs::write(&sentinel, b"keep").expect("sentinel");
+
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen backend");
+
+        assert!(
+            sentinel.exists(),
+            "opening a healthy backend must not delete shared secondary index directories"
+        );
         cleanup(&root);
     }
 
