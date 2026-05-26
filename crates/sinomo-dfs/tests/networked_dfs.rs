@@ -2633,7 +2633,7 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
-    .with_control_plane(control_plane)
+    .with_control_plane(control_plane.clone())
     .with_metadata_backend(owner_backend)
     .expect("owner metadata backend");
     let mut replica_dfs = NetworkedDfsService::new(
@@ -2764,6 +2764,30 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
         [DfsMetadataReplicationOutcome::NoChanges { after_sequence, .. }]
             if *after_sequence as usize == expected_entries
     ));
+
+    drop(owner_dfs);
+    let restarted_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
+            .expect("restarted owner metadata");
+    let mut restarted_owner = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content-restarted"))
+            .expect("restarted owner content"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(restarted_backend)
+    .expect("restarted owner metadata backend");
+    let restarted_outcomes = restarted_owner
+        .replicate_metadata_shard_to_configured_replicas(&file_system_id, "root")
+        .expect("restarted metadata replication check");
+    assert!(
+        matches!(
+            restarted_outcomes.as_slice(),
+            [DfsMetadataReplicationOutcome::NoChanges { after_sequence, .. }]
+                if *after_sequence as usize == expected_entries
+        ),
+        "restarted owner should load the durable replication cursor instead of resending the full journal: {restarted_outcomes:?}"
+    );
 
     cleanup(&root);
 }

@@ -491,6 +491,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         entries.truncate(max_entries);
         Ok(entries)
     }
+    fn metadata_replication_cursor(
+        &self,
+        _target_node_id: &NodeId,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<u64> {
+        Ok(0)
+    }
+    fn put_metadata_replication_cursor(
+        &mut self,
+        _target_node_id: &NodeId,
+        _shard_id: &DfsMetadataShardId,
+        _next_after_sequence: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription;
     fn poll_subscription(
@@ -998,6 +1013,17 @@ impl LocalJsonMetadataBackend {
             .join(format!("{}.sobj", key_segment(&shard_id.0)))
     }
 
+    fn metadata_replication_cursor_path(
+        &self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+    ) -> PathBuf {
+        self.records_root()
+            .join("metadata-replication-cursors")
+            .join(key_segment(target_node_id))
+            .join(format!("{}.sobj", key_segment(&shard_id.0)))
+    }
+
     fn journal_head_path(&self) -> PathBuf {
         self.root.join("journal").join("head.sobj")
     }
@@ -1396,6 +1422,35 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         max_entries: usize,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         LocalJsonMetadataBackend::journal_since_limited(self, after_sequence, max_entries)
+    }
+
+    fn metadata_replication_cursor(
+        &self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<u64> {
+        Ok(read_json_optional::<DfsMetadataReplayCursor>(
+            &self.metadata_replication_cursor_path(target_node_id, shard_id),
+        )?
+        .map(|cursor| cursor.last_sequence)
+        .unwrap_or(0))
+    }
+
+    fn put_metadata_replication_cursor(
+        &mut self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+        next_after_sequence: u64,
+    ) -> Result<()> {
+        let next_after_sequence =
+            next_after_sequence.max(self.metadata_replication_cursor(target_node_id, shard_id)?);
+        write_json_atomic(
+            &self.metadata_replication_cursor_path(target_node_id, shard_id),
+            &DfsMetadataReplayCursor {
+                shard_id: shard_id.clone(),
+                last_sequence: next_after_sequence,
+            },
+        )
     }
 
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
@@ -3854,6 +3909,39 @@ mod tests {
 
         cleanup(&leader_root);
         cleanup(&follower_root);
+    }
+
+    #[test]
+    fn local_backend_persists_metadata_replication_cursor_monotonically() {
+        let root = temp_root("local_backend_metadata_replication_cursor");
+        let target_node_id = node("node_cursor_target");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+        assert_eq!(
+            backend
+                .metadata_replication_cursor(&target_node_id, &shard_id)
+                .expect("initial cursor"),
+            0
+        );
+
+        backend
+            .put_metadata_replication_cursor(&target_node_id, &shard_id, 42)
+            .expect("write cursor");
+        backend
+            .put_metadata_replication_cursor(&target_node_id, &shard_id, 7)
+            .expect("stale cursor");
+        let reopened =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("reopen");
+
+        assert_eq!(
+            reopened
+                .metadata_replication_cursor(&target_node_id, &shard_id)
+                .expect("reopened cursor"),
+            42,
+            "older acknowledgements must not move a durable replication cursor backwards"
+        );
+        cleanup(&root);
     }
 
     #[test]

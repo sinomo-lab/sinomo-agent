@@ -1407,11 +1407,18 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .filter(|target_node_id| target_node_id != &local_node_id)
         {
             let cursor_key = (target_node_id.clone(), shard_id.clone());
-            let after_sequence = self
-                .metadata_replication_cursors
-                .get(&cursor_key)
-                .copied()
-                .unwrap_or(0);
+            let after_sequence =
+                if let Some(after_sequence) = self.metadata_replication_cursors.get(&cursor_key) {
+                    *after_sequence
+                } else if let Some(backend) = self.metadata_backend.as_ref() {
+                    let after_sequence =
+                        backend.metadata_replication_cursor(&target_node_id, &shard_id)?;
+                    self.metadata_replication_cursors
+                        .insert(cursor_key.clone(), after_sequence);
+                    after_sequence
+                } else {
+                    0
+                };
             let Some(batch) = self.metadata_journal_batch_since(after_sequence)? else {
                 outcomes.push(DfsMetadataReplicationOutcome::NoChanges {
                     target_node_id,
@@ -2505,7 +2512,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 }
                 DfsNetworkMessage::MetadataJournalBatchResponse(response) => {
                     if let Some(event) =
-                        self.handle_metadata_journal_batch_response(source_node_id, response)
+                        self.handle_metadata_journal_batch_response(source_node_id, response)?
                     {
                         events.push(event);
                     }
@@ -2547,21 +2554,26 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         &mut self,
         source_node_id: NodeId,
         response: DfsMetadataJournalBatchResponse,
-    ) -> Option<NetworkedDfsServiceEvent> {
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
         let pending = self
             .pending_metadata_replications
-            .remove(&response.request_id)?;
+            .remove(&response.request_id);
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
         if pending.target_node_id != source_node_id || pending.shard_id != response.shard_id {
-            return Some(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
-                request_id: response.request_id,
-                source_node_id,
-                shard_id: response.shard_id,
-                reason: "metadata journal batch response does not match pending replication"
-                    .to_string(),
-            });
+            return Ok(Some(
+                NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                    request_id: response.request_id,
+                    source_node_id,
+                    shard_id: response.shard_id,
+                    reason: "metadata journal batch response does not match pending replication"
+                        .to_string(),
+                },
+            ));
         }
 
-        match response.result {
+        Ok(match response.result {
             DfsMetadataJournalBatchResult::Applied => {
                 let cursor_key = (source_node_id.clone(), response.shard_id.clone());
                 let cursor = self
@@ -2571,6 +2583,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 *cursor = (*cursor)
                     .max(response.next_after_sequence)
                     .max(pending.next_after_sequence);
+                if let Some(backend) = self.metadata_backend.as_mut() {
+                    backend.put_metadata_replication_cursor(
+                        &source_node_id,
+                        &response.shard_id,
+                        *cursor,
+                    )?;
+                }
                 Some(NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
                     request_id: response.request_id,
                     source_node_id,
@@ -2587,7 +2606,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     reason,
                 })
             }
-        }
+        })
     }
 
     fn metadata_journal_batch_since(
