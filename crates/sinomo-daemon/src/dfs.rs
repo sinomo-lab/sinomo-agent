@@ -11,10 +11,11 @@ use sinomo_dfs::{
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy, DfsWriteOptions,
-    LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService, content_service_key,
-    content_services_prefix, distributed_sifs, distributed_sifs_bootstrap_objects,
-    fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy,
+    DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService,
+    content_service_key, content_services_prefix, distributed_sifs,
+    distributed_sifs_bootstrap_objects, fallback_dfs_node_id, file_system_config_key,
+    metadata_service_key, metadata_shard_key, sifs_node_files_path,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
@@ -217,7 +218,7 @@ pub fn ensure_default_distributed_dfs(
     } else {
         sinomo_network::read_cluster_state_without_kv(&cluster_paths)?
     };
-    let file_system = distributed_sifs(state.local_node_id.clone());
+    let file_system = default_cluster_sifs(&state);
     let mut backend = LocalJsonMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         data_dir.dfs_dir().join("metadata").join("root"),
@@ -225,7 +226,7 @@ pub fn ensure_default_distributed_dfs(
     if backend.get_file_system(&file_system.file_system_id)? != Some(file_system.clone()) {
         backend.put_file_system(&file_system)?;
     }
-    for object in distributed_sifs_bootstrap_objects(state.local_node_id.clone()) {
+    for object in default_cluster_sifs_bootstrap_objects(&state) {
         if backend
             .get_object_by_path(&object.file_system_id, object.path.trim_matches('/'))?
             .is_none()
@@ -254,25 +255,12 @@ pub fn ensure_default_distributed_dfs(
         file_system_config_key(&file_system.file_system_id),
         &DfsFileSystemConfig::from(&file_system),
     )?;
+    let root_shard = default_cluster_root_metadata_shard(&cluster_paths, &state, &file_system)?;
     put_cluster_kv_control_record(
         &cluster_paths,
         &state.local_node_id,
         metadata_shard_key(&file_system.file_system_id, "root"),
-        &DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: state.local_node_id.clone(),
-            replica_node_ids: state
-                .members
-                .iter()
-                .filter(|member| member.node_id != state.local_node_id)
-                .take(2)
-                .map(|member| member.node_id.clone())
-                .collect(),
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        },
+        &root_shard,
     )?;
     publish_dfs_service_advertisements_for_cluster(&cluster_paths, &state, options)?;
     Ok(())
@@ -302,7 +290,40 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
     if !scheduled_repairs.is_empty() {
         service.process_incoming()?;
     }
+    log_dfs_metadata_replication_report(publish_default_dfs_metadata_journal(paths)?);
     Ok(())
+}
+
+pub fn log_dfs_metadata_replication_report(report: DaemonDfsMetadataReplicationReport) {
+    for outcome in report.outcomes {
+        match outcome {
+            DaemonDfsMetadataReplicationOutcome::Applied {
+                target_node_id,
+                entries,
+                ..
+            } => {
+                eprintln!(
+                    "sinomo daemon replicated {entries} DFS metadata journal entries to {target_node_id}"
+                );
+            }
+            DaemonDfsMetadataReplicationOutcome::Rejected {
+                target_node_id,
+                reason,
+                ..
+            }
+            | DaemonDfsMetadataReplicationOutcome::Failed {
+                target_node_id,
+                reason,
+                ..
+            } => {
+                eprintln!(
+                    "sinomo daemon DFS metadata replication to {target_node_id} failed: {reason}"
+                );
+            }
+            DaemonDfsMetadataReplicationOutcome::NoChanges { .. }
+            | DaemonDfsMetadataReplicationOutcome::MissingEndpoint { .. } => {}
+        }
+    }
 }
 
 fn publish_dfs_service_advertisements_for_cluster(
@@ -312,20 +333,166 @@ fn publish_dfs_service_advertisements_for_cluster(
 ) -> Result<(), DaemonError> {
     for member in dfs_service_members(state) {
         let endpoint = dfs_service_endpoint_for_member(state, member, options);
+        let metadata = stable_dfs_advertisement(
+            cluster_paths,
+            metadata_service_key(&member.node_id),
+            DfsNodeAdvertisement::metadata(member.node_id.clone(), endpoint.clone()),
+        )?;
+        let content = stable_dfs_advertisement(
+            cluster_paths,
+            content_service_key(&member.node_id),
+            DfsNodeAdvertisement::content(member.node_id.clone(), endpoint),
+        )?;
         put_cluster_kv_control_record(
             cluster_paths,
             &state.local_node_id,
             metadata_service_key(&member.node_id),
-            &DfsNodeAdvertisement::metadata(member.node_id.clone(), endpoint.clone()),
+            &metadata,
         )?;
         put_cluster_kv_control_record(
             cluster_paths,
             &state.local_node_id,
             content_service_key(&member.node_id),
-            &DfsNodeAdvertisement::content(member.node_id.clone(), endpoint),
+            &content,
         )?;
     }
     Ok(())
+}
+
+fn stable_dfs_advertisement(
+    cluster_paths: &ClusterPaths,
+    key: String,
+    desired: DfsNodeAdvertisement,
+) -> Result<DfsNodeAdvertisement, DaemonError> {
+    let Some(current) =
+        sinomo_network::read_cluster_kv_value::<DfsNodeAdvertisement>(cluster_paths, &key)?
+    else {
+        return Ok(desired);
+    };
+    if current.node_id == desired.node_id
+        && current.endpoint == desired.endpoint
+        && current.accepts_metadata == desired.accepts_metadata
+        && current.accepts_content == desired.accepts_content
+        && current.capacity_weight == desired.capacity_weight
+        && current.zone == desired.zone
+    {
+        return Ok(current);
+    }
+    Ok(desired)
+}
+
+fn default_cluster_sifs(state: &ClusterBootstrapState) -> sinomo_dfs::DfsFileSystem {
+    let owner_node_id = default_cluster_sifs_owner(state);
+    let mut file_system = distributed_sifs(owner_node_id.clone());
+    file_system.owner_node_id = owner_node_id;
+    file_system.subtree_policies = default_cluster_sifs_subtree_policies(state);
+    file_system
+}
+
+fn default_cluster_sifs_owner(state: &ClusterBootstrapState) -> sinomo_node::NodeId {
+    stable_dfs_service_node_ids(state)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| state.local_node_id.clone())
+}
+
+fn default_cluster_sifs_subtree_policies(state: &ClusterBootstrapState) -> Vec<DfsSubtreePolicy> {
+    let mut policies = stable_dfs_service_node_ids(state)
+        .into_iter()
+        .map(|node_id| DfsSubtreePolicy {
+            path_prefix: sifs_node_files_path(&node_id),
+            policy: DfsObjectPolicy::LocalOwned,
+        })
+        .collect::<Vec<_>>();
+    if policies.is_empty() {
+        policies.push(DfsSubtreePolicy {
+            path_prefix: sifs_node_files_path(&state.local_node_id),
+            policy: DfsObjectPolicy::LocalOwned,
+        });
+    }
+    policies.push(DfsSubtreePolicy {
+        path_prefix: sinomo_dfs::SIFS_USERS_PATH.to_string(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+    });
+    policies.push(DfsSubtreePolicy {
+        path_prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+    });
+    policies
+}
+
+fn default_cluster_sifs_bootstrap_objects(
+    state: &ClusterBootstrapState,
+) -> Vec<sinomo_dfs::DfsObjectMetadata> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut objects = Vec::new();
+    let mut node_ids = stable_dfs_service_node_ids(state);
+    if node_ids.is_empty() {
+        node_ids.push(state.local_node_id.clone());
+    }
+    for node_id in node_ids {
+        for object in distributed_sifs_bootstrap_objects(node_id) {
+            if seen.insert(object.path.clone()) {
+                objects.push(object);
+            }
+        }
+    }
+    objects
+}
+
+fn default_cluster_root_metadata_shard(
+    cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    file_system: &sinomo_dfs::DfsFileSystem,
+) -> Result<DfsMetadataShardConfig, DaemonError> {
+    let primary_node_id = default_cluster_sifs_owner(state);
+    let replica_node_ids = stable_dfs_service_node_ids(state)
+        .into_iter()
+        .filter(|node_id| node_id != &primary_node_id)
+        .take(2)
+        .collect::<Vec<_>>();
+    let key = metadata_shard_key(&file_system.file_system_id, "root");
+    let mut desired = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id,
+        replica_node_ids,
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let Some(current) =
+        sinomo_network::read_cluster_kv_value::<DfsMetadataShardConfig>(cluster_paths, &key)?
+    else {
+        return Ok(desired);
+    };
+    if metadata_shard_layout_matches(&current, &desired) {
+        return Ok(current);
+    }
+    desired.epoch = current.epoch.saturating_add(1);
+    Ok(desired)
+}
+
+fn metadata_shard_layout_matches(
+    left: &DfsMetadataShardConfig,
+    right: &DfsMetadataShardConfig,
+) -> bool {
+    left.file_system_id == right.file_system_id
+        && left.shard_id == right.shard_id
+        && left.primary_node_id == right.primary_node_id
+        && left.replica_node_ids == right.replica_node_ids
+        && left.assignment == right.assignment
+        && left.default_policy == right.default_policy
+}
+
+fn stable_dfs_service_node_ids(state: &ClusterBootstrapState) -> Vec<sinomo_node::NodeId> {
+    let mut node_ids = dfs_service_members(state)
+        .into_iter()
+        .map(|member| member.node_id.clone())
+        .collect::<Vec<_>>();
+    node_ids.sort();
+    node_ids.dedup();
+    node_ids
 }
 
 fn dfs_service_members(state: &ClusterBootstrapState) -> Vec<&ClusterMemberRecord> {
@@ -550,13 +717,15 @@ pub fn publish_default_dfs_metadata_journal(
     }
     let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
     let file_system = distributed_sifs(state.local_node_id.clone());
-    let store = sinomo_network::read_cluster_kv_store(&cluster_paths)?;
-    let Some(entry) = store.get(&metadata_shard_key(&file_system.file_system_id, "root")) else {
+    let Some(shard) = sinomo_network::read_cluster_kv_value::<DfsMetadataShardConfig>(
+        &cluster_paths,
+        &metadata_shard_key(&file_system.file_system_id, "root"),
+    )?
+    else {
         return Ok(DaemonDfsMetadataReplicationReport {
             outcomes: Vec::new(),
         });
     };
-    let shard: DfsMetadataShardConfig = entry.decode()?;
     if shard.primary_node_id != state.local_node_id {
         return Ok(DaemonDfsMetadataReplicationReport {
             outcomes: Vec::new(),
@@ -677,14 +846,13 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
         return Err(DaemonError::ClusterOrphan);
     }
     let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    let store = sinomo_network::read_cluster_kv_store(&cluster_paths)?;
-    let mut content_nodes = store
-        .range_prefix(content_services_prefix())
-        .into_iter()
-        .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
-        .filter(|advertisement| advertisement.accepts_content)
-        .map(|advertisement| advertisement.node_id)
-        .collect::<Vec<_>>();
+    let mut content_nodes =
+        sinomo_network::read_cluster_kv_prefix_entries(&cluster_paths, content_services_prefix())?
+            .into_iter()
+            .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
+            .filter(|advertisement| advertisement.accepts_content)
+            .map(|advertisement| advertisement.node_id)
+            .collect::<Vec<_>>();
     content_nodes.sort();
     content_nodes.dedup();
 
@@ -1318,6 +1486,103 @@ mod tests {
     }
 
     #[test]
+    fn default_cluster_sifs_covers_every_dfs_service_node() {
+        let state = test_cluster_state_with_members(
+            "cluster_dfs_default_sifs",
+            "node_dfs_default_local",
+            &["node_dfs_default_remote_a", "node_dfs_default_remote_b"],
+        );
+        let file_system = default_cluster_sifs(&state);
+
+        let expected_node_ids = stable_dfs_service_node_ids(&state);
+        assert_eq!(file_system.owner_node_id, expected_node_ids[0]);
+        for node_id in expected_node_ids {
+            assert!(file_system.subtree_policies.iter().any(|policy| {
+                policy.path_prefix == sifs_node_files_path(&node_id)
+                    && policy.policy == DfsObjectPolicy::LocalOwned
+            }));
+        }
+        assert!(file_system.subtree_policies.iter().any(|policy| {
+            policy.path_prefix == sinomo_dfs::SIFS_USERS_PATH
+                && policy.policy == DfsObjectPolicy::ReplicatedEventual
+        }));
+        assert!(file_system.subtree_policies.iter().any(|policy| {
+            policy.path_prefix == sinomo_dfs::SIFS_SERVICES_PATH
+                && policy.policy == DfsObjectPolicy::ReplicatedEventual
+        }));
+    }
+
+    #[test]
+    fn default_root_metadata_shard_is_deterministic_and_epoch_stable() {
+        let root = temp_root("default_root_metadata_shard_is_deterministic");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let state = test_cluster_state_with_members(
+            "cluster_dfs_default_root_shard",
+            "node_dfs_default_root_local",
+            &[
+                "node_dfs_default_root_remote_a",
+                "node_dfs_default_root_remote_b",
+            ],
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let file_system = default_cluster_sifs(&state);
+        let expected_primary = stable_dfs_service_node_ids(&state)[0].clone();
+        let old_primary = stable_dfs_service_node_ids(&state)
+            .into_iter()
+            .rev()
+            .find(|node_id| node_id != &expected_primary)
+            .expect("remote primary");
+        let old_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: old_primary,
+            replica_node_ids: Vec::new(),
+            epoch: 9,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &state.local_node_id,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &old_shard,
+                    None,
+                )
+                .expect("put shard op"),
+            ),
+        )
+        .expect("write old shard");
+
+        let migrated = default_cluster_root_metadata_shard(&cluster_paths, &state, &file_system)
+            .expect("default shard");
+        assert_eq!(migrated.primary_node_id, expected_primary);
+        assert_eq!(migrated.epoch, 10);
+
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &state.local_node_id,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &migrated,
+                    None,
+                )
+                .expect("put migrated op"),
+            ),
+        )
+        .expect("write migrated shard");
+        let stable = default_cluster_root_metadata_shard(&cluster_paths, &state, &file_system)
+            .expect("stable shard");
+        assert_eq!(stable, migrated);
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn dfs_service_endpoint_prefers_internet_direct_for_remote_members() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
@@ -1379,6 +1644,38 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+    }
+
+    fn test_cluster_state_with_members(
+        cluster_name: &str,
+        local_name: &str,
+        remote_names: &[&str],
+    ) -> sinomo_core::ClusterBootstrapState {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named(cluster_name).expect("cluster id");
+        let local = NodeId::from_legacy_named(local_name).expect("local node");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "daemon dfs test cluster",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        for remote_name in remote_names {
+            let node_id = NodeId::from_legacy_named(*remote_name).expect("remote node");
+            state
+                .members
+                .push(sinomo_core::ClusterMemberRecord::local_voter(
+                    cluster_id.clone(),
+                    node_id,
+                    *remote_name,
+                    format!("pk-{remote_name}"),
+                    now,
+                ));
+        }
+        state
     }
 
     fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {

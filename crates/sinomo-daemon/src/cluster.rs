@@ -6,8 +6,7 @@ use crate::{
     daemon_cluster_status_matches, daemon_connect_address, daemon_options_from_status,
     default_main_daemon_status, ensure_daemon_cluster_members, ensure_default_distributed_dfs,
     fetch_cluster_kv_snapshot_from_endpoint, fetch_daemon_status_from_endpoint,
-    invite_introducers_from_daemon_status, probe_daemon_status,
-    publish_default_dfs_metadata_journal, read_daemon_status,
+    invite_introducers_from_daemon_status, probe_daemon_status, read_daemon_status,
     send_cluster_join_registration_to_channel, send_cluster_kv_txn, send_cluster_kv_watch_events,
     send_cluster_member_publish, send_cluster_raft_append, send_cluster_raft_vote,
     unknown_cluster_node_status, write_daemon_status,
@@ -944,14 +943,19 @@ impl ClusterNetworkMaintenance {
             sinomo_network::cleanup_cluster_iroh_endpoints(&mut state);
             let shadow_options =
                 current_shadow_daemon_options(data_dir, DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT);
-            ensure_daemon_cluster_members(
+            let mut local_state_changed = ensure_daemon_cluster_members(
                 &mut state,
                 options,
                 &shadow_options,
                 time::OffsetDateTime::now_utc(),
             );
+            let state_before_keys = state.clone();
             assign_local_node_public_keys(&cluster_paths, &mut state)?;
-            if refresh_local_iroh_endpoints_from_disk(&cluster_paths, &mut state)? {
+            local_state_changed |=
+                !sinomo_network::cluster_bootstrap_state_stable_eq(&state_before_keys, &state);
+            local_state_changed |=
+                refresh_local_iroh_endpoints_from_disk(&cluster_paths, &mut state)?;
+            if local_state_changed {
                 sinomo_network::write_cluster_state(&cluster_paths, &state)?;
             }
         }
@@ -1010,47 +1014,6 @@ impl ClusterNetworkMaintenance {
                 ) {
                     if let Err(error) = refresh_daemon_node_status_in_kv(&shadow_paths) {
                         eprintln!("sinomo daemon shadow status publish failed: {error}");
-                        publish_failed = true;
-                    }
-                }
-                match publish_default_dfs_metadata_journal(paths) {
-                    Ok(report) => {
-                        for outcome in report.outcomes {
-                            match outcome {
-                                crate::DaemonDfsMetadataReplicationOutcome::Applied {
-                                    target_node_id,
-                                    entries,
-                                    ..
-                                } => {
-                                    eprintln!(
-                                        "sinomo daemon replicated {entries} DFS metadata journal entries to {target_node_id}"
-                                    );
-                                }
-                                crate::DaemonDfsMetadataReplicationOutcome::Rejected {
-                                    target_node_id,
-                                    reason,
-                                    ..
-                                }
-                                | crate::DaemonDfsMetadataReplicationOutcome::Failed {
-                                    target_node_id,
-                                    reason,
-                                    ..
-                                } => {
-                                    eprintln!(
-                                        "sinomo daemon DFS metadata replication to {target_node_id} failed: {reason}"
-                                    );
-                                }
-                                crate::DaemonDfsMetadataReplicationOutcome::NoChanges {
-                                    ..
-                                }
-                                | crate::DaemonDfsMetadataReplicationOutcome::MissingEndpoint {
-                                    ..
-                                } => {}
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("sinomo daemon DFS metadata replication failed: {error}");
                         publish_failed = true;
                     }
                 }
@@ -2238,15 +2201,12 @@ pub fn put_cluster_kv_control_record<T: Serialize>(
     value: &T,
 ) -> Result<(), DaemonError> {
     let op = KvOp::put_serde(key.clone(), value, None)?;
-    if sinomo_network::read_cluster_kv_store(paths)?
-        .get(&key)
-        .is_some_and(|entry| match &op {
-            KvOp::Put {
-                value, lease_id, ..
-            } => entry.value == *value && entry.lease_id == *lease_id,
-            _ => false,
-        })
-    {
+    if sinomo_network::read_cluster_kv_entry(paths, &key)?.is_some_and(|entry| match &op {
+        KvOp::Put {
+            value, lease_id, ..
+        } => entry.value == *value && entry.lease_id == *lease_id,
+        _ => false,
+    }) {
         return Ok(());
     }
     let mut state = sinomo_network::read_cluster_state(paths)?;

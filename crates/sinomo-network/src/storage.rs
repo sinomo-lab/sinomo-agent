@@ -769,18 +769,52 @@ pub fn write_cluster_kv_snapshot_if_changed(
 }
 
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
-    let node_id = read_cluster_state_without_kv(paths)
-        .map(|state| state.local_node_id)
-        .or_else(|error| {
-            if paths.kv_raft.exists() {
-                Err(error)
-            } else {
-                Ok(NodeId::from_legacy_named("cluster_kv_cache_reader")
-                    .expect("static cache reader node id"))
-            }
-        })?;
+    let node_id = read_cluster_kv_reader_node_id(paths)?;
     cluster_kv_local_cache(paths)
         .current_store(node_id)
+        .map_err(Into::into)
+}
+
+pub fn read_cluster_kv_entry(
+    paths: &ClusterPaths,
+    key: &str,
+) -> Result<Option<KvEntry>, NetworkError> {
+    let node_id = read_cluster_kv_reader_node_id(paths)?;
+    cluster_kv_local_cache(paths)
+        .current_get(node_id, key)
+        .map_err(Into::into)
+}
+
+pub fn read_cluster_kv_prefix_entries(
+    paths: &ClusterPaths,
+    prefix: &str,
+) -> Result<Vec<KvEntry>, NetworkError> {
+    let node_id = read_cluster_kv_reader_node_id(paths)?;
+    cluster_kv_local_cache(paths)
+        .current_range_prefix(node_id, prefix)
+        .map_err(Into::into)
+}
+
+pub fn read_cluster_kv_value<T>(paths: &ClusterPaths, key: &str) -> Result<Option<T>, NetworkError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let node_id = read_cluster_kv_reader_node_id(paths)?;
+    cluster_kv_local_cache(paths)
+        .current_get_serde(node_id, key)
+        .map_err(Into::into)
+}
+
+pub fn read_cluster_kv_prefix_values<T>(
+    paths: &ClusterPaths,
+    prefix: &str,
+) -> Result<Vec<T>, NetworkError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let node_id = read_cluster_kv_reader_node_id(paths)?;
+    cluster_kv_local_cache(paths)
+        .current_range_prefix_serde(node_id, prefix)
         .map_err(Into::into)
 }
 
@@ -794,6 +828,19 @@ pub fn read_cluster_kv_snapshot_store(
 
 fn cluster_kv_local_cache(paths: &ClusterPaths) -> KvLocalCache {
     KvLocalCache::new(paths.kv_snapshot.clone(), paths.kv_raft.clone())
+}
+
+fn read_cluster_kv_reader_node_id(paths: &ClusterPaths) -> Result<NodeId, NetworkError> {
+    read_cluster_state_without_kv(paths)
+        .map(|state| state.local_node_id)
+        .or_else(|error| {
+            if paths.kv_raft.exists() {
+                Err(error)
+            } else {
+                Ok(NodeId::from_legacy_named("cluster_kv_cache_reader")
+                    .expect("static cache reader node id"))
+            }
+        })
 }
 
 pub fn cluster_raft_wal_paths(paths: &ClusterPaths, node_id: &NodeId) -> KvWalPaths {

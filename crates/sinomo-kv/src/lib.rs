@@ -481,6 +481,39 @@ impl KvLocalCache {
         self.materialized.read_store()
     }
 
+    pub fn current_get(&self, node_id: NodeId, key: &str) -> Result<Option<KvEntry>, KvError> {
+        Ok(self.current_store(node_id)?.get(key).cloned())
+    }
+
+    pub fn current_get_serde<T: DeserializeOwned>(
+        &self,
+        node_id: NodeId,
+        key: &str,
+    ) -> Result<Option<T>, KvError> {
+        self.current_get(node_id, key)?
+            .map(|entry| entry.decode())
+            .transpose()
+    }
+
+    pub fn current_range_prefix(
+        &self,
+        node_id: NodeId,
+        prefix: &str,
+    ) -> Result<Vec<KvEntry>, KvError> {
+        Ok(self.current_store(node_id)?.range_prefix(prefix))
+    }
+
+    pub fn current_range_prefix_serde<T: DeserializeOwned>(
+        &self,
+        node_id: NodeId,
+        prefix: &str,
+    ) -> Result<Vec<T>, KvError> {
+        self.current_range_prefix(node_id, prefix)?
+            .into_iter()
+            .map(|entry| entry.decode())
+            .collect()
+    }
+
     pub fn current_snapshot(&self, node_id: NodeId) -> Result<KvSnapshot, KvError> {
         self.current_store(node_id).map(|store| store.snapshot())
     }
@@ -2451,6 +2484,43 @@ mod tests {
                 .expect("cached raft value")
                 .value,
             b"current"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_reads_entries_without_exposing_snapshot_files() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-local-cache-read-interface-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_local_cache_read").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde("/dfs/services/content/a", &"node-a", None)
+            .expect("put a");
+        store
+            .put_serde("/dfs/services/content/b", &"node-b", None)
+            .expect("put b");
+        cache
+            .write_snapshot(&store.snapshot())
+            .expect("write cache snapshot");
+
+        assert_eq!(
+            cache
+                .current_get_serde::<String>(node_id.clone(), "/dfs/services/content/a")
+                .expect("read value"),
+            Some("node-a".to_string())
+        );
+        assert_eq!(
+            cache
+                .current_range_prefix_serde::<String>(node_id, "/dfs/services/content/")
+                .expect("range values"),
+            vec!["node-a".to_string(), "node-b".to_string()]
         );
         std::fs::remove_dir_all(root).ok();
     }

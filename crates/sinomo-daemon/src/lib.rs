@@ -82,7 +82,8 @@ pub use dfs::{
     DaemonDfsMetadataReplicationReport, DaemonDfsSmokeReport, ensure_default_distributed_dfs,
     ensure_default_local_dfs_expose, handle_daemon_dfs_expose_config,
     handle_daemon_dfs_metadata_journal_batch, handle_daemon_dfs_protocol_frame,
-    publish_default_dfs_metadata_journal, run_daemon_dfs_maintenance_tick, run_daemon_dfs_smoke,
+    log_dfs_metadata_replication_report, publish_default_dfs_metadata_journal,
+    run_daemon_dfs_maintenance_tick, run_daemon_dfs_smoke,
 };
 pub use error::DaemonError;
 pub use install::{
