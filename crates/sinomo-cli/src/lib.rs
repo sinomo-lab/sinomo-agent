@@ -205,6 +205,7 @@ use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
 #[cfg(test)]
 use sinomo_runtime::node::load_or_create_main_node_identity;
+#[cfg(test)]
 use sinomo_runtime::node::shadow_daemon_node_id;
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;

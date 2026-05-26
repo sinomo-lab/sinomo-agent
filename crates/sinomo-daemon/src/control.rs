@@ -2795,7 +2795,7 @@ pub fn open_daemon_sandbox_dfs_service(
     let metadata = sinomo_dfs::open_root_local_metadata_backend(
         data_dir.dfs_dir().join("metadata").join("root"),
     )?;
-    let endpoints = sinomo_network::cluster_sync_targets_with_connectivity(&cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
     let mut dfs = sinomo_dfs::NetworkedDfsService::new(
         DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
         content,

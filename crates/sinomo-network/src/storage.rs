@@ -1712,6 +1712,221 @@ pub fn cluster_raft_command_targets(
     targets
 }
 
+pub fn cluster_daemon_command_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    prefer_bounded_daemon_command_targets(cluster_sync_targets_with_connectivity(paths, state))
+}
+
+pub fn cluster_dfs_protocol_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_daemon_command_targets(paths, state)
+}
+
+pub fn cluster_main_daemon_command_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let main_daemon_node_ids = state
+        .members
+        .iter()
+        .filter(|member| {
+            member.node_id != state.local_node_id
+                && member.state.is_authorized()
+                && member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == "daemon.main.run")
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut selected_remote_nodes = BTreeSet::new();
+    cluster_daemon_command_targets(paths, state)
+        .into_iter()
+        .filter(|endpoint| {
+            endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+                && main_daemon_node_ids.contains(&endpoint.node_id)
+                && selected_remote_nodes.insert(endpoint.node_id.clone())
+        })
+        .collect()
+}
+
+pub fn cluster_voter_command_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .filter(|endpoint| cluster_raft_node_is_voter(state, &endpoint.node_id))
+        .collect()
+}
+
+pub fn cluster_member_daemon_status_targets(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> Vec<ClusterEndpointRecord> {
+    let is_local_process = cluster_member_is_local_process(state, member);
+    let mut endpoints = prefer_bounded_daemon_command_targets(member.endpoints.clone());
+    endpoints.sort_by_key(|endpoint| {
+        (
+            cluster_daemon_command_transport_rank(endpoint),
+            endpoint.privacy != ClusterEndpointPrivacy::Lan,
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+    endpoints
+        .into_iter()
+        .filter(|endpoint| {
+            is_local_process || !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
+        })
+        .collect()
+}
+
+pub fn cluster_rollout_endpoint_candidates(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints = Vec::new();
+    for member in &state.members {
+        if member.node_id == state.local_node_id || !member.state.is_authorized() {
+            continue;
+        }
+        endpoints.extend(
+            member
+                .endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+                        && matches!(
+                            endpoint.transport,
+                            ClusterTransportKind::LanTcp
+                                | ClusterTransportKind::Loopback
+                                | ClusterTransportKind::Iroh
+                        )
+                })
+                .cloned(),
+        );
+    }
+    if let Ok(kv_endpoints) = read_cluster_endpoints_from_kv(paths) {
+        for endpoint in kv_endpoints {
+            if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
+                || !matches!(
+                    endpoint.transport,
+                    ClusterTransportKind::LanTcp
+                        | ClusterTransportKind::Loopback
+                        | ClusterTransportKind::Iroh
+                )
+                || endpoints
+                    .iter()
+                    .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+            {
+                continue;
+            }
+            endpoints.push(endpoint);
+        }
+    }
+    sort_cluster_rollout_endpoints(paths, state, &mut endpoints);
+    endpoints
+}
+
+pub fn cluster_rollout_target_endpoint_for_main(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    main_node_id: &NodeId,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    let shadow_node_id = shadow_daemon_node_id(main_node_id);
+    let graph = read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
+    let mut candidates = candidates
+        .iter()
+        .filter(|endpoint| {
+            (endpoint.node_id == shadow_node_id || endpoint.node_id == *main_node_id)
+                && endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|endpoint| {
+        let score = cluster_rollout_endpoint_connectivity_score(state, &graph, endpoint);
+        let unreachable_shadow_endpoint = endpoint.node_id == shadow_node_id
+            && score >= CLUSTER_ROLLOUT_ENDPOINT_UNREACHABLE_SCORE;
+        (
+            unreachable_shadow_endpoint,
+            endpoint.node_id != shadow_node_id,
+            score,
+            cluster_rollout_endpoint_unknown_route_rank(endpoint),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+    candidates.into_iter().next()
+}
+
+pub fn sort_cluster_rollout_endpoints(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoints: &mut [ClusterEndpointRecord],
+) {
+    let graph = read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
+    endpoints.sort_by_key(|endpoint| {
+        (
+            endpoint.node_id.clone(),
+            cluster_rollout_endpoint_connectivity_score(state, &graph, endpoint),
+            cluster_rollout_endpoint_unknown_route_rank(endpoint),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+}
+
+fn cluster_rollout_endpoint_connectivity_score(
+    state: &ClusterBootstrapState,
+    graph: &[ClusterConnectivityRecord],
+    endpoint: &ClusterEndpointRecord,
+) -> u8 {
+    graph
+        .iter()
+        .find(|record| {
+            record.source_node_id == state.local_node_id
+                && record.target_node_id == endpoint.node_id
+                && record.endpoint_id == endpoint.endpoint_id
+        })
+        .map(|record| match record.state {
+            ClusterConnectivityState::Healthy => 0,
+            ClusterConnectivityState::Degraded => 1,
+            ClusterConnectivityState::Unreachable => 3,
+        })
+        .unwrap_or(CLUSTER_ROLLOUT_ENDPOINT_UNKNOWN_SCORE)
+}
+
+const CLUSTER_ROLLOUT_ENDPOINT_UNKNOWN_SCORE: u8 = 2;
+const CLUSTER_ROLLOUT_ENDPOINT_UNREACHABLE_SCORE: u8 = 3;
+
+fn cluster_rollout_endpoint_unknown_route_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    match endpoint.transport {
+        ClusterTransportKind::Iroh => 0,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            1_u8.saturating_add(cluster_rollout_tcp_address_rank(endpoint))
+        }
+        _ => 8,
+    }
+}
+
+fn cluster_rollout_tcp_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
+        return 3;
+    };
+    match address.ip() {
+        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
+        IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
+        ip if ip.is_loopback() || ip.is_unspecified() => 2,
+        _ => 1,
+    }
+}
+
 fn cluster_raft_route_order_key(
     state: &ClusterBootstrapState,
     connectivity: &BTreeMap<(NodeId, ClusterEndpointId), ClusterConnectivityRecord>,

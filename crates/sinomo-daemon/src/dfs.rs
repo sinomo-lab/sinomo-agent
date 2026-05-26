@@ -291,7 +291,7 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
         DfsMetadataShardId::new("root"),
         data_dir.dfs_dir().join("metadata").join("root"),
     )?;
-    let endpoints = sinomo_network::cluster_sync_targets_with_connectivity(&cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
     let mut service = NetworkedDfsService::new(
         DaemonDfsEndpointTransport::new(state.local_node_id, endpoints),
         content,
@@ -635,10 +635,6 @@ impl DaemonDfsEndpointTransport {
                     .push(endpoint);
             }
         }
-        for endpoints in endpoints_by_node_id.values_mut() {
-            *endpoints =
-                sinomo_network::prefer_bounded_daemon_command_targets(std::mem::take(endpoints));
-        }
         Self {
             local_node_id,
             endpoints_by_node_id,
@@ -759,7 +755,7 @@ pub fn publish_default_dfs_metadata_journal(
         shard_id.clone(),
         data_dir.dfs_dir().join("metadata").join(&shard.shard_id),
     )?;
-    let endpoints = sinomo_network::cluster_sync_targets_with_connectivity(&cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
     let mut outcomes = Vec::new();
     for target_node_id in shard
         .replica_node_ids
@@ -878,7 +874,7 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
     content_nodes.sort();
     content_nodes.dedup();
 
-    let endpoints = sinomo_network::cluster_sync_targets_with_connectivity(&cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
     let endpoint_node_ids = endpoints
         .iter()
         .map(|endpoint| endpoint.node_id.clone())

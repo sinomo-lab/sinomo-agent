@@ -558,32 +558,9 @@ pub(crate) fn rollout_cluster_targets(
         if let Some(local_target) = local_target {
             push_unique_rollout_target(&mut targets, RolloutTarget::address(local_target));
         }
-        let sync_targets = network::cluster_sync_targets_with_connectivity(&paths, state);
-        let mut rollout_endpoints = rollout_endpoint_candidates(state);
-        extend_rollout_endpoints_from_kv(&paths, &mut rollout_endpoints);
-        sort_rollout_endpoints_by_connectivity(&paths, state, &mut rollout_endpoints);
-        let mut selected_remote_nodes = std::collections::BTreeSet::new();
-        for endpoint in sync_targets.clone() {
-            if endpoint.node_id == state.local_node_id
-                || endpoint.privacy == sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
-            {
-                continue;
-            }
-            let Some(member) = state
-                .members
-                .iter()
-                .find(|member| member.node_id == endpoint.node_id)
-            else {
-                continue;
-            };
-            let is_main_daemon = member
-                .capabilities
-                .iter()
-                .any(|capability| capability.as_str() == "daemon.main.run");
-            if !is_main_daemon || !selected_remote_nodes.insert(endpoint.node_id.clone()) {
-                continue;
-            }
-            let rollout_endpoint = rollout_target_endpoint_for_main_with_connectivity(
+        let rollout_endpoints = network::cluster_rollout_endpoint_candidates(&paths, state);
+        for endpoint in network::cluster_main_daemon_command_targets(&paths, state) {
+            let rollout_endpoint = network::cluster_rollout_target_endpoint_for_main(
                 &paths,
                 state,
                 &endpoint.node_id,
@@ -605,6 +582,7 @@ pub(crate) fn rollout_cluster_targets(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn rollout_endpoint_candidates(
     state: &sinomo_runtime::core::ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -632,6 +610,7 @@ pub(crate) fn rollout_endpoint_candidates(
     endpoints
 }
 
+#[cfg(test)]
 pub(crate) fn extend_rollout_endpoints_from_kv(
     paths: &ClusterPaths,
     endpoints: &mut Vec<ClusterEndpointRecord>,
@@ -682,99 +661,23 @@ pub(crate) fn rollout_target_endpoint_for_main_in_order(
         .cloned()
 }
 
+#[cfg(test)]
 pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
     paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
     main_node_id: &NodeId,
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
-    let shadow_node_id = shadow_daemon_node_id(main_node_id);
-    let graph = network::read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
-    let mut candidates = candidates
-        .iter()
-        .filter(|endpoint| {
-            (endpoint.node_id == shadow_node_id || endpoint.node_id == *main_node_id)
-                && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|endpoint| {
-        let score = rollout_endpoint_connectivity_score(state, &graph, endpoint);
-        let unreachable_shadow_endpoint =
-            endpoint.node_id == shadow_node_id && score >= ROLLOUT_ENDPOINT_UNREACHABLE_SCORE;
-        (
-            unreachable_shadow_endpoint,
-            endpoint.node_id != shadow_node_id,
-            score,
-            rollout_endpoint_unknown_route_rank(endpoint),
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
-    candidates.into_iter().next()
+    network::cluster_rollout_target_endpoint_for_main(paths, state, main_node_id, candidates)
 }
 
+#[cfg(test)]
 pub(crate) fn sort_rollout_endpoints_by_connectivity(
     paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
     endpoints: &mut [ClusterEndpointRecord],
 ) {
-    let graph = network::read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
-    endpoints.sort_by_key(|endpoint| {
-        (
-            endpoint.node_id.clone(),
-            rollout_endpoint_connectivity_score(state, &graph, endpoint),
-            rollout_endpoint_unknown_route_rank(endpoint),
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
-}
-
-fn rollout_endpoint_connectivity_score(
-    state: &sinomo_runtime::core::ClusterBootstrapState,
-    graph: &[network::ClusterConnectivityRecord],
-    endpoint: &ClusterEndpointRecord,
-) -> u8 {
-    graph
-        .iter()
-        .find(|record| {
-            record.source_node_id == state.local_node_id
-                && record.target_node_id == endpoint.node_id
-                && record.endpoint_id == endpoint.endpoint_id
-        })
-        .map(|record| match record.state {
-            network::ClusterConnectivityState::Healthy => 0,
-            network::ClusterConnectivityState::Degraded => 1,
-            network::ClusterConnectivityState::Unreachable => 3,
-        })
-        .unwrap_or(ROLLOUT_ENDPOINT_UNKNOWN_SCORE)
-}
-
-const ROLLOUT_ENDPOINT_UNKNOWN_SCORE: u8 = 2;
-const ROLLOUT_ENDPOINT_UNREACHABLE_SCORE: u8 = 3;
-
-fn rollout_endpoint_unknown_route_rank(endpoint: &ClusterEndpointRecord) -> u8 {
-    match endpoint.transport {
-        sinomo_runtime::core::ClusterTransportKind::Iroh => 0,
-        sinomo_runtime::core::ClusterTransportKind::LanTcp
-        | sinomo_runtime::core::ClusterTransportKind::Loopback => {
-            1_u8.saturating_add(rollout_tcp_address_rank(endpoint))
-        }
-        _ => 8,
-    }
-}
-
-fn rollout_tcp_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
-    let Ok(address) = endpoint.address.parse::<std::net::SocketAddr>() else {
-        return 3;
-    };
-    match address.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
-        std::net::IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
-        ip if ip.is_loopback() || ip.is_unspecified() => 2,
-        _ => 1,
-    }
+    network::sort_cluster_rollout_endpoints(paths, state, endpoints);
 }
 
 fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {

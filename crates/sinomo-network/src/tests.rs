@@ -839,6 +839,117 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
 }
 
 #[test]
+fn main_daemon_command_targets_select_one_route_per_remote_main() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-main-daemon-targets-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_main_daemon_targets").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_main_daemon_targets_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_network_main_daemon_targets_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network main daemon targets",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let remote_tcp = daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10);
+    let remote_iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&remote, "iroh_public_key_network_main_targets"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_network_main_targets?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![remote_tcp.clone(), remote_iroh];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &state.local_node_id,
+        vec![cluster_connectivity_record(
+            &state,
+            &remote_tcp,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity records");
+
+    let targets = cluster_main_daemon_command_targets(&paths, &state);
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].endpoint_id, remote_tcp.endpoint_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rollout_target_selection_prefers_shadow_route_until_shadow_is_unreachable() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-rollout-shadow-route-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_rollout_shadow").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_rollout_shadow_local").expect("local");
+    let main = NodeId::from_legacy_named("node_network_rollout_shadow_main").expect("main");
+    let shadow = shadow_daemon_node_id(&main);
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "network rollout shadow",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let main_endpoint = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
+    let shadow_endpoint = daemon_lan_endpoint(&shadow, "10.0.0.42:21354".to_string(), 10);
+
+    let selected = cluster_rollout_target_endpoint_for_main(
+        &paths,
+        &state,
+        &main,
+        &[main_endpoint, shadow_endpoint.clone()],
+    )
+    .expect("rollout endpoint");
+
+    assert_eq!(selected.endpoint_id, shadow_endpoint.endpoint_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn public_ip_endpoint_is_marked_internet_direct() {
     let node_id = NodeId::from_legacy_named("node_public_endpoint").expect("node");
     let endpoints = daemon_advertised_endpoints_from_addresses(

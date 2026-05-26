@@ -662,10 +662,7 @@ pub fn publish_local_members_via_voter(
     }
     let request = ClusterMemberPublishRequest { members };
     let mut failures = Vec::new();
-    for endpoint in sinomo_network::cluster_sync_targets_with_connectivity(paths, state)
-        .into_iter()
-        .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
-    {
+    for endpoint in sinomo_network::cluster_voter_command_targets(paths, state) {
         match send_cluster_member_publish(
             &endpoint,
             &request,
@@ -1349,21 +1346,7 @@ pub fn probe_member_daemon_status(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Option<ClusterNodeStatusRecord> {
-    let is_local_process = sinomo_network::cluster_member_is_local_process(state, member);
-    let mut endpoints =
-        sinomo_network::prefer_bounded_daemon_command_targets(member.endpoints.clone());
-    endpoints.sort_by_key(|endpoint| {
-        (
-            sinomo_network::cluster_daemon_command_transport_rank(endpoint),
-            endpoint.privacy != ClusterEndpointPrivacy::Lan,
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
-    for endpoint in endpoints {
-        if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
-            continue;
-        }
+    for endpoint in sinomo_network::cluster_member_daemon_status_targets(state, member) {
         let Ok(status) = fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
         else {
             continue;
