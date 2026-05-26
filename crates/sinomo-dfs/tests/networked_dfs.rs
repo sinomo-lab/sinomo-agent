@@ -6083,6 +6083,10 @@ fn networked_remote_read_cache_records_size_without_rewriting_object_metadata() 
             file_system_id: file_system_id.clone(),
             object_id: object_id.clone(),
             version: version.clone(),
+            version_record: backend
+                .get_version(&object_id, &version)
+                .expect("cached version")
+                .or_else(|| panic!("cached version missing")),
         }]
     );
     let backend_object = backend

@@ -14,13 +14,15 @@ use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT: u64 = 4096;
+const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
+const DIRFRAG_BUCKET_COUNT: u64 = 256;
 
 #[derive(Debug, Error)]
 pub enum MetadataBackendError {
@@ -244,44 +246,64 @@ pub struct DfsMetadataJournalEntry {
 pub enum DfsMetadataMutation {
     PutFileSystem {
         file_system_id: DfsFileSystemId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_system: Option<DfsFileSystem>,
     },
     PutObject {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        object: Option<DfsObjectMetadata>,
     },
     PutVersion {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
         version: DfsVersion,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version_record: Option<DfsObjectVersionRecord>,
     },
     PutReceipt {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
         version: DfsVersion,
         replica_node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<DfsReplicaReceiptRecord>,
     },
     PutIntent {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
         intent_id: String,
         status: DfsWriteIntentStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent: Option<DfsWriteIntentRecord>,
     },
     CommitVisibleVersion {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
         previous_version: DfsVersion,
         committed_version: DfsVersion,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        committed_object: Option<DfsObjectMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visible_version: Option<DfsObjectVersionRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        required_replica_node_ids: Vec<NodeId>,
     },
     PutConflict {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
         conflict_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conflict: Option<DfsConflictRecord>,
     },
     ApplyNamespaceTransaction {
         file_system_id: DfsFileSystemId,
         transaction_id: String,
         object_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction: Option<DfsNamespaceTransaction>,
     },
 }
 
@@ -305,6 +327,11 @@ pub struct DfsMetadataJournalBatch {
     pub shard_id: DfsMetadataShardId,
     pub entries: Vec<DfsMetadataJournalEntry>,
     pub next_after_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsMetadataJournalHead {
+    next_sequence: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -458,7 +485,9 @@ impl LocalJsonMetadataBackend {
         let root = root.into();
         create_dir_all(root.join("records"))?;
         create_dir_all(root.join("journal"))?;
-        let next_sequence = next_journal_sequence(&root)?;
+        create_dir_all(root.join("journal").join("segments"))?;
+        migrate_legacy_journal_entries(&root)?;
+        let next_sequence = recover_next_journal_sequence(&root)?;
         let mut backend = Self {
             shard_id,
             root,
@@ -475,27 +504,24 @@ impl LocalJsonMetadataBackend {
     }
 
     fn write_journal(&mut self, mutation: DfsMetadataMutation) -> Result<DfsMetadataJournalEntry> {
-        let mut sequence = self.next_sequence.max(next_journal_sequence(&self.root)?);
-        loop {
-            let entry = DfsMetadataJournalEntry {
-                shard_id: self.shard_id.clone(),
-                sequence,
-                created_at: OffsetDateTime::now_utc(),
-                mutation: mutation.clone(),
-            };
-            match write_json_create_new_atomic(&self.journal_path(entry.sequence), &entry) {
-                Ok(()) => {
-                    self.next_sequence = sequence.saturating_add(1);
-                    return Ok(entry);
-                }
-                Err(MetadataBackendError::Io { source, .. })
-                    if source.kind() == io::ErrorKind::AlreadyExists =>
-                {
-                    sequence = sequence.saturating_add(1);
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let sequence = self
+            .next_sequence
+            .max(fast_next_journal_sequence(&self.root)?);
+        let entry = DfsMetadataJournalEntry {
+            shard_id: self.shard_id.clone(),
+            sequence,
+            created_at: OffsetDateTime::now_utc(),
+            mutation,
+        };
+        append_segmented_journal_entry(&self.root, &entry)?;
+        self.next_sequence = sequence.saturating_add(1);
+        write_json_atomic(
+            &self.journal_head_path(),
+            &DfsMetadataJournalHead {
+                next_sequence: self.next_sequence,
+            },
+        )?;
+        Ok(entry)
     }
 
     fn records_root(&self) -> PathBuf {
@@ -671,10 +697,8 @@ impl LocalJsonMetadataBackend {
         self.records_root().join("namespace-transactions")
     }
 
-    fn journal_path(&self, sequence: u64) -> PathBuf {
-        self.root
-            .join("journal")
-            .join(format!("{sequence:020}.sobj"))
+    fn journal_head_path(&self) -> PathBuf {
+        self.root.join("journal").join("head.sobj")
     }
 }
 
@@ -686,6 +710,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         )?;
         self.write_journal(DfsMetadataMutation::PutFileSystem {
             file_system_id: file_system.file_system_id.clone(),
+            file_system: Some(file_system.clone()),
         })
     }
 
@@ -712,6 +737,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             path: object.path.clone(),
+            object: Some(object),
         })
     }
 
@@ -782,28 +808,29 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     ) -> Result<Vec<DfsObjectMetadata>> {
         let directory_path = normalize_posix_path(directory_path);
         let parent_inode_id = directory_inode_id(file_system_id, &directory_path);
-        let dentry_dir = self
+        let mut objects = Vec::new();
+        let parent_dentry_root = self
             .records_root()
             .join("dentries")
-            .join(key_segment(&parent_inode_id.0))
-            .join(key_segment(&"root"));
-        let mut objects = Vec::new();
-        for path_record in read_json_dir::<DfsPathRecord>(&dentry_dir)? {
-            if path_record.file_system_id != *file_system_id
-                || path_record.parent_inode_id != parent_inode_id
-            {
-                continue;
+            .join(key_segment(&parent_inode_id.0));
+        for fragment_dir in read_child_dirs_if_exists(&parent_dentry_root)? {
+            for path_record in read_json_dir::<DfsPathRecord>(&fragment_dir)? {
+                if path_record.file_system_id != *file_system_id
+                    || path_record.parent_inode_id != parent_inode_id
+                {
+                    continue;
+                }
+                let Some(object) = self.get_object(&path_record.object_id)? else {
+                    continue;
+                };
+                if object.kind == DfsObjectKind::Tombstone
+                    || object.file_system_id != *file_system_id
+                    || normalize_path(&object.path) != path_record.path
+                {
+                    continue;
+                }
+                objects.push(object);
             }
-            let Some(object) = self.get_object(&path_record.object_id)? else {
-                continue;
-            };
-            if object.kind == DfsObjectKind::Tombstone
-                || object.file_system_id != *file_system_id
-                || normalize_path(&object.path) != path_record.path
-            {
-                continue;
-            }
-            objects.push(object);
         }
         objects.sort_by(|left, right| {
             left.path
@@ -854,6 +881,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             file_system_id: version.file_system_id.clone(),
             object_id: version.object_id.clone(),
             version: version.version.clone(),
+            version_record: Some(version),
         })
     }
 
@@ -889,6 +917,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             object_id: receipt.receipt.object_id.clone(),
             version: receipt.receipt.committed_version.clone(),
             replica_node_id: receipt.replica_node_id.clone(),
+            receipt: Some(receipt.clone()),
         })
     }
 
@@ -910,6 +939,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             object_id: intent.object_id.clone(),
             intent_id: intent.intent_id.clone(),
             status: intent.status.clone(),
+            intent: Some(intent.clone()),
         })
     }
 
@@ -980,6 +1010,9 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             object_id: committed_object.object_id.clone(),
             previous_version: expected_version.clone(),
             committed_version: committed_object.version.clone(),
+            committed_object: Some(commit_record.committed_object.clone()),
+            visible_version: Some(commit_record.visible_version.clone()),
+            required_replica_node_ids: commit_record.required_replica_node_ids.clone(),
         })
     }
 
@@ -1012,6 +1045,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             file_system_id: transaction.file_system_id.clone(),
             transaction_id: transaction.transaction_id.clone(),
             object_count: transaction.objects.len(),
+            transaction: Some(transaction),
         })
     }
 
@@ -1021,6 +1055,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             file_system_id: conflict.file_system_id.clone(),
             object_id: conflict.object_id.clone(),
             conflict_id: conflict.conflict_id.clone(),
+            conflict: Some(conflict.clone()),
         })
     }
 
@@ -1051,31 +1086,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let journal_dir = self.root.join("journal");
-        if !journal_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut paths = BTreeMap::new();
-        for entry in read_dir(&journal_dir)? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            let Ok(sequence) = stem.parse::<u64>() else {
-                continue;
-            };
-            if sequence > after_sequence {
-                paths.insert(sequence, path);
-            }
-        }
-        let mut entries = Vec::new();
-        for path in paths.into_values() {
-            entries.push(read_json(&path)?);
-        }
-        Ok(entries)
+        journal_entries_since(&self.root, after_sequence)
     }
 
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {
@@ -1115,6 +1126,7 @@ impl LocalJsonMetadataBackend {
                 file_system_id: transaction.file_system_id.clone(),
                 transaction_id: transaction.transaction_id.clone(),
                 object_count: transaction.objects.len(),
+                transaction: Some(transaction.clone()),
             })?;
         }
         Ok(())
@@ -1222,7 +1234,26 @@ impl LocalJsonMetadataBackend {
     ) -> Result<()> {
         let object = normalized_object_metadata(object);
         let inode = DfsInodeRecord::from(&object);
-        let path_record = path_record_for_object(&object);
+        let previous_path_record = previous
+            .map(|previous| {
+                self.stored_path_record_for_object(previous)
+                    .map(|stored| stored.unwrap_or_else(|| path_record_for_object(previous)))
+            })
+            .transpose()?;
+        let path_record = if object.kind == DfsObjectKind::Tombstone {
+            path_record_for_object(&object)
+        } else if let Some(previous_path_record) = previous_path_record.as_ref()
+            && previous_path_record.file_system_id == object.file_system_id
+            && previous_path_record.path == normalize_path(&object.path)
+            && previous_path_record.parent_inode_id
+                == parent_inode_id(&object.file_system_id, &normalize_path(&object.path))
+        {
+            let mut path_record = path_record_for_object(&object);
+            path_record.dirfrag_id = previous_path_record.dirfrag_id.clone();
+            path_record
+        } else {
+            self.path_record_for_new_dentry(&object)?
+        };
 
         if let Some(previous_target_object_id) =
             previous.and_then(|previous| previous.link_target_object_id.as_ref())
@@ -1234,7 +1265,10 @@ impl LocalJsonMetadataBackend {
             )?;
         }
         if let Some(previous) = previous {
-            let previous_path_record = path_record_for_object(previous);
+            let previous_path_record = previous_path_record
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| path_record_for_object(previous));
             if previous.file_system_id != object.file_system_id {
                 remove_file_if_exists(
                     &self
@@ -1269,7 +1303,7 @@ impl LocalJsonMetadataBackend {
         {
             write_json_atomic(
                 &self.hardlink_index_path(target_object_id, &object.object_id),
-                &path_record_for_object(&object),
+                &path_record,
             )?;
         }
         if object.kind == DfsObjectKind::Tombstone {
@@ -1285,6 +1319,8 @@ impl LocalJsonMetadataBackend {
         let dirfrag = self.read_or_create_dirfrag(
             &path_record.file_system_id,
             &path_record.parent_inode_id,
+            &path_record.dirfrag_id,
+            Some(path_record.name_hash),
             !dentry_path.exists(),
         )?;
         write_json_atomic(
@@ -1310,6 +1346,28 @@ impl LocalJsonMetadataBackend {
         };
         dirfrag.entry_count = dirfrag.entry_count.saturating_sub(1);
         write_json_atomic(&dirfrag_path, &dirfrag)
+    }
+
+    fn stored_path_record_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<Option<DfsPathRecord>> {
+        read_json_optional(&self.path_index_path(&object.file_system_id, &object.path))
+    }
+
+    fn path_record_for_new_dentry(&self, object: &DfsObjectMetadata) -> Result<DfsPathRecord> {
+        let mut path_record = path_record_for_object(object);
+        let root_dirfrag = self.read_or_create_dirfrag(
+            &path_record.file_system_id,
+            &path_record.parent_inode_id,
+            &DfsDirFragmentId::new("root"),
+            None,
+            false,
+        )?;
+        if root_dirfrag.entry_count >= root_dirfrag.split_after_count {
+            path_record.dirfrag_id = bucket_dirfrag_id(path_record.name_hash);
+        }
+        Ok(path_record)
     }
 
     fn recover_visible_version_commits(&mut self) -> Result<()> {
@@ -1410,6 +1468,9 @@ impl LocalJsonMetadataBackend {
             object_id: commit.committed_object.object_id.clone(),
             previous_version: commit.expected_version.clone(),
             committed_version: commit.committed_object.version.clone(),
+            committed_object: Some(commit.committed_object.clone()),
+            visible_version: Some(commit.visible_version.clone()),
+            required_replica_node_ids: commit.required_replica_node_ids.clone(),
         })?;
         Ok(())
     }
@@ -1430,17 +1491,19 @@ impl LocalJsonMetadataBackend {
         &self,
         file_system_id: &DfsFileSystemId,
         dir_inode_id: &DfsInodeId,
+        dirfrag_id: &DfsDirFragmentId,
+        name_hash: Option<u64>,
         increment_entry_count: bool,
     ) -> Result<DfsDirFragmentRecord> {
-        let dirfrag_id = DfsDirFragmentId::new("root");
-        let path = self.dirfrag_path(dir_inode_id, &dirfrag_id);
+        let path = self.dirfrag_path(dir_inode_id, dirfrag_id);
+        let (hash_start_inclusive, hash_end_exclusive) = dirfrag_hash_range(dirfrag_id, name_hash);
         let mut dirfrag =
             read_json_optional::<DfsDirFragmentRecord>(&path)?.unwrap_or(DfsDirFragmentRecord {
                 file_system_id: file_system_id.clone(),
                 dir_inode_id: dir_inode_id.clone(),
-                dirfrag_id,
-                hash_start_inclusive: 0,
-                hash_end_exclusive: u64::MAX,
+                dirfrag_id: dirfrag_id.clone(),
+                hash_start_inclusive,
+                hash_end_exclusive,
                 entry_count: 0,
                 split_after_count: DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT,
             });
@@ -1470,6 +1533,42 @@ fn path_record_for_object(object: &DfsObjectMetadata) -> DfsPathRecord {
         name,
         kind: object.kind.clone(),
     }
+}
+
+fn bucket_dirfrag_id(name_hash: u64) -> DfsDirFragmentId {
+    let bucket = dirfrag_bucket(name_hash);
+    DfsDirFragmentId::new(format!("bucket-{bucket:02x}"))
+}
+
+fn dirfrag_bucket(name_hash: u64) -> u64 {
+    name_hash
+        .checked_div((u64::MAX / DIRFRAG_BUCKET_COUNT).saturating_add(1))
+        .unwrap_or(0)
+        .min(DIRFRAG_BUCKET_COUNT - 1)
+}
+
+fn dirfrag_hash_range(dirfrag_id: &DfsDirFragmentId, name_hash: Option<u64>) -> (u64, u64) {
+    if dirfrag_id.0 == "root" {
+        return (0, u64::MAX);
+    }
+    let bucket = name_hash
+        .map(dirfrag_bucket)
+        .or_else(|| {
+            dirfrag_id
+                .0
+                .strip_prefix("bucket-")
+                .and_then(|bucket| u64::from_str_radix(bucket, 16).ok())
+        })
+        .unwrap_or(0)
+        .min(DIRFRAG_BUCKET_COUNT - 1);
+    let width = (u64::MAX / DIRFRAG_BUCKET_COUNT).saturating_add(1);
+    let start = bucket.saturating_mul(width);
+    let end = if bucket + 1 >= DIRFRAG_BUCKET_COUNT {
+        u64::MAX
+    } else {
+        (bucket + 1).saturating_mul(width)
+    };
+    (start, end)
 }
 
 fn normalized_object_metadata(object: &DfsObjectMetadata) -> DfsObjectMetadata {
@@ -1567,14 +1666,34 @@ fn key_segment(value: &impl ToString) -> String {
         .replace(['/', '\\', ':'], "_")
 }
 
-fn next_journal_sequence(root: &Path) -> Result<u64> {
+fn fast_next_journal_sequence(root: &Path) -> Result<u64> {
     let journal_dir = root.join("journal");
     if !journal_dir.exists() {
         return Ok(1);
     }
-    let mut max_sequence = 0_u64;
+    if let Some(head) =
+        read_json_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
+        && head.next_sequence > 0
+    {
+        return Ok(head.next_sequence);
+    }
+    recover_next_journal_sequence(root)
+}
+
+fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
+    let journal_dir = root.join("journal");
+    if !journal_dir.exists() {
+        return Ok(1);
+    }
+    let mut max_sequence =
+        read_json_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
+            .map(|head| head.next_sequence.saturating_sub(1))
+            .unwrap_or(0);
     for entry in read_dir(&journal_dir)? {
         let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some("head.sobj") {
+            continue;
+        }
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
@@ -1583,7 +1702,187 @@ fn next_journal_sequence(root: &Path) -> Result<u64> {
         };
         max_sequence = max_sequence.max(sequence);
     }
+    for entry in journal_entries_since(root, 0)? {
+        max_sequence = max_sequence.max(entry.sequence);
+    }
     Ok(max_sequence.saturating_add(1).max(1))
+}
+
+fn append_segmented_journal_entry(root: &Path, entry: &DfsMetadataJournalEntry) -> Result<()> {
+    let bytes = sinomo_object_serde::to_bytes(entry, 1, LengthMode::U32)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    let length = u32::try_from(bytes.len()).map_err(|_| {
+        MetadataBackendError::Serde(format!(
+            "metadata journal entry {} is too large: {} bytes",
+            entry.sequence,
+            bytes.len()
+        ))
+    })?;
+    let segment_id = journal_segment_id(entry.sequence);
+    let path = root
+        .join("journal")
+        .join("segments")
+        .join(format!("{segment_id:020}.slog"));
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    let mut record = Vec::with_capacity(4 + bytes.len());
+    record.extend_from_slice(&length.to_le_bytes());
+    record.extend_from_slice(&bytes);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    file.write_all(&record)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn journal_entries_since(root: &Path, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
+    segmented_journal_entries_since(root, after_sequence)
+}
+
+fn migrate_legacy_journal_entries(root: &Path) -> Result<()> {
+    let existing_segment_sequences = segmented_journal_entries_since(root, 0)?
+        .into_iter()
+        .map(|entry| entry.sequence)
+        .collect::<BTreeSet<_>>();
+    for (sequence, path, entry) in legacy_journal_entry_paths_since(root, 0)? {
+        if !existing_segment_sequences.contains(&sequence) {
+            append_segmented_journal_entry(root, &entry)?;
+        }
+        remove_file_if_exists(&path)?;
+    }
+    Ok(())
+}
+
+fn legacy_journal_entry_paths_since(
+    root: &Path,
+    after_sequence: u64,
+) -> Result<Vec<(u64, PathBuf, DfsMetadataJournalEntry)>> {
+    let journal_dir = root.join("journal");
+    if !journal_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = BTreeMap::new();
+    for entry in read_dir(&journal_dir)? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sobj")
+            || path.file_name().and_then(|name| name.to_str()) == Some("head.sobj")
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(sequence) = stem.parse::<u64>() else {
+            continue;
+        };
+        if sequence > after_sequence {
+            paths.insert(sequence, path);
+        }
+    }
+    let mut entries = Vec::new();
+    for path in paths.into_values() {
+        let entry: DfsMetadataJournalEntry = read_json(&path)?;
+        entries.push((entry.sequence, path, entry));
+    }
+    Ok(entries)
+}
+
+fn segmented_journal_entries_since(
+    root: &Path,
+    after_sequence: u64,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    let segments_dir = root.join("journal").join("segments");
+    if !segments_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let first_segment = journal_segment_id(after_sequence.saturating_add(1));
+    let mut paths = BTreeMap::new();
+    for entry in read_dir(&segments_dir)? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("slog") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(segment_id) = stem.parse::<u64>() else {
+            continue;
+        };
+        if segment_id >= first_segment {
+            paths.insert(segment_id, path);
+        }
+    }
+    let mut entries = Vec::new();
+    for path in paths.into_values() {
+        entries.extend(read_segmented_journal_file_since(&path, after_sequence)?);
+    }
+    entries.sort_by_key(|entry| entry.sequence);
+    Ok(entries)
+}
+
+fn read_segmented_journal_file_since(
+    path: &Path,
+    after_sequence: u64,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut entries = Vec::new();
+    loop {
+        let mut length_bytes = [0_u8; 4];
+        match file.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(source) => {
+                return Err(MetadataBackendError::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        }
+        let length = u32::from_le_bytes(length_bytes) as usize;
+        let mut bytes = vec![0_u8; length];
+        match file.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(source) => {
+                return Err(MetadataBackendError::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        }
+        let entry: DfsMetadataJournalEntry = sinomo_object_serde::from_bytes(&bytes)
+            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+        if entry.sequence > after_sequence {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn journal_segment_id(sequence: u64) -> u64 {
+    sequence
+        .saturating_sub(1)
+        .checked_div(JOURNAL_SEGMENT_ENTRY_LIMIT)
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 fn create_dir_all(path: PathBuf) -> Result<()> {
@@ -1637,6 +1936,21 @@ fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>> {
     Ok(entries)
 }
 
+fn read_child_dirs_if_exists(path: &Path) -> Result<Vec<PathBuf>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in read_dir(path)? {
+        let path = entry.path();
+        if path.is_dir() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 fn read_file(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(|source| MetadataBackendError::Io {
         path: path.to_owned(),
@@ -1683,18 +1997,30 @@ fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,
 {
-    let bytes = sinomo_object_serde::to_bytes(value, 1, LengthMode::U32)
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
-    write_file_atomic(path, &bytes)
+    write_json_atomic_if_changed(path, value).map(|_| ())
 }
 
-fn write_json_create_new_atomic<T>(path: &Path, value: &T) -> Result<()>
+fn write_json_atomic_if_changed<T>(path: &Path, value: &T) -> Result<bool>
 where
     T: Serialize,
 {
     let bytes = sinomo_object_serde::to_bytes(value, 1, LengthMode::U32)
         .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
-    write_file_create_new_atomic(path, &bytes)
+    if path.is_file() {
+        match fs::read(path) {
+            Ok(existing) if existing == bytes => return Ok(false),
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(MetadataBackendError::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        }
+    }
+    write_file_atomic(path, &bytes)?;
+    Ok(true)
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1715,39 +2041,6 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(file);
     fs::rename(&tmp_path, path).map_err(|source| MetadataBackendError::Io {
         path: path.to_owned(),
-        source,
-    })?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
-    Ok(())
-}
-
-fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent.to_owned())?;
-    }
-    let tmp_path = temporary_path_for(path);
-    let mut file = fs::File::create(&tmp_path).map_err(|source| MetadataBackendError::Io {
-        path: tmp_path.clone(),
-        source,
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| MetadataBackendError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-    drop(file);
-    if let Err(source) = fs::hard_link(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        });
-    }
-    fs::remove_file(&tmp_path).map_err(|source| MetadataBackendError::Io {
-        path: tmp_path,
         source,
     })?;
     if let Some(parent) = path.parent() {
@@ -1783,7 +2076,7 @@ fn temporary_path_for(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use sinomo_core::DfsObjectPolicy;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -1850,6 +2143,24 @@ mod tests {
         assert_eq!(file_system_entry.sequence, 1);
         assert_eq!(object_entry.sequence, 2);
         assert_eq!(
+            file_system_entry.mutation,
+            DfsMetadataMutation::PutFileSystem {
+                file_system_id: file_system.file_system_id.clone(),
+                file_system: Some(file_system.clone()),
+            },
+            "filesystem journal entries should carry replay-ready record payloads"
+        );
+        assert_eq!(
+            object_entry.mutation,
+            DfsMetadataMutation::PutObject {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                path: object.path.clone(),
+                object: Some(object.clone()),
+            },
+            "object journal entries should carry replay-ready record payloads"
+        );
+        assert_eq!(
             backend
                 .get_file_system(&file_system.file_system_id)
                 .expect("get DfsFileSystem"),
@@ -1912,6 +2223,129 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_appends_journal_entries_to_segment_files() {
+        let root = temp_root("local_backend_appends_journal_entries_to_segment_files");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+
+        assert!(
+            root.join("journal").join("head.sobj").is_file(),
+            "the journal head should track the next sequence without scanning every append"
+        );
+        assert!(
+            root.join("journal")
+                .join("segments")
+                .join("00000000000000000001.slog")
+                .is_file(),
+            "new journal entries should be appended to a segment file"
+        );
+        assert!(
+            !root
+                .join("journal")
+                .join("00000000000000000001.sobj")
+                .exists(),
+            "new journal entries should not create one object file per mutation"
+        );
+        assert_eq!(backend.journal_since(0).expect("journal").len(), 2);
+        assert_eq!(backend.journal_since(1).expect("journal").len(), 1);
+
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen");
+        assert_eq!(reopened.journal_since(0).expect("journal").len(), 2);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_migrates_legacy_journal_files_to_segments() {
+        let root = temp_root("local_backend_migrates_legacy_journal_files_to_segments");
+        fs::create_dir_all(root.join("journal")).expect("journal dir");
+        let legacy_path = root.join("journal").join("00000000000000000001.sobj");
+        let legacy_entry = DfsMetadataJournalEntry {
+            shard_id: DfsMetadataShardId::new("shard-root"),
+            sequence: 1,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            mutation: DfsMetadataMutation::PutFileSystem {
+                file_system_id: file_system_id(),
+                file_system: Some(file_system()),
+            },
+        };
+        write_json_atomic(&legacy_path, &legacy_entry).expect("legacy journal entry");
+
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        assert!(
+            !legacy_path.exists(),
+            "opening the backend should migrate legacy root journal files out of the live path"
+        );
+        assert!(
+            root.join("journal")
+                .join("segments")
+                .join("00000000000000000001.slog")
+                .is_file(),
+            "legacy journal entries should be appended to the segmented journal"
+        );
+        assert_eq!(
+            backend.journal_since(0).expect("journal"),
+            vec![legacy_entry]
+        );
+        let next = backend.put_file_system(&file_system()).expect("filesystem");
+        assert_eq!(
+            next.sequence, 2,
+            "sequence allocation should continue after migrated legacy entries"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reopen_recovers_next_sequence_from_segment_tail() {
+        let root = temp_root("local_backend_reopen_recovers_next_sequence_from_segment_tail");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        append_segmented_journal_entry(
+            &root,
+            &DfsMetadataJournalEntry {
+                shard_id: DfsMetadataShardId::new("shard-root"),
+                sequence: 2,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                mutation: DfsMetadataMutation::PutObject {
+                    file_system_id: file_system_id(),
+                    object_id: object_id(),
+                    path: "docs/readme.md".to_string(),
+                    object: None,
+                },
+            },
+        )
+        .expect("append segment entry without advancing head");
+
+        let mut reopened =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("reopen");
+        let mut object = object(version("version_1"));
+        object.object_id =
+            DfsObjectId::from_legacy_named("obj_after_tail_recovery").expect("object");
+        object.path = "docs/after-tail-recovery.md".to_string();
+        let entry = reopened.put_object(&object).expect("object");
+        assert_eq!(
+            entry.sequence, 3,
+            "reopen must scan segment tails so a crash after append but before head update cannot reuse a sequence"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_lists_directory_children_from_dentry_index() {
         let root = temp_root("local_backend_lists_directory_children_from_dentry_index");
         let mut backend =
@@ -1948,6 +2382,161 @@ mod tests {
                 .map(|object| object.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["/docs/readme.md"]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_routes_new_large_directory_entries_to_hash_fragments() {
+        let root = temp_root("local_backend_routes_new_large_directory_entries_to_hash_fragments");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let mut existing = object(version("version_1"));
+        existing.path = "/docs/existing.md".to_string();
+        backend.put_object(&existing).expect("existing object");
+        let existing_record = read_json::<DfsPathRecord>(
+            &backend.path_index_path(&existing.file_system_id, &existing.path),
+        )
+        .expect("existing path record");
+        assert_eq!(existing_record.dirfrag_id, DfsDirFragmentId::new("root"));
+
+        let root_dirfrag_path = backend.dirfrag_path(
+            &existing_record.parent_inode_id,
+            &DfsDirFragmentId::new("root"),
+        );
+        let mut root_dirfrag =
+            read_json::<DfsDirFragmentRecord>(&root_dirfrag_path).expect("root dirfrag");
+        root_dirfrag.entry_count = root_dirfrag.split_after_count;
+        write_json_atomic(&root_dirfrag_path, &root_dirfrag).expect("force split threshold");
+
+        let mut bucketed = object(version("version_1"));
+        bucketed.object_id = DfsObjectId::from_legacy_named("obj_bucketed").expect("object");
+        bucketed.path = "/docs/bucketed.md".to_string();
+        backend.put_object(&bucketed).expect("bucketed object");
+
+        let bucketed_record = read_json::<DfsPathRecord>(
+            &backend.path_index_path(&bucketed.file_system_id, &bucketed.path),
+        )
+        .expect("bucketed path record");
+        assert_ne!(
+            bucketed_record.dirfrag_id,
+            DfsDirFragmentId::new("root"),
+            "large directories should route new entries away from the root dentry fragment"
+        );
+        assert!(
+            backend.dentry_path(&bucketed_record).is_file(),
+            "bucketed dentry record should be materialized in its selected fragment"
+        );
+
+        let children = backend
+            .child_objects_for_directory(&file_system_id(), "/docs")
+            .expect("children");
+        assert_eq!(
+            children
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/bucketed.md", "/docs/existing.md"],
+            "directory listing must merge root and bucket fragments"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_content_update_does_not_rewrite_stable_namespace_indexes() {
+        let root = temp_root("local_backend_content_update_skips_stable_indexes");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let mut readme = object(version("version_1"));
+        readme.path = "/docs/readme.md".to_string();
+        backend.put_object(&readme).expect("object");
+        let path_record = read_json::<DfsPathRecord>(
+            &backend.path_index_path(&readme.file_system_id, &readme.path),
+        )
+        .expect("path record");
+        let filesystem_object_index =
+            backend.file_system_object_index_path(&readme.file_system_id, &readme.object_id);
+        let path_index = backend.path_index_path(&readme.file_system_id, &readme.path);
+        let dentry_index = backend.dentry_path(&path_record);
+        let object_record = backend.object_path(&readme.object_id);
+        let inode_record = backend.inode_path(&path_record.inode_id);
+
+        let stable_index_modified_at = [
+            fs::metadata(&filesystem_object_index)
+                .expect("filesystem object index metadata")
+                .modified()
+                .expect("filesystem object index modified"),
+            fs::metadata(&path_index)
+                .expect("path index metadata")
+                .modified()
+                .expect("path index modified"),
+            fs::metadata(&dentry_index)
+                .expect("dentry index metadata")
+                .modified()
+                .expect("dentry index modified"),
+        ];
+        let object_modified_at = fs::metadata(&object_record)
+            .expect("object metadata")
+            .modified()
+            .expect("object modified");
+        let inode_modified_at = fs::metadata(&inode_record)
+            .expect("inode metadata")
+            .modified()
+            .expect("inode modified");
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        readme.content_hash = Some("blake3:new-content".to_string());
+        readme.version = version("version_2");
+        backend.put_object(&readme).expect("content update");
+
+        assert_eq!(
+            fs::metadata(&filesystem_object_index)
+                .expect("filesystem object index metadata after update")
+                .modified()
+                .expect("filesystem object index modified after update"),
+            stable_index_modified_at[0],
+            "content-only updates should not rewrite the filesystem-object index"
+        );
+        assert_eq!(
+            fs::metadata(&path_index)
+                .expect("path index metadata after update")
+                .modified()
+                .expect("path index modified after update"),
+            stable_index_modified_at[1],
+            "content-only updates should not rewrite the path index"
+        );
+        assert_eq!(
+            fs::metadata(&dentry_index)
+                .expect("dentry index metadata after update")
+                .modified()
+                .expect("dentry index modified after update"),
+            stable_index_modified_at[2],
+            "content-only updates should not rewrite the dentry index"
+        );
+        assert!(
+            fs::metadata(&object_record)
+                .expect("object metadata after update")
+                .modified()
+                .expect("object modified after update")
+                > object_modified_at,
+            "the primary object record should still update when content metadata changes"
+        );
+        assert!(
+            fs::metadata(&inode_record)
+                .expect("inode metadata after update")
+                .modified()
+                .expect("inode modified after update")
+                > inode_modified_at,
+            "the inode record should still update when visible object metadata changes"
         );
 
         cleanup(&root);
@@ -2401,8 +2990,9 @@ mod tests {
             entry.mutation,
             DfsMetadataMutation::PutIntent {
                 status: DfsWriteIntentStatus::ReceiptsPending,
+                intent: Some(ref journal_intent),
                 ..
-            }
+            } if journal_intent == &intent
         ));
         assert_eq!(
             backend
@@ -2896,7 +3486,10 @@ mod tests {
         let entry = backend.put_conflict(&conflict).expect("put conflict");
         assert!(matches!(
             entry.mutation,
-            DfsMetadataMutation::PutConflict { .. }
+            DfsMetadataMutation::PutConflict {
+                conflict: Some(ref journal_conflict),
+                ..
+            } if journal_conflict == &conflict
         ));
         assert_eq!(
             backend
