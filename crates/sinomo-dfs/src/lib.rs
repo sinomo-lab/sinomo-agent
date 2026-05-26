@@ -6233,30 +6233,40 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         content_hash: &str,
     ) -> Result<bool, DfsError> {
         self.ensure_metadata_receipt_accepts(object_id, version, replica_node_id, content_hash)?;
-        let Some(backend) = self.metadata_backend.as_mut() else {
-            return Ok(false);
-        };
-        for receipt in backend.receipts_for_version(object_id, version)? {
-            if receipt.replica_node_id != *replica_node_id {
-                continue;
-            }
-            if receipt.content_hash.as_deref() == Some(content_hash) {
+        let inserted = {
+            let Some(backend) = self.metadata_backend.as_mut() else {
                 return Ok(false);
+            };
+            let mut existing_matching_receipt = false;
+            for receipt in backend.receipts_for_version(object_id, version)? {
+                if receipt.replica_node_id != *replica_node_id {
+                    continue;
+                }
+                if receipt.content_hash.as_deref() == Some(content_hash) {
+                    existing_matching_receipt = true;
+                    break;
+                }
             }
-        }
-        backend.put_receipt(&DfsReplicaReceiptRecord {
-            receipt: DfsWriteReceipt {
-                file_system_id: file_system_id.clone(),
-                object_id: object_id.clone(),
-                committed_version: version.clone(),
-                owner_node_id: self.node_id.clone(),
-                event_id: EventId::generate(),
-            },
-            replica_node_id: replica_node_id.clone(),
-            content_hash: Some(content_hash.to_string()),
-            received_at: OffsetDateTime::now_utc(),
-        })?;
-        Ok(true)
+            if existing_matching_receipt {
+                false
+            } else {
+                backend.put_receipt(&DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: file_system_id.clone(),
+                        object_id: object_id.clone(),
+                        committed_version: version.clone(),
+                        owner_node_id: self.node_id.clone(),
+                        event_id: EventId::generate(),
+                    },
+                    replica_node_id: replica_node_id.clone(),
+                    content_hash: Some(content_hash.to_string()),
+                    received_at: OffsetDateTime::now_utc(),
+                })?;
+                true
+            }
+        };
+        self.mark_repaired_location(object_id, version, replica_node_id, content_hash)?;
+        Ok(inserted)
     }
 
     fn ensure_metadata_receipt_accepts(
@@ -7372,6 +7382,38 @@ mod tests {
         };
         assert_eq!(repair_jobs.len(), 1);
         assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn receipt_updates_visible_current_locations_for_current_version() {
+        let root = temp_root("receipt-updates-current-locations");
+        let owner = NodeId::from_legacy_named("node_receipt_location_owner").expect("owner");
+        let replica = NodeId::from_legacy_named("node_receipt_location_replica").expect("replica");
+        let object_id = DfsObjectId::from_legacy_named("obj_receipt_location").expect("object");
+        let version = DfsVersion::from_legacy_named("version_2").expect("version");
+        let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+        let mut metadata = file_metadata(owner.clone());
+        metadata.object_id = object_id.clone();
+        metadata.version = version.clone();
+        metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+        metadata.current_locations = vec![owner.clone()];
+        metadata.content_hash = Some("blake3:receipt-location".to_string());
+        dfs.add_object_metadata(metadata).expect("metadata");
+
+        dfs.put_metadata_receipt(
+            &sifs_file_system_id(),
+            &object_id,
+            &version,
+            &replica,
+            "blake3:receipt-location",
+        )
+        .expect("receipt");
+
+        let object = dfs
+            .current_read_object_metadata(&object_id)
+            .expect("current object");
+        assert_eq!(object.current_locations, vec![owner, replica]);
         std::fs::remove_dir_all(root).ok();
     }
 
