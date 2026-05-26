@@ -73,6 +73,7 @@ pub const CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS: i64 = 120;
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 1;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
+const CLUSTER_RAFT_ELECTION_TERM_BUMP: u64 = 64;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInfoRecord>>> =
@@ -2803,7 +2804,9 @@ pub fn elect_cluster_raft_leader(
             let _raft_guard = lock_cluster_raft_operation()?;
             let node = sinomo_network::open_cluster_raft_kv_node(paths, &state.local_node_id)?;
             (
-                node.hard_state().current_term.saturating_add(1),
+                node.hard_state()
+                    .current_term
+                    .saturating_add(CLUSTER_RAFT_ELECTION_TERM_BUMP),
                 node.last_log_index(),
                 node.last_log_term(),
             )
