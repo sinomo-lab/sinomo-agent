@@ -5,6 +5,7 @@
 //! ordered layout on disk, and every mutation is mirrored into an append-only
 //! journal that can later be replicated or replayed by metadata shard peers.
 
+use crate::control_plane::{DfsMetadataShardConfig, select_metadata_shard_config_for_path};
 use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use fs2::FileExt;
@@ -510,6 +511,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             max_encoded_bytes,
         )
     }
+    fn journal_batch_for_shard_since_limited(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        after_sequence: u64,
+        max_entries: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<DfsMetadataJournalBatch>> {
+        self.journal_batch_since_limited(after_sequence, max_entries, max_encoded_bytes)
+    }
     fn metadata_replication_cursor(
         &self,
         _target_node_id: &NodeId,
@@ -538,6 +548,519 @@ pub struct LocalJsonMetadataBackend {
     shard_id: DfsMetadataShardId,
     root: PathBuf,
     next_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsObjectShardIndexRecord {
+    object_id: DfsObjectId,
+    file_system_id: DfsFileSystemId,
+    path: String,
+    shard_id: DfsMetadataShardId,
+}
+
+#[derive(Debug)]
+pub struct LocalShardedMetadataBackend {
+    root: PathBuf,
+    shard_configs: BTreeMap<String, DfsMetadataShardConfig>,
+    shards: BTreeMap<DfsMetadataShardId, LocalJsonMetadataBackend>,
+}
+
+impl LocalShardedMetadataBackend {
+    pub fn new(root: impl Into<PathBuf>, shards: Vec<DfsMetadataShardConfig>) -> Result<Self> {
+        let root = root.into();
+        if shards.is_empty() {
+            return Err(MetadataBackendError::Serde(
+                "local sharded metadata backend requires at least one shard".to_string(),
+            ));
+        }
+        create_dir_all(root.join("shard-index").join("objects"))?;
+        let mut shard_configs = BTreeMap::new();
+        let mut backends = BTreeMap::new();
+        for shard in shards {
+            let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+            if shard_configs
+                .insert(shard.shard_id.clone(), shard.clone())
+                .is_some()
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "duplicate DFS metadata shard config: {}",
+                    shard.shard_id
+                )));
+            }
+            let backend = LocalJsonMetadataBackend::new(
+                shard_id.clone(),
+                root.join(key_segment(&shard_id.0)),
+            )?;
+            backends.insert(shard_id, backend);
+        }
+        Ok(Self {
+            root,
+            shard_configs,
+            shards: backends,
+        })
+    }
+
+    pub fn shard_ids(&self) -> Vec<DfsMetadataShardId> {
+        self.shards.keys().cloned().collect()
+    }
+
+    fn object_shard_index_path(&self, object_id: &DfsObjectId) -> PathBuf {
+        self.root
+            .join("shard-index")
+            .join("objects")
+            .join(format!("{}.sobj", key_segment(object_id)))
+    }
+
+    fn read_object_shard_index(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectShardIndexRecord>> {
+        read_json_optional(&self.object_shard_index_path(object_id))
+    }
+
+    fn write_object_shard_index(
+        &self,
+        object: &DfsObjectMetadata,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        write_json_atomic(
+            &self.object_shard_index_path(&object.object_id),
+            &DfsObjectShardIndexRecord {
+                object_id: object.object_id.clone(),
+                file_system_id: object.file_system_id.clone(),
+                path: normalize_path(&object.path),
+                shard_id: shard_id.clone(),
+            },
+        )
+    }
+
+    fn shard_backend(&self, shard_id: &DfsMetadataShardId) -> Result<&LocalJsonMetadataBackend> {
+        self.shards.get(shard_id).ok_or_else(|| {
+            MetadataBackendError::Serde(format!("unknown local DFS metadata shard: {}", shard_id.0))
+        })
+    }
+
+    fn shard_backend_mut(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<&mut LocalJsonMetadataBackend> {
+        self.shards.get_mut(shard_id).ok_or_else(|| {
+            MetadataBackendError::Serde(format!("unknown local DFS metadata shard: {}", shard_id.0))
+        })
+    }
+
+    fn shard_configs_for_file_system(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Vec<DfsMetadataShardConfig> {
+        self.shard_configs
+            .values()
+            .filter(|shard| shard.file_system_id == *file_system_id)
+            .cloned()
+            .collect()
+    }
+
+    fn select_shard_id_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<DfsMetadataShardId> {
+        let selected = select_metadata_shard_config_for_path(
+            self.shard_configs_for_file_system(file_system_id),
+            path,
+        )
+        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        selected
+            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
+            .ok_or_else(|| MetadataBackendError::UnknownFileSystem {
+                file_system_id: file_system_id.clone(),
+            })
+    }
+
+    fn shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsMetadataShardId>> {
+        if let Some(index) = self.read_object_shard_index(object_id)? {
+            return Ok(Some(index.shard_id));
+        }
+        for (shard_id, backend) in &self.shards {
+            if backend.get_object(object_id)?.is_some() {
+                return Ok(Some(shard_id.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn require_shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<DfsMetadataShardId> {
+        self.shard_id_for_object(object_id)?
+            .ok_or_else(|| MetadataBackendError::UnknownObject {
+                object_id: object_id.clone(),
+            })
+    }
+
+    fn put_cross_shard_tombstone(
+        &mut self,
+        object: &DfsObjectMetadata,
+        source_shard_id: &DfsMetadataShardId,
+        target_shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        if source_shard_id == target_shard_id {
+            return Ok(());
+        }
+        let Some(previous) = self
+            .shard_backend(source_shard_id)?
+            .get_object(&object.object_id)?
+        else {
+            return Ok(());
+        };
+        if previous.kind == DfsObjectKind::Tombstone {
+            return Ok(());
+        }
+        let mut tombstone = previous.clone();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.version = object.version.clone();
+        tombstone.changed_at_unix_nanos = object.changed_at_unix_nanos;
+        tombstone.last_modified_by_event_id = object.last_modified_by_event_id.clone();
+        self.shard_backend_mut(source_shard_id)?
+            .put_object(&tombstone)?;
+        Ok(())
+    }
+
+    fn put_object_routed(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
+        let object = normalized_object_metadata(object);
+        let target_shard_id =
+            self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        if let Some(index) = self.read_object_shard_index(&object.object_id)? {
+            self.put_cross_shard_tombstone(&object, &index.shard_id, &target_shard_id)?;
+        }
+        let entry = self
+            .shard_backend_mut(&target_shard_id)?
+            .put_object(&object)?;
+        self.write_object_shard_index(&object, &target_shard_id)?;
+        Ok(entry)
+    }
+}
+
+impl DfsMetadataBackend for LocalShardedMetadataBackend {
+    fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
+        let shard_ids = self
+            .shard_configs_for_file_system(&file_system.file_system_id)
+            .into_iter()
+            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
+            .collect::<Vec<_>>();
+        if shard_ids.is_empty() {
+            return Err(MetadataBackendError::UnknownFileSystem {
+                file_system_id: file_system.file_system_id.clone(),
+            });
+        }
+        let mut last_entry = None;
+        for shard_id in shard_ids {
+            last_entry = Some(
+                self.shard_backend_mut(&shard_id)?
+                    .put_file_system(file_system)?,
+            );
+        }
+        last_entry.ok_or_else(|| MetadataBackendError::UnknownFileSystem {
+            file_system_id: file_system.file_system_id.clone(),
+        })
+    }
+
+    fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>> {
+        for backend in self.shards.values() {
+            if let Some(file_system) = backend.get_file_system(file_system_id)? {
+                return Ok(Some(file_system));
+            }
+        }
+        Ok(None)
+    }
+
+    fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>> {
+        let mut file_systems = BTreeMap::<DfsFileSystemId, DfsFileSystem>::new();
+        for backend in self.shards.values() {
+            for file_system in backend.list_file_systems()? {
+                file_systems.insert(file_system.file_system_id.clone(), file_system);
+            }
+        }
+        Ok(file_systems.into_values().collect())
+    }
+
+    fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
+        self.put_object_routed(object)
+    }
+
+    fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
+        if let Some(shard_id) = self.shard_id_for_object(object_id)? {
+            return self.shard_backend(&shard_id)?.get_object(object_id);
+        }
+        Ok(None)
+    }
+
+    fn get_object_by_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let shard_id = self.select_shard_id_for_path(file_system_id, path)?;
+        self.shard_backend(&shard_id)?
+            .get_object_by_path(file_system_id, path)
+    }
+
+    fn objects_for_file_system(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let mut objects = BTreeMap::<DfsObjectId, DfsObjectMetadata>::new();
+        for (shard_id, backend) in &self.shards {
+            for object in backend.objects_for_file_system(file_system_id)? {
+                if let Some(index) = self.read_object_shard_index(&object.object_id)?
+                    && index.shard_id != *shard_id
+                {
+                    continue;
+                }
+                objects.insert(object.object_id.clone(), object);
+            }
+        }
+        let mut objects = objects.into_values().collect::<Vec<_>>();
+        objects.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        Ok(objects)
+    }
+
+    fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = self.require_shard_id_for_object(&version.object_id)?;
+        self.shard_backend_mut(&shard_id)?.put_version(version)
+    }
+
+    fn get_version(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<Option<DfsObjectVersionRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(None);
+        };
+        self.shard_backend(&shard_id)?
+            .get_version(object_id, version)
+    }
+
+    fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(Vec::new());
+        };
+        self.shard_backend(&shard_id)?
+            .versions_for_object(object_id)
+    }
+
+    fn put_receipt(
+        &mut self,
+        receipt: &DfsReplicaReceiptRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = self.require_shard_id_for_object(&receipt.receipt.object_id)?;
+        self.shard_backend_mut(&shard_id)?.put_receipt(receipt)
+    }
+
+    fn receipts_for_version(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<Vec<DfsReplicaReceiptRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(Vec::new());
+        };
+        self.shard_backend(&shard_id)?
+            .receipts_for_version(object_id, version)
+    }
+
+    fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = self.require_shard_id_for_object(&intent.object_id)?;
+        self.shard_backend_mut(&shard_id)?.put_intent(intent)
+    }
+
+    fn get_intent(
+        &self,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<Option<DfsWriteIntentRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(None);
+        };
+        self.shard_backend(&shard_id)?
+            .get_intent(object_id, intent_id)
+    }
+
+    fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(Vec::new());
+        };
+        self.shard_backend(&shard_id)?.intents_for_object(object_id)
+    }
+
+    fn commit_visible_version(
+        &mut self,
+        expected_version: &DfsVersion,
+        committed_object: &DfsObjectMetadata,
+        visible_version: &DfsObjectVersionRecord,
+        required_replica_node_ids: &[NodeId],
+    ) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = self.require_shard_id_for_object(&committed_object.object_id)?;
+        let entry = self.shard_backend_mut(&shard_id)?.commit_visible_version(
+            expected_version,
+            committed_object,
+            visible_version,
+            required_replica_node_ids,
+        )?;
+        self.write_object_shard_index(&normalized_object_metadata(committed_object), &shard_id)?;
+        Ok(entry)
+    }
+
+    fn apply_namespace_transaction(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let mut objects_by_shard = BTreeMap::<DfsMetadataShardId, Vec<DfsObjectMetadata>>::new();
+        for object in &transaction.objects {
+            let object = normalized_object_metadata(object);
+            let target_shard_id =
+                self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+            if let Some(index) = self.read_object_shard_index(&object.object_id)? {
+                self.put_cross_shard_tombstone(&object, &index.shard_id, &target_shard_id)?;
+            }
+            objects_by_shard
+                .entry(target_shard_id)
+                .or_default()
+                .push(object);
+        }
+        let mut last_entry = None;
+        for (shard_id, objects) in objects_by_shard {
+            let shard_transaction = DfsNamespaceTransaction {
+                transaction_id: format!("{}:{}", transaction.transaction_id, shard_id.0),
+                file_system_id: transaction.file_system_id.clone(),
+                objects,
+                created_at: transaction.created_at,
+            };
+            let entry = self
+                .shard_backend_mut(&shard_id)?
+                .apply_namespace_transaction(&shard_transaction)?;
+            for object in &shard_transaction.objects {
+                self.write_object_shard_index(object, &shard_id)?;
+            }
+            last_entry = Some(entry);
+        }
+        last_entry.ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "namespace transaction {} did not contain any objects",
+                transaction.transaction_id
+            ))
+        })
+    }
+
+    fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = self.require_shard_id_for_object(&conflict.object_id)?;
+        self.shard_backend_mut(&shard_id)?.put_conflict(conflict)
+    }
+
+    fn get_conflict(
+        &self,
+        object_id: &DfsObjectId,
+        conflict_id: &str,
+    ) -> Result<Option<DfsConflictRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(None);
+        };
+        self.shard_backend(&shard_id)?
+            .get_conflict(object_id, conflict_id)
+    }
+
+    fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(Vec::new());
+        };
+        self.shard_backend(&shard_id)?
+            .conflicts_for_object(object_id)
+    }
+
+    fn update_conflict_status(
+        &mut self,
+        object_id: &DfsObjectId,
+        conflict_id: &str,
+        status: DfsConflictStatus,
+    ) -> Result<Option<DfsConflictRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(None);
+        };
+        self.shard_backend_mut(&shard_id)?
+            .update_conflict_status(object_id, conflict_id, status)
+    }
+
+    fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let mut entries = Vec::new();
+        for backend in self.shards.values() {
+            entries.extend(backend.journal_since(after_sequence)?);
+        }
+        entries.sort_by(|left, right| {
+            left.sequence
+                .cmp(&right.sequence)
+                .then_with(|| left.shard_id.cmp(&right.shard_id))
+        });
+        Ok(entries)
+    }
+
+    fn journal_batch_for_shard_since_limited(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after_sequence: u64,
+        max_entries: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<DfsMetadataJournalBatch>> {
+        self.shard_backend(shard_id)?.journal_batch_since_limited(
+            after_sequence,
+            max_entries,
+            max_encoded_bytes,
+        )
+    }
+
+    fn metadata_replication_cursor(
+        &self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<u64> {
+        self.shard_backend(shard_id)?
+            .metadata_replication_cursor(target_node_id, shard_id)
+    }
+
+    fn put_metadata_replication_cursor(
+        &mut self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+        next_after_sequence: u64,
+    ) -> Result<()> {
+        self.shard_backend_mut(shard_id)?
+            .put_metadata_replication_cursor(target_node_id, shard_id, next_after_sequence)
+    }
+
+    fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
+        self.shard_backend_mut(&batch.shard_id)?
+            .apply_journal_batch(batch)
+    }
+
+    fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {
+        let shard_id = self
+            .shards
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| DfsMetadataShardId::new("default"));
+        DfsMetadataSubscription::new(shard_id, after_sequence)
+    }
+
+    fn poll_subscription(
+        &self,
+        subscription: &mut DfsMetadataSubscription,
+    ) -> Result<DfsMetadataJournalBatch> {
+        self.shard_backend(&subscription.shard_id)?
+            .poll_subscription(subscription)
+    }
 }
 
 impl LocalJsonMetadataBackend {
@@ -1749,6 +2272,24 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         max_entries: usize,
         max_encoded_bytes: usize,
     ) -> Result<Option<DfsMetadataJournalBatch>> {
+        LocalJsonMetadataBackend::journal_batch_since_limited(
+            self,
+            after_sequence,
+            max_entries,
+            max_encoded_bytes,
+        )
+    }
+
+    fn journal_batch_for_shard_since_limited(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after_sequence: u64,
+        max_entries: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<DfsMetadataJournalBatch>> {
+        if shard_id != &self.shard_id {
+            return Ok(None);
+        }
         LocalJsonMetadataBackend::journal_batch_since_limited(
             self,
             after_sequence,
@@ -2985,6 +3526,7 @@ fn temporary_path_for(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DfsMetadataShardAssignment;
     use sinomo_core::DfsObjectPolicy;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -3035,6 +3577,21 @@ mod tests {
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
             last_modified_by_event_id: None,
+        }
+    }
+
+    fn shard_config(
+        shard_id: &str,
+        assignment: DfsMetadataShardAssignment,
+    ) -> DfsMetadataShardConfig {
+        DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: shard_id.to_string(),
+            primary_node_id: node("node_owner"),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
         }
     }
 
@@ -3091,6 +3648,136 @@ mod tests {
         let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(reopened.journal_since(1).expect("journal").len(), 1);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_routes_object_and_version_to_selected_path_shard() {
+        let root = temp_root("sharded_backend_routes_object_and_version");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let mut object = object(version("version_1"));
+        object.path = "/services/readme.md".to_string();
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: object.created_by_event_id.clone(),
+            created_at: OffsetDateTime::now_utc(),
+            visible: true,
+        };
+
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        backend.put_version(&version_record).expect("version");
+
+        assert_eq!(
+            backend
+                .get_object(&object.object_id)
+                .expect("get object")
+                .as_ref()
+                .map(|object| object.path.as_str()),
+            Some("/services/readme.md")
+        );
+        assert_eq!(
+            backend
+                .get_version(&object.object_id, &object.version)
+                .expect("get version"),
+            Some(version_record)
+        );
+        let services_batch = backend
+            .journal_batch_for_shard_since_limited(
+                &DfsMetadataShardId::new("services"),
+                0,
+                16,
+                usize::MAX,
+            )
+            .expect("services batch")
+            .expect("services changes");
+        assert!(
+            services_batch.entries.iter().any(|entry| matches!(
+                entry.mutation,
+                DfsMetadataMutation::PutObject { .. } | DfsMetadataMutation::PutVersion { .. }
+            )),
+            "path-selected shard should own object and version journal entries"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_moves_object_between_path_shards_without_scanning_on_read() {
+        let root = temp_root("sharded_backend_moves_object_between_path_shards");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+                shard_config(
+                    "users",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/users".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let mut object = object(version("version_1"));
+        object.path = "/services/readme.md".to_string();
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("services object");
+
+        let mut moved = object.clone();
+        moved.path = "/users/readme.md".to_string();
+        moved.version = version("version_2");
+        backend.put_object(&moved).expect("moved object");
+
+        assert_eq!(
+            backend
+                .get_object(&object.object_id)
+                .expect("get moved object")
+                .as_ref()
+                .map(|object| object.path.as_str()),
+            Some("/users/readme.md")
+        );
+        assert_eq!(
+            backend
+                .objects_for_file_system(&file_system.file_system_id)
+                .expect("objects")
+                .into_iter()
+                .map(|object| object.path)
+                .collect::<Vec<_>>(),
+            vec!["/users/readme.md".to_string()]
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, "/services/readme.md")
+                .expect("old path")
+                .map(|object| object.kind),
+            Some(DfsObjectKind::Tombstone)
+        );
 
         cleanup(&root);
     }

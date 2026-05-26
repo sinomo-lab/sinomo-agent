@@ -2808,23 +2808,56 @@ pub fn open_daemon_sandbox_dfs_service(
             detail: source.to_string(),
         },
     )?;
-    let metadata = sinomo_dfs::open_root_local_metadata_backend(
-        data_dir.dfs_dir().join("metadata").join("root"),
-    )?;
     let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
-    let mut dfs = sinomo_dfs::NetworkedDfsService::new(
+    let dfs = sinomo_dfs::NetworkedDfsService::new(
         DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
         content,
-    )
-    .with_metadata_backend(metadata)
-    .map_err(|source| DaemonError::Parse {
-        detail: source.to_string(),
-    })?;
+    );
+    let mut dfs = if let Some(metadata) =
+        open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)?
+    {
+        dfs.with_metadata_backend(metadata)
+            .map_err(|source| DaemonError::Parse {
+                detail: source.to_string(),
+            })?
+    } else {
+        let metadata = sinomo_dfs::open_root_local_metadata_backend(
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )?;
+        dfs.with_metadata_backend(metadata)
+            .map_err(|source| DaemonError::Parse {
+                detail: source.to_string(),
+            })?
+    };
     dfs.bootstrap_distributed_sifs()
         .map_err(|source| DaemonError::Parse {
             detail: source.to_string(),
         })?;
     Ok(dfs)
+}
+
+fn open_daemon_sharded_dfs_metadata_backend(
+    data_dir: &sinomo_local::SinomoDataDir,
+    cluster_paths: &sinomo_network::ClusterPaths,
+) -> Result<Option<sinomo_dfs::LocalShardedMetadataBackend>, DaemonError> {
+    let file_system_id = sinomo_dfs::sifs_file_system_id();
+    let mut shards = sinomo_network::read_cluster_kv_prefix_entries(
+        cluster_paths,
+        &format!("{}/", sinomo_dfs::metadata_shards_prefix(&file_system_id)),
+    )?
+    .into_iter()
+    .map(|entry| entry.decode::<sinomo_dfs::DfsMetadataShardConfig>())
+    .collect::<Result<Vec<_>, _>>()?;
+    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    if shards.is_empty() {
+        return Ok(None);
+    }
+    sinomo_dfs::open_local_sharded_metadata_backend(
+        sinomo_dfs::default_dfs_metadata_shards_root(data_dir),
+        shards,
+    )
+    .map(Some)
+    .map_err(Into::into)
 }
 
 fn daemon_data_dir_path(paths: &DaemonPaths) -> Result<PathBuf, DaemonError> {
@@ -2999,6 +3032,108 @@ mod tests {
         assert!(candidates.contains(&local));
         assert!(candidates.contains(&replica));
         assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn daemon_opens_configured_sharded_dfs_metadata_backend() {
+        use sinomo_dfs::DfsMetadataBackend as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-daemon-sharded-dfs-metadata-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_daemon_sharded_dfs")
+            .expect("cluster");
+        let local = NodeId::from_legacy_named("node_daemon_sharded_dfs").expect("node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "daemon sharded dfs",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+        let file_system = sinomo_dfs::distributed_sifs(local.clone());
+        let root_shard = sinomo_dfs::DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: sinomo_dfs::DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let services_shard = sinomo_dfs::DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: sinomo_dfs::DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_kv::KvCommand::Txn(sinomo_kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_kv::KvOp::put_serde(
+                        sinomo_dfs::metadata_shard_key(&file_system.file_system_id, "root"),
+                        &root_shard,
+                        None,
+                    )
+                    .expect("root shard op"),
+                    sinomo_kv::KvOp::put_serde(
+                        sinomo_dfs::metadata_shard_key(&file_system.file_system_id, "services"),
+                        &services_shard,
+                        None,
+                    )
+                    .expect("services shard op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("write shard configs");
+
+        let mut backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+            .expect("open backend")
+            .expect("configured sharded backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        let mut object = sinomo_dfs::distributed_sifs_bootstrap_objects(local)
+            .into_iter()
+            .next()
+            .expect("object");
+        object.path = "/services/daemon-sharded.txt".to_string();
+        backend.put_object(&object).expect("object");
+
+        let services_batch = backend
+            .journal_batch_for_shard_since_limited(
+                &sinomo_dfs::DfsMetadataShardId::new("services"),
+                0,
+                sinomo_dfs::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                sinomo_dfs::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .expect("services journal")
+            .expect("services entries");
+        assert!(services_batch.entries.iter().any(|entry| matches!(
+            entry.mutation,
+            sinomo_dfs::DfsMetadataMutation::PutObject { .. }
+        )));
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

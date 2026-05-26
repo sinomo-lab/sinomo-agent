@@ -226,7 +226,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
-        select_metadata_shard_for_path(self.list_metadata_shards(file_system_id)?, path)
+        select_metadata_shard_config_for_path(self.list_metadata_shards(file_system_id)?, path)
     }
 
     pub fn transfer_metadata_shard_primary(
@@ -283,7 +283,7 @@ fn normalize_segment(segment: &str) -> String {
     segment.trim_matches('/').replace('/', "_")
 }
 
-fn select_metadata_shard_for_path(
+pub(crate) fn select_metadata_shard_config_for_path(
     shards: Vec<DfsMetadataShardConfig>,
     path: &str,
 ) -> Result<Option<DfsMetadataShardConfig>, KvError> {

@@ -40,7 +40,8 @@ pub use metadata_backend::{
     DfsInodeRecord, DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
     DfsMetadataMutation, DfsMetadataShardId, DfsMetadataSubscription, DfsNamespaceTransaction,
     DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
-    DfsWriteIntentStatus, LocalJsonMetadataBackend, MetadataBackendError,
+    DfsWriteIntentStatus, LocalJsonMetadataBackend, LocalShardedMetadataBackend,
+    MetadataBackendError,
 };
 use namespace::metadata_path;
 pub use namespace::{
@@ -160,6 +161,10 @@ pub fn default_dfs_metadata_root(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir.dfs_dir().join("metadata").join("root")
 }
 
+pub fn default_dfs_metadata_shards_root(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir.dfs_dir().join("metadata")
+}
+
 pub fn resolve_dfs_metadata_root(explicit: Option<PathBuf>) -> Result<PathBuf, LocalDataError> {
     if let Some(path) = explicit {
         return Ok(path);
@@ -246,6 +251,13 @@ pub fn open_root_local_metadata_backend(
     root: impl Into<PathBuf>,
 ) -> Result<LocalJsonMetadataBackend, MetadataBackendError> {
     LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.into())
+}
+
+pub fn open_local_sharded_metadata_backend(
+    root: impl Into<PathBuf>,
+    shards: Vec<DfsMetadataShardConfig>,
+) -> Result<LocalShardedMetadataBackend, MetadataBackendError> {
+    LocalShardedMetadataBackend::new(root, shards)
 }
 
 pub fn inspect_dfs_status(
@@ -1427,7 +1439,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 } else {
                     0
                 };
-            let Some(batch) = self.metadata_journal_batch_since(after_sequence)? else {
+            let Some(batch) =
+                self.metadata_journal_batch_for_shard_since(&shard_id, after_sequence)?
+            else {
                 outcomes.push(DfsMetadataReplicationOutcome::NoChanges {
                     target_node_id,
                     shard_id: shard_id.clone(),
@@ -2664,6 +2678,24 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         };
         backend
             .journal_batch_since_limited(
+                after_sequence,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .map_err(Into::into)
+    }
+
+    fn metadata_journal_batch_for_shard_since(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after_sequence: u64,
+    ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        backend
+            .journal_batch_for_shard_since_limited(
+                shard_id,
                 after_sequence,
                 DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
                 DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
@@ -7906,39 +7938,41 @@ mod tests {
         let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
         let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
         let file_system = file_system(owner.clone());
+        let shard_configs = vec![
+            DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: root_primary.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 7,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ];
         let shared_kv = SharedDfsControlPlaneKvClient::new(
             InProcessRaftKvCluster::new(vec![owner.clone()]).expect("kv"),
         );
         shared_kv.with_client(|kv| {
             let mut control = DfsControlPlaneStore::new(kv);
-            control
-                .put_metadata_shard(&DfsMetadataShardConfig {
-                    file_system_id: file_system.file_system_id.clone(),
-                    shard_id: "root".to_string(),
-                    primary_node_id: root_primary.clone(),
-                    replica_node_ids: Vec::new(),
-                    epoch: 1,
-                    assignment: DfsMetadataShardAssignment::Root,
-                    default_policy: DfsObjectPolicy::ReplicatedEventual,
-                })
-                .expect("root shard");
-            control
-                .put_metadata_shard(&DfsMetadataShardConfig {
-                    file_system_id: file_system.file_system_id.clone(),
-                    shard_id: "services".to_string(),
-                    primary_node_id: owner.clone(),
-                    replica_node_ids: Vec::new(),
-                    epoch: 7,
-                    assignment: DfsMetadataShardAssignment::PathPrefix {
-                        prefix: "/services".to_string(),
-                    },
-                    default_policy: DfsObjectPolicy::ReplicatedEventual,
-                })
-                .expect("services shard");
+            for shard in &shard_configs {
+                control.put_metadata_shard(shard).expect("metadata shard");
+            }
         });
 
         let content = LocalContentStore::new(root.join("content")).expect("content");
-        let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+        let metadata = open_local_sharded_metadata_backend(root.join("metadata"), shard_configs)
+            .expect("metadata");
         let mut dfs = NetworkedDfsService::new(
             FailingSendTransport {
                 local_node_id: owner.clone(),
@@ -7981,6 +8015,24 @@ mod tests {
             .expect("read intent")
             .expect("intent");
         assert_eq!(intent.owner_epoch, 7);
+        let services_batch = dfs
+            .metadata_backend()
+            .expect("metadata backend")
+            .journal_batch_for_shard_since_limited(
+                &DfsMetadataShardId::new("services"),
+                0,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .expect("services journal")
+            .expect("services entries");
+        assert!(
+            services_batch.entries.iter().any(|entry| matches!(
+                entry.mutation,
+                DfsMetadataMutation::PutIntent { .. } | DfsMetadataMutation::PutVersion { .. }
+            )),
+            "distributed write metadata must be journaled on the selected services shard"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
