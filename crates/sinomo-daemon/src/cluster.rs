@@ -47,11 +47,11 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const DAEMON_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
-pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
+pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
-pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_millis(750);
+pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_secs(15);
 pub const DAEMON_CLUSTER_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
