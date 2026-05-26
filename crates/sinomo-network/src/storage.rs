@@ -1058,6 +1058,20 @@ pub fn apply_cluster_raft_vote(
     node.request_vote(vote).map_err(Into::into)
 }
 
+pub fn observe_cluster_raft_term(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    term: u64,
+) -> Result<bool, NetworkError> {
+    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    let changed = node.observe_term(term)?;
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
+    if changed {
+        mirror_cluster_raft_snapshot(paths, &node)?;
+    }
+    Ok(changed)
+}
+
 pub fn set_cluster_raft_leader(
     paths: &ClusterPaths,
     node_id: &NodeId,

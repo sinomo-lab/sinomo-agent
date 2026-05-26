@@ -2798,64 +2798,78 @@ pub fn elect_cluster_raft_leader(
     if !sinomo_network::cluster_raft_local_is_voter(state) {
         return Ok(false);
     }
-    let (election_term, last_log_index, last_log_term) = {
-        let _raft_guard = lock_cluster_raft_operation()?;
-        let node = sinomo_network::open_cluster_raft_kv_node(paths, &state.local_node_id)?;
-        (
-            node.hard_state().current_term.saturating_add(1),
-            node.last_log_index(),
-            node.last_log_term(),
-        )
-    };
-    let vote_request = ClusterRaftVoteRequest {
-        state: state.clone(),
-        vote: RaftRequestVoteRequest {
-            term: election_term,
-            candidate_id: state.local_node_id.clone(),
-            last_log_index,
-            last_log_term,
-        },
-    };
-    let local_vote = {
-        let _raft_guard = lock_cluster_raft_operation()?;
-        sinomo_network::apply_cluster_raft_vote(
-            paths,
-            &state.local_node_id,
-            vote_request.vote.clone(),
-        )?
-    };
-    let mut granted = std::collections::BTreeSet::new();
-    if local_vote.vote_granted {
-        granted.insert(state.local_node_id.clone());
-    }
-    let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    let targets = cluster_raft_live_voter_targets(paths, state);
-    for (index, endpoint) in targets.iter().enumerate() {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            break;
-        }
-        let Ok(response) = send_cluster_raft_vote(
-            &endpoint,
-            &vote_request,
-            cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index),
-        ) else {
-            continue;
+    for _ in 0..3 {
+        let (election_term, last_log_index, last_log_term) = {
+            let _raft_guard = lock_cluster_raft_operation()?;
+            let node = sinomo_network::open_cluster_raft_kv_node(paths, &state.local_node_id)?;
+            (
+                node.hard_state().current_term.saturating_add(1),
+                node.last_log_index(),
+                node.last_log_term(),
+            )
         };
-        if response.vote.vote_granted {
-            granted.insert(endpoint.node_id.clone());
+        let vote_request = ClusterRaftVoteRequest {
+            state: state.clone(),
+            vote: RaftRequestVoteRequest {
+                term: election_term,
+                candidate_id: state.local_node_id.clone(),
+                last_log_index,
+                last_log_term,
+            },
+        };
+        let local_vote = {
+            let _raft_guard = lock_cluster_raft_operation()?;
+            sinomo_network::apply_cluster_raft_vote(
+                paths,
+                &state.local_node_id,
+                vote_request.vote.clone(),
+            )?
+        };
+        let mut highest_observed_term = local_vote.term.max(election_term);
+        let mut granted = std::collections::BTreeSet::new();
+        if local_vote.vote_granted {
+            granted.insert(state.local_node_id.clone());
         }
+        let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
+        let targets = cluster_raft_live_voter_targets(paths, state);
+        for (index, endpoint) in targets.iter().enumerate() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(response) = send_cluster_raft_vote(
+                endpoint,
+                &vote_request,
+                cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index),
+            ) else {
+                continue;
+            };
+            highest_observed_term = highest_observed_term.max(response.vote.term);
+            if response.vote.vote_granted {
+                granted.insert(endpoint.node_id.clone());
+            }
+        }
+        if highest_observed_term > election_term {
+            let _raft_guard = lock_cluster_raft_operation()?;
+            sinomo_network::observe_cluster_raft_term(
+                paths,
+                &state.local_node_id,
+                highest_observed_term,
+            )?;
+            continue;
+        }
+        if granted.len() < sinomo_network::cluster_raft_quorum_size(state) {
+            return Ok(false);
+        }
+        {
+            let _raft_guard = lock_cluster_raft_operation()?;
+            sinomo_network::set_cluster_raft_leader(paths, &state.local_node_id, election_term)?;
+        }
+        return Ok(true);
     }
-    if granted.len() < sinomo_network::cluster_raft_quorum_size(state) {
-        return Ok(false);
-    }
-    {
-        let _raft_guard = lock_cluster_raft_operation()?;
-        sinomo_network::set_cluster_raft_leader(paths, &state.local_node_id, election_term)?;
-    }
-    Ok(true)
+    Ok(false)
 }
 
 pub fn replicate_cluster_raft_to_endpoint(

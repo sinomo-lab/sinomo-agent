@@ -1592,6 +1592,16 @@ impl ReplicatedKvNode {
         })
     }
 
+    fn observe_term(&mut self, term: u64) -> bool {
+        if term <= self.hard_state.current_term {
+            return false;
+        }
+        self.hard_state.current_term = term;
+        self.hard_state.voted_for = None;
+        self.hard_state.leader_id = None;
+        true
+    }
+
     fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
         if commit_index <= self.applied_index {
             self.hard_state.commit_index = self.hard_state.commit_index.max(commit_index);
@@ -1857,6 +1867,14 @@ impl DurableRaftKvNode {
         let response = self.node.handle_request_vote(request)?;
         self.persist_hard_state()?;
         Ok(response)
+    }
+
+    pub fn observe_term(&mut self, term: u64) -> Result<bool, KvError> {
+        if !self.node.observe_term(term) {
+            return Ok(false);
+        }
+        self.persist_hard_state()?;
+        Ok(true)
     }
 
     pub fn become_leader(&mut self, term: u64) -> Result<(), KvError> {
@@ -3068,6 +3086,48 @@ mod tests {
         assert_eq!(node.last_log_index(), 2);
         assert_eq!(node.hard_state().commit_index, 1);
         assert!(node.store().get("/config/replacement").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_observe_higher_term_clears_vote_and_leader() {
+        let root = temp_raft_root("sinomo-kv-observe-higher-term");
+        let node_id = NodeId::from_legacy_named("node_observe_higher_term").expect("node");
+        let leader_id = NodeId::from_legacy_named("node_observe_higher_term_leader").expect("node");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
+            node.request_vote(RaftRequestVoteRequest {
+                term: 2,
+                candidate_id: leader_id.clone(),
+                last_log_index: 0,
+                last_log_term: 0,
+            })
+            .expect("vote");
+            let append = node
+                .append_entries(RaftAppendEntriesRequest {
+                    term: 2,
+                    leader_id,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                })
+                .expect("append");
+            assert!(append.success);
+            assert!(node.hard_state().voted_for.is_some());
+            assert!(node.hard_state().leader_id.is_some());
+            assert!(node.observe_term(5).expect("observe higher term"));
+            assert_eq!(node.hard_state().current_term, 5);
+            assert!(node.hard_state().voted_for.is_none());
+            assert!(node.hard_state().leader_id.is_none());
+            assert!(!node.observe_term(4).expect("ignore lower term"));
+        }
+
+        let node = DurableRaftKvNode::open(node_id, paths).expect("reopen");
+        assert_eq!(node.hard_state().current_term, 5);
+        assert!(node.hard_state().voted_for.is_none());
+        assert!(node.hard_state().leader_id.is_none());
         std::fs::remove_dir_all(root).ok();
     }
 
