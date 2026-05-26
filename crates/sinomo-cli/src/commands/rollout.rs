@@ -706,8 +706,7 @@ pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
             unreachable_shadow_endpoint,
             endpoint.node_id != shadow_node_id,
             score,
-            network::cluster_daemon_command_address_rank(endpoint),
-            network::cluster_daemon_command_transport_rank(endpoint),
+            rollout_endpoint_unknown_route_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
         )
@@ -725,8 +724,7 @@ pub(crate) fn sort_rollout_endpoints_by_connectivity(
         (
             endpoint.node_id.clone(),
             rollout_endpoint_connectivity_score(state, &graph, endpoint),
-            network::cluster_daemon_command_address_rank(endpoint),
-            network::cluster_daemon_command_transport_rank(endpoint),
+            rollout_endpoint_unknown_route_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
         )
@@ -755,6 +753,29 @@ fn rollout_endpoint_connectivity_score(
 
 const ROLLOUT_ENDPOINT_UNKNOWN_SCORE: u8 = 2;
 const ROLLOUT_ENDPOINT_UNREACHABLE_SCORE: u8 = 3;
+
+fn rollout_endpoint_unknown_route_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    match endpoint.transport {
+        sinomo_runtime::core::ClusterTransportKind::Iroh => 0,
+        sinomo_runtime::core::ClusterTransportKind::LanTcp
+        | sinomo_runtime::core::ClusterTransportKind::Loopback => {
+            1_u8.saturating_add(rollout_tcp_address_rank(endpoint))
+        }
+        _ => 8,
+    }
+}
+
+fn rollout_tcp_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    let Ok(address) = endpoint.address.parse::<std::net::SocketAddr>() else {
+        return 3;
+    };
+    match address.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
+        std::net::IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
+        ip if ip.is_loopback() || ip.is_unspecified() => 2,
+        _ => 1,
+    }
+}
 
 fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {
     if !targets

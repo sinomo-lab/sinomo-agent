@@ -11617,6 +11617,53 @@ fn rollout_target_prefers_shadow_iroh_over_unknown_private_tcp() {
 }
 
 #[test]
+fn rollout_target_prefers_unknown_private_shadow_tcp_over_public_tcp() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-shadow-private-before-public-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_shadow_private_public").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_shadow_private_public_local").expect("node");
+    let main_node_id =
+        NodeId::from_legacy_named("node_rollout_shadow_private_public_remote").expect("node");
+    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "rollout shadow private public",
+        local_node_id,
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+
+    let private_shadow =
+        invite_introducer_endpoint(&shadow_node_id, "10.14.5.15:21354".to_string());
+    let public_shadow =
+        invite_introducer_endpoint(&shadow_node_id, "98.6.32.186:21354".to_string());
+
+    let selected = rollout_target_endpoint_for_main_with_connectivity(
+        &paths,
+        &state,
+        &main_node_id,
+        &[public_shadow, private_shadow.clone()],
+    )
+    .expect("rollout target");
+
+    assert_eq!(selected.node_id, shadow_node_id);
+    assert_eq!(selected.endpoint_id, private_shadow.endpoint_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn rollout_target_prefers_unknown_shadow_iroh_over_healthy_main_tcp() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-rollout-shadow-before-main-{}",
