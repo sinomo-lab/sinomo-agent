@@ -75,9 +75,9 @@ pub(crate) mod prelude {
     };
     pub(crate) use sinomo_kv::{
         DurableRaftKvNode, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent,
-        KvLogEntry, KvMaterializedCache, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse,
-        KvWalPaths, LeaseId, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
-        RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot, WatchId,
+        KvLocalCache, KvLogEntry, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvWalPaths,
+        LeaseId, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
+        RaftRequestVoteResponse, RaftSnapshot, WatchId,
     };
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::{

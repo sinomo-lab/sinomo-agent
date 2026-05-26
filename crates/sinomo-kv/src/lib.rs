@@ -458,6 +458,99 @@ impl KvMaterializedCache {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvLocalCache {
+    materialized: KvMaterializedCache,
+    raft_root: PathBuf,
+}
+
+impl KvLocalCache {
+    pub fn new(materialized_snapshot: impl Into<PathBuf>, raft_root: impl Into<PathBuf>) -> Self {
+        Self {
+            materialized: KvMaterializedCache::new(materialized_snapshot),
+            raft_root: raft_root.into(),
+        }
+    }
+
+    pub fn current_store(&self, node_id: NodeId) -> Result<InProcessKvStore, KvError> {
+        self.materialized
+            .read_store_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))
+    }
+
+    pub fn cached_store(&self) -> Result<InProcessKvStore, KvError> {
+        self.materialized.read_store()
+    }
+
+    pub fn current_snapshot(&self, node_id: NodeId) -> Result<KvSnapshot, KvError> {
+        self.current_store(node_id).map(|store| store.snapshot())
+    }
+
+    pub fn cached_snapshot(&self) -> Result<KvSnapshot, KvError> {
+        self.materialized.read_snapshot()
+    }
+
+    pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
+        self.materialized.write_snapshot(snapshot)
+    }
+
+    pub fn write_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
+        self.materialized.write_snapshot_if_changed(snapshot)
+    }
+
+    pub fn restore_raft_from_snapshot_if_newer(
+        &self,
+        node_id: NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, KvError> {
+        let wal_paths = self.raft_wal_paths(&node_id);
+        let node = DurableRaftKvNode::open_with_materialized_cache(
+            node_id.clone(),
+            wal_paths,
+            &self.materialized,
+        )?;
+        if snapshot.revision <= node.store().revision() {
+            self.materialized
+                .write_snapshot_if_changed(&node.store().snapshot())?;
+            return Ok(false);
+        }
+        self.materialized.write_snapshot_if_changed(&snapshot)?;
+        if node.applied_index() == 0 && node.last_log_index() == 0 {
+            drop(node);
+            let mut node = self.open_raft_node(node_id)?;
+            node.restore_snapshot(RaftSnapshot {
+                last_included_index: 0,
+                last_included_term: 0,
+                kv: snapshot,
+            })?;
+        }
+        Ok(true)
+    }
+
+    pub fn open_raft_node(&self, node_id: NodeId) -> Result<DurableRaftKvNode, KvError> {
+        DurableRaftKvNode::open_with_materialized_cache(
+            node_id.clone(),
+            self.raft_wal_paths(&node_id),
+            &self.materialized,
+        )
+    }
+
+    pub async fn open_raft_node_async(
+        &self,
+        node_id: NodeId,
+    ) -> Result<DurableRaftKvNode, KvError> {
+        DurableRaftKvNode::open_async_with_materialized_cache(
+            node_id.clone(),
+            self.raft_wal_paths(&node_id),
+            self.materialized.clone(),
+        )
+        .await
+    }
+
+    pub fn raft_wal_paths(&self, node_id: &NodeId) -> KvWalPaths {
+        KvWalPaths::new(self.raft_root.join(node_id.as_str()))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum KvCommand {
     Op(KvOp),
@@ -2310,6 +2403,55 @@ mod tests {
             .expect("open with cache");
         assert_eq!(node.last_log_index(), 1);
         assert!(node.store().get("/cache").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_current_store_prefers_raft_and_refreshes_materialized_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-local-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_local_cache").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        {
+            let mut node = cache.open_raft_node(node_id.clone()).expect("open raft");
+            node.append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/raft-current".to_string(),
+                    value: b"current".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append raft value");
+            node.commit_to(1).expect("commit raft value");
+        }
+        let mut stale_store = InProcessKvStore::new();
+        stale_store
+            .put("/cache-only", b"stale".to_vec(), None)
+            .expect("seed stale cache");
+        cache
+            .write_snapshot(&stale_store.snapshot())
+            .expect("write stale cache");
+
+        let current = cache.current_store(node_id).expect("read current store");
+        assert!(current.get("/cache-only").is_none());
+        assert_eq!(
+            current.get("/raft-current").expect("raft value").value,
+            b"current"
+        );
+        let refreshed = cache.cached_store().expect("read refreshed cache");
+        assert_eq!(
+            refreshed
+                .get("/raft-current")
+                .expect("cached raft value")
+                .value,
+            b"current"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

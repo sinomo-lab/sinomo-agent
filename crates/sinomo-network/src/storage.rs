@@ -745,8 +745,8 @@ pub fn write_cluster_state(
 }
 
 pub fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, NetworkError> {
-    cluster_kv_materialized_cache(paths)
-        .read_snapshot()
+    cluster_kv_local_cache(paths)
+        .cached_snapshot()
         .map_err(Into::into)
 }
 
@@ -754,7 +754,7 @@ pub fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), NetworkError> {
-    cluster_kv_materialized_cache(paths)
+    cluster_kv_local_cache(paths)
         .write_snapshot(snapshot)
         .map_err(Into::into)
 }
@@ -763,13 +763,12 @@ pub fn write_cluster_kv_snapshot_if_changed(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    cluster_kv_materialized_cache(paths)
+    cluster_kv_local_cache(paths)
         .write_snapshot_if_changed(snapshot)
         .map_err(Into::into)
 }
 
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
-    let cache = cluster_kv_materialized_cache(paths);
     let node_id = read_cluster_state_without_kv(paths)
         .map(|state| state.local_node_id)
         .or_else(|error| {
@@ -780,22 +779,21 @@ pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, N
                     .expect("static cache reader node id"))
             }
         })?;
-    let wal_paths = cluster_raft_wal_paths(paths, &node_id);
-    cache
-        .read_store_with_raft_view(node_id, wal_paths)
+    cluster_kv_local_cache(paths)
+        .current_store(node_id)
         .map_err(Into::into)
 }
 
 pub fn read_cluster_kv_snapshot_store(
     paths: &ClusterPaths,
 ) -> Result<InProcessKvStore, NetworkError> {
-    cluster_kv_materialized_cache(paths)
-        .read_store()
+    cluster_kv_local_cache(paths)
+        .cached_store()
         .map_err(Into::into)
 }
 
-fn cluster_kv_materialized_cache(paths: &ClusterPaths) -> KvMaterializedCache {
-    KvMaterializedCache::new(paths.kv_snapshot.clone())
+fn cluster_kv_local_cache(paths: &ClusterPaths) -> KvLocalCache {
+    KvLocalCache::new(paths.kv_snapshot.clone(), paths.kv_raft.clone())
 }
 
 pub fn cluster_raft_wal_paths(paths: &ClusterPaths, node_id: &NodeId) -> KvWalPaths {
@@ -806,10 +804,8 @@ pub fn open_cluster_raft_kv_node(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<DurableRaftKvNode, NetworkError> {
-    let wal_paths = cluster_raft_wal_paths(paths, node_id);
-    let cache = cluster_kv_materialized_cache(paths);
-    let mut node =
-        DurableRaftKvNode::open_with_materialized_cache(node_id.clone(), wal_paths, &cache)?;
+    let cache = cluster_kv_local_cache(paths);
+    let mut node = cache.open_raft_node(node_id.clone())?;
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
     Ok(node)
 }
@@ -819,34 +815,17 @@ pub fn restore_cluster_raft_from_snapshot_if_newer(
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    let node = open_cluster_raft_kv_node(paths, node_id)?;
-    let local_snapshot = node.store().snapshot();
-    if snapshot.revision <= local_snapshot.revision {
-        write_cluster_kv_snapshot_if_changed(paths, &local_snapshot)?;
-        return Ok(false);
-    }
-    write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-    if node.applied_index() == 0 && node.last_log_index() == 0 {
-        drop(node);
-        let mut node = open_cluster_raft_kv_node(paths, node_id)?;
-        node.restore_snapshot(RaftSnapshot {
-            last_included_index: 0,
-            last_included_term: 0,
-            kv: snapshot,
-        })?;
-    }
-    Ok(true)
+    cluster_kv_local_cache(paths)
+        .restore_raft_from_snapshot_if_newer(node_id.clone(), snapshot)
+        .map_err(Into::into)
 }
 
 pub async fn open_cluster_raft_kv_node_async(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<DurableRaftKvNode, NetworkError> {
-    let wal_paths = cluster_raft_wal_paths(paths, node_id);
-    let cache = cluster_kv_materialized_cache(paths);
-    let mut node =
-        DurableRaftKvNode::open_async_with_materialized_cache(node_id.clone(), wal_paths, cache)
-            .await?;
+    let cache = cluster_kv_local_cache(paths);
+    let mut node = cache.open_raft_node_async(node_id.clone()).await?;
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
     Ok(node)
 }
