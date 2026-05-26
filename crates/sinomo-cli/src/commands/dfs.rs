@@ -1,4 +1,5 @@
 use super::*;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsCliCommand {
@@ -20,6 +21,9 @@ pub(crate) enum DfsCliCommand {
     Conflicts(DfsFilterOptions),
     Repair(DfsFilterOptions),
     MetadataPublish {
+        json: bool,
+    },
+    Services {
         json: bool,
     },
     Pin(DfsPinCliCommand),
@@ -135,6 +139,7 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
         Some((command, rest)) if command == "repair" => {
             Ok(DfsCliCommand::Repair(parse_dfs_filter_options(rest)?))
         }
+        Some((command, rest)) if command == "services" => parse_dfs_services_command(rest),
         Some((command, rest)) if command == "metadata" => parse_dfs_metadata_command(rest),
         Some((command, rest)) if command == "pin" => {
             Ok(DfsCliCommand::Pin(parse_dfs_pin_command(rest)?))
@@ -232,6 +237,17 @@ pub(crate) fn parse_dfs_filter_options(args: &[String]) -> Result<DfsFilterOptio
         index += 1;
     }
     Ok(options)
+}
+
+pub(crate) fn parse_dfs_services_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(DfsCliCommand::Services { json })
 }
 
 pub(crate) fn parse_dfs_metadata_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
@@ -663,6 +679,46 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             }
             Ok(())
         }
+        DfsCliCommand::Services { json } => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let daemon_paths = DaemonPaths::new(&data_dir);
+            let services = DfsServiceAdvertisements {
+                metadata: decode_dfs_advertisements(daemon_handle_daemon_cluster_kv_range_prefix(
+                    &daemon_paths,
+                    sinomo_runtime::dfs::metadata_services_prefix(),
+                )?)?,
+                content: decode_dfs_advertisements(daemon_handle_daemon_cluster_kv_range_prefix(
+                    &daemon_paths,
+                    sinomo_runtime::dfs::content_services_prefix(),
+                )?)?,
+            };
+            if json {
+                print_json("<dfs-services>", &services)?;
+            } else {
+                println!("DFS services:");
+                println!("  metadata: {}", services.metadata.len());
+                for service in &services.metadata {
+                    println!(
+                        "    {} endpoint={} metadata={} content={}",
+                        service.node_id,
+                        service.endpoint,
+                        service.accepts_metadata,
+                        service.accepts_content
+                    );
+                }
+                println!("  content: {}", services.content.len());
+                for service in &services.content {
+                    println!(
+                        "    {} endpoint={} metadata={} content={}",
+                        service.node_id,
+                        service.endpoint,
+                        service.accepts_metadata,
+                        service.accepts_content
+                    );
+                }
+            }
+            Ok(())
+        }
         DfsCliCommand::MetadataPublish { json } => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
@@ -681,6 +737,27 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
         DfsCliCommand::Expose(command) => run_dfs_expose_command(command),
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsServiceAdvertisements {
+    metadata: Vec<sinomo_runtime::dfs::DfsNodeAdvertisement>,
+    content: Vec<sinomo_runtime::dfs::DfsNodeAdvertisement>,
+}
+
+fn decode_dfs_advertisements(
+    entries: Vec<sinomo_runtime::kv::KvEntry>,
+) -> Result<Vec<sinomo_runtime::dfs::DfsNodeAdvertisement>, CliError> {
+    let mut advertisements: Vec<sinomo_runtime::dfs::DfsNodeAdvertisement> = Vec::new();
+    for entry in entries {
+        advertisements.push(entry.decode()?);
+    }
+    advertisements.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.endpoint.cmp(&right.endpoint))
+    });
+    Ok(advertisements)
 }
 
 fn print_dfs_object_view(object: &sinomo_runtime::dfs::DfsOperatorObjectView) {

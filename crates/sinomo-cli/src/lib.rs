@@ -2,7 +2,6 @@
 
 #[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::Serialize;
 use sinomo_agent::{
     AgentLoopInput, BoundedContextBuilder, EventEnvelopeExt, InteractionModel, InteractionOutput,
     InteractionSession, InteractionSurface, InteractionSurfaceKind, MainAgentLoop,
@@ -98,6 +97,7 @@ use sinomo_runtime::daemon::{
     fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     git_is_available as daemon_git_is_available,
+    handle_daemon_cluster_kv_range_prefix as daemon_handle_daemon_cluster_kv_range_prefix,
     handle_daemon_connection as daemon_handle_daemon_connection,
     initialize_local_cluster as daemon_initialize_local_cluster,
     install_managed_source_repo as daemon_install_managed_source_repo,

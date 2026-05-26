@@ -6307,6 +6307,10 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
                 && file_system_id == sinomo_runtime::dfs::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0").expect("filesystem")
                 && options.json
     ));
+    assert_eq!(
+        parse_dfs_command(&["services".to_string(), "--json".to_string()]).expect("dfs services"),
+        DfsCliCommand::Services { json: true }
+    );
     assert!(matches!(
         parse_dfs_command(&[
             "pin".to_string(),

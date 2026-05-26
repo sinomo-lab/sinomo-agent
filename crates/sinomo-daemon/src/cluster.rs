@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const DAEMON_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
-pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
 pub const DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -131,10 +131,19 @@ fn cluster_raft_command_targets(
         })
         .collect::<Vec<_>>();
     node_order.sort_by_key(|(rank, node_id)| (rank.clone(), node_id.clone()));
+    let ordered_node_ids = node_order
+        .into_iter()
+        .map(|(_, node_id)| node_id)
+        .collect::<Vec<_>>();
+    let max_endpoint_count = endpoints_by_node.values().map(Vec::len).max().unwrap_or(0);
     let mut targets = Vec::new();
-    for (_, node_id) in node_order {
-        if let Some(endpoints) = endpoints_by_node.remove(&node_id) {
-            targets.extend(endpoints);
+    for endpoint_index in 0..max_endpoint_count {
+        for node_id in &ordered_node_ids {
+            if let Some(endpoints) = endpoints_by_node.get(node_id)
+                && let Some(endpoint) = endpoints.get(endpoint_index)
+            {
+                targets.push(endpoint.clone());
+            }
         }
     }
     targets
@@ -168,7 +177,7 @@ fn cluster_raft_endpoint_connectivity_rank(
         None if matches!(
             endpoint.transport,
             ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-        ) && cluster_raft_direct_address_rank(endpoint) == 0 =>
+        ) && cluster_raft_direct_address_rank(endpoint) <= 1 =>
         {
             2
         }
@@ -3348,8 +3357,8 @@ mod tests {
             .position(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
             .expect("public tcp target");
         assert!(
-            iroh_position < public_position,
-            "Iroh should stay ahead of unproven public TCP"
+            public_position < iroh_position,
+            "unknown direct TCP should stay ahead of relay fallback"
         );
         assert!(
             targets
@@ -3360,6 +3369,97 @@ mod tests {
             targets
                 .iter()
                 .any(|endpoint| endpoint.endpoint_id == private_tcp.endpoint_id)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn raft_command_targets_try_each_voter_before_same_voter_fallbacks() {
+        let root = unique_cluster_test_root("sinomo-daemon-raft-interleaved-voters");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_raft_interleave").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_daemon_raft_interleave_local").expect("local node");
+        let first_node =
+            NodeId::from_legacy_named("node_daemon_raft_interleave_first").expect("first node");
+        let second_node =
+            NodeId::from_legacy_named("node_daemon_raft_interleave_second").expect("second node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "raft interleaved voters",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let first_tcp =
+            sinomo_network::daemon_lan_endpoint(&first_node, "10.0.0.41:21353".to_string(), 10);
+        let first_iroh = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
+                &first_node,
+                "iroh_public_key_daemon_raft_interleave_first",
+            ),
+            node_id: first_node.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address:
+                "iroh://iroh_public_key_daemon_raft_interleave_first?relay=https://relay.example./"
+                    .to_string(),
+            source: sinomo_core::ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        };
+        let second_tcp =
+            sinomo_network::daemon_lan_endpoint(&second_node, "10.0.0.42:21353".to_string(), 10);
+        for (node_id, name, public_key, endpoints) in [
+            (
+                first_node.clone(),
+                "first",
+                "pk-first",
+                vec![first_tcp.clone(), first_iroh.clone()],
+            ),
+            (
+                second_node.clone(),
+                "second",
+                "pk-second",
+                vec![second_tcp.clone()],
+            ),
+        ] {
+            let mut member = ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                node_id,
+                name,
+                public_key,
+                now,
+            );
+            member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            member.endpoints = endpoints;
+            state.members.push(member);
+        }
+
+        sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state to raft kv");
+
+        let targets = cluster_raft_command_targets(&paths, &state);
+        let first_iroh_position = targets
+            .iter()
+            .position(|endpoint| endpoint.endpoint_id == first_iroh.endpoint_id)
+            .expect("first iroh");
+        let second_tcp_position = targets
+            .iter()
+            .position(|endpoint| endpoint.endpoint_id == second_tcp.endpoint_id)
+            .expect("second tcp");
+
+        assert!(
+            second_tcp_position < first_iroh_position,
+            "raft/KV forwarding should try another voter's best endpoint before fallbacks for one voter"
         );
         std::fs::remove_dir_all(root).ok();
     }

@@ -1,10 +1,12 @@
 use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions, cluster_has_local_quorum,
-    put_cluster_kv_control_record, send_dfs_metadata_journal_batch_to_endpoint,
-    send_dfs_protocol_frame_to_endpoint,
+    DaemonError, DaemonPaths, DaemonRunOptions, put_cluster_kv_control_record,
+    send_dfs_metadata_journal_batch_to_endpoint, send_dfs_protocol_frame_to_endpoint,
 };
 use serde::{Deserialize, Serialize};
-use sinomo_core::{ClusterEndpointRecord, DfsObjectPolicy};
+use sinomo_core::{
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
+    ClusterMemberRole, DfsObjectPolicy,
+};
 use sinomo_dfs::{
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
@@ -186,7 +188,11 @@ pub fn ensure_default_distributed_dfs(
     if !cluster_paths.state.exists() {
         return Ok(());
     }
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let state = if publish_cluster_control {
+        sinomo_network::read_cluster_state(&cluster_paths)?
+    } else {
+        sinomo_network::read_cluster_state_without_kv(&cluster_paths)?
+    };
     let file_system = distributed_sifs(state.local_node_id.clone());
     let mut backend = LocalJsonMetadataBackend::new(
         DfsMetadataShardId::new("root"),
@@ -214,7 +220,7 @@ pub fn ensure_default_distributed_dfs(
             })?;
         }
     }
-    if !publish_cluster_control || !cluster_has_local_quorum(&cluster_paths, &state) {
+    if !publish_cluster_control {
         return Ok(());
     }
 
@@ -244,20 +250,69 @@ pub fn ensure_default_distributed_dfs(
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     )?;
-    let endpoint = format!("loopback://{}:{}", options.host, options.port);
-    put_cluster_kv_control_record(
-        &cluster_paths,
-        &state.local_node_id,
-        metadata_service_key(&state.local_node_id),
-        &DfsNodeAdvertisement::metadata(state.local_node_id.clone(), endpoint.clone()),
-    )?;
-    put_cluster_kv_control_record(
-        &cluster_paths,
-        &state.local_node_id,
-        content_service_key(&state.local_node_id),
-        &DfsNodeAdvertisement::content(state.local_node_id.clone(), endpoint),
-    )?;
+    publish_dfs_service_advertisements_for_cluster(&cluster_paths, &state, options)?;
     Ok(())
+}
+
+fn publish_dfs_service_advertisements_for_cluster(
+    cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: &DaemonRunOptions,
+) -> Result<(), DaemonError> {
+    for member in dfs_service_members(state) {
+        let endpoint = dfs_service_endpoint_for_member(state, member, options);
+        put_cluster_kv_control_record(
+            cluster_paths,
+            &state.local_node_id,
+            metadata_service_key(&member.node_id),
+            &DfsNodeAdvertisement::metadata(member.node_id.clone(), endpoint.clone()),
+        )?;
+        put_cluster_kv_control_record(
+            cluster_paths,
+            &state.local_node_id,
+            content_service_key(&member.node_id),
+            &DfsNodeAdvertisement::content(member.node_id.clone(), endpoint),
+        )?;
+    }
+    Ok(())
+}
+
+fn dfs_service_members(state: &ClusterBootstrapState) -> Vec<&ClusterMemberRecord> {
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            member.state.is_authorized() && !matches!(member.role, ClusterMemberRole::NonVoting)
+        })
+        .collect()
+}
+
+fn dfs_service_endpoint_for_member(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    options: &DaemonRunOptions,
+) -> String {
+    if member.node_id == state.local_node_id {
+        return format!("loopback://{}:{}", options.host, options.port);
+    }
+    member
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
+        .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
+        .or_else(|| member.endpoints.first())
+        .map(|endpoint| endpoint.address.clone())
+        .unwrap_or_else(|| format!("cluster-member://{}", member.node_id))
+}
+
+fn dfs_service_endpoint_rank(endpoint: &ClusterEndpointRecord) -> (u8, u16, String) {
+    let privacy_rank = match endpoint.privacy {
+        ClusterEndpointPrivacy::InternetDirect => 0,
+        ClusterEndpointPrivacy::Relayed => 1,
+        ClusterEndpointPrivacy::Lan => 2,
+        ClusterEndpointPrivacy::LocalOnly => 3,
+    };
+    (privacy_rank, endpoint.priority, endpoint.address.clone())
 }
 
 #[derive(Debug)]
@@ -997,6 +1052,118 @@ mod tests {
         assert_eq!(stat.size_bytes, Some(b"replicated bytes".len() as u64));
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn dfs_service_members_include_authorized_voters_and_learners_only() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_service_members")
+                .expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_service_local").expect("local");
+        let voter = NodeId::from_legacy_named("node_dfs_service_voter").expect("voter");
+        let learner = NodeId::from_legacy_named("node_dfs_service_learner").expect("learner");
+        let non_voting =
+            NodeId::from_legacy_named("node_dfs_service_non_voting").expect("non voting");
+        let removed = NodeId::from_legacy_named("node_dfs_service_removed").expect("removed");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs service members",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                voter.clone(),
+                "voter",
+                "pk-voter",
+                now,
+            ));
+        let mut learner_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            learner.clone(),
+            "learner",
+            "pk-learner",
+            now,
+        );
+        learner_member.role = sinomo_core::ClusterMemberRole::Learner;
+        learner_member.state = sinomo_core::ClusterMemberState::Learner;
+        state.members.push(learner_member);
+        state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                non_voting.clone(),
+                "shadow",
+                "pk-shadow",
+                now,
+            ));
+        let mut removed_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            removed.clone(),
+            "removed",
+            "pk-removed",
+            now,
+        );
+        removed_member.state = sinomo_core::ClusterMemberState::Removed;
+        state.members.push(removed_member);
+
+        let service_nodes = dfs_service_members(&state)
+            .into_iter()
+            .map(|member| member.node_id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(service_nodes, vec![local, voter, learner]);
+    }
+
+    #[test]
+    fn dfs_service_endpoint_prefers_internet_direct_for_remote_members() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_service_endpoint")
+                .expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_service_endpoint_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_service_endpoint_remote").expect("remote");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs service endpoint",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.endpoints = vec![
+            sinomo_network::daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10),
+            ClusterEndpointRecord {
+                endpoint_id: sinomo_core::Id::from_legacy_named(
+                    "endpoint_dfs_service_internet_direct",
+                )
+                .expect("endpoint id"),
+                node_id: remote,
+                transport: sinomo_core::ClusterTransportKind::LanTcp,
+                address: "129.146.106.76:21353".to_string(),
+                source: sinomo_core::ClusterEndpointSource::Observed,
+                privacy: ClusterEndpointPrivacy::InternetDirect,
+                priority: 20,
+                last_observed_latency_ms: None,
+            },
+        ];
+
+        assert_eq!(
+            dfs_service_endpoint_for_member(&state, &member, &DaemonRunOptions::default()),
+            "129.146.106.76:21353"
+        );
     }
 
     fn write_test_cluster_state(data_root: &std::path::Path, node_id: &NodeId) {
