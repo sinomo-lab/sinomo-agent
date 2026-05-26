@@ -254,6 +254,33 @@ pub fn ensure_default_distributed_dfs(
     Ok(())
 }
 
+pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(());
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let metadata = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        data_dir.dfs_dir().join("metadata").join("root"),
+    )?;
+    let endpoints = sinomo_network::cluster_sync_targets_with_connectivity(&cluster_paths, &state);
+    let mut service = NetworkedDfsService::new(
+        DaemonDfsEndpointTransport::new(state.local_node_id, endpoints),
+        content,
+    )
+    .with_metadata_backend(metadata)?;
+    let scheduled_repairs = service.retry_pending_repairs()?;
+    if !scheduled_repairs.is_empty() {
+        service.process_incoming()?;
+    }
+    Ok(())
+}
+
 fn publish_dfs_service_advertisements_for_cluster(
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,

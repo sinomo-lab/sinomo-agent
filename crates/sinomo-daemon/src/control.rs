@@ -15,7 +15,7 @@ use crate::{
     handle_daemon_finalize_shadow_rollout, handle_daemon_rollout_binary_request,
     handle_daemon_rollout_build_request, handle_daemon_rollout_diagnostics,
     handle_forwarded_daemon_cluster_kv_txn_request, read_daemon_status,
-    start_daemon_iroh_proxy_if_clustered,
+    run_daemon_dfs_maintenance_tick, start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
 use sinomo_rollout::{SelfRolloutPaths, read_rollout_status};
@@ -285,6 +285,11 @@ pub fn run_daemon_control_loop(
             loop {
                 if let Err(error) = cluster_network.tick(&maintenance_paths, &maintenance_options) {
                     eprintln!("sinomo {maintenance_label} cluster network tick failed: {error}");
+                }
+                if maintenance_label == "daemon"
+                    && let Err(error) = run_daemon_dfs_maintenance_tick(&maintenance_paths)
+                {
+                    eprintln!("sinomo {maintenance_label} DFS maintenance tick failed: {error}");
                 }
                 thread::sleep(DAEMON_CLUSTER_TICK_INTERVAL);
             }

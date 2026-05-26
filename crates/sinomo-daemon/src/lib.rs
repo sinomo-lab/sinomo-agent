@@ -82,7 +82,7 @@ pub use dfs::{
     DaemonDfsMetadataReplicationReport, ensure_default_distributed_dfs,
     ensure_default_local_dfs_expose, handle_daemon_dfs_expose_config,
     handle_daemon_dfs_metadata_journal_batch, handle_daemon_dfs_protocol_frame,
-    publish_default_dfs_metadata_journal,
+    publish_default_dfs_metadata_journal, run_daemon_dfs_maintenance_tick,
 };
 pub use error::DaemonError;
 pub use install::{
