@@ -32,6 +32,7 @@ pub const DAEMON_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const DAEMON_ACCEPT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
+pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 
 static SANDBOX_ACTIVE_EXECUTIONS: OnceLock<Mutex<SandboxActiveExecutions>> = OnceLock::new();
 
@@ -282,14 +283,21 @@ pub fn run_daemon_control_loop(
         .name(format!("sinomo-{label}-cluster"))
         .spawn(move || {
             let mut cluster_network = ClusterNetworkMaintenance::new();
+            let mut last_dfs_maintenance = std::time::Instant::now();
             loop {
                 if let Err(error) = cluster_network.tick(&maintenance_paths, &maintenance_options) {
                     eprintln!("sinomo {maintenance_label} cluster network tick failed: {error}");
                 }
                 if maintenance_label == "daemon"
+                    && last_dfs_maintenance.elapsed() >= DAEMON_DFS_MAINTENANCE_INTERVAL
                     && let Err(error) = run_daemon_dfs_maintenance_tick(&maintenance_paths)
                 {
                     eprintln!("sinomo {maintenance_label} DFS maintenance tick failed: {error}");
+                }
+                if maintenance_label == "daemon"
+                    && last_dfs_maintenance.elapsed() >= DAEMON_DFS_MAINTENANCE_INTERVAL
+                {
+                    last_dfs_maintenance = std::time::Instant::now();
                 }
                 thread::sleep(DAEMON_CLUSTER_TICK_INTERVAL);
             }
