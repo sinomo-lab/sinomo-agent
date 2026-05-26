@@ -940,6 +940,16 @@ pub fn open_cluster_raft_kv_node(
     Ok(node)
 }
 
+fn open_cluster_raft_kv_node_discarding_uncommitted_tail(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<DurableRaftKvNode, NetworkError> {
+    let cache = cluster_kv_local_cache(paths);
+    let mut node = cache.open_raft_node_discarding_uncommitted_tail(node_id.clone())?;
+    compact_cluster_raft_node_if_needed(paths, &mut node)?;
+    Ok(node)
+}
+
 pub fn restore_cluster_raft_from_snapshot_if_newer(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -973,7 +983,7 @@ pub fn append_cluster_raft_command_with_response(
     node_id: &NodeId,
     command: KvCommand,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
-    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
     let term = node.hard_state().current_term.max(1);
     let entry = node.append_local_command(term, command)?;
     node.commit_to(entry.index)?;
@@ -987,11 +997,21 @@ pub fn append_cluster_raft_command_uncommitted(
     node_id: &NodeId,
     command: KvCommand,
 ) -> Result<KvLogEntry, NetworkError> {
-    let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
+    node.discard_uncommitted_tail()?;
     let term = node.hard_state().current_term.max(1);
     let entry = node.append_local_command(term, command)?;
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
     Ok(entry)
+}
+
+pub fn discard_cluster_raft_uncommitted_tail(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<(), NetworkError> {
+    let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
+    node.discard_uncommitted_tail()?;
+    compact_cluster_raft_node_if_needed(paths, &mut node)
 }
 
 pub fn commit_cluster_raft_index(

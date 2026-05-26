@@ -567,6 +567,17 @@ impl KvLocalCache {
         )
     }
 
+    pub fn open_raft_node_discarding_uncommitted_tail(
+        &self,
+        node_id: NodeId,
+    ) -> Result<DurableRaftKvNode, KvError> {
+        DurableRaftKvNode::open_discarding_uncommitted_tail_with_materialized_cache(
+            node_id.clone(),
+            self.raft_wal_paths(&node_id),
+            &self.materialized,
+        )
+    }
+
     pub async fn open_raft_node_async(
         &self,
         node_id: NodeId,
@@ -1506,6 +1517,15 @@ impl ReplicatedKvNode {
         Ok(())
     }
 
+    fn discard_uncommitted_tail(&mut self) -> bool {
+        let committed = self.hard_state.commit_index.max(self.applied_index);
+        let old_log_len = self.log.len();
+        let old_response_len = self.txn_responses.len();
+        self.log.retain(|entry| entry.index <= committed);
+        self.txn_responses.retain(|index, _| *index <= committed);
+        old_log_len != self.log.len() || old_response_len != self.txn_responses.len()
+    }
+
     fn handle_append_entries(
         &mut self,
         request: RaftAppendEntriesRequest,
@@ -1629,6 +1649,21 @@ pub struct DurableRaftKvNode {
 
 impl DurableRaftKvNode {
     pub fn open(node_id: NodeId, paths: KvWalPaths) -> Result<Self, KvError> {
+        Self::open_inner(node_id, paths, false)
+    }
+
+    pub fn open_discarding_uncommitted_tail(
+        node_id: NodeId,
+        paths: KvWalPaths,
+    ) -> Result<Self, KvError> {
+        Self::open_inner(node_id, paths, true)
+    }
+
+    fn open_inner(
+        node_id: NodeId,
+        paths: KvWalPaths,
+        discard_uncommitted_tail: bool,
+    ) -> Result<Self, KvError> {
         paths.ensure()?;
         let lock = open_node_lock(&paths)?;
         lock.try_lock_exclusive().map_err(|source| {
@@ -1674,7 +1709,11 @@ impl DurableRaftKvNode {
                 txn_responses: BTreeMap::new(),
             }
         };
-        let WalRead { entries, truncated } = read_wal_entries(&paths.wal)?;
+        let committed_index = node.hard_state.commit_index.max(node.applied_index);
+        let WalRead { entries, truncated } = read_wal_entries(
+            &paths.wal,
+            discard_uncommitted_tail.then_some(committed_index),
+        )?;
         for entry in entries {
             node.append_entries(vec![entry])?;
         }
@@ -1706,14 +1745,32 @@ impl DurableRaftKvNode {
         paths: KvWalPaths,
         cache: &KvMaterializedCache,
     ) -> Result<Self, KvError> {
-        let mut node = match Self::open(node_id.clone(), paths.clone()) {
-            Ok(node) => node,
-            Err(error) if cache.exists() && !kv_error_is_busy(&error) => {
-                quarantine_unreadable_raft_view(&paths);
-                Self::open(node_id, paths)?
-            }
-            Err(error) => return Err(error),
-        };
+        Self::open_with_materialized_cache_inner(node_id, paths, cache, false)
+    }
+
+    pub fn open_discarding_uncommitted_tail_with_materialized_cache(
+        node_id: NodeId,
+        paths: KvWalPaths,
+        cache: &KvMaterializedCache,
+    ) -> Result<Self, KvError> {
+        Self::open_with_materialized_cache_inner(node_id, paths, cache, true)
+    }
+
+    fn open_with_materialized_cache_inner(
+        node_id: NodeId,
+        paths: KvWalPaths,
+        cache: &KvMaterializedCache,
+        discard_uncommitted_tail: bool,
+    ) -> Result<Self, KvError> {
+        let mut node =
+            match Self::open_inner(node_id.clone(), paths.clone(), discard_uncommitted_tail) {
+                Ok(node) => node,
+                Err(error) if cache.exists() && !kv_error_is_busy(&error) => {
+                    quarantine_unreadable_raft_view(&paths);
+                    Self::open_inner(node_id, paths, discard_uncommitted_tail)?
+                }
+                Err(error) => return Err(error),
+            };
         if node.applied_index() == 0 && node.last_log_index() == 0 && cache.exists() {
             node.restore_snapshot(RaftSnapshot {
                 last_included_index: 0,
@@ -1833,6 +1890,15 @@ impl DurableRaftKvNode {
         Ok(entry)
     }
 
+    pub fn discard_uncommitted_tail(&mut self) -> Result<bool, KvError> {
+        if !self.node.discard_uncommitted_tail() {
+            return Ok(false);
+        }
+        rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
+        self.persist_hard_state()?;
+        Ok(true)
+    }
+
     pub fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
         self.node.commit_to(commit_index)?;
         self.persist_hard_state()
@@ -1872,7 +1938,7 @@ struct WalRead {
     truncated: bool,
 }
 
-fn read_wal_entries(path: &Path) -> Result<WalRead, KvError> {
+fn read_wal_entries(path: &Path, max_index: Option<u64>) -> Result<WalRead, KvError> {
     if !path.exists() {
         return Ok(WalRead::default());
     }
@@ -1911,7 +1977,14 @@ fn read_wal_entries(path: &Path) -> Result<WalRead, KvError> {
             break;
         }
         match sinomo_object_serde::from_bytes(&bytes[offset..offset + len]) {
-            Ok(entry) => entries.push(entry),
+            Ok(entry) => {
+                let entry: KvLogEntry = entry;
+                if max_index.is_some_and(|limit| entry.index > limit) {
+                    truncated = true;
+                    break;
+                }
+                entries.push(entry);
+            }
             Err(source) => {
                 eprintln!(
                     "warning: truncating cluster kv WAL at unreadable binary record {} in {}: {source}",
@@ -2924,6 +2997,77 @@ mod tests {
                 .value,
             b"lost"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_discard_uncommitted_tail_keeps_committed_prefix() {
+        let root = temp_raft_root("sinomo-kv-discard-uncommitted-tail");
+        let node_id = NodeId::from_legacy_named("node_discard_uncommitted_tail").expect("node");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
+            let committed = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/config/committed".to_string(),
+                        value: b"kept".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append committed");
+            node.commit_to(committed.index).expect("commit first");
+            let uncommitted = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/config/uncommitted".to_string(),
+                        value: b"dropped".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append uncommitted");
+            assert_eq!(uncommitted.index, 2);
+            assert_eq!(node.last_log_index(), 2);
+        }
+
+        {
+            let mut node =
+                DurableRaftKvNode::open_discarding_uncommitted_tail(node_id.clone(), paths.clone())
+                    .expect("open and discard");
+            assert_eq!(node.hard_state().commit_index, 1);
+            assert_eq!(node.last_log_index(), 1);
+            assert_eq!(
+                node.store()
+                    .get("/config/committed")
+                    .expect("committed value")
+                    .value,
+                b"kept"
+            );
+            assert!(node.store().get("/config/uncommitted").is_none());
+            assert!(
+                !node
+                    .discard_uncommitted_tail()
+                    .expect("second discard is a no-op")
+            );
+            let replacement = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/config/replacement".to_string(),
+                        value: b"next".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append replacement");
+            assert_eq!(replacement.index, 2);
+        }
+
+        let node = DurableRaftKvNode::open(node_id, paths).expect("reopen after discard");
+        assert_eq!(node.last_log_index(), 2);
+        assert_eq!(node.hard_state().commit_index, 1);
+        assert!(node.store().get("/config/replacement").is_none());
         std::fs::remove_dir_all(root).ok();
     }
 

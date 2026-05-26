@@ -2546,6 +2546,8 @@ pub fn commit_cluster_raft_command_with_quorum(
         }
     }
     if voter_acks.len() < quorum_size {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        let _ = sinomo_network::discard_cluster_raft_uncommitted_tail(paths, &state.local_node_id);
         let _ = sinomo_network::clear_cluster_raft_leader(paths, &state.local_node_id);
         return Err(DaemonError::ClusterReadOnly {
             detail: format!(
