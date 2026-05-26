@@ -174,14 +174,14 @@ fn cluster_raft_endpoint_connectivity_rank(
     match connectivity_state {
         Some(sinomo_network::ClusterConnectivityState::Healthy) => 0,
         Some(sinomo_network::ClusterConnectivityState::Degraded) => 1,
+        None if endpoint.transport == ClusterTransportKind::Iroh => 2,
         None if matches!(
             endpoint.transport,
             ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
         ) && cluster_raft_direct_address_rank(endpoint) <= 1 =>
         {
-            2
+            3
         }
-        None if endpoint.transport == ClusterTransportKind::Iroh => 3,
         None => 4,
         Some(sinomo_network::ClusterConnectivityState::Unreachable)
             if endpoint.transport == ClusterTransportKind::Iroh =>
@@ -3286,7 +3286,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_command_targets_try_private_tcp_before_iroh_and_public_tcp_fallbacks() {
+    fn raft_command_targets_try_unknown_iroh_before_unknown_tcp_fallbacks() {
         let root = unique_cluster_test_root("sinomo-daemon-raft-unknown-tcp-order");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -3345,8 +3345,8 @@ mod tests {
 
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
-            Some(&private_tcp.endpoint_id),
-            "raft/KV forwarding should try a private direct endpoint before relay or public TCP fallbacks"
+            Some(&iroh.endpoint_id),
+            "raft/KV forwarding should not spend the command budget on an unverified TCP endpoint before an available Iroh fallback"
         );
         let iroh_position = targets
             .iter()
@@ -3356,10 +3356,7 @@ mod tests {
             .iter()
             .position(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
             .expect("public tcp target");
-        assert!(
-            public_position < iroh_position,
-            "unknown direct TCP should stay ahead of relay fallback"
-        );
+        assert!(iroh_position < public_position);
         assert!(
             targets
                 .iter()

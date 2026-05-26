@@ -1607,7 +1607,11 @@ pub fn cluster_sync_targets_with_connectivity(
                 ClusterConnectivityState::Degraded => 1,
                 ClusterConnectivityState::Unreachable => 3,
             })
-            .unwrap_or(2);
+            .unwrap_or_else(|| match endpoint.transport {
+                ClusterTransportKind::Iroh => 2,
+                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => 3,
+                _ => 4,
+            });
         (
             node_status_rank,
             score,
