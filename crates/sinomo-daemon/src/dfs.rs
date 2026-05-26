@@ -26,6 +26,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 const DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
+const DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES: usize = 512;
 const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
 type DfsProtocolFrameSender = Arc<
@@ -768,7 +769,10 @@ pub fn publish_default_dfs_metadata_journal(
             .map(|cursor| cursor.next_after_sequence)
             .unwrap_or(0);
         let entries =
-            backend.hydrate_journal_entry_payloads(backend.journal_since(after_sequence)?)?;
+            backend.hydrate_journal_entry_payloads(backend.journal_since_limited(
+                after_sequence,
+                DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+            )?)?;
         let Some(last_entry) = entries.last() else {
             outcomes.push(DaemonDfsMetadataReplicationOutcome::NoChanges {
                 target_node_id,

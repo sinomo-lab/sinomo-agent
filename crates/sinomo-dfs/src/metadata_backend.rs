@@ -525,13 +525,21 @@ impl LocalJsonMetadataBackend {
 
     pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         let mut applied = 0usize;
+        let mut replay_cursors = BTreeMap::<DfsMetadataShardId, DfsMetadataReplayCursor>::new();
+        let mut advanced_cursors = BTreeSet::<DfsMetadataShardId>::new();
         for entry in &batch.entries {
-            let replay_cursor_path = self.replay_cursor_path(&entry.shard_id);
-            let mut cursor = read_json_optional::<DfsMetadataReplayCursor>(&replay_cursor_path)?
-                .unwrap_or(DfsMetadataReplayCursor {
-                    shard_id: entry.shard_id.clone(),
-                    last_sequence: 0,
-                });
+            if !replay_cursors.contains_key(&entry.shard_id) {
+                let replay_cursor_path = self.replay_cursor_path(&entry.shard_id);
+                let cursor = read_json_optional::<DfsMetadataReplayCursor>(&replay_cursor_path)?
+                    .unwrap_or(DfsMetadataReplayCursor {
+                        shard_id: entry.shard_id.clone(),
+                        last_sequence: 0,
+                    });
+                replay_cursors.insert(entry.shard_id.clone(), cursor);
+            }
+            let cursor = replay_cursors
+                .get_mut(&entry.shard_id)
+                .expect("cursor inserted above");
             if entry.sequence <= cursor.last_sequence {
                 continue;
             }
@@ -539,7 +547,12 @@ impl LocalJsonMetadataBackend {
                 applied = applied.saturating_add(1);
             }
             cursor.last_sequence = entry.sequence;
-            write_json_atomic(&replay_cursor_path, &cursor)?;
+            advanced_cursors.insert(entry.shard_id.clone());
+        }
+        for shard_id in advanced_cursors {
+            if let Some(cursor) = replay_cursors.get(&shard_id) {
+                write_json_atomic(&self.replay_cursor_path(&cursor.shard_id), cursor)?;
+            }
         }
         Ok(applied)
     }
@@ -708,6 +721,14 @@ impl LocalJsonMetadataBackend {
             .into_iter()
             .map(|entry| self.hydrate_journal_entry_payload(entry))
             .collect()
+    }
+
+    pub fn journal_since_limited(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        journal_entries_since_limited(&self.root, after_sequence, max_entries)
     }
 
     fn hydrate_journal_entry_payload(
@@ -2121,7 +2142,15 @@ fn append_segmented_journal_entry(root: &Path, entry: &DfsMetadataJournalEntry) 
 }
 
 fn journal_entries_since(root: &Path, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
-    segmented_journal_entries_since(root, after_sequence)
+    journal_entries_since_limited(root, after_sequence, usize::MAX)
+}
+
+fn journal_entries_since_limited(
+    root: &Path,
+    after_sequence: u64,
+    max_entries: usize,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    segmented_journal_entries_since_limited(root, after_sequence, max_entries)
 }
 
 fn migrate_legacy_journal_entries(root: &Path) -> Result<()> {
@@ -2176,6 +2205,17 @@ fn segmented_journal_entries_since(
     root: &Path,
     after_sequence: u64,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
+    segmented_journal_entries_since_limited(root, after_sequence, usize::MAX)
+}
+
+fn segmented_journal_entries_since_limited(
+    root: &Path,
+    after_sequence: u64,
+    max_entries: usize,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    if max_entries == 0 {
+        return Ok(Vec::new());
+    }
     let segments_dir = root.join("journal").join("segments");
     if !segments_dir.exists() {
         return Ok(Vec::new());
@@ -2199,15 +2239,28 @@ fn segmented_journal_entries_since(
     }
     let mut entries = Vec::new();
     for path in paths.into_values() {
-        entries.extend(read_segmented_journal_file_since(&path, after_sequence)?);
+        let remaining = max_entries.saturating_sub(entries.len());
+        if remaining == 0 {
+            break;
+        }
+        entries.extend(read_segmented_journal_file_since_limited(
+            &path,
+            after_sequence,
+            remaining,
+        )?);
+        if entries.len() >= max_entries {
+            break;
+        }
     }
     entries.sort_by_key(|entry| entry.sequence);
+    entries.truncate(max_entries);
     Ok(entries)
 }
 
-fn read_segmented_journal_file_since(
+fn read_segmented_journal_file_since_limited(
     path: &Path,
     after_sequence: u64,
+    max_entries: usize,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
     let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
         path: path.to_owned(),
@@ -2242,6 +2295,9 @@ fn read_segmented_journal_file_since(
             .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
         if entry.sequence > after_sequence {
             entries.push(entry);
+            if entries.len() >= max_entries {
+                break;
+            }
         }
     }
     Ok(entries)
@@ -2678,6 +2734,53 @@ mod tests {
         let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(reopened.journal_since(0).expect("journal").len(), 2);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reads_bounded_journal_batches() {
+        let root = temp_root("local_backend_reads_bounded_journal_batches");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+        for index in 0..5 {
+            let mut object = object(version("version_1"));
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_bounded_journal_{index}"))
+                    .expect("object");
+            object.path = format!("/docs/bounded-{index}.md");
+            backend.put_object(&object).expect("object");
+        }
+
+        let first_batch = backend
+            .journal_since_limited(0, 3)
+            .expect("first bounded batch");
+        assert_eq!(
+            first_batch
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let second_batch = backend
+            .journal_since_limited(3, 3)
+            .expect("second bounded batch");
+        assert_eq!(
+            second_batch
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+        assert!(
+            backend
+                .journal_since_limited(6, 3)
+                .expect("empty bounded batch")
+                .is_empty()
+        );
 
         cleanup(&root);
     }
@@ -3164,6 +3267,8 @@ mod tests {
                 read_json::<DfsDirFragmentRecord>(&dirfrag_path).expect("dirfrag before corrupt");
             dirfrag.entry_count = 999;
             write_json_atomic(&dirfrag_path, &dirfrag).expect("corrupt dirfrag count");
+            remove_dir_all_if_exists(&backend.records_root().join("dirfrags"))
+                .expect("force secondary index recovery");
         }
 
         let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
@@ -3718,6 +3823,15 @@ mod tests {
                 .apply_journal_batch(&batch)
                 .expect("reapply journal batch"),
             0
+        );
+        assert_eq!(
+            read_json::<DfsMetadataReplayCursor>(
+                &follower.replay_cursor_path(&DfsMetadataShardId::new("shard-leader"))
+            )
+            .expect("replay cursor")
+            .last_sequence,
+            4,
+            "a replicated batch should persist the source cursor once at the batch boundary"
         );
 
         cleanup(&leader_root);
