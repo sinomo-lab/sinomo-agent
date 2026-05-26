@@ -28,6 +28,7 @@ fn distributed_eventual_commit_advances_metadata_then_repairs_missing_replica() 
         owner_node_id: node_a.clone(),
         current_locations: vec![node_a.clone()],
         content_hash: Some("blake3:old".to_string()),
+        content_size_bytes: None,
         link_target_object_id: None,
         mode: 0o644,
         uid: 0,

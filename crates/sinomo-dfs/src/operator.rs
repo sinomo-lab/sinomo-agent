@@ -9,7 +9,7 @@ use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -111,16 +111,18 @@ impl<'a> DfsOperatorInspector<'a> {
                 object_count += 1;
                 let versions = self.backend.versions_for_object(&object.object_id)?;
                 version_count += versions.len();
+                let mut receipts_by_version = BTreeMap::new();
                 for version in &versions {
-                    receipt_count += self
+                    let receipts = self
                         .backend
-                        .receipts_for_version(&object.object_id, &version.version)?
-                        .len();
+                        .receipts_for_version(&object.object_id, &version.version)?;
+                    receipt_count += receipts.len();
+                    receipts_by_version.insert(version.version.clone(), receipts);
                 }
                 let intents = self.backend.intents_for_object(&object.object_id)?;
                 pending_write_count += intents
                     .iter()
-                    .filter(|intent| intent.status == DfsWriteIntentStatus::ReceiptsPending)
+                    .filter(|intent| write_intent_is_active(&intent.status))
                     .count();
                 intent_count += intents.len();
                 open_conflict_count += self
@@ -129,7 +131,8 @@ impl<'a> DfsOperatorInspector<'a> {
                     .into_iter()
                     .filter(|conflict| conflict.status == DfsConflictStatus::Open)
                     .count();
-                pending_repair_count += self.repairs_for_object(&object.object_id)?.len();
+                pending_repair_count +=
+                    repairs_from_intents_and_receipts(&intents, &receipts_by_version).len();
             }
         }
 
@@ -156,13 +159,14 @@ impl<'a> DfsOperatorInspector<'a> {
         let mut open_conflict_count = 0;
         let mut pending_repair_count = 0;
         for object in &objects {
+            let intents = self.backend.intents_for_object(&object.object_id)?;
             open_conflict_count += self
                 .backend
                 .conflicts_for_object(&object.object_id)?
                 .into_iter()
                 .filter(|conflict| conflict.status == DfsConflictStatus::Open)
                 .count();
-            pending_repair_count += self.repairs_for_object(&object.object_id)?.len();
+            pending_repair_count += self.repairs_for_intents(&intents)?.len();
         }
         Ok(Some(DfsOperatorFileSystemView {
             file_system,
@@ -181,15 +185,17 @@ impl<'a> DfsOperatorInspector<'a> {
         };
         let versions = self.backend.versions_for_object(object_id)?;
         let mut receipts = Vec::new();
+        let mut receipts_by_version = BTreeMap::new();
         for version in &versions {
-            receipts.extend(
-                self.backend
-                    .receipts_for_version(object_id, &version.version)?,
-            );
+            let version_receipts = self
+                .backend
+                .receipts_for_version(object_id, &version.version)?;
+            receipts_by_version.insert(version.version.clone(), version_receipts.clone());
+            receipts.extend(version_receipts);
         }
         let intents = self.backend.intents_for_object(object_id)?;
         let conflicts = self.backend.conflicts_for_object(object_id)?;
-        let repairs = self.repairs_for_object(object_id)?;
+        let repairs = repairs_from_intents_and_receipts(&intents, &receipts_by_version);
         let agent_state = agent_state_for(&object, &intents, &conflicts, &repairs);
         Ok(Some(DfsOperatorObjectView {
             object,
@@ -228,7 +234,8 @@ impl<'a> DfsOperatorInspector<'a> {
         let objects = self.filtered_objects(file_system_id, object_id)?;
         let mut repairs = Vec::new();
         for object in objects {
-            repairs.extend(self.repairs_for_object(&object.object_id)?);
+            let intents = self.backend.intents_for_object(&object.object_id)?;
+            repairs.extend(self.repairs_for_intents(&intents)?);
         }
         repairs.sort_by(|left, right| {
             left.object_id
@@ -253,7 +260,7 @@ impl<'a> DfsOperatorInspector<'a> {
         for object in self.backend.objects_for_file_system(file_system_id)? {
             let intents = self.backend.intents_for_object(&object.object_id)?;
             let conflicts = self.backend.conflicts_for_object(&object.object_id)?;
-            let repairs = self.repairs_for_object(&object.object_id)?;
+            let repairs = self.repairs_for_intents(&intents)?;
             objects.push(DfsAgentObjectSummary {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
@@ -296,42 +303,65 @@ impl<'a> DfsOperatorInspector<'a> {
         Ok(objects)
     }
 
-    fn repairs_for_object(
+    fn repairs_for_intents(
         &self,
-        object_id: &DfsObjectId,
+        intents: &[DfsWriteIntentRecord],
     ) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
-        let mut repairs = Vec::new();
-        for intent in self.backend.intents_for_object(object_id)? {
-            if intent.status != DfsWriteIntentStatus::Committed {
-                continue;
-            }
-            let receipt_nodes: BTreeSet<NodeId> = self
-                .backend
-                .receipts_for_version(&intent.object_id, &intent.target_version)?
-                .into_iter()
-                .filter(|receipt| {
-                    intent
-                        .content_hash
-                        .as_ref()
-                        .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
-                })
-                .map(|receipt| receipt.replica_node_id)
-                .collect();
-            for node_id in &intent.desired_replica_node_ids {
-                if !receipt_nodes.contains(node_id) {
-                    repairs.push(DfsOperatorRepairView {
-                        intent_id: intent.intent_id.clone(),
-                        file_system_id: intent.file_system_id.clone(),
-                        object_id: intent.object_id.clone(),
-                        version: intent.target_version.clone(),
-                        content_hash: intent.content_hash.clone(),
-                        missing_replica_node_id: node_id.clone(),
-                    });
-                }
+        let mut receipts_by_version = BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
+        for intent in intents
+            .iter()
+            .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
+        {
+            if !receipts_by_version.contains_key(&intent.target_version) {
+                receipts_by_version.insert(
+                    intent.target_version.clone(),
+                    self.backend
+                        .receipts_for_version(&intent.object_id, &intent.target_version)?,
+                );
             }
         }
-        Ok(repairs)
+        Ok(repairs_from_intents_and_receipts(
+            intents,
+            &receipts_by_version,
+        ))
     }
+}
+
+fn repairs_from_intents_and_receipts(
+    intents: &[DfsWriteIntentRecord],
+    receipts_by_version: &BTreeMap<DfsVersion, Vec<DfsReplicaReceiptRecord>>,
+) -> Vec<DfsOperatorRepairView> {
+    let mut repairs = Vec::new();
+    for intent in intents {
+        if intent.status != DfsWriteIntentStatus::Committed {
+            continue;
+        }
+        let receipt_nodes: BTreeSet<NodeId> = receipts_by_version
+            .get(&intent.target_version)
+            .into_iter()
+            .flatten()
+            .filter(|receipt| {
+                intent
+                    .content_hash
+                    .as_ref()
+                    .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
+            })
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect();
+        for node_id in &intent.desired_replica_node_ids {
+            if !receipt_nodes.contains(node_id) {
+                repairs.push(DfsOperatorRepairView {
+                    intent_id: intent.intent_id.clone(),
+                    file_system_id: intent.file_system_id.clone(),
+                    object_id: intent.object_id.clone(),
+                    version: intent.target_version.clone(),
+                    content_hash: intent.content_hash.clone(),
+                    missing_replica_node_id: node_id.clone(),
+                });
+            }
+        }
+    }
+    repairs
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -472,7 +502,7 @@ fn agent_state_for(
     }
     if intents
         .iter()
-        .any(|intent| intent.status == DfsWriteIntentStatus::ReceiptsPending)
+        .any(|intent| write_intent_is_active(&intent.status))
     {
         return DfsAgentObjectState::PendingWrite;
     }
@@ -484,6 +514,13 @@ fn agent_state_for(
     } else {
         DfsAgentObjectState::MetadataOnly
     }
+}
+
+fn write_intent_is_active(status: &DfsWriteIntentStatus) -> bool {
+    matches!(
+        status,
+        DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+    )
 }
 
 fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>, DfsPinStoreError> {
@@ -679,6 +716,75 @@ mod tests {
         assert_eq!(
             object.repairs[0].missing_replica_node_id,
             node("node_replica")
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn operator_inspector_counts_staging_intents_as_pending_writes() {
+        let root = temp_root("operator_inspector_counts_staging_intents_as_pending_writes");
+        let mut backend =
+            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = DfsFileSystem {
+            file_system_id: file_system_id(),
+            display_name: "repo".to_string(),
+            owner_node_id: node("node_owner"),
+            subtree_policies: Vec::new(),
+        };
+        let object = DfsObjectMetadata {
+            object_id: object_id(),
+            file_system_id: file_system_id(),
+            path: "artifact.bin".to_string(),
+            kind: DfsObjectKind::Artifact,
+            owner_node_id: node("node_owner"),
+            current_locations: vec![node("node_owner")],
+            content_hash: Some("blake3:old".to_string()),
+            content_size_bytes: Some(512),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version("version_1"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: "dfs_intent_staging".to_string(),
+                file_system_id: file_system_id(),
+                object_id: object_id(),
+                base_version: Some(version("version_1")),
+                target_version: version("version_2"),
+                coordinator_node_id: node("node_owner"),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
+                policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+                status: DfsWriteIntentStatus::Staging,
+                content_hash: Some("blake3:new".to_string()),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            })
+            .expect("intent");
+
+        let inspector = DfsOperatorInspector::new(&backend);
+        let status = inspector.status().expect("status");
+        assert_eq!(status.pending_write_count, 1);
+        assert_eq!(
+            inspector
+                .object(&object_id())
+                .expect("object")
+                .expect("object")
+                .agent_state,
+            DfsAgentObjectState::PendingWrite
         );
 
         fs::remove_dir_all(&root).expect("cleanup");

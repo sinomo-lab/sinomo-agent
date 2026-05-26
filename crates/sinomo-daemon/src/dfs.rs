@@ -75,6 +75,7 @@ pub fn ensure_default_distributed_dfs(
                 object_id: object.object_id.clone(),
                 version: object.version.clone(),
                 content_hash: object.content_hash.clone(),
+                size_bytes: object.content_size_bytes,
                 locations: object.current_locations.clone(),
                 created_by_event_id: object.created_by_event_id.clone(),
                 created_at: OffsetDateTime::now_utc(),

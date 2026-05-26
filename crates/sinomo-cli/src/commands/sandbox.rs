@@ -5699,14 +5699,15 @@ pub(crate) fn sandbox_logs_with_store(
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
     let (manifest, layout) = store.load(&options.sandbox_id)?;
-    let sandbox_fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
+    let mut sandbox_fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
     match options.command_id {
         Some(command_id) => {
             let stdout_path =
                 sinomo_runtime::sandbox::sandbox_command_stdout_log_path(&command_id)?;
             let stderr_path =
                 sinomo_runtime::sandbox::sandbox_command_stderr_log_path(&command_id)?;
-            let record = sinomo_runtime::sandbox::load_command_record(&sandbox_fs, &command_id)?;
+            let record =
+                sinomo_runtime::sandbox::load_command_record(&mut sandbox_fs, &command_id)?;
             print_sandbox_command_record_summary(&record);
             let stdout = sandbox_fs.read(&stdout_path, None)?;
             let stderr = sandbox_fs.read(&stderr_path, None)?;
@@ -5721,7 +5722,7 @@ pub(crate) fn sandbox_logs_with_store(
                     println!("{}", entry.path);
                 }
             } else {
-                print_sandbox_command_history(&sandbox_fs, &manifest.command_history)?;
+                print_sandbox_command_history(&mut sandbox_fs, &manifest.command_history)?;
             }
         }
     }
@@ -5770,7 +5771,7 @@ pub(crate) fn sandbox_logs_with_daemon(options: SandboxLogsOptions) -> Result<()
 }
 
 fn print_sandbox_command_history<F: sinomo_runtime::sandbox::SandboxFileSystem>(
-    sandbox_fs: &F,
+    sandbox_fs: &mut F,
     command_history: &[sinomo_runtime::sandbox::SandboxCommandId],
 ) -> Result<(), CliError> {
     for command_id in command_history {

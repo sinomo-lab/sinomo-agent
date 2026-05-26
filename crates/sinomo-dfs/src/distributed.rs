@@ -129,6 +129,14 @@ pub fn plan_replicas(
     })
 }
 
+pub fn validate_replication_plan(
+    desired_replica_nodes: &[NodeId],
+    policy: &DfsReplicationPolicy,
+) -> Result<(), DfsDistributedError> {
+    policy.validate()?;
+    validate_replica_set(desired_replica_nodes, policy)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsWriteIntentState {
@@ -250,36 +258,16 @@ impl DistributedEventualCoordinator {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<DistributedWriteIntent, DfsDistributedError> {
-        policy.validate()?;
-        validate_replica_set(&desired_replica_nodes, &policy)?;
+        self.validate_new_intent(
+            &file_system_id,
+            &object_id,
+            base_version.as_ref(),
+            &target_version,
+            &desired_replica_nodes,
+            &policy,
+        )?;
 
-        let key = ObjectKey::new(file_system_id.clone(), object_id.clone());
-        if let Some(committed_version) = self.committed_versions.get(&key) {
-            if Some(committed_version) != base_version.as_ref() {
-                return Err(DfsDistributedError::BaseVersionConflict {
-                    object_id,
-                    expected_base_version: committed_version.clone(),
-                    supplied_base_version: base_version,
-                });
-            }
-        }
-
-        if self.intents.values().any(|intent| {
-            intent.file_system_id == file_system_id
-                && intent.object_id == object_id
-                && intent.target_version == target_version
-                && matches!(
-                    intent.state,
-                    DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
-                )
-        }) {
-            return Err(DfsDistributedError::DuplicateIntent {
-                object_id,
-                target_version,
-            });
-        }
-
-        let intent_id = self.next_intent_id();
+        let intent_id = self.next_intent_id(&requesting_node_id);
         let intent = DistributedWriteIntent {
             intent_id: intent_id.clone(),
             file_system_id,
@@ -296,6 +284,59 @@ impl DistributedEventualCoordinator {
         Ok(intent)
     }
 
+    pub fn validate_new_intent(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        base_version: Option<&DfsVersion>,
+        target_version: &DfsVersion,
+        desired_replica_nodes: &[NodeId],
+        policy: &DfsReplicationPolicy,
+    ) -> Result<(), DfsDistributedError> {
+        validate_replication_plan(desired_replica_nodes, policy)?;
+
+        let key = ObjectKey::from_refs(file_system_id, object_id);
+        if let Some(committed_version) = self.committed_versions.get(&key)
+            && Some(committed_version) != base_version
+        {
+            return Err(DfsDistributedError::BaseVersionConflict {
+                object_id: object_id.clone(),
+                expected_base_version: committed_version.clone(),
+                supplied_base_version: base_version.cloned(),
+            });
+        }
+
+        if self.intents.values().any(|intent| {
+            intent.file_system_id == *file_system_id
+                && intent.object_id == *object_id
+                && intent.target_version == *target_version
+                && matches!(
+                    intent.state,
+                    DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
+                )
+        }) {
+            return Err(DfsDistributedError::DuplicateIntent {
+                object_id: object_id.clone(),
+                target_version: target_version.clone(),
+            });
+        }
+
+        if let Some(pending) = self.intents.values().find(|intent| {
+            intent.file_system_id == *file_system_id
+                && intent.object_id == *object_id
+                && matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
+        }) {
+            return Err(DfsDistributedError::PendingIntentConflict {
+                object_id: object_id.clone(),
+                pending_intent_id: pending.intent_id.clone(),
+                pending_target_version: pending.target_version.clone(),
+                requested_target_version: target_version.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
     pub fn intent(&self, intent_id: &str) -> Option<&DistributedWriteIntent> {
         self.intents.get(intent_id)
     }
@@ -304,8 +345,17 @@ impl DistributedEventualCoordinator {
         &mut self,
         intent: DistributedWriteIntent,
     ) -> Result<(), DfsDistributedError> {
-        intent.policy.validate()?;
-        validate_replica_set(&intent.desired_replica_nodes, &intent.policy)?;
+        validate_replication_plan(&intent.desired_replica_nodes, &intent.policy)?;
+        if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
+            self.validate_new_intent(
+                &intent.file_system_id,
+                &intent.object_id,
+                intent.base_version.as_ref(),
+                &intent.target_version,
+                &intent.desired_replica_nodes,
+                &intent.policy,
+            )?;
+        }
         self.advance_next_intent_id(&intent.intent_id);
         if matches!(intent.state, DfsWriteIntentState::Committed) {
             self.committed_versions.insert(
@@ -561,14 +611,18 @@ impl DistributedEventualCoordinator {
             .collect()
     }
 
-    fn next_intent_id(&mut self) -> String {
-        let intent_id = format!("dfs_intent_{}", self.next_intent_id);
+    fn next_intent_id(&mut self, requesting_node_id: &NodeId) -> String {
+        let intent_id = format!(
+            "dfs_intent_{}_{}",
+            requesting_node_id.as_str(),
+            self.next_intent_id
+        );
         self.next_intent_id += 1;
         intent_id
     }
 
     fn advance_next_intent_id(&mut self, intent_id: &str) {
-        let Some(suffix) = intent_id.strip_prefix("dfs_intent_") else {
+        let Some(suffix) = intent_id.rsplit('_').next() else {
             return;
         };
         let Ok(value) = suffix.parse::<u64>() else {
@@ -637,9 +691,9 @@ fn validate_replica_set(
         });
     }
 
-    if desired_replica_nodes.len() < policy.desired_replicas {
+    if desired_replica_nodes.len() != policy.desired_replicas {
         return Err(DfsDistributedError::InvalidReplicaSet {
-            reason: "desired_replica_nodes is smaller than desired_replicas".to_string(),
+            reason: "desired_replica_nodes must match desired_replicas".to_string(),
         });
     }
 
@@ -695,6 +749,15 @@ pub enum DfsDistributedError {
     DuplicateIntent {
         object_id: DfsObjectId,
         target_version: DfsVersion,
+    },
+    #[error(
+        "pending DFS write intent {pending_intent_id} for {object_id} at {pending_target_version} conflicts with requested target {requested_target_version}"
+    )]
+    PendingIntentConflict {
+        object_id: DfsObjectId,
+        pending_intent_id: String,
+        pending_target_version: DfsVersion,
+        requested_target_version: DfsVersion,
     },
     #[error(
         "base version conflict for {object_id}: expected {expected_base_version}, supplied {supplied_base_version:?}"
@@ -796,6 +859,39 @@ mod tests {
     }
 
     #[test]
+    fn intent_ids_include_requesting_node_to_avoid_cross_node_collisions() {
+        let mut left = DistributedEventualCoordinator::new();
+        let mut right = DistributedEventualCoordinator::new();
+
+        let left_intent = left
+            .create_intent(
+                file_system_id(),
+                object_id(),
+                Some(version("version_1")),
+                version("version_2"),
+                node("node_left"),
+                vec![node("node_left"), node("node_replica")],
+                policy(2, 2),
+            )
+            .expect("left intent");
+        let right_intent = right
+            .create_intent(
+                file_system_id(),
+                object_id(),
+                Some(version("version_1")),
+                version("version_3"),
+                node("node_right"),
+                vec![node("node_right"), node("node_replica")],
+                policy(2, 2),
+            )
+            .expect("right intent");
+
+        assert_ne!(left_intent.intent_id, right_intent.intent_id);
+        assert!(left_intent.intent_id.contains(node("node_left").as_str()));
+        assert!(right_intent.intent_id.contains(node("node_right").as_str()));
+    }
+
+    #[test]
     fn commits_after_threshold_receipts() {
         let mut coordinator = DistributedEventualCoordinator::new();
         let intent = create_intent(&mut coordinator, policy(2, 3));
@@ -845,6 +941,36 @@ mod tests {
         assert_eq!(updated.state, DfsWriteIntentState::AwaitingReceipts);
         assert_eq!(coordinator.durable_receipt_count(&intent.intent_id), 1);
         assert!(coordinator.repair_jobs().is_empty());
+    }
+
+    #[test]
+    fn rejects_competing_pending_intent_for_same_object() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let pending = create_intent(&mut coordinator, policy(2, 3));
+
+        let error = coordinator
+            .create_intent(
+                file_system_id(),
+                object_id(),
+                Some(version("version_1")),
+                version("version_3"),
+                node("node_writer"),
+                vec![node("node_a"), node("node_b"), node("node_c")],
+                policy(2, 3),
+            )
+            .expect_err("competing pending intent should be rejected");
+
+        assert!(matches!(
+            error,
+            DfsDistributedError::PendingIntentConflict {
+                pending_intent_id,
+                pending_target_version,
+                requested_target_version,
+                ..
+            } if pending_intent_id == pending.intent_id
+                && pending_target_version == version("version_2")
+                && requested_target_version == version("version_3")
+        ));
     }
 
     #[test]

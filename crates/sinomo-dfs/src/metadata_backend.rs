@@ -12,7 +12,7 @@ use sinomo_core::DfsWriteReceipt;
 use sinomo_events::EventId;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -105,6 +105,8 @@ pub struct DfsInodeRecord {
 
 impl From<&DfsObjectMetadata> for DfsInodeRecord {
     fn from(object: &DfsObjectMetadata) -> Self {
+        let mut current_locations = object.current_locations.clone();
+        normalize_node_locations(&mut current_locations);
         Self {
             inode_id: object_inode_id(&object.object_id),
             file_system_id: object.file_system_id.clone(),
@@ -114,7 +116,7 @@ impl From<&DfsObjectMetadata> for DfsInodeRecord {
             policy: object.policy.clone(),
             visible_version: object.version.clone(),
             content_hash: object.content_hash.clone(),
-            current_locations: object.current_locations.clone(),
+            current_locations,
             created_by_event_id: object.created_by_event_id.clone(),
             last_modified_by_event_id: object.last_modified_by_event_id.clone(),
         }
@@ -339,6 +341,58 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>>;
+    fn child_objects_for_directory(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let directory_path = normalize_posix_path(directory_path);
+        let prefix = if directory_path == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", directory_path.trim_end_matches('/'))
+        };
+        let mut children = Vec::new();
+        for object in self.objects_for_file_system(file_system_id)? {
+            let object_path = normalize_posix_path(&object.path);
+            if object.kind == DfsObjectKind::Tombstone
+                || object_path == directory_path
+                || !object_path.starts_with(&prefix)
+            {
+                continue;
+            }
+            let rest = object_path.trim_start_matches(&prefix);
+            if !rest.is_empty() && !rest.contains('/') {
+                children.push(object);
+            }
+        }
+        children.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        Ok(children)
+    }
+    fn hardlinks_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let mut hardlinks = Vec::new();
+        for object in self.objects_for_file_system(file_system_id)? {
+            if object.kind == DfsObjectKind::Hardlink
+                && object.link_target_object_id.as_ref() == Some(target_object_id)
+            {
+                hardlinks.push(object);
+            }
+        }
+        hardlinks.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        Ok(hardlinks)
+    }
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry>;
     fn get_version(
         &self,
@@ -410,6 +464,7 @@ impl LocalJsonMetadataBackend {
             root,
             next_sequence,
         };
+        backend.recover_secondary_indexes()?;
         backend.recover_namespace_transactions()?;
         backend.recover_visible_version_commits()?;
         Ok(backend)
@@ -420,15 +475,27 @@ impl LocalJsonMetadataBackend {
     }
 
     fn write_journal(&mut self, mutation: DfsMetadataMutation) -> Result<DfsMetadataJournalEntry> {
-        let entry = DfsMetadataJournalEntry {
-            shard_id: self.shard_id.clone(),
-            sequence: self.next_sequence,
-            created_at: OffsetDateTime::now_utc(),
-            mutation,
-        };
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        write_json_atomic(&self.journal_path(entry.sequence), &entry)?;
-        Ok(entry)
+        let mut sequence = self.next_sequence.max(next_journal_sequence(&self.root)?);
+        loop {
+            let entry = DfsMetadataJournalEntry {
+                shard_id: self.shard_id.clone(),
+                sequence,
+                created_at: OffsetDateTime::now_utc(),
+                mutation: mutation.clone(),
+            };
+            match write_json_create_new_atomic(&self.journal_path(entry.sequence), &entry) {
+                Ok(()) => {
+                    self.next_sequence = sequence.saturating_add(1);
+                    return Ok(entry);
+                }
+                Err(MetadataBackendError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    sequence = sequence.saturating_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn records_root(&self) -> PathBuf {
@@ -452,8 +519,25 @@ impl LocalJsonMetadataBackend {
             .join("object.sobj")
     }
 
-    fn object_dir(&self) -> PathBuf {
+    fn object_records_dir(&self) -> PathBuf {
         self.records_root().join("objects")
+    }
+
+    fn file_system_object_index_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> PathBuf {
+        self.records_root()
+            .join("filesystem-objects")
+            .join(key_segment(file_system_id))
+            .join(format!("{}.sobj", key_segment(object_id)))
+    }
+
+    fn file_system_object_index_dir(&self, file_system_id: &DfsFileSystemId) -> PathBuf {
+        self.records_root()
+            .join("filesystem-objects")
+            .join(key_segment(file_system_id))
     }
 
     fn path_index_path(&self, file_system_id: &DfsFileSystemId, path: &str) -> PathBuf {
@@ -486,6 +570,23 @@ impl LocalJsonMetadataBackend {
                 path_record.name_hash,
                 path_hash(&path_record.name)
             ))
+    }
+
+    fn hardlink_index_path(
+        &self,
+        target_object_id: &DfsObjectId,
+        hardlink_object_id: &DfsObjectId,
+    ) -> PathBuf {
+        self.records_root()
+            .join("hardlinks")
+            .join(key_segment(target_object_id))
+            .join(format!("{}.sobj", key_segment(hardlink_object_id)))
+    }
+
+    fn hardlink_index_dir(&self, target_object_id: &DfsObjectId) -> PathBuf {
+        self.records_root()
+            .join("hardlinks")
+            .join(key_segment(target_object_id))
     }
 
     fn version_path(&self, object_id: &DfsObjectId, version: &DfsVersion) -> PathBuf {
@@ -597,13 +698,15 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
+        let object = normalized_object_metadata(object);
         if self.get_file_system(&object.file_system_id)?.is_none() {
             return Err(MetadataBackendError::UnknownFileSystem {
                 file_system_id: object.file_system_id.clone(),
             });
         }
 
-        self.materialize_object_indexes(object)?;
+        let previous = self.get_object(&object.object_id)?;
+        self.materialize_object_indexes_with_previous(&object, previous.as_ref())?;
 
         self.write_journal(DfsMetadataMutation::PutObject {
             file_system_id: object.file_system_id.clone(),
@@ -626,12 +729,18 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         else {
             return Ok(None);
         };
+        if path_record.file_system_id != *file_system_id {
+            return Ok(None);
+        }
         if normalize_path(&path_record.path) != normalize_path(path) {
             return Ok(None);
         }
         let Some(object) = self.get_object(&path_record.object_id)? else {
             return Ok(None);
         };
+        if object.file_system_id != *file_system_id {
+            return Ok(None);
+        }
         if normalize_path(&object.path) != normalize_path(path) {
             return Ok(None);
         }
@@ -643,16 +752,18 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>> {
         let mut objects = Vec::new();
-        if !self.object_dir().exists() {
-            return Ok(objects);
-        }
-        for entry in read_dir(&self.object_dir())? {
-            let path = entry.path().join("object.sobj");
-            if !path.is_file() {
+        for path_record in
+            read_json_dir::<DfsPathRecord>(&self.file_system_object_index_dir(file_system_id))?
+        {
+            if path_record.file_system_id != *file_system_id {
                 continue;
             }
-            let object: DfsObjectMetadata = read_json(&path)?;
-            if &object.file_system_id == file_system_id {
+            let Some(object) = self.get_object(&path_record.object_id)? else {
+                continue;
+            };
+            if object.file_system_id == *file_system_id
+                && normalize_path(&object.path) == path_record.path
+            {
                 objects.push(object);
             }
         }
@@ -664,10 +775,80 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         Ok(objects)
     }
 
+    fn child_objects_for_directory(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let directory_path = normalize_posix_path(directory_path);
+        let parent_inode_id = directory_inode_id(file_system_id, &directory_path);
+        let dentry_dir = self
+            .records_root()
+            .join("dentries")
+            .join(key_segment(&parent_inode_id.0))
+            .join(key_segment(&"root"));
+        let mut objects = Vec::new();
+        for path_record in read_json_dir::<DfsPathRecord>(&dentry_dir)? {
+            if path_record.file_system_id != *file_system_id
+                || path_record.parent_inode_id != parent_inode_id
+            {
+                continue;
+            }
+            let Some(object) = self.get_object(&path_record.object_id)? else {
+                continue;
+            };
+            if object.kind == DfsObjectKind::Tombstone
+                || object.file_system_id != *file_system_id
+                || normalize_path(&object.path) != path_record.path
+            {
+                continue;
+            }
+            objects.push(object);
+        }
+        objects.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        Ok(objects)
+    }
+
+    fn hardlinks_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let mut hardlinks = Vec::new();
+        for path_record in
+            read_json_dir::<DfsPathRecord>(&self.hardlink_index_dir(target_object_id))?
+        {
+            if path_record.file_system_id != *file_system_id {
+                continue;
+            }
+            let Some(object) = self.get_object(&path_record.object_id)? else {
+                continue;
+            };
+            if object.kind == DfsObjectKind::Hardlink
+                && object.file_system_id == *file_system_id
+                && object.link_target_object_id.as_ref() == Some(target_object_id)
+                && normalize_path(&object.path) == path_record.path
+            {
+                hardlinks.push(object);
+            }
+        }
+        hardlinks.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        Ok(hardlinks)
+    }
+
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
+        let version = normalized_version_record(version);
         write_json_atomic(
             &self.version_path(&version.object_id, &version.version),
-            version,
+            &version,
         )?;
         self.write_journal(DfsMetadataMutation::PutVersion {
             file_system_id: version.file_system_id.clone(),
@@ -783,9 +964,9 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
 
         let commit_record = DfsVisibleVersionCommitRecord {
             expected_version: expected_version.clone(),
-            committed_object: committed_object.clone(),
-            visible_version: visible_version.clone(),
-            required_replica_node_ids: required_replica_node_ids.to_vec(),
+            committed_object: normalized_object_metadata(committed_object),
+            visible_version: normalized_version_record(visible_version),
+            required_replica_node_ids: normalized_node_location_list(required_replica_node_ids),
             created_at: OffsetDateTime::now_utc(),
         };
         write_json_atomic(
@@ -821,11 +1002,12 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             });
         }
 
+        let transaction = normalized_namespace_transaction(transaction);
         write_json_atomic(
             &self.namespace_transaction_path(&transaction.transaction_id),
-            transaction,
+            &transaction,
         )?;
-        self.materialize_namespace_transaction(transaction)?;
+        self.materialize_namespace_transaction(&transaction)?;
         self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
             file_system_id: transaction.file_system_id.clone(),
             transaction_id: transaction.transaction_id.clone(),
@@ -869,22 +1051,31 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let mut entries = BTreeMap::new();
         let journal_dir = self.root.join("journal");
         if !journal_dir.exists() {
             return Ok(Vec::new());
         }
+        let mut paths = BTreeMap::new();
         for entry in read_dir(&journal_dir)? {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
                 continue;
             }
-            let journal_entry: DfsMetadataJournalEntry = read_json(&path)?;
-            if journal_entry.sequence > after_sequence {
-                entries.insert(journal_entry.sequence, journal_entry);
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Ok(sequence) = stem.parse::<u64>() else {
+                continue;
+            };
+            if sequence > after_sequence {
+                paths.insert(sequence, path);
             }
         }
-        Ok(entries.into_values().collect())
+        let mut entries = Vec::new();
+        for path in paths.into_values() {
+            entries.push(read_json(&path)?);
+        }
+        Ok(entries)
     }
 
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {
@@ -979,12 +1170,110 @@ impl LocalJsonMetadataBackend {
     }
 
     fn materialize_object_indexes(&self, object: &DfsObjectMetadata) -> Result<()> {
-        let inode = DfsInodeRecord::from(object);
+        self.materialize_object_indexes_with_previous(object, None)
+    }
 
-        write_json_atomic(&self.object_path(&object.object_id), object)?;
+    fn recover_secondary_indexes(&self) -> Result<()> {
+        let mut objects = self.object_records()?;
+        objects.sort_by(|left, right| {
+            left.version
+                .cmp(&right.version)
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        for index_dir in [
+            "filesystem-objects",
+            "paths",
+            "dentries",
+            "dirfrags",
+            "hardlinks",
+        ] {
+            remove_dir_all_if_exists(&self.records_root().join(index_dir))?;
+        }
+        for object in objects {
+            self.materialize_object_indexes_with_previous(&object, None)?;
+        }
+        Ok(())
+    }
+
+    fn object_records(&self) -> Result<Vec<DfsObjectMetadata>> {
+        let root = self.object_records_dir();
+        let mut objects = Vec::new();
+        if !root.exists() {
+            return Ok(objects);
+        }
+        for object_dir in read_dir(&root)? {
+            let object_dir_path = object_dir.path();
+            if !object_dir_path.is_dir() {
+                continue;
+            }
+            let path = object_dir_path.join("object.sobj");
+            if path.is_file() {
+                objects.push(read_json(&path)?);
+            }
+        }
+        Ok(objects)
+    }
+
+    fn materialize_object_indexes_with_previous(
+        &self,
+        object: &DfsObjectMetadata,
+        previous: Option<&DfsObjectMetadata>,
+    ) -> Result<()> {
+        let object = normalized_object_metadata(object);
+        let inode = DfsInodeRecord::from(&object);
+        let path_record = path_record_for_object(&object);
+
+        if let Some(previous_target_object_id) =
+            previous.and_then(|previous| previous.link_target_object_id.as_ref())
+            && (object.kind != DfsObjectKind::Hardlink
+                || object.link_target_object_id.as_ref() != Some(previous_target_object_id))
+        {
+            remove_file_if_exists(
+                &self.hardlink_index_path(previous_target_object_id, &object.object_id),
+            )?;
+        }
+        if let Some(previous) = previous {
+            let previous_path_record = path_record_for_object(previous);
+            if previous.file_system_id != object.file_system_id {
+                remove_file_if_exists(
+                    &self
+                        .file_system_object_index_path(&previous.file_system_id, &object.object_id),
+                )?;
+            }
+            if previous_path_record.file_system_id != path_record.file_system_id
+                || previous_path_record.path != path_record.path
+            {
+                remove_file_if_exists(&self.path_index_path(
+                    &previous_path_record.file_system_id,
+                    &previous_path_record.path,
+                ))?;
+            }
+            if previous.kind != DfsObjectKind::Tombstone
+                && (object.kind == DfsObjectKind::Tombstone
+                    || previous_path_record.path != path_record.path
+                    || previous_path_record.parent_inode_id != path_record.parent_inode_id
+                    || previous_path_record.name != path_record.name)
+            {
+                self.remove_dentry_index(&previous_path_record)?;
+            }
+        }
+        write_json_atomic(
+            &self.file_system_object_index_path(&object.file_system_id, &object.object_id),
+            &path_record,
+        )?;
+        write_json_atomic(&self.object_path(&object.object_id), &object)?;
         write_json_atomic(&self.inode_path(&inode.inode_id), &inode)?;
+        if object.kind == DfsObjectKind::Hardlink
+            && let Some(target_object_id) = object.link_target_object_id.as_ref()
+        {
+            write_json_atomic(
+                &self.hardlink_index_path(target_object_id, &object.object_id),
+                &path_record_for_object(&object),
+            )?;
+        }
         if object.kind == DfsObjectKind::Tombstone {
-            let path_record = path_record_for_object(object);
+            self.remove_dentry_index(&path_record)?;
             write_json_atomic(
                 &self.path_index_path(&object.file_system_id, &path_record.path),
                 &path_record,
@@ -992,7 +1281,6 @@ impl LocalJsonMetadataBackend {
             return Ok(());
         }
 
-        let path_record = path_record_for_object(object);
         let dentry_path = self.dentry_path(&path_record);
         let dirfrag = self.read_or_create_dirfrag(
             &path_record.file_system_id,
@@ -1008,6 +1296,20 @@ impl LocalJsonMetadataBackend {
             &self.dirfrag_path(&dirfrag.dir_inode_id, &dirfrag.dirfrag_id),
             &dirfrag,
         )
+    }
+
+    fn remove_dentry_index(&self, path_record: &DfsPathRecord) -> Result<()> {
+        let dentry_path = self.dentry_path(path_record);
+        if !dentry_path.exists() {
+            return Ok(());
+        }
+        remove_file_if_exists(&dentry_path)?;
+        let dirfrag_path = self.dirfrag_path(&path_record.parent_inode_id, &path_record.dirfrag_id);
+        let Some(mut dirfrag) = read_json_optional::<DfsDirFragmentRecord>(&dirfrag_path)? else {
+            return Ok(());
+        };
+        dirfrag.entry_count = dirfrag.entry_count.saturating_sub(1);
+        write_json_atomic(&dirfrag_path, &dirfrag)
     }
 
     fn recover_visible_version_commits(&mut self) -> Result<()> {
@@ -1117,12 +1419,10 @@ impl LocalJsonMetadataBackend {
         commit: &DfsVisibleVersionCommitRecord,
     ) -> Result<()> {
         self.materialize_object_indexes(&commit.committed_object)?;
+        let visible_version = normalized_version_record(&commit.visible_version);
         write_json_atomic(
-            &self.version_path(
-                &commit.visible_version.object_id,
-                &commit.visible_version.version,
-            ),
-            &commit.visible_version,
+            &self.version_path(&visible_version.object_id, &visible_version.version),
+            &visible_version,
         )
     }
 
@@ -1172,6 +1472,39 @@ fn path_record_for_object(object: &DfsObjectMetadata) -> DfsPathRecord {
     }
 }
 
+fn normalized_object_metadata(object: &DfsObjectMetadata) -> DfsObjectMetadata {
+    let mut object = object.clone();
+    normalize_node_locations(&mut object.current_locations);
+    object
+}
+
+fn normalized_version_record(version: &DfsObjectVersionRecord) -> DfsObjectVersionRecord {
+    let mut version = version.clone();
+    normalize_node_locations(&mut version.locations);
+    version
+}
+
+fn normalized_namespace_transaction(
+    transaction: &DfsNamespaceTransaction,
+) -> DfsNamespaceTransaction {
+    let mut transaction = transaction.clone();
+    for object in &mut transaction.objects {
+        normalize_node_locations(&mut object.current_locations);
+    }
+    transaction
+}
+
+fn normalized_node_location_list(nodes: &[NodeId]) -> Vec<NodeId> {
+    let mut nodes = nodes.to_vec();
+    normalize_node_locations(&mut nodes);
+    nodes
+}
+
+fn normalize_node_locations(nodes: &mut Vec<NodeId>) {
+    let mut seen = BTreeSet::new();
+    nodes.retain(|node_id| seen.insert(node_id.clone()));
+}
+
 fn object_inode_id(object_id: &DfsObjectId) -> DfsInodeId {
     DfsInodeId::new(format!("obj:{}", object_id))
 }
@@ -1188,8 +1521,30 @@ fn parent_inode_id(file_system_id: &DfsFileSystemId, normalized_path: &str) -> D
     }
 }
 
+fn directory_inode_id(file_system_id: &DfsFileSystemId, directory_path: &str) -> DfsInodeId {
+    let normalized = normalize_path(directory_path);
+    if normalized.is_empty() {
+        DfsInodeId::new(format!("fs:{}:root", file_system_id))
+    } else {
+        DfsInodeId::new(format!(
+            "path:{}:{}",
+            file_system_id,
+            path_hash(&normalized)
+        ))
+    }
+}
+
 fn normalize_path(path: &str) -> String {
     path.trim_matches('/').to_string()
+}
+
+fn normalize_posix_path(path: &str) -> String {
+    let normalized = normalize_path(path);
+    if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{normalized}")
+    }
 }
 
 fn path_hash(path: &str) -> String {
@@ -1233,6 +1588,38 @@ fn next_journal_sequence(root: &Path) -> Result<u64> {
 
 fn create_dir_all(path: PathBuf) -> Result<()> {
     fs::create_dir_all(&path).map_err(|source| MetadataBackendError::Io { path, source })
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                sync_dir(parent)?;
+            }
+            Ok(())
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn remove_dir_all_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                sync_dir(parent)?;
+            }
+            Ok(())
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>> {
@@ -1301,6 +1688,15 @@ where
     write_file_atomic(path, &bytes)
 }
 
+fn write_json_create_new_atomic<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let bytes = sinomo_object_serde::to_bytes(value, 1, LengthMode::U32)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    write_file_create_new_atomic(path, &bytes)
+}
+
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent.to_owned())?;
@@ -1319,6 +1715,39 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(file);
     fs::rename(&tmp_path, path).map_err(|source| MetadataBackendError::Io {
         path: path.to_owned(),
+        source,
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    let tmp_path = temporary_path_for(path);
+    let mut file = fs::File::create(&tmp_path).map_err(|source| MetadataBackendError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| MetadataBackendError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+    drop(file);
+    if let Err(source) = fs::hard_link(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        });
+    }
+    fs::remove_file(&tmp_path).map_err(|source| MetadataBackendError::Io {
+        path: tmp_path,
         source,
     })?;
     if let Some(parent) = path.parent() {
@@ -1446,6 +1875,505 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_allocates_journal_sequences_across_open_handles() {
+        let root = temp_root("local_backend_allocates_journal_sequences_across_open_handles");
+        let mut first = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("first backend");
+        let mut second =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("second backend");
+        let file_system = file_system();
+        let mut object = object(version("version_1"));
+        object.object_id = DfsObjectId::from_legacy_named("obj_second_handle").expect("object");
+        object.path = "/docs/second.md".to_string();
+
+        let first_entry = first.put_file_system(&file_system).expect("filesystem");
+        let second_entry = second
+            .put_object(&object)
+            .expect("object from second handle");
+
+        assert_eq!(first_entry.sequence, 1);
+        assert_eq!(
+            second_entry.sequence, 2,
+            "a second backend opened before the first write must not reuse the first sequence"
+        );
+        let journal = first.journal_since(0).expect("journal");
+        assert_eq!(journal.len(), 2);
+        assert!(matches!(
+            journal[0].mutation,
+            DfsMetadataMutation::PutFileSystem { .. }
+        ));
+        assert!(matches!(
+            journal[1].mutation,
+            DfsMetadataMutation::PutObject { .. }
+        ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_lists_directory_children_from_dentry_index() {
+        let root = temp_root("local_backend_lists_directory_children_from_dentry_index");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let mut readme = object(version("version_1"));
+        readme.path = "/docs/readme.md".to_string();
+        let mut changelog = object(version("version_1"));
+        changelog.object_id = DfsObjectId::from_legacy_named("obj_changelog").expect("object");
+        changelog.path = "/docs/changelog.md".to_string();
+        let mut nested = object(version("version_1"));
+        nested.object_id = DfsObjectId::from_legacy_named("obj_setup").expect("object");
+        nested.path = "/docs/guides/setup.md".to_string();
+        let mut outside = object(version("version_1"));
+        outside.object_id = DfsObjectId::from_legacy_named("obj_lib").expect("object");
+        outside.path = "/src/lib.rs".to_string();
+        for object in [&readme, &changelog, &nested, &outside] {
+            backend.put_object(object).expect("object");
+        }
+        let mut changelog_tombstone = changelog.clone();
+        changelog_tombstone.kind = DfsObjectKind::Tombstone;
+        changelog_tombstone.version = version("version_2");
+        changelog_tombstone.content_hash = None;
+        backend.put_object(&changelog_tombstone).expect("tombstone");
+
+        let children = backend
+            .child_objects_for_directory(&file_system_id(), "/docs")
+            .expect("children");
+        assert_eq!(
+            children
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/readme.md"]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_removes_stale_path_and_dentry_indexes() {
+        let root = temp_root("local_backend_removes_stale_path_and_dentry_indexes");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let mut readme = object(version("version_1"));
+        readme.path = "/docs/readme.md".to_string();
+        backend.put_object(&readme).expect("object");
+        let old_path_index = backend.path_index_path(&file_system_id(), "/docs/readme.md");
+        let old_dentry = backend.dentry_path(&path_record_for_object(&readme));
+        let dirfrag_path = backend.dirfrag_path(
+            &path_record_for_object(&readme).parent_inode_id,
+            &DfsDirFragmentId::new("root"),
+        );
+        assert!(old_path_index.exists());
+        assert!(old_dentry.exists());
+        assert_eq!(
+            read_json::<DfsDirFragmentRecord>(&dirfrag_path)
+                .expect("dirfrag after create")
+                .entry_count,
+            1
+        );
+
+        readme.path = "/docs/renamed.md".to_string();
+        readme.version = version("version_2");
+        backend.put_object(&readme).expect("renamed object");
+        assert!(
+            !old_path_index.exists(),
+            "renaming should remove the obsolete path index"
+        );
+        assert!(
+            !old_dentry.exists(),
+            "renaming should remove the obsolete directory entry"
+        );
+        assert!(
+            backend
+                .path_index_path(&file_system_id(), "/docs/renamed.md")
+                .exists()
+        );
+        assert!(
+            backend
+                .dentry_path(&path_record_for_object(&readme))
+                .exists()
+        );
+        assert_eq!(
+            backend
+                .child_objects_for_directory(&file_system_id(), "/docs")
+                .expect("children")
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/renamed.md"]
+        );
+        assert_eq!(
+            read_json::<DfsDirFragmentRecord>(&dirfrag_path)
+                .expect("dirfrag after rename")
+                .entry_count,
+            1
+        );
+
+        let renamed_dentry = backend.dentry_path(&path_record_for_object(&readme));
+        readme.kind = DfsObjectKind::Tombstone;
+        readme.content_hash = None;
+        readme.version = version("version_3");
+        backend.put_object(&readme).expect("tombstone object");
+        assert!(
+            !renamed_dentry.exists(),
+            "tombstoning should remove the visible directory entry"
+        );
+        assert!(
+            backend
+                .path_index_path(&file_system_id(), "/docs/renamed.md")
+                .exists(),
+            "tombstone path record should remain addressable"
+        );
+        assert!(
+            backend
+                .child_objects_for_directory(&file_system_id(), "/docs")
+                .expect("children after tombstone")
+                .is_empty()
+        );
+        assert_eq!(
+            read_json::<DfsDirFragmentRecord>(&dirfrag_path)
+                .expect("dirfrag after tombstone")
+                .entry_count,
+            0
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_rebuilds_dirfrag_counts_during_secondary_index_recovery() {
+        let root = temp_root("local_backend_rebuilds_dirfrag_counts");
+        {
+            let mut backend =
+                LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                    .expect("backend");
+            backend.put_file_system(&file_system()).expect("filesystem");
+
+            let mut readme = object(version("version_1"));
+            readme.path = "/docs/readme.md".to_string();
+            let mut changelog = object(version("version_1"));
+            changelog.object_id = DfsObjectId::from_legacy_named("obj_changelog").expect("object");
+            changelog.path = "/docs/changelog.md".to_string();
+            for object in [&readme, &changelog] {
+                backend.put_object(object).expect("object");
+            }
+
+            let path_record = path_record_for_object(&readme);
+            let dirfrag_path =
+                backend.dirfrag_path(&path_record.parent_inode_id, &path_record.dirfrag_id);
+            let mut dirfrag =
+                read_json::<DfsDirFragmentRecord>(&dirfrag_path).expect("dirfrag before corrupt");
+            dirfrag.entry_count = 999;
+            write_json_atomic(&dirfrag_path, &dirfrag).expect("corrupt dirfrag count");
+        }
+
+        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("recovered backend");
+        let path_record = path_record_for_object(&object(version("version_1")));
+        let dirfrag_path =
+            recovered.dirfrag_path(&path_record.parent_inode_id, &path_record.dirfrag_id);
+        assert_eq!(
+            read_json::<DfsDirFragmentRecord>(&dirfrag_path)
+                .expect("recovered dirfrag")
+                .entry_count,
+            2
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_lists_objects_from_filesystem_object_index() {
+        let root = temp_root("local_backend_lists_objects_from_filesystem_object_index");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let other_file_system = DfsFileSystem {
+            file_system_id: DfsFileSystemId::from_legacy_named("otherfs").expect("filesystem"),
+            display_name: "other".to_string(),
+            owner_node_id: node("node_owner"),
+            subtree_policies: Vec::new(),
+        };
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend
+            .put_file_system(&other_file_system)
+            .expect("other filesystem");
+
+        let mut readme = object(version("version_1"));
+        readme.path = "/docs/readme.md".to_string();
+        let mut changelog = object(version("version_1"));
+        changelog.object_id = DfsObjectId::from_legacy_named("obj_changelog").expect("object");
+        changelog.path = "/docs/changelog.md".to_string();
+        let mut other = object(version("version_1"));
+        other.object_id = DfsObjectId::from_legacy_named("obj_other").expect("object");
+        other.file_system_id = other_file_system.file_system_id.clone();
+        other.path = "/other.txt".to_string();
+        for object in [&readme, &changelog, &other] {
+            backend.put_object(object).expect("object");
+        }
+        assert!(
+            backend
+                .file_system_object_index_path(&file_system_id(), &readme.object_id)
+                .exists()
+        );
+
+        let objects = backend
+            .objects_for_file_system(&file_system_id())
+            .expect("objects");
+        assert_eq!(
+            objects
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/changelog.md", "/docs/readme.md"]
+        );
+
+        let old_index =
+            backend.file_system_object_index_path(&file_system_id(), &changelog.object_id);
+        changelog.file_system_id = other_file_system.file_system_id.clone();
+        changelog.path = "/moved-changelog.md".to_string();
+        backend.put_object(&changelog).expect("move filesystem");
+        assert!(
+            !old_index.exists(),
+            "moving an object to another filesystem should remove its old filesystem-object index"
+        );
+        assert_eq!(
+            backend
+                .objects_for_file_system(&file_system_id())
+                .expect("objects")
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/readme.md"]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_removes_stale_path_index_when_object_moves_filesystems_without_renaming() {
+        let root =
+            temp_root("local_backend_removes_stale_path_index_when_object_moves_filesystems");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let other_file_system = DfsFileSystem {
+            file_system_id: DfsFileSystemId::from_legacy_named("otherfs").expect("filesystem"),
+            display_name: "other".to_string(),
+            owner_node_id: node("node_owner"),
+            subtree_policies: Vec::new(),
+        };
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend
+            .put_file_system(&other_file_system)
+            .expect("other filesystem");
+
+        let mut object = object(version("version_1"));
+        object.path = "/services/shared-name.txt".to_string();
+        backend.put_object(&object).expect("object");
+        let old_path_index = backend.path_index_path(&file_system.file_system_id, &object.path);
+        assert!(old_path_index.exists());
+
+        object.file_system_id = other_file_system.file_system_id.clone();
+        backend
+            .put_object(&object)
+            .expect("move filesystem without rename");
+
+        assert!(
+            !old_path_index.exists(),
+            "moving an object between filesystems must remove the old filesystem path index even when the path string is unchanged"
+        );
+        assert!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, "/services/shared-name.txt")
+                .expect("old filesystem lookup")
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(
+                    &other_file_system.file_system_id,
+                    "/services/shared-name.txt"
+                )
+                .expect("new filesystem lookup")
+                .expect("object")
+                .object_id,
+            object.object_id
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_recovers_secondary_indexes_for_legacy_object_records() {
+        let root = temp_root("local_backend_recovers_secondary_indexes_for_legacy_object_records");
+        {
+            let mut backend =
+                LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                    .expect("backend");
+            backend.put_file_system(&file_system()).expect("filesystem");
+
+            let target = object(version("version_1"));
+            let mut alias = object(version("version_1"));
+            alias.object_id = DfsObjectId::from_legacy_named("obj_legacy_alias").expect("object");
+            alias.path = "/docs/readme.alias".to_string();
+            alias.kind = DfsObjectKind::Hardlink;
+            alias.content_hash = None;
+            alias.link_target_object_id = Some(target.object_id.clone());
+            for object in [&target, &alias] {
+                backend.put_object(object).expect("object");
+            }
+        }
+
+        for index_dir in ["filesystem-objects", "paths", "dentries", "hardlinks"] {
+            fs::remove_dir_all(root.join("records").join(index_dir)).ok();
+        }
+
+        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("recovered backend");
+        assert_eq!(
+            recovered
+                .objects_for_file_system(&file_system_id())
+                .expect("objects")
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/readme.alias", "docs/readme.md"]
+        );
+        assert_eq!(
+            recovered
+                .child_objects_for_directory(&file_system_id(), "/docs")
+                .expect("children")
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/readme.alias", "docs/readme.md"]
+        );
+        assert_eq!(
+            recovered
+                .hardlinks_to_object(&file_system_id(), &object_id())
+                .expect("hardlinks")
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/readme.alias"]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_lists_hardlinks_from_target_index() {
+        let root = temp_root("local_backend_lists_hardlinks_from_target_index");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let target = object(version("version_1"));
+        let mut alias_a = object(version("version_1"));
+        alias_a.object_id = DfsObjectId::from_legacy_named("obj_alias_a").expect("object");
+        alias_a.path = "/docs/readme.alias-a".to_string();
+        alias_a.kind = DfsObjectKind::Hardlink;
+        alias_a.content_hash = None;
+        alias_a.link_target_object_id = Some(target.object_id.clone());
+        let mut alias_b = alias_a.clone();
+        alias_b.object_id = DfsObjectId::from_legacy_named("obj_alias_b").expect("object");
+        alias_b.path = "/docs/readme.alias-b".to_string();
+        let mut unrelated = object(version("version_1"));
+        unrelated.object_id = DfsObjectId::from_legacy_named("obj_unrelated").expect("object");
+        unrelated.path = "/docs/unrelated".to_string();
+
+        for object in [&target, &alias_b, &unrelated, &alias_a] {
+            backend.put_object(object).expect("object");
+        }
+        let mut stale_alias = alias_b.clone();
+        stale_alias.kind = DfsObjectKind::Tombstone;
+        stale_alias.link_target_object_id = None;
+        backend
+            .put_object(&stale_alias)
+            .expect("tombstone stale alias");
+
+        let hardlinks = backend
+            .hardlinks_to_object(&file_system_id(), &target.object_id)
+            .expect("hardlinks");
+        assert_eq!(
+            hardlinks
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/readme.alias-a"]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_removes_stale_hardlink_target_index_entries() {
+        let root = temp_root("local_backend_removes_stale_hardlink_target_index_entries");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let target_a = object(version("version_1"));
+        let mut target_b = object(version("version_1"));
+        target_b.object_id = DfsObjectId::from_legacy_named("obj_target_b").expect("object");
+        target_b.path = "/docs/target-b.md".to_string();
+        let mut alias = object(version("version_1"));
+        alias.object_id = DfsObjectId::from_legacy_named("obj_alias").expect("object");
+        alias.path = "/docs/readme.alias".to_string();
+        alias.kind = DfsObjectKind::Hardlink;
+        alias.content_hash = None;
+        alias.link_target_object_id = Some(target_a.object_id.clone());
+
+        for object in [&target_a, &target_b, &alias] {
+            backend.put_object(object).expect("object");
+        }
+        let old_index_path = backend.hardlink_index_path(&target_a.object_id, &alias.object_id);
+        assert!(old_index_path.exists());
+
+        alias.link_target_object_id = Some(target_b.object_id.clone());
+        backend.put_object(&alias).expect("retarget alias");
+        assert!(
+            !old_index_path.exists(),
+            "retargeting a hardlink should remove its old target index entry"
+        );
+        assert!(
+            backend
+                .hardlink_index_path(&target_b.object_id, &alias.object_id)
+                .exists()
+        );
+
+        alias.kind = DfsObjectKind::Tombstone;
+        alias.link_target_object_id = None;
+        backend.put_object(&alias).expect("tombstone alias");
+        assert!(
+            !backend
+                .hardlink_index_path(&target_b.object_id, &alias.object_id)
+                .exists(),
+            "tombstoning a hardlink should remove its target index entry"
+        );
+        assert!(
+            backend
+                .hardlinks_to_object(&file_system_id(), &target_b.object_id)
+                .expect("hardlinks")
+                .is_empty()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_persists_intents_and_polls_subscription_batches() {
         let root = temp_root("local_backend_persists_intents_and_polls_subscription_batches");
         let mut backend =
@@ -1496,6 +2424,17 @@ mod tests {
             .expect("second batch");
         assert!(second_batch.entries.is_empty());
         assert_eq!(second_batch.next_after_sequence, 1);
+
+        fs::write(
+            root.join("journal").join("00000000000000000001.sobj"),
+            b"not json",
+        )
+        .expect("corrupt already-consumed journal entry");
+        let third_batch = backend
+            .poll_subscription(&mut subscription)
+            .expect("already-consumed corrupted journal entry is not reparsed");
+        assert!(third_batch.entries.is_empty());
+        assert_eq!(third_batch.next_after_sequence, 1);
 
         cleanup(&root);
     }
@@ -1582,6 +2521,100 @@ mod tests {
                 .expect("receipts")
                 .len(),
             1
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_normalizes_replica_locations_at_persistence_boundary() {
+        let root = temp_root("local_backend_normalizes_replica_locations");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let owner = node("node_owner");
+        let replica = node("node_replica");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let mut object = object(version("version_1"));
+        object.current_locations = vec![owner.clone(), replica.clone(), owner.clone()];
+        backend.put_object(&object).expect("object");
+        assert_eq!(
+            backend
+                .get_object(&object.object_id)
+                .expect("get object")
+                .expect("object")
+                .current_locations,
+            vec![owner.clone(), replica.clone()]
+        );
+
+        let mut version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: Some(3),
+            locations: vec![owner.clone(), replica.clone(), owner.clone()],
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        backend.put_version(&version_record).expect("version");
+        assert_eq!(
+            backend
+                .get_version(&object.object_id, &object.version)
+                .expect("get version")
+                .expect("version")
+                .locations,
+            vec![owner.clone(), replica.clone()]
+        );
+
+        let version_2 = version("version_2");
+        let mut committed = object.clone();
+        committed.version = version_2.clone();
+        committed.current_locations = vec![owner.clone(), replica.clone(), owner.clone()];
+        version_record.version = version_2;
+        version_record.locations = committed.current_locations.clone();
+        for node_id in [&owner, &replica] {
+            backend
+                .put_receipt(&DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: committed.file_system_id.clone(),
+                        object_id: committed.object_id.clone(),
+                        committed_version: committed.version.clone(),
+                        owner_node_id: owner.clone(),
+                        event_id: EventId::from_legacy_named(&format!("evt_{node_id}"))
+                            .expect("event"),
+                    },
+                    replica_node_id: node_id.clone(),
+                    content_hash: committed.content_hash.clone(),
+                    received_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .expect("receipt");
+        }
+        backend
+            .commit_visible_version(
+                &object.version,
+                &committed,
+                &version_record,
+                &[owner.clone(), replica.clone(), owner.clone()],
+            )
+            .expect("visible commit");
+        assert_eq!(
+            backend
+                .get_object(&committed.object_id)
+                .expect("get committed object")
+                .expect("committed object")
+                .current_locations,
+            vec![owner.clone(), replica.clone()]
+        );
+        assert_eq!(
+            backend
+                .get_version(&committed.object_id, &committed.version)
+                .expect("get committed version")
+                .expect("committed version")
+                .locations,
+            vec![owner, replica]
         );
 
         cleanup(&root);

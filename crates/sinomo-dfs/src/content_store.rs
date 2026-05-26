@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -21,6 +21,8 @@ pub enum ContentStoreError {
     InvalidHash(String),
     #[error("staged content not found for intent: {0}")]
     MissingStaged(String),
+    #[error("content-addressed blob hash mismatch: expected={expected}, actual={actual}")]
+    BlobHashMismatch { expected: String, actual: String },
     #[error(
         "object version manifest already exists with different content: object={object_id}, version={version}, existing={existing_hash}, new={new_hash}"
     )]
@@ -91,7 +93,9 @@ impl LocalContentStore {
 
     pub fn read_blob(&self, hash: &str) -> Result<Vec<u8>> {
         let path = self.blob_path(hash)?;
-        read_file(&path)
+        let bytes = read_file(&path)?;
+        ensure_bytes_match_hash(hash, &bytes)?;
+        Ok(bytes)
     }
 
     pub fn read_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
@@ -119,7 +123,10 @@ impl LocalContentStore {
 
     pub fn has_blob(&self, hash: &str) -> Result<bool> {
         let path = self.blob_path(hash)?;
-        Ok(path.is_file())
+        if !path.is_file() {
+            return Ok(false);
+        }
+        Ok(file_content_hash(&path).is_ok_and(|actual| actual == hash))
     }
 
     fn write_object_version(
@@ -129,11 +136,6 @@ impl LocalContentStore {
         bytes: &[u8],
     ) -> Result<ContentManifest> {
         let hash = content_hash(bytes);
-        let blob_path = self.blob_path(&hash)?;
-        if !blob_path.exists() {
-            write_file_atomic(&blob_path, bytes)?;
-        }
-
         let manifest_path = self.manifest_path(object_id, version);
         if manifest_path.is_file() {
             let existing = decode_manifest(&read_file(&manifest_path)?)?;
@@ -145,7 +147,16 @@ impl LocalContentStore {
                     new_hash: hash,
                 });
             }
+            let blob_path = self.blob_path(&hash)?;
+            if !self.has_blob(&hash)? {
+                write_file_atomic(&blob_path, bytes)?;
+            }
             return Ok(existing);
+        }
+
+        let blob_path = self.blob_path(&hash)?;
+        if !self.has_blob(&hash)? {
+            write_file_atomic(&blob_path, bytes)?;
         }
 
         let manifest = ContentManifest {
@@ -155,7 +166,23 @@ impl LocalContentStore {
             size_bytes: bytes.len() as u64,
         };
         let manifest_bytes = encode_manifest(&manifest)?;
-        write_file_atomic(&manifest_path, &manifest_bytes)?;
+        if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
+            if let ContentStoreError::Io { source, .. } = &error
+                && source.kind() == io::ErrorKind::AlreadyExists
+            {
+                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                if existing.content_hash != manifest.content_hash {
+                    return Err(ContentStoreError::VersionHashConflict {
+                        object_id: object_id.to_owned(),
+                        version: version.to_owned(),
+                        existing_hash: existing.content_hash,
+                        new_hash: manifest.content_hash,
+                    });
+                }
+                return Ok(existing);
+            }
+            return Err(error);
+        }
         Ok(manifest)
     }
 
@@ -189,6 +216,39 @@ fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
 
 fn content_hash(bytes: &[u8]) -> String {
     format!("{HASH_PREFIX}{}", blake3::hash(bytes).to_hex())
+}
+
+fn ensure_bytes_match_hash(hash: &str, bytes: &[u8]) -> Result<()> {
+    let actual = content_hash(bytes);
+    if actual == hash {
+        return Ok(());
+    }
+    Err(ContentStoreError::BlobHashMismatch {
+        expected: hash.to_owned(),
+        actual,
+    })
+}
+
+fn file_content_hash(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).map_err(|source| ContentStoreError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{HASH_PREFIX}{}", hasher.finalize().to_hex()))
 }
 
 fn hash_hex(hash: &str) -> Result<&str> {
@@ -256,6 +316,40 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(file);
     fs::rename(&tmp_path, path).map_err(|source| ContentStoreError::Io {
         path: path.to_owned(),
+        source,
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+
+    let tmp_path = temporary_path_for(path);
+    let mut file = fs::File::create(&tmp_path).map_err(|source| ContentStoreError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| ContentStoreError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+    drop(file);
+    if let Err(source) = fs::hard_link(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        });
+    }
+    fs::remove_file(&tmp_path).map_err(|source| ContentStoreError::Io {
+        path: tmp_path,
         source,
     })?;
     if let Some(parent) = path.parent() {
@@ -354,6 +448,80 @@ mod tests {
                 ..
             } if object_id == "object-a" && version == "v1"
         ));
+        let rejected_hash = content_hash(b"different bytes");
+        assert!(
+            !store.has_blob(&rejected_hash).expect("rejected blob check"),
+            "version conflicts must not leave unreferenced content-addressed blobs"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn create_new_atomic_does_not_overwrite_existing_file() {
+        let root = temp_root("create_new_atomic_does_not_overwrite_existing_file");
+        let path = root.join("published.sobj");
+        write_file_create_new_atomic(&path, b"winner").expect("publish winner");
+
+        let error = write_file_create_new_atomic(&path, b"loser")
+            .expect_err("loser must not overwrite published file");
+        assert!(matches!(
+            error,
+            ContentStoreError::Io { source, .. }
+                if source.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(read_file(&path).expect("published file"), b"winner");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn read_blob_rejects_content_address_mismatch() {
+        let root = temp_root("read_blob_rejects_content_address_mismatch");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let manifest = store
+            .put_object_version("object-a", "v1", b"correct bytes")
+            .expect("put object version");
+        let blob_path = store.blob_path(&manifest.content_hash).expect("blob path");
+        write_file_atomic(&blob_path, b"corrupt bytes").expect("corrupt blob");
+
+        let error = store
+            .read_blob(&manifest.content_hash)
+            .expect_err("corrupt blob must not be returned");
+        assert!(matches!(
+            error,
+            ContentStoreError::BlobHashMismatch { expected, .. }
+                if expected == manifest.content_hash
+        ));
+        assert!(
+            !store.has_blob(&manifest.content_hash).expect("has blob"),
+            "corrupt content-addressed blobs must not count as locally available"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_version_repairs_corrupt_content_addressed_blob() {
+        let root = temp_root("put_object_version_repairs_corrupt_blob");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let manifest = store
+            .put_object_version("object-a", "v1", b"correct bytes")
+            .expect("put object version");
+        let blob_path = store.blob_path(&manifest.content_hash).expect("blob path");
+        write_file_atomic(&blob_path, b"corrupt bytes").expect("corrupt blob");
+
+        let repaired = store
+            .put_object_version("object-a", "v1", b"correct bytes")
+            .expect("repair same version blob");
+
+        assert_eq!(repaired, manifest);
+        assert_eq!(
+            store
+                .read_blob(&manifest.content_hash)
+                .expect("read repaired"),
+            b"correct bytes"
+        );
 
         cleanup(&root);
     }

@@ -620,6 +620,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             if !matches!(current, NetworkedDfsReadOutcome::PendingReplication { .. }) {
                 return Ok(current);
             }
+            if !self.has_pending_remote_read_for_current_object(object_id)? {
+                if Instant::now() >= deadline {
+                    return Ok(current);
+                }
+                if self.request_remote_object_read(object_id)?.is_empty() {
+                    return Ok(current);
+                }
+            }
             if Instant::now() >= deadline {
                 return Ok(current);
             }
@@ -1113,18 +1121,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             format!("{}/", path.trim_end_matches('/'))
         };
         let mut descendant_paths = self
-            .objects_for_sifs()?
+            .descendant_objects_for_sifs_dir(&path)?
             .into_iter()
-            .filter_map(|object| {
-                let object_path = normalize_posix_path(&object.path).ok()?;
-                if object.kind == DfsObjectKind::Tombstone {
-                    return None;
-                }
-                if object_path == path || !object_path.starts_with(&prefix) {
-                    return None;
-                }
-                Some(object_path)
-            })
+            .filter_map(|object| normalize_posix_path(&object.path).ok())
             .collect::<Vec<_>>();
         descendant_paths.sort();
         descendant_paths.dedup();
@@ -1281,13 +1280,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 ) && self.link_count_for_object(&destination_target)? > 1
                 {
                     let alias = self
-                        .objects_for_sifs()?
+                        .hardlinks_to_object(&destination.object_id)?
                         .into_iter()
-                        .filter(|candidate| {
-                            candidate.kind == DfsObjectKind::Hardlink
-                                && candidate.link_target_object_id.as_ref()
-                                    == Some(&destination.object_id)
-                        })
                         .min_by(|left, right| left.path.cmp(&right.path))
                         .ok_or_else(|| DfsPosixError::NotFound { path: to.clone() })?;
                     let mut alias_tombstone = alias.clone();
@@ -1322,7 +1316,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
 
         if source.kind == DfsObjectKind::Directory {
-            for mut object in self.objects_for_sifs()? {
+            for mut object in self.descendant_objects_for_sifs_dir(&from)? {
                 let object_path = normalize_posix_path(&object.path)?;
                 let listed_object_id = object.object_id.clone();
                 if object.object_id == source.object_id
@@ -1456,21 +1450,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 path: path.to_string(),
             });
         }
-        let prefix = if path == "/" {
-            "/".to_string()
-        } else {
-            format!("{}/", path.trim_end_matches('/'))
-        };
         let mut entries = Vec::new();
-        for object in self.objects_for_sifs()? {
+        for object in self.child_objects_for_sifs_dir(path)? {
             let object_path = normalize_posix_path(&object.path)?;
-            if object_path == path || !object_path.starts_with(&prefix) {
-                continue;
-            }
-            let rest = object_path.trim_start_matches(&prefix);
-            if rest.is_empty() || rest.contains('/') {
-                continue;
-            }
             let listed_object_id = object.object_id.clone();
             let Some(object) = self.lookup_sifs_path(&object_path)? else {
                 continue;
@@ -1479,7 +1461,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 continue;
             }
             entries.push(DfsDirEntry {
-                name: rest.to_string(),
+                name: object_path
+                    .rsplit('/')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("/")
+                    .to_string(),
                 path: object_path,
                 kind: self.resolve_hardlink_target(&object)?.kind,
                 object_id: self.resolve_hardlink_target(&object)?.object_id,
@@ -1751,18 +1738,86 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn objects_for_sifs(&self) -> Result<Vec<DfsObjectMetadata>> {
+    fn child_objects_for_sifs_dir(&self, path: &str) -> Result<Vec<DfsObjectMetadata>> {
         let file_system_id = sifs_file_system_id();
         if let Some(backend) = self.metadata_backend.as_ref() {
-            return Ok(backend.objects_for_file_system(&file_system_id)?);
+            return Ok(backend.child_objects_for_directory(&file_system_id, path)?);
         }
+        let prefix = if path == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", path.trim_end_matches('/'))
+        };
         Ok(self
             .metadata
             .objects
             .values()
-            .filter(|object| object.file_system_id == file_system_id)
+            .filter(|object| {
+                if object.file_system_id != file_system_id
+                    || object.kind == DfsObjectKind::Tombstone
+                {
+                    return false;
+                }
+                let Ok(object_path) = normalize_posix_path(&object.path) else {
+                    return false;
+                };
+                if object_path == path || !object_path.starts_with(&prefix) {
+                    return false;
+                }
+                let rest = object_path.trim_start_matches(&prefix);
+                !rest.is_empty() && !rest.contains('/')
+            })
             .cloned()
             .collect())
+    }
+
+    fn hardlinks_to_object(
+        &self,
+        target_object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let file_system_id = sifs_file_system_id();
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            return Ok(backend.hardlinks_to_object(&file_system_id, target_object_id)?);
+        }
+        let mut hardlinks = self
+            .metadata
+            .objects
+            .values()
+            .filter(|candidate| {
+                candidate.file_system_id == file_system_id
+                    && candidate.kind == DfsObjectKind::Hardlink
+                    && candidate.link_target_object_id.as_ref() == Some(target_object_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        hardlinks.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        Ok(hardlinks)
+    }
+
+    fn descendant_objects_for_sifs_dir(&self, path: &str) -> Result<Vec<DfsObjectMetadata>> {
+        let mut descendants = Vec::new();
+        let mut pending_dirs = vec![normalize_posix_path(path)?];
+        while let Some(directory_path) = pending_dirs.pop() {
+            for object in self.child_objects_for_sifs_dir(&directory_path)? {
+                if object.kind == DfsObjectKind::Tombstone {
+                    continue;
+                }
+                if object.kind == DfsObjectKind::Directory {
+                    pending_dirs.push(normalize_posix_path(&object.path)?);
+                }
+                descendants.push(object);
+            }
+        }
+        descendants.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        Ok(descendants)
     }
 
     fn object_by_id(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
@@ -1963,36 +2018,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             return self.link_count_for_object(&target);
         }
         if object.kind != DfsObjectKind::Directory {
-            let count = self
-                .objects_for_sifs()?
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.kind == DfsObjectKind::Hardlink
-                        && candidate.link_target_object_id.as_ref() == Some(&object.object_id)
-                })
-                .count();
+            let count = self.hardlinks_to_object(&object.object_id)?.len();
             return Ok(1u64.saturating_add(count as u64));
         }
         let path = normalize_posix_path(&object.path)?;
-        let prefix = if path == "/" {
-            "/".to_string()
-        } else {
-            format!("{}/", path.trim_end_matches('/'))
-        };
-        let mut child_directory_count = 0u64;
-        for child in self.objects_for_sifs()? {
-            if child.kind != DfsObjectKind::Directory {
-                continue;
-            }
-            let child_path = normalize_posix_path(&child.path)?;
-            if child_path == path || !child_path.starts_with(&prefix) {
-                continue;
-            }
-            let rest = child_path.trim_start_matches(&prefix);
-            if !rest.is_empty() && !rest.contains('/') {
-                child_directory_count = child_directory_count.saturating_add(1);
-            }
-        }
+        let child_directory_count = self
+            .child_objects_for_sifs_dir(&path)?
+            .into_iter()
+            .filter(|child| child.kind == DfsObjectKind::Directory)
+            .count() as u64;
         Ok(2u64.saturating_add(child_directory_count))
     }
 
@@ -2002,12 +2036,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         old_path: &str,
     ) -> Result<DfsStat> {
         let alias = self
-            .objects_for_sifs()?
+            .hardlinks_to_object(&object.object_id)?
             .into_iter()
-            .filter(|candidate| {
-                candidate.kind == DfsObjectKind::Hardlink
-                    && candidate.link_target_object_id.as_ref() == Some(&object.object_id)
-            })
             .min_by(|left, right| left.path.cmp(&right.path))
             .ok_or_else(|| DfsPosixError::NotFound {
                 path: old_path.to_string(),
@@ -2055,14 +2085,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         prefix: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
         let mut aliases = self
-            .objects_for_sifs()?
+            .hardlinks_to_object(&object.object_id)?
             .into_iter()
             .filter(|candidate| {
-                candidate.kind == DfsObjectKind::Hardlink
-                    && candidate.link_target_object_id.as_ref() == Some(&object.object_id)
-                    && normalize_posix_path(&candidate.path)
-                        .map(|path| !path.starts_with(prefix))
-                        .unwrap_or(false)
+                normalize_posix_path(&candidate.path)
+                    .map(|path| !path.starts_with(prefix))
+                    .unwrap_or(false)
             })
             .collect::<Vec<_>>();
         aliases.sort_by(|left, right| left.path.cmp(&right.path));

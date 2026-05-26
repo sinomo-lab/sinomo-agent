@@ -1094,7 +1094,7 @@ pub fn handle_daemon_sandbox_http_fetch_to_file(
     let dfs = open_daemon_sandbox_dfs_service(paths)?;
     let execution_node_id = dfs.node_id().clone();
     let replica_candidates = daemon_sandbox_replica_candidates(paths, &execution_node_id);
-    let store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
+    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
         .with_replica_candidates(replica_candidates.clone());
     let manifest = store.load(&request.sandbox_id)?;
     if let Err(denial) = config
@@ -1312,7 +1312,7 @@ pub fn handle_daemon_sandbox_status(
     request: sinomo_sandbox::SandboxStatusRequest,
 ) -> Result<sinomo_sandbox::SandboxStatusResponse, DaemonError> {
     let dfs = open_daemon_sandbox_dfs_service(paths)?;
-    let store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = store.load(&request.sandbox_id)?;
     Ok(sinomo_sandbox::SandboxStatusResponse { manifest })
 }
@@ -1520,7 +1520,7 @@ pub fn handle_daemon_sandbox_list(
     request: sinomo_sandbox::SandboxListRequest,
 ) -> Result<sinomo_sandbox::SandboxListResponse, DaemonError> {
     let dfs = open_daemon_sandbox_dfs_service(paths)?;
-    let store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = store.load(&request.sandbox_id)?;
     let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     let entries = fs.list(&request.path)?;
@@ -1532,7 +1532,7 @@ pub fn handle_daemon_sandbox_read(
     request: sinomo_sandbox::SandboxReadRequest,
 ) -> Result<sinomo_sandbox::SandboxReadResponse, DaemonError> {
     let dfs = open_daemon_sandbox_dfs_service(paths)?;
-    let store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = store.load(&request.sandbox_id)?;
     let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     let bytes = fs.read(&request.path, request.range)?;
@@ -1547,7 +1547,7 @@ pub fn handle_daemon_sandbox_write(
     let dfs = open_daemon_sandbox_dfs_service(paths)?;
     let node_id = dfs.node_id().clone();
     let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
-    let store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
+    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
         .with_replica_candidates(replica_candidates.clone());
     let manifest = store.load(&request.sandbox_id)?;
     validate_daemon_sandbox_manifest_policy(
@@ -2117,7 +2117,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink(
         data_dir.join("sandbox").join("tmp").join("daemon-staging"),
     );
     let before_command_history = {
-        let store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+        let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
         let manifest = store.load(&request.sandbox_id)?;
         dfs = store.into_inner();
         manifest.command_history
@@ -2180,9 +2180,9 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink(
     };
     let dfs = outcome.dfs;
     let node_id = dfs.node_id().clone();
-    let store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = store.load(&request.sandbox_id)?;
-    let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
+    let mut fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     let mut event_store = daemon_event_store(paths)?;
     let process = match outcome.process {
         Ok(process) => process,
@@ -2191,7 +2191,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink(
                 &mut event_store,
                 node_id,
                 &manifest,
-                &fs,
+                &mut fs,
                 &before_command_history,
                 &manifest.command_history,
             )?;
@@ -2205,7 +2205,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink(
             &mut event_store,
             node_id.clone(),
             &manifest,
-            &fs,
+            &mut fs,
             step,
         )?;
     }
@@ -2216,7 +2216,7 @@ fn append_daemon_sandbox_new_command_record_events<T: sinomo_network::NetworkTra
     event_store: &mut sinomo_events::JsonlEventStore,
     node_id: sinomo_node::NodeId,
     manifest: &sinomo_sandbox::SandboxInstanceManifest,
-    fs: &sinomo_sandbox::SifsSandboxFileSystem<T>,
+    fs: &mut sinomo_sandbox::SifsSandboxFileSystem<T>,
     before_command_history: &[sinomo_sandbox::SandboxCommandId],
     after_command_history: &[sinomo_sandbox::SandboxCommandId],
 ) -> Result<(), DaemonError> {
@@ -2376,11 +2376,11 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink(
     let command = outcome.command.map_err(|source| DaemonError::Parse {
         detail: source.to_string(),
     })?;
-    let store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = store.load(&request.sandbox_id)?;
-    let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
+    let mut fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     let mut event_store = daemon_event_store(paths)?;
-    append_daemon_sandbox_command_events(&mut event_store, node_id, &manifest, &fs, &command)?;
+    append_daemon_sandbox_command_events(&mut event_store, node_id, &manifest, &mut fs, &command)?;
     Ok(command)
 }
 
@@ -2388,7 +2388,7 @@ fn append_daemon_sandbox_command_events<T: sinomo_network::NetworkTransport>(
     event_store: &mut sinomo_events::JsonlEventStore,
     node_id: sinomo_node::NodeId,
     manifest: &sinomo_sandbox::SandboxInstanceManifest,
-    fs: &sinomo_sandbox::SifsSandboxFileSystem<T>,
+    fs: &mut sinomo_sandbox::SifsSandboxFileSystem<T>,
     command: &sinomo_sandbox::SandboxLocalCommandOutcome,
 ) -> Result<(), DaemonError> {
     let record = sinomo_sandbox::load_command_record(fs, &command.response.command_id)?;
