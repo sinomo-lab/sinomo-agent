@@ -5,6 +5,7 @@ use crate::{
     verify_cluster_invite_challenge_proof,
 };
 use sinomo_core::{ClusterEndpointRecord, ClusterTransportKind};
+use sinomo_dfs::{DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse};
 use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_network::{
     ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterKvWatchEventsRequest,
@@ -105,6 +106,20 @@ pub fn fetch_daemon_status_from_endpoint(
         &(),
     )?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn send_dfs_metadata_journal_batch_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsMetadataJournalBatchCommand,
+    timeout: Duration,
+) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        sinomo_network::DFS_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 

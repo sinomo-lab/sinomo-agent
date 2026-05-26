@@ -4,7 +4,8 @@ use crate::{
 };
 use sinomo_core::DfsObjectPolicy;
 use sinomo_dfs::{
-    DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataShardAssignment,
+    DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
     LocalJsonMetadataBackend, content_service_key, distributed_sifs,
     distributed_sifs_bootstrap_objects, fallback_dfs_node_id, file_system_config_key,
@@ -41,6 +42,42 @@ pub fn handle_daemon_dfs_expose_config(paths: &DaemonPaths) -> Result<String, Da
         path: config_path.display().to_string(),
         detail: source.to_string(),
     })
+}
+
+pub fn handle_daemon_dfs_metadata_journal_batch(
+    paths: &DaemonPaths,
+    command: DfsMetadataJournalBatchCommand,
+) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    let mut backend = LocalJsonMetadataBackend::new(
+        command.batch.shard_id.clone(),
+        data_dir
+            .dfs_dir()
+            .join("metadata")
+            .join(command.batch.shard_id.0.clone()),
+    )?;
+    let shard_id = command.batch.shard_id.clone();
+    let next_after_sequence = command.batch.next_after_sequence;
+    match backend.apply_journal_batch(&command.batch) {
+        Ok(applied_entries) => Ok(DfsMetadataJournalBatchResponse {
+            request_id: command.request_id,
+            shard_id,
+            next_after_sequence,
+            applied_entries,
+            result: DfsMetadataJournalBatchResult::Applied,
+        }),
+        Err(error) => Ok(DfsMetadataJournalBatchResponse {
+            request_id: command.request_id,
+            shard_id,
+            next_after_sequence,
+            applied_entries: 0,
+            result: DfsMetadataJournalBatchResult::Rejected {
+                reason: error.to_string(),
+            },
+        }),
+    }
 }
 
 pub fn ensure_default_distributed_dfs(
@@ -134,4 +171,84 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError>
         path: paths.root.display().to_string(),
         detail: "daemon root has no data directory parent".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_dfs::DfsMetadataJournalBatchResult;
+    use sinomo_node::NodeId;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
+        let root = temp_root("daemon_dfs_metadata_journal_batch");
+        let paths = DaemonPaths::with_root(root.join("data").join("daemon"));
+        let source_root = root.join("source-meta");
+        let node_id = NodeId::from_legacy_named("node_daemon_dfs_metadata").expect("node");
+        let file_system = distributed_sifs(node_id.clone());
+        let object = distributed_sifs_bootstrap_objects(node_id)
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        let mut source =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), source_root)
+                .expect("source backend");
+        source.put_file_system(&file_system).expect("filesystem");
+        source.put_object(&object).expect("object");
+        source
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                content_hash: object.content_hash.clone(),
+                size_bytes: object.content_size_bytes,
+                locations: object.current_locations.clone(),
+                created_by_event_id: object.created_by_event_id.clone(),
+                created_at: OffsetDateTime::now_utc(),
+                visible: true,
+            })
+            .expect("version");
+        let mut subscription = source.subscribe(0);
+        let batch = source
+            .poll_subscription(&mut subscription)
+            .expect("source batch");
+
+        let response = handle_daemon_dfs_metadata_journal_batch(
+            &paths,
+            DfsMetadataJournalBatchCommand {
+                request_id: "dfs_meta_req_1".to_string(),
+                batch,
+            },
+        )
+        .expect("apply batch");
+        assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+        assert_eq!(response.applied_entries, 3);
+
+        let target = LocalJsonMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.join("data").join("dfs").join("metadata").join("root"),
+        )
+        .expect("target backend");
+        assert_eq!(
+            target.get_object(&object.object_id).expect("target object"),
+            Some(object)
+        );
+
+        cleanup(&root);
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sinomo-daemon-dfs-{name}-{nanos}"))
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = fs::remove_dir_all(path);
+    }
 }

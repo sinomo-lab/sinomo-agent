@@ -38,6 +38,7 @@ pub const CLUSTER_JOIN_CHALLENGE_ROUTE: &str = "/cluster/join/challenge";
 pub const CLUSTER_JOIN_REGISTER_ROUTE: &str = "/cluster/join/register";
 pub const DFS_RPC_CATEGORY: &str = "dfs";
 pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
+pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const SANDBOX_RPC_CATEGORY: &str = "sandbox";
 pub const SANDBOX_CREATE_ROUTE: &str = "/sandbox/create";
 pub const SANDBOX_STATUS_ROUTE: &str = "/sandbox/status";

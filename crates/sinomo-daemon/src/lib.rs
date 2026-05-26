@@ -27,6 +27,7 @@ pub use client::{
     send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_build,
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_diagnostics, send_daemon_rpc,
     send_daemon_rpc_stream, send_daemon_rpc_to_endpoint, send_daemon_shutdown_request,
+    send_dfs_metadata_journal_batch_to_endpoint,
 };
 pub use cluster::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
@@ -78,7 +79,7 @@ pub use control::{
 };
 pub use dfs::{
     ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
-    handle_daemon_dfs_expose_config,
+    handle_daemon_dfs_expose_config, handle_daemon_dfs_metadata_journal_batch,
 };
 pub use error::DaemonError;
 pub use install::{
