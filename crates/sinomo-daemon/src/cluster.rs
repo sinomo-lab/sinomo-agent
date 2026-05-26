@@ -2416,7 +2416,7 @@ pub fn commit_cluster_raft_command_with_quorum(
     let mut failures = Vec::new();
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
     let targets = cluster_raft_live_voter_targets(paths, state);
-    for (index, endpoint) in targets.iter().enumerate() {
+    for endpoint in &targets {
         if voter_acks.len() >= quorum_size {
             break;
         }
@@ -2430,14 +2430,7 @@ pub fn commit_cluster_raft_command_with_quorum(
             ));
             break;
         }
-        let attempt_timeout =
-            cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index);
-        match replicate_cluster_raft_to_endpoint_with_timeout(
-            paths,
-            state,
-            endpoint,
-            attempt_timeout,
-        ) {
+        match replicate_cluster_raft_to_endpoint_with_timeout(paths, state, endpoint, remaining) {
             Ok(response) if response.accepted => {
                 voter_acks.insert(endpoint.node_id.clone());
                 sinomo_network::merge_cluster_state_from_peer(state, response.state);
@@ -2797,7 +2790,7 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
                 paths, state, next_index,
             )?
         };
-        let attempt_timeout = cluster_endpoint_command_timeout(endpoint, remaining);
+        let attempt_timeout = cluster_raft_append_attempt_timeout(endpoint, remaining, &request);
         let response = send_cluster_raft_append(endpoint, &request, attempt_timeout)?;
         if response.accepted {
             return Ok(response);
@@ -2850,6 +2843,17 @@ fn cluster_endpoint_fair_command_timeout(
         _ => DAEMON_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
     };
     cluster_endpoint_command_timeout(endpoint, remaining.min(attempt_cap))
+}
+
+fn cluster_raft_append_attempt_timeout(
+    endpoint: &ClusterEndpointRecord,
+    remaining: Duration,
+    request: &ClusterRaftAppendRequest,
+) -> Duration {
+    if request.snapshot.is_some() || request.append.entries.len() > 64 {
+        return cluster_endpoint_command_timeout(endpoint, remaining);
+    }
+    cluster_endpoint_fair_command_timeout(endpoint, remaining, 1)
 }
 
 pub fn handle_daemon_cluster_raft_append_request(
@@ -3748,6 +3752,40 @@ mod tests {
         assert_eq!(
             cluster_endpoint_fair_command_timeout(&lan, Duration::from_millis(50), 8),
             Duration::from_millis(50)
+        );
+
+        let state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_daemon_raft_snapshot_timeout").expect("cluster"),
+            "snapshot timeout",
+            NodeId::from_legacy_named("node_daemon_raft_snapshot_timeout_local").expect("local"),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        let snapshot_request = ClusterRaftAppendRequest {
+            state,
+            snapshot: Some(sinomo_kv::RaftSnapshot {
+                last_included_index: 1,
+                last_included_term: 1,
+                kv: InProcessKvStore::new().snapshot(),
+            }),
+            append: sinomo_kv::RaftAppendEntriesRequest {
+                term: 1,
+                leader_id: NodeId::from_legacy_named("node_daemon_raft_snapshot_timeout_leader")
+                    .expect("leader"),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 1,
+            },
+        };
+        assert_eq!(
+            cluster_raft_append_attempt_timeout(
+                &public,
+                DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT,
+                &snapshot_request
+            ),
+            DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT
         );
     }
 }
