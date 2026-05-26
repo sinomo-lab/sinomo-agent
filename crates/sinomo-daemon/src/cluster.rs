@@ -2367,10 +2367,7 @@ pub fn cluster_reachable_voter_count(paths: &ClusterPaths, state: &ClusterBootst
         }
     }
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in sinomo_network::cluster_raft_command_targets(paths, state) {
-        if !sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id) {
-            continue;
-        }
+    for endpoint in cluster_raft_live_voter_targets(paths, state) {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -2412,7 +2409,7 @@ pub fn commit_cluster_raft_command_with_quorum(
     let quorum_size = sinomo_network::cluster_raft_quorum_size(state);
     let mut failures = Vec::new();
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in sinomo_network::cluster_raft_command_targets(paths, state) {
+    for endpoint in cluster_raft_live_voter_targets(paths, state) {
         if voter_acks.len() >= quorum_size {
             break;
         }
@@ -2425,9 +2422,6 @@ pub fn commit_cluster_raft_command_with_quorum(
                 DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT.as_millis()
             ));
             break;
-        }
-        if !sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id) {
-            continue;
         }
         match replicate_cluster_raft_to_endpoint_with_timeout(paths, state, &endpoint, remaining) {
             Ok(response) if response.accepted => {
@@ -2499,7 +2493,7 @@ fn fan_out_committed_cluster_raft_command_blocking(
     snapshot: &KvSnapshot,
 ) {
     let mut replicated_nodes = std::collections::BTreeSet::new();
-    for endpoint in sinomo_network::cluster_raft_command_targets(paths, state) {
+    for endpoint in cluster_raft_live_voter_targets(paths, state) {
         if replicated_nodes.contains(&endpoint.node_id) {
             continue;
         }
@@ -2708,10 +2702,7 @@ pub fn elect_cluster_raft_leader(
         granted.insert(state.local_node_id.clone());
     }
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for endpoint in sinomo_network::cluster_raft_command_targets(paths, state)
-        .into_iter()
-        .filter(|endpoint| sinomo_network::cluster_raft_node_is_voter(state, &endpoint.node_id))
-    {
+    for endpoint in cluster_raft_live_voter_targets(paths, state) {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
