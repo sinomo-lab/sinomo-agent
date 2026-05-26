@@ -78,8 +78,10 @@ pub use control::{
     run_daemon_control_loop, write_daemon_rpc_response_frame,
 };
 pub use dfs::{
+    DaemonDfsMetadataReplicationOutcome, DaemonDfsMetadataReplicationReport,
     ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     handle_daemon_dfs_expose_config, handle_daemon_dfs_metadata_journal_batch,
+    publish_default_dfs_metadata_journal,
 };
 pub use error::DaemonError;
 pub use install::{

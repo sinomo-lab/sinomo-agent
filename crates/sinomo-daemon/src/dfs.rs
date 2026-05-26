@@ -1,7 +1,8 @@
 use crate::{
     DaemonError, DaemonPaths, DaemonRunOptions, cluster_has_local_quorum,
-    put_cluster_kv_control_record,
+    put_cluster_kv_control_record, send_dfs_metadata_journal_batch_to_endpoint,
 };
+use serde::{Deserialize, Serialize};
 use sinomo_core::DfsObjectPolicy;
 use sinomo_dfs::{
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
@@ -13,7 +14,54 @@ use sinomo_dfs::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
+use std::fs;
+use std::time::Duration;
 use time::OffsetDateTime;
+
+const DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsMetadataReplicationReport {
+    pub outcomes: Vec<DaemonDfsMetadataReplicationOutcome>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DaemonDfsMetadataReplicationOutcome {
+    Applied {
+        target_node_id: sinomo_node::NodeId,
+        shard_id: DfsMetadataShardId,
+        entries: usize,
+        next_after_sequence: u64,
+    },
+    NoChanges {
+        target_node_id: sinomo_node::NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+    },
+    MissingEndpoint {
+        target_node_id: sinomo_node::NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+    },
+    Rejected {
+        target_node_id: sinomo_node::NodeId,
+        shard_id: DfsMetadataShardId,
+        reason: String,
+    },
+    Failed {
+        target_node_id: sinomo_node::NodeId,
+        shard_id: DfsMetadataShardId,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DaemonDfsMetadataReplicationCursor {
+    target_node_id: sinomo_node::NodeId,
+    shard_id: DfsMetadataShardId,
+    next_after_sequence: u64,
+}
 
 pub fn ensure_default_local_dfs_expose(paths: &DaemonPaths) -> Result<(), DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
@@ -166,11 +214,192 @@ pub fn ensure_default_distributed_dfs(
     Ok(())
 }
 
+pub fn publish_default_dfs_metadata_journal(
+    paths: &DaemonPaths,
+) -> Result<DaemonDfsMetadataReplicationReport, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(DaemonDfsMetadataReplicationReport {
+            outcomes: Vec::new(),
+        });
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let file_system = distributed_sifs(state.local_node_id.clone());
+    let store = sinomo_network::read_cluster_kv_store(&cluster_paths)?;
+    let Some(entry) = store.get(&metadata_shard_key(&file_system.file_system_id, "root")) else {
+        return Ok(DaemonDfsMetadataReplicationReport {
+            outcomes: Vec::new(),
+        });
+    };
+    let shard: DfsMetadataShardConfig = entry.decode()?;
+    if shard.primary_node_id != state.local_node_id {
+        return Ok(DaemonDfsMetadataReplicationReport {
+            outcomes: Vec::new(),
+        });
+    }
+
+    let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+    let backend = LocalJsonMetadataBackend::new(
+        shard_id.clone(),
+        data_dir.dfs_dir().join("metadata").join(&shard.shard_id),
+    )?;
+    let endpoints = sinomo_network::cluster_sync_targets_with_connectivity(&cluster_paths, &state);
+    let mut outcomes = Vec::new();
+    for target_node_id in shard
+        .replica_node_ids
+        .into_iter()
+        .filter(|target_node_id| target_node_id != &state.local_node_id)
+    {
+        let cursor_path =
+            dfs_metadata_replication_cursor_path(&data_dir, &target_node_id, &shard_id);
+        let after_sequence = read_dfs_metadata_replication_cursor(&cursor_path)?
+            .map(|cursor| cursor.next_after_sequence)
+            .unwrap_or(0);
+        let entries = backend.journal_since(after_sequence)?;
+        let Some(last_entry) = entries.last() else {
+            outcomes.push(DaemonDfsMetadataReplicationOutcome::NoChanges {
+                target_node_id,
+                shard_id: shard_id.clone(),
+                after_sequence,
+            });
+            continue;
+        };
+        let Some(endpoint) = endpoints
+            .iter()
+            .find(|endpoint| endpoint.node_id == target_node_id)
+        else {
+            outcomes.push(DaemonDfsMetadataReplicationOutcome::MissingEndpoint {
+                target_node_id,
+                shard_id: shard_id.clone(),
+                after_sequence,
+            });
+            continue;
+        };
+        let next_after_sequence = last_entry.sequence;
+        let entry_count = entries.len();
+        let command = DfsMetadataJournalBatchCommand {
+            request_id: format!(
+                "dfs_meta_{}_{}_{}",
+                state.local_node_id, target_node_id, next_after_sequence
+            ),
+            batch: sinomo_dfs::DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                entries,
+                next_after_sequence,
+            },
+        };
+        match send_dfs_metadata_journal_batch_to_endpoint(
+            endpoint,
+            &command,
+            DFS_METADATA_REPLICATION_TIMEOUT,
+        ) {
+            Ok(response) => match response.result {
+                DfsMetadataJournalBatchResult::Applied => {
+                    write_dfs_metadata_replication_cursor(
+                        &cursor_path,
+                        &DaemonDfsMetadataReplicationCursor {
+                            target_node_id: target_node_id.clone(),
+                            shard_id: shard_id.clone(),
+                            next_after_sequence,
+                        },
+                    )?;
+                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Applied {
+                        target_node_id,
+                        shard_id: shard_id.clone(),
+                        entries: entry_count,
+                        next_after_sequence,
+                    });
+                }
+                DfsMetadataJournalBatchResult::Rejected { reason } => {
+                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Rejected {
+                        target_node_id,
+                        shard_id: shard_id.clone(),
+                        reason,
+                    });
+                }
+            },
+            Err(error) => {
+                outcomes.push(DaemonDfsMetadataReplicationOutcome::Failed {
+                    target_node_id,
+                    shard_id: shard_id.clone(),
+                    reason: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(DaemonDfsMetadataReplicationReport { outcomes })
+}
+
 fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError> {
     paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon root has no data directory parent".to_string(),
     })
+}
+
+fn dfs_metadata_replication_cursor_path(
+    data_dir: &SinomoDataDir,
+    target_node_id: &sinomo_node::NodeId,
+    shard_id: &DfsMetadataShardId,
+) -> std::path::PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("metadata-replication-cursors")
+        .join(path_safe_segment(&target_node_id.to_string()))
+        .join(format!("{}.json", path_safe_segment(&shard_id.0)))
+}
+
+fn read_dfs_metadata_replication_cursor(
+    path: &std::path::Path,
+) -> Result<Option<DaemonDfsMetadataReplicationCursor>, DaemonError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| DaemonError::Json {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+fn write_dfs_metadata_replication_cursor(
+    path: &std::path::Path,
+    cursor: &DaemonDfsMetadataReplicationCursor,
+) -> Result<(), DaemonError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(cursor).map_err(|source| DaemonError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    fs::write(path, bytes).map_err(|source| DaemonError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn path_safe_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
