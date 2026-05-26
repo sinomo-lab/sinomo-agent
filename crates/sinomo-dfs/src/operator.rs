@@ -132,7 +132,8 @@ impl<'a> DfsOperatorInspector<'a> {
                     .filter(|conflict| conflict.status == DfsConflictStatus::Open)
                     .count();
                 pending_repair_count +=
-                    repairs_from_intents_and_receipts(&intents, &receipts_by_version).len();
+                    repairs_from_intents_and_receipts(&object, &intents, &receipts_by_version)
+                        .len();
             }
         }
 
@@ -166,7 +167,7 @@ impl<'a> DfsOperatorInspector<'a> {
                 .into_iter()
                 .filter(|conflict| conflict.status == DfsConflictStatus::Open)
                 .count();
-            pending_repair_count += self.repairs_for_intents(&intents)?.len();
+            pending_repair_count += self.repairs_for_object(&object, &intents)?.len();
         }
         Ok(Some(DfsOperatorFileSystemView {
             file_system,
@@ -195,7 +196,7 @@ impl<'a> DfsOperatorInspector<'a> {
         }
         let intents = self.backend.intents_for_object(object_id)?;
         let conflicts = self.backend.conflicts_for_object(object_id)?;
-        let repairs = repairs_from_intents_and_receipts(&intents, &receipts_by_version);
+        let repairs = repairs_from_intents_and_receipts(&object, &intents, &receipts_by_version);
         let agent_state = agent_state_for(&object, &intents, &conflicts, &repairs);
         Ok(Some(DfsOperatorObjectView {
             object,
@@ -246,7 +247,7 @@ impl<'a> DfsOperatorInspector<'a> {
         let mut repairs = Vec::new();
         for object in objects {
             let intents = self.backend.intents_for_object(&object.object_id)?;
-            repairs.extend(self.repairs_for_intents(&intents)?);
+            repairs.extend(self.repairs_for_object(&object, &intents)?);
         }
         repairs.sort_by(|left, right| {
             left.object_id
@@ -271,7 +272,7 @@ impl<'a> DfsOperatorInspector<'a> {
         for object in self.backend.objects_for_file_system(file_system_id)? {
             let intents = self.backend.intents_for_object(&object.object_id)?;
             let conflicts = self.backend.conflicts_for_object(&object.object_id)?;
-            let repairs = self.repairs_for_intents(&intents)?;
+            let repairs = self.repairs_for_object(&object, &intents)?;
             objects.push(DfsAgentObjectSummary {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
@@ -314,8 +315,9 @@ impl<'a> DfsOperatorInspector<'a> {
         Ok(objects)
     }
 
-    fn repairs_for_intents(
+    fn repairs_for_object(
         &self,
+        object: &DfsObjectMetadata,
         intents: &[DfsWriteIntentRecord],
     ) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
         let mut receipts_by_version = BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
@@ -332,6 +334,7 @@ impl<'a> DfsOperatorInspector<'a> {
             }
         }
         Ok(repairs_from_intents_and_receipts(
+            object,
             intents,
             &receipts_by_version,
         ))
@@ -339,12 +342,15 @@ impl<'a> DfsOperatorInspector<'a> {
 }
 
 fn repairs_from_intents_and_receipts(
+    object: &DfsObjectMetadata,
     intents: &[DfsWriteIntentRecord],
     receipts_by_version: &BTreeMap<DfsVersion, Vec<DfsReplicaReceiptRecord>>,
 ) -> Vec<DfsOperatorRepairView> {
     let mut repairs = Vec::new();
     for intent in intents {
-        if intent.status != DfsWriteIntentStatus::Committed {
+        if intent.status != DfsWriteIntentStatus::Committed
+            || intent.target_version != object.version
+        {
             continue;
         }
         let receipt_nodes: BTreeSet<NodeId> = receipts_by_version
@@ -801,6 +807,129 @@ mod tests {
                 .expect("object")
                 .agent_state,
             DfsAgentObjectState::PendingWrite
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn operator_inspector_ignores_superseded_version_repairs() {
+        let root = temp_root("operator_inspector_ignores_superseded_version_repairs");
+        let mut backend =
+            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = DfsFileSystem {
+            file_system_id: file_system_id(),
+            display_name: "repo".to_string(),
+            owner_node_id: node("node_owner"),
+            subtree_policies: Vec::new(),
+        };
+        let object = DfsObjectMetadata {
+            object_id: object_id(),
+            file_system_id: file_system_id(),
+            path: "artifact.bin".to_string(),
+            kind: DfsObjectKind::Artifact,
+            owner_node_id: node("node_owner"),
+            current_locations: vec![node("node_owner"), node("node_replica")],
+            content_hash: Some("blake3:new".to_string()),
+            content_size_bytes: Some(1024),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version("version_2"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        for (version_id, hash) in [
+            (version("version_1"), "blake3:old"),
+            (version("version_2"), "blake3:new"),
+        ] {
+            backend
+                .put_version(&DfsObjectVersionRecord {
+                    file_system_id: file_system_id(),
+                    object_id: object_id(),
+                    version: version_id.clone(),
+                    content_hash: Some(hash.to_string()),
+                    size_bytes: Some(3),
+                    locations: vec![node("node_owner"), node("node_replica")],
+                    created_by_event_id: None,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    visible: true,
+                })
+                .expect("version");
+            backend
+                .put_receipt(&DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: file_system_id(),
+                        object_id: object_id(),
+                        committed_version: version_id,
+                        owner_node_id: node("node_owner"),
+                        event_id: EventId::from_legacy_named(format!("evt_{hash}")).expect("event"),
+                    },
+                    replica_node_id: node("node_owner"),
+                    content_hash: Some(hash.to_string()),
+                    received_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .expect("owner receipt");
+        }
+        backend
+            .put_receipt(&DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: file_system_id(),
+                    object_id: object_id(),
+                    committed_version: version("version_2"),
+                    owner_node_id: node("node_owner"),
+                    event_id: EventId::from_legacy_named("evt_current_replica").expect("event"),
+                },
+                replica_node_id: node("node_replica"),
+                content_hash: Some("blake3:new".to_string()),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("replica receipt");
+        for (intent_id, target_version, hash) in [
+            ("dfs_intent_old", version("version_1"), "blake3:old"),
+            ("dfs_intent_current", version("version_2"), "blake3:new"),
+        ] {
+            backend
+                .put_intent(&DfsWriteIntentRecord {
+                    intent_id: intent_id.to_string(),
+                    file_system_id: file_system_id(),
+                    object_id: object_id(),
+                    base_version: None,
+                    target_version,
+                    coordinator_node_id: node("node_owner"),
+                    owner_epoch: 1,
+                    desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
+                    policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                    status: DfsWriteIntentStatus::Committed,
+                    content_hash: Some(hash.to_string()),
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+                })
+                .expect("intent");
+        }
+
+        let inspector = DfsOperatorInspector::new(&backend);
+        assert_eq!(
+            inspector.status().expect("status").pending_repair_count,
+            0,
+            "a superseded version missing an old receipt must not keep the current object pending repair"
+        );
+        assert_eq!(
+            inspector
+                .object(&object_id())
+                .expect("object")
+                .expect("object")
+                .agent_state,
+            DfsAgentObjectState::Current
         );
 
         fs::remove_dir_all(&root).expect("cleanup");
