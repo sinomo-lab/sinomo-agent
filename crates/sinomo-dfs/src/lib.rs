@@ -1169,6 +1169,13 @@ pub enum DfsMetadataReplicationOutcome {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingMetadataReplication {
+    target_node_id: NodeId,
+    shard_id: DfsMetadataShardId,
+    next_after_sequence: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum NetworkedDfsServiceEvent {
     BlobStaged {
@@ -1269,6 +1276,7 @@ pub struct NetworkedDfsService<T> {
     incoming_fetch_transfers: BTreeMap<String, InProgressFetchBlobTransfer>,
     incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
     metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
+    pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
     transport: T,
     repair_retry_tick: u64,
     next_frame_id: u64,
@@ -1295,6 +1303,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             incoming_fetch_transfers: BTreeMap::new(),
             incoming_blob_transfers: BTreeMap::new(),
             metadata_replication_cursors: BTreeMap::new(),
+            pending_metadata_replications: BTreeMap::new(),
             transport,
             repair_retry_tick: 0,
             next_frame_id: 1,
@@ -1407,16 +1416,22 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             let entries = batch.entries.len();
             let next_after_sequence = batch.next_after_sequence;
             let request_id = self.next_request_id();
+            self.pending_metadata_replications.insert(
+                request_id.clone(),
+                PendingMetadataReplication {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    next_after_sequence,
+                },
+            );
             let sent = self.send_dfs_message_if_routable(
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
-                    request_id,
+                    request_id: request_id.clone(),
                     batch,
                 }),
             )?;
             if sent {
-                self.metadata_replication_cursors
-                    .insert(cursor_key, next_after_sequence);
                 outcomes.push(DfsMetadataReplicationOutcome::Sent {
                     target_node_id,
                     shard_id: shard_id.clone(),
@@ -1424,6 +1439,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     next_after_sequence,
                 });
             } else {
+                self.pending_metadata_replications.remove(&request_id);
                 outcomes.push(DfsMetadataReplicationOutcome::Unroutable {
                     target_node_id,
                     shard_id: shard_id.clone(),
@@ -2480,8 +2496,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 DfsNetworkMessage::MetadataJournalBatch(command) => {
                     events.push(self.handle_metadata_journal_batch(source_node_id, command)?);
                 }
+                DfsNetworkMessage::MetadataJournalBatchResponse(response) => {
+                    if let Some(event) =
+                        self.handle_metadata_journal_batch_response(source_node_id, response)
+                    {
+                        events.push(event);
+                    }
+                }
                 DfsNetworkMessage::CommitVersionResponse(_)
-                | DfsNetworkMessage::MetadataJournalBatchResponse(_)
                 | DfsNetworkMessage::WriteRequest(_)
                 | DfsNetworkMessage::WriteResponse(_) => {}
             }
@@ -2510,6 +2532,53 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         for request_id in expired_request_ids {
             self.pending_reads.remove(&request_id);
             self.incoming_read_transfers.remove(&request_id);
+        }
+    }
+
+    fn handle_metadata_journal_batch_response(
+        &mut self,
+        source_node_id: NodeId,
+        response: DfsMetadataJournalBatchResponse,
+    ) -> Option<NetworkedDfsServiceEvent> {
+        let pending = self
+            .pending_metadata_replications
+            .remove(&response.request_id)?;
+        if pending.target_node_id != source_node_id || pending.shard_id != response.shard_id {
+            return Some(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                request_id: response.request_id,
+                source_node_id,
+                shard_id: response.shard_id,
+                reason: "metadata journal batch response does not match pending replication"
+                    .to_string(),
+            });
+        }
+
+        match response.result {
+            DfsMetadataJournalBatchResult::Applied => {
+                let cursor_key = (source_node_id.clone(), response.shard_id.clone());
+                let cursor = self
+                    .metadata_replication_cursors
+                    .entry(cursor_key)
+                    .or_insert(0);
+                *cursor = (*cursor)
+                    .max(response.next_after_sequence)
+                    .max(pending.next_after_sequence);
+                Some(NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                    request_id: response.request_id,
+                    source_node_id,
+                    shard_id: response.shard_id,
+                    applied_entries: response.applied_entries,
+                    next_after_sequence: *cursor,
+                })
+            }
+            DfsMetadataJournalBatchResult::Rejected { reason } => {
+                Some(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                    request_id: response.request_id,
+                    source_node_id,
+                    shard_id: response.shard_id,
+                    reason,
+                })
+            }
         }
     }
 
@@ -7191,6 +7260,7 @@ impl From<KvError> for DfsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_kv::InProcessRaftKvCluster;
     use sinomo_network::InProcessNetwork;
     use std::collections::VecDeque;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7335,6 +7405,151 @@ mod tests {
             .expect("metadata backend");
         dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
         dfs
+    }
+
+    #[test]
+    fn metadata_replication_cursor_advances_only_after_replica_ack() {
+        let root = temp_root("metadata-replication-cursor-after-ack");
+        let primary = NodeId::from_legacy_named("node_meta_primary").expect("primary");
+        let replica = NodeId::from_legacy_named("node_meta_replica").expect("replica");
+        let file_system = file_system(primary.clone());
+        let shared_kv = SharedDfsControlPlaneKvClient::new(
+            InProcessRaftKvCluster::new(vec![primary.clone()]).expect("kv"),
+        );
+        shared_kv.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+                .expect("filesystem config");
+            control
+                .put_metadata_shard(&DfsMetadataShardConfig {
+                    file_system_id: file_system.file_system_id.clone(),
+                    shard_id: "root".to_string(),
+                    primary_node_id: primary.clone(),
+                    replica_node_ids: vec![primary.clone(), replica.clone()],
+                    epoch: 1,
+                    assignment: DfsMetadataShardAssignment::Root,
+                    default_policy: DfsObjectPolicy::ReplicatedEventual,
+                })
+                .expect("metadata shard");
+        });
+
+        let network = InProcessNetwork::new();
+        let mut drop_replica_mailbox = network.add_node(replica.clone());
+        let primary_content =
+            LocalContentStore::new(root.join("primary-content")).expect("content");
+        let mut primary_backend = LocalJsonMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.join("primary-meta"),
+        )
+        .expect("primary backend");
+        primary_backend
+            .put_file_system(&file_system)
+            .expect("primary filesystem");
+        let mut first = file_metadata(primary.clone());
+        first.object_id = DfsObjectId::from_legacy_named("obj_meta_first").expect("object");
+        first.path = "/services/metadata/first.txt".to_string();
+        first.file_system_id = file_system.file_system_id.clone();
+        first.policy = DfsObjectPolicy::ReplicatedEventual;
+        primary_backend.put_object(&first).expect("first object");
+        let mut primary_dfs =
+            NetworkedDfsService::new(network.add_node(primary.clone()), primary_content)
+                .with_control_plane(shared_kv.clone())
+                .with_metadata_backend(primary_backend)
+                .expect("primary dfs");
+
+        let outcomes = primary_dfs
+            .replicate_metadata_shard_to_configured_replicas(&file_system.file_system_id, "root")
+            .expect("first replication send");
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [DfsMetadataReplicationOutcome::Sent { .. }]
+            ),
+            "unexpected first replication outcomes: {outcomes:?}"
+        );
+
+        assert_eq!(
+            NetworkTransport::drain_incoming(&mut drop_replica_mailbox)
+                .expect("drop first batch")
+                .len(),
+            1,
+            "the first metadata batch is intentionally lost before the replica applies it"
+        );
+
+        let mut second = file_metadata(primary.clone());
+        second.object_id = DfsObjectId::from_legacy_named("obj_meta_second").expect("object");
+        second.path = "/services/metadata/second.txt".to_string();
+        second.file_system_id = file_system.file_system_id.clone();
+        second.policy = DfsObjectPolicy::ReplicatedEventual;
+        primary_dfs
+            .add_object_metadata(second.clone())
+            .expect("second object");
+
+        let outcomes = primary_dfs
+            .replicate_metadata_shard_to_configured_replicas(&file_system.file_system_id, "root")
+            .expect("retry replication before ack");
+        assert!(matches!(
+            outcomes.as_slice(),
+            [DfsMetadataReplicationOutcome::Sent { entries, .. }] if *entries >= 3
+        ));
+
+        let replica_content =
+            LocalContentStore::new(root.join("replica-content")).expect("content");
+        let replica_backend = LocalJsonMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.join("replica-meta"),
+        )
+        .expect("replica backend");
+        let mut replica_dfs =
+            NetworkedDfsService::new(network.add_node(replica.clone()), replica_content)
+                .with_metadata_backend(replica_backend)
+                .expect("replica dfs");
+        let events = replica_dfs
+            .process_incoming()
+            .expect("replica applies retry");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                    applied_entries,
+                    ..
+                }] if *applied_entries >= 3
+            ),
+            "unexpected replica events: {events:?}"
+        );
+
+        let replica_backend = replica_dfs
+            .metadata_backend()
+            .expect("replica metadata backend");
+        assert_eq!(
+            replica_backend
+                .get_object(&first.object_id)
+                .expect("first replicated")
+                .as_ref()
+                .map(|object| object.path.as_str()),
+            Some(first.path.as_str())
+        );
+        assert_eq!(
+            replica_backend
+                .get_object(&second.object_id)
+                .expect("second replicated")
+                .as_ref()
+                .map(|object| object.path.as_str()),
+            Some(second.path.as_str())
+        );
+
+        let owner_events = primary_dfs.process_incoming().expect("owner handles ack");
+        assert!(matches!(
+            owner_events.as_slice(),
+            [NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                source_node_id,
+                next_after_sequence,
+                ..
+            }] if source_node_id == &replica && *next_after_sequence >= 3
+        ));
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
