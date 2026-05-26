@@ -1,5 +1,5 @@
 use crate::{
-    DFS_BLOB_CHUNK_BYTES, DfsError, DfsFileSystemId, DfsObjectId, DfsObjectMetadata, DfsVersion,
+    ChunkedBlobAssembler, DFS_BLOB_CHUNK_BYTES, DfsError, DfsFileSystemId, DfsObjectId, DfsVersion,
 };
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -92,14 +92,14 @@ impl InProgressReadTransfer {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct InProgressFetchBlobTransfer {
     pub(crate) object_id: DfsObjectId,
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
     pub(crate) total_size_bytes: u64,
     pub(crate) last_updated_at: Instant,
-    pub(crate) chunks: Vec<Option<Vec<u8>>>,
+    pub(crate) assembler: ChunkedBlobAssembler,
 }
 
 impl InProgressFetchBlobTransfer {
@@ -109,22 +109,20 @@ impl InProgressFetchBlobTransfer {
         content_hash: String,
         total_size_bytes: u64,
         total_chunks: u32,
+        assembler: ChunkedBlobAssembler,
     ) -> Result<Self, DfsError> {
-        let total_chunks_len = validate_chunked_transfer_shape(
+        validate_chunked_transfer_shape(
             "chunked DFS fetch response",
             total_size_bytes,
             total_chunks,
         )?;
-        usize::try_from(total_size_bytes).map_err(|_| DfsError::Distributed {
-            message: format!("chunked DFS fetch response is too large: {total_size_bytes} bytes"),
-        })?;
         Ok(Self {
             object_id,
             version,
             content_hash,
             total_size_bytes,
             last_updated_at: Instant::now(),
-            chunks: vec![None; total_chunks_len],
+            assembler,
         })
     }
 
@@ -133,20 +131,22 @@ impl InProgressFetchBlobTransfer {
         chunk_index: u32,
         total_chunks: u32,
         bytes: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>, DfsError> {
-        insert_chunk_into(
+    ) -> Result<bool, DfsError> {
+        validate_chunk_bytes(
             "chunked DFS fetch response",
             self.total_size_bytes,
-            &mut self.last_updated_at,
-            &mut self.chunks,
             chunk_index,
             total_chunks,
-            bytes,
-        )
+            &bytes,
+        )?;
+        self.last_updated_at = Instant::now();
+        self.assembler
+            .insert_chunk(chunk_index, &bytes)
+            .map_err(DfsError::from)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct InProgressBlobTransfer {
     pub(crate) request_id: String,
     pub(crate) intent_id: String,
@@ -156,9 +156,8 @@ pub(crate) struct InProgressBlobTransfer {
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
     pub(crate) total_size_bytes: u64,
-    pub(crate) object_metadata: Option<DfsObjectMetadata>,
     pub(crate) last_updated_at: Instant,
-    pub(crate) chunks: Vec<Option<Vec<u8>>>,
+    pub(crate) assembler: ChunkedBlobAssembler,
 }
 
 impl InProgressBlobTransfer {
@@ -173,9 +172,9 @@ impl InProgressBlobTransfer {
         content_hash: String,
         total_size_bytes: u64,
         total_chunks: u32,
-        object_metadata: Option<DfsObjectMetadata>,
+        assembler: ChunkedBlobAssembler,
     ) -> Result<Self, DfsError> {
-        let total_chunks_len = validate_chunked_transfer_shape(
+        validate_chunked_transfer_shape(
             "chunked DFS blob transfer",
             total_size_bytes,
             total_chunks,
@@ -189,9 +188,8 @@ impl InProgressBlobTransfer {
             version,
             content_hash,
             total_size_bytes,
-            object_metadata,
             last_updated_at: Instant::now(),
-            chunks: vec![None; total_chunks_len],
+            assembler,
         })
     }
 
@@ -200,16 +198,18 @@ impl InProgressBlobTransfer {
         chunk_index: u32,
         total_chunks: u32,
         bytes: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>, DfsError> {
-        insert_chunk_into(
+    ) -> Result<bool, DfsError> {
+        validate_chunk_bytes(
             "chunked DFS blob transfer",
             self.total_size_bytes,
-            &mut self.last_updated_at,
-            &mut self.chunks,
             chunk_index,
             total_chunks,
-            bytes,
-        )
+            &bytes,
+        )?;
+        self.last_updated_at = Instant::now();
+        self.assembler
+            .insert_chunk(chunk_index, &bytes)
+            .map_err(DfsError::from)
     }
 }
 

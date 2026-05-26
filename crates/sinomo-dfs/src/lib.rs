@@ -12,7 +12,9 @@ pub mod posix;
 pub mod protocol;
 mod transfer;
 
-pub use content_store::{BlobReader, ContentManifest, ContentStoreError, LocalContentStore};
+pub use content_store::{
+    BlobReader, ChunkedBlobAssembler, ContentManifest, ContentStoreError, LocalContentStore,
+};
 pub use control_plane::{
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, SharedDfsControlPlaneKvClient, file_system_config_key,
@@ -3522,6 +3524,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             ) {
                 return self.reject_stage_blob_chunk(requester_node_id, command, error.to_string());
             }
+            let local_node_id = self.node_id.clone();
+            if let Err(error) = self.ensure_metadata_receipt_accepts(
+                &command.object_id,
+                &command.version,
+                &local_node_id,
+                &command.content_hash,
+            ) {
+                return self.reject_stage_blob_chunk(requester_node_id, command, error.to_string());
+            }
             if self.local_object_version_manifest_matches(
                 &command.object_id,
                 &command.version,
@@ -3570,6 +3581,23 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     content_hash: command.content_hash,
                 }));
             }
+            let assembler = match self.content.begin_chunked_object_version(
+                command.object_id.as_str(),
+                command.version.as_str(),
+                &command.content_hash,
+                command.total_size_bytes,
+                command.total_chunks,
+                DFS_BLOB_CHUNK_BYTES,
+            ) {
+                Ok(assembler) => assembler,
+                Err(error) => {
+                    return self.reject_stage_blob_chunk(
+                        requester_node_id,
+                        command,
+                        error.to_string(),
+                    );
+                }
+            };
             let transfer = InProgressBlobTransfer::new(
                 command.request_id.clone(),
                 command.intent_id.clone(),
@@ -3580,7 +3608,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 command.content_hash.clone(),
                 command.total_size_bytes,
                 command.total_chunks,
-                command.object_metadata.clone(),
+                assembler,
             )?;
             self.incoming_blob_transfers
                 .insert(transfer_key.clone(), transfer);
@@ -3602,36 +3630,63 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             );
             return self.reject_stage_blob_chunk(requester_node_id, command, reason);
         }
-        let bytes = match transfer.insert_chunk(
+        let transfer_complete = match transfer.insert_chunk(
             command.chunk_index,
             command.total_chunks,
             command.bytes.clone(),
         ) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
+            Ok(true) => true,
+            Ok(false) => return Ok(None),
             Err(error) => {
                 self.incoming_blob_transfers.remove(&transfer_key);
                 return self.reject_stage_blob_chunk(requester_node_id, command, error.to_string());
             }
         };
+        if !transfer_complete {
+            return Ok(None);
+        }
         let transfer = self
             .incoming_blob_transfers
             .remove(&transfer_key)
             .expect("completed transfer");
-        Ok(Some(self.handle_stage_blob(
-            requester_node_id,
-            DfsStageBlobCommand {
+        let manifest = match self
+            .content
+            .commit_chunked_object_version(transfer.assembler)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return self.reject_stage_blob_chunk(requester_node_id, command, error.to_string());
+            }
+        };
+        let local_node_id = self.node_id.clone();
+        self.put_metadata_receipt(
+            &transfer.file_system_id,
+            &transfer.object_id,
+            &transfer.version,
+            &local_node_id,
+            &manifest.content_hash,
+        )?;
+        self.send_dfs_message_if_routable(
+            &requester_node_id,
+            DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
                 request_id: transfer.request_id,
-                intent_id: command.intent_id,
+                intent_id: transfer.intent_id.clone(),
                 file_system_id: transfer.file_system_id,
-                object_id: transfer.object_id,
-                expected_base_version: transfer.expected_base_version,
-                version: transfer.version,
-                content_hash: transfer.content_hash,
-                bytes,
-                object_metadata: transfer.object_metadata,
-            },
-        )?))
+                object_id: transfer.object_id.clone(),
+                version: transfer.version.clone(),
+                replica_node_id: self.node_id.clone(),
+                result: DfsBlobTransferResult::Durable {
+                    content_hash: manifest.content_hash.clone(),
+                },
+            }),
+        )?;
+        Ok(Some(NetworkedDfsServiceEvent::BlobStaged {
+            intent_id: transfer.intent_id,
+            object_id: transfer.object_id,
+            version: transfer.version,
+            replica_node_id: self.node_id.clone(),
+            content_hash: manifest.content_hash,
+        }))
     }
 
     fn reject_stage_blob_chunk(
@@ -4369,6 +4424,23 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     content_hash: command.content_hash,
                 }));
             }
+            let assembler = match self.content.begin_chunked_object_version(
+                command.object_id.as_str(),
+                command.version.as_str(),
+                &command.content_hash,
+                command.total_size_bytes,
+                command.total_chunks,
+                DFS_BLOB_CHUNK_BYTES,
+            ) {
+                Ok(assembler) => assembler,
+                Err(error) => {
+                    return self.reject_repair_replica_chunk(
+                        requester_node_id,
+                        command,
+                        error.to_string(),
+                    );
+                }
+            };
             let transfer = InProgressBlobTransfer::new(
                 command.request_id.clone(),
                 command.intent_id.clone(),
@@ -4379,7 +4451,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 command.content_hash.clone(),
                 command.total_size_bytes,
                 command.total_chunks,
-                command.object_metadata.clone(),
+                assembler,
             )?;
             self.incoming_blob_transfers
                 .insert(transfer_key.clone(), transfer);
@@ -4401,13 +4473,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             );
             return self.reject_repair_replica_chunk(requester_node_id, command, reason);
         }
-        let bytes = match transfer.insert_chunk(
+        let transfer_complete = match transfer.insert_chunk(
             command.chunk_index,
             command.total_chunks,
             command.bytes.clone(),
         ) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
+            Ok(true) => true,
+            Ok(false) => return Ok(None),
             Err(error) => {
                 self.incoming_blob_transfers.remove(&transfer_key);
                 return self.reject_repair_replica_chunk(
@@ -4417,24 +4489,62 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 );
             }
         };
+        if !transfer_complete {
+            return Ok(None);
+        }
         let transfer = self
             .incoming_blob_transfers
             .remove(&transfer_key)
             .expect("completed transfer");
-        Ok(Some(self.handle_repair_replica(
-            requester_node_id,
-            DfsRepairReplicaCommand {
+        let manifest = match self
+            .content
+            .commit_chunked_object_version(transfer.assembler)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return self.reject_repair_replica_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+        };
+        let object = self.commit_local_metadata(
+            &transfer.object_id,
+            &transfer.version,
+            &manifest.content_hash,
+            dfs_now_unix_nanos(),
+        )?;
+        self.put_visible_object_in_metadata_backend(&object)?;
+        let local_node_id = self.node_id.clone();
+        self.put_metadata_receipt(
+            &transfer.file_system_id,
+            &transfer.object_id,
+            &transfer.version,
+            &local_node_id,
+            &manifest.content_hash,
+        )?;
+        self.send_dfs_message_if_routable(
+            &requester_node_id,
+            DfsNetworkMessage::RepairReplicaResponse(DfsRepairReplicaResponse {
                 request_id: transfer.request_id,
-                intent_id: command.intent_id,
+                intent_id: transfer.intent_id.clone(),
                 file_system_id: transfer.file_system_id,
-                object_id: transfer.object_id,
-                expected_base_version: transfer.expected_base_version,
-                version: transfer.version,
-                content_hash: transfer.content_hash,
-                bytes,
-                object_metadata: transfer.object_metadata,
-            },
-        )?))
+                object_id: transfer.object_id.clone(),
+                version: transfer.version.clone(),
+                replica_node_id: self.node_id.clone(),
+                result: DfsBlobTransferResult::Committed {
+                    content_hash: manifest.content_hash.clone(),
+                },
+            }),
+        )?;
+        Ok(Some(NetworkedDfsServiceEvent::ReplicaRepaired {
+            intent_id: transfer.intent_id,
+            object_id: transfer.object_id,
+            version: transfer.version,
+            replica_node_id: self.node_id.clone(),
+            content_hash: manifest.content_hash,
+        }))
     }
 
     fn reject_repair_replica_chunk(
@@ -5006,12 +5116,27 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .incoming_fetch_transfers
             .contains_key(&chunk.request_id)
         {
+            let assembler = match self.content.begin_chunked_object_version(
+                chunk.object_id.as_str(),
+                chunk.version.as_str(),
+                &chunk.content_hash,
+                chunk.total_size_bytes,
+                chunk.total_chunks,
+                DFS_BLOB_CHUNK_BYTES,
+            ) {
+                Ok(assembler) => assembler,
+                Err(error) => {
+                    return self
+                        .reject_fetch_response_chunk_and_fail_source(chunk, error.to_string());
+                }
+            };
             let transfer = match InProgressFetchBlobTransfer::new(
                 chunk.object_id.clone(),
                 chunk.version.clone(),
                 chunk.content_hash.clone(),
                 chunk.total_size_bytes,
                 chunk.total_chunks,
+                assembler,
             ) {
                 Ok(transfer) => transfer,
                 Err(error) => {
@@ -5043,17 +5168,23 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let version = chunk.version.clone();
         let source_node_id = chunk.source_node_id.clone();
         let content_hash = chunk.content_hash.clone();
-        let bytes =
+        let transfer_complete =
             match transfer.insert_chunk(chunk.chunk_index, chunk.total_chunks, chunk.bytes.clone())
             {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => return Ok(None),
+                Ok(true) => true,
+                Ok(false) => return Ok(None),
                 Err(error) => {
                     return self
                         .reject_fetch_response_chunk_and_fail_source(chunk, error.to_string());
                 }
             };
-        self.incoming_fetch_transfers.remove(&request_id);
+        if !transfer_complete {
+            return Ok(None);
+        }
+        let transfer = self
+            .incoming_fetch_transfers
+            .remove(&request_id)
+            .expect("completed fetch transfer");
         if let Some(pending) = self.pending_writes.get_mut(&intent_id) {
             pending.fetch_inflight_from.remove(&source_node_id);
             pending.fetch_inflight_request_ids.remove(&source_node_id);
@@ -5078,21 +5209,40 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 content_hash,
             }));
         }
-        if let Err(error) = self.store_command_bytes(&object_id, &version, &content_hash, &bytes) {
+        let manifest = match self
+            .content
+            .commit_chunked_object_version(transfer.assembler)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.record_fetch_failed_source_and_wake_retries(&intent_id, &source_node_id);
+                return Ok(Some(NetworkedDfsServiceEvent::BlobFetchRejected {
+                    intent_id,
+                    object_id,
+                    source_node_id,
+                    reason: error.to_string(),
+                }));
+            }
+        };
+        if manifest.content_hash != content_hash {
             self.record_fetch_failed_source_and_wake_retries(&intent_id, &source_node_id);
             return Ok(Some(NetworkedDfsServiceEvent::BlobFetchRejected {
                 intent_id,
                 object_id,
                 source_node_id,
-                reason: error.to_string(),
+                reason: DfsError::ContentHashMismatch {
+                    expected: content_hash,
+                    actual: manifest.content_hash,
+                }
+                .to_string(),
             }));
         }
         self.record_fetched_pending_write_size(
             &intent_id,
             &object_id,
             &version,
-            &content_hash,
-            bytes.len() as u64,
+            &manifest.content_hash,
+            manifest.size_bytes,
         )?;
         self.wake_pending_retries_after_fetch_success(&intent_id);
         Ok(Some(NetworkedDfsServiceEvent::BlobFetched {
@@ -5100,7 +5250,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             object_id,
             version,
             source_node_id,
-            content_hash,
+            content_hash: manifest.content_hash,
         }))
     }
 
@@ -7546,6 +7696,29 @@ mod tests {
         dfs
     }
 
+    fn test_chunked_assembler(
+        root: &Path,
+        name: &str,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        total_chunks: u32,
+    ) -> (LocalContentStore, ChunkedBlobAssembler) {
+        let store = LocalContentStore::new(root.join(name)).expect("chunk store");
+        let assembler = store
+            .begin_chunked_object_version(
+                object_id.as_str(),
+                version.as_str(),
+                content_hash,
+                total_size_bytes,
+                total_chunks,
+                DFS_BLOB_CHUNK_BYTES,
+            )
+            .expect("chunk assembler");
+        (store, assembler)
+    }
+
     #[test]
     fn put_local_object_version_from_reader_streams_to_content_store() {
         let root = temp_root("put-local-object-version-from-reader");
@@ -7814,6 +7987,16 @@ mod tests {
         let object_id = DfsObjectId::from_legacy_named("obj_partial_transfer").expect("object");
         let version = DfsVersion::from_legacy_named("version_1").expect("version");
         let mut dfs = networked_sifs_with_backend(&root, node_id);
+        let content_hash = content_hash(b"partial1");
+        let (_, assembler) = test_chunked_assembler(
+            &root,
+            "partial-transfer",
+            &object_id,
+            &version,
+            &content_hash,
+            8,
+            1,
+        );
         dfs.incoming_blob_transfers.insert(
             blob_transfer_key("stage", &requester, "intent_partial", "dfs_net_req_partial"),
             InProgressBlobTransfer::new(
@@ -7823,10 +8006,10 @@ mod tests {
                 object_id,
                 None,
                 version,
-                content_hash(b"partial"),
+                content_hash,
                 8,
                 1,
-                None,
+                assembler,
             )
             .expect("partial transfer"),
         );
@@ -8665,6 +8848,15 @@ mod tests {
             .expect("pending")
             .fetch_inflight_request_ids
             .insert(replica.clone(), request_id.clone());
+        let (_, fetch_assembler) = test_chunked_assembler(
+            &root,
+            "abort-fetch-transfer",
+            &object_id,
+            &version_2,
+            &fetch_hash,
+            b"repair".len() as u64,
+            1,
+        );
         dfs.incoming_fetch_transfers.insert(
             request_id.clone(),
             InProgressFetchBlobTransfer::new(
@@ -8673,11 +8865,21 @@ mod tests {
                 fetch_hash.clone(),
                 b"repair".len() as u64,
                 1,
+                fetch_assembler,
             )
             .expect("fetch transfer"),
         );
         let unrelated_intent_id = "dfs_intent_unrelated_abort".to_string();
         let unrelated_blob_request_id = "dfs_net_req_blob_unrelated".to_string();
+        let (_, blob_assembler) = test_chunked_assembler(
+            &root,
+            "abort-blob-transfer",
+            &object_id,
+            &version_2,
+            &fetch_hash,
+            b"repair".len() as u64,
+            1,
+        );
         dfs.incoming_blob_transfers.insert(
             blob_transfer_key("stage", &replica, &intent_id, &blob_request_id),
             InProgressBlobTransfer::new(
@@ -8690,9 +8892,18 @@ mod tests {
                 fetch_hash.clone(),
                 b"repair".len() as u64,
                 1,
-                None,
+                blob_assembler,
             )
             .expect("blob transfer"),
+        );
+        let (_, unrelated_blob_assembler) = test_chunked_assembler(
+            &root,
+            "abort-unrelated-blob-transfer",
+            &object_id,
+            &version_2,
+            &fetch_hash,
+            b"repair".len() as u64,
+            1,
         );
         dfs.incoming_blob_transfers.insert(
             blob_transfer_key(
@@ -8711,7 +8922,7 @@ mod tests {
                 fetch_hash,
                 b"repair".len() as u64,
                 1,
-                None,
+                unrelated_blob_assembler,
             )
             .expect("unrelated blob transfer"),
         );
@@ -9174,6 +9385,7 @@ mod tests {
 
     #[test]
     fn chunk_assemblers_ignore_identical_duplicate_chunks() {
+        let root = temp_root("chunk-assemblers-ignore-duplicates");
         let object_id = DfsObjectId::from_legacy_named("obj_duplicate_chunk").expect("object");
         let version = DfsVersion::from_legacy_named("version_2").expect("version");
         let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
@@ -9183,6 +9395,15 @@ mod tests {
         let first_chunk = bytes[..DFS_BLOB_CHUNK_BYTES].to_vec();
         let second_chunk = bytes[DFS_BLOB_CHUNK_BYTES..].to_vec();
         let hash = content_hash(&bytes);
+        let (blob_store, blob_assembler) = test_chunked_assembler(
+            &root,
+            "duplicate-blob-transfer",
+            &object_id,
+            &version,
+            &hash,
+            bytes.len() as u64,
+            2,
+        );
 
         let mut blob_transfer = InProgressBlobTransfer::new(
             "dfs_net_req_blob_duplicate".to_string(),
@@ -9194,25 +9415,30 @@ mod tests {
             hash.clone(),
             bytes.len() as u64,
             2,
-            None,
+            blob_assembler,
         )
         .expect("blob transfer");
         assert!(
-            blob_transfer
+            !blob_transfer
                 .insert_chunk(0, 2, first_chunk.clone())
                 .expect("first blob chunk")
-                .is_none()
+        );
+        assert!(
+            !blob_transfer
+                .insert_chunk(0, 2, first_chunk.clone())
+                .expect("duplicate blob chunk")
         );
         assert!(
             blob_transfer
-                .insert_chunk(0, 2, first_chunk.clone())
-                .expect("duplicate blob chunk")
-                .is_none()
-        );
-        assert_eq!(
-            blob_transfer
                 .insert_chunk(1, 2, second_chunk.clone())
                 .expect("second blob chunk")
+        );
+        let manifest = blob_store
+            .commit_chunked_object_version(blob_transfer.assembler)
+            .expect("commit assembled blob");
+        assert_eq!(
+            blob_store
+                .read_blob(&manifest.content_hash)
                 .expect("assembled blob"),
             bytes
         );
@@ -9245,28 +9471,49 @@ mod tests {
             bytes
         );
 
-        let mut fetch_transfer =
-            InProgressFetchBlobTransfer::new(object_id, version, hash, bytes.len() as u64, 2)
-                .expect("fetch transfer");
+        let (fetch_store, fetch_assembler) = test_chunked_assembler(
+            &root,
+            "duplicate-fetch-transfer",
+            &object_id,
+            &version,
+            &hash,
+            bytes.len() as u64,
+            2,
+        );
+        let mut fetch_transfer = InProgressFetchBlobTransfer::new(
+            object_id,
+            version,
+            hash,
+            bytes.len() as u64,
+            2,
+            fetch_assembler,
+        )
+        .expect("fetch transfer");
         assert!(
-            fetch_transfer
+            !fetch_transfer
                 .insert_chunk(0, 2, first_chunk.clone())
                 .expect("first fetch chunk")
-                .is_none()
         );
         assert!(
-            fetch_transfer
+            !fetch_transfer
                 .insert_chunk(0, 2, first_chunk)
                 .expect("duplicate fetch chunk")
-                .is_none()
         );
-        assert_eq!(
+        assert!(
             fetch_transfer
                 .insert_chunk(1, 2, second_chunk)
                 .expect("second fetch chunk")
+        );
+        let manifest = fetch_store
+            .commit_chunked_object_version(fetch_transfer.assembler)
+            .expect("commit assembled fetch");
+        assert_eq!(
+            fetch_store
+                .read_blob(&manifest.content_hash)
                 .expect("assembled fetch"),
             bytes
         );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -10461,35 +10708,57 @@ mod tests {
                 fetch_failed_from: BTreeSet::new(),
             },
         );
-        dfs.incoming_fetch_transfers.insert(
-            fetch_request_id.clone(),
-            InProgressFetchBlobTransfer {
-                object_id: object_id.clone(),
-                version: version.clone(),
-                content_hash: content_hash.clone(),
-                total_size_bytes: 70_000,
-                last_updated_at: stale_at,
-                chunks: vec![None; 2],
-            },
-        );
+        dfs.incoming_fetch_transfers
+            .insert(fetch_request_id.clone(), {
+                let (_, assembler) = test_chunked_assembler(
+                    &root,
+                    "idle-prune-fetch",
+                    &object_id,
+                    &version,
+                    &content_hash,
+                    70_000,
+                    2,
+                );
+                let mut transfer = InProgressFetchBlobTransfer::new(
+                    object_id.clone(),
+                    version.clone(),
+                    content_hash.clone(),
+                    70_000,
+                    2,
+                    assembler,
+                )
+                .expect("fetch transfer");
+                transfer.last_updated_at = stale_at;
+                transfer
+            });
 
         let blob_key = blob_transfer_key("stage", &replica, &intent_id, "dfs_net_req_prune_stage");
-        dfs.incoming_blob_transfers.insert(
-            blob_key.clone(),
-            InProgressBlobTransfer {
-                request_id: "dfs_net_req_prune_stage".to_string(),
-                intent_id: intent_id.clone(),
+        dfs.incoming_blob_transfers.insert(blob_key.clone(), {
+            let (_, assembler) = test_chunked_assembler(
+                &root,
+                "idle-prune-blob",
+                &object_id,
+                &version,
+                &content_hash,
+                70_000,
+                2,
+            );
+            let mut transfer = InProgressBlobTransfer::new(
+                "dfs_net_req_prune_stage".to_string(),
+                intent_id.clone(),
                 file_system_id,
                 object_id,
-                expected_base_version: None,
+                None,
                 version,
                 content_hash,
-                total_size_bytes: 70_000,
-                object_metadata: None,
-                last_updated_at: stale_at,
-                chunks: vec![None; 2],
-            },
-        );
+                70_000,
+                2,
+                assembler,
+            )
+            .expect("blob transfer");
+            transfer.last_updated_at = stale_at;
+            transfer
+        });
 
         dfs.prune_idle_chunk_transfers();
 
