@@ -2814,7 +2814,7 @@ pub fn open_daemon_sandbox_dfs_service(
         content,
     );
     let mut dfs = if let Some(metadata) =
-        open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)?
+        crate::dfs::open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)?
     {
         dfs.with_metadata_backend(metadata)
             .map_err(|source| DaemonError::Parse {
@@ -2834,30 +2834,6 @@ pub fn open_daemon_sandbox_dfs_service(
             detail: source.to_string(),
         })?;
     Ok(dfs)
-}
-
-fn open_daemon_sharded_dfs_metadata_backend(
-    data_dir: &sinomo_local::SinomoDataDir,
-    cluster_paths: &sinomo_network::ClusterPaths,
-) -> Result<Option<sinomo_dfs::LocalShardedMetadataBackend>, DaemonError> {
-    let file_system_id = sinomo_dfs::sifs_file_system_id();
-    let mut shards = sinomo_network::read_cluster_kv_prefix_entries(
-        cluster_paths,
-        &format!("{}/", sinomo_dfs::metadata_shards_prefix(&file_system_id)),
-    )?
-    .into_iter()
-    .map(|entry| entry.decode::<sinomo_dfs::DfsMetadataShardConfig>())
-    .collect::<Result<Vec<_>, _>>()?;
-    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
-    if shards.is_empty() {
-        return Ok(None);
-    }
-    sinomo_dfs::open_local_sharded_metadata_backend(
-        sinomo_dfs::default_dfs_metadata_shards_root(data_dir),
-        shards,
-    )
-    .map(Some)
-    .map_err(Into::into)
 }
 
 fn daemon_data_dir_path(paths: &DaemonPaths) -> Result<PathBuf, DaemonError> {
@@ -3108,9 +3084,10 @@ mod tests {
         )
         .expect("write shard configs");
 
-        let mut backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
-            .expect("open backend")
-            .expect("configured sharded backend");
+        let mut backend =
+            crate::dfs::open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("open backend")
+                .expect("configured sharded backend");
         backend.put_file_system(&file_system).expect("filesystem");
         let mut object = sinomo_dfs::distributed_sifs_bootstrap_objects(local)
             .into_iter()

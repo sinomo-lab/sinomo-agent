@@ -12,11 +12,12 @@ use sinomo_dfs::{
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy,
-    DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService,
-    content_service_key, content_services_prefix, distributed_sifs,
-    distributed_sifs_bootstrap_objects, fallback_dfs_node_id, file_system_config_key,
-    metadata_service_key, metadata_shard_key, sifs_node_files_path,
+    DfsOperatorInspector, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy,
+    DfsSubtreePolicy, DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend,
+    LocalShardedMetadataBackend, NetworkedDfsService, content_service_key, content_services_prefix,
+    default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
+    fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
+    sifs_node_files_path,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
@@ -164,8 +165,40 @@ pub fn handle_daemon_dfs_status(
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if cluster_paths.state.exists()
+        && let Some(metadata) = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)?
+    {
+        return DfsOperatorInspector::new(&metadata)
+            .status()
+            .map_err(DaemonError::from);
+    }
     sinomo_dfs::inspect_dfs_status(data_dir.dfs_dir().join("metadata").join("root"))
         .map_err(DaemonError::from)
+}
+
+pub(crate) fn open_daemon_sharded_dfs_metadata_backend(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<Option<LocalShardedMetadataBackend>, DaemonError> {
+    let file_system_id = sinomo_dfs::sifs_file_system_id();
+    let mut shards = sinomo_network::read_cluster_kv_prefix_entries(
+        cluster_paths,
+        &format!("{}/", sinomo_dfs::metadata_shards_prefix(&file_system_id)),
+    )?
+    .into_iter()
+    .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+    .collect::<Result<Vec<_>, _>>()?;
+    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    if shards.is_empty() {
+        return Ok(None);
+    }
+    sinomo_dfs::open_local_sharded_metadata_backend(
+        default_dfs_metadata_shards_root(data_dir),
+        shards,
+    )
+    .map(Some)
+    .map_err(Into::into)
 }
 
 pub fn handle_daemon_dfs_metadata_journal_batch(
@@ -1310,6 +1343,106 @@ mod tests {
             data_dir.dfs_dir().join("metadata").join("root"),
         )
         .expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        backend
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                content_hash: object.content_hash.clone(),
+                size_bytes: object.content_size_bytes,
+                locations: object.current_locations.clone(),
+                created_by_event_id: object.created_by_event_id.clone(),
+                created_at: OffsetDateTime::now_utc(),
+                visible: true,
+            })
+            .expect("version");
+
+        let status = handle_daemon_dfs_status(&paths).expect("dfs status");
+
+        assert_eq!(status.file_system_count, 1);
+        assert_eq!(status.object_count, 1);
+        assert_eq!(status.version_count, 1);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
+        let root = temp_root("daemon_dfs_status_sharded");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_status_sharded")
+            .expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_daemon_dfs_status_sharded").expect("node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "daemon dfs status sharded",
+            node_id.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+        let file_system = distributed_sifs(node_id.clone());
+        let root_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let services_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &node_id,
+            sinomo_kv::KvCommand::Txn(sinomo_kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "root"),
+                        &root_shard,
+                        None,
+                    )
+                    .expect("root shard op"),
+                    sinomo_kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "services"),
+                        &services_shard,
+                        None,
+                    )
+                    .expect("services shard op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("write shard configs");
+        let mut object = distributed_sifs_bootstrap_objects(node_id)
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        object.path = "/services/status-sharded.txt".to_string();
+        let mut backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+            .expect("open sharded backend")
+            .expect("configured backend");
         backend.put_file_system(&file_system).expect("filesystem");
         backend.put_object(&object).expect("object");
         backend
