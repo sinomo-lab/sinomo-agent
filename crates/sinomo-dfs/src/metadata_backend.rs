@@ -7,6 +7,7 @@
 
 use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::DfsWriteReceipt;
 use sinomo_events::EventId;
@@ -17,6 +18,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 #[cfg(windows)]
 use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 use thiserror::Error;
@@ -33,6 +35,7 @@ const SECONDARY_INDEX_DIRS: &[&str] = &[
     "dirfrags",
     "hardlinks",
 ];
+static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum MetadataBackendError {
@@ -816,6 +819,14 @@ impl LocalJsonMetadataBackend {
     }
 
     fn write_journal(&mut self, mutation: DfsMetadataMutation) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.metadata_write_lock()?;
+        self.write_journal_unlocked(mutation)
+    }
+
+    fn write_journal_unlocked(
+        &mut self,
+        mutation: DfsMetadataMutation,
+    ) -> Result<DfsMetadataJournalEntry> {
         let sequence = self
             .next_sequence
             .max(fast_next_journal_sequence(&self.root)?);
@@ -1194,11 +1205,82 @@ impl LocalJsonMetadataBackend {
     fn journal_head_path(&self) -> PathBuf {
         self.root.join("journal").join("head.sobj")
     }
+
+    fn journal_write_lock_path(&self) -> PathBuf {
+        self.root.join("journal").join("write.lock")
+    }
+
+    fn metadata_write_lock(&self) -> Result<MetadataWriteLock> {
+        let path_guard = MetadataPathWriteGuard::lock(self.root.clone());
+        let path = self.journal_write_lock_path();
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent.to_owned())?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock_exclusive()
+            .map_err(|source| MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(MetadataWriteLock {
+            _path_guard: path_guard,
+            _file: file,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct MetadataWriteLock {
+    _path_guard: MetadataPathWriteGuard,
+    _file: fs::File,
+}
+
+#[derive(Debug)]
+struct MetadataPathWriteGuard {
+    path: PathBuf,
+}
+
+impl MetadataPathWriteGuard {
+    fn lock(path: PathBuf) -> Self {
+        let (mutex, condvar) =
+            METADATA_WRITE_PATH_LOCKS.get_or_init(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
+        let mut locked = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !locked.insert(path.clone()) {
+            locked = condvar
+                .wait(locked)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        Self { path }
+    }
+}
+
+impl Drop for MetadataPathWriteGuard {
+    fn drop(&mut self) {
+        let Some((mutex, condvar)) = METADATA_WRITE_PATH_LOCKS.get() else {
+            return;
+        };
+        let mut locked = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locked.remove(&self.path);
+        condvar.notify_all();
+    }
 }
 
 impl DfsMetadataBackend for LocalJsonMetadataBackend {
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
-        let entry = self.write_journal(DfsMetadataMutation::PutFileSystem {
+        let _lock = self.metadata_write_lock()?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutFileSystem {
             file_system_id: file_system.file_system_id.clone(),
             file_system: Some(file_system.clone()),
         })?;
@@ -1219,6 +1301,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.metadata_write_lock()?;
         let object = normalized_object_metadata(object);
         if self.get_file_system(&object.file_system_id)?.is_none() {
             return Err(MetadataBackendError::UnknownFileSystem {
@@ -1227,7 +1310,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         }
 
         let previous = self.get_object(&object.object_id)?;
-        let entry = self.write_journal(DfsMetadataMutation::PutObject {
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutObject {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             path: object.path.clone(),
@@ -1369,8 +1452,9 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.metadata_write_lock()?;
         let version = normalized_version_record(version);
-        let entry = self.write_journal(DfsMetadataMutation::PutVersion {
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutVersion {
             file_system_id: version.file_system_id.clone(),
             object_id: version.object_id.clone(),
             version: version.version.clone(),
@@ -1409,7 +1493,8 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         &mut self,
         receipt: &DfsReplicaReceiptRecord,
     ) -> Result<DfsMetadataJournalEntry> {
-        let entry = self.write_journal(DfsMetadataMutation::PutReceipt {
+        let _lock = self.metadata_write_lock()?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutReceipt {
             file_system_id: receipt.receipt.file_system_id.clone(),
             object_id: receipt.receipt.object_id.clone(),
             version: receipt.receipt.committed_version.clone(),
@@ -1437,7 +1522,8 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry> {
-        let entry = self.write_journal(DfsMetadataMutation::PutIntent {
+        let _lock = self.metadata_write_lock()?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutIntent {
             file_system_id: intent.file_system_id.clone(),
             object_id: intent.object_id.clone(),
             intent_id: intent.intent_id.clone(),
@@ -1473,6 +1559,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         visible_version: &DfsObjectVersionRecord,
         required_replica_node_ids: &[NodeId],
     ) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.metadata_write_lock()?;
         let current = self
             .get_object(&committed_object.object_id)?
             .ok_or_else(|| MetadataBackendError::UnknownObject {
@@ -1512,7 +1599,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             &self.visible_commit_path(&committed_object.object_id, &committed_object.version),
             &commit_record,
         )?;
-        let entry = self.write_journal(DfsMetadataMutation::CommitVisibleVersion {
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::CommitVisibleVersion {
             file_system_id: committed_object.file_system_id.clone(),
             object_id: committed_object.object_id.clone(),
             previous_version: expected_version.clone(),
@@ -1530,6 +1617,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         &mut self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.metadata_write_lock()?;
         if self.get_file_system(&transaction.file_system_id)?.is_none() {
             return Err(MetadataBackendError::UnknownFileSystem {
                 file_system_id: transaction.file_system_id.clone(),
@@ -1550,12 +1638,13 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             &self.namespace_transaction_path(&transaction.transaction_id),
             &transaction,
         )?;
-        let entry = self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
-            file_system_id: transaction.file_system_id.clone(),
-            transaction_id: transaction.transaction_id.clone(),
-            object_count: transaction.objects.len(),
-            transaction: Some(transaction),
-        })?;
+        let entry =
+            self.write_journal_unlocked(DfsMetadataMutation::ApplyNamespaceTransaction {
+                file_system_id: transaction.file_system_id.clone(),
+                transaction_id: transaction.transaction_id.clone(),
+                object_count: transaction.objects.len(),
+                transaction: Some(transaction),
+            })?;
         if let DfsMetadataMutation::ApplyNamespaceTransaction {
             transaction: Some(transaction),
             ..
@@ -1568,7 +1657,8 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry> {
-        let entry = self.write_journal(DfsMetadataMutation::PutConflict {
+        let _lock = self.metadata_write_lock()?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutConflict {
             file_system_id: conflict.file_system_id.clone(),
             object_id: conflict.object_id.clone(),
             conflict_id: conflict.conflict_id.clone(),
@@ -1635,6 +1725,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         shard_id: &DfsMetadataShardId,
         next_after_sequence: u64,
     ) -> Result<()> {
+        let _lock = self.metadata_write_lock()?;
         let next_after_sequence =
             next_after_sequence.max(self.metadata_replication_cursor(target_node_id, shard_id)?);
         write_json_atomic(
@@ -3046,6 +3137,67 @@ mod tests {
             journal[1].mutation,
             DfsMetadataMutation::PutObject { .. }
         ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_serializes_concurrent_metadata_writers() {
+        let root = temp_root("local_backend_serializes_concurrent_metadata_writers");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        drop(backend);
+
+        let writer_count = 8usize;
+        let writes_per_writer = 16usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(writer_count));
+        let mut handles = Vec::new();
+        for writer_index in 0..writer_count {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut backend =
+                    LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                        .expect("backend");
+                barrier.wait();
+                for object_index in 0..writes_per_writer {
+                    let mut object = object(version("version_1"));
+                    object.object_id = DfsObjectId::from_legacy_named(format!(
+                        "obj_concurrent_{writer_index}_{object_index}"
+                    ))
+                    .expect("object");
+                    object.path = format!("/docs/concurrent-{writer_index}-{object_index}.md");
+                    backend.put_object(&object).expect("object");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let backend = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen");
+        let journal = backend.journal_since(0).expect("journal");
+        assert_eq!(journal.len(), 1 + writer_count * writes_per_writer);
+        let sequences = journal
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequences,
+            (1..=journal.len() as u64).collect::<Vec<_>>(),
+            "concurrent metadata writers must allocate contiguous journal sequences"
+        );
+        assert_eq!(
+            backend
+                .objects_for_file_system(&file_system_id())
+                .expect("objects")
+                .len(),
+            writer_count * writes_per_writer,
+            "concurrent materialization must not lose object indexes"
+        );
 
         cleanup(&root);
     }
