@@ -23,6 +23,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT: u64 = 4096;
+pub const DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT: usize = 512;
 const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
 const SECONDARY_INDEX_DIRS: &[&str] = &[
@@ -481,6 +482,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         status: DfsConflictStatus,
     ) -> Result<Option<DfsConflictRecord>>;
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>>;
+    fn journal_since_limited(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let mut entries = self.journal_since(after_sequence)?;
+        entries.truncate(max_entries);
+        Ok(entries)
+    }
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription;
     fn poll_subscription(
@@ -1378,6 +1388,14 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
 
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
         journal_entries_since(&self.root, after_sequence)
+    }
+
+    fn journal_since_limited(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        LocalJsonMetadataBackend::journal_since_limited(self, after_sequence, max_entries)
     }
 
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {

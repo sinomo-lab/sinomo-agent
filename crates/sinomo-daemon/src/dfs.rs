@@ -8,14 +8,15 @@ use sinomo_core::{
     ClusterMemberRole, DfsObjectPolicy,
 };
 use sinomo_dfs::{
-    DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy,
-    DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService,
-    content_service_key, content_services_prefix, distributed_sifs,
-    distributed_sifs_bootstrap_objects, fallback_dfs_node_id, file_system_config_key,
-    metadata_service_key, metadata_shard_key, sifs_node_files_path,
+    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsExposeStore, DfsFileSystemConfig,
+    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataJournalBatchResult, DfsMetadataShardAssignment, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord, DfsProtocolFrameCommand,
+    DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy, DfsWriteOptions,
+    LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService, content_service_key,
+    content_services_prefix, distributed_sifs, distributed_sifs_bootstrap_objects,
+    fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
+    sifs_node_files_path,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
@@ -26,7 +27,8 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 const DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
-const DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES: usize = 512;
+const DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES: usize =
+    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT;
 const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
 type DfsProtocolFrameSender = Arc<

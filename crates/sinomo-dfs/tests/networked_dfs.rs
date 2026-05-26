@@ -1,18 +1,19 @@
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 use sinomo_dfs::{
-    DFS_PROTOCOL, DfsBlobTransferResult, DfsCommitVersionCommand, DfsConfirmedTimeoutAction,
-    DfsConfirmedTimeoutOutcome, DfsConflictStatus, DfsControlPlaneStore, DfsFetchBlobResponse,
-    DfsFetchBlobResponseChunk, DfsFetchBlobResult, DfsFileSystem, DfsFileSystemId,
-    DfsMetadataBackend, DfsMetadataMutation, DfsMetadataReplicationOutcome,
-    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId, DfsNetworkMessage,
-    DfsNodeAdvertisement, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
-    DfsOwnerHandoffOutcome, DfsReadData, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
-    DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
-    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsStageBlobChunkCommand, DfsStageBlobCommand,
-    DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
-    LocalJsonMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
+    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DFS_PROTOCOL, DfsBlobTransferResult,
+    DfsCommitVersionCommand, DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome,
+    DfsConflictStatus, DfsControlPlaneStore, DfsFetchBlobResponse, DfsFetchBlobResponseChunk,
+    DfsFetchBlobResult, DfsFileSystem, DfsFileSystemId, DfsMetadataBackend, DfsMetadataMutation,
+    DfsMetadataReplicationOutcome, DfsMetadataShardAssignment, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsOwnerHandoffOutcome, DfsReadData,
+    DfsReadResponse, DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand,
+    DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsReplicaReceiptRecord,
+    DfsReplicationPolicy, DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse,
+    DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus, LocalJsonMetadataBackend,
+    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient,
+    file_system_config_key, sifs_node_files_path,
 };
 use sinomo_events::EventId;
 use sinomo_kv::InProcessRaftKvCluster;
@@ -2501,6 +2502,99 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
             } if source_node_id == &owner
         )
     }));
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_sends_metadata_journal_in_bounded_batches() {
+    let owner = NodeId::from_legacy_named("node_metadata_bounded_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_metadata_bounded_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let root = temp_root("networked_metadata_bounded_batches");
+    let network = InProcessNetwork::new();
+    let owner_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
+    let _replica_transport = network.add_node(replica.clone());
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    owner_dfs
+        .add_file_system(file_system)
+        .expect("owner filesystem");
+    for index in 0..DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 7 {
+        let metadata = DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named(format!("obj_metadata_bounded_{index}"))
+                .expect("object"),
+            file_system_id: file_system_id.clone(),
+            path: format!("/services/bounded-{index}.txt"),
+            kind: DfsObjectKind::File,
+            owner_node_id: owner.clone(),
+            current_locations: vec![owner.clone()],
+            content_hash: Some(format!("blake3:bounded-{index}")),
+            content_size_bytes: Some(index as u64),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: DfsVersion::from_legacy_named(format!("version_bounded_{index}"))
+                .expect("version"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        owner_dfs
+            .add_object_metadata(metadata)
+            .expect("owner metadata");
+    }
+
+    let first = owner_dfs
+        .send_metadata_journal_since(&replica, 0)
+        .expect("first journal send")
+        .expect("first batch");
+    assert_eq!(
+        first.entries.len(),
+        DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT
+    );
+    assert_eq!(
+        first.next_after_sequence,
+        DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64
+    );
+    let second = owner_dfs
+        .send_metadata_journal_since(&replica, first.next_after_sequence)
+        .expect("second journal send")
+        .expect("second batch");
+    assert_eq!(
+        second.entries.len(),
+        DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT
+    );
+    assert_eq!(
+        second.next_after_sequence,
+        (DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT * 2) as u64
+    );
+    let third = owner_dfs
+        .send_metadata_journal_since(&replica, second.next_after_sequence)
+        .expect("third journal send")
+        .expect("third batch");
+    assert_eq!(third.entries.len(), 15);
+    assert_eq!(
+        third.next_after_sequence,
+        (DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT * 2 + 15) as u64
+    );
 
     cleanup(&root);
 }
