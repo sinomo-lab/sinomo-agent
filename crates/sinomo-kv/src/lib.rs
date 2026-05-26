@@ -1569,7 +1569,7 @@ impl DurableRaftKvNode {
             }
             Err(error) => return Err(error),
         };
-        if node.hard_state().commit_index == 0 && cache.exists() {
+        if node.applied_index() == 0 && node.last_log_index() == 0 && cache.exists() {
             node.restore_snapshot(RaftSnapshot {
                 last_included_index: 0,
                 last_included_term: 0,
@@ -2246,6 +2246,47 @@ mod tests {
         );
         let restored = cache.read_store().expect("read cache");
         assert_eq!(restored.get("alpha").expect("alpha").value, b"one");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn materialized_cache_does_not_replace_existing_raft_log() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-cache-does-not-replace-log-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_cache_existing_log").expect("node");
+        let wal_paths = KvWalPaths::new(root.join("raft"));
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths.clone())
+                .expect("open raft node");
+            node.append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/raft-log".to_string(),
+                    value: b"raft".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append uncommitted");
+        }
+
+        let cache = KvMaterializedCache::new(root.join("cache.sobj"));
+        let mut cache_store = InProcessKvStore::new();
+        cache_store
+            .put("/cache", b"cache".to_vec(), None)
+            .expect("seed cache");
+        cache
+            .write_snapshot(&cache_store.snapshot())
+            .expect("write cache");
+
+        let node = DurableRaftKvNode::open_with_materialized_cache(node_id, wal_paths, &cache)
+            .expect("open with cache");
+        assert_eq!(node.last_log_index(), 1);
+        assert!(node.store().get("/cache").is_none());
         std::fs::remove_dir_all(root).ok();
     }
 
