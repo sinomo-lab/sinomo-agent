@@ -46,6 +46,18 @@ pub fn register_storage_paths(
             STORAGE_CONTRACT_OBJECT_VERSION,
         ),
     )?;
+    layout.register_sinomo_object(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/connectivity-local.sobj",
+        ObjectSchema::new(
+            "Vec<ClusterConnectivityRecord>",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("source_node_id", "NodeId")
+        .field("target_node_id", "NodeId")
+        .field("endpoint_id", "ClusterEndpointId"),
+    )?;
     layout.register_escape_path(
         "sinomo-network",
         StorageRing::R1,

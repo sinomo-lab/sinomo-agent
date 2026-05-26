@@ -18,6 +18,7 @@ pub struct ClusterPaths {
     pub root: PathBuf,
     pub state: PathBuf,
     pub iroh: PathBuf,
+    pub connectivity_local: PathBuf,
     pub kv_snapshot: PathBuf,
     pub kv_raft: PathBuf,
     pub kv_watches: PathBuf,
@@ -30,6 +31,7 @@ impl ClusterPaths {
         Self {
             state: root.join("state.sobj"),
             iroh: root.join("iroh"),
+            connectivity_local: root.join("connectivity-local.sobj"),
             kv_snapshot: root.join("kv-snapshot.sobj"),
             kv_raft: root.join("kv-raft"),
             kv_watches: root.join("watches"),
@@ -333,7 +335,7 @@ impl ClusterConnectivityGraph {
     pub fn read_for_local(paths: &ClusterPaths, state: &ClusterBootstrapState) -> Self {
         Self::from_records(
             state.local_node_id.clone(),
-            read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default(),
+            read_cluster_connectivity_graph(paths).unwrap_or_default(),
         )
     }
 
@@ -1435,6 +1437,106 @@ pub fn read_cluster_connectivity_graph_from_kv(
     Ok(records)
 }
 
+pub fn read_cluster_connectivity_graph(
+    paths: &ClusterPaths,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    let now = OffsetDateTime::now_utc();
+    let mut records_by_key =
+        BTreeMap::<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>::new();
+    for record in read_cluster_connectivity_graph_from_kv(paths)? {
+        records_by_key.insert(
+            (
+                record.source_node_id.clone(),
+                record.target_node_id.clone(),
+                record.endpoint_id.clone(),
+            ),
+            record,
+        );
+    }
+    for record in read_local_cluster_connectivity_records(paths)? {
+        if cluster_network_record_live(record.expires_at, now) {
+            records_by_key.insert(
+                (
+                    record.source_node_id.clone(),
+                    record.target_node_id.clone(),
+                    record.endpoint_id.clone(),
+                ),
+                record,
+            );
+        }
+    }
+    let mut records = records_by_key.into_values().collect::<Vec<_>>();
+    sort_cluster_connectivity_records(&mut records);
+    Ok(records)
+}
+
+pub fn read_local_cluster_connectivity_records(
+    paths: &ClusterPaths,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    if !paths.connectivity_local.exists() {
+        return Ok(Vec::new());
+    }
+    let now = OffsetDateTime::now_utc();
+    let mut records: Vec<ClusterConnectivityRecord> = read_object_file(&paths.connectivity_local)?;
+    records.retain(|record| cluster_network_record_live(record.expires_at, now));
+    sort_cluster_connectivity_records(&mut records);
+    Ok(records)
+}
+
+pub fn write_local_cluster_connectivity_records(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<(), NetworkError> {
+    let now = OffsetDateTime::now_utc();
+    let mut merged = read_local_cluster_connectivity_records(paths)?
+        .into_iter()
+        .filter(|record| cluster_network_record_live(record.expires_at, now))
+        .map(|record| {
+            (
+                (
+                    record.source_node_id.clone(),
+                    record.target_node_id.clone(),
+                    record.endpoint_id.clone(),
+                ),
+                record,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for record in records {
+        if record.source_node_id == *source_node_id
+            && cluster_network_record_live(record.expires_at, now)
+        {
+            merged.insert(
+                (
+                    record.source_node_id.clone(),
+                    record.target_node_id.clone(),
+                    record.endpoint_id.clone(),
+                ),
+                record.clone(),
+            );
+        }
+    }
+    let mut merged = merged.into_values().collect::<Vec<_>>();
+    sort_cluster_connectivity_records(&mut merged);
+    write_object_file(&paths.connectivity_local, &merged)
+}
+
+fn sort_cluster_connectivity_records(records: &mut [ClusterConnectivityRecord]) {
+    records.sort_by(|left, right| {
+        (
+            left.source_node_id.as_str(),
+            left.target_node_id.as_str(),
+            left.endpoint_id.as_str(),
+        )
+            .cmp(&(
+                right.source_node_id.as_str(),
+                right.target_node_id.as_str(),
+                right.endpoint_id.as_str(),
+            ))
+    });
+}
+
 /// Mirrors a cluster state into the local durable Raft store without proving
 /// replication to a quorum.
 ///
@@ -1987,6 +2089,15 @@ fn cluster_route_connectivity_quality_rank(connectivity: Option<&ClusterConnecti
     }
 }
 
+fn cluster_route_command_quality_rank(connectivity: Option<&ClusterConnectivityState>) -> u8 {
+    match connectivity {
+        Some(ClusterConnectivityState::Healthy) => 0,
+        None => 1,
+        Some(ClusterConnectivityState::Degraded) => 2,
+        Some(ClusterConnectivityState::Unreachable) => 3,
+    }
+}
+
 fn cluster_endpoint_static_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8 {
     match endpoint.transport {
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
@@ -2014,7 +2125,7 @@ fn cluster_raft_route_order_key(
     endpoint: &ClusterEndpointRecord,
 ) -> (u8, u8, u8, u16, String) {
     (
-        graph.unavailability_rank(endpoint),
+        cluster_route_command_quality_rank(graph.state_for_endpoint(endpoint)),
         cluster_endpoint_static_fallback_rank(endpoint),
         graph.quality_rank(endpoint),
         endpoint.priority,

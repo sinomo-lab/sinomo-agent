@@ -194,6 +194,84 @@ fn remember_connectivity_records(paths: &ClusterPaths, records: &[ClusterConnect
     }
 }
 
+fn remember_cluster_endpoint_command_connectivity(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    connectivity_state: sinomo_network::ClusterConnectivityState,
+    latency_ms: Option<u64>,
+) {
+    let now = OffsetDateTime::now_utc();
+    let timestamp = now
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let previous = sinomo_network::read_cluster_connectivity_graph(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|record| {
+            record.source_node_id == state.local_node_id
+                && record.target_node_id == endpoint.node_id
+                && record.endpoint_id == endpoint.endpoint_id
+        });
+    let consecutive_failures = if matches!(
+        connectivity_state,
+        sinomo_network::ClusterConnectivityState::Healthy
+    ) {
+        0
+    } else {
+        previous
+            .as_ref()
+            .map(|record| record.consecutive_failures.saturating_add(1))
+            .unwrap_or(1)
+            .min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD)
+    };
+    let connectivity_state = if !matches!(
+        connectivity_state,
+        sinomo_network::ClusterConnectivityState::Healthy
+    ) && consecutive_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+    {
+        sinomo_network::ClusterConnectivityState::Unreachable
+    } else {
+        connectivity_state
+    };
+    let last_success_at = if matches!(
+        connectivity_state,
+        sinomo_network::ClusterConnectivityState::Healthy
+    ) {
+        Some(timestamp.clone())
+    } else {
+        previous.and_then(|record| record.last_success_at)
+    };
+    let last_failure_at = if matches!(
+        connectivity_state,
+        sinomo_network::ClusterConnectivityState::Healthy
+    ) {
+        None
+    } else {
+        Some(timestamp)
+    };
+    let record = sinomo_network::cluster_connectivity_record(
+        state,
+        endpoint,
+        connectivity_state,
+        latency_ms,
+        consecutive_failures,
+        last_success_at,
+        last_failure_at,
+        now,
+        CLUSTER_CONNECTIVITY_TTL_SECONDS,
+    );
+    if sinomo_network::write_local_cluster_connectivity_records(
+        paths,
+        &state.local_node_id,
+        std::slice::from_ref(&record),
+    )
+    .is_ok()
+    {
+        remember_connectivity_records(paths, &[record]);
+    }
+}
+
 struct ClusterRaftFanoutGuard;
 
 impl Drop for ClusterRaftFanoutGuard {
@@ -2286,6 +2364,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
     source_node_id: &NodeId,
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
+    sinomo_network::write_local_cluster_connectivity_records(paths, source_node_id, &records)?;
     let publishable = records
         .into_iter()
         .filter(|record| !cached_connectivity_matches(paths, record))
@@ -2430,23 +2509,49 @@ pub fn commit_cluster_raft_command_with_quorum(
             ));
             break;
         }
+        let started = Instant::now();
         match replicate_cluster_raft_to_endpoint_with_timeout(paths, state, endpoint, remaining) {
             Ok(response) if response.accepted => {
+                remember_cluster_endpoint_command_connectivity(
+                    paths,
+                    state,
+                    endpoint,
+                    sinomo_network::ClusterConnectivityState::Healthy,
+                    Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                );
                 voter_acks.insert(endpoint.node_id.clone());
                 sinomo_network::merge_cluster_state_from_peer(state, response.state);
             }
-            Ok(response) => failures.push(format!(
-                "{} ({:?}) rejected append: {} (term {}, match_index {})",
-                endpoint.address,
-                endpoint.transport,
-                response.detail,
-                response.append.term,
-                response.append.match_index
-            )),
-            Err(error) => failures.push(format!(
-                "{} ({:?}) failed: {}",
-                endpoint.address, endpoint.transport, error
-            )),
+            Ok(response) => {
+                remember_cluster_endpoint_command_connectivity(
+                    paths,
+                    state,
+                    endpoint,
+                    sinomo_network::ClusterConnectivityState::Healthy,
+                    Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                );
+                failures.push(format!(
+                    "{} ({:?}) rejected append: {} (term {}, match_index {})",
+                    endpoint.address,
+                    endpoint.transport,
+                    response.detail,
+                    response.append.term,
+                    response.append.match_index
+                ));
+            }
+            Err(error) => {
+                remember_cluster_endpoint_command_connectivity(
+                    paths,
+                    state,
+                    endpoint,
+                    sinomo_network::ClusterConnectivityState::Degraded,
+                    None,
+                );
+                failures.push(format!(
+                    "{} ({:?}) failed: {}",
+                    endpoint.address, endpoint.transport, error
+                ));
+            }
         }
     }
     if voter_acks.len() < quorum_size {

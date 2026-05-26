@@ -941,6 +941,94 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
 }
 
 #[test]
+fn raft_command_targets_use_healthy_public_before_degraded_private() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-raft-route-degraded-private-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_raft_degraded_private").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_raft_degraded_private_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_network_raft_degraded_private_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network raft degraded private",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let private_tcp = daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10);
+    let public_tcp = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named(
+            "endpoint_network_raft_degraded_private_public",
+        )
+        .expect("endpoint"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "203.0.113.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![private_tcp.clone(), public_tcp.clone()];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &private_tcp,
+                ClusterConnectivityState::Degraded,
+                None,
+                1,
+                None,
+                Some("timed out".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &public_tcp,
+                ClusterConnectivityState::Healthy,
+                Some(40),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+
+    let targets = cluster_raft_command_targets(&paths, &state);
+
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&public_tcp.endpoint_id)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn main_daemon_command_targets_select_one_route_per_remote_main() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-main-daemon-targets-{}",
