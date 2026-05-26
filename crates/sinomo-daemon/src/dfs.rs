@@ -166,8 +166,15 @@ pub fn handle_daemon_dfs_status(
     let data_dir = SinomoDataDir::new(data_dir);
     data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
+    inspect_daemon_dfs_status(&data_dir, &cluster_paths)
+}
+
+fn inspect_daemon_dfs_status(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<sinomo_dfs::DfsOperatorStatus, DaemonError> {
     if cluster_paths.state.exists()
-        && let Some(metadata) = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)?
+        && let Some(metadata) = open_daemon_sharded_dfs_metadata_backend(data_dir, cluster_paths)?
     {
         return DfsOperatorInspector::new(&metadata)
             .status()
@@ -1028,8 +1035,8 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
             ),
         });
     };
-    let metadata_root = data_dir.dfs_dir().join("metadata").join("root");
-    let status = sinomo_dfs::inspect_dfs_status(&metadata_root)?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let status = inspect_daemon_dfs_status(&data_dir, &cluster_paths)?;
     let metadata_replication = publish_default_dfs_metadata_journal(paths)?;
     Ok(DaemonDfsSmokeReport {
         path: stat.path,

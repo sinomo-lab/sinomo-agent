@@ -47,6 +47,20 @@ pub(crate) struct DfsFilterOptions {
     pub(crate) object_id: Option<DfsObjectId>,
 }
 
+pub(crate) enum DfsInspectionMetadata {
+    Root(LocalJsonMetadataBackend),
+    Sharded(LocalShardedMetadataBackend),
+}
+
+impl DfsInspectionMetadata {
+    pub(crate) fn inspector(&self) -> DfsOperatorInspector<'_> {
+        match self {
+            Self::Root(backend) => DfsOperatorInspector::new(backend),
+            Self::Sharded(backend) => DfsOperatorInspector::new(backend),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsPinCliCommand {
     List(DfsPinListOptions),
@@ -600,11 +614,9 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             file_system_id,
             options,
         } => {
-            let Some(file_system) = inspect_dfs_file_system(
-                dfs_metadata_root(options.metadata_root.clone())?,
-                &file_system_id,
-            )?
-            else {
+            let metadata = open_dfs_metadata_for_inspection(options.metadata_root.clone())?;
+            let inspector = metadata.inspector();
+            let Some(file_system) = inspector.file_system(&file_system_id)? else {
                 return Err(CliError::MissingArtifact {
                     artifact: format!("DFS filesystem {file_system_id}"),
                 });
@@ -630,12 +642,9 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             file_system_id,
             options,
         } => {
-            let Some(object) = inspect_dfs_path(
-                dfs_metadata_root(options.metadata_root.clone())?,
-                &file_system_id,
-                &path,
-            )?
-            else {
+            let metadata = open_dfs_metadata_for_inspection(options.metadata_root.clone())?;
+            let inspector = metadata.inspector();
+            let Some(object) = inspector.object_by_path(&file_system_id, &path)? else {
                 return Err(CliError::MissingArtifact {
                     artifact: format!("DFS path {path} in filesystem {file_system_id}"),
                 });
@@ -649,11 +658,9 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Object { object_id, options } => {
-            let Some(object) = inspect_dfs_object(
-                dfs_metadata_root(options.metadata_root.clone())?,
-                &object_id,
-            )?
-            else {
+            let metadata = open_dfs_metadata_for_inspection(options.metadata_root.clone())?;
+            let inspector = metadata.inspector();
+            let Some(object) = inspector.object(&object_id)? else {
                 return Err(CliError::MissingArtifact {
                     artifact: format!("DFS object {object_id}"),
                 });
@@ -666,11 +673,10 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Conflicts(options) => {
-            let conflicts = inspect_dfs_conflicts(
-                dfs_metadata_root(options.common.metadata_root.clone())?,
-                options.file_system_id.as_ref(),
-                options.object_id.as_ref(),
-            )?;
+            let metadata = open_dfs_metadata_for_inspection(options.common.metadata_root.clone())?;
+            let inspector = metadata.inspector();
+            let conflicts =
+                inspector.conflicts(options.file_system_id.as_ref(), options.object_id.as_ref())?;
             if options.common.json {
                 print_json("<dfs-conflicts>", &conflicts)?;
             } else if conflicts.is_empty() {
@@ -691,11 +697,10 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Repair(options) => {
-            let repairs = inspect_dfs_repairs(
-                dfs_metadata_root(options.common.metadata_root.clone())?,
-                options.file_system_id.as_ref(),
-                options.object_id.as_ref(),
-            )?;
+            let metadata = open_dfs_metadata_for_inspection(options.common.metadata_root.clone())?;
+            let inspector = metadata.inspector();
+            let repairs =
+                inspector.repairs(options.file_system_id.as_ref(), options.object_id.as_ref())?;
             if options.common.json {
                 print_json("<dfs-repair>", &repairs)?;
             } else if repairs.is_empty() {
@@ -1140,6 +1145,50 @@ pub(crate) fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliEr
 
 pub(crate) fn dfs_metadata_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliError> {
     resolve_dfs_metadata_root(explicit).map_err(Into::into)
+}
+
+pub(crate) fn open_dfs_metadata_for_inspection(
+    explicit: Option<PathBuf>,
+) -> Result<DfsInspectionMetadata, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    open_dfs_metadata_for_inspection_with_data_dir(explicit, &data_dir)
+}
+
+pub(crate) fn open_dfs_metadata_for_inspection_with_data_dir(
+    explicit: Option<PathBuf>,
+    data_dir: &SinomoDataDir,
+) -> Result<DfsInspectionMetadata, CliError> {
+    if let Some(metadata_root) = explicit {
+        return open_root_local_metadata_backend(dfs_metadata_root(Some(metadata_root))?)
+            .map(DfsInspectionMetadata::Root)
+            .map_err(Into::into);
+    }
+
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(data_dir);
+    if cluster_paths.state.exists() {
+        let file_system_id = sifs_file_system_id();
+        let mut shards = network::read_cluster_kv_prefix_entries(
+            &cluster_paths,
+            &format!("{}/", metadata_shards_prefix(&file_system_id)),
+        )?
+        .into_iter()
+        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+        .collect::<Result<Vec<_>, _>>()?;
+        shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+        if !shards.is_empty() {
+            return open_local_sharded_metadata_backend(
+                default_dfs_metadata_shards_root(data_dir),
+                shards,
+            )
+            .map(DfsInspectionMetadata::Sharded)
+            .map_err(Into::into);
+        }
+    }
+
+    open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
+        .map(DfsInspectionMetadata::Root)
+        .map_err(Into::into)
 }
 
 pub(crate) fn dfs_pin_root(explicit: Option<PathBuf>) -> Result<PathBuf, CliError> {

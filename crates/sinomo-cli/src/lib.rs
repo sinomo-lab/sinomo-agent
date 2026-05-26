@@ -185,13 +185,16 @@ use sinomo_runtime::daemon::{
 };
 use sinomo_runtime::dfs::{
     DfsExposeAddRequest, DfsPinAddRequest, DfsPinMode, add_dfs_expose_entry, add_local_dfs_pin,
-    dfs_expose_config_path, ensure_default_dfs_expose_config, fallback_dfs_node_id,
-    inspect_dfs_conflicts, inspect_dfs_file_system, inspect_dfs_object, inspect_dfs_path,
-    inspect_dfs_repairs, inspect_dfs_status, list_local_dfs_pins, load_dfs_expose_config,
-    remove_dfs_expose_entry, remove_local_dfs_pin, resolve_dfs_metadata_root, resolve_dfs_pin_root,
-    sifs_file_system_id,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_expose_config_path,
+    ensure_default_dfs_expose_config, fallback_dfs_node_id, inspect_dfs_status,
+    list_local_dfs_pins, load_dfs_expose_config, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, remove_dfs_expose_entry,
+    remove_local_dfs_pin, resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
 };
-use sinomo_runtime::dfs::{DfsFileSystemId, DfsObjectId};
+use sinomo_runtime::dfs::{
+    DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId, DfsOperatorInspector,
+    LocalJsonMetadataBackend, LocalShardedMetadataBackend,
+};
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};

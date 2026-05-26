@@ -42,14 +42,15 @@ use super::{
     invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
     managed_source_status, models_default_with_data_dir, normalize_model_provider,
-    parse_cli_command, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_models_list_options, parse_models_runtime_command, parse_propose_options,
-    parse_provider_command, parse_rollout_command, parse_sandbox_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, push_unique_introducer, quickjs_setup_script,
-    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
-    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
-    rollout_cluster_targets, rollout_endpoint_candidates, rollout_target_endpoint_for_main,
+    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cluster_command,
+    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
+    parse_install_options, parse_model_default_options, parse_models_list_options,
+    parse_models_runtime_command, parse_propose_options, parse_provider_command,
+    parse_rollout_command, parse_sandbox_command, parse_slash_command, parse_uninstall_options,
+    parse_usage_options, push_unique_introducer, quickjs_setup_script, read_cluster_kv_snapshot,
+    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
+    read_cluster_state, refresh_daemon_node_status_in_kv, rollout_cluster_targets,
+    rollout_endpoint_candidates, rollout_target_endpoint_for_main,
     rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
     run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_cui_with_io_and_daemon_probe,
     run_evolve_command, run_shadow_daemon_with_paths, sandbox_cat_with_store,
@@ -81,11 +82,15 @@ use sinomo_runtime::core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
     ClusterEndpointSource, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
     ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole, ClusterTransportKind,
-    TrustDomain, TrustRing,
+    DfsObjectPolicy, TrustDomain, TrustRing,
 };
 use sinomo_runtime::daemon::daemon_status_matches_options;
+use sinomo_runtime::dfs::{
+    DfsMetadataBackend, DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsObjectVersionRecord,
+    distributed_sifs, distributed_sifs_bootstrap_objects, metadata_shard_key,
+};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery, SessionId};
-use sinomo_runtime::kv::{InProcessKvStore, KvCompare, KvOp, KvRevision, KvTxn};
+use sinomo_runtime::kv::{InProcessKvStore, KvCommand, KvCompare, KvOp, KvRevision, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{ClusterEndpointId, ClusterId, ClusterInviteId, daemon_lan_endpoint};
 use sinomo_runtime::node::{NodeId, main_daemon_capabilities};
@@ -6496,6 +6501,120 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
                 && options.node_id == Some(NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node"))
                 && !options.writable
     ));
+}
+
+#[test]
+fn dfs_operator_inspection_uses_configured_metadata_shards() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-dfs-sharded-inspection-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_paths.ensure().expect("cluster paths");
+    let now = time::OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_cli_dfs_sharded_inspection").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_cli_dfs_sharded_inspection").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "cli dfs sharded inspection",
+        node_id.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    sinomo_runtime::network::write_cluster_state(&cluster_paths, &state)
+        .expect("write cluster state");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        .expect("sync cluster state");
+
+    let file_system = distributed_sifs(node_id.clone());
+    let root_shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: node_id.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let services_shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "services".to_string(),
+        primary_node_id: node_id.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::PathPrefix {
+            prefix: "/services".to_string(),
+        },
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    super::network::append_cluster_raft_command(
+        &cluster_paths,
+        &node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &root_shard,
+                    None,
+                )
+                .expect("root shard op"),
+                KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "services"),
+                    &services_shard,
+                    None,
+                )
+                .expect("services shard op"),
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("write shard configs");
+
+    let mut backend = sinomo_runtime::dfs::open_local_sharded_metadata_backend(
+        sinomo_runtime::dfs::default_dfs_metadata_shards_root(&data_dir),
+        vec![root_shard, services_shard],
+    )
+    .expect("open sharded backend");
+    let mut object = distributed_sifs_bootstrap_objects(node_id)
+        .into_iter()
+        .next()
+        .expect("bootstrap object");
+    object.path = "/services/cli-sharded-inspection.txt".to_string();
+    backend.put_file_system(&file_system).expect("filesystem");
+    backend.put_object(&object).expect("object");
+    backend
+        .put_version(&DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: object.created_by_event_id.clone(),
+            created_at: now,
+            visible: true,
+        })
+        .expect("version");
+
+    let metadata = open_dfs_metadata_for_inspection_with_data_dir(None, &data_dir)
+        .expect("open inspection metadata");
+    let inspector = metadata.inspector();
+    let inspected = inspector
+        .object_by_path(&file_system.file_system_id, &object.path)
+        .expect("inspect path")
+        .expect("object by path");
+
+    assert_eq!(inspected.object.object_id, object.object_id);
+    assert_eq!(inspected.object.path, object.path);
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
