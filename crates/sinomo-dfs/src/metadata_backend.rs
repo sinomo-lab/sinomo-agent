@@ -2318,12 +2318,24 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
-    open_dir_for_sync(path)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        })
+    sync_dir_impl(path).map_err(|source| MetadataBackendError::Io {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+#[cfg(not(windows))]
+fn sync_dir_impl(path: &Path) -> io::Result<()> {
+    open_dir_for_sync(path).and_then(|dir| dir.sync_all())
+}
+
+#[cfg(windows)]
+fn sync_dir_impl(path: &Path) -> io::Result<()> {
+    match open_dir_for_sync(path).and_then(|dir| dir.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        Err(source) => Err(source),
+    }
 }
 
 #[cfg(not(windows))]
