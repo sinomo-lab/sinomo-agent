@@ -2342,6 +2342,93 @@ fn cluster_network_records_publish_overwrite_and_expire() {
 }
 
 #[test]
+fn connectivity_sync_refreshes_stable_records_near_expiry() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-refresh-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = sinomo_local::SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_connectivity_refresh").expect("cluster");
+    let source_node_id =
+        NodeId::from_legacy_named("node_network_connectivity_refresh_source").expect("source");
+    let target_node_id =
+        NodeId::from_legacy_named("node_network_connectivity_refresh_target").expect("target");
+    let endpoint_id = ClusterEndpointId::from_legacy_named("endpoint_network_connectivity_refresh")
+        .expect("endpoint");
+    let mut stored = ClusterConnectivityRecord {
+        cluster_id,
+        source_node_id: source_node_id.clone(),
+        target_node_id,
+        endpoint_id,
+        transport: ClusterTransportKind::LanTcp,
+        address: "192.0.2.12:21353".to_string(),
+        state: ClusterConnectivityState::Healthy,
+        latency_ms: Some(12),
+        consecutive_failures: 0,
+        last_success_at: Some("2026-05-06T00:00:00Z".to_string()),
+        last_failure_at: None,
+        observed_at: now - time::Duration::seconds(300),
+        expires_at: now + time::Duration::seconds(30),
+    };
+    let mut incoming = stored.clone();
+    incoming.latency_ms = Some(18);
+    incoming.observed_at = now;
+    incoming.expires_at = now + time::Duration::seconds(900);
+
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(
+            cluster_connectivity_key(
+                &stored.source_node_id,
+                &stored.target_node_id,
+                &stored.endpoint_id,
+            ),
+            &stored,
+            None,
+        )
+        .expect("stored connectivity");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("cluster kv snapshot");
+
+    let ops = cluster_connectivity_sync_ops(&paths, &source_node_id, &[incoming.clone()])
+        .expect("connectivity sync ops");
+    assert_eq!(
+        ops.len(),
+        1,
+        "stable connectivity records near expiry must refresh their KV TTL"
+    );
+
+    stored.expires_at = now + time::Duration::seconds(300);
+    store
+        .put_serde(
+            cluster_connectivity_key(
+                &stored.source_node_id,
+                &stored.target_node_id,
+                &stored.endpoint_id,
+            ),
+            &stored,
+            None,
+        )
+        .expect("fresh stored connectivity");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("fresh cluster kv snapshot");
+    let ops =
+        cluster_connectivity_sync_ops(&paths, &source_node_id, &[incoming]).expect("fresh ops");
+    assert!(
+        ops.is_empty(),
+        "fresh stable connectivity records should not be rewritten just to update timestamps"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn raft_config_allows_voter_removal_with_overlapping_quorum() {
     let cluster_id = ClusterId::from_legacy_named("cluster_raft_config_overlap").expect("cluster");
     let node_a = NodeId::from_legacy_named("node_raft_config_overlap_a").expect("node a");

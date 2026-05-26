@@ -87,13 +87,15 @@ fn lock_cluster_raft_operation() -> Result<std::sync::MutexGuard<'static, ()>, D
 
 fn cached_network_info_matches(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) -> bool {
     let key = publish_cache_key(paths, &info.node_id);
+    let now = OffsetDateTime::now_utc();
     PUBLISHED_NETWORK_INFO
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
-            cache
-                .get(&key)
-                .is_some_and(|known| sinomo_network::cluster_network_info_stable_eq(known, info))
+            cache.get(&key).is_some_and(|known| {
+                sinomo_network::cluster_network_info_stable_eq(known, info)
+                    && !sinomo_network::cluster_network_record_should_refresh(known.expires_at, now)
+            })
         })
 }
 
@@ -129,33 +131,39 @@ fn remember_node_status(paths: &ClusterPaths, status: &ClusterNodeStatusRecord) 
     }
 }
 
-fn connectivity_cache_key(record: &ClusterConnectivityRecord) -> String {
-    sinomo_network::cluster_connectivity_key(
-        &record.source_node_id,
-        &record.target_node_id,
-        &record.endpoint_id,
+fn connectivity_cache_key(paths: &ClusterPaths, record: &ClusterConnectivityRecord) -> String {
+    format!(
+        "{}:{}",
+        paths.root.display(),
+        sinomo_network::cluster_connectivity_key(
+            &record.source_node_id,
+            &record.target_node_id,
+            &record.endpoint_id,
+        )
     )
 }
 
-fn cached_connectivity_matches(record: &ClusterConnectivityRecord) -> bool {
-    let key = connectivity_cache_key(record);
+fn cached_connectivity_matches(paths: &ClusterPaths, record: &ClusterConnectivityRecord) -> bool {
+    let key = connectivity_cache_key(paths, record);
+    let now = OffsetDateTime::now_utc();
     PUBLISHED_CONNECTIVITY
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
-            cache
-                .get(&key)
-                .is_some_and(|known| sinomo_network::cluster_connectivity_stable_eq(known, record))
+            cache.get(&key).is_some_and(|known| {
+                sinomo_network::cluster_connectivity_stable_eq(known, record)
+                    && !sinomo_network::cluster_network_record_should_refresh(known.expires_at, now)
+            })
         })
 }
 
-fn remember_connectivity_records(records: &[ClusterConnectivityRecord]) {
+fn remember_connectivity_records(paths: &ClusterPaths, records: &[ClusterConnectivityRecord]) {
     if let Ok(mut cache) = PUBLISHED_CONNECTIVITY
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
     {
         for record in records {
-            cache.insert(connectivity_cache_key(record), record.clone());
+            cache.insert(connectivity_cache_key(paths, record), record.clone());
         }
     }
 }
@@ -2126,7 +2134,6 @@ pub fn sync_cluster_network_info_to_kv(
         return Ok(None);
     }
     if sinomo_network::stored_cluster_network_info_matches(paths, &info)? {
-        remember_network_info(paths, &info);
         return Ok(None);
     }
     let mut state = sinomo_network::read_cluster_state(paths)?;
@@ -2157,7 +2164,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
 ) -> Result<Option<KvSnapshot>, DaemonError> {
     let publishable = records
         .into_iter()
-        .filter(|record| !cached_connectivity_matches(record))
+        .filter(|record| !cached_connectivity_matches(paths, record))
         .collect::<Vec<_>>();
     if publishable.is_empty() {
         return Ok(None);
@@ -2165,7 +2172,6 @@ pub fn sync_cluster_connectivity_records_to_kv(
     let success =
         sinomo_network::cluster_connectivity_sync_ops(paths, source_node_id, &publishable)?;
     if success.is_empty() {
-        remember_connectivity_records(&publishable);
         return Ok(None);
     }
     let mut state = sinomo_network::read_cluster_state(paths)?;
@@ -2180,7 +2186,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
     )
     .map(Some);
     if result.is_ok() {
-        remember_connectivity_records(&publishable);
+        remember_connectivity_records(paths, &publishable);
     }
     result
 }
@@ -3015,6 +3021,55 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn connectivity_publish_cache_is_scoped_and_expires_before_kv_ttl() {
+        let root_a = unique_cluster_test_root("sinomo-daemon-connectivity-cache-a");
+        let root_b = unique_cluster_test_root("sinomo-daemon-connectivity-cache-b");
+        let paths_a = ClusterPaths::new(&SinomoDataDir::new(&root_a));
+        let paths_b = ClusterPaths::new(&SinomoDataDir::new(&root_b));
+        paths_a.ensure().expect("paths a");
+        paths_b.ensure().expect("paths b");
+
+        let now = OffsetDateTime::now_utc();
+        let record = ClusterConnectivityRecord {
+            cluster_id: ClusterId::from_legacy_named("cluster_daemon_connectivity_cache")
+                .expect("cluster"),
+            source_node_id: NodeId::from_legacy_named("node_daemon_cache_source").expect("source"),
+            target_node_id: NodeId::from_legacy_named("node_daemon_cache_target").expect("target"),
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_cache",
+            )
+            .expect("endpoint"),
+            transport: ClusterTransportKind::LanTcp,
+            address: "192.0.2.44:21353".to_string(),
+            state: sinomo_network::ClusterConnectivityState::Healthy,
+            latency_ms: Some(9),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(300),
+        };
+
+        remember_connectivity_records(&paths_a, std::slice::from_ref(&record));
+        assert!(cached_connectivity_matches(&paths_a, &record));
+        assert!(
+            !cached_connectivity_matches(&paths_b, &record),
+            "connectivity publish cache must not cross data directories"
+        );
+
+        let mut near_expiry = record;
+        near_expiry.expires_at = now + time::Duration::seconds(30);
+        remember_connectivity_records(&paths_b, std::slice::from_ref(&near_expiry));
+        assert!(
+            !cached_connectivity_matches(&paths_b, &near_expiry),
+            "stable cached connectivity must be publishable before its KV record expires"
+        );
+
+        std::fs::remove_dir_all(root_a).ok();
+        std::fs::remove_dir_all(root_b).ok();
     }
 
     #[test]

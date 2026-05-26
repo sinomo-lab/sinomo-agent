@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
+pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2324,7 +2325,9 @@ pub fn stored_cluster_network_info_matches(
     let Ok(existing) = entry.decode::<ClusterNetworkInfoRecord>() else {
         return Ok(false);
     };
-    Ok(cluster_network_info_stable_eq(&existing, info))
+    let now = OffsetDateTime::now_utc();
+    Ok(cluster_network_info_stable_eq(&existing, info)
+        && !cluster_network_record_should_refresh(existing.expires_at, now))
 }
 
 pub fn cluster_network_info_stable_eq(
@@ -2344,6 +2347,7 @@ pub fn cluster_connectivity_sync_ops(
     records: &[ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, NetworkError> {
     let store = read_cluster_kv_snapshot_store(paths)?;
+    let now = OffsetDateTime::now_utc();
     let mut existing = BTreeMap::new();
     for entry in store.range_prefix(&cluster_connectivity_source_prefix(source_node_id)) {
         match entry.decode::<ClusterConnectivityRecord>() {
@@ -2368,10 +2372,10 @@ pub fn cluster_connectivity_sync_ops(
 
     let mut ops = Vec::new();
     for (key, record) in incoming {
-        if existing
-            .get(&key)
-            .is_some_and(|existing| cluster_connectivity_stable_eq(existing, record))
-        {
+        if existing.get(&key).is_some_and(|existing| {
+            cluster_connectivity_stable_eq(existing, record)
+                && !cluster_network_record_should_refresh(existing.expires_at, now)
+        }) {
             continue;
         }
         ops.push(KvOp::put_serde(key, record, None)?);
@@ -2426,6 +2430,13 @@ fn cluster_network_record_expired(expires_at: OffsetDateTime, now: OffsetDateTim
 
 fn cluster_network_record_live(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {
     expires_at > now
+}
+
+pub fn cluster_network_record_should_refresh(
+    expires_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> bool {
+    expires_at <= now + time::Duration::seconds(CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS)
 }
 
 pub fn cluster_connectivity_stable_eq(
