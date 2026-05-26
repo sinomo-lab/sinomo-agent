@@ -915,6 +915,55 @@ fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
 }
 
 #[test]
+fn stale_cluster_kv_restore_refreshes_materialized_cache_from_raft() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-stale-restore-refresh-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_stale_restore_refresh").expect("node");
+
+    append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/current".to_string(),
+            value: b"current".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed raft");
+    let current = read_cluster_kv_snapshot(&paths).expect("current snapshot");
+
+    let stale = InProcessKvStore::new().snapshot();
+    write_cluster_kv_snapshot(&paths, &stale).expect("write stale cache");
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("stale cache")
+            .revision,
+        stale.revision
+    );
+
+    assert!(
+        !restore_cluster_raft_from_snapshot_if_newer(&paths, &node_id, stale)
+            .expect("restore stale snapshot")
+    );
+    let refreshed = read_cluster_kv_snapshot(&paths).expect("refreshed cache");
+    assert_eq!(refreshed.revision, current.revision);
+    assert!(
+        InProcessKvStore::restore(refreshed)
+            .get("/current")
+            .is_some()
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-raft-append-compacted-{}",

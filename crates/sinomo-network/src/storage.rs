@@ -822,7 +822,9 @@ pub fn restore_cluster_raft_from_snapshot_if_newer(
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
     let node = open_cluster_raft_kv_node(paths, node_id)?;
-    if snapshot.revision <= node.store().snapshot().revision {
+    let local_snapshot = node.store().snapshot();
+    if snapshot.revision <= local_snapshot.revision {
+        write_cluster_kv_snapshot_if_changed(paths, &local_snapshot)?;
         return Ok(false);
     }
     write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
