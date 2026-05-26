@@ -580,7 +580,7 @@ fn iroh_daemon_proxy_keeps_short_timeout_for_regular_commands() {
 }
 
 #[test]
-fn connectivity_sort_prefers_healthy_iroh_over_unreachable_tcp() {
+fn connectivity_sort_uses_iroh_after_direct_tcp_is_known_unavailable() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-connectivity-sort-{}",
         std::time::SystemTime::now()
@@ -657,6 +657,94 @@ fn connectivity_sort_prefers_healthy_iroh_over_unreachable_tcp() {
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn connectivity_graph_keys_records_by_source_target_and_endpoint() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-graph-key-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_graph_key").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_connectivity_graph_key_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_connectivity_graph_key_b").expect("node b");
+    let node_c = NodeId::from_legacy_named("node_connectivity_graph_key_c").expect("node c");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity graph key",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let shared_endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_connectivity_graph_key_shared")
+            .expect("endpoint");
+    let endpoint_b = ClusterEndpointRecord {
+        endpoint_id: shared_endpoint_id.clone(),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "10.0.0.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 1,
+        last_observed_latency_ms: None,
+    };
+    let endpoint_c = ClusterEndpointRecord {
+        endpoint_id: shared_endpoint_id,
+        node_id: node_c.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "10.0.0.42:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 20,
+        last_observed_latency_ms: None,
+    };
+    for (node_id, endpoint, public_key) in [
+        (node_b.clone(), endpoint_b.clone(), "pk-b"),
+        (node_c.clone(), endpoint_c.clone(), "pk-c"),
+    ] {
+        let mut member =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_id, "node", public_key, now);
+        member.capabilities = main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![endpoint];
+        state.members.push(member);
+    }
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &node_a,
+        vec![cluster_connectivity_record(
+            &state,
+            &endpoint_b,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some("failed".to_string()),
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity records");
+
+    let targets = cluster_sync_targets_with_connectivity(&paths, &state);
+
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.node_id),
+        Some(&node_c)
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -1580,6 +1668,46 @@ fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
     state.members.push(member_b);
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &node_a,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &lan,
+                ClusterConnectivityState::Degraded,
+                Some(80),
+                1,
+                Some("slow".to_string()),
+                None,
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &public,
+                ClusterConnectivityState::Healthy,
+                Some(20),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &iroh,
+                ClusterConnectivityState::Healthy,
+                Some(10),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
 
     let targets = cluster_sync_targets_with_connectivity(&paths, &state);
     let ordered_endpoint_ids = targets

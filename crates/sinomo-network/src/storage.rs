@@ -286,6 +286,71 @@ pub struct ClusterConnectivityRecord {
     pub expires_at: OffsetDateTime,
 }
 
+#[derive(Clone, Debug)]
+pub struct ClusterConnectivityGraph {
+    source_node_id: NodeId,
+    records: BTreeMap<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+}
+
+impl ClusterConnectivityGraph {
+    pub fn from_records(
+        source_node_id: NodeId,
+        records: impl IntoIterator<Item = ClusterConnectivityRecord>,
+    ) -> Self {
+        let records = records
+            .into_iter()
+            .map(|record| {
+                (
+                    (
+                        record.source_node_id.clone(),
+                        record.target_node_id.clone(),
+                        record.endpoint_id.clone(),
+                    ),
+                    record,
+                )
+            })
+            .collect();
+        Self {
+            source_node_id,
+            records,
+        }
+    }
+
+    pub fn read_for_local(paths: &ClusterPaths, state: &ClusterBootstrapState) -> Self {
+        Self::from_records(
+            state.local_node_id.clone(),
+            read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default(),
+        )
+    }
+
+    pub fn record_for_endpoint(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+    ) -> Option<&ClusterConnectivityRecord> {
+        self.records.get(&(
+            self.source_node_id.clone(),
+            endpoint.node_id.clone(),
+            endpoint.endpoint_id.clone(),
+        ))
+    }
+
+    pub fn state_for_endpoint(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+    ) -> Option<&ClusterConnectivityState> {
+        self.record_for_endpoint(endpoint)
+            .map(|record| &record.state)
+    }
+
+    pub fn unavailability_rank(&self, endpoint: &ClusterEndpointRecord) -> u8 {
+        cluster_route_unavailability_rank(self.state_for_endpoint(endpoint))
+    }
+
+    pub fn quality_rank(&self, endpoint: &ClusterEndpointRecord) -> u8 {
+        cluster_route_connectivity_quality_rank(self.state_for_endpoint(endpoint))
+    }
+}
+
 pub fn build_cluster_network_info_record(
     state: &ClusterBootstrapState,
     node_id: &NodeId,
@@ -1610,7 +1675,7 @@ pub fn cluster_sync_targets_with_connectivity(
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = cluster_sync_targets(state);
-    let graph = read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     let node_statuses = read_cluster_node_statuses_from_kv(paths)
         .unwrap_or_default()
         .into_iter()
@@ -1622,12 +1687,11 @@ pub fn cluster_sync_targets_with_connectivity(
             Some(sinomo_core::ClusterNodeAvailability::Unknown) | None => 1,
             Some(sinomo_core::ClusterNodeAvailability::Offline) => 2,
         };
-        let connectivity = cluster_connectivity_state_for_endpoint(state, &graph, endpoint);
         (
             node_status_rank,
-            cluster_route_unavailability_rank(connectivity),
+            graph.unavailability_rank(endpoint),
             cluster_endpoint_static_fallback_rank(endpoint),
-            cluster_route_connectivity_quality_rank(connectivity),
+            graph.quality_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
         )
@@ -1639,16 +1703,7 @@ pub fn cluster_raft_command_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    let connectivity = read_cluster_connectivity_graph_from_kv(paths)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|record| {
-            (
-                (record.source_node_id.clone(), record.endpoint_id.clone()),
-                record,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     let mut endpoints_by_node = BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
     for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
         endpoints_by_node
@@ -1657,8 +1712,7 @@ pub fn cluster_raft_command_targets(
             .push(endpoint);
     }
     for endpoints in endpoints_by_node.values_mut() {
-        endpoints
-            .sort_by_key(|endpoint| cluster_raft_route_order_key(state, &connectivity, endpoint));
+        endpoints.sort_by_key(|endpoint| cluster_raft_route_order_key(&graph, endpoint));
         let mut seen = BTreeSet::new();
         endpoints.retain(|endpoint| {
             seen.insert((
@@ -1672,7 +1726,7 @@ pub fn cluster_raft_command_targets(
         .filter_map(|(node_id, endpoints)| {
             endpoints.first().map(|endpoint| {
                 (
-                    cluster_raft_route_order_key(state, &connectivity, endpoint),
+                    cluster_raft_route_order_key(&graph, endpoint),
                     node_id.clone(),
                 )
             })
@@ -1834,7 +1888,7 @@ pub fn cluster_rollout_target_endpoint_for_main(
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
     let shadow_node_id = shadow_daemon_node_id(main_node_id);
-    let graph = read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     let mut candidates = candidates
         .iter()
         .filter(|endpoint| {
@@ -1844,15 +1898,14 @@ pub fn cluster_rollout_target_endpoint_for_main(
         .cloned()
         .collect::<Vec<_>>();
     candidates.sort_by_key(|endpoint| {
-        let connectivity = cluster_connectivity_state_for_endpoint(state, &graph, endpoint);
-        let unreachable_shadow_endpoint = endpoint.node_id == shadow_node_id
-            && cluster_route_unavailability_rank(connectivity) != 0;
+        let unreachable_shadow_endpoint =
+            endpoint.node_id == shadow_node_id && graph.unavailability_rank(endpoint) != 0;
         (
             unreachable_shadow_endpoint,
             endpoint.node_id != shadow_node_id,
-            cluster_route_unavailability_rank(connectivity),
+            graph.unavailability_rank(endpoint),
             cluster_endpoint_static_fallback_rank(endpoint),
-            cluster_route_connectivity_quality_rank(connectivity),
+            graph.quality_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
         )
@@ -1865,33 +1918,17 @@ pub fn sort_cluster_rollout_endpoints(
     state: &ClusterBootstrapState,
     endpoints: &mut [ClusterEndpointRecord],
 ) {
-    let graph = read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     endpoints.sort_by_key(|endpoint| {
-        let connectivity = cluster_connectivity_state_for_endpoint(state, &graph, endpoint);
         (
             endpoint.node_id.clone(),
-            cluster_route_unavailability_rank(connectivity),
+            graph.unavailability_rank(endpoint),
             cluster_endpoint_static_fallback_rank(endpoint),
-            cluster_route_connectivity_quality_rank(connectivity),
+            graph.quality_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
         )
     });
-}
-
-fn cluster_connectivity_state_for_endpoint<'a>(
-    state: &ClusterBootstrapState,
-    graph: &'a [ClusterConnectivityRecord],
-    endpoint: &ClusterEndpointRecord,
-) -> Option<&'a ClusterConnectivityState> {
-    graph
-        .iter()
-        .find(|record| {
-            record.source_node_id == state.local_node_id
-                && record.target_node_id == endpoint.node_id
-                && record.endpoint_id == endpoint.endpoint_id
-        })
-        .map(|record| &record.state)
 }
 
 fn cluster_route_unavailability_rank(connectivity: Option<&ClusterConnectivityState>) -> u8 {
@@ -1933,39 +1970,16 @@ fn cluster_direct_endpoint_static_fallback_rank(endpoint: &ClusterEndpointRecord
 }
 
 fn cluster_raft_route_order_key(
-    state: &ClusterBootstrapState,
-    connectivity: &BTreeMap<(NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+    graph: &ClusterConnectivityGraph,
     endpoint: &ClusterEndpointRecord,
 ) -> (u8, u8, u8, u16, String) {
     (
-        cluster_raft_route_unavailability_rank(state, connectivity, endpoint),
+        graph.unavailability_rank(endpoint),
         cluster_endpoint_static_fallback_rank(endpoint),
-        cluster_raft_route_connectivity_quality_rank(state, connectivity, endpoint),
+        graph.quality_rank(endpoint),
         endpoint.priority,
         endpoint.address.clone(),
     )
-}
-
-fn cluster_raft_route_unavailability_rank(
-    state: &ClusterBootstrapState,
-    connectivity: &BTreeMap<(NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
-    endpoint: &ClusterEndpointRecord,
-) -> u8 {
-    let connectivity_state = connectivity
-        .get(&(state.local_node_id.clone(), endpoint.endpoint_id.clone()))
-        .map(|record| &record.state);
-    cluster_route_unavailability_rank(connectivity_state)
-}
-
-fn cluster_raft_route_connectivity_quality_rank(
-    state: &ClusterBootstrapState,
-    connectivity: &BTreeMap<(NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
-    endpoint: &ClusterEndpointRecord,
-) -> u8 {
-    let connectivity_state = connectivity
-        .get(&(state.local_node_id.clone(), endpoint.endpoint_id.clone()))
-        .map(|record| &record.state);
-    cluster_route_connectivity_quality_rank(connectivity_state)
 }
 
 pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
