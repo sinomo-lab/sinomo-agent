@@ -534,6 +534,8 @@ impl LocalJsonMetadataBackend {
             root,
             next_sequence,
         };
+        backend.ensure_local_materialization_cursor()?;
+        backend.recover_unmaterialized_local_journal_entries()?;
         if backend.secondary_indexes_need_recovery() {
             backend.recover_secondary_indexes()?;
         }
@@ -834,6 +836,165 @@ impl LocalJsonMetadataBackend {
         Ok(entry)
     }
 
+    fn ensure_local_materialization_cursor(&self) -> Result<()> {
+        if self.local_materialization_cursor_path().is_file() {
+            return Ok(());
+        }
+        write_json_atomic(
+            &self.local_materialization_cursor_path(),
+            &DfsMetadataReplayCursor {
+                shard_id: self.shard_id.clone(),
+                last_sequence: self.next_sequence.saturating_sub(1),
+            },
+        )
+    }
+
+    fn local_materialization_cursor(&self) -> Result<DfsMetadataReplayCursor> {
+        Ok(read_json_optional::<DfsMetadataReplayCursor>(
+            &self.local_materialization_cursor_path(),
+        )?
+        .unwrap_or(DfsMetadataReplayCursor {
+            shard_id: self.shard_id.clone(),
+            last_sequence: self.next_sequence.saturating_sub(1),
+        }))
+    }
+
+    fn advance_local_materialization_cursor(&self, sequence: u64) -> Result<()> {
+        let current = self.local_materialization_cursor()?;
+        write_json_atomic(
+            &self.local_materialization_cursor_path(),
+            &DfsMetadataReplayCursor {
+                shard_id: self.shard_id.clone(),
+                last_sequence: sequence.max(current.last_sequence),
+            },
+        )
+    }
+
+    fn recover_unmaterialized_local_journal_entries(&self) -> Result<()> {
+        let mut cursor = self.local_materialization_cursor()?;
+        loop {
+            let entries = journal_entries_since_limited(
+                &self.root,
+                cursor.last_sequence,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            )?;
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries {
+                self.materialize_local_journal_entry(&entry)?;
+                cursor.last_sequence = entry.sequence;
+                write_json_atomic(&self.local_materialization_cursor_path(), &cursor)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn materialize_local_journal_entry(&self, entry: &DfsMetadataJournalEntry) -> Result<()> {
+        match &entry.mutation {
+            DfsMetadataMutation::PutFileSystem {
+                file_system_id,
+                file_system,
+            } => {
+                let Some(file_system) = file_system.as_ref() else {
+                    return Ok(());
+                };
+                write_json_atomic(&self.file_system_path(file_system_id), file_system)
+            }
+            DfsMetadataMutation::PutObject { object, .. } => {
+                let Some(object) = object.as_ref() else {
+                    return Ok(());
+                };
+                if self.get_file_system(&object.file_system_id)?.is_none() {
+                    return Err(MetadataBackendError::UnknownFileSystem {
+                        file_system_id: object.file_system_id.clone(),
+                    });
+                }
+                let previous = self.get_object(&object.object_id)?;
+                self.materialize_object_indexes_with_previous(object, previous.as_ref())
+            }
+            DfsMetadataMutation::PutVersion { version_record, .. } => {
+                let Some(version_record) = version_record.as_ref() else {
+                    return Ok(());
+                };
+                write_json_atomic(
+                    &self.version_path(&version_record.object_id, &version_record.version),
+                    &normalized_version_record(version_record),
+                )
+            }
+            DfsMetadataMutation::PutReceipt { receipt, .. } => {
+                let Some(receipt) = receipt.as_ref() else {
+                    return Ok(());
+                };
+                write_json_atomic(
+                    &self.receipt_path(
+                        &receipt.receipt.object_id,
+                        &receipt.receipt.committed_version,
+                        &receipt.replica_node_id,
+                    ),
+                    receipt,
+                )
+            }
+            DfsMetadataMutation::PutIntent { intent, .. } => {
+                let Some(intent) = intent.as_ref() else {
+                    return Ok(());
+                };
+                write_json_atomic(
+                    &self.intent_path(&intent.object_id, &intent.intent_id),
+                    intent,
+                )
+            }
+            DfsMetadataMutation::CommitVisibleVersion {
+                previous_version,
+                committed_object,
+                visible_version,
+                required_replica_node_ids,
+                ..
+            } => {
+                let Some(committed_object) = committed_object.as_ref() else {
+                    return Ok(());
+                };
+                let Some(visible_version) = visible_version.as_ref() else {
+                    return Ok(());
+                };
+                let commit_record = DfsVisibleVersionCommitRecord {
+                    expected_version: previous_version.clone(),
+                    committed_object: normalized_object_metadata(committed_object),
+                    visible_version: normalized_version_record(visible_version),
+                    required_replica_node_ids: normalized_node_location_list(
+                        required_replica_node_ids,
+                    ),
+                    created_at: entry.created_at,
+                };
+                write_json_atomic(
+                    &self.visible_commit_path(
+                        &commit_record.committed_object.object_id,
+                        &commit_record.committed_object.version,
+                    ),
+                    &commit_record,
+                )?;
+                self.materialize_visible_version_commit(&commit_record)
+            }
+            DfsMetadataMutation::PutConflict { conflict, .. } => {
+                let Some(conflict) = conflict.as_ref() else {
+                    return Ok(());
+                };
+                write_json_atomic(&self.conflict_path(conflict), conflict)
+            }
+            DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
+                let Some(transaction) = transaction.as_ref() else {
+                    return Ok(());
+                };
+                let transaction = normalized_namespace_transaction(transaction);
+                write_json_atomic(
+                    &self.namespace_transaction_path(&transaction.transaction_id),
+                    &transaction,
+                )?;
+                self.materialize_namespace_transaction(&transaction)
+            }
+        }
+    }
+
     fn records_root(&self) -> PathBuf {
         self.root.join("records")
     }
@@ -1013,6 +1174,12 @@ impl LocalJsonMetadataBackend {
             .join(format!("{}.sobj", key_segment(&shard_id.0)))
     }
 
+    fn local_materialization_cursor_path(&self) -> PathBuf {
+        self.records_root()
+            .join("local-materialization")
+            .join("cursor.sobj")
+    }
+
     fn metadata_replication_cursor_path(
         &self,
         target_node_id: &NodeId,
@@ -1031,14 +1198,16 @@ impl LocalJsonMetadataBackend {
 
 impl DfsMetadataBackend for LocalJsonMetadataBackend {
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
+        let entry = self.write_journal(DfsMetadataMutation::PutFileSystem {
+            file_system_id: file_system.file_system_id.clone(),
+            file_system: Some(file_system.clone()),
+        })?;
         write_json_atomic(
             &self.file_system_path(&file_system.file_system_id),
             file_system,
         )?;
-        self.write_journal(DfsMetadataMutation::PutFileSystem {
-            file_system_id: file_system.file_system_id.clone(),
-            file_system: Some(file_system.clone()),
-        })
+        self.advance_local_materialization_cursor(entry.sequence)?;
+        Ok(entry)
     }
 
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>> {
@@ -1058,14 +1227,15 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         }
 
         let previous = self.get_object(&object.object_id)?;
-        self.materialize_object_indexes_with_previous(&object, previous.as_ref())?;
-
-        self.write_journal(DfsMetadataMutation::PutObject {
+        let entry = self.write_journal(DfsMetadataMutation::PutObject {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             path: object.path.clone(),
-            object: Some(object),
-        })
+            object: Some(object.clone()),
+        })?;
+        self.materialize_object_indexes_with_previous(&object, previous.as_ref())?;
+        self.advance_local_materialization_cursor(entry.sequence)?;
+        Ok(entry)
     }
 
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
@@ -1200,16 +1370,24 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
 
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
         let version = normalized_version_record(version);
-        write_json_atomic(
-            &self.version_path(&version.object_id, &version.version),
-            &version,
-        )?;
-        self.write_journal(DfsMetadataMutation::PutVersion {
+        let entry = self.write_journal(DfsMetadataMutation::PutVersion {
             file_system_id: version.file_system_id.clone(),
             object_id: version.object_id.clone(),
             version: version.version.clone(),
             version_record: Some(version),
-        })
+        })?;
+        if let DfsMetadataMutation::PutVersion {
+            version_record: Some(version),
+            ..
+        } = &entry.mutation
+        {
+            write_json_atomic(
+                &self.version_path(&version.object_id, &version.version),
+                version,
+            )?;
+        }
+        self.advance_local_materialization_cursor(entry.sequence)?;
+        Ok(entry)
     }
 
     fn get_version(
@@ -1231,6 +1409,13 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         &mut self,
         receipt: &DfsReplicaReceiptRecord,
     ) -> Result<DfsMetadataJournalEntry> {
+        let entry = self.write_journal(DfsMetadataMutation::PutReceipt {
+            file_system_id: receipt.receipt.file_system_id.clone(),
+            object_id: receipt.receipt.object_id.clone(),
+            version: receipt.receipt.committed_version.clone(),
+            replica_node_id: receipt.replica_node_id.clone(),
+            receipt: Some(receipt.clone()),
+        })?;
         write_json_atomic(
             &self.receipt_path(
                 &receipt.receipt.object_id,
@@ -1239,13 +1424,8 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             ),
             receipt,
         )?;
-        self.write_journal(DfsMetadataMutation::PutReceipt {
-            file_system_id: receipt.receipt.file_system_id.clone(),
-            object_id: receipt.receipt.object_id.clone(),
-            version: receipt.receipt.committed_version.clone(),
-            replica_node_id: receipt.replica_node_id.clone(),
-            receipt: Some(receipt.clone()),
-        })
+        self.advance_local_materialization_cursor(entry.sequence)?;
+        Ok(entry)
     }
 
     fn receipts_for_version(
@@ -1257,17 +1437,19 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry> {
-        write_json_atomic(
-            &self.intent_path(&intent.object_id, &intent.intent_id),
-            intent,
-        )?;
-        self.write_journal(DfsMetadataMutation::PutIntent {
+        let entry = self.write_journal(DfsMetadataMutation::PutIntent {
             file_system_id: intent.file_system_id.clone(),
             object_id: intent.object_id.clone(),
             intent_id: intent.intent_id.clone(),
             status: intent.status.clone(),
             intent: Some(intent.clone()),
-        })
+        })?;
+        write_json_atomic(
+            &self.intent_path(&intent.object_id, &intent.intent_id),
+            intent,
+        )?;
+        self.advance_local_materialization_cursor(entry.sequence)?;
+        Ok(entry)
     }
 
     fn get_intent(
@@ -1330,9 +1512,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             &self.visible_commit_path(&committed_object.object_id, &committed_object.version),
             &commit_record,
         )?;
-        self.materialize_visible_version_commit(&commit_record)?;
-
-        self.write_journal(DfsMetadataMutation::CommitVisibleVersion {
+        let entry = self.write_journal(DfsMetadataMutation::CommitVisibleVersion {
             file_system_id: committed_object.file_system_id.clone(),
             object_id: committed_object.object_id.clone(),
             previous_version: expected_version.clone(),
@@ -1340,7 +1520,10 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             committed_object: Some(commit_record.committed_object.clone()),
             visible_version: Some(commit_record.visible_version.clone()),
             required_replica_node_ids: commit_record.required_replica_node_ids.clone(),
-        })
+        })?;
+        self.materialize_visible_version_commit(&commit_record)?;
+        self.advance_local_materialization_cursor(entry.sequence)?;
+        Ok(entry)
     }
 
     fn apply_namespace_transaction(
@@ -1367,23 +1550,33 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             &self.namespace_transaction_path(&transaction.transaction_id),
             &transaction,
         )?;
-        self.materialize_namespace_transaction(&transaction)?;
-        self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
+        let entry = self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
             file_system_id: transaction.file_system_id.clone(),
             transaction_id: transaction.transaction_id.clone(),
             object_count: transaction.objects.len(),
             transaction: Some(transaction),
-        })
+        })?;
+        if let DfsMetadataMutation::ApplyNamespaceTransaction {
+            transaction: Some(transaction),
+            ..
+        } = &entry.mutation
+        {
+            self.materialize_namespace_transaction(transaction)?;
+        }
+        self.advance_local_materialization_cursor(entry.sequence)?;
+        Ok(entry)
     }
 
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry> {
-        write_json_atomic(&self.conflict_path(conflict), conflict)?;
-        self.write_journal(DfsMetadataMutation::PutConflict {
+        let entry = self.write_journal(DfsMetadataMutation::PutConflict {
             file_system_id: conflict.file_system_id.clone(),
             object_id: conflict.object_id.clone(),
             conflict_id: conflict.conflict_id.clone(),
             conflict: Some(conflict.clone()),
-        })
+        })?;
+        write_json_atomic(&self.conflict_path(conflict), conflict)?;
+        self.advance_local_materialization_cursor(entry.sequence)?;
+        Ok(entry)
     }
 
     fn get_conflict(
@@ -2707,6 +2900,92 @@ mod tests {
         let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(reopened.journal_since(1).expect("journal").len(), 1);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_does_not_materialize_object_when_journal_append_fails() {
+        let root = temp_root("local_backend_journal_failure_does_not_materialize_object");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+        backend.put_file_system(&file_system).expect("filesystem");
+        fs::remove_dir_all(root.join("journal").join("segments")).expect("remove segments dir");
+        fs::write(root.join("journal").join("segments"), b"not a directory")
+            .expect("block journal segment writes");
+
+        let error = backend
+            .put_object(&object)
+            .expect_err("object write should fail before materialization when the journal fails");
+
+        assert!(
+            matches!(error, MetadataBackendError::Io { .. }),
+            "journal append failure should be surfaced as I/O: {error:?}"
+        );
+        assert_eq!(
+            backend
+                .get_object(&object.object_id)
+                .expect("object lookup"),
+            None,
+            "object metadata must not become visible without a journal entry"
+        );
+        assert!(
+            !backend
+                .path_index_path(&object.file_system_id, &object.path)
+                .exists(),
+            "path index must not become visible without a journal entry"
+        );
+
+        fs::remove_file(root.join("journal").join("segments")).ok();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_replays_journal_entries_after_materialization_cursor() {
+        let root = temp_root("local_backend_replays_after_materialization_cursor");
+        let object = object(version("version_1"));
+        let journaled_sequence = {
+            let mut backend =
+                LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                    .expect("backend");
+            let file_system = file_system();
+            backend.put_file_system(&file_system).expect("filesystem");
+            let entry = backend
+                .write_journal(DfsMetadataMutation::PutObject {
+                    file_system_id: object.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                    path: object.path.clone(),
+                    object: Some(object.clone()),
+                })
+                .expect("journal object without materializing");
+            assert_eq!(
+                backend
+                    .get_object(&object.object_id)
+                    .expect("object lookup"),
+                None
+            );
+            entry.sequence
+        };
+
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen");
+
+        assert_eq!(
+            reopened
+                .get_object(&object.object_id)
+                .expect("object lookup"),
+            Some(object.clone()),
+            "reopen should replay journaled metadata that was not yet materialized"
+        );
+        assert_eq!(
+            read_json::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
+                .expect("materialization cursor")
+                .last_sequence,
+            journaled_sequence
+        );
 
         cleanup(&root);
     }

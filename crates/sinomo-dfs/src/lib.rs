@@ -6362,7 +6362,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 true
             }
         };
-        self.mark_repaired_location(object_id, version, replica_node_id, content_hash)?;
+        match self.mark_repaired_location(object_id, version, replica_node_id, content_hash) {
+            Ok(()) | Err(DfsError::UnknownObject { .. }) => {}
+            Err(error) => return Err(error),
+        }
         Ok(inserted)
     }
 
