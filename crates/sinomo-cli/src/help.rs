@@ -153,6 +153,10 @@ pub(super) fn print_dfs_help() {
     println!("      Summarize local shard metadata, writes, repairs, and conflicts.");
     println!("  sinomo dfs filesystem <file_system_id> [--metadata-root <path>] [--json]");
     println!("      Inspect one filesystem.");
+    println!(
+        "  sinomo dfs path <path> [--filesystem <file_system_id>] [--metadata-root <path>] [--json]"
+    );
+    println!("      Inspect one object by filesystem path, including replica locations.");
     println!("  sinomo dfs object <object_id> [--metadata-root <path>] [--json]");
     println!("      Inspect one object with versions, receipts, intents, conflicts, and repairs.");
     println!(

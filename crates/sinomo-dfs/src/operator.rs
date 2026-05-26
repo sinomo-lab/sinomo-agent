@@ -208,6 +208,17 @@ impl<'a> DfsOperatorInspector<'a> {
         }))
     }
 
+    pub fn object_by_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsOperatorObjectView>, MetadataBackendError> {
+        let Some(object) = self.backend.get_object_by_path(file_system_id, path)? else {
+            return Ok(None);
+        };
+        self.object(&object.object_id)
+    }
+
     pub fn conflicts(
         &self,
         file_system_id: Option<&DfsFileSystemId>,
@@ -717,6 +728,11 @@ mod tests {
             object.repairs[0].missing_replica_node_id,
             node("node_replica")
         );
+        let path_object = inspector
+            .object_by_path(&file_system_id(), "/artifact.bin")
+            .expect("path object")
+            .expect("path object");
+        assert_eq!(path_object.object.object_id, object_id());
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

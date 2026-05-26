@@ -6294,6 +6294,21 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
     );
     assert!(matches!(
         parse_dfs_command(&[
+            "path".to_string(),
+            "/services/sandbox/instances/01hxy6qa9k0t9vr4g9n8d3q5d2/manifest.sobj"
+                .to_string(),
+            "--filesystem".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d0".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("dfs path"),
+        DfsCliCommand::Path { path, file_system_id, options }
+            if path == "/services/sandbox/instances/01hxy6qa9k0t9vr4g9n8d3q5d2/manifest.sobj"
+                && file_system_id == sinomo_runtime::dfs::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0").expect("filesystem")
+                && options.json
+    ));
+    assert!(matches!(
+        parse_dfs_command(&[
             "pin".to_string(),
             "add".to_string(),
             "--path".to_string(),

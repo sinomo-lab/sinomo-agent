@@ -8,6 +8,11 @@ pub(crate) enum DfsCliCommand {
         file_system_id: DfsFileSystemId,
         options: DfsCommonOptions,
     },
+    Path {
+        path: String,
+        file_system_id: DfsFileSystemId,
+        options: DfsCommonOptions,
+    },
     Object {
         object_id: DfsObjectId,
         options: DfsCommonOptions,
@@ -116,6 +121,7 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
                 options: parse_dfs_common_options(rest)?,
             })
         }
+        Some((command, rest)) if command == "path" => parse_dfs_path_command(rest),
         Some((command, rest)) if command == "object" => {
             let (id, rest) = rest.split_first().ok_or(CliError::Usage)?;
             Ok(DfsCliCommand::Object {
@@ -158,6 +164,40 @@ pub(crate) fn parse_dfs_common_options(args: &[String]) -> Result<DfsCommonOptio
         index += 1;
     }
     Ok(options)
+}
+
+pub(crate) fn parse_dfs_path_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
+    let (path, rest) = args.split_first().ok_or(CliError::Usage)?;
+    let mut file_system_id = default_dfs_file_system_id();
+    let mut common_args = Vec::new();
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--filesystem" | "--fs" => {
+                index += 1;
+                let Some(value) = rest.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                file_system_id = parse_dfs_file_system_id(value)?;
+            }
+            "--metadata-root" => {
+                common_args.push(rest[index].clone());
+                index += 1;
+                let Some(value) = rest.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                common_args.push(value.clone());
+            }
+            "--json" => common_args.push(rest[index].clone()),
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(DfsCliCommand::Path {
+        path: path.clone(),
+        file_system_id,
+        options: parse_dfs_common_options(&common_args)?,
+    })
 }
 
 pub(crate) fn parse_dfs_filter_options(args: &[String]) -> Result<DfsFilterOptions, CliError> {
@@ -534,6 +574,29 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             }
             Ok(())
         }
+        DfsCliCommand::Path {
+            path,
+            file_system_id,
+            options,
+        } => {
+            let Some(object) = inspect_dfs_path(
+                dfs_metadata_root(options.metadata_root.clone())?,
+                &file_system_id,
+                &path,
+            )?
+            else {
+                return Err(CliError::MissingArtifact {
+                    artifact: format!("DFS path {path} in filesystem {file_system_id}"),
+                });
+            };
+            if options.json {
+                print_json("<dfs-path>", &object)?;
+            } else {
+                println!("DFS path: {path}");
+                print_dfs_object_view(&object);
+            }
+            Ok(())
+        }
         DfsCliCommand::Object { object_id, options } => {
             let Some(object) = inspect_dfs_object(
                 dfs_metadata_root(options.metadata_root.clone())?,
@@ -547,34 +610,7 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             if options.json {
                 print_json("<dfs-object>", &object)?;
             } else {
-                println!("DFS object: {}", object.object.object_id);
-                println!("  filesystem: {}", object.object.file_system_id);
-                println!("  path: {}", object.object.path);
-                println!("  owner: {}", object.object.owner_node_id);
-                println!("  policy: {:?}", object.object.policy);
-                println!("  visible version: {}", object.object.version);
-                println!(
-                    "  content hash: {}",
-                    option_label(&object.object.content_hash)
-                );
-                println!(
-                    "  locations: {}",
-                    join_labels(&object.object.current_locations)
-                );
-                println!("  agent state: {:?}", object.agent_state);
-                println!("  versions: {}", object.versions.len());
-                println!("  receipts: {}", object.receipts.len());
-                println!("  intents: {}", object.intents.len());
-                println!("  pending repairs: {}", object.repairs.len());
-                println!(
-                    "  open conflicts: {}",
-                    object
-                        .conflicts
-                        .iter()
-                        .filter(|conflict| conflict.status
-                            == sinomo_runtime::dfs::DfsConflictStatus::Open)
-                        .count()
-                );
+                print_dfs_object_view(&object);
             }
             Ok(())
         }
@@ -645,6 +681,36 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
         DfsCliCommand::Expose(command) => run_dfs_expose_command(command),
     }
+}
+
+fn print_dfs_object_view(object: &sinomo_runtime::dfs::DfsOperatorObjectView) {
+    println!("DFS object: {}", object.object.object_id);
+    println!("  filesystem: {}", object.object.file_system_id);
+    println!("  path: {}", object.object.path);
+    println!("  owner: {}", object.object.owner_node_id);
+    println!("  policy: {:?}", object.object.policy);
+    println!("  visible version: {}", object.object.version);
+    println!(
+        "  content hash: {}",
+        option_label(&object.object.content_hash)
+    );
+    println!(
+        "  locations: {}",
+        join_labels(&object.object.current_locations)
+    );
+    println!("  agent state: {:?}", object.agent_state);
+    println!("  versions: {}", object.versions.len());
+    println!("  receipts: {}", object.receipts.len());
+    println!("  intents: {}", object.intents.len());
+    println!("  pending repairs: {}", object.repairs.len());
+    println!(
+        "  open conflicts: {}",
+        object
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
+            .count()
+    );
 }
 
 pub(crate) fn run_dfs_expose_command(command: DfsExposeCliCommand) -> Result<(), CliError> {

@@ -267,6 +267,15 @@ pub fn inspect_dfs_object(
     DfsOperatorInspector::new(&backend).object(object_id)
 }
 
+pub fn inspect_dfs_path(
+    root: impl Into<PathBuf>,
+    file_system_id: &DfsFileSystemId,
+    path: &str,
+) -> Result<Option<DfsOperatorObjectView>, MetadataBackendError> {
+    let backend = open_root_local_metadata_backend(root)?;
+    DfsOperatorInspector::new(&backend).object_by_path(file_system_id, path)
+}
+
 pub fn inspect_dfs_conflicts(
     root: impl Into<PathBuf>,
     file_system_id: Option<&DfsFileSystemId>,
