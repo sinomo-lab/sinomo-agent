@@ -81,7 +81,6 @@ use sinomo_runtime::daemon::{
     activate_boot_entries as daemon_activate_boot_entries,
     build_cluster_join_invite as daemon_build_cluster_join_invite, cluster_doctor_findings,
     cluster_has_local_quorum, cluster_health_rows,
-    cluster_invite_publish_targets as daemon_cluster_invite_publish_targets,
     cluster_peer_members as daemon_cluster_peer_members, cluster_reachable_voter_count,
     cluster_rollout_should_use_remote_build as daemon_cluster_rollout_should_use_remote_build,
     daemon_bind_address, daemon_cluster_registration,

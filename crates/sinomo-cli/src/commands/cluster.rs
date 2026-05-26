@@ -631,10 +631,18 @@ fn cluster_invite_requires_voter_error(
 }
 
 pub(crate) fn cluster_invite_publish_targets(
-    _paths: &ClusterPaths,
+    paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    daemon_cluster_invite_publish_targets(state)
+    let mut seen_nodes = std::collections::BTreeSet::new();
+    let mut targets = Vec::new();
+    for endpoint in network::cluster_voter_command_targets(paths, state) {
+        if !seen_nodes.insert(endpoint.node_id.clone()) {
+            continue;
+        }
+        targets.push(endpoint);
+    }
+    targets
 }
 
 pub(crate) fn build_cluster_invite(

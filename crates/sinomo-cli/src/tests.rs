@@ -5394,6 +5394,140 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
 }
 
 #[test]
+fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-invite-target-connectivity-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_invite_target_connectivity").expect("cluster");
+    let local_node = NodeId::from_legacy_named("node_invite_connectivity_local").expect("node");
+    let voter_node = NodeId::from_legacy_named("node_invite_connectivity_voter").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "invite target connectivity",
+        local_node,
+        "local",
+        "local-public-key",
+        now,
+    );
+    let lan = sinomo_runtime::network::daemon_lan_endpoint(
+        &voter_node,
+        "10.0.0.41:21353".to_string(),
+        20,
+    );
+    let public = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_connectivity_public")
+            .expect("endpoint"),
+        node_id: voter_node.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "203.0.113.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 30,
+        last_observed_latency_ms: None,
+    };
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: sinomo_runtime::network::stable_iroh_endpoint_id(
+            &voter_node,
+            "iroh_public_key_invite_connectivity",
+        ),
+        node_id: voter_node.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_invite_connectivity?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let mut voter = ClusterMemberRecord::local_voter(
+        cluster_id,
+        voter_node.clone(),
+        "remote voter",
+        "remote-voter-public-key",
+        now,
+    );
+    voter.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    voter.allowed_capabilities = voter.capabilities.clone();
+    voter.endpoints = vec![iroh.clone(), public.clone(), lan.clone()];
+    state.members.push(voter);
+    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync kv");
+
+    let targets = cluster_invite_publish_targets(&paths, &state);
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&lan.endpoint_id)
+    );
+
+    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &state.local_node_id,
+        vec![sinomo_runtime::network::cluster_connectivity_record(
+            &state,
+            &lan,
+            sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some("failed".to_string()),
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity records");
+    let targets = cluster_invite_publish_targets(&paths, &state);
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&public.endpoint_id)
+    );
+
+    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &state.local_node_id,
+        vec![
+            sinomo_runtime::network::cluster_connectivity_record(
+                &state,
+                &lan,
+                sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("failed".to_string()),
+                now,
+                60,
+            ),
+            sinomo_runtime::network::cluster_connectivity_record(
+                &state,
+                &public,
+                sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("failed".to_string()),
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+    let targets = cluster_invite_publish_targets(&paths, &state);
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&iroh.endpoint_id)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn default_invite_compaction_keeps_iroh_fallback() {
     let node_id = NodeId::from_legacy_named("node_invite_compact").expect("node");
     let mut endpoints = vec![

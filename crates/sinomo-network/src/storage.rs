@@ -3043,7 +3043,7 @@ pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpoin
         let mut endpoints = member.endpoints.clone();
         endpoints.sort_by_key(|endpoint| {
             (
-                endpoint.privacy != ClusterEndpointPrivacy::Lan,
+                cluster_endpoint_static_fallback_rank(endpoint),
                 endpoint.priority,
                 endpoint.address.clone(),
             )

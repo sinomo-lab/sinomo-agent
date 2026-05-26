@@ -1616,6 +1616,65 @@ fn connectivity_sort_prefers_unknown_public_tcp_over_unknown_iroh() {
 }
 
 #[test]
+fn cluster_sync_targets_keep_lan_public_iroh_order_before_connectivity() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_static_route_order").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_static_route_order_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_static_route_order_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "static route order",
+        node_a,
+        "node a",
+        "pk-a",
+        now,
+    );
+    let lan = daemon_lan_endpoint(&node_b, "10.0.0.41:21353".to_string(), 80);
+    let public = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_static_route_order_public")
+            .expect("endpoint"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "203.0.113.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&node_b, "iroh_public_key_static_route_order"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_static_route_order?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let mut member_b = ClusterMemberRecord::local_voter(cluster_id, node_b, "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![iroh.clone(), public.clone(), lan.clone()];
+    state.members.push(member_b);
+
+    let targets = cluster_sync_targets(&state);
+    let ordered_endpoint_ids = targets
+        .iter()
+        .map(|endpoint| endpoint.endpoint_id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        &ordered_endpoint_ids[..3],
+        &[
+            lan.endpoint_id.clone(),
+            public.endpoint_id.clone(),
+            iroh.endpoint_id.clone(),
+        ]
+    );
+}
+
+#[test]
 fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-lan-public-iroh-sort-{}",
