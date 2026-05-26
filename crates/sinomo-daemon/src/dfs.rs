@@ -651,7 +651,8 @@ mod tests {
     };
     use sinomo_dfs::{
         DfsBlobTransferResult, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-        DfsProtocolFrameCommand, DfsStageBlobCommand, DfsVersion,
+        DfsProtocolFrameCommand, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
+        DfsWriteOptions,
     };
     use sinomo_network::{
         MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
@@ -914,6 +915,88 @@ mod tests {
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].received_by, local);
         assert_eq!(incoming[0].frame.source_node_id, remote);
+    }
+
+    #[test]
+    fn daemon_dfs_endpoint_transport_completes_synchronous_replica_write() {
+        let root = temp_root("daemon_dfs_endpoint_transport_replica_write");
+        let local = NodeId::from_legacy_named("node_dfs_endpoint_write_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_endpoint_write_remote").expect("remote");
+        let endpoint = test_endpoint(&remote, "192.0.2.11:21353");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_sender = Arc::clone(&calls);
+        let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+            let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
+                panic!("expected protocol frame");
+            };
+            let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
+            let DfsNetworkMessage::StageBlob(stage) = message else {
+                return Ok(DfsProtocolFrameResponse {
+                    request_id: command.request_id.clone(),
+                    outbound_frames: Vec::new(),
+                });
+            };
+            calls_for_sender
+                .lock()
+                .expect("calls lock")
+                .push(stage.request_id.clone());
+            let response = DfsNetworkMessage::StageBlobResponse(sinomo_dfs::DfsStageBlobResponse {
+                request_id: stage.request_id,
+                intent_id: stage.intent_id,
+                file_system_id: stage.file_system_id,
+                object_id: stage.object_id,
+                version: stage.version,
+                replica_node_id: command.frame.target_node_id.clone(),
+                result: DfsBlobTransferResult::Durable {
+                    content_hash: stage.content_hash,
+                },
+            });
+            Ok(DfsProtocolFrameResponse {
+                request_id: command.request_id.clone(),
+                outbound_frames: vec![NetworkFrame {
+                    frame_id: NetworkFrameId(100),
+                    source_node_id: command.frame.target_node_id.clone(),
+                    target_node_id: command.frame.source_node_id.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(100),
+                        origin_node_id: command.frame.target_node_id.clone(),
+                        target_node_id: command.frame.source_node_id.clone(),
+                        body: MeshMessageBody::Protocol(
+                            ProtocolMessage::encode(sinomo_dfs::DFS_PROTOCOL, &response)
+                                .expect("encode response"),
+                        ),
+                    },
+                }],
+            })
+        });
+        let transport = DaemonDfsEndpointTransport::with_sender(
+            local.clone(),
+            vec![endpoint],
+            Duration::from_millis(1),
+            sender,
+        );
+        let content = LocalContentStore::new(root.join("content")).expect("content store");
+        let mut dfs = NetworkedDfsService::new(transport, content);
+        dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+        dfs.posix_mkdir_all("/services").expect("services dir");
+
+        let stat = dfs
+            .posix_write_file(
+                "/services/daemon-endpoint-transport.txt",
+                b"replicated bytes",
+                DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+                    replica_candidates: vec![local.clone(), remote.clone()],
+                    wait_for_commit: true,
+                },
+            )
+            .expect("replicated write");
+
+        assert_eq!(calls.lock().expect("calls lock").len(), 1);
+        assert_eq!(stat.current_locations, vec![local, remote]);
+        assert_eq!(stat.size_bytes, Some(b"replicated bytes".len() as u64));
+
+        cleanup(&root);
     }
 
     fn write_test_cluster_state(data_root: &std::path::Path, node_id: &NodeId) {

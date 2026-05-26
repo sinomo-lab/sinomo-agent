@@ -2382,6 +2382,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
                 }
             }
+            self.process_incoming()?;
         }
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;

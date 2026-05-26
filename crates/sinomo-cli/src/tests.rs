@@ -2721,11 +2721,11 @@ fn sandbox_fetch_uses_mediated_transport_and_persists_output_and_audit() {
     .expect("fetch");
 
     let (_manifest, layout) = store.load(&sandbox_id).expect("load");
-    let fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
+    let mut fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
     assert_eq!(fs.read(&output_path, None).expect("output"), b"archive");
     assert_eq!(
         sinomo_runtime::sandbox::load_http_exchange_record(
-            &fs,
+            &mut fs,
             &result.record.command_id,
             &result.request_id
         )
@@ -7814,10 +7814,10 @@ fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
     assert_eq!(result.response_bytes, 11);
     let dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
-    let fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
+    let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
     assert_eq!(fs.read(&output_path, None).expect("body"), b"hello world");
     let audit = sinomo_runtime::sandbox::load_http_exchange_record(
-        &fs,
+        &mut fs,
         &result.record.command_id,
         &result.request_id,
     )
@@ -8663,7 +8663,7 @@ fn daemon_sandbox_create_status_and_busybox_import_use_sifs() {
     assert_eq!(checkpoint_response.checkpoint.sandbox_id, sandbox_id);
 
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = store.load(&sandbox_id).expect("load sandbox");
     let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     fs.write(
@@ -8694,7 +8694,7 @@ fn daemon_sandbox_create_status_and_busybox_import_use_sifs() {
     assert_eq!(read_response.bytes, b"fn main() {}\n");
 
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
+    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
     assert_eq!(
         toolchain_store
             .load_command_module(&import_response.manifest, "cat")
@@ -8703,7 +8703,7 @@ fn daemon_sandbox_create_status_and_busybox_import_use_sifs() {
     );
 
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = store.load(&sandbox_id).expect("load sandbox");
     let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     fs.write(
@@ -8919,7 +8919,7 @@ fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
     );
 
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
+    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
     let manifest = toolchain_store
         .load_manifest(&toolchain_id)
         .expect("load toolchain");
@@ -9050,7 +9050,7 @@ fn daemon_sandbox_toolchain_add_artifact_persists_sifs_support_file() {
     );
 
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
+    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
     let manifest = toolchain_store
         .load_manifest(&toolchain_id)
         .expect("load toolchain");
@@ -9200,7 +9200,7 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
     );
 
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
+    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
     let manifest = toolchain_store
         .load_manifest(&toolchain_id)
         .expect("load toolchain");
@@ -9440,7 +9440,7 @@ fn daemon_sandbox_run_toolchain_executes_sifs_pinned_command() {
     assert_eq!(outcome.response.exit_status, 0);
     assert_eq!(outcome.stdout, b"hello\n");
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs");
-    let instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = instance_store.load(&sandbox_id).expect("load sandbox");
     assert!(manifest.last_placement.is_some());
     let event_store =
@@ -9598,7 +9598,7 @@ fn daemon_sandbox_run_process_plan_executes_sifs_pinned_commands() {
     assert_eq!(outcome.stdout, b"hello\n");
     assert_eq!(outcome.step_outcomes.len(), 2);
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs");
-    let instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = instance_store.load(&sandbox_id).expect("load sandbox");
     assert_eq!(manifest.command_history.len(), 2);
     let event_store =
@@ -9920,13 +9920,13 @@ fn daemon_sandbox_run_process_plan_records_events_for_resource_exhausted_step() 
     assert!(error.to_string().contains("input limit"));
 
     let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs");
-    let instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
     let manifest = instance_store.load(&sandbox_id).expect("load sandbox");
     assert_eq!(manifest.command_history.len(), 2);
-    let fs =
+    let mut fs =
         sinomo_runtime::sandbox::SifsSandboxFileSystem::new(instance_store.into_inner(), &manifest);
     let receiver_record =
-        sinomo_runtime::sandbox::load_command_record(&fs, &manifest.command_history[1])
+        sinomo_runtime::sandbox::load_command_record(&mut fs, &manifest.command_history[1])
             .expect("receiver record");
     assert_eq!(
         receiver_record.status,
