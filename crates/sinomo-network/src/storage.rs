@@ -1621,28 +1621,12 @@ pub fn cluster_sync_targets_with_connectivity(
             Some(sinomo_core::ClusterNodeAvailability::Unknown) | None => 1,
             Some(sinomo_core::ClusterNodeAvailability::Offline) => 2,
         };
-        let score = graph
-            .iter()
-            .find(|record| {
-                record.source_node_id == state.local_node_id
-                    && record.target_node_id == endpoint.node_id
-                    && record.endpoint_id == endpoint.endpoint_id
-            })
-            .map(|record| match record.state {
-                ClusterConnectivityState::Healthy => 0,
-                ClusterConnectivityState::Degraded => 1,
-                ClusterConnectivityState::Unreachable => 3,
-            })
-            .unwrap_or_else(|| match endpoint.transport {
-                ClusterTransportKind::Iroh => 2,
-                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => 3,
-                _ => 4,
-            });
+        let connectivity = cluster_connectivity_state_for_endpoint(state, &graph, endpoint);
         (
             node_status_rank,
-            score,
-            cluster_daemon_command_transport_rank(endpoint),
-            cluster_daemon_command_address_rank(endpoint),
+            cluster_route_unavailability_rank(connectivity),
+            cluster_endpoint_static_fallback_rank(endpoint),
+            cluster_route_connectivity_quality_rank(connectivity),
             endpoint.priority,
             endpoint.address.clone(),
         )
@@ -1730,6 +1714,17 @@ pub fn cluster_main_daemon_command_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
+    let mut selected_remote_nodes = BTreeSet::new();
+    cluster_main_daemon_command_endpoint_candidates(paths, state)
+        .into_iter()
+        .filter(|endpoint| selected_remote_nodes.insert(endpoint.node_id.clone()))
+        .collect()
+}
+
+pub fn cluster_main_daemon_command_endpoint_candidates(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
     let main_daemon_node_ids = state
         .members
         .iter()
@@ -1743,13 +1738,11 @@ pub fn cluster_main_daemon_command_targets(
         })
         .map(|member| member.node_id.clone())
         .collect::<BTreeSet<_>>();
-    let mut selected_remote_nodes = BTreeSet::new();
     cluster_daemon_command_targets(paths, state)
         .into_iter()
         .filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && main_daemon_node_ids.contains(&endpoint.node_id)
-                && selected_remote_nodes.insert(endpoint.node_id.clone())
         })
         .collect()
 }
@@ -1850,14 +1843,15 @@ pub fn cluster_rollout_target_endpoint_for_main(
         .cloned()
         .collect::<Vec<_>>();
     candidates.sort_by_key(|endpoint| {
-        let score = cluster_rollout_endpoint_connectivity_score(state, &graph, endpoint);
+        let connectivity = cluster_connectivity_state_for_endpoint(state, &graph, endpoint);
         let unreachable_shadow_endpoint = endpoint.node_id == shadow_node_id
-            && score >= CLUSTER_ROLLOUT_ENDPOINT_UNREACHABLE_SCORE;
+            && cluster_route_unavailability_rank(connectivity) != 0;
         (
             unreachable_shadow_endpoint,
             endpoint.node_id != shadow_node_id,
-            score,
-            cluster_rollout_endpoint_unknown_route_rank(endpoint),
+            cluster_route_unavailability_rank(connectivity),
+            cluster_endpoint_static_fallback_rank(endpoint),
+            cluster_route_connectivity_quality_rank(connectivity),
             endpoint.priority,
             endpoint.address.clone(),
         )
@@ -1872,21 +1866,23 @@ pub fn sort_cluster_rollout_endpoints(
 ) {
     let graph = read_cluster_connectivity_graph_from_kv(paths).unwrap_or_default();
     endpoints.sort_by_key(|endpoint| {
+        let connectivity = cluster_connectivity_state_for_endpoint(state, &graph, endpoint);
         (
             endpoint.node_id.clone(),
-            cluster_rollout_endpoint_connectivity_score(state, &graph, endpoint),
-            cluster_rollout_endpoint_unknown_route_rank(endpoint),
+            cluster_route_unavailability_rank(connectivity),
+            cluster_endpoint_static_fallback_rank(endpoint),
+            cluster_route_connectivity_quality_rank(connectivity),
             endpoint.priority,
             endpoint.address.clone(),
         )
     });
 }
 
-fn cluster_rollout_endpoint_connectivity_score(
+fn cluster_connectivity_state_for_endpoint<'a>(
     state: &ClusterBootstrapState,
-    graph: &[ClusterConnectivityRecord],
+    graph: &'a [ClusterConnectivityRecord],
     endpoint: &ClusterEndpointRecord,
-) -> u8 {
+) -> Option<&'a ClusterConnectivityState> {
     graph
         .iter()
         .find(|record| {
@@ -1894,28 +1890,36 @@ fn cluster_rollout_endpoint_connectivity_score(
                 && record.target_node_id == endpoint.node_id
                 && record.endpoint_id == endpoint.endpoint_id
         })
-        .map(|record| match record.state {
-            ClusterConnectivityState::Healthy => 0,
-            ClusterConnectivityState::Degraded => 1,
-            ClusterConnectivityState::Unreachable => 3,
-        })
-        .unwrap_or(CLUSTER_ROLLOUT_ENDPOINT_UNKNOWN_SCORE)
+        .map(|record| &record.state)
 }
 
-const CLUSTER_ROLLOUT_ENDPOINT_UNKNOWN_SCORE: u8 = 2;
-const CLUSTER_ROLLOUT_ENDPOINT_UNREACHABLE_SCORE: u8 = 3;
+fn cluster_route_unavailability_rank(connectivity: Option<&ClusterConnectivityState>) -> u8 {
+    match connectivity {
+        Some(ClusterConnectivityState::Unreachable) => 1,
+        _ => 0,
+    }
+}
 
-fn cluster_rollout_endpoint_unknown_route_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+fn cluster_route_connectivity_quality_rank(connectivity: Option<&ClusterConnectivityState>) -> u8 {
+    match connectivity {
+        Some(ClusterConnectivityState::Healthy) => 0,
+        Some(ClusterConnectivityState::Degraded) => 1,
+        None => 2,
+        Some(ClusterConnectivityState::Unreachable) => 3,
+    }
+}
+
+fn cluster_endpoint_static_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8 {
     match endpoint.transport {
-        ClusterTransportKind::Iroh => 0,
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            1_u8.saturating_add(cluster_rollout_tcp_address_rank(endpoint))
+            cluster_direct_endpoint_static_fallback_rank(endpoint)
         }
+        ClusterTransportKind::Iroh => 2,
         _ => 8,
     }
 }
 
-fn cluster_rollout_tcp_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+fn cluster_direct_endpoint_static_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8 {
     let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
         return 3;
     };
@@ -1933,15 +1937,15 @@ fn cluster_raft_route_order_key(
     endpoint: &ClusterEndpointRecord,
 ) -> (u8, u8, u8, u16, String) {
     (
-        cluster_raft_route_connectivity_rank(state, connectivity, endpoint),
-        cluster_daemon_command_transport_rank(endpoint),
-        cluster_raft_direct_address_rank(endpoint),
+        cluster_raft_route_unavailability_rank(state, connectivity, endpoint),
+        cluster_endpoint_static_fallback_rank(endpoint),
+        cluster_raft_route_connectivity_quality_rank(state, connectivity, endpoint),
         endpoint.priority,
         endpoint.address.clone(),
     )
 }
 
-fn cluster_raft_route_connectivity_rank(
+fn cluster_raft_route_unavailability_rank(
     state: &ClusterBootstrapState,
     connectivity: &BTreeMap<(NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
     endpoint: &ClusterEndpointRecord,
@@ -1949,43 +1953,18 @@ fn cluster_raft_route_connectivity_rank(
     let connectivity_state = connectivity
         .get(&(state.local_node_id.clone(), endpoint.endpoint_id.clone()))
         .map(|record| &record.state);
-    match connectivity_state {
-        Some(ClusterConnectivityState::Healthy) => 0,
-        Some(ClusterConnectivityState::Degraded) => 1,
-        None if matches!(
-            endpoint.transport,
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-        ) && cluster_raft_direct_address_rank(endpoint) <= 1 =>
-        {
-            2
-        }
-        None if endpoint.transport == ClusterTransportKind::Iroh => 3,
-        None => 4,
-        Some(ClusterConnectivityState::Unreachable)
-            if endpoint.transport == ClusterTransportKind::Iroh =>
-        {
-            5
-        }
-        Some(ClusterConnectivityState::Unreachable) => 6,
-    }
+    cluster_route_unavailability_rank(connectivity_state)
 }
 
-fn cluster_raft_direct_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
-    if !matches!(
-        endpoint.transport,
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-    ) {
-        return 0;
-    }
-    let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
-        return 2;
-    };
-    match address.ip() {
-        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
-        IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
-        ip if ip.is_loopback() || ip.is_unspecified() => 3,
-        _ => 1,
-    }
+fn cluster_raft_route_connectivity_quality_rank(
+    state: &ClusterBootstrapState,
+    connectivity: &BTreeMap<(NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+    endpoint: &ClusterEndpointRecord,
+) -> u8 {
+    let connectivity_state = connectivity
+        .get(&(state.local_node_id.clone(), endpoint.endpoint_id.clone()))
+        .map(|record| &record.state);
+    cluster_route_connectivity_quality_rank(connectivity_state)
 }
 
 pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
@@ -1996,8 +1975,8 @@ pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<Clust
     endpoints.sort_by_key(|endpoint| {
         (
             endpoint.node_id.clone(),
+            cluster_endpoint_static_fallback_rank(endpoint),
             endpoint.priority,
-            format!("{:?}", endpoint.transport),
             endpoint.address.clone(),
         )
     });
@@ -2007,22 +1986,23 @@ pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<Clust
 pub fn prefer_bounded_daemon_command_targets(
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> Vec<ClusterEndpointRecord> {
-    let endpoints: Vec<_> = endpoints.into_iter().collect();
+    let mut endpoint_route_keys = BTreeSet::new();
+    let endpoints = endpoints
+        .into_iter()
+        .filter(|endpoint| {
+            endpoint_route_keys.insert((
+                endpoint.node_id.clone(),
+                format!("{:?}", endpoint.transport),
+                endpoint.address.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
     let mut selected = Vec::new();
     let mut selected_endpoint_ids = BTreeSet::new();
     let mut nodes_with_primary = BTreeSet::new();
     for endpoint in &endpoints {
-        if cluster_daemon_command_transport_rank(endpoint) <= 1
-            && nodes_with_primary.insert(endpoint.node_id.clone())
-        {
+        if nodes_with_primary.insert(endpoint.node_id.clone()) {
             selected_endpoint_ids.insert(endpoint.endpoint_id.clone());
-            selected.push(endpoint.clone());
-        }
-    }
-    for endpoint in &endpoints {
-        if endpoint.transport == ClusterTransportKind::Iroh
-            && selected_endpoint_ids.insert(endpoint.endpoint_id.clone())
-        {
             selected.push(endpoint.clone());
         }
     }

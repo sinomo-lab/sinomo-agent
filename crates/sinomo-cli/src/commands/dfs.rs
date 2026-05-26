@@ -36,6 +36,7 @@ pub(crate) enum DfsCliCommand {
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub(crate) struct DfsCommonOptions {
     pub(crate) metadata_root: Option<PathBuf>,
+    pub(crate) cluster: bool,
     pub(crate) json: bool,
 }
 
@@ -167,6 +168,7 @@ pub(crate) fn parse_dfs_common_options(args: &[String]) -> Result<DfsCommonOptio
                 };
                 options.metadata_root = Some(PathBuf::from(path));
             }
+            "--cluster" => options.cluster = true,
             "--json" => options.json = true,
             _ => return Err(CliError::Usage),
         }
@@ -560,6 +562,18 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Status(options) => {
+            if options.cluster && options.metadata_root.is_some() {
+                return Err(CliError::Usage);
+            }
+            if options.cluster {
+                let report = inspect_cluster_dfs_status()?;
+                if options.json {
+                    print_json("<dfs-cluster-status>", &report)?;
+                } else {
+                    print_dfs_cluster_status(&report);
+                }
+                return Ok(());
+            }
             let status = if let Some(metadata_root) = options.metadata_root.clone() {
                 inspect_dfs_status(dfs_metadata_root(Some(metadata_root))?)?
             } else {
@@ -806,6 +820,77 @@ struct DfsServiceAdvertisements {
     content: Vec<sinomo_runtime::dfs::DfsNodeAdvertisement>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsClusterStatusReport {
+    nodes: Vec<DfsClusterNodeStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsClusterNodeStatus {
+    node_id: NodeId,
+    local: bool,
+    endpoint: Option<String>,
+    status: Option<sinomo_runtime::dfs::DfsOperatorStatus>,
+    error: Option<String>,
+}
+
+fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let daemon_paths = DaemonPaths::new(&data_dir);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = daemon_read_local_cluster_state(&cluster_paths)?;
+    let mut nodes = vec![DfsClusterNodeStatus {
+        node_id: state.local_node_id.clone(),
+        local: true,
+        endpoint: Some("local-daemon".to_string()),
+        status: Some(daemon_handle_daemon_dfs_status(&daemon_paths)?),
+        error: None,
+    }];
+    let mut endpoints_by_node =
+        std::collections::BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
+    for endpoint in network::cluster_main_daemon_command_endpoint_candidates(&cluster_paths, &state)
+    {
+        endpoints_by_node
+            .entry(endpoint.node_id.clone())
+            .or_default()
+            .push(endpoint);
+    }
+    for (node_id, endpoints) in endpoints_by_node {
+        let mut failures = Vec::new();
+        let mut successful = None;
+        for endpoint in endpoints {
+            match daemon_fetch_dfs_status_from_endpoint(
+                &endpoint,
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(status) => {
+                    successful = Some((endpoint.address, status));
+                    break;
+                }
+                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            }
+        }
+        nodes.push(match successful {
+            Some((endpoint, status)) => DfsClusterNodeStatus {
+                node_id,
+                local: false,
+                endpoint: Some(endpoint),
+                status: Some(status),
+                error: None,
+            },
+            None => DfsClusterNodeStatus {
+                node_id,
+                local: false,
+                endpoint: None,
+                status: None,
+                error: Some(failures.join("; ")),
+            },
+        });
+    }
+    Ok(DfsClusterStatusReport { nodes })
+}
+
 fn decode_dfs_advertisements(
     entries: Vec<sinomo_runtime::kv::KvEntry>,
 ) -> Result<Vec<sinomo_runtime::dfs::DfsNodeAdvertisement>, CliError> {
@@ -819,6 +904,31 @@ fn decode_dfs_advertisements(
             .then_with(|| left.endpoint.cmp(&right.endpoint))
     });
     Ok(advertisements)
+}
+
+fn print_dfs_cluster_status(report: &DfsClusterStatusReport) {
+    println!("DFS cluster status:");
+    for node in &report.nodes {
+        println!(
+            "  {}{}:",
+            node.node_id,
+            if node.local { " (local)" } else { "" }
+        );
+        if let Some(endpoint) = &node.endpoint {
+            println!("    endpoint: {endpoint}");
+        }
+        if let Some(status) = &node.status {
+            println!("    filesystems: {}", status.file_system_count);
+            println!("    objects: {}", status.object_count);
+            println!("    versions: {}", status.version_count);
+            println!("    pending writes: {}", status.pending_write_count);
+            println!("    pending repairs: {}", status.pending_repair_count);
+            println!("    open conflicts: {}", status.open_conflict_count);
+        }
+        if let Some(error) = &node.error {
+            println!("    error: {error}");
+        }
+    }
 }
 
 fn print_dfs_object_view(object: &sinomo_runtime::dfs::DfsOperatorObjectView) {

@@ -6268,6 +6268,20 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         .expect("dfs status"),
         DfsCliCommand::Status(DfsCommonOptions {
             metadata_root: Some(metadata_root.clone()),
+            cluster: false,
+            json: true,
+        })
+    );
+    assert_eq!(
+        parse_dfs_command(&[
+            "status".to_string(),
+            "--cluster".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("dfs cluster status"),
+        DfsCliCommand::Status(DfsCommonOptions {
+            metadata_root: None,
+            cluster: true,
             json: true,
         })
     );

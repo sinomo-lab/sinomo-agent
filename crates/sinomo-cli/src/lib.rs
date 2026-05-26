@@ -96,6 +96,7 @@ use sinomo_runtime::daemon::{
     ensure_rollout_target_platform_matches_local as daemon_ensure_rollout_target_platform_matches_local,
     fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
+    fetch_dfs_status_from_endpoint as daemon_fetch_dfs_status_from_endpoint,
     git_is_available as daemon_git_is_available,
     handle_daemon_cluster_kv_range_prefix as daemon_handle_daemon_cluster_kv_range_prefix,
     handle_daemon_connection as daemon_handle_daemon_connection,

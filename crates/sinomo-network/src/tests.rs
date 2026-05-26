@@ -466,7 +466,20 @@ fn command_target_selection_keeps_iroh_fallback_after_direct_endpoint() {
 }
 
 #[test]
-fn command_target_selection_tries_iroh_before_extra_tcp_fallbacks() {
+fn command_target_selection_deduplicates_identical_routes() {
+    let node_id = NodeId::from_legacy_named("node_target_duplicate_route").expect("node");
+    let direct = daemon_lan_endpoint(&node_id, "10.0.0.44:21353".to_string(), 20);
+    let mut duplicate = direct.clone();
+    duplicate.endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_target_duplicate_route").expect("endpoint");
+
+    let selected = prefer_bounded_daemon_command_targets(vec![direct.clone(), duplicate]);
+
+    assert_eq!(selected, vec![direct]);
+}
+
+#[test]
+fn command_target_selection_keeps_extra_tcp_before_iroh_fallbacks() {
     let node_id = NodeId::from_legacy_named("node_target_iroh_before_tcp").expect("node");
     let primary = daemon_lan_endpoint(&node_id, "203.0.113.44:21353".to_string(), 20);
     let extra_tcp = daemon_lan_endpoint(&node_id, "10.0.0.44:21353".to_string(), 30);
@@ -488,8 +501,8 @@ fn command_target_selection_tries_iroh_before_extra_tcp_fallbacks() {
     ]);
 
     assert_eq!(selected[0], primary);
-    assert_eq!(selected[1], iroh);
-    assert_eq!(selected[2], extra_tcp);
+    assert_eq!(selected[1], extra_tcp);
+    assert_eq!(selected[2], iroh);
 }
 
 #[test]
@@ -909,6 +922,75 @@ fn main_daemon_command_targets_select_one_route_per_remote_main() {
 }
 
 #[test]
+fn main_daemon_endpoint_candidates_keep_static_fallback_order() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-main-daemon-candidate-order-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_main_daemon_order").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_main_order_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_network_main_order_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network main daemon order",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let lan = daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10);
+    let public = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_main_daemon_public_order")
+            .expect("endpoint"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "203.0.113.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&remote, "iroh_public_key_main_order"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_main_order?relay=https://relay.example./".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![iroh.clone(), public.clone(), lan.clone()];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let candidates = cluster_main_daemon_command_endpoint_candidates(&paths, &state);
+    let ordered_endpoint_ids = candidates
+        .iter()
+        .map(|endpoint| endpoint.endpoint_id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        ordered_endpoint_ids,
+        vec![lan.endpoint_id, public.endpoint_id, iroh.endpoint_id]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn rollout_target_selection_prefers_shadow_route_until_shadow_is_unreachable() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-rollout-shadow-route-{}",
@@ -1323,7 +1405,7 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
 }
 
 #[test]
-fn connectivity_sort_prefers_unknown_iroh_over_unknown_private_tcp() {
+fn connectivity_sort_prefers_unknown_private_tcp_over_unknown_iroh() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-unknown-iroh-sort-{}",
         std::time::SystemTime::now()
@@ -1367,13 +1449,262 @@ fn connectivity_sort_prefers_unknown_iroh_over_unknown_private_tcp() {
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
-        Some(&iroh.endpoint_id)
+        Some(&private.endpoint_id)
     );
     assert!(
         targets
             .iter()
-            .any(|endpoint| endpoint.endpoint_id == private.endpoint_id)
+            .any(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn connectivity_sort_prefers_unknown_public_tcp_over_unknown_iroh() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-unknown-public-tcp-sort-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_unknown_public_tcp_sort").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_unknown_public_tcp_sort_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_unknown_public_tcp_sort_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "unknown public tcp sort",
+        node_a,
+        "node a",
+        "pk-a",
+        now,
+    );
+    let public = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_unknown_public_tcp_sort")
+            .expect("endpoint"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "203.0.113.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&node_b, "iroh_public_key_unknown_public_sort"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_unknown_public_sort?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member_b = ClusterMemberRecord::local_voter(cluster_id, node_b, "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![iroh.clone(), public.clone()];
+    state.members.push(member_b);
+
+    let targets = cluster_sync_targets_with_connectivity(&paths, &state);
+
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&public.endpoint_id)
+    );
+    assert!(
+        targets
+            .iter()
+            .any(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-lan-public-iroh-sort-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_lan_public_iroh_sort").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_lan_public_iroh_sort_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_lan_public_iroh_sort_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "lan public iroh sort",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let lan = daemon_lan_endpoint(&node_b, "10.0.0.41:21353".to_string(), 10);
+    let public = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_lan_public_iroh_public")
+            .expect("endpoint"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "203.0.113.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&node_b, "iroh_public_key_lan_public_sort"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_lan_public_sort?relay=https://relay.example./".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member_b = ClusterMemberRecord::local_voter(cluster_id, node_b, "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![iroh.clone(), public.clone(), lan.clone()];
+    state.members.push(member_b);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let targets = cluster_sync_targets_with_connectivity(&paths, &state);
+    let ordered_endpoint_ids = targets
+        .iter()
+        .map(|endpoint| endpoint.endpoint_id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        &ordered_endpoint_ids[..3],
+        &[
+            lan.endpoint_id.clone(),
+            public.endpoint_id.clone(),
+            iroh.endpoint_id.clone(),
+        ]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-rollout-lan-public-iroh-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_lan_public_iroh").expect("cluster");
+    let local = NodeId::from_legacy_named("node_rollout_lan_public_iroh_local").expect("local");
+    let main = NodeId::from_legacy_named("node_rollout_lan_public_iroh_main").expect("main");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "rollout lan public iroh",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    let lan = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
+    let public = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_rollout_public")
+            .expect("endpoint"),
+        node_id: main.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "203.0.113.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&main, "iroh_public_key_rollout_sort"),
+        node_id: main.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_rollout_sort?relay=https://relay.example./".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let candidates = vec![iroh.clone(), public.clone(), lan.clone()];
+
+    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+        .expect("rollout endpoint");
+    assert_eq!(selected.endpoint_id, lan.endpoint_id);
+
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &state.local_node_id,
+        vec![cluster_connectivity_record(
+            &state,
+            &lan,
+            ClusterConnectivityState::Unreachable,
+            None,
+            1,
+            None,
+            Some("failed".to_string()),
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity records");
+    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+        .expect("rollout endpoint");
+    assert_eq!(selected.endpoint_id, public.endpoint_id);
+
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &state.local_node_id,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &lan,
+                ClusterConnectivityState::Unreachable,
+                None,
+                1,
+                None,
+                Some("failed".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &public,
+                ClusterConnectivityState::Unreachable,
+                None,
+                1,
+                None,
+                Some("failed".to_string()),
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+        .expect("rollout endpoint");
+    assert_eq!(selected.endpoint_id, iroh.endpoint_id);
+
     std::fs::remove_dir_all(root).ok();
 }
 

@@ -149,7 +149,7 @@ pub(super) fn print_dfs_help() {
     println!("DFS:");
     println!("  sinomo dfs");
     println!("      Show DFS commands.");
-    println!("  sinomo dfs status [--metadata-root <path>] [--json]");
+    println!("  sinomo dfs status [--cluster] [--metadata-root <path>] [--json]");
     println!("      Summarize local shard metadata, writes, repairs, and conflicts.");
     println!("  sinomo dfs filesystem <file_system_id> [--metadata-root <path>] [--json]");
     println!("      Inspect one filesystem.");
