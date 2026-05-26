@@ -1816,12 +1816,31 @@ pub fn cluster_member_daemon_status_targets(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Vec<ClusterEndpointRecord> {
+    let graph = ClusterConnectivityGraph::from_records(state.local_node_id.clone(), []);
+    cluster_member_daemon_status_targets_with_graph(state, member, &graph)
+}
+
+pub fn cluster_member_daemon_status_targets_with_connectivity(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> Vec<ClusterEndpointRecord> {
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    cluster_member_daemon_status_targets_with_graph(state, member, &graph)
+}
+
+fn cluster_member_daemon_status_targets_with_graph(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    graph: &ClusterConnectivityGraph,
+) -> Vec<ClusterEndpointRecord> {
     let is_local_process = cluster_member_is_local_process(state, member);
     let mut endpoints = prefer_bounded_daemon_command_targets(member.endpoints.clone());
     endpoints.sort_by_key(|endpoint| {
         (
-            cluster_daemon_command_transport_rank(endpoint),
-            endpoint.privacy != ClusterEndpointPrivacy::Lan,
+            graph.unavailability_rank(endpoint),
+            cluster_endpoint_static_fallback_rank(endpoint),
+            graph.quality_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
         )

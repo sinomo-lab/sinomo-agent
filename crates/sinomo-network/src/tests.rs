@@ -1786,6 +1786,206 @@ fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
 }
 
 #[test]
+fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-status-route-connectivity-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_status_route_connectivity").expect("cluster");
+    let local = NodeId::from_legacy_named("node_status_route_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_status_route_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "status route connectivity",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let lan = daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10);
+    let public = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_status_route_public")
+            .expect("endpoint"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "203.0.113.41:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&remote, "iroh_public_key_status_route"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_status_route?relay=https://relay.example./".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![iroh.clone(), public.clone(), lan.clone()];
+    state.members.push(member.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &lan,
+                ClusterConnectivityState::Degraded,
+                Some(80),
+                1,
+                Some("slow".to_string()),
+                None,
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &public,
+                ClusterConnectivityState::Healthy,
+                Some(20),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &iroh,
+                ClusterConnectivityState::Healthy,
+                Some(10),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    assert_eq!(
+        targets
+            .iter()
+            .take(3)
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            lan.endpoint_id.clone(),
+            public.endpoint_id.clone(),
+            iroh.endpoint_id.clone(),
+        ]
+    );
+
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &lan,
+                ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("failed".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &public,
+                ClusterConnectivityState::Healthy,
+                Some(20),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &iroh,
+                ClusterConnectivityState::Healthy,
+                Some(10),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    assert_eq!(targets[0].endpoint_id, public.endpoint_id);
+    assert_eq!(targets[1].endpoint_id, iroh.endpoint_id);
+
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &lan,
+                ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("failed".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &public,
+                ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("failed".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &iroh,
+                ClusterConnectivityState::Healthy,
+                Some(10),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    assert_eq!(targets[0].endpoint_id, iroh.endpoint_id);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-rollout-lan-public-iroh-{}",

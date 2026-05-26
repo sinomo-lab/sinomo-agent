@@ -1310,7 +1310,7 @@ pub fn cluster_health_rows(
         if matches!(member.state, ClusterMemberState::Removed) {
             continue;
         }
-        let live = probe_member_daemon_status(state, member);
+        let live = probe_member_daemon_status(paths, state, member);
         let stored = stored_statuses
             .iter()
             .find(|status| status.node_id == member.node_id)
@@ -1349,10 +1349,13 @@ pub fn cluster_health_rows(
 }
 
 pub fn probe_member_daemon_status(
+    paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Option<ClusterNodeStatusRecord> {
-    for endpoint in sinomo_network::cluster_member_daemon_status_targets(state, member) {
+    for endpoint in
+        sinomo_network::cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
+    {
         let Ok(status) = fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
         else {
             continue;
