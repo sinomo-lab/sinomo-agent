@@ -534,6 +534,13 @@ pub fn upsert_daemon_member(
         .find(|member| member.node_id == replacement.node_id)
     {
         let mut next_endpoints = member.endpoints.clone();
+        if endpoints
+            .iter()
+            .any(|endpoint| daemon_tcp_endpoint_is_listener_advertisement(endpoint))
+        {
+            next_endpoints
+                .retain(|endpoint| !daemon_tcp_endpoint_is_listener_advertisement(endpoint));
+        }
         for endpoint in endpoints {
             next_endpoints.retain(|candidate| candidate.endpoint_id != endpoint.endpoint_id);
             next_endpoints.push(endpoint);
@@ -570,6 +577,16 @@ pub fn upsert_daemon_member(
         state.members.push(member);
         true
     }
+}
+
+fn daemon_tcp_endpoint_is_listener_advertisement(endpoint: &ClusterEndpointRecord) -> bool {
+    matches!(
+        endpoint.transport,
+        ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp
+    ) && matches!(
+        endpoint.source,
+        ClusterEndpointSource::Static | ClusterEndpointSource::Observed
+    )
 }
 
 pub fn cluster_raft_local_is_voter(state: &ClusterBootstrapState) -> bool {

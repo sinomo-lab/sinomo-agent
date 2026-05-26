@@ -493,6 +493,56 @@ fn command_target_selection_tries_iroh_before_extra_tcp_fallbacks() {
 }
 
 #[test]
+fn daemon_member_endpoint_publish_replaces_stale_tcp_listener_advertisements() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_replace_stale_tcp").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_replace_stale_tcp").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "replace stale tcp",
+        node_id.clone(),
+        "node",
+        "pk",
+        now,
+    );
+    let stale_lan = daemon_lan_endpoint(&node_id, "10.0.0.41:21353".to_string(), 20);
+    let current_loopback = daemon_loopback_endpoint(&node_id, "127.0.0.1:21353".to_string(), 0);
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&node_id, "iroh_public_key_replace_tcp"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_replace_tcp?relay=https://relay.example./".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+
+    assert!(ensure_main_daemon_cluster_member(
+        &mut state,
+        vec![stale_lan.clone(), iroh.clone()],
+        now,
+    ));
+    assert!(ensure_main_daemon_cluster_member(
+        &mut state,
+        vec![current_loopback.clone()],
+        now + time::Duration::seconds(1),
+    ));
+
+    let member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == node_id)
+        .expect("local member");
+    assert!(member.endpoints.contains(&current_loopback));
+    assert!(member.endpoints.contains(&iroh));
+    assert!(
+        !member.endpoints.contains(&stale_lan),
+        "old TCP listener advertisements must be removed when the daemon bind changes"
+    );
+}
+
+#[test]
 fn iroh_daemon_proxy_uses_long_timeout_for_rollout_build() {
     let request =
         ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, &"build request")
