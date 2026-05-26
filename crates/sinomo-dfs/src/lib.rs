@@ -125,6 +125,10 @@ pub fn register_storage_paths(
             "default DFS root metadata shard with object records and journal entries",
         ),
         (
+            "dfs/metadata-replication-cursors",
+            "durable per-replica DFS metadata journal replication cursors",
+        ),
+        (
             "dfs/operator",
             "dynamic DFS operator intent records stored as sinomo-object files",
         ),

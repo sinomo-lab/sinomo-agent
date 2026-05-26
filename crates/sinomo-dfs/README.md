@@ -105,6 +105,7 @@ dfs/content/staging
 dfs/metadata/records
 dfs/metadata/journal
 dfs/metadata/root
+dfs/metadata-replication-cursors
 dfs/operator
 dfs/pins
 files

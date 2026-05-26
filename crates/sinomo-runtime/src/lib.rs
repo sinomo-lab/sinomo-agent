@@ -114,6 +114,7 @@ mod tests {
             .verify_relative_paths([
                 "daemon/status.sobj",
                 "dfs/metadata/root/records/filesystems/root/object.sobj",
+                "dfs/metadata-replication-cursors/01kr4w089vqgdxpb84t6bq1qxn/root.json",
                 "sandbox/runtime/active.sobj",
                 "bin/sinomo",
                 "startup/sinomo-daemon.service",
