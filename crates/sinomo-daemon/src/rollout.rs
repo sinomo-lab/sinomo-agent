@@ -284,9 +284,10 @@ where
             last_main_probe = now;
         }
 
+        let pending_main_activation = rollout_main_activation_path(&rollout_paths).exists();
         if pending_rollout.is_none()
             && matches!(main_probe_status, DaemonProbeStatus::Running(_))
-            && rollout_main_activation_path(&rollout_paths).exists()
+            && pending_main_activation
             && Instant::now() >= next_pending_activation_shutdown_nudge
         {
             if let DaemonProbeStatus::Running(status) =
@@ -322,10 +323,13 @@ where
             }
         }
 
-        if !main_restart_suppressed
+        if should_shadow_start_main(main_restart_suppressed, pending_main_activation)
             && supervised_main.is_none()
             && matches!(main_probe_status, DaemonProbeStatus::NotRunning)
         {
+            if pending_main_activation {
+                main_restart_suppressed = false;
+            }
             match start_shadow_main_if_needed(
                 &rollout_paths,
                 &main_binary,
@@ -476,6 +480,10 @@ fn shadow_main_probe_interval(pending_rollout: bool) -> Duration {
     } else {
         Duration::from_secs(10)
     }
+}
+
+fn should_shadow_start_main(main_restart_suppressed: bool, pending_main_activation: bool) -> bool {
+    pending_main_activation || !main_restart_suppressed
 }
 
 pub fn cluster_rollout_should_use_remote_build(
@@ -1341,6 +1349,13 @@ mod tests {
     fn pending_shadow_rollout_uses_fast_main_health_probe() {
         assert!(shadow_main_probe_interval(true) < Duration::from_secs(1));
         assert!(shadow_main_probe_interval(false) >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn pending_main_activation_overrides_suppressed_restart() {
+        assert!(should_shadow_start_main(true, true));
+        assert!(!should_shadow_start_main(true, false));
+        assert!(should_shadow_start_main(false, false));
     }
 
     #[test]
