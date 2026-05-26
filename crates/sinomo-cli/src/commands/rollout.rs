@@ -404,11 +404,18 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
     );
     let mut binary_request: Option<ClusterRolloutBinaryRequest> = None;
     let mut source_bundle: Option<(String, String)> = None;
+    let mut desired_source_head = None;
     if options.targets.is_empty() && options.remote_build && options.remote_repo.is_none() {
-        source_bundle = Some(rollout_source_bundle_base64(&options)?);
+        let repo = rollout_source_repo_from_options(&options)?;
+        desired_source_head = Some(rollout_source_head(&repo)?);
     }
     if options.targets.is_empty() && options.remote_build {
-        publish_cluster_rollout_desired(&options, &source, &requested_at, source_bundle.as_ref())?;
+        publish_cluster_rollout_desired(
+            &options,
+            &source,
+            &requested_at,
+            desired_source_head.as_deref(),
+        )?;
     }
 
     for target in targets {
@@ -502,7 +509,7 @@ fn publish_cluster_rollout_desired(
     options: &RolloutOptions,
     source: &str,
     requested_at: &str,
-    source_bundle: Option<&(String, String)>,
+    source_head: Option<&str>,
 ) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     let state = read_cluster_state(&paths)?;
@@ -511,8 +518,8 @@ fn publish_cluster_rollout_desired(
         state: "active".to_string(),
         source: Some(source.to_string()),
         mode: Some("cluster-remote-build".to_string()),
-        source_head: source_bundle.map(|(_, head)| head.clone()),
-        source_bundle_base64: source_bundle.map(|(bundle, _)| bundle.clone()),
+        source_head: source_head.map(str::to_string),
+        source_bundle_base64: None,
         remote_repo: options.remote_repo.clone(),
         host: Some(options.host.clone()),
         port: Some(options.port),
