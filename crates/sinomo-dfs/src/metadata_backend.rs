@@ -1395,13 +1395,14 @@ impl LocalJsonMetadataBackend {
                 continue;
             }
             let transaction: DfsNamespaceTransaction = read_json(&path)?;
-            self.materialize_namespace_transaction_for_recovery(&transaction)?;
-            self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
-                file_system_id: transaction.file_system_id.clone(),
-                transaction_id: transaction.transaction_id.clone(),
-                object_count: transaction.objects.len(),
-                transaction: Some(transaction.clone()),
-            })?;
+            if self.materialize_namespace_transaction_for_recovery(&transaction)? {
+                self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
+                    file_system_id: transaction.file_system_id.clone(),
+                    transaction_id: transaction.transaction_id.clone(),
+                    object_count: transaction.objects.len(),
+                    transaction: Some(transaction.clone()),
+                })?;
+            }
         }
         Ok(())
     }
@@ -1430,29 +1431,74 @@ impl LocalJsonMetadataBackend {
     fn materialize_namespace_transaction_for_recovery(
         &self,
         transaction: &DfsNamespaceTransaction,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut changed = false;
         for object in transaction
             .objects
             .iter()
             .filter(|object| object.kind == DfsObjectKind::Tombstone)
         {
-            self.materialize_object_indexes_if_current(object)?;
+            changed |= self.materialize_object_indexes_if_current(object)?;
         }
         for object in transaction
             .objects
             .iter()
             .filter(|object| object.kind != DfsObjectKind::Tombstone)
         {
-            self.materialize_object_indexes_if_current(object)?;
+            changed |= self.materialize_object_indexes_if_current(object)?;
         }
-        Ok(())
+        Ok(changed)
     }
 
-    fn materialize_object_indexes_if_current(&self, object: &DfsObjectMetadata) -> Result<()> {
+    fn materialize_object_indexes_if_current(&self, object: &DfsObjectMetadata) -> Result<bool> {
         if let Some(current) = self.get_object(&object.object_id)? {
-            return self.materialize_object_indexes(&current);
+            if self.object_indexes_are_materialized(&current)? {
+                return Ok(false);
+            }
+            self.materialize_object_indexes(&current)?;
+            return Ok(true);
         }
-        self.materialize_object_indexes(object)
+        if self.object_indexes_are_materialized(object)? {
+            return Ok(false);
+        }
+        self.materialize_object_indexes(object)?;
+        Ok(true)
+    }
+
+    fn object_indexes_are_materialized(&self, object: &DfsObjectMetadata) -> Result<bool> {
+        let path_record = path_record_for_object(object);
+        if read_json_optional::<DfsObjectMetadata>(&self.object_path(&object.object_id))?
+            != Some(normalized_object_metadata(object))
+        {
+            return Ok(false);
+        }
+        if !self.inode_path(&object_inode_id(&object.object_id)).is_file() {
+            return Ok(false);
+        }
+        if read_json_optional::<DfsPathRecord>(
+            &self.file_system_object_index_path(&object.file_system_id, &object.object_id),
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+        if read_json_optional::<DfsPathRecord>(
+            &self.path_index_path(&object.file_system_id, &path_record.path),
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+        if object.kind == DfsObjectKind::Tombstone {
+            return Ok(true);
+        }
+        read_json_optional::<DfsPathRecord>(&self.dentry_path(&path_record)).map(|record| {
+            record.is_some_and(|record| {
+                record.object_id == object.object_id
+                    && record.file_system_id == object.file_system_id
+                    && record.path == path_record.path
+            })
+        })
     }
 
     fn materialize_object_indexes(&self, object: &DfsObjectMetadata) -> Result<()> {
@@ -4139,6 +4185,48 @@ mod tests {
                 .is_none()
         );
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reopen_does_not_rejournal_healthy_namespace_transactions() {
+        let root = temp_root("local_backend_reopen_does_not_rejournal_namespace_transactions");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let mut source = object(version("version_1"));
+        source.path = "/services/web/index.html".to_string();
+        let mut destination = object(version("version_1"));
+        destination.object_id = DfsObjectId::from_legacy_named("obj_current").expect("object");
+        destination.path = "/services/web/current.html".to_string();
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&source).expect("source");
+        backend.put_object(&destination).expect("destination");
+
+        source.path = "/services/web/current.html".to_string();
+        destination.kind = DfsObjectKind::Tombstone;
+        destination.version = version("version_2");
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "namespace_test_rename".to_string(),
+            file_system_id: file_system_id(),
+            objects: vec![source, destination],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend
+            .apply_namespace_transaction(&transaction)
+            .expect("transaction");
+        let journal_len = backend.journal_since(0).expect("journal").len();
+        drop(backend);
+
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopened backend");
+
+        assert_eq!(
+            reopened.journal_since(0).expect("journal").len(),
+            journal_len,
+            "opening a healthy backend must not append duplicate namespace transaction journal entries"
+        );
         cleanup(&root);
     }
 
