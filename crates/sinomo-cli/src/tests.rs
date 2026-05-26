@@ -7279,6 +7279,24 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            &super::daemon_rpc_command(sinomo_runtime::network::DFS_SMOKE_ROUTE),
+            super::DaemonSignerAuthority::Member,
+            "node_member",
+            "pk_member"
+        ))
+        .is_err()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            &super::daemon_rpc_command(sinomo_runtime::network::DFS_SMOKE_ROUTE),
+            super::DaemonSignerAuthority::Local,
+            "node_local",
+            "pk_local"
+        ))
+        .is_ok()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
             &super::daemon_rpc_command(sinomo_runtime::network::SANDBOX_HTTP_FETCH_ROUTE),
             super::DaemonSignerAuthority::Member,
             "node_member",

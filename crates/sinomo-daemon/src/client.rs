@@ -1,7 +1,7 @@
 use crate::auth::CLUSTER_INVITE_CHALLENGE_PROTOCOL;
 use crate::{
-    ClusterInviteChallengeProof, ClusterInviteChallengeRequest, DaemonError, DaemonStatus,
-    daemon_rpc_command, sign_daemon_rpc_request_for_local_node,
+    ClusterInviteChallengeProof, ClusterInviteChallengeRequest, DaemonDfsSmokeReport, DaemonError,
+    DaemonStatus, daemon_rpc_command, sign_daemon_rpc_request_for_local_node,
     verify_cluster_invite_challenge_proof,
 };
 use sinomo_core::{ClusterEndpointRecord, ClusterTransportKind};
@@ -122,6 +122,19 @@ pub fn fetch_dfs_status_from_endpoint(
         &(),
     )?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn run_dfs_smoke_via_daemon(
+    address: &str,
+    timeout: Duration,
+) -> Result<DaemonDfsSmokeReport, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        sinomo_network::DFS_SMOKE_ROUTE,
+        sinomo_network::DFS_RPC_CATEGORY,
+        &(),
+    )?;
+    let response = send_daemon_rpc(address, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 

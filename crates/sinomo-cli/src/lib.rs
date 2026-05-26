@@ -122,6 +122,7 @@ use sinomo_runtime::daemon::{
     rollout_target_platform_matches_local as daemon_rollout_target_platform_matches_local,
     run_daemon_control_loop as daemon_run_daemon_control_loop,
     run_daemon_dfs_smoke as daemon_run_daemon_dfs_smoke,
+    run_dfs_smoke_via_daemon as daemon_run_dfs_smoke_via_daemon,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,

@@ -332,6 +332,9 @@ pub fn authorize_authenticated_daemon_command(
                 | DaemonSignerAuthority::Voter
                 | DaemonSignerAuthority::Member
         ),
+        command if command == daemon_rpc_command(sinomo_network::DFS_SMOKE_ROUTE) => {
+            authenticated.signer.can_run_local_command()
+        }
         command
             if command == daemon_rpc_command(sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE) =>
         {
@@ -814,6 +817,24 @@ mod tests {
             let authenticated = authenticated_command(command.clone(), signer);
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to inspect local DFS metadata status");
+        }
+    }
+
+    #[test]
+    fn dfs_smoke_authorizes_only_local_signer() {
+        let command = daemon_rpc_command(sinomo_network::DFS_SMOKE_ROUTE);
+        authorize_authenticated_daemon_command(&authenticated_command(
+            command.clone(),
+            DaemonSignerAuthority::Local,
+        ))
+        .expect("local operators must be able to run DFS smoke through the daemon");
+        for signer in [
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+            DaemonSignerAuthority::JoinCandidate,
+        ] {
+            let authenticated = authenticated_command(command.clone(), signer);
+            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }
 

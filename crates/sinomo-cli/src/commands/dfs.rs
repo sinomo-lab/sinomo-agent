@@ -722,7 +722,14 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::Smoke { json } => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
-            let report = daemon_run_daemon_dfs_smoke(&DaemonPaths::new(&data_dir))?;
+            let report = if let Some(status) = default_main_daemon_status()? {
+                daemon_run_dfs_smoke_via_daemon(
+                    &status.address,
+                    std::time::Duration::from_secs(30),
+                )?
+            } else {
+                daemon_run_daemon_dfs_smoke(&DaemonPaths::new(&data_dir))?
+            };
             if json {
                 print_json("<dfs-smoke>", &report)?;
             } else {
