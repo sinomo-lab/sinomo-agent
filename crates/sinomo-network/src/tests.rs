@@ -648,7 +648,7 @@ fn connectivity_sort_prefers_healthy_iroh_over_unreachable_tcp() {
 }
 
 #[test]
-fn connectivity_sort_prefers_public_tcp_over_unknown_private_tcp() {
+fn connectivity_sort_prefers_private_tcp_over_unknown_public_tcp() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-public-tcp-sort-{}",
         std::time::SystemTime::now()
@@ -676,14 +676,14 @@ fn connectivity_sort_prefers_public_tcp_over_unknown_private_tcp() {
     let mut member_b = ClusterMemberRecord::local_voter(cluster_id, node_b, "node b", "pk-b", now);
     member_b.capabilities = main_daemon_capabilities(&member_b.role);
     member_b.allowed_capabilities = member_b.capabilities.clone();
-    member_b.endpoints = vec![private, public.clone()];
+    member_b.endpoints = vec![private.clone(), public.clone()];
     state.members.push(member_b);
 
     let targets = cluster_sync_targets_with_connectivity(&paths, &state);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
-        Some(&public.endpoint_id)
+        Some(&private.endpoint_id)
     );
     std::fs::remove_dir_all(root).ok();
 }

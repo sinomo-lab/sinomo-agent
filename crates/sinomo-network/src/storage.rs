@@ -1731,10 +1731,12 @@ pub fn cluster_daemon_command_address_rank(endpoint: &ClusterEndpointRecord) -> 
         return 1;
     };
     match address.ip() {
-        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 2,
-        IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 2,
+        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
+        IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
+        _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::Lan) => 0,
+        _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::InternetDirect) => 1,
         ip if ip.is_loopback() || ip.is_unspecified() => 3,
-        _ => 0,
+        _ => 1,
     }
 }
 
