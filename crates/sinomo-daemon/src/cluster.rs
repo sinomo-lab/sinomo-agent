@@ -225,15 +225,6 @@ fn remember_cluster_endpoint_command_connectivity(
             .unwrap_or(1)
             .min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD)
     };
-    let connectivity_state = if !matches!(
-        connectivity_state,
-        sinomo_network::ClusterConnectivityState::Healthy
-    ) && consecutive_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
-    {
-        sinomo_network::ClusterConnectivityState::Unreachable
-    } else {
-        connectivity_state
-    };
     let last_success_at = if matches!(
         connectivity_state,
         sinomo_network::ClusterConnectivityState::Healthy

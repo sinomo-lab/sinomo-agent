@@ -941,7 +941,7 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
 }
 
 #[test]
-fn raft_command_targets_use_healthy_public_before_degraded_private() {
+fn raft_command_targets_keep_degraded_direct_before_iroh() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-raft-route-degraded-private-{}",
         std::time::SystemTime::now()
@@ -981,11 +981,26 @@ fn raft_command_targets_use_healthy_public_before_degraded_private() {
         priority: 10,
         last_observed_latency_ms: None,
     };
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(
+            &remote,
+            "iroh_public_key_network_raft_degraded_private",
+        ),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address:
+            "iroh://iroh_public_key_network_raft_degraded_private?relay=https://relay.example./"
+                .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
     let mut member =
         ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
     member.capabilities = main_daemon_capabilities(&member.role);
     member.allowed_capabilities = member.capabilities.clone();
-    member.endpoints = vec![private_tcp.clone(), public_tcp.clone()];
+    member.endpoints = vec![private_tcp.clone(), public_tcp.clone(), iroh.clone()];
     state.members.push(member);
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
@@ -996,9 +1011,9 @@ fn raft_command_targets_use_healthy_public_before_degraded_private() {
             cluster_connectivity_record(
                 &state,
                 &private_tcp,
-                ClusterConnectivityState::Degraded,
+                ClusterConnectivityState::Unreachable,
                 None,
-                1,
+                3,
                 None,
                 Some("timed out".to_string()),
                 now,
@@ -1007,8 +1022,19 @@ fn raft_command_targets_use_healthy_public_before_degraded_private() {
             cluster_connectivity_record(
                 &state,
                 &public_tcp,
-                ClusterConnectivityState::Healthy,
+                ClusterConnectivityState::Degraded,
                 Some(40),
+                1,
+                None,
+                Some("timed out".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &iroh,
+                ClusterConnectivityState::Healthy,
+                Some(30),
                 0,
                 Some("ok".to_string()),
                 None,
@@ -1025,6 +1051,15 @@ fn raft_command_targets_use_healthy_public_before_degraded_private() {
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&public_tcp.endpoint_id)
     );
+    let iroh_position = targets
+        .iter()
+        .position(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
+        .expect("iroh target");
+    let public_position = targets
+        .iter()
+        .position(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
+        .expect("public target");
+    assert!(public_position < iroh_position);
     std::fs::remove_dir_all(root).ok();
 }
 

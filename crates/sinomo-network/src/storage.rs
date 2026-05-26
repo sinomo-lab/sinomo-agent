@@ -2089,12 +2089,16 @@ fn cluster_route_connectivity_quality_rank(connectivity: Option<&ClusterConnecti
     }
 }
 
-fn cluster_route_command_quality_rank(connectivity: Option<&ClusterConnectivityState>) -> u8 {
-    match connectivity {
-        Some(ClusterConnectivityState::Healthy) => 0,
-        None => 1,
-        Some(ClusterConnectivityState::Degraded) => 2,
-        Some(ClusterConnectivityState::Unreachable) => 3,
+fn cluster_raft_route_availability_rank(
+    endpoint: &ClusterEndpointRecord,
+    connectivity: Option<&ClusterConnectivityState>,
+) -> u8 {
+    match (endpoint.transport.clone(), connectivity) {
+        (_, Some(ClusterConnectivityState::Unreachable)) => 4,
+        (ClusterTransportKind::Iroh, Some(ClusterConnectivityState::Healthy)) => 2,
+        (ClusterTransportKind::Iroh, _) => 3,
+        (_, Some(ClusterConnectivityState::Healthy)) => 0,
+        _ => 1,
     }
 }
 
@@ -2125,7 +2129,7 @@ fn cluster_raft_route_order_key(
     endpoint: &ClusterEndpointRecord,
 ) -> (u8, u8, u8, u16, String) {
     (
-        cluster_route_command_quality_rank(graph.state_for_endpoint(endpoint)),
+        cluster_raft_route_availability_rank(endpoint, graph.state_for_endpoint(endpoint)),
         cluster_endpoint_static_fallback_rank(endpoint),
         graph.quality_rank(endpoint),
         endpoint.priority,
