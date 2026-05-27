@@ -95,6 +95,32 @@ fn lock_cluster_raft_operation() -> Result<std::sync::MutexGuard<'static, ()>, D
         })
 }
 
+fn locked_cluster_raft_known_leader_id(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Option<NodeId>, DaemonError> {
+    let _raft_guard = lock_cluster_raft_operation()?;
+    sinomo_network::cluster_raft_known_leader_id(paths, state).map_err(Into::into)
+}
+
+fn locked_cluster_raft_local_is_leader(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<bool, DaemonError> {
+    let _raft_guard = lock_cluster_raft_operation()?;
+    sinomo_network::cluster_raft_local_is_leader(paths, state).map_err(Into::into)
+}
+
+fn locked_restore_cluster_raft_from_snapshot_if_newer(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    snapshot: KvSnapshot,
+) -> Result<bool, DaemonError> {
+    let _raft_guard = lock_cluster_raft_operation()?;
+    sinomo_network::restore_cluster_raft_from_snapshot_if_newer(paths, node_id, snapshot)
+        .map_err(Into::into)
+}
+
 fn cached_network_info_matches(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) -> bool {
     let key = publish_cache_key(paths, &info.node_id);
     let now = OffsetDateTime::now_utc();
@@ -1807,7 +1833,10 @@ pub fn initialize_local_cluster(
     );
     assign_local_node_public_keys(paths, &mut state)?;
     sinomo_network::write_cluster_state(paths, &state)?;
-    sinomo_network::set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
+    {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        sinomo_network::set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
+    }
     sync_cluster_state_to_kv(paths, &state)?;
     Ok(state)
 }
@@ -1941,7 +1970,7 @@ fn current_cluster_kv_store(
         snapshots.push(snapshot);
     }
     let mut targets = cluster_raft_live_voter_targets(paths, state);
-    if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
+    if let Ok(Some(leader_id)) = locked_cluster_raft_known_leader_id(paths, state)
         && !cluster_node_status_blocks_leader_preference(paths, state, &leader_id)
         && let Some(position) = targets
             .iter()
@@ -1977,7 +2006,7 @@ fn current_cluster_kv_store(
             detail: "no local or reachable cluster KV snapshot is available".to_string(),
         })?;
     sinomo_network::write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-    sinomo_network::restore_cluster_raft_from_snapshot_if_newer(
+    locked_restore_cluster_raft_from_snapshot_if_newer(
         paths,
         &state.local_node_id,
         snapshot.clone(),
@@ -2757,7 +2786,7 @@ fn commit_cluster_kv_txn_with_quorum_response_with_forwarding(
             ),
         });
     }
-    if !sinomo_network::cluster_raft_local_is_leader(paths, state)?
+    if !locked_cluster_raft_local_is_leader(paths, state)?
         && !elect_cluster_raft_leader(paths, state)?
     {
         if allow_forwarding
@@ -2781,7 +2810,7 @@ fn forward_cluster_kv_txn_to_voter(
     if targets.is_empty() {
         return None;
     }
-    if let Ok(Some(leader_id)) = sinomo_network::cluster_raft_known_leader_id(paths, state)
+    if let Ok(Some(leader_id)) = locked_cluster_raft_known_leader_id(paths, state)
         && !cluster_node_status_blocks_leader_preference(paths, state, &leader_id)
         && let Some(position) = targets
             .iter()
@@ -3418,6 +3447,69 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn cluster_kv_commit_waits_for_local_raft_operation_lock() {
+        let root = unique_cluster_test_root("sinomo-daemon-raft-local-lock-wait");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_raft_local_lock_wait").expect("cluster");
+        let local = NodeId::from_legacy_named("node_daemon_raft_local_lock_wait").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "raft local lock wait",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+        sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state to raft");
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let paths_for_holder = paths.clone();
+        let local_for_holder = local.clone();
+        let holder = thread::spawn(move || {
+            let _raft_guard = lock_cluster_raft_operation().expect("raft operation lock");
+            let _node =
+                sinomo_network::open_cluster_raft_kv_node(&paths_for_holder, &local_for_holder)
+                    .expect("hold raft node");
+            held_tx.send(()).expect("notify lock held");
+            thread::sleep(Duration::from_millis(100));
+        });
+        held_rx.recv().expect("wait for held raft node");
+
+        let (snapshot, _) = commit_cluster_kv_txn_with_quorum_response(
+            &paths,
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/test/local-lock-wait".to_string(),
+                    value: b"ok".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+        )
+        .expect("commit should wait for the in-process raft operation");
+        holder.join().expect("join raft holder");
+
+        let store = InProcessKvStore::restore(snapshot);
+        assert_eq!(
+            store.get("/test/local-lock-wait").expect("committed").value,
+            b"ok"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
