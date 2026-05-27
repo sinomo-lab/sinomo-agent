@@ -17,6 +17,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -24,6 +26,8 @@ pub const KV_OBJECT_VERSION_ID: u16 = 1;
 pub const KV_WAL_OBJECT_VERSION_ID: u16 = 2;
 const MAX_RETAINED_EVENTS: usize = 4096;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
+const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
+const RAFT_NODE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn register_storage_paths(
@@ -446,13 +450,14 @@ impl KvMaterializedCache {
         paths: KvWalPaths,
     ) -> Result<InProcessKvStore, KvError> {
         if paths.root.exists() {
-            let node = match DurableRaftKvNode::open_with_materialized_cache(node_id, paths, self) {
-                Ok(node) => node,
-                Err(KvError::Busy { .. }) if self.exists() => {
-                    return self.read_store();
-                }
-                Err(error) => return Err(error),
-            };
+            let node =
+                match DurableRaftKvNode::try_open_with_materialized_cache(node_id, paths, self) {
+                    Ok(node) => node,
+                    Err(KvError::Busy { .. }) if self.exists() => {
+                        return self.read_store();
+                    }
+                    Err(error) => return Err(error),
+                };
             let store = node.store().clone();
             self.write_snapshot_if_changed(&store.snapshot())?;
             return Ok(store);
@@ -1665,35 +1670,25 @@ pub struct DurableRaftKvNode {
 
 impl DurableRaftKvNode {
     pub fn open(node_id: NodeId, paths: KvWalPaths) -> Result<Self, KvError> {
-        Self::open_inner(node_id, paths, false)
+        Self::open_inner(node_id, paths, false, RAFT_NODE_LOCK_WAIT)
     }
 
     pub fn open_discarding_uncommitted_tail(
         node_id: NodeId,
         paths: KvWalPaths,
     ) -> Result<Self, KvError> {
-        Self::open_inner(node_id, paths, true)
+        Self::open_inner(node_id, paths, true, RAFT_NODE_LOCK_WAIT)
     }
 
     fn open_inner(
         node_id: NodeId,
         paths: KvWalPaths,
         discard_uncommitted_tail: bool,
+        lock_wait: Duration,
     ) -> Result<Self, KvError> {
         paths.ensure()?;
         let lock = open_node_lock(&paths)?;
-        lock.try_lock_exclusive().map_err(|source| {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
-                KvError::Busy {
-                    path: paths.lock.display().to_string(),
-                }
-            } else {
-                KvError::Io {
-                    path: paths.lock.display().to_string(),
-                    detail: source.to_string(),
-                }
-            }
-        })?;
+        lock_node_exclusive(&lock, &paths.lock, lock_wait)?;
         let snapshot = read_optional_object::<RaftSnapshot>(&paths.snapshot)?;
         let hard_state: RaftHardState =
             read_optional_object(&paths.hard_state)?.unwrap_or_default();
@@ -1761,7 +1756,7 @@ impl DurableRaftKvNode {
         paths: KvWalPaths,
         cache: &KvMaterializedCache,
     ) -> Result<Self, KvError> {
-        Self::open_with_materialized_cache_inner(node_id, paths, cache, false)
+        Self::open_with_materialized_cache_inner(node_id, paths, cache, false, RAFT_NODE_LOCK_WAIT)
     }
 
     pub fn open_discarding_uncommitted_tail_with_materialized_cache(
@@ -1769,7 +1764,15 @@ impl DurableRaftKvNode {
         paths: KvWalPaths,
         cache: &KvMaterializedCache,
     ) -> Result<Self, KvError> {
-        Self::open_with_materialized_cache_inner(node_id, paths, cache, true)
+        Self::open_with_materialized_cache_inner(node_id, paths, cache, true, RAFT_NODE_LOCK_WAIT)
+    }
+
+    fn try_open_with_materialized_cache(
+        node_id: NodeId,
+        paths: KvWalPaths,
+        cache: &KvMaterializedCache,
+    ) -> Result<Self, KvError> {
+        Self::open_with_materialized_cache_inner(node_id, paths, cache, false, Duration::ZERO)
     }
 
     fn open_with_materialized_cache_inner(
@@ -1777,16 +1780,21 @@ impl DurableRaftKvNode {
         paths: KvWalPaths,
         cache: &KvMaterializedCache,
         discard_uncommitted_tail: bool,
+        lock_wait: Duration,
     ) -> Result<Self, KvError> {
-        let mut node =
-            match Self::open_inner(node_id.clone(), paths.clone(), discard_uncommitted_tail) {
-                Ok(node) => node,
-                Err(error) if cache.exists() && !kv_error_is_busy(&error) => {
-                    quarantine_unreadable_raft_view(&paths);
-                    Self::open_inner(node_id, paths, discard_uncommitted_tail)?
-                }
-                Err(error) => return Err(error),
-            };
+        let mut node = match Self::open_inner(
+            node_id.clone(),
+            paths.clone(),
+            discard_uncommitted_tail,
+            lock_wait,
+        ) {
+            Ok(node) => node,
+            Err(error) if cache.exists() && !kv_error_is_busy(&error) => {
+                quarantine_unreadable_raft_view(&paths);
+                Self::open_inner(node_id, paths, discard_uncommitted_tail, lock_wait)?
+            }
+            Err(error) => return Err(error),
+        };
         if node.applied_index() == 0 && node.last_log_index() == 0 && cache.exists() {
             node.restore_snapshot(RaftSnapshot {
                 last_included_index: 0,
@@ -2176,6 +2184,34 @@ fn open_node_lock(paths: &KvWalPaths) -> Result<File, KvError> {
             path: paths.lock.display().to_string(),
             detail: source.to_string(),
         })
+}
+
+fn lock_node_exclusive(lock: &File, path: &Path, wait: Duration) -> Result<(), KvError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(source) if file_lock_is_busy(&source) => {
+                if wait.is_zero() || Instant::now() >= deadline {
+                    return Err(KvError::Busy {
+                        path: path.display().to_string(),
+                    });
+                }
+                thread::sleep(RAFT_NODE_LOCK_RETRY_INTERVAL);
+            }
+            Err(source) => {
+                return Err(KvError::Io {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn file_lock_is_busy(source: &std::io::Error) -> bool {
+    source.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(source.raw_os_error(), Some(32 | 33))
 }
 
 fn kv_error_is_busy(error: &KvError) -> bool {
@@ -2614,6 +2650,34 @@ mod tests {
             current.get("/cached").expect("cached value").value,
             b"available"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_node_open_waits_for_transient_lock_holder() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-raft-lock-wait-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_raft_lock_wait").expect("node");
+        let paths = KvWalPaths::new(root.join("raft"));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder_node_id = node_id.clone();
+        let holder_paths = paths.clone();
+        let holder = std::thread::spawn(move || {
+            let _node =
+                DurableRaftKvNode::open(holder_node_id, holder_paths).expect("hold raft node");
+            held_tx.send(()).expect("notify lock held");
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        held_rx.recv().expect("wait for holder");
+
+        let node = DurableRaftKvNode::open(node_id, paths).expect("wait for raft node lock");
+        assert_eq!(node.last_log_index(), 0);
+        holder.join().expect("join holder");
         std::fs::remove_dir_all(root).ok();
     }
 
