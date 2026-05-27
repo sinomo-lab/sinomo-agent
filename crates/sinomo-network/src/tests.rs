@@ -1374,6 +1374,20 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
     )
     .expect("public-context rollout endpoint");
     assert_eq!(selected.endpoint_id, shadow_iroh.endpoint_id);
+    let ordered = cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+        &paths,
+        &state,
+        &main,
+        Some(&public_main),
+        &[
+            private_shadow.clone(),
+            shadow_iroh.clone(),
+            public_main.clone(),
+        ],
+    );
+    assert_eq!(ordered[0].endpoint_id, shadow_iroh.endpoint_id);
+    assert_eq!(ordered[1].node_id, main);
+    assert_eq!(ordered[2].endpoint_id, private_shadow.endpoint_id);
 
     let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         &paths,

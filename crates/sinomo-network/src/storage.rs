@@ -2090,6 +2090,24 @@ pub fn cluster_rollout_target_endpoint_for_main_with_command_endpoint(
     command_endpoint: Option<&ClusterEndpointRecord>,
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
+    cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+        paths,
+        state,
+        main_node_id,
+        command_endpoint,
+        candidates,
+    )
+    .into_iter()
+    .next()
+}
+
+pub fn cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    main_node_id: &NodeId,
+    command_endpoint: Option<&ClusterEndpointRecord>,
+    candidates: &[ClusterEndpointRecord],
+) -> Vec<ClusterEndpointRecord> {
     let shadow_node_id = shadow_daemon_node_id(main_node_id);
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     let command_route_rank = command_endpoint
@@ -2121,7 +2139,7 @@ pub fn cluster_rollout_target_endpoint_for_main_with_command_endpoint(
             endpoint.address.clone(),
         )
     });
-    candidates.into_iter().next()
+    candidates
 }
 
 pub fn sort_cluster_rollout_endpoints(

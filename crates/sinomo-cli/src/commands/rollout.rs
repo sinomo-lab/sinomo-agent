@@ -46,6 +46,7 @@ impl Default for RolloutOptions {
 pub(crate) struct RolloutTarget {
     pub(crate) address: String,
     pub(crate) endpoint: Option<ClusterEndpointRecord>,
+    pub(crate) rollout_node_id: Option<NodeId>,
 }
 
 impl RolloutTarget {
@@ -53,18 +54,35 @@ impl RolloutTarget {
         Self {
             address,
             endpoint: None,
+            rollout_node_id: None,
         }
     }
 
     pub(crate) fn endpoint(endpoint: ClusterEndpointRecord) -> Self {
         Self {
             address: endpoint.address.clone(),
+            rollout_node_id: Some(endpoint.node_id.clone()),
             endpoint: Some(endpoint),
+        }
+    }
+
+    pub(crate) fn endpoint_for_node(
+        endpoint: ClusterEndpointRecord,
+        rollout_node_id: NodeId,
+    ) -> Self {
+        Self {
+            address: endpoint.address.clone(),
+            endpoint: Some(endpoint),
+            rollout_node_id: Some(rollout_node_id),
         }
     }
 
     pub(crate) fn label(&self) -> &str {
         &self.address
+    }
+
+    pub(crate) fn rollout_node_id(&self) -> Option<&NodeId> {
+        self.rollout_node_id.as_ref()
     }
 }
 
@@ -418,7 +436,14 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         )?;
     }
 
+    let mut completed_rollout_nodes = std::collections::BTreeSet::new();
     for target in targets {
+        if target
+            .rollout_node_id()
+            .is_some_and(|node_id| completed_rollout_nodes.contains(node_id))
+        {
+            continue;
+        }
         let target_status = match read_rollout_target_status(&target) {
             Ok(status) => status,
             Err(error) => {
@@ -461,6 +486,11 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                         );
                     } else {
                         println!("{}: {}", target.label(), response.status);
+                        if response.status == "accepted"
+                            && let Some(node_id) = target.rollout_node_id()
+                        {
+                            completed_rollout_nodes.insert(node_id.clone());
+                        }
                     }
                     if !response.detail.is_empty() {
                         println!("  {}", response.detail);
@@ -495,6 +525,11 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         match send_daemon_rollout_binary(&target, request) {
             Ok(response) => {
                 println!("{}: {}", target.label(), response.status);
+                if response.status == "accepted"
+                    && let Some(node_id) = target.rollout_node_id()
+                {
+                    completed_rollout_nodes.insert(node_id.clone());
+                }
                 if !response.detail.is_empty() {
                     println!("  {}", response.detail);
                 }
@@ -624,16 +659,23 @@ pub(crate) fn rollout_cluster_targets(
         }
         let rollout_endpoints = network::cluster_rollout_endpoint_candidates(&paths, state);
         for endpoint in network::cluster_main_daemon_command_targets(&paths, state) {
-            let rollout_endpoint =
-                network::cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+            let mut target_endpoints =
+                network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
                     &paths,
                     state,
                     &endpoint.node_id,
                     Some(&endpoint),
                     &rollout_endpoints,
-                )
-                .unwrap_or_else(|| endpoint.clone());
-            push_unique_rollout_target(&mut targets, RolloutTarget::endpoint(rollout_endpoint));
+                );
+            if target_endpoints.is_empty() {
+                target_endpoints.push(endpoint.clone());
+            }
+            for rollout_endpoint in target_endpoints {
+                push_unique_rollout_target(
+                    &mut targets,
+                    RolloutTarget::endpoint_for_node(rollout_endpoint, endpoint.node_id.clone()),
+                );
+            }
         }
         return Ok(targets);
     }
