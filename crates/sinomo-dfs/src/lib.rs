@@ -1212,6 +1212,7 @@ struct PendingMetadataReplication {
 struct PendingRoutedWrite {
     object_id: DfsObjectId,
     primary_node_id: NodeId,
+    remote_intent_id: Option<String>,
     durable_receipts: usize,
     required_receipts: usize,
     result: Option<Result<NetworkedDfsWriteOutcome, DfsError>>,
@@ -2760,6 +2761,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             PendingRoutedWrite {
                 object_id: object.object_id,
                 primary_node_id,
+                remote_intent_id: None,
                 durable_receipts: 0,
                 required_receipts: 1,
                 result: None,
@@ -2996,18 +2998,24 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 ),
             });
         }
+        let mut remote_intent_alias = None;
         match &response.result {
             DfsDistributedWriteResult::Outcome {
                 outcome:
                     NetworkedDfsWriteOutcome::Pending {
+                        intent_id,
                         durable_receipts,
                         required_receipts,
                         ..
                     },
             } => {
+                pending.remote_intent_id = Some(intent_id.clone());
                 pending.durable_receipts = *durable_receipts;
                 pending.required_receipts = *required_receipts;
                 pending.result = None;
+                if intent_id != &response.request_id {
+                    remote_intent_alias = Some((intent_id.clone(), pending.clone()));
+                }
             }
             DfsDistributedWriteResult::Outcome { outcome } => {
                 pending.result = Some(Ok(outcome.clone()));
@@ -3017,6 +3025,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     message: reason.clone(),
                 }));
             }
+        }
+        if let Some((intent_id, pending)) = remote_intent_alias {
+            self.pending_routed_writes
+                .entry(intent_id)
+                .or_insert(pending);
         }
         Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
             request_id: response.request_id,
@@ -4290,6 +4303,23 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 };
                 if matches!(updated_intent.state, DfsWriteIntentState::Committed) {
                     self.apply_committed_intent(&updated_intent.intent_id)?;
+                    if updated_intent.requesting_node_id != self.node_id
+                        && !self
+                            .pending_remote_write_responses
+                            .contains_key(&updated_intent.intent_id)
+                    {
+                        let outcome = self.write_outcome(&updated_intent.intent_id)?;
+                        self.send_dfs_message_if_routable(
+                            &updated_intent.requesting_node_id,
+                            DfsNetworkMessage::DistributedWriteResponse(
+                                DfsDistributedWriteResponse {
+                                    request_id: updated_intent.intent_id.clone(),
+                                    object_id: response.object_id.clone(),
+                                    result: DfsDistributedWriteResult::Outcome { outcome },
+                                },
+                            ),
+                        )?;
+                    }
                 }
                 if let Some(pending) = self.pending_writes.get_mut(&response.intent_id) {
                     pending
@@ -7646,7 +7676,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 Some(Ok(outcome)) => Ok(outcome.clone()),
                 Some(Err(error)) => Err(error.clone()),
                 None => Ok(NetworkedDfsWriteOutcome::Pending {
-                    intent_id: intent_id.to_string(),
+                    intent_id: pending
+                        .remote_intent_id
+                        .clone()
+                        .unwrap_or_else(|| intent_id.to_string()),
                     durable_receipts: pending.durable_receipts,
                     required_receipts: pending.required_receipts,
                 }),
@@ -8608,6 +8641,92 @@ mod tests {
             )),
             "distributed write metadata must be journaled on the selected services shard"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn routed_write_response_tracks_remote_intent_alias() {
+        let requester =
+            NodeId::from_legacy_named("node_routed_write_alias_requester").expect("requester");
+        let primary =
+            NodeId::from_legacy_named("node_routed_write_alias_primary").expect("primary");
+        let object_id = DfsObjectId::from_legacy_named("obj_routed_write_alias").expect("object");
+        let version = DfsVersion::from_legacy_named("version_routed_write_alias").expect("version");
+        let root = temp_root("routed-write-alias");
+        let mut dfs = NetworkedDfsService::new(
+            FailingSendTransport {
+                local_node_id: requester,
+            },
+            LocalContentStore::new(root.join("content")).expect("content"),
+        );
+        dfs.pending_routed_writes.insert(
+            "dfs_net_req_1".to_string(),
+            PendingRoutedWrite {
+                object_id: object_id.clone(),
+                primary_node_id: primary.clone(),
+                remote_intent_id: None,
+                durable_receipts: 0,
+                required_receipts: 1,
+                result: None,
+            },
+        );
+
+        dfs.handle_distributed_write_response(
+            primary.clone(),
+            DfsDistributedWriteResponse {
+                request_id: "dfs_net_req_1".to_string(),
+                object_id: object_id.clone(),
+                result: DfsDistributedWriteResult::Outcome {
+                    outcome: NetworkedDfsWriteOutcome::Pending {
+                        intent_id: "intent_remote_alias".to_string(),
+                        durable_receipts: 1,
+                        required_receipts: 2,
+                    },
+                },
+            },
+        )
+        .expect("pending response");
+
+        assert!(matches!(
+            dfs.write_outcome("dfs_net_req_1").expect("request outcome"),
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id,
+                durable_receipts: 1,
+                required_receipts: 2,
+            } if intent_id == "intent_remote_alias"
+        ));
+        assert!(
+            dfs.pending_routed_writes
+                .contains_key("intent_remote_alias")
+        );
+
+        dfs.handle_distributed_write_response(
+            primary,
+            DfsDistributedWriteResponse {
+                request_id: "intent_remote_alias".to_string(),
+                object_id,
+                result: DfsDistributedWriteResult::Outcome {
+                    outcome: NetworkedDfsWriteOutcome::Committed {
+                        intent_id: "intent_remote_alias".to_string(),
+                        version: version.clone(),
+                        content_hash: "blake3:routed-write-alias".to_string(),
+                        repair_jobs: Vec::new(),
+                    },
+                },
+            },
+        )
+        .expect("committed response");
+
+        assert!(matches!(
+            dfs.write_outcome("intent_remote_alias")
+                .expect("alias outcome"),
+            NetworkedDfsWriteOutcome::Committed {
+                intent_id,
+                version: committed_version,
+                ..
+            } if intent_id == "intent_remote_alias" && committed_version == version
+        ));
+
         std::fs::remove_dir_all(root).ok();
     }
 

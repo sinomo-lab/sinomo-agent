@@ -112,7 +112,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome else {
             return Ok(outcome);
         };
-        let intent_id = intent_id.clone();
+        let mut intent_id = intent_id.clone();
         let mut outcome = outcome;
         for _ in 0..POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
             let events = self.process_incoming()?;
@@ -120,6 +120,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 break;
             }
             outcome = self.write_outcome(&intent_id)?;
+            if let NetworkedDfsWriteOutcome::Pending {
+                intent_id: next_intent_id,
+                ..
+            } = &outcome
+            {
+                intent_id = next_intent_id.clone();
+            }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
                 break;
             }
