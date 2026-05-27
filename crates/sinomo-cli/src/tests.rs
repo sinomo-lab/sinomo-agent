@@ -12269,9 +12269,9 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
 }
 
 #[test]
-fn rollout_main_activation_requires_running_shadow() {
+fn rollout_main_activation_without_shadow_requires_staged_binary() {
     let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-shadow-required-{}",
+        "sinomo-cli-rollout-main-self-restart-staged-required-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
@@ -12296,7 +12296,7 @@ fn rollout_main_activation_requires_running_shadow() {
             mode: "test".to_string(),
         },
     )
-    .expect_err("shadow required");
+    .expect_err("staged binary required");
 
     assert!(matches!(error, CliError::DaemonNotRunning { .. }));
     assert!(!super::rollout_main_activation_path(&rollout_paths).exists());

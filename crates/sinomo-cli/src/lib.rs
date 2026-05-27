@@ -112,6 +112,7 @@ use sinomo_runtime::daemon::{
     prepare_installed_daemon_install_plan as daemon_prepare_installed_daemon_install_plan,
     prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
     prepare_local_shadow_rollout_restart as daemon_prepare_local_shadow_rollout_restart,
+    prepare_main_self_restart_from_env as daemon_prepare_main_self_restart_from_env,
     prepare_pending_cluster_join_state as daemon_prepare_pending_cluster_join_state,
     probe_daemon_status, publish_cluster_invitation_to_quorum,
     publish_default_dfs_metadata_journal as daemon_publish_default_dfs_metadata_journal,

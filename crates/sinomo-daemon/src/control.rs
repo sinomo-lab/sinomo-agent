@@ -35,6 +35,7 @@ pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const DAEMON_ACCEPT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
+const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 static SANDBOX_ACTIVE_EXECUTIONS: OnceLock<Mutex<SandboxActiveExecutions>> = OnceLock::new();
 
@@ -1129,9 +1130,11 @@ pub fn handle_daemon_connection(
                     detail: source.to_string(),
                 })?;
                 stream.shutdown_write();
-                Ok(accepted_rollout_should_stop_current_daemon(
-                    paths, &response,
-                ))
+                let should_stop = accepted_rollout_should_stop_current_daemon(paths, &response);
+                if should_stop {
+                    thread::sleep(ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE);
+                }
+                Ok(should_stop)
             }
             command if command == daemon_rpc_command(sinomo_network::ROLLOUT_BUILD_ROUTE) => {
                 let request = require_daemon_rpc_request(
@@ -1161,9 +1164,11 @@ pub fn handle_daemon_connection(
                     detail: source.to_string(),
                 })?;
                 stream.shutdown_write();
-                Ok(accepted_rollout_should_stop_current_daemon(
-                    paths, &response,
-                ))
+                let should_stop = accepted_rollout_should_stop_current_daemon(paths, &response);
+                if should_stop {
+                    thread::sleep(ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE);
+                }
+                Ok(should_stop)
             }
             _ => Ok(false),
         }
@@ -3215,9 +3220,9 @@ mod tests {
     }
 
     #[test]
-    fn accepted_rollout_keeps_shadow_control_loop_running() {
+    fn accepted_rollout_stops_main_but_not_shadow() {
         let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-control-rollout-shadow-{}",
+            "sinomo-daemon-control-rollout-main-stop-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time")

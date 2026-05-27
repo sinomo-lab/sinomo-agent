@@ -4,7 +4,8 @@ use crate::{
     prepare_background_command, probe_daemon_status, read_daemon_status,
     send_daemon_finalize_shadow_rollout_request, send_daemon_shutdown_request,
     spawn_candidate_main_daemon_process, spawn_main_daemon_process,
-    start_daemon_iroh_proxy_if_clustered, start_shadow_daemon_status_publisher,
+    spawn_main_daemon_process_with_env, start_daemon_iroh_proxy_if_clustered,
+    start_shadow_daemon_status_publisher,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sinomo_core::ClusterNodeRolloutStatus;
@@ -14,9 +15,9 @@ use sinomo_rollout::{
     LocalRolloutArtifacts, MainExitObservation, PendingShadowRolloutContext,
     ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutFailureDiagnostics, RolloutMainActivation,
     SelfRolloutPaths, activate_staged_rollout_binary, classify_main_exit,
-    deploy_managed_source_bundle, ensure_rollout_layout, managed_source_status,
-    read_pending_shadow_rollout, read_rollout_main_activation, read_tail_lossy,
-    record_activation_failure, record_main_activation_staged,
+    deploy_managed_source_bundle, ensure_rollout_layout, install_binary_atomically,
+    managed_source_status, read_pending_shadow_rollout, read_rollout_main_activation,
+    read_rollout_status, read_tail_lossy, record_activation_failure, record_main_activation_staged,
     record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
     record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
     restore_rollout_binary_from_backup, rollout_artifact_suffix, rollout_build_dev_binary,
@@ -40,8 +41,15 @@ pub const SHADOW_MAIN_HOST_ENV: &str = "SINOMO_SHADOW_MAIN_HOST";
 pub const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
 pub const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
 pub const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
+pub const MAIN_SELF_RESTART_DELAY_MS_ENV: &str = "SINOMO_MAIN_SELF_RESTART_DELAY_MS";
+pub const MAIN_SELF_ACTIVATE_BINARY_ENV: &str = "SINOMO_MAIN_SELF_ACTIVATE_BINARY";
+pub const MAIN_SELF_ACTIVATE_SHADOW_BINARY_ENV: &str = "SINOMO_MAIN_SELF_ACTIVATE_SHADOW_BINARY";
+pub const MAIN_SELF_ROLLOUT_ROOT_ENV: &str = "SINOMO_MAIN_SELF_ROLLOUT_ROOT";
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAIN_ACTIVATION_SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
+const MAIN_SELF_RESTART_DELAY: Duration = Duration::from_millis(1000);
+const MAIN_SELF_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const MAIN_SELF_ACTIVATION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
@@ -557,6 +565,110 @@ pub fn sleep_for_shadow_start_delay() -> Result<(), DaemonError> {
     Ok(())
 }
 
+pub fn prepare_main_self_restart_from_env() -> Result<(), DaemonError> {
+    sleep_for_main_self_restart_delay(take_rollout_env(MAIN_SELF_RESTART_DELAY_MS_ENV))?;
+    let Some(main_binary) = take_rollout_env(MAIN_SELF_ACTIVATE_BINARY_ENV) else {
+        return Ok(());
+    };
+    let shadow_binary = take_rollout_env(MAIN_SELF_ACTIVATE_SHADOW_BINARY_ENV)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let rollout_root = take_rollout_env(MAIN_SELF_ROLLOUT_ROOT_ENV).map(PathBuf::from);
+    install_self_restart_binary_with_retry(Path::new(&main_binary), shadow_binary.as_deref())?;
+    if let Some(rollout_root) = rollout_root {
+        record_main_self_restart_completed(&SelfRolloutPaths::new(&rollout_root))?;
+    }
+    Ok(())
+}
+
+fn take_rollout_env(key: &str) -> Option<String> {
+    let value = env::var(key).ok();
+    // This runs at daemon process startup, before worker threads are created.
+    unsafe {
+        env::remove_var(key);
+    }
+    value
+}
+
+fn sleep_for_main_self_restart_delay(delay: Option<String>) -> Result<(), DaemonError> {
+    let Some(delay) = delay else {
+        return Ok(());
+    };
+    let delay = delay.parse::<u64>().map_err(|source| DaemonError::Parse {
+        detail: format!("invalid {MAIN_SELF_RESTART_DELAY_MS_ENV} `{delay}`: {source}"),
+    })?;
+    if delay > 0 {
+        thread::sleep(Duration::from_millis(delay));
+    }
+    Ok(())
+}
+
+fn record_main_self_restart_completed(rollout_paths: &SelfRolloutPaths) -> Result<(), DaemonError> {
+    let previous = read_rollout_status(rollout_paths).ok().flatten();
+    write_rollout_status(
+        rollout_paths,
+        &ClusterNodeRolloutStatus {
+            status: "accepted".to_string(),
+            mode: previous.as_ref().and_then(|status| status.mode.clone()),
+            detail: Some("main daemon self-activated rollout".to_string()),
+            source: previous.as_ref().and_then(|status| status.source.clone()),
+            requested_at: previous
+                .as_ref()
+                .and_then(|status| status.requested_at.clone()),
+            staged_at: previous
+                .as_ref()
+                .and_then(|status| status.staged_at.clone()),
+            updated_at: Some(
+                OffsetDateTime::now_utc()
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            failed_at: None,
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        },
+    )?;
+    Ok(())
+}
+
+fn install_self_restart_binary_with_retry(
+    main_binary: &Path,
+    shadow_binary: Option<&Path>,
+) -> Result<(), DaemonError> {
+    let source = env::current_exe().map_err(|source| DaemonError::Io {
+        path: "current executable".to_string(),
+        detail: source.to_string(),
+    })?;
+    install_self_restart_destination_with_retry(&source, main_binary)?;
+    if let Some(shadow_binary) = shadow_binary
+        && let Err(error) = install_self_restart_destination_with_retry(&source, shadow_binary)
+    {
+        eprintln!("sinomo main self rollout could not refresh shadow binary: {error}");
+    }
+    Ok(())
+}
+
+fn install_self_restart_destination_with_retry(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), DaemonError> {
+    let deadline = Instant::now() + MAIN_SELF_ACTIVATION_TIMEOUT;
+    loop {
+        let result = install_binary_atomically(source, destination).map_err(DaemonError::from);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if Instant::now() < deadline => {
+                eprintln!("sinomo main self rollout activation retrying: {error}");
+                thread::sleep(MAIN_SELF_ACTIVATION_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub fn shadow_main_options_from_env() -> Result<crate::DaemonRunOptions, DaemonError> {
     let mut options = crate::DaemonRunOptions::default();
     if let Ok(host) = env::var(SHADOW_MAIN_HOST_ENV) {
@@ -720,21 +832,66 @@ pub fn stage_rollout_main_activation(
 ) -> Result<(), DaemonError> {
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
-    if !current_daemon_is_shadow
-        && !matches!(
+    let shadow_running = current_daemon_is_shadow
+        || matches!(
             probe_daemon_status(&shadow_paths, CLUSTER_HEALTH_PROBE_TIMEOUT),
             DaemonProbeStatus::Running(_)
-        )
-    {
-        return Err(DaemonError::NotRunning {
-            detail: "safe rollout requires the existing shadow daemon to be running".to_string(),
-        });
+        );
+    if !shadow_running {
+        return stage_main_self_restart_without_shadow(rollout_paths, activation);
     }
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
     if current_daemon_is_shadow {
         request_main_shutdown_for_shadow_rollout(data_dir, &activation)?;
     }
+    Ok(())
+}
+
+fn stage_main_self_restart_without_shadow(
+    rollout_paths: &SelfRolloutPaths,
+    activation: RolloutMainActivation,
+) -> Result<(), DaemonError> {
+    let staged_main = activation
+        .staged_main_binary
+        .as_ref()
+        .filter(|path| path.exists())
+        .ok_or_else(|| DaemonError::NotRunning {
+            detail: "main-only rollout requires a staged main binary".to_string(),
+        })?;
+    let candidate = rollout_paths.root.join("staged").join(format!(
+        "self-main-{}{}",
+        rollout_artifact_suffix(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    stage_rollout_file(staged_main, &candidate)?;
+    let main_options = crate::DaemonRunOptions {
+        host: activation.main_host.clone(),
+        port: activation.main_port,
+    };
+    spawn_main_daemon_process_with_env(
+        &candidate,
+        &main_options,
+        &[
+            (
+                MAIN_SELF_RESTART_DELAY_MS_ENV,
+                MAIN_SELF_RESTART_DELAY.as_millis().to_string(),
+            ),
+            (
+                MAIN_SELF_ACTIVATE_BINARY_ENV,
+                activation.main_binary.display().to_string(),
+            ),
+            (
+                MAIN_SELF_ACTIVATE_SHADOW_BINARY_ENV,
+                activation.shadow_binary.display().to_string(),
+            ),
+            (
+                MAIN_SELF_ROLLOUT_ROOT_ENV,
+                rollout_paths.root.display().to_string(),
+            ),
+        ],
+    )?;
+    record_main_activation_staged(rollout_paths, &activation)?;
     Ok(())
 }
 
@@ -1543,8 +1700,8 @@ mod tests {
     }
 
     #[test]
-    fn stage_rollout_main_activation_still_requires_shadow_when_called_from_main() {
-        let root = temp_rollout_test_root("main-requires-shadow");
+    fn stage_rollout_main_activation_without_shadow_requires_staged_binary() {
+        let root = temp_rollout_test_root("main-self-restart-requires-staged");
         std::fs::create_dir_all(root.join("daemon")).expect("main root");
         let rollout_paths = SelfRolloutPaths::new(&root);
         ensure_rollout_layout(&rollout_paths).expect("rollout layout");
@@ -1552,8 +1709,50 @@ mod tests {
         let activation = test_main_activation(&rollout_paths);
 
         let error = stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
-            .expect_err("main daemon must still verify a separate shadow daemon");
-        assert!(error.to_string().contains("safe rollout requires"));
+            .expect_err("main daemon needs a staged binary for self restart");
+        assert!(error.to_string().contains("main-only rollout requires"));
+        assert!(!rollout_main_activation_path(&rollout_paths).exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stage_rollout_main_activation_without_shadow_schedules_self_restart() {
+        let root = temp_rollout_test_root("main-self-restart");
+        std::fs::create_dir_all(root.join("daemon")).expect("main root");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        let staged_main = rollout_paths
+            .root
+            .join("staged")
+            .join(format!("test-main{}", std::env::consts::EXE_SUFFIX));
+        std::fs::create_dir_all(staged_main.parent().expect("staged parent"))
+            .expect("staged parent dir");
+        std::fs::copy(std::env::current_exe().expect("current exe"), &staged_main)
+            .expect("stage executable");
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.staged_main_binary = Some(staged_main);
+        activation.main_binary = root.join("bin").join("sinomo-main");
+        activation.shadow_binary = root.join("bin").join("sinomo-shadow");
+
+        stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
+            .expect("main daemon can schedule self restart without shadow");
+
+        let status = read_rollout_status(&rollout_paths)
+            .expect("read status")
+            .expect("status recorded");
+        assert_eq!(status.status, "main-staged");
+        assert!(!rollout_main_activation_path(&rollout_paths).exists());
+        let self_candidate_exists = std::fs::read_dir(rollout_paths.root.join("staged"))
+            .expect("staged dir")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("self-main-")
+            });
+        assert!(self_candidate_exists);
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -52,6 +52,14 @@ pub fn spawn_main_daemon_process(
     binary: &Path,
     options: &DaemonRunOptions,
 ) -> Result<Child, DaemonError> {
+    spawn_main_daemon_process_with_env(binary, options, &[])
+}
+
+pub fn spawn_main_daemon_process_with_env(
+    binary: &Path,
+    options: &DaemonRunOptions,
+    extra_env: &[(&str, String)],
+) -> Result<Child, DaemonError> {
     let mut command = Command::new(binary);
     prepare_background_command(&mut command);
     command
@@ -64,6 +72,9 @@ pub fn spawn_main_daemon_process(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     command.spawn().map_err(|source| DaemonError::Io {
         path: binary.display().to_string(),
         detail: source.to_string(),

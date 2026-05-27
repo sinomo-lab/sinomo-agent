@@ -132,6 +132,7 @@ pub(crate) fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliErro
 }
 
 pub(crate) fn run_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+    daemon_prepare_main_self_restart_from_env()?;
     let registration = daemon_cluster_registration_if_initialized(daemon_cluster_registration(
         DaemonClusterProcess::Main,
         options.clone(),
