@@ -41,6 +41,7 @@ pub const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
 pub const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
 pub const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+const MAIN_ACTIVATION_SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
@@ -367,6 +368,7 @@ where
         if pending_rollout.is_none()
             && matches!(main_probe_status, DaemonProbeStatus::Running(_))
             && pending_main_activation
+            && pending_main_activation_ready_for_shutdown(&rollout_paths)
             && Instant::now() >= next_pending_activation_shutdown_nudge
         {
             if let DaemonProbeStatus::Running(status) =
@@ -595,6 +597,19 @@ fn shadow_main_probe_interval(pending_rollout: bool) -> Duration {
 
 fn should_shadow_start_main(main_restart_suppressed: bool, pending_main_activation: bool) -> bool {
     pending_main_activation || !main_restart_suppressed
+}
+
+fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) -> bool {
+    let path = rollout_main_activation_path(rollout_paths);
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return true;
+    };
+    modified_at
+        .elapsed()
+        .is_ok_and(|age| age >= MAIN_ACTIVATION_SHUTDOWN_GRACE)
 }
 
 pub fn cluster_rollout_should_use_remote_build(
@@ -1468,6 +1483,21 @@ mod tests {
         assert!(should_shadow_start_main(true, true));
         assert!(!should_shadow_start_main(true, false));
         assert!(should_shadow_start_main(false, false));
+    }
+
+    #[test]
+    fn pending_main_activation_waits_before_shutdown_nudge() {
+        let root = temp_rollout_test_root("activation-shutdown-grace");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        std::fs::create_dir_all(&rollout_paths.root).expect("rollout root");
+        write_main_activation(&rollout_paths, &test_main_activation(&rollout_paths))
+            .expect("write activation");
+
+        assert!(!pending_main_activation_ready_for_shutdown(&rollout_paths));
+        std::thread::sleep(MAIN_ACTIVATION_SHUTDOWN_GRACE + Duration::from_millis(100));
+        assert!(pending_main_activation_ready_for_shutdown(&rollout_paths));
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
