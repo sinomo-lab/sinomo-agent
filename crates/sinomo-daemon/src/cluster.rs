@@ -382,21 +382,31 @@ pub fn start_daemon_iroh_proxy_if_clustered(
             };
             let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
             let daemon_address = daemon_connect_address(&options.host, options.port);
-            match sinomo_network::start_iroh_daemon_proxy(
-                cluster_paths,
-                cluster.cluster_id.clone(),
-                cluster.node_id.clone(),
-                daemon_address,
-            ) {
-                Ok(record) => {
-                    let endpoint = record.endpoint();
-                    if let Err(error) = advertise_daemon_iroh_endpoint(&paths, record) {
-                        eprintln!("sinomo {label} iroh endpoint advertisement failed: {error}");
-                    } else {
-                        println!("sinomo {label} iroh endpoint: {}", endpoint.address);
+            loop {
+                match sinomo_network::start_iroh_daemon_proxy(
+                    cluster_paths.clone(),
+                    cluster.cluster_id.clone(),
+                    cluster.node_id.clone(),
+                    daemon_address.clone(),
+                ) {
+                    Ok(record) => {
+                        let endpoint = record.endpoint();
+                        if let Err(error) = advertise_daemon_iroh_endpoint(&paths, record) {
+                            eprintln!("sinomo {label} iroh endpoint advertisement failed: {error}");
+                        } else {
+                            println!("sinomo {label} iroh endpoint: {}", endpoint.address);
+                        }
+                        break;
+                    }
+                    Err(error) if error.to_string().contains("without iroh-transport") => {
+                        eprintln!("sinomo {label} iroh proxy disabled: {error}");
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("sinomo {label} iroh proxy unavailable, retrying: {error}");
+                        thread::sleep(Duration::from_secs(5));
                     }
                 }
-                Err(error) => eprintln!("sinomo {label} iroh proxy disabled: {error}"),
             }
         })
         .map(|_| ())
@@ -2164,6 +2174,24 @@ pub fn register_daemon_cluster_node(
     })
 }
 
+pub fn daemon_cluster_status_from_local_state(
+    paths: &ClusterPaths,
+    registration: &DaemonClusterRegistration,
+) -> Result<DaemonClusterStatus, DaemonError> {
+    let mut state = sinomo_network::read_cluster_state_without_kv(paths)?;
+    ensure_daemon_cluster_members(
+        &mut state,
+        &registration.main_options,
+        &registration.shadow_options,
+        OffsetDateTime::now_utc(),
+    );
+    assign_local_node_public_keys(paths, &mut state)?;
+    let _ = refresh_local_iroh_endpoints_from_disk(paths, &mut state)?;
+    daemon_cluster_status(&state, registration.process).ok_or_else(|| DaemonError::Parse {
+        detail: "daemon cluster member could not be resolved from local state".to_string(),
+    })
+}
+
 pub fn daemon_cluster_registration_if_initialized(
     paths: &ClusterPaths,
     registration: DaemonClusterRegistration,
@@ -3330,6 +3358,48 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn daemon_cluster_status_from_local_state_resolves_shadow_without_kv() {
+        let root = unique_cluster_test_root("sinomo-daemon-shadow-local-cluster-status");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_shadow_local_status").expect("cluster"),
+            "shadow local status".to_string(),
+            NodeId::from_legacy_named("node_shadow_local_status").expect("node"),
+            "shadow local status".to_string(),
+            "main-public-key".to_string(),
+            now,
+        );
+        let main_options = DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 21_353,
+        };
+        let shadow_options = DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 21_354,
+        };
+        ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, now);
+        sinomo_network::write_cluster_state(&paths, &state).expect("write local state");
+
+        let registration = DaemonClusterRegistration {
+            process: crate::DaemonClusterProcess::Shadow,
+            main_options,
+            shadow_options,
+        };
+        let status = daemon_cluster_status_from_local_state(&paths, &registration)
+            .expect("shadow cluster status");
+
+        assert_eq!(status.cluster_id, state.cluster_id);
+        assert_eq!(status.process, crate::DAEMON_SHADOW_CLUSTER_ROLE);
+        assert_eq!(status.member_role, ClusterMemberRole::NonVoting);
+        assert_eq!(status.member_state, ClusterMemberState::NonVoting);
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

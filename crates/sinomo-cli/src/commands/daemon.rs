@@ -180,8 +180,12 @@ pub(crate) fn run_shadow_daemon_with_paths(
     registration: Option<DaemonClusterRegistration>,
 ) -> Result<(), CliError> {
     let cluster = registration
-        .map(|registration| register_daemon_cluster_node(&registration))
-        .transpose()?;
+        .as_ref()
+        .map(|registration| {
+            register_shadow_daemon_cluster_node_best_effort(&shadow_paths, registration)
+        })
+        .transpose()?
+        .flatten();
     daemon_run_shadow_daemon_supervision_loop(
         options,
         shadow_paths,
@@ -195,6 +199,36 @@ pub(crate) fn run_shadow_daemon_with_paths(
         handle_daemon_connection,
     )
     .map_err(Into::into)
+}
+
+fn register_shadow_daemon_cluster_node_best_effort(
+    shadow_paths: &DaemonPaths,
+    registration: &DaemonClusterRegistration,
+) -> Result<Option<DaemonClusterStatus>, CliError> {
+    match register_daemon_cluster_node(registration) {
+        Ok(cluster) => Ok(Some(cluster)),
+        Err(register_error) => {
+            let data_dir = shadow_paths.root.parent().ok_or_else(|| CliError::Io {
+                path: shadow_paths.root.display().to_string(),
+                detail: "shadow daemon paths have no data directory parent".to_string(),
+            })?;
+            let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+            match daemon_cluster_status_from_local_state(&cluster_paths, registration) {
+                Ok(cluster) => {
+                    eprintln!(
+                        "sinomo shadow daemon cluster registration failed: {register_error}; continuing with local cluster identity for repair routing"
+                    );
+                    Ok(Some(cluster))
+                }
+                Err(fallback_error) => {
+                    eprintln!(
+                        "sinomo shadow daemon cluster registration failed: {register_error}; local cluster identity unavailable: {fallback_error}; continuing unclustered"
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn run_daemon_with_paths(
@@ -311,6 +345,7 @@ pub(crate) fn print_daemon_status_with_paths(
                     format_member_role(&cluster.member_role),
                     format_member_state(&cluster.member_state)
                 );
+                print_local_daemon_iroh_endpoint(&paths, &status);
             }
             println!("  lock: {}", status.lock_file.display());
             println!("  status: {}", paths.status.display());
@@ -339,6 +374,7 @@ pub(crate) fn print_daemon_status_with_paths(
                         format_member_role(&cluster.member_role),
                         format_member_state(&cluster.member_state)
                     );
+                    print_local_daemon_iroh_endpoint(&paths, &status);
                 }
             } else {
                 println!("  default bind: {}:{}", options.host, options.port);
@@ -360,6 +396,21 @@ pub(crate) fn print_daemon_status_with_paths(
             Ok(())
         }
     }
+}
+
+fn print_local_daemon_iroh_endpoint(paths: &DaemonPaths, status: &DaemonStatus) {
+    let Some(cluster) = status.cluster.as_ref() else {
+        return;
+    };
+    let Some(data_dir) = paths.root.parent() else {
+        return;
+    };
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let Ok(record) = daemon_read_local_iroh_endpoint_record(&cluster_paths, &cluster.node_id)
+    else {
+        return;
+    };
+    println!("  iroh endpoint: {}", record.endpoint().address);
 }
 
 pub(crate) fn stop_daemon(options: DaemonRunOptions) -> Result<(), CliError> {

@@ -8,6 +8,8 @@ pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
 pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
+#[cfg(feature = "iroh-transport")]
+const IROH_DAEMON_PROXY_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -440,39 +442,61 @@ pub fn start_iroh_daemon_proxy(
     node_id: NodeId,
     daemon_address: String,
 ) -> Result<IrohEndpointRecord, NetworkError> {
-    let secret_key = load_or_create_iroh_secret_key(&paths, &node_id)?;
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name(format!("sinomo-iroh-{}", node_id.as_str()))
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(source) => {
-                    let _ = tx.send(Err(NetworkError::Io {
-                        operation: "start iroh runtime".to_string(),
-                        detail: source.to_string(),
-                    }));
-                    return;
-                }
-            };
-            runtime.block_on(async move {
-                let result = run_iroh_daemon_proxy(
-                    paths,
-                    cluster_id,
-                    node_id,
-                    daemon_address,
+            let mut first_ready = Some(tx);
+            loop {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(source) => {
+                        let error = NetworkError::Io {
+                            operation: "start iroh runtime".to_string(),
+                            detail: source.to_string(),
+                        };
+                        if let Some(ready) = first_ready.take() {
+                            let _ = ready.send(Err(error));
+                            return;
+                        }
+                        eprintln!("sinomo iroh daemon proxy restart failed: {error}");
+                        thread::sleep(IROH_DAEMON_PROXY_RESTART_BACKOFF);
+                        continue;
+                    }
+                };
+                let secret_key = match load_or_create_iroh_secret_key(&paths, &node_id) {
+                    Ok(secret_key) => secret_key,
+                    Err(error) => {
+                        if let Some(ready) = first_ready.take() {
+                            let _ = ready.send(Err(error));
+                            return;
+                        }
+                        eprintln!("sinomo iroh daemon proxy restart failed: {error}");
+                        runtime.shutdown_timeout(Duration::from_millis(250));
+                        thread::sleep(IROH_DAEMON_PROXY_RESTART_BACKOFF);
+                        continue;
+                    }
+                };
+                let result = runtime.block_on(run_iroh_daemon_proxy(
+                    paths.clone(),
+                    cluster_id.clone(),
+                    node_id.clone(),
+                    daemon_address.clone(),
                     secret_key,
-                    tx,
-                )
-                .await;
+                    first_ready.take(),
+                ));
+                runtime.shutdown_timeout(Duration::from_millis(250));
                 if let Err(error) = result {
                     eprintln!("sinomo iroh daemon proxy stopped: {error}");
+                } else {
+                    eprintln!("sinomo iroh daemon proxy stopped");
                 }
-            });
+                thread::sleep(IROH_DAEMON_PROXY_RESTART_BACKOFF);
+            }
         })
         .map_err(|source| NetworkError::Io {
             operation: "spawn iroh daemon proxy".to_string(),
@@ -504,21 +528,46 @@ async fn run_iroh_daemon_proxy(
     node_id: NodeId,
     daemon_address: String,
     secret_key: iroh::SecretKey,
-    ready: mpsc::Sender<Result<IrohEndpointRecord, NetworkError>>,
+    mut ready: Option<mpsc::Sender<Result<IrohEndpointRecord, NetworkError>>>,
 ) -> Result<(), NetworkError> {
-    let endpoint = sinomo_iroh_endpoint_builder()?
+    let builder = match sinomo_iroh_endpoint_builder() {
+        Ok(builder) => builder,
+        Err(error) => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
+    let endpoint = match builder
         .secret_key(secret_key)
         .alpns(vec![IROH_ROAMING_PROTOCOL.as_bytes().to_vec()])
         .bind()
         .await
-        .map_err(|source| NetworkError::Io {
-            operation: "bind iroh endpoint".to_string(),
-            detail: source.to_string(),
-        })?;
+    {
+        Ok(endpoint) => endpoint,
+        Err(source) => {
+            let error = NetworkError::Io {
+                operation: "bind iroh endpoint".to_string(),
+                detail: source.to_string(),
+            };
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
     let _ = tokio::time::timeout(IROH_DAEMON_ONLINE_TIMEOUT, endpoint.online()).await;
     let record = iroh_endpoint_record_from_addr(&cluster_id, &node_id, endpoint.addr());
-    write_iroh_endpoint_record(&paths, &record)?;
-    let _ = ready.send(Ok(record));
+    if let Err(error) = write_iroh_endpoint_record(&paths, &record) {
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Err(error.clone()));
+        }
+        return Err(error);
+    }
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(record));
+    }
 
     while let Some(connecting) = endpoint.accept().await {
         let daemon_address = daemon_address.clone();
