@@ -446,7 +446,13 @@ impl KvMaterializedCache {
         paths: KvWalPaths,
     ) -> Result<InProcessKvStore, KvError> {
         if paths.root.exists() {
-            let node = DurableRaftKvNode::open_with_materialized_cache(node_id, paths, self)?;
+            let node = match DurableRaftKvNode::open_with_materialized_cache(node_id, paths, self) {
+                Ok(node) => node,
+                Err(KvError::Busy { .. }) if self.exists() => {
+                    return self.read_store();
+                }
+                Err(error) => return Err(error),
+            };
             let store = node.store().clone();
             self.write_snapshot_if_changed(&store.snapshot())?;
             return Ok(store);
@@ -2575,6 +2581,38 @@ mod tests {
                 .expect("cached raft value")
                 .value,
             b"current"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_current_store_falls_back_to_snapshot_when_raft_node_is_busy() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-local-cache-busy-fallback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_local_cache_busy").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        let mut cached_store = InProcessKvStore::new();
+        cached_store
+            .put("/cached", b"available".to_vec(), None)
+            .expect("seed cache");
+        cache
+            .write_snapshot(&cached_store.snapshot())
+            .expect("write cache");
+        let _held_node = cache
+            .open_raft_node(node_id.clone())
+            .expect("hold raft lock");
+
+        let current = cache
+            .current_store(node_id)
+            .expect("busy raft should fall back to materialized snapshot");
+        assert_eq!(
+            current.get("/cached").expect("cached value").value,
+            b"available"
         );
         std::fs::remove_dir_all(root).ok();
     }
