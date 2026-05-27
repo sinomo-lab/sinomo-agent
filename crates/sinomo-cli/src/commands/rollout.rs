@@ -427,13 +427,18 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         let repo = rollout_source_repo_from_options(&options)?;
         desired_source_head = Some(rollout_source_head(&repo)?);
     }
-    if options.targets.is_empty() && options.remote_build {
-        publish_cluster_rollout_desired(
+    if options.targets.is_empty()
+        && options.remote_build
+        && let Err(error) = publish_cluster_rollout_desired(
             &options,
             &source,
             &requested_at,
             desired_source_head.as_deref(),
-        )?;
+        )
+    {
+        eprintln!(
+            "warning: cluster rollout desired-state publication failed: {error}; continuing with direct rollout targets"
+        );
     }
 
     let mut completed_rollout_nodes = std::collections::BTreeSet::new();
@@ -619,15 +624,7 @@ pub(crate) fn rollout_source_repo_from_options(
 pub(crate) fn rollout_cluster_targets(
     options: &RolloutOptions,
 ) -> Result<Vec<RolloutTarget>, CliError> {
-    let local_target = if options.targets.is_empty() && !options.skip_local {
-        if let Some(status) = default_main_daemon_status()? {
-            Some(status.address)
-        } else {
-            Some(daemon_connect_address(&options.host, options.port))
-        }
-    } else {
-        None
-    };
+    let local_target = local_rollout_target(options)?;
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let paths = ClusterPaths::new(&data_dir);
     let state = if options.targets.is_empty() {
@@ -655,7 +652,7 @@ pub(crate) fn rollout_cluster_targets(
     if let Some(state) = state.as_ref() {
         let mut targets = Vec::new();
         if let Some(local_target) = local_target {
-            push_unique_rollout_target(&mut targets, RolloutTarget::address(local_target));
+            push_unique_rollout_target(&mut targets, local_target);
         }
         let rollout_endpoints = network::cluster_rollout_endpoint_candidates(&paths, state);
         for endpoint in network::cluster_main_daemon_command_targets(&paths, state) {
@@ -679,15 +676,30 @@ pub(crate) fn rollout_cluster_targets(
         }
         return Ok(targets);
     }
-    Ok(
-        prepare_rollout_cluster_targets(Vec::new(), local_target, None)
-            .into_iter()
-            .map(RolloutTarget::address)
-            .fold(Vec::new(), |mut targets, target| {
-                push_unique_rollout_target(&mut targets, target);
-                targets
-            }),
-    )
+    let mut targets = Vec::new();
+    if let Some(local_target) = local_target {
+        push_unique_rollout_target(&mut targets, local_target);
+    }
+    Ok(targets)
+}
+
+fn local_rollout_target(options: &RolloutOptions) -> Result<Option<RolloutTarget>, CliError> {
+    if !options.targets.is_empty() || options.skip_local {
+        return Ok(None);
+    }
+    if let Some(status) = default_main_daemon_status()? {
+        return Ok(Some(RolloutTarget::address(status.address)));
+    }
+    let shadow_paths = shadow_daemon_paths_from_defaults()?;
+    if let DaemonProbeStatus::Running(status) =
+        probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT)
+    {
+        return Ok(Some(RolloutTarget::address(status.address)));
+    }
+    Ok(Some(RolloutTarget::address(daemon_connect_address(
+        &options.host,
+        options.port,
+    ))))
 }
 
 #[cfg(test)]

@@ -41,6 +41,9 @@ pub const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
 pub const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
 pub const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct ShadowMainRolloutMonitor {
@@ -58,6 +61,9 @@ pub enum ShadowMainStart {
     Main {
         child: Child,
     },
+    StartFailed {
+        detail: String,
+    },
     Candidate {
         child: Child,
         monitor: ShadowMainRolloutMonitor,
@@ -72,7 +78,7 @@ pub enum ShadowMainStart {
 
 pub enum ShadowMainExit {
     PendingActivation,
-    Restarted { child: Child },
+    RestartRequested,
     Suppressed,
 }
 
@@ -101,6 +107,48 @@ pub struct LocalShadowRolloutRestartPlan {
 pub struct LocalRolloutMainActivationPlan {
     pub activation: RolloutMainActivation,
     pub previous_main_status: Option<DaemonStatus>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ShadowMainRestartBackoff {
+    consecutive_failures: u32,
+    next_restart_at: Option<Instant>,
+}
+
+impl ShadowMainRestartBackoff {
+    fn can_restart(&self, now: Instant) -> bool {
+        self.next_restart_at
+            .is_none_or(|next_restart_at| now >= next_restart_at)
+    }
+
+    fn schedule_after_failure(&mut self, now: Instant) -> Duration {
+        let shift = self.consecutive_failures.min(7);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let multiplier = 1_u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let delay = SHADOW_MAIN_RESTART_INITIAL_BACKOFF
+            .saturating_mul(multiplier)
+            .min(SHADOW_MAIN_RESTART_MAX_BACKOFF);
+        self.next_restart_at = Some(now + delay);
+        delay
+    }
+
+    fn clear_schedule(&mut self) {
+        self.next_restart_at = None;
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+        self.next_restart_at = None;
+    }
+
+    fn reset_after_stable_start(&mut self, started_at: Option<Instant>, now: Instant) {
+        let Some(started_at) = started_at else {
+            return;
+        };
+        if now.duration_since(started_at) >= SHADOW_MAIN_RESTART_STABLE_RESET_AFTER {
+            self.reset();
+        }
+    }
 }
 
 impl PendingShadowRolloutContext for ShadowMainRolloutMonitor {
@@ -255,10 +303,14 @@ where
     ) {
         eprintln!("sinomo shadow daemon iroh proxy disabled: {error}");
     }
-    start_shadow_daemon_status_publisher(&shadow_paths)?;
+    if let Err(error) = start_shadow_daemon_status_publisher(&shadow_paths) {
+        eprintln!("sinomo shadow daemon status publisher disabled: {error}");
+    }
 
     let mut supervised_main: Option<Child> = None;
+    let mut supervised_main_started_at: Option<Instant> = None;
     let mut main_restart_suppressed = false;
+    let mut main_restart_backoff = ShadowMainRestartBackoff::default();
     let mut pending_rollout: Option<ShadowMainRolloutMonitor> = None;
     let shadow_idle_interval = Duration::from_millis(100);
     let mut last_main_probe = Instant::now() - shadow_main_probe_interval(false);
@@ -304,6 +356,11 @@ where
         if now.duration_since(last_main_probe) >= main_probe_interval {
             main_probe_status = probe_daemon_status(&main_paths, probe_timeout);
             last_main_probe = now;
+            if matches!(main_probe_status, DaemonProbeStatus::Running(_))
+                && pending_rollout.is_none()
+            {
+                main_restart_backoff.reset_after_stable_start(supervised_main_started_at, now);
+            }
         }
 
         let pending_main_activation = rollout_main_activation_path(&rollout_paths).exists();
@@ -348,9 +405,11 @@ where
         if should_shadow_start_main(main_restart_suppressed, pending_main_activation)
             && supervised_main.is_none()
             && matches!(main_probe_status, DaemonProbeStatus::NotRunning)
+            && (pending_main_activation || main_restart_backoff.can_restart(now))
         {
             if pending_main_activation {
                 main_restart_suppressed = false;
+                main_restart_backoff.clear_schedule();
             }
             match start_shadow_main_if_needed(
                 &rollout_paths,
@@ -359,7 +418,18 @@ where
                 finalize_timeout,
             )? {
                 ShadowMainStart::None => {}
-                ShadowMainStart::Main { child } => supervised_main = Some(child),
+                ShadowMainStart::Main { child } => {
+                    supervised_main = Some(child);
+                    supervised_main_started_at = Some(Instant::now());
+                    main_restart_backoff.clear_schedule();
+                }
+                ShadowMainStart::StartFailed { detail } => {
+                    let delay = main_restart_backoff.schedule_after_failure(Instant::now());
+                    eprintln!(
+                        "sinomo shadow daemon could not start supervised main: {detail}; retrying in {}ms",
+                        delay.as_millis()
+                    );
+                }
                 ShadowMainStart::Candidate {
                     child,
                     monitor,
@@ -367,6 +437,8 @@ where
                 } => {
                     main_binary = candidate_main_binary;
                     supervised_main = Some(child);
+                    supervised_main_started_at = Some(Instant::now());
+                    main_restart_backoff.clear_schedule();
                     pending_rollout = Some(monitor);
                     main_probe_status = DaemonProbeStatus::NotRunning;
                     last_main_probe = Instant::now() - shadow_main_probe_interval(true);
@@ -379,6 +451,8 @@ where
                     main_binary = recovered_main_binary;
                     main_options = recovered_main_options;
                     supervised_main = child;
+                    supervised_main_started_at = supervised_main.as_ref().map(|_| Instant::now());
+                    main_restart_backoff.clear_schedule();
                 }
             }
         }
@@ -409,6 +483,8 @@ where
                             main_probe_status = promoted_probe_status;
                             last_main_probe = Instant::now();
                             supervised_main = None;
+                            supervised_main_started_at = None;
+                            main_restart_backoff.reset();
                         }
                         PendingShadowMainExit::Recovered {
                             child,
@@ -418,6 +494,9 @@ where
                             main_binary = recovered_main_binary;
                             main_options = recovered_main_options;
                             supervised_main = child;
+                            supervised_main_started_at =
+                                supervised_main.as_ref().map(|_| Instant::now());
+                            main_restart_backoff.clear_schedule();
                         }
                     }
                     thread::sleep(Duration::from_millis(200));
@@ -432,16 +511,26 @@ where
                 )? {
                     ShadowMainExit::PendingActivation => {
                         supervised_main = None;
+                        supervised_main_started_at = None;
                         main_restart_suppressed = false;
+                        main_restart_backoff.clear_schedule();
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
-                    ShadowMainExit::Restarted { child } => {
-                        supervised_main = Some(child);
+                    ShadowMainExit::RestartRequested => {
+                        supervised_main = None;
+                        supervised_main_started_at = None;
+                        let delay = main_restart_backoff.schedule_after_failure(Instant::now());
+                        eprintln!(
+                            "sinomo shadow daemon supervised main crashed; retrying in {}ms",
+                            delay.as_millis()
+                        );
                     }
                     ShadowMainExit::Suppressed => {
                         supervised_main = None;
+                        supervised_main_started_at = None;
                         main_restart_suppressed = true;
+                        main_restart_backoff.reset();
                     }
                 }
             }
@@ -1049,9 +1138,12 @@ pub fn start_shadow_main_if_needed(
             }
         }
     } else if main_binary.exists() {
-        Ok(ShadowMainStart::Main {
-            child: spawn_main_daemon_process(main_binary, main_options)?,
-        })
+        match spawn_main_daemon_process(main_binary, main_options) {
+            Ok(child) => Ok(ShadowMainStart::Main { child }),
+            Err(error) => Ok(ShadowMainStart::StartFailed {
+                detail: error.to_string(),
+            }),
+        }
     } else {
         Ok(ShadowMainStart::None)
     }
@@ -1059,8 +1151,8 @@ pub fn start_shadow_main_if_needed(
 
 pub fn handle_shadow_main_process_exit(
     rollout_paths: &SelfRolloutPaths,
-    main_binary: &Path,
-    main_options: &crate::DaemonRunOptions,
+    _main_binary: &Path,
+    _main_options: &crate::DaemonRunOptions,
     status: ExitStatus,
 ) -> Result<ShadowMainExit, DaemonError> {
     if read_rollout_main_activation(rollout_paths)?.is_some() {
@@ -1070,9 +1162,7 @@ pub fn handle_shadow_main_process_exit(
     let kind = classify_main_exit(observation);
     record_rollout_main_exit(rollout_paths, observation, kind)?;
     if kind == sinomo_rollout::MainExitKind::Crash {
-        Ok(ShadowMainExit::Restarted {
-            child: spawn_main_daemon_process(main_binary, main_options)?,
-        })
+        Ok(ShadowMainExit::RestartRequested)
     } else {
         Ok(ShadowMainExit::Suppressed)
     }
@@ -1378,6 +1468,29 @@ mod tests {
         assert!(should_shadow_start_main(true, true));
         assert!(!should_shadow_start_main(true, false));
         assert!(should_shadow_start_main(false, false));
+    }
+
+    #[test]
+    fn shadow_main_restart_backoff_caps_and_resets_after_stable_runtime() {
+        let mut backoff = ShadowMainRestartBackoff::default();
+        let start = Instant::now();
+
+        let first = backoff.schedule_after_failure(start);
+        assert_eq!(first, SHADOW_MAIN_RESTART_INITIAL_BACKOFF);
+        assert!(!backoff.can_restart(start));
+        assert!(backoff.can_restart(start + first));
+
+        let mut delay = first;
+        let mut now = start;
+        for _ in 0..16 {
+            now = now + delay;
+            delay = backoff.schedule_after_failure(now);
+        }
+        assert_eq!(delay, SHADOW_MAIN_RESTART_MAX_BACKOFF);
+
+        backoff.reset_after_stable_start(Some(now), now + SHADOW_MAIN_RESTART_STABLE_RESET_AFTER);
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert!(backoff.next_restart_at.is_none());
     }
 
     #[test]
