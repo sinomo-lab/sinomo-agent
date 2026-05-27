@@ -54,7 +54,7 @@ Object versions are protected by hash. Rewriting the same `(object_id, version)`
 
 ### Metadata Backend
 
-`DfsMetadataBackend` is the durable metadata interface. The current `LocalJsonMetadataBackend` stores shard-local records as Sinomo object files and provides:
+`DfsMetadataBackend` is the durable metadata interface. The current `LocalJsonMetadataBackend` stores materialized shard state in packed append-only table batches under `records/tables/materialized.slog`; the shard journal remains the replay and replication source of truth. This avoids creating one host file per object, path, dentry, receipt, or version while preserving the same logical records:
 
 - filesystem records,
 - object and path records,
@@ -68,6 +68,8 @@ Object versions are protected by hash. Rewriting the same `(object_id, version)`
 Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation.
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever.
+
+Legacy per-record `.sobj` metadata layouts are loaded into the packed table log during backend open. New writes use the packed table path only.
 
 ### Networked DFS Service
 

@@ -1,8 +1,8 @@
 //! Durable DFS metadata shard backend.
 //!
 //! This is the first concrete metadata-plane surface. It intentionally stores
-//! file/object metadata outside `sinomo-kv`: records live in a shard-local
-//! ordered layout on disk, and every mutation is mirrored into an append-only
+//! file/object metadata outside `sinomo-kv`: materialized shard state lives in
+//! packed table batches, and every mutation is mirrored into an append-only
 //! journal that can later be replicated or replayed by metadata shard peers.
 
 use crate::control_plane::{DfsMetadataShardConfig, select_metadata_shard_config_for_path};
@@ -16,7 +16,7 @@ use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -30,13 +30,6 @@ pub const DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT: usize = 512;
 pub const DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
-const SECONDARY_INDEX_DIRS: &[&str] = &[
-    "filesystem-objects",
-    "paths",
-    "dentries",
-    "dirfrags",
-    "hardlinks",
-];
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
 
 #[derive(Debug, Error)]
@@ -564,6 +557,8 @@ pub struct LocalJsonMetadataBackend {
     shard_id: DfsMetadataShardId,
     root: PathBuf,
     next_sequence: u64,
+    tables: DfsMetadataTables,
+    table_log_offset: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -572,6 +567,231 @@ struct DfsObjectShardIndexRecord {
     file_system_id: DfsFileSystemId,
     path: String,
     shard_id: DfsMetadataShardId,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DfsMetadataTables {
+    file_systems: BTreeMap<DfsFileSystemId, DfsFileSystem>,
+    objects: BTreeMap<DfsObjectId, DfsObjectMetadata>,
+    file_system_objects: BTreeMap<(DfsFileSystemId, DfsObjectId), DfsPathRecord>,
+    paths: BTreeMap<(DfsFileSystemId, String), DfsPathRecord>,
+    inodes: BTreeMap<DfsInodeId, DfsInodeRecord>,
+    dirfrags: BTreeMap<(DfsInodeId, DfsDirFragmentId), DfsDirFragmentRecord>,
+    dentries: BTreeMap<(DfsInodeId, DfsDirFragmentId, u64, String), DfsPathRecord>,
+    hardlinks: BTreeMap<(DfsObjectId, DfsObjectId), DfsPathRecord>,
+    versions: BTreeMap<(DfsObjectId, DfsVersion), DfsObjectVersionRecord>,
+    receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), DfsReplicaReceiptRecord>,
+    intents: BTreeMap<(DfsObjectId, String), DfsWriteIntentRecord>,
+    conflicts: BTreeMap<(DfsObjectId, String), DfsConflictRecord>,
+    visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
+    namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DfsMetadataTableState {
+    tables: DfsMetadataTables,
+    table_log_offset: u64,
+}
+
+impl DfsMetadataTables {
+    fn has_materialized_state(&self) -> bool {
+        !self.file_systems.is_empty()
+            || !self.objects.is_empty()
+            || !self.versions.is_empty()
+            || !self.receipts.is_empty()
+            || !self.intents.is_empty()
+            || !self.conflicts.is_empty()
+            || !self.namespace_transactions.is_empty()
+            || !self.visible_commits.is_empty()
+    }
+
+    fn apply(&mut self, op: DfsMetadataTableOp) {
+        match op {
+            DfsMetadataTableOp::PutFileSystem { file_system } => {
+                self.file_systems
+                    .insert(file_system.file_system_id.clone(), file_system);
+            }
+            DfsMetadataTableOp::PutObject { object } => {
+                self.objects.insert(object.object_id.clone(), object);
+            }
+            DfsMetadataTableOp::PutFileSystemObject { path_record } => {
+                self.file_system_objects.insert(
+                    (
+                        path_record.file_system_id.clone(),
+                        path_record.object_id.clone(),
+                    ),
+                    path_record,
+                );
+            }
+            DfsMetadataTableOp::RemoveFileSystemObject {
+                file_system_id,
+                object_id,
+            } => {
+                self.file_system_objects
+                    .remove(&(file_system_id, object_id));
+            }
+            DfsMetadataTableOp::PutPath { path_record } => {
+                self.paths.insert(
+                    (path_record.file_system_id.clone(), path_record.path.clone()),
+                    path_record,
+                );
+            }
+            DfsMetadataTableOp::RemovePath {
+                file_system_id,
+                path,
+            } => {
+                self.paths.remove(&(file_system_id, path));
+            }
+            DfsMetadataTableOp::PutInode { inode } => {
+                self.inodes.insert(inode.inode_id.clone(), inode);
+            }
+            DfsMetadataTableOp::PutDirFragment { dirfrag } => {
+                self.dirfrags.insert(
+                    (dirfrag.dir_inode_id.clone(), dirfrag.dirfrag_id.clone()),
+                    dirfrag,
+                );
+            }
+            DfsMetadataTableOp::PutDentry { path_record } => {
+                self.dentries.insert(dentry_key(&path_record), path_record);
+            }
+            DfsMetadataTableOp::RemoveDentry {
+                parent_inode_id,
+                dirfrag_id,
+                name_hash,
+                name,
+            } => {
+                self.dentries
+                    .remove(&(parent_inode_id, dirfrag_id, name_hash, name));
+            }
+            DfsMetadataTableOp::PutHardlink {
+                target_object_id,
+                hardlink_object_id,
+                path_record,
+            } => {
+                self.hardlinks
+                    .insert((target_object_id, hardlink_object_id), path_record);
+            }
+            DfsMetadataTableOp::RemoveHardlink {
+                target_object_id,
+                hardlink_object_id,
+            } => {
+                self.hardlinks
+                    .remove(&(target_object_id, hardlink_object_id));
+            }
+            DfsMetadataTableOp::PutVersion { version } => {
+                self.versions.insert(
+                    (version.object_id.clone(), version.version.clone()),
+                    version,
+                );
+            }
+            DfsMetadataTableOp::PutReceipt { receipt } => {
+                self.receipts.insert(
+                    (
+                        receipt.receipt.object_id.clone(),
+                        receipt.receipt.committed_version.clone(),
+                        receipt.replica_node_id.clone(),
+                    ),
+                    receipt,
+                );
+            }
+            DfsMetadataTableOp::PutIntent { intent } => {
+                self.intents
+                    .insert((intent.object_id.clone(), intent.intent_id.clone()), intent);
+            }
+            DfsMetadataTableOp::PutConflict { conflict } => {
+                self.conflicts.insert(
+                    (conflict.object_id.clone(), conflict.conflict_id.clone()),
+                    conflict,
+                );
+            }
+            DfsMetadataTableOp::PutVisibleCommit {
+                object_id,
+                version,
+                commit,
+            } => {
+                self.visible_commits.insert((object_id, version), commit);
+            }
+            DfsMetadataTableOp::PutNamespaceTransaction { transaction } => {
+                self.namespace_transactions
+                    .insert(transaction.transaction_id.clone(), transaction);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsMetadataTableBatch {
+    sequence: u64,
+    ops: Vec<DfsMetadataTableOp>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum DfsMetadataTableOp {
+    PutFileSystem {
+        file_system: DfsFileSystem,
+    },
+    PutObject {
+        object: DfsObjectMetadata,
+    },
+    PutFileSystemObject {
+        path_record: DfsPathRecord,
+    },
+    RemoveFileSystemObject {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+    },
+    PutPath {
+        path_record: DfsPathRecord,
+    },
+    RemovePath {
+        file_system_id: DfsFileSystemId,
+        path: String,
+    },
+    PutInode {
+        inode: DfsInodeRecord,
+    },
+    PutDirFragment {
+        dirfrag: DfsDirFragmentRecord,
+    },
+    PutDentry {
+        path_record: DfsPathRecord,
+    },
+    RemoveDentry {
+        parent_inode_id: DfsInodeId,
+        dirfrag_id: DfsDirFragmentId,
+        name_hash: u64,
+        name: String,
+    },
+    PutHardlink {
+        target_object_id: DfsObjectId,
+        hardlink_object_id: DfsObjectId,
+        path_record: DfsPathRecord,
+    },
+    RemoveHardlink {
+        target_object_id: DfsObjectId,
+        hardlink_object_id: DfsObjectId,
+    },
+    PutVersion {
+        version: DfsObjectVersionRecord,
+    },
+    PutReceipt {
+        receipt: DfsReplicaReceiptRecord,
+    },
+    PutIntent {
+        intent: DfsWriteIntentRecord,
+    },
+    PutConflict {
+        conflict: DfsConflictRecord,
+    },
+    PutVisibleCommit {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        commit: DfsVisibleVersionCommitRecord,
+    },
+    PutNamespaceTransaction {
+        transaction: DfsNamespaceTransaction,
+    },
 }
 
 #[derive(Debug)]
@@ -1139,13 +1359,14 @@ impl LocalJsonMetadataBackend {
             shard_id,
             root,
             next_sequence,
+            tables: DfsMetadataTables::default(),
+            table_log_offset: 0,
         };
+        let state = load_or_migrate_metadata_tables(&backend.root)?;
+        backend.tables = state.tables;
+        backend.table_log_offset = state.table_log_offset;
         backend.ensure_local_materialization_cursor()?;
         backend.recover_unmaterialized_local_journal_entries()?;
-        if backend.secondary_indexes_need_recovery() {
-            backend.recover_secondary_indexes()?;
-        }
-        backend.ensure_secondary_index_dirs()?;
         backend.recover_namespace_transactions()?;
         backend.recover_visible_version_commits()?;
         backend.recover_object_locations_from_visible_versions()?;
@@ -1442,7 +1663,7 @@ impl LocalJsonMetadataBackend {
     }
 
     fn write_journal(&mut self, mutation: DfsMetadataMutation) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         self.write_journal_unlocked(mutation)
     }
 
@@ -1474,11 +1695,16 @@ impl LocalJsonMetadataBackend {
         if self.local_materialization_cursor_path().is_file() {
             return Ok(());
         }
+        let last_sequence = if self.tables.has_materialized_state() {
+            self.next_sequence.saturating_sub(1)
+        } else {
+            0
+        };
         write_json_atomic(
             &self.local_materialization_cursor_path(),
             &DfsMetadataReplayCursor {
                 shard_id: self.shard_id.clone(),
-                last_sequence: self.next_sequence.saturating_sub(1),
+                last_sequence,
             },
         )
     }
@@ -1504,7 +1730,7 @@ impl LocalJsonMetadataBackend {
         )
     }
 
-    fn recover_unmaterialized_local_journal_entries(&self) -> Result<()> {
+    fn recover_unmaterialized_local_journal_entries(&mut self) -> Result<()> {
         let mut cursor = self.local_materialization_cursor()?;
         loop {
             let entries = journal_entries_since_limited(
@@ -1524,16 +1750,21 @@ impl LocalJsonMetadataBackend {
         Ok(())
     }
 
-    fn materialize_local_journal_entry(&self, entry: &DfsMetadataJournalEntry) -> Result<()> {
+    fn materialize_local_journal_entry(&mut self, entry: &DfsMetadataJournalEntry) -> Result<()> {
         match &entry.mutation {
             DfsMetadataMutation::PutFileSystem {
-                file_system_id,
+                file_system_id: _,
                 file_system,
             } => {
                 let Some(file_system) = file_system.as_ref() else {
                     return Ok(());
                 };
-                write_json_atomic(&self.file_system_path(file_system_id), file_system)
+                self.append_and_apply_table_ops(
+                    entry.sequence,
+                    vec![DfsMetadataTableOp::PutFileSystem {
+                        file_system: file_system.clone(),
+                    }],
+                )
             }
             DfsMetadataMutation::PutObject { object, .. } => {
                 let Some(object) = object.as_ref() else {
@@ -1545,37 +1776,43 @@ impl LocalJsonMetadataBackend {
                     });
                 }
                 let previous = self.get_object(&object.object_id)?;
-                self.materialize_object_indexes_with_previous(object, previous.as_ref())
+                self.materialize_object_indexes_with_previous(
+                    object,
+                    previous.as_ref(),
+                    entry.sequence,
+                )
             }
             DfsMetadataMutation::PutVersion { version_record, .. } => {
                 let Some(version_record) = version_record.as_ref() else {
                     return Ok(());
                 };
-                write_json_atomic(
-                    &self.version_path(&version_record.object_id, &version_record.version),
-                    &normalized_version_record(version_record),
+                self.append_and_apply_table_ops(
+                    entry.sequence,
+                    vec![DfsMetadataTableOp::PutVersion {
+                        version: normalized_version_record(version_record),
+                    }],
                 )
             }
             DfsMetadataMutation::PutReceipt { receipt, .. } => {
                 let Some(receipt) = receipt.as_ref() else {
                     return Ok(());
                 };
-                write_json_atomic(
-                    &self.receipt_path(
-                        &receipt.receipt.object_id,
-                        &receipt.receipt.committed_version,
-                        &receipt.replica_node_id,
-                    ),
-                    receipt,
+                self.append_and_apply_table_ops(
+                    entry.sequence,
+                    vec![DfsMetadataTableOp::PutReceipt {
+                        receipt: receipt.clone(),
+                    }],
                 )
             }
             DfsMetadataMutation::PutIntent { intent, .. } => {
                 let Some(intent) = intent.as_ref() else {
                     return Ok(());
                 };
-                write_json_atomic(
-                    &self.intent_path(&intent.object_id, &intent.intent_id),
-                    intent,
+                self.append_and_apply_table_ops(
+                    entry.sequence,
+                    vec![DfsMetadataTableOp::PutIntent {
+                        intent: intent.clone(),
+                    }],
                 )
             }
             DfsMetadataMutation::CommitVisibleVersion {
@@ -1600,31 +1837,31 @@ impl LocalJsonMetadataBackend {
                     ),
                     created_at: entry.created_at,
                 };
-                write_json_atomic(
-                    &self.visible_commit_path(
-                        &commit_record.committed_object.object_id,
-                        &commit_record.committed_object.version,
-                    ),
-                    &commit_record,
-                )?;
-                self.materialize_visible_version_commit(&commit_record)
+                self.materialize_visible_version_commit(&commit_record, entry.sequence)
             }
             DfsMetadataMutation::PutConflict { conflict, .. } => {
                 let Some(conflict) = conflict.as_ref() else {
                     return Ok(());
                 };
-                write_json_atomic(&self.conflict_path(conflict), conflict)
+                self.append_and_apply_table_ops(
+                    entry.sequence,
+                    vec![DfsMetadataTableOp::PutConflict {
+                        conflict: conflict.clone(),
+                    }],
+                )
             }
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
                 let Some(transaction) = transaction.as_ref() else {
                     return Ok(());
                 };
                 let transaction = normalized_namespace_transaction(transaction);
-                write_json_atomic(
-                    &self.namespace_transaction_path(&transaction.transaction_id),
-                    &transaction,
+                self.append_and_apply_table_ops(
+                    entry.sequence,
+                    vec![DfsMetadataTableOp::PutNamespaceTransaction {
+                        transaction: transaction.clone(),
+                    }],
                 )?;
-                self.materialize_namespace_transaction(&transaction)
+                self.materialize_namespace_transaction(&transaction, entry.sequence)
             }
         }
     }
@@ -1633,173 +1870,10 @@ impl LocalJsonMetadataBackend {
         self.root.join("records")
     }
 
-    fn file_system_path(&self, file_system_id: &DfsFileSystemId) -> PathBuf {
-        self.records_root()
-            .join("filesystems")
-            .join(format!("{}.sobj", key_segment(file_system_id)))
-    }
-
-    fn file_system_dir(&self) -> PathBuf {
-        self.records_root().join("filesystems")
-    }
-
-    fn object_path(&self, object_id: &DfsObjectId) -> PathBuf {
-        self.records_root()
-            .join("objects")
-            .join(key_segment(object_id))
-            .join("object.sobj")
-    }
-
-    fn object_records_dir(&self) -> PathBuf {
-        self.records_root().join("objects")
-    }
-
-    fn file_system_object_index_path(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        object_id: &DfsObjectId,
-    ) -> PathBuf {
-        self.records_root()
-            .join("filesystem-objects")
-            .join(key_segment(file_system_id))
-            .join(format!("{}.sobj", key_segment(object_id)))
-    }
-
-    fn file_system_object_index_dir(&self, file_system_id: &DfsFileSystemId) -> PathBuf {
-        self.records_root()
-            .join("filesystem-objects")
-            .join(key_segment(file_system_id))
-    }
-
-    fn path_index_path(&self, file_system_id: &DfsFileSystemId, path: &str) -> PathBuf {
-        self.records_root()
-            .join("paths")
-            .join(key_segment(file_system_id))
-            .join(format!("{}.sobj", path_hash(path)))
-    }
-
-    fn inode_path(&self, inode_id: &DfsInodeId) -> PathBuf {
-        self.records_root()
-            .join("inodes")
-            .join(format!("{}.sobj", key_segment(&inode_id.0)))
-    }
-
-    fn dirfrag_path(&self, dir_inode_id: &DfsInodeId, dirfrag_id: &DfsDirFragmentId) -> PathBuf {
-        self.records_root()
-            .join("dirfrags")
-            .join(key_segment(&dir_inode_id.0))
-            .join(format!("{}.sobj", key_segment(&dirfrag_id.0)))
-    }
-
-    fn dentry_path(&self, path_record: &DfsPathRecord) -> PathBuf {
-        self.records_root()
-            .join("dentries")
-            .join(key_segment(&path_record.parent_inode_id.0))
-            .join(key_segment(&path_record.dirfrag_id.0))
-            .join(format!(
-                "{:016x}-{}.sobj",
-                path_record.name_hash,
-                path_hash(&path_record.name)
-            ))
-    }
-
-    fn hardlink_index_path(
-        &self,
-        target_object_id: &DfsObjectId,
-        hardlink_object_id: &DfsObjectId,
-    ) -> PathBuf {
-        self.records_root()
-            .join("hardlinks")
-            .join(key_segment(target_object_id))
-            .join(format!("{}.sobj", key_segment(hardlink_object_id)))
-    }
-
-    fn hardlink_index_dir(&self, target_object_id: &DfsObjectId) -> PathBuf {
-        self.records_root()
-            .join("hardlinks")
-            .join(key_segment(target_object_id))
-    }
-
-    fn version_path(&self, object_id: &DfsObjectId, version: &DfsVersion) -> PathBuf {
-        self.records_root()
-            .join("versions")
-            .join(key_segment(object_id))
-            .join(format!("{}.sobj", key_segment(version)))
-    }
-
-    fn version_dir(&self, object_id: &DfsObjectId) -> PathBuf {
-        self.records_root()
-            .join("versions")
-            .join(key_segment(object_id))
-    }
-
-    fn receipt_path(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        replica_node_id: &NodeId,
-    ) -> PathBuf {
-        self.records_root()
-            .join("receipts")
-            .join(key_segment(object_id))
-            .join(key_segment(version))
-            .join(format!("{}.sobj", key_segment(replica_node_id)))
-    }
-
-    fn receipt_dir(&self, object_id: &DfsObjectId, version: &DfsVersion) -> PathBuf {
-        self.records_root()
-            .join("receipts")
-            .join(key_segment(object_id))
-            .join(key_segment(version))
-    }
-
-    fn intent_path(&self, object_id: &DfsObjectId, intent_id: &str) -> PathBuf {
-        self.records_root()
-            .join("intents")
-            .join(key_segment(object_id))
-            .join(format!("{}.sobj", key_segment(&intent_id)))
-    }
-
-    fn intent_dir(&self, object_id: &DfsObjectId) -> PathBuf {
-        self.records_root()
-            .join("intents")
-            .join(key_segment(object_id))
-    }
-
-    fn conflict_dir(&self, object_id: &DfsObjectId) -> PathBuf {
-        self.records_root()
-            .join("conflicts")
-            .join(key_segment(object_id))
-    }
-
-    fn conflict_path(&self, conflict: &DfsConflictRecord) -> PathBuf {
-        self.conflict_path_by_id(&conflict.object_id, &conflict.conflict_id)
-    }
-
-    fn conflict_path_by_id(&self, object_id: &DfsObjectId, conflict_id: &str) -> PathBuf {
-        self.conflict_dir(object_id)
-            .join(format!("{}.sobj", key_segment(&conflict_id)))
-    }
-
-    fn visible_commit_path(&self, object_id: &DfsObjectId, version: &DfsVersion) -> PathBuf {
-        self.records_root()
-            .join("visible-commits")
-            .join(key_segment(object_id))
-            .join(format!("{}.sobj", key_segment(version)))
-    }
-
-    fn visible_commit_root(&self) -> PathBuf {
-        self.records_root().join("visible-commits")
-    }
-
     fn namespace_transaction_path(&self, transaction_id: &str) -> PathBuf {
         self.records_root()
             .join("namespace-transactions")
             .join(format!("{}.sobj", key_segment(&transaction_id)))
-    }
-
-    fn namespace_transaction_root(&self) -> PathBuf {
-        self.records_root().join("namespace-transactions")
     }
 
     fn replay_cursor_path(&self, shard_id: &DfsMetadataShardId) -> PathBuf {
@@ -1858,6 +1932,44 @@ impl LocalJsonMetadataBackend {
             _file: file,
         })
     }
+
+    fn begin_metadata_write(&mut self) -> Result<MetadataWriteLock> {
+        let lock = self.metadata_write_lock()?;
+        self.refresh_metadata_tables()?;
+        Ok(lock)
+    }
+
+    fn append_and_apply_table_ops(
+        &mut self,
+        sequence: u64,
+        ops: Vec<DfsMetadataTableOp>,
+    ) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let written = append_metadata_table_batch(
+            &self.root,
+            &DfsMetadataTableBatch {
+                sequence,
+                ops: ops.clone(),
+            },
+        )?;
+        self.table_log_offset = self.table_log_offset.saturating_add(written);
+        for op in ops {
+            self.tables.apply(op);
+        }
+        Ok(())
+    }
+
+    fn refresh_metadata_tables(&mut self) -> Result<()> {
+        let path = metadata_table_path(&self.root);
+        if !path.is_file() {
+            return Ok(());
+        }
+        self.table_log_offset =
+            replay_metadata_table_batches_from(&path, self.table_log_offset, &mut self.tables)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1902,29 +2014,31 @@ impl Drop for MetadataPathWriteGuard {
 
 impl DfsMetadataBackend for LocalJsonMetadataBackend {
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         let entry = self.write_journal_unlocked(DfsMetadataMutation::PutFileSystem {
             file_system_id: file_system.file_system_id.clone(),
             file_system: Some(file_system.clone()),
         })?;
-        write_json_atomic(
-            &self.file_system_path(&file_system.file_system_id),
-            file_system,
+        self.append_and_apply_table_ops(
+            entry.sequence,
+            vec![DfsMetadataTableOp::PutFileSystem {
+                file_system: file_system.clone(),
+            }],
         )?;
         self.advance_local_materialization_cursor(entry.sequence)?;
         Ok(entry)
     }
 
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>> {
-        read_json_optional(&self.file_system_path(file_system_id))
+        Ok(self.tables.file_systems.get(file_system_id).cloned())
     }
 
     fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>> {
-        read_json_dir(&self.file_system_dir())
+        Ok(self.tables.file_systems.values().cloned().collect())
     }
 
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         let object = normalized_object_metadata(object);
         if self.get_file_system(&object.file_system_id)?.is_none() {
             return Err(MetadataBackendError::UnknownFileSystem {
@@ -1939,13 +2053,13 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             path: object.path.clone(),
             object: Some(object.clone()),
         })?;
-        self.materialize_object_indexes_with_previous(&object, previous.as_ref())?;
+        self.materialize_object_indexes_with_previous(&object, previous.as_ref(), entry.sequence)?;
         self.advance_local_materialization_cursor(entry.sequence)?;
         Ok(entry)
     }
 
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
-        read_json_optional(&self.object_path(object_id))
+        Ok(self.tables.objects.get(object_id).cloned())
     }
 
     fn get_object_by_path(
@@ -1953,15 +2067,19 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
-        let Some(path_record) =
-            read_json_optional::<DfsPathRecord>(&self.path_index_path(file_system_id, path))?
+        let normalized_path = normalize_path(path);
+        let Some(path_record) = self
+            .tables
+            .paths
+            .get(&(file_system_id.clone(), normalized_path.clone()))
+            .cloned()
         else {
             return Ok(None);
         };
         if path_record.file_system_id != *file_system_id {
             return Ok(None);
         }
-        if normalize_path(&path_record.path) != normalize_path(path) {
+        if normalize_path(&path_record.path) != normalized_path {
             return Ok(None);
         }
         let Some(object) = self.get_object(&path_record.object_id)? else {
@@ -1981,8 +2099,11 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>> {
         let mut objects = Vec::new();
-        for path_record in
-            read_json_dir::<DfsPathRecord>(&self.file_system_object_index_dir(file_system_id))?
+        for path_record in self
+            .tables
+            .file_system_objects
+            .values()
+            .filter(|path_record| path_record.file_system_id == *file_system_id)
         {
             if path_record.file_system_id != *file_system_id {
                 continue;
@@ -2016,24 +2137,28 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             .records_root()
             .join("dentries")
             .join(key_segment(&parent_inode_id.0));
-        for fragment_dir in read_child_dirs_if_exists(&parent_dentry_root)? {
-            for path_record in read_json_dir::<DfsPathRecord>(&fragment_dir)? {
-                if path_record.file_system_id != *file_system_id
-                    || path_record.parent_inode_id != parent_inode_id
-                {
-                    continue;
-                }
-                let Some(object) = self.get_object(&path_record.object_id)? else {
-                    continue;
-                };
-                if object.kind == DfsObjectKind::Tombstone
-                    || object.file_system_id != *file_system_id
-                    || normalize_path(&object.path) != path_record.path
-                {
-                    continue;
-                }
-                objects.push(object);
+        let _ = parent_dentry_root;
+        for path_record in self
+            .tables
+            .dentries
+            .values()
+            .filter(|path_record| path_record.parent_inode_id == parent_inode_id)
+        {
+            if path_record.file_system_id != *file_system_id
+                || path_record.parent_inode_id != parent_inode_id
+            {
+                continue;
             }
+            let Some(object) = self.get_object(&path_record.object_id)? else {
+                continue;
+            };
+            if object.kind == DfsObjectKind::Tombstone
+                || object.file_system_id != *file_system_id
+                || normalize_path(&object.path) != path_record.path
+            {
+                continue;
+            }
+            objects.push(object);
         }
         objects.sort_by(|left, right| {
             left.path
@@ -2049,9 +2174,10 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         target_object_id: &DfsObjectId,
     ) -> Result<Vec<DfsObjectMetadata>> {
         let mut hardlinks = Vec::new();
-        for path_record in
-            read_json_dir::<DfsPathRecord>(&self.hardlink_index_dir(target_object_id))?
-        {
+        for ((target_id, _), path_record) in &self.tables.hardlinks {
+            if target_id != target_object_id {
+                continue;
+            }
             if path_record.file_system_id != *file_system_id {
                 continue;
             }
@@ -2075,7 +2201,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         let version = normalized_version_record(version);
         let entry = self.write_journal_unlocked(DfsMetadataMutation::PutVersion {
             file_system_id: version.file_system_id.clone(),
@@ -2088,9 +2214,11 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             ..
         } = &entry.mutation
         {
-            write_json_atomic(
-                &self.version_path(&version.object_id, &version.version),
-                version,
+            self.append_and_apply_table_ops(
+                entry.sequence,
+                vec![DfsMetadataTableOp::PutVersion {
+                    version: version.clone(),
+                }],
             )?;
         }
         self.advance_local_materialization_cursor(entry.sequence)?;
@@ -2102,12 +2230,21 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Option<DfsObjectVersionRecord>> {
-        read_json_optional(&self.version_path(object_id, version))
+        Ok(self
+            .tables
+            .versions
+            .get(&(object_id.clone(), version.clone()))
+            .cloned())
     }
 
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
-        let mut versions: Vec<DfsObjectVersionRecord> =
-            read_json_dir(&self.version_dir(object_id))?;
+        let mut versions = self
+            .tables
+            .versions
+            .values()
+            .filter(|version| version.object_id == *object_id)
+            .cloned()
+            .collect::<Vec<_>>();
         versions.sort_by(|left, right| left.version.cmp(&right.version));
         Ok(versions)
     }
@@ -2116,7 +2253,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         &mut self,
         receipt: &DfsReplicaReceiptRecord,
     ) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         let entry = self.write_journal_unlocked(DfsMetadataMutation::PutReceipt {
             file_system_id: receipt.receipt.file_system_id.clone(),
             object_id: receipt.receipt.object_id.clone(),
@@ -2124,13 +2261,11 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             replica_node_id: receipt.replica_node_id.clone(),
             receipt: Some(receipt.clone()),
         })?;
-        write_json_atomic(
-            &self.receipt_path(
-                &receipt.receipt.object_id,
-                &receipt.receipt.committed_version,
-                &receipt.replica_node_id,
-            ),
-            receipt,
+        self.append_and_apply_table_ops(
+            entry.sequence,
+            vec![DfsMetadataTableOp::PutReceipt {
+                receipt: receipt.clone(),
+            }],
         )?;
         self.advance_local_materialization_cursor(entry.sequence)?;
         Ok(entry)
@@ -2141,11 +2276,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Vec<DfsReplicaReceiptRecord>> {
-        read_json_dir(&self.receipt_dir(object_id, version))
+        Ok(self
+            .tables
+            .receipts
+            .values()
+            .filter(|receipt| {
+                receipt.receipt.object_id == *object_id
+                    && receipt.receipt.committed_version == *version
+            })
+            .cloned()
+            .collect())
     }
 
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         let entry = self.write_journal_unlocked(DfsMetadataMutation::PutIntent {
             file_system_id: intent.file_system_id.clone(),
             object_id: intent.object_id.clone(),
@@ -2153,9 +2297,11 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             status: intent.status.clone(),
             intent: Some(intent.clone()),
         })?;
-        write_json_atomic(
-            &self.intent_path(&intent.object_id, &intent.intent_id),
-            intent,
+        self.append_and_apply_table_ops(
+            entry.sequence,
+            vec![DfsMetadataTableOp::PutIntent {
+                intent: intent.clone(),
+            }],
         )?;
         self.advance_local_materialization_cursor(entry.sequence)?;
         Ok(entry)
@@ -2166,11 +2312,21 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>> {
-        read_json_optional(&self.intent_path(object_id, intent_id))
+        Ok(self
+            .tables
+            .intents
+            .get(&(object_id.clone(), intent_id.to_string()))
+            .cloned())
     }
 
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
-        let mut intents: Vec<DfsWriteIntentRecord> = read_json_dir(&self.intent_dir(object_id))?;
+        let mut intents = self
+            .tables
+            .intents
+            .values()
+            .filter(|intent| intent.object_id == *object_id)
+            .cloned()
+            .collect::<Vec<_>>();
         intents.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
         Ok(intents)
     }
@@ -2182,7 +2338,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         visible_version: &DfsObjectVersionRecord,
         required_replica_node_ids: &[NodeId],
     ) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         let current = self
             .get_object(&committed_object.object_id)?
             .ok_or_else(|| MetadataBackendError::UnknownObject {
@@ -2197,12 +2353,11 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         }
 
         for node_id in required_replica_node_ids {
-            let receipt = self.receipt_path(
-                &committed_object.object_id,
-                &committed_object.version,
-                node_id,
-            );
-            if !receipt.is_file() {
+            if !self.tables.receipts.contains_key(&(
+                committed_object.object_id.clone(),
+                committed_object.version.clone(),
+                node_id.clone(),
+            )) {
                 return Err(MetadataBackendError::Conflict {
                     object_id: committed_object.object_id.clone(),
                     expected: expected_version.clone(),
@@ -2218,10 +2373,6 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             required_replica_node_ids: normalized_node_location_list(required_replica_node_ids),
             created_at: OffsetDateTime::now_utc(),
         };
-        write_json_atomic(
-            &self.visible_commit_path(&committed_object.object_id, &committed_object.version),
-            &commit_record,
-        )?;
         let entry = self.write_journal_unlocked(DfsMetadataMutation::CommitVisibleVersion {
             file_system_id: committed_object.file_system_id.clone(),
             object_id: committed_object.object_id.clone(),
@@ -2231,7 +2382,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             visible_version: Some(commit_record.visible_version.clone()),
             required_replica_node_ids: commit_record.required_replica_node_ids.clone(),
         })?;
-        self.materialize_visible_version_commit(&commit_record)?;
+        self.materialize_visible_version_commit(&commit_record, entry.sequence)?;
         self.advance_local_materialization_cursor(entry.sequence)?;
         Ok(entry)
     }
@@ -2240,7 +2391,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         &mut self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         if self.get_file_system(&transaction.file_system_id)?.is_none() {
             return Err(MetadataBackendError::UnknownFileSystem {
                 file_system_id: transaction.file_system_id.clone(),
@@ -2257,10 +2408,6 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         }
 
         let transaction = normalized_namespace_transaction(transaction);
-        write_json_atomic(
-            &self.namespace_transaction_path(&transaction.transaction_id),
-            &transaction,
-        )?;
         let entry =
             self.write_journal_unlocked(DfsMetadataMutation::ApplyNamespaceTransaction {
                 file_system_id: transaction.file_system_id.clone(),
@@ -2273,21 +2420,32 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             ..
         } = &entry.mutation
         {
-            self.materialize_namespace_transaction(transaction)?;
+            self.append_and_apply_table_ops(
+                entry.sequence,
+                vec![DfsMetadataTableOp::PutNamespaceTransaction {
+                    transaction: transaction.clone(),
+                }],
+            )?;
+            self.materialize_namespace_transaction(transaction, entry.sequence)?;
         }
         self.advance_local_materialization_cursor(entry.sequence)?;
         Ok(entry)
     }
 
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         let entry = self.write_journal_unlocked(DfsMetadataMutation::PutConflict {
             file_system_id: conflict.file_system_id.clone(),
             object_id: conflict.object_id.clone(),
             conflict_id: conflict.conflict_id.clone(),
             conflict: Some(conflict.clone()),
         })?;
-        write_json_atomic(&self.conflict_path(conflict), conflict)?;
+        self.append_and_apply_table_ops(
+            entry.sequence,
+            vec![DfsMetadataTableOp::PutConflict {
+                conflict: conflict.clone(),
+            }],
+        )?;
         self.advance_local_materialization_cursor(entry.sequence)?;
         Ok(entry)
     }
@@ -2297,11 +2455,21 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         conflict_id: &str,
     ) -> Result<Option<DfsConflictRecord>> {
-        read_json_optional(&self.conflict_path_by_id(object_id, conflict_id))
+        Ok(self
+            .tables
+            .conflicts
+            .get(&(object_id.clone(), conflict_id.to_string()))
+            .cloned())
     }
 
     fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>> {
-        read_json_dir(&self.conflict_dir(object_id))
+        Ok(self
+            .tables
+            .conflicts
+            .values()
+            .filter(|conflict| conflict.object_id == *object_id)
+            .cloned()
+            .collect())
     }
 
     fn update_conflict_status(
@@ -2380,7 +2548,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         shard_id: &DfsMetadataShardId,
         next_after_sequence: u64,
     ) -> Result<()> {
-        let _lock = self.metadata_write_lock()?;
+        let _lock = self.begin_metadata_write()?;
         let next_after_sequence =
             next_after_sequence.max(self.metadata_replication_cursor(target_node_id, shard_id)?);
         write_json_atomic(
@@ -2418,16 +2586,13 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
 
 impl LocalJsonMetadataBackend {
     fn recover_namespace_transactions(&mut self) -> Result<()> {
-        let root = self.namespace_transaction_root();
-        if !root.exists() {
-            return Ok(());
-        }
-        for entry in read_dir(&root)? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
-                continue;
-            }
-            let transaction: DfsNamespaceTransaction = read_json(&path)?;
+        for transaction in self
+            .tables
+            .namespace_transactions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             if self.materialize_namespace_transaction_for_recovery(&transaction)? {
                 self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
                     file_system_id: transaction.file_system_id.clone(),
@@ -2441,159 +2606,128 @@ impl LocalJsonMetadataBackend {
     }
 
     fn materialize_namespace_transaction(
-        &self,
+        &mut self,
         transaction: &DfsNamespaceTransaction,
+        sequence: u64,
     ) -> Result<()> {
         for object in transaction
             .objects
             .iter()
             .filter(|object| object.kind == DfsObjectKind::Tombstone)
         {
-            self.materialize_object_indexes(object)?;
+            self.materialize_object_indexes(object, sequence)?;
         }
         for object in transaction
             .objects
             .iter()
             .filter(|object| object.kind != DfsObjectKind::Tombstone)
         {
-            self.materialize_object_indexes(object)?;
+            self.materialize_object_indexes(object, sequence)?;
         }
         Ok(())
     }
 
     fn materialize_namespace_transaction_for_recovery(
-        &self,
+        &mut self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<bool> {
+        let sequence = self.next_sequence.saturating_sub(1);
         let mut changed = false;
         for object in transaction
             .objects
             .iter()
             .filter(|object| object.kind == DfsObjectKind::Tombstone)
         {
-            changed |= self.materialize_object_indexes_if_current(object)?;
+            changed |= self.materialize_object_indexes_if_current(object, sequence)?;
         }
         for object in transaction
             .objects
             .iter()
             .filter(|object| object.kind != DfsObjectKind::Tombstone)
         {
-            changed |= self.materialize_object_indexes_if_current(object)?;
+            changed |= self.materialize_object_indexes_if_current(object, sequence)?;
         }
         Ok(changed)
     }
 
-    fn materialize_object_indexes_if_current(&self, object: &DfsObjectMetadata) -> Result<bool> {
+    fn materialize_object_indexes_if_current(
+        &mut self,
+        object: &DfsObjectMetadata,
+        sequence: u64,
+    ) -> Result<bool> {
         if let Some(current) = self.get_object(&object.object_id)? {
             if self.object_indexes_are_materialized(&current)? {
                 return Ok(false);
             }
-            self.materialize_object_indexes(&current)?;
+            self.materialize_object_indexes(&current, sequence)?;
             return Ok(true);
         }
         if self.object_indexes_are_materialized(object)? {
             return Ok(false);
         }
-        self.materialize_object_indexes(object)?;
+        self.materialize_object_indexes(object, sequence)?;
         Ok(true)
     }
 
     fn object_indexes_are_materialized(&self, object: &DfsObjectMetadata) -> Result<bool> {
         let path_record = path_record_for_object(object);
-        if read_json_optional::<DfsObjectMetadata>(&self.object_path(&object.object_id))?
+        if self.tables.objects.get(&object.object_id).cloned()
             != Some(normalized_object_metadata(object))
         {
             return Ok(false);
         }
         if !self
-            .inode_path(&object_inode_id(&object.object_id))
-            .is_file()
+            .tables
+            .inodes
+            .contains_key(&object_inode_id(&object.object_id))
         {
             return Ok(false);
         }
-        if read_json_optional::<DfsPathRecord>(
-            &self.file_system_object_index_path(&object.file_system_id, &object.object_id),
-        )?
-        .is_none()
+        if !self
+            .tables
+            .file_system_objects
+            .contains_key(&(object.file_system_id.clone(), object.object_id.clone()))
         {
             return Ok(false);
         }
-        if read_json_optional::<DfsPathRecord>(
-            &self.path_index_path(&object.file_system_id, &path_record.path),
-        )?
-        .is_none()
+        if !self
+            .tables
+            .paths
+            .contains_key(&(object.file_system_id.clone(), path_record.path.clone()))
         {
             return Ok(false);
         }
         if object.kind == DfsObjectKind::Tombstone {
             return Ok(true);
         }
-        read_json_optional::<DfsPathRecord>(&self.dentry_path(&path_record)).map(|record| {
-            record.is_some_and(|record| {
+        Ok(self
+            .tables
+            .dentries
+            .get(&dentry_key(&path_record))
+            .is_some_and(|record| {
                 record.object_id == object.object_id
                     && record.file_system_id == object.file_system_id
                     && record.path == path_record.path
-            })
-        })
+            }))
     }
 
-    fn materialize_object_indexes(&self, object: &DfsObjectMetadata) -> Result<()> {
-        self.materialize_object_indexes_with_previous(object, None)
-    }
-
-    fn recover_secondary_indexes(&self) -> Result<()> {
-        let mut objects = self.object_records()?;
-        objects.sort_by(|left, right| {
-            left.version
-                .cmp(&right.version)
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.object_id.cmp(&right.object_id))
-        });
-        for index_dir in SECONDARY_INDEX_DIRS {
-            remove_dir_all_if_exists(&self.records_root().join(index_dir))?;
-        }
-        for object in objects {
-            self.materialize_object_indexes_with_previous(&object, None)?;
-        }
-        Ok(())
-    }
-
-    fn secondary_indexes_need_recovery(&self) -> bool {
-        SECONDARY_INDEX_DIRS
-            .iter()
-            .any(|index_dir| !self.records_root().join(index_dir).is_dir())
-    }
-
-    fn ensure_secondary_index_dirs(&self) -> Result<()> {
-        for index_dir in SECONDARY_INDEX_DIRS {
-            create_dir_all(self.records_root().join(index_dir))?;
-        }
-        Ok(())
+    fn materialize_object_indexes(
+        &mut self,
+        object: &DfsObjectMetadata,
+        sequence: u64,
+    ) -> Result<()> {
+        self.materialize_object_indexes_with_previous(object, None, sequence)
     }
 
     fn object_records(&self) -> Result<Vec<DfsObjectMetadata>> {
-        let root = self.object_records_dir();
-        let mut objects = Vec::new();
-        if !root.exists() {
-            return Ok(objects);
-        }
-        for object_dir in read_dir(&root)? {
-            let object_dir_path = object_dir.path();
-            if !object_dir_path.is_dir() {
-                continue;
-            }
-            let path = object_dir_path.join("object.sobj");
-            if path.is_file() {
-                objects.push(read_json(&path)?);
-            }
-        }
-        Ok(objects)
+        Ok(self.tables.objects.values().cloned().collect())
     }
 
     fn materialize_object_indexes_with_previous(
-        &self,
+        &mut self,
         object: &DfsObjectMetadata,
         previous: Option<&DfsObjectMetadata>,
+        sequence: u64,
     ) -> Result<()> {
         let object = normalized_object_metadata(object);
         let inode = DfsInodeRecord::from(&object);
@@ -2618,14 +2752,17 @@ impl LocalJsonMetadataBackend {
             self.path_record_for_new_dentry(&object)?
         };
 
+        let mut table_ops = Vec::new();
+        let mut removed_dentry = None::<DfsPathRecord>;
         if let Some(previous_target_object_id) =
             previous.and_then(|previous| previous.link_target_object_id.as_ref())
             && (object.kind != DfsObjectKind::Hardlink
                 || object.link_target_object_id.as_ref() != Some(previous_target_object_id))
         {
-            remove_file_if_exists(
-                &self.hardlink_index_path(previous_target_object_id, &object.object_id),
-            )?;
+            table_ops.push(DfsMetadataTableOp::RemoveHardlink {
+                target_object_id: previous_target_object_id.clone(),
+                hardlink_object_id: object.object_id.clone(),
+            });
         }
         if let Some(previous) = previous {
             let previous_path_record = previous_path_record
@@ -2633,18 +2770,18 @@ impl LocalJsonMetadataBackend {
                 .cloned()
                 .unwrap_or_else(|| path_record_for_object(previous));
             if previous.file_system_id != object.file_system_id {
-                remove_file_if_exists(
-                    &self
-                        .file_system_object_index_path(&previous.file_system_id, &object.object_id),
-                )?;
+                table_ops.push(DfsMetadataTableOp::RemoveFileSystemObject {
+                    file_system_id: previous.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                });
             }
             if previous_path_record.file_system_id != path_record.file_system_id
                 || previous_path_record.path != path_record.path
             {
-                remove_file_if_exists(&self.path_index_path(
-                    &previous_path_record.file_system_id,
-                    &previous_path_record.path,
-                ))?;
+                table_ops.push(DfsMetadataTableOp::RemovePath {
+                    file_system_id: previous_path_record.file_system_id.clone(),
+                    path: previous_path_record.path.clone(),
+                });
             }
             if previous.kind != DfsObjectKind::Tombstone
                 && (object.kind == DfsObjectKind::Tombstone
@@ -2652,70 +2789,92 @@ impl LocalJsonMetadataBackend {
                     || previous_path_record.parent_inode_id != path_record.parent_inode_id
                     || previous_path_record.name != path_record.name)
             {
-                self.remove_dentry_index(&previous_path_record)?;
+                removed_dentry = Some(previous_path_record.clone());
+                self.remove_dentry_index(&previous_path_record, &mut table_ops)?;
             }
         }
-        write_json_atomic(
-            &self.file_system_object_index_path(&object.file_system_id, &object.object_id),
-            &path_record,
-        )?;
-        write_json_atomic(&self.object_path(&object.object_id), &object)?;
-        write_json_atomic(&self.inode_path(&inode.inode_id), &inode)?;
+        table_ops.push(DfsMetadataTableOp::PutFileSystemObject {
+            path_record: path_record.clone(),
+        });
+        table_ops.push(DfsMetadataTableOp::PutObject {
+            object: object.clone(),
+        });
+        table_ops.push(DfsMetadataTableOp::PutInode { inode });
         if object.kind == DfsObjectKind::Hardlink
             && let Some(target_object_id) = object.link_target_object_id.as_ref()
         {
-            write_json_atomic(
-                &self.hardlink_index_path(target_object_id, &object.object_id),
-                &path_record,
-            )?;
+            table_ops.push(DfsMetadataTableOp::PutHardlink {
+                target_object_id: target_object_id.clone(),
+                hardlink_object_id: object.object_id.clone(),
+                path_record: path_record.clone(),
+            });
         }
         if object.kind == DfsObjectKind::Tombstone {
-            self.remove_dentry_index(&path_record)?;
-            write_json_atomic(
-                &self.path_index_path(&object.file_system_id, &path_record.path),
-                &path_record,
-            )?;
+            self.remove_dentry_index(&path_record, &mut table_ops)?;
+            table_ops.push(DfsMetadataTableOp::PutPath { path_record });
+            self.append_and_apply_table_ops(sequence, table_ops)?;
             return Ok(());
         }
 
-        let dentry_path = self.dentry_path(&path_record);
+        let removed_from_new_dirfrag = removed_dentry.as_ref().is_some_and(|removed| {
+            removed.parent_inode_id == path_record.parent_inode_id
+                && removed.dirfrag_id == path_record.dirfrag_id
+        });
         let dirfrag = self.read_or_create_dirfrag(
             &path_record.file_system_id,
             &path_record.parent_inode_id,
             &path_record.dirfrag_id,
             Some(path_record.name_hash),
-            !dentry_path.exists(),
+            !self.tables.dentries.contains_key(&dentry_key(&path_record))
+                && !removed_from_new_dirfrag,
         )?;
-        write_json_atomic(
-            &self.path_index_path(&object.file_system_id, &path_record.path),
-            &path_record,
-        )?;
-        write_json_atomic(&dentry_path, &path_record)?;
-        write_json_atomic(
-            &self.dirfrag_path(&dirfrag.dir_inode_id, &dirfrag.dirfrag_id),
-            &dirfrag,
-        )
+        table_ops.push(DfsMetadataTableOp::PutPath {
+            path_record: path_record.clone(),
+        });
+        table_ops.push(DfsMetadataTableOp::PutDentry { path_record });
+        table_ops.push(DfsMetadataTableOp::PutDirFragment { dirfrag });
+        self.append_and_apply_table_ops(sequence, table_ops)
     }
 
-    fn remove_dentry_index(&self, path_record: &DfsPathRecord) -> Result<()> {
-        let dentry_path = self.dentry_path(path_record);
-        if !dentry_path.exists() {
+    fn remove_dentry_index(
+        &self,
+        path_record: &DfsPathRecord,
+        table_ops: &mut Vec<DfsMetadataTableOp>,
+    ) -> Result<()> {
+        if !self.tables.dentries.contains_key(&dentry_key(path_record)) {
             return Ok(());
         }
-        remove_file_if_exists(&dentry_path)?;
-        let dirfrag_path = self.dirfrag_path(&path_record.parent_inode_id, &path_record.dirfrag_id);
-        let Some(mut dirfrag) = read_json_optional::<DfsDirFragmentRecord>(&dirfrag_path)? else {
+        table_ops.push(DfsMetadataTableOp::RemoveDentry {
+            parent_inode_id: path_record.parent_inode_id.clone(),
+            dirfrag_id: path_record.dirfrag_id.clone(),
+            name_hash: path_record.name_hash,
+            name: path_record.name.clone(),
+        });
+        let Some(mut dirfrag) = self
+            .tables
+            .dirfrags
+            .get(&(
+                path_record.parent_inode_id.clone(),
+                path_record.dirfrag_id.clone(),
+            ))
+            .cloned()
+        else {
             return Ok(());
         };
         dirfrag.entry_count = dirfrag.entry_count.saturating_sub(1);
-        write_json_atomic(&dirfrag_path, &dirfrag)
+        table_ops.push(DfsMetadataTableOp::PutDirFragment { dirfrag });
+        Ok(())
     }
 
     fn stored_path_record_for_object(
         &self,
         object: &DfsObjectMetadata,
     ) -> Result<Option<DfsPathRecord>> {
-        read_json_optional(&self.path_index_path(&object.file_system_id, &object.path))
+        Ok(self
+            .tables
+            .paths
+            .get(&(object.file_system_id.clone(), normalize_path(&object.path)))
+            .cloned())
     }
 
     fn path_record_for_new_dentry(&self, object: &DfsObjectMetadata) -> Result<DfsPathRecord> {
@@ -2734,25 +2893,12 @@ impl LocalJsonMetadataBackend {
     }
 
     fn recover_visible_version_commits(&mut self) -> Result<()> {
-        let root = self.visible_commit_root();
-        if !root.exists() {
-            return Ok(());
-        }
-        let mut commits = Vec::new();
-        for object_dir in read_dir(&root)? {
-            let object_dir_path = object_dir.path();
-            if !object_dir_path.is_dir() {
-                continue;
-            }
-            for entry in read_dir(&object_dir_path)? {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
-                    continue;
-                }
-                let commit: DfsVisibleVersionCommitRecord = read_json(&path)?;
-                commits.push(commit);
-            }
-        }
+        let mut commits = self
+            .tables
+            .visible_commits
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         commits.sort_by(|left, right| {
             left.created_at
                 .cmp(&right.created_at)
@@ -2773,7 +2919,8 @@ impl LocalJsonMetadataBackend {
         Ok(())
     }
 
-    fn recover_object_locations_from_visible_versions(&self) -> Result<()> {
+    fn recover_object_locations_from_visible_versions(&mut self) -> Result<()> {
+        let sequence = self.next_sequence.saturating_sub(1);
         for mut object in self.object_records()? {
             if object.kind == DfsObjectKind::Tombstone {
                 continue;
@@ -2795,7 +2942,7 @@ impl LocalJsonMetadataBackend {
                 continue;
             }
             object.current_locations = version_locations;
-            self.materialize_object_indexes(&object)?;
+            self.materialize_object_indexes(&object, sequence)?;
         }
         Ok(())
     }
@@ -2814,14 +2961,11 @@ impl LocalJsonMetadataBackend {
             return Ok(());
         }
         for node_id in &commit.required_replica_node_ids {
-            if !self
-                .receipt_path(
-                    &commit.committed_object.object_id,
-                    &commit.committed_object.version,
-                    node_id,
-                )
-                .is_file()
-            {
+            if !self.tables.receipts.contains_key(&(
+                commit.committed_object.object_id.clone(),
+                commit.committed_object.version.clone(),
+                node_id.clone(),
+            )) {
                 return Ok(());
             }
         }
@@ -2852,8 +2996,7 @@ impl LocalJsonMetadataBackend {
             return Ok(());
         }
 
-        self.materialize_visible_version_commit(commit)?;
-        self.write_journal(DfsMetadataMutation::CommitVisibleVersion {
+        let entry = self.write_journal(DfsMetadataMutation::CommitVisibleVersion {
             file_system_id: commit.committed_object.file_system_id.clone(),
             object_id: commit.committed_object.object_id.clone(),
             previous_version: commit.expected_version.clone(),
@@ -2862,18 +3005,30 @@ impl LocalJsonMetadataBackend {
             visible_version: Some(commit.visible_version.clone()),
             required_replica_node_ids: commit.required_replica_node_ids.clone(),
         })?;
+        self.materialize_visible_version_commit(commit, entry.sequence)?;
         Ok(())
     }
 
     fn materialize_visible_version_commit(
-        &self,
+        &mut self,
         commit: &DfsVisibleVersionCommitRecord,
+        sequence: u64,
     ) -> Result<()> {
-        self.materialize_object_indexes(&commit.committed_object)?;
+        self.append_and_apply_table_ops(
+            sequence,
+            vec![DfsMetadataTableOp::PutVisibleCommit {
+                object_id: commit.committed_object.object_id.clone(),
+                version: commit.committed_object.version.clone(),
+                commit: commit.clone(),
+            }],
+        )?;
+        self.materialize_object_indexes(&commit.committed_object, sequence)?;
         let visible_version = normalized_version_record(&commit.visible_version);
-        write_json_atomic(
-            &self.version_path(&visible_version.object_id, &visible_version.version),
-            &visible_version,
+        self.append_and_apply_table_ops(
+            sequence,
+            vec![DfsMetadataTableOp::PutVersion {
+                version: visible_version,
+            }],
         )
     }
 
@@ -2885,10 +3040,13 @@ impl LocalJsonMetadataBackend {
         name_hash: Option<u64>,
         increment_entry_count: bool,
     ) -> Result<DfsDirFragmentRecord> {
-        let path = self.dirfrag_path(dir_inode_id, dirfrag_id);
         let (hash_start_inclusive, hash_end_exclusive) = dirfrag_hash_range(dirfrag_id, name_hash);
-        let mut dirfrag =
-            read_json_optional::<DfsDirFragmentRecord>(&path)?.unwrap_or(DfsDirFragmentRecord {
+        let mut dirfrag = self
+            .tables
+            .dirfrags
+            .get(&(dir_inode_id.clone(), dirfrag_id.clone()))
+            .cloned()
+            .unwrap_or(DfsDirFragmentRecord {
                 file_system_id: file_system_id.clone(),
                 dir_inode_id: dir_inode_id.clone(),
                 dirfrag_id: dirfrag_id.clone(),
@@ -3067,6 +3225,374 @@ fn key_segment(value: &impl ToString) -> String {
         .to_string()
         .trim_matches('/')
         .replace(['/', '\\', ':'], "_")
+}
+
+fn dentry_key(path_record: &DfsPathRecord) -> (DfsInodeId, DfsDirFragmentId, u64, String) {
+    (
+        path_record.parent_inode_id.clone(),
+        path_record.dirfrag_id.clone(),
+        path_record.name_hash,
+        path_record.name.clone(),
+    )
+}
+
+fn metadata_table_path(root: &Path) -> PathBuf {
+    root.join("records")
+        .join("tables")
+        .join("materialized.slog")
+}
+
+fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState> {
+    let table_path = metadata_table_path(root);
+    let mut state = if table_path.is_file() {
+        read_metadata_table_batches(&table_path)?
+    } else {
+        DfsMetadataTableState::default()
+    };
+    if state.tables.has_materialized_state() {
+        return Ok(state);
+    }
+    state.tables = load_legacy_metadata_tables(root)?;
+    if state.tables.has_materialized_state() {
+        persist_metadata_table_snapshot(root, &state.tables)?;
+        if table_path.is_file() {
+            state.table_log_offset = table_path
+                .metadata()
+                .map_err(|source| MetadataBackendError::Io {
+                    path: table_path.clone(),
+                    source,
+                })?
+                .len();
+        }
+    }
+    Ok(state)
+}
+
+fn read_metadata_table_batches(path: &Path) -> Result<DfsMetadataTableState> {
+    let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut tables = DfsMetadataTables::default();
+    let table_log_offset = replay_metadata_table_batches(&mut file, path, &mut tables)?;
+    Ok(DfsMetadataTableState {
+        tables,
+        table_log_offset,
+    })
+}
+
+fn replay_metadata_table_batches_from(
+    path: &Path,
+    offset: u64,
+    tables: &mut DfsMetadataTables,
+) -> Result<u64> {
+    let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let len = file
+        .metadata()
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if offset > len {
+        return Err(MetadataBackendError::Serde(format!(
+            "DFS metadata table cursor {} is beyond table log length {} at {}",
+            offset,
+            len,
+            path.display()
+        )));
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    replay_metadata_table_batches(&mut file, path, tables)
+}
+
+fn replay_metadata_table_batches(
+    file: &mut fs::File,
+    path: &Path,
+    tables: &mut DfsMetadataTables,
+) -> Result<u64> {
+    let mut offset = file
+        .stream_position()
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    loop {
+        let mut length_bytes = [0_u8; 4];
+        match file.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(source) => {
+                return Err(MetadataBackendError::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        }
+        let length = u32::from_le_bytes(length_bytes) as usize;
+        offset = offset.saturating_add(4);
+        let mut bytes = vec![0_u8; length];
+        match file.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(source) => {
+                return Err(MetadataBackendError::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        }
+        let batch: DfsMetadataTableBatch = sinomo_object_serde::from_bytes(&bytes)
+            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+        for op in batch.ops {
+            tables.apply(op);
+        }
+        offset = offset.saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+    }
+    Ok(offset)
+}
+
+fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Result<u64> {
+    let path = metadata_table_path(root);
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    let bytes = sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    let length = u32::try_from(bytes.len()).map_err(|_| {
+        MetadataBackendError::Serde(format!(
+            "DFS metadata table batch {} is too large: {} bytes",
+            batch.sequence,
+            bytes.len()
+        ))
+    })?;
+    let mut record = Vec::with_capacity(4 + bytes.len());
+    record.extend_from_slice(&length.to_le_bytes());
+    record.extend_from_slice(&bytes);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    file.write_all(&record)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(u64::try_from(record.len()).unwrap_or(u64::MAX))
+}
+
+fn persist_metadata_table_snapshot(root: &Path, tables: &DfsMetadataTables) -> Result<()> {
+    let mut ops = Vec::new();
+    ops.extend(
+        tables
+            .file_systems
+            .values()
+            .cloned()
+            .map(|file_system| DfsMetadataTableOp::PutFileSystem { file_system }),
+    );
+    ops.extend(
+        tables
+            .objects
+            .values()
+            .cloned()
+            .map(|object| DfsMetadataTableOp::PutObject { object }),
+    );
+    ops.extend(
+        tables
+            .inodes
+            .values()
+            .cloned()
+            .map(|inode| DfsMetadataTableOp::PutInode { inode }),
+    );
+    ops.extend(
+        tables
+            .file_system_objects
+            .values()
+            .cloned()
+            .map(|path_record| DfsMetadataTableOp::PutFileSystemObject { path_record }),
+    );
+    ops.extend(
+        tables
+            .paths
+            .values()
+            .cloned()
+            .map(|path_record| DfsMetadataTableOp::PutPath { path_record }),
+    );
+    ops.extend(
+        tables
+            .dirfrags
+            .values()
+            .cloned()
+            .map(|dirfrag| DfsMetadataTableOp::PutDirFragment { dirfrag }),
+    );
+    ops.extend(
+        tables
+            .dentries
+            .values()
+            .cloned()
+            .map(|path_record| DfsMetadataTableOp::PutDentry { path_record }),
+    );
+    ops.extend(tables.hardlinks.iter().map(
+        |((target_object_id, hardlink_object_id), path_record)| DfsMetadataTableOp::PutHardlink {
+            target_object_id: target_object_id.clone(),
+            hardlink_object_id: hardlink_object_id.clone(),
+            path_record: path_record.clone(),
+        },
+    ));
+    ops.extend(
+        tables
+            .versions
+            .values()
+            .cloned()
+            .map(|version| DfsMetadataTableOp::PutVersion { version }),
+    );
+    ops.extend(
+        tables
+            .receipts
+            .values()
+            .cloned()
+            .map(|receipt| DfsMetadataTableOp::PutReceipt { receipt }),
+    );
+    ops.extend(
+        tables
+            .intents
+            .values()
+            .cloned()
+            .map(|intent| DfsMetadataTableOp::PutIntent { intent }),
+    );
+    ops.extend(
+        tables
+            .conflicts
+            .values()
+            .cloned()
+            .map(|conflict| DfsMetadataTableOp::PutConflict { conflict }),
+    );
+    ops.extend(
+        tables
+            .visible_commits
+            .iter()
+            .map(
+                |((object_id, version), commit)| DfsMetadataTableOp::PutVisibleCommit {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                    commit: commit.clone(),
+                },
+            ),
+    );
+    ops.extend(
+        tables
+            .namespace_transactions
+            .values()
+            .cloned()
+            .map(|transaction| DfsMetadataTableOp::PutNamespaceTransaction { transaction }),
+    );
+    for (index, chunk) in ops.chunks(512).enumerate() {
+        append_metadata_table_batch(
+            root,
+            &DfsMetadataTableBatch {
+                sequence: index as u64,
+                ops: chunk.to_vec(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn load_legacy_metadata_tables(root: &Path) -> Result<DfsMetadataTables> {
+    let records = root.join("records");
+    let mut tables = DfsMetadataTables::default();
+    for file_system in read_json_tree::<DfsFileSystem>(&records.join("filesystems"))? {
+        tables.apply(DfsMetadataTableOp::PutFileSystem { file_system });
+    }
+    for object in read_json_tree::<DfsObjectMetadata>(&records.join("objects"))? {
+        let object = normalized_object_metadata(&object);
+        let path_record = path_record_for_object(&object);
+        tables.apply(DfsMetadataTableOp::PutObject {
+            object: object.clone(),
+        });
+        tables.apply(DfsMetadataTableOp::PutInode {
+            inode: DfsInodeRecord::from(&object),
+        });
+        tables.apply(DfsMetadataTableOp::PutFileSystemObject {
+            path_record: path_record.clone(),
+        });
+        tables.apply(DfsMetadataTableOp::PutPath {
+            path_record: path_record.clone(),
+        });
+        if object.kind != DfsObjectKind::Tombstone {
+            tables.apply(DfsMetadataTableOp::PutDentry {
+                path_record: path_record.clone(),
+            });
+        }
+        if object.kind == DfsObjectKind::Hardlink
+            && let Some(target_object_id) = object.link_target_object_id.as_ref()
+        {
+            tables.apply(DfsMetadataTableOp::PutHardlink {
+                target_object_id: target_object_id.clone(),
+                hardlink_object_id: object.object_id.clone(),
+                path_record,
+            });
+        }
+    }
+    for path_record in read_json_tree::<DfsPathRecord>(&records.join("filesystem-objects"))? {
+        tables.apply(DfsMetadataTableOp::PutFileSystemObject { path_record });
+    }
+    for path_record in read_json_tree::<DfsPathRecord>(&records.join("paths"))? {
+        tables.apply(DfsMetadataTableOp::PutPath { path_record });
+    }
+    for inode in read_json_tree::<DfsInodeRecord>(&records.join("inodes"))? {
+        tables.apply(DfsMetadataTableOp::PutInode { inode });
+    }
+    for dirfrag in read_json_tree::<DfsDirFragmentRecord>(&records.join("dirfrags"))? {
+        tables.apply(DfsMetadataTableOp::PutDirFragment { dirfrag });
+    }
+    for path_record in read_json_tree::<DfsPathRecord>(&records.join("dentries"))? {
+        tables.apply(DfsMetadataTableOp::PutDentry { path_record });
+    }
+    for version in read_json_tree::<DfsObjectVersionRecord>(&records.join("versions"))? {
+        tables.apply(DfsMetadataTableOp::PutVersion {
+            version: normalized_version_record(&version),
+        });
+    }
+    for receipt in read_json_tree::<DfsReplicaReceiptRecord>(&records.join("receipts"))? {
+        tables.apply(DfsMetadataTableOp::PutReceipt { receipt });
+    }
+    for intent in read_json_tree::<DfsWriteIntentRecord>(&records.join("intents"))? {
+        tables.apply(DfsMetadataTableOp::PutIntent { intent });
+    }
+    for conflict in read_json_tree::<DfsConflictRecord>(&records.join("conflicts"))? {
+        tables.apply(DfsMetadataTableOp::PutConflict { conflict });
+    }
+    for commit in read_json_tree::<DfsVisibleVersionCommitRecord>(&records.join("visible-commits"))?
+    {
+        tables.apply(DfsMetadataTableOp::PutVisibleCommit {
+            object_id: commit.committed_object.object_id.clone(),
+            version: commit.committed_object.version.clone(),
+            commit,
+        });
+    }
+    for transaction in
+        read_json_tree::<DfsNamespaceTransaction>(&records.join("namespace-transactions"))?
+    {
+        tables.apply(DfsMetadataTableOp::PutNamespaceTransaction { transaction });
+    }
+    Ok(tables)
 }
 
 fn fast_next_journal_sequence(root: &Path) -> Result<u64> {
@@ -3393,22 +3919,6 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn remove_dir_all_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => {
-            if let Some(parent) = path.parent() {
-                sync_dir(parent)?;
-            }
-            Ok(())
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        }),
-    }
-}
-
 fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>> {
     let mut entries = Vec::new();
     let reader = fs::read_dir(path).map_err(|source| MetadataBackendError::Io {
@@ -3422,21 +3932,6 @@ fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>> {
         })?);
     }
     Ok(entries)
-}
-
-fn read_child_dirs_if_exists(path: &Path) -> Result<Vec<PathBuf>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths = Vec::new();
-    for entry in read_dir(path)? {
-        let path = entry.path();
-        if path.is_dir() {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
@@ -3464,7 +3959,7 @@ where
     read_json(path).map(Some)
 }
 
-fn read_json_dir<T>(path: &Path) -> Result<Vec<T>>
+fn read_json_tree<T>(path: &Path) -> Result<Vec<T>>
 where
     T: DeserializeOwned,
 {
@@ -3472,13 +3967,23 @@ where
         return Ok(Vec::new());
     }
     let mut records = Vec::new();
+    read_json_tree_into(path, &mut records)?;
+    Ok(records)
+}
+
+fn read_json_tree_into<T>(path: &Path, records: &mut Vec<T>) -> Result<()>
+where
+    T: DeserializeOwned,
+{
     for entry in read_dir(path)? {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("sobj") {
+        if path.is_dir() {
+            read_json_tree_into(&path, records)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("sobj") {
             records.push(read_json(&path)?);
         }
     }
-    Ok(records)
+    Ok(())
 }
 
 fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
@@ -3592,7 +4097,7 @@ mod tests {
     use super::*;
     use crate::DfsMetadataShardAssignment;
     use sinomo_core::DfsObjectPolicy;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -3659,6 +4164,91 @@ mod tests {
         }
     }
 
+    fn table_path_record(
+        backend: &LocalJsonMetadataBackend,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> DfsPathRecord {
+        backend
+            .tables
+            .paths
+            .get(&(file_system_id.clone(), normalize_path(path)))
+            .cloned()
+            .expect("path table record")
+    }
+
+    fn table_path_exists(
+        backend: &LocalJsonMetadataBackend,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> bool {
+        backend
+            .tables
+            .paths
+            .contains_key(&(file_system_id.clone(), normalize_path(path)))
+    }
+
+    fn table_dentry_exists(
+        backend: &LocalJsonMetadataBackend,
+        path_record: &DfsPathRecord,
+    ) -> bool {
+        backend
+            .tables
+            .dentries
+            .contains_key(&dentry_key(path_record))
+    }
+
+    fn table_dirfrag(
+        backend: &LocalJsonMetadataBackend,
+        dir_inode_id: &DfsInodeId,
+        dirfrag_id: &DfsDirFragmentId,
+    ) -> DfsDirFragmentRecord {
+        backend
+            .tables
+            .dirfrags
+            .get(&(dir_inode_id.clone(), dirfrag_id.clone()))
+            .cloned()
+            .expect("dirfrag table record")
+    }
+
+    fn table_file_system_object_exists(
+        backend: &LocalJsonMetadataBackend,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> bool {
+        backend
+            .tables
+            .file_system_objects
+            .contains_key(&(file_system_id.clone(), object_id.clone()))
+    }
+
+    fn table_hardlink_exists(
+        backend: &LocalJsonMetadataBackend,
+        target_object_id: &DfsObjectId,
+        hardlink_object_id: &DfsObjectId,
+    ) -> bool {
+        backend
+            .tables
+            .hardlinks
+            .contains_key(&(target_object_id.clone(), hardlink_object_id.clone()))
+    }
+
+    fn force_table_replay_from_journal(
+        backend: &LocalJsonMetadataBackend,
+        root: &Path,
+        last_materialized_sequence: u64,
+    ) {
+        remove_file_if_exists(&metadata_table_path(root)).expect("remove metadata table log");
+        write_json_atomic(
+            &backend.local_materialization_cursor_path(),
+            &DfsMetadataReplayCursor {
+                shard_id: backend.shard_id.clone(),
+                last_sequence: last_materialized_sequence,
+            },
+        )
+        .expect("rewind materialization cursor");
+    }
+
     #[test]
     fn local_backend_persists_file_system_object_path_and_journal() {
         let root = temp_root("local_backend_persists_file_system_object_path_and_journal");
@@ -3705,9 +4295,31 @@ mod tests {
             backend
                 .get_object_by_path(&object.file_system_id, "docs/readme.md")
                 .expect("get by path"),
-            Some(object)
+            Some(object.clone())
         );
         assert_eq!(backend.journal_since(0).expect("journal").len(), 2);
+        assert!(
+            metadata_table_path(&root).is_file(),
+            "new metadata writes should materialize through the packed table log"
+        );
+        assert!(
+            !root
+                .join("records")
+                .join("objects")
+                .join(key_segment(&object.object_id))
+                .join("object.sobj")
+                .exists(),
+            "new object writes should not create one file per object metadata record"
+        );
+        assert!(
+            !root
+                .join("records")
+                .join("paths")
+                .join(key_segment(&object.file_system_id))
+                .join(format!("{}.sobj", path_hash(&object.path)))
+                .exists(),
+            "new object writes should not create one file per path index record"
+        );
 
         let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
@@ -3875,9 +4487,7 @@ mod tests {
             "object metadata must not become visible without a journal entry"
         );
         assert!(
-            !backend
-                .path_index_path(&object.file_system_id, &object.path)
-                .exists(),
+            !table_path_exists(&backend, &object.file_system_id, &object.path),
             "path index must not become visible without a journal entry"
         );
 
@@ -3933,8 +4543,8 @@ mod tests {
     }
 
     #[test]
-    fn local_backend_open_does_not_rebuild_existing_secondary_indexes() {
-        let root = temp_root("local_backend_open_preserves_secondary_indexes");
+    fn local_backend_open_does_not_rewrite_existing_metadata_table() {
+        let root = temp_root("local_backend_open_preserves_metadata_table");
         let mut backend =
             LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
@@ -3942,15 +4552,18 @@ mod tests {
         backend
             .put_object(&object(version("version_1")))
             .expect("object");
-        let sentinel = root.join("records/filesystem-objects/.sentinel");
-        fs::write(&sentinel, b"keep").expect("sentinel");
+        let table_path = metadata_table_path(&root);
+        let before_len = fs::metadata(&table_path).expect("metadata table").len();
 
         LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen backend");
 
-        assert!(
-            sentinel.exists(),
-            "opening a healthy backend must not delete shared secondary index directories"
+        let after_len = fs::metadata(&table_path)
+            .expect("metadata table after reopen")
+            .len();
+        assert_eq!(
+            before_len, after_len,
+            "opening a healthy backend must not rewrite the materialized metadata table"
         );
         cleanup(&root);
     }
@@ -4418,37 +5031,37 @@ mod tests {
         let mut existing = object(version("version_1"));
         existing.path = "/docs/existing.md".to_string();
         backend.put_object(&existing).expect("existing object");
-        let existing_record = read_json::<DfsPathRecord>(
-            &backend.path_index_path(&existing.file_system_id, &existing.path),
-        )
-        .expect("existing path record");
+        let existing_record = table_path_record(&backend, &existing.file_system_id, &existing.path);
         assert_eq!(existing_record.dirfrag_id, DfsDirFragmentId::new("root"));
 
-        let root_dirfrag_path = backend.dirfrag_path(
+        let mut root_dirfrag = table_dirfrag(
+            &backend,
             &existing_record.parent_inode_id,
             &DfsDirFragmentId::new("root"),
         );
-        let mut root_dirfrag =
-            read_json::<DfsDirFragmentRecord>(&root_dirfrag_path).expect("root dirfrag");
         root_dirfrag.entry_count = root_dirfrag.split_after_count;
-        write_json_atomic(&root_dirfrag_path, &root_dirfrag).expect("force split threshold");
+        backend
+            .append_and_apply_table_ops(
+                backend.next_sequence,
+                vec![DfsMetadataTableOp::PutDirFragment {
+                    dirfrag: root_dirfrag,
+                }],
+            )
+            .expect("force split threshold");
 
         let mut bucketed = object(version("version_1"));
         bucketed.object_id = DfsObjectId::from_legacy_named("obj_bucketed").expect("object");
         bucketed.path = "/docs/bucketed.md".to_string();
         backend.put_object(&bucketed).expect("bucketed object");
 
-        let bucketed_record = read_json::<DfsPathRecord>(
-            &backend.path_index_path(&bucketed.file_system_id, &bucketed.path),
-        )
-        .expect("bucketed path record");
+        let bucketed_record = table_path_record(&backend, &bucketed.file_system_id, &bucketed.path);
         assert_ne!(
             bucketed_record.dirfrag_id,
             DfsDirFragmentId::new("root"),
             "large directories should route new entries away from the root dentry fragment"
         );
         assert!(
-            backend.dentry_path(&bucketed_record).is_file(),
+            table_dentry_exists(&backend, &bucketed_record),
             "bucketed dentry record should be materialized in its selected fragment"
         );
 
@@ -4478,84 +5091,81 @@ mod tests {
         let mut readme = object(version("version_1"));
         readme.path = "/docs/readme.md".to_string();
         backend.put_object(&readme).expect("object");
-        let path_record = read_json::<DfsPathRecord>(
-            &backend.path_index_path(&readme.file_system_id, &readme.path),
-        )
-        .expect("path record");
-        let filesystem_object_index =
-            backend.file_system_object_index_path(&readme.file_system_id, &readme.object_id);
-        let path_index = backend.path_index_path(&readme.file_system_id, &readme.path);
-        let dentry_index = backend.dentry_path(&path_record);
-        let object_record = backend.object_path(&readme.object_id);
-        let inode_record = backend.inode_path(&path_record.inode_id);
-
-        let stable_index_modified_at = [
-            fs::metadata(&filesystem_object_index)
-                .expect("filesystem object index metadata")
-                .modified()
-                .expect("filesystem object index modified"),
-            fs::metadata(&path_index)
-                .expect("path index metadata")
-                .modified()
-                .expect("path index modified"),
-            fs::metadata(&dentry_index)
-                .expect("dentry index metadata")
-                .modified()
-                .expect("dentry index modified"),
-        ];
-        let object_modified_at = fs::metadata(&object_record)
-            .expect("object metadata")
-            .modified()
-            .expect("object modified");
-        let inode_modified_at = fs::metadata(&inode_record)
-            .expect("inode metadata")
-            .modified()
-            .expect("inode modified");
-
-        std::thread::sleep(Duration::from_millis(20));
+        let path_record = table_path_record(&backend, &readme.file_system_id, &readme.path);
+        let filesystem_object_record = backend
+            .tables
+            .file_system_objects
+            .get(&(readme.file_system_id.clone(), readme.object_id.clone()))
+            .cloned()
+            .expect("filesystem object index");
+        let dentry_record = backend
+            .tables
+            .dentries
+            .get(&dentry_key(&path_record))
+            .cloned()
+            .expect("dentry index");
+        let dirfrag = table_dirfrag(
+            &backend,
+            &path_record.parent_inode_id,
+            &path_record.dirfrag_id,
+        );
+        let object_before = backend
+            .tables
+            .objects
+            .get(&readme.object_id)
+            .cloned()
+            .expect("object record");
+        let inode_before = backend
+            .tables
+            .inodes
+            .get(&path_record.inode_id)
+            .cloned()
+            .expect("inode record");
 
         readme.content_hash = Some("blake3:new-content".to_string());
         readme.version = version("version_2");
         backend.put_object(&readme).expect("content update");
 
         assert_eq!(
-            fs::metadata(&filesystem_object_index)
-                .expect("filesystem object index metadata after update")
-                .modified()
-                .expect("filesystem object index modified after update"),
-            stable_index_modified_at[0],
-            "content-only updates should not rewrite the filesystem-object index"
+            backend
+                .tables
+                .file_system_objects
+                .get(&(readme.file_system_id.clone(), readme.object_id.clone()))
+                .cloned(),
+            Some(filesystem_object_record),
+            "content-only updates should keep the filesystem-object namespace index stable"
         );
         assert_eq!(
-            fs::metadata(&path_index)
-                .expect("path index metadata after update")
-                .modified()
-                .expect("path index modified after update"),
-            stable_index_modified_at[1],
-            "content-only updates should not rewrite the path index"
+            table_path_record(&backend, &readme.file_system_id, &readme.path),
+            path_record,
+            "content-only updates should keep the path namespace index stable"
         );
         assert_eq!(
-            fs::metadata(&dentry_index)
-                .expect("dentry index metadata after update")
-                .modified()
-                .expect("dentry index modified after update"),
-            stable_index_modified_at[2],
-            "content-only updates should not rewrite the dentry index"
+            backend
+                .tables
+                .dentries
+                .get(&dentry_key(&path_record))
+                .cloned(),
+            Some(dentry_record),
+            "content-only updates should keep the dentry namespace index stable"
         );
-        assert!(
-            fs::metadata(&object_record)
-                .expect("object metadata after update")
-                .modified()
-                .expect("object modified after update")
-                > object_modified_at,
+        assert_eq!(
+            table_dirfrag(
+                &backend,
+                &path_record.parent_inode_id,
+                &path_record.dirfrag_id
+            ),
+            dirfrag,
+            "content-only updates should not change directory fragment accounting"
+        );
+        assert_ne!(
+            backend.tables.objects.get(&readme.object_id).cloned(),
+            Some(object_before),
             "the primary object record should still update when content metadata changes"
         );
-        assert!(
-            fs::metadata(&inode_record)
-                .expect("inode metadata after update")
-                .modified()
-                .expect("inode modified after update")
-                > inode_modified_at,
+        assert_ne!(
+            backend.tables.inodes.get(&path_record.inode_id).cloned(),
+            Some(inode_before),
             "the inode record should still update when visible object metadata changes"
         );
 
@@ -4573,18 +5183,20 @@ mod tests {
         let mut readme = object(version("version_1"));
         readme.path = "/docs/readme.md".to_string();
         backend.put_object(&readme).expect("object");
-        let old_path_index = backend.path_index_path(&file_system_id(), "/docs/readme.md");
-        let old_dentry = backend.dentry_path(&path_record_for_object(&readme));
-        let dirfrag_path = backend.dirfrag_path(
-            &path_record_for_object(&readme).parent_inode_id,
-            &DfsDirFragmentId::new("root"),
-        );
-        assert!(old_path_index.exists());
-        assert!(old_dentry.exists());
+        let old_path_record = path_record_for_object(&readme);
+        assert!(table_path_exists(
+            &backend,
+            &file_system_id(),
+            "/docs/readme.md"
+        ));
+        assert!(table_dentry_exists(&backend, &old_path_record));
         assert_eq!(
-            read_json::<DfsDirFragmentRecord>(&dirfrag_path)
-                .expect("dirfrag after create")
-                .entry_count,
+            table_dirfrag(
+                &backend,
+                &old_path_record.parent_inode_id,
+                &DfsDirFragmentId::new("root")
+            )
+            .entry_count,
             1
         );
 
@@ -4592,23 +5204,20 @@ mod tests {
         readme.version = version("version_2");
         backend.put_object(&readme).expect("renamed object");
         assert!(
-            !old_path_index.exists(),
+            !table_path_exists(&backend, &file_system_id(), "/docs/readme.md"),
             "renaming should remove the obsolete path index"
         );
         assert!(
-            !old_dentry.exists(),
+            !table_dentry_exists(&backend, &old_path_record),
             "renaming should remove the obsolete directory entry"
         );
-        assert!(
-            backend
-                .path_index_path(&file_system_id(), "/docs/renamed.md")
-                .exists()
-        );
-        assert!(
-            backend
-                .dentry_path(&path_record_for_object(&readme))
-                .exists()
-        );
+        assert!(table_path_exists(
+            &backend,
+            &file_system_id(),
+            "/docs/renamed.md"
+        ));
+        let renamed_path_record = path_record_for_object(&readme);
+        assert!(table_dentry_exists(&backend, &renamed_path_record));
         assert_eq!(
             backend
                 .child_objects_for_directory(&file_system_id(), "/docs")
@@ -4619,25 +5228,25 @@ mod tests {
             vec!["/docs/renamed.md"]
         );
         assert_eq!(
-            read_json::<DfsDirFragmentRecord>(&dirfrag_path)
-                .expect("dirfrag after rename")
-                .entry_count,
+            table_dirfrag(
+                &backend,
+                &old_path_record.parent_inode_id,
+                &DfsDirFragmentId::new("root")
+            )
+            .entry_count,
             1
         );
 
-        let renamed_dentry = backend.dentry_path(&path_record_for_object(&readme));
         readme.kind = DfsObjectKind::Tombstone;
         readme.content_hash = None;
         readme.version = version("version_3");
         backend.put_object(&readme).expect("tombstone object");
         assert!(
-            !renamed_dentry.exists(),
+            !table_dentry_exists(&backend, &renamed_path_record),
             "tombstoning should remove the visible directory entry"
         );
         assert!(
-            backend
-                .path_index_path(&file_system_id(), "/docs/renamed.md")
-                .exists(),
+            table_path_exists(&backend, &file_system_id(), "/docs/renamed.md"),
             "tombstone path record should remain addressable"
         );
         assert!(
@@ -4647,9 +5256,12 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            read_json::<DfsDirFragmentRecord>(&dirfrag_path)
-                .expect("dirfrag after tombstone")
-                .entry_count,
+            table_dirfrag(
+                &backend,
+                &old_path_record.parent_inode_id,
+                &DfsDirFragmentId::new("root")
+            )
+            .entry_count,
             0
         );
 
@@ -4657,7 +5269,7 @@ mod tests {
     }
 
     #[test]
-    fn local_backend_rebuilds_dirfrag_counts_during_secondary_index_recovery() {
+    fn local_backend_rebuilds_dirfrag_counts_during_table_replay() {
         let root = temp_root("local_backend_rebuilds_dirfrag_counts");
         {
             let mut backend =
@@ -4675,25 +5287,28 @@ mod tests {
             }
 
             let path_record = path_record_for_object(&readme);
-            let dirfrag_path =
-                backend.dirfrag_path(&path_record.parent_inode_id, &path_record.dirfrag_id);
-            let mut dirfrag =
-                read_json::<DfsDirFragmentRecord>(&dirfrag_path).expect("dirfrag before corrupt");
-            dirfrag.entry_count = 999;
-            write_json_atomic(&dirfrag_path, &dirfrag).expect("corrupt dirfrag count");
-            remove_dir_all_if_exists(&backend.records_root().join("dirfrags"))
-                .expect("force secondary index recovery");
+            assert_eq!(
+                table_dirfrag(
+                    &backend,
+                    &path_record.parent_inode_id,
+                    &path_record.dirfrag_id
+                )
+                .entry_count,
+                2
+            );
+            force_table_replay_from_journal(&backend, &root, 0);
         }
 
         let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("recovered backend");
         let path_record = path_record_for_object(&object(version("version_1")));
-        let dirfrag_path =
-            recovered.dirfrag_path(&path_record.parent_inode_id, &path_record.dirfrag_id);
         assert_eq!(
-            read_json::<DfsDirFragmentRecord>(&dirfrag_path)
-                .expect("recovered dirfrag")
-                .entry_count,
+            table_dirfrag(
+                &recovered,
+                &path_record.parent_inode_id,
+                &path_record.dirfrag_id
+            )
+            .entry_count,
             2
         );
 
@@ -4730,11 +5345,11 @@ mod tests {
         for object in [&readme, &changelog, &other] {
             backend.put_object(object).expect("object");
         }
-        assert!(
-            backend
-                .file_system_object_index_path(&file_system_id(), &readme.object_id)
-                .exists()
-        );
+        assert!(table_file_system_object_exists(
+            &backend,
+            &file_system_id(),
+            &readme.object_id
+        ));
 
         let objects = backend
             .objects_for_file_system(&file_system_id())
@@ -4747,13 +5362,16 @@ mod tests {
             vec!["/docs/changelog.md", "/docs/readme.md"]
         );
 
-        let old_index =
-            backend.file_system_object_index_path(&file_system_id(), &changelog.object_id);
+        assert!(table_file_system_object_exists(
+            &backend,
+            &file_system_id(),
+            &changelog.object_id
+        ));
         changelog.file_system_id = other_file_system.file_system_id.clone();
         changelog.path = "/moved-changelog.md".to_string();
         backend.put_object(&changelog).expect("move filesystem");
         assert!(
-            !old_index.exists(),
+            !table_file_system_object_exists(&backend, &file_system_id(), &changelog.object_id),
             "moving an object to another filesystem should remove its old filesystem-object index"
         );
         assert_eq!(
@@ -4791,8 +5409,11 @@ mod tests {
         let mut object = object(version("version_1"));
         object.path = "/services/shared-name.txt".to_string();
         backend.put_object(&object).expect("object");
-        let old_path_index = backend.path_index_path(&file_system.file_system_id, &object.path);
-        assert!(old_path_index.exists());
+        assert!(table_path_exists(
+            &backend,
+            &file_system.file_system_id,
+            &object.path
+        ));
 
         object.file_system_id = other_file_system.file_system_id.clone();
         backend
@@ -4800,7 +5421,7 @@ mod tests {
             .expect("move filesystem without rename");
 
         assert!(
-            !old_path_index.exists(),
+            !table_path_exists(&backend, &file_system.file_system_id, &object.path),
             "moving an object between filesystems must remove the old filesystem path index even when the path string is unchanged"
         );
         assert!(
@@ -4950,28 +5571,29 @@ mod tests {
         for object in [&target_a, &target_b, &alias] {
             backend.put_object(object).expect("object");
         }
-        let old_index_path = backend.hardlink_index_path(&target_a.object_id, &alias.object_id);
-        assert!(old_index_path.exists());
+        assert!(table_hardlink_exists(
+            &backend,
+            &target_a.object_id,
+            &alias.object_id
+        ));
 
         alias.link_target_object_id = Some(target_b.object_id.clone());
         backend.put_object(&alias).expect("retarget alias");
         assert!(
-            !old_index_path.exists(),
+            !table_hardlink_exists(&backend, &target_a.object_id, &alias.object_id),
             "retargeting a hardlink should remove its old target index entry"
         );
-        assert!(
-            backend
-                .hardlink_index_path(&target_b.object_id, &alias.object_id)
-                .exists()
-        );
+        assert!(table_hardlink_exists(
+            &backend,
+            &target_b.object_id,
+            &alias.object_id
+        ));
 
         alias.kind = DfsObjectKind::Tombstone;
         alias.link_target_object_id = None;
         backend.put_object(&alias).expect("tombstone alias");
         assert!(
-            !backend
-                .hardlink_index_path(&target_b.object_id, &alias.object_id)
-                .exists(),
+            !table_hardlink_exists(&backend, &target_b.object_id, &alias.object_id),
             "tombstoning a hardlink should remove its target index entry"
         );
         assert!(
@@ -5551,9 +6173,7 @@ mod tests {
             )
             .expect("commit");
 
-        fs::remove_file(backend.object_path(&committed.object_id)).expect("remove object");
-        fs::remove_file(backend.version_path(&committed.object_id, &committed.version))
-            .expect("remove version");
+        force_table_replay_from_journal(&backend, &root, 0);
         drop(backend);
 
         let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
@@ -5729,7 +6349,7 @@ mod tests {
             .apply_namespace_transaction(&transaction)
             .expect("transaction");
 
-        fs::remove_file(backend.object_path(&source.object_id)).expect("remove source object");
+        force_table_replay_from_journal(&backend, &root, 0);
         drop(backend);
 
         let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
