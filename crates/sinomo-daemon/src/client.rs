@@ -31,14 +31,34 @@ pub fn send_daemon_rpc(
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
-    sinomo_network::send_daemon_rpc_raw(
-        address,
-        &daemon_rpc_command(&request.route),
-        Some(&signed),
-        request,
-        timeout,
-    )
+    let command = daemon_rpc_command(&request.route);
+    match daemon_rpc_address_transport(address) {
+        DaemonRpcAddressTransport::Iroh => sinomo_network::send_iroh_daemon_rpc_raw(
+            address,
+            &command,
+            Some(&signed),
+            request,
+            timeout,
+        ),
+        DaemonRpcAddressTransport::Tcp => {
+            sinomo_network::send_daemon_rpc_raw(address, &command, Some(&signed), request, timeout)
+        }
+    }
     .map_err(DaemonError::from)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonRpcAddressTransport {
+    Tcp,
+    Iroh,
+}
+
+fn daemon_rpc_address_transport(address: &str) -> DaemonRpcAddressTransport {
+    if address.trim_start().starts_with("iroh://") {
+        DaemonRpcAddressTransport::Iroh
+    } else {
+        DaemonRpcAddressTransport::Tcp
+    }
 }
 
 pub fn send_daemon_rpc_stream(
@@ -557,4 +577,25 @@ pub fn send_daemon_rollout_diagnostics(
     )?;
     let response = send_daemon_rpc(address, &request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DaemonRpcAddressTransport, daemon_rpc_address_transport};
+
+    #[test]
+    fn daemon_rpc_address_transport_detects_iroh_urls() {
+        assert_eq!(
+            daemon_rpc_address_transport("iroh://public-key?relay=https://relay.example./"),
+            DaemonRpcAddressTransport::Iroh
+        );
+        assert_eq!(
+            daemon_rpc_address_transport("  iroh://public-key"),
+            DaemonRpcAddressTransport::Iroh
+        );
+        assert_eq!(
+            daemon_rpc_address_transport("127.0.0.1:21353"),
+            DaemonRpcAddressTransport::Tcp
+        );
+    }
 }

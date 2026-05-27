@@ -201,7 +201,16 @@ sinomo cluster health
 sinomo rollout cluster --remote-build --skip-local --target 192.168.1.154:21353
 ```
 
-Do not target the remote shadow daemon for normal rollout. The current safe rollout handler runs on the main daemon and requires the target's existing shadow daemon to be running locally so it can supervise activation.
+Do not target the remote shadow daemon for normal rollout while the main daemon is healthy. The safe rollout handler normally runs on the main daemon and requires the target's existing shadow daemon to be running locally so it can supervise activation.
+
+If the main daemon or cluster control path is broken but the shadow daemon is still alive, use the shadow daemon as the repair surface. `sinomo daemon shadow status` prints the local shadow Iroh endpoint, and remote operators can use that endpoint directly for diagnostics or a repair rollout:
+
+```sh
+sinomo rollout diagnostics --target 'iroh://<shadow-public-key>?relay=<relay-url>'
+sinomo rollout cluster --remote-build --skip-local --target 'iroh://<shadow-public-key>?relay=<relay-url>'
+```
+
+The shadow daemon must keep its control listener and Iroh proxy independent of KV quorum. Lost quorum should make cluster KV writes read-only, but it must not stop shadow diagnostics, rollout staging, or supervised main recovery.
 
 ## Common Workflows
 
