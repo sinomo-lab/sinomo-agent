@@ -593,7 +593,7 @@ pub fn ensure_default_distributed_dfs(
             &DfsFileSystemConfig::from(&file_system),
         )?;
         let metadata_shards =
-            default_cluster_metadata_shards(&cluster_paths, &state, &file_system)?;
+            default_cluster_metadata_shards(&data_dir, &cluster_paths, &state, &file_system)?;
         let local_has_primary_metadata_shards = metadata_shards
             .iter()
             .any(|shard| shard.primary_node_id == state.local_node_id);
@@ -879,19 +879,23 @@ fn default_cluster_sifs_bootstrap_objects(
 }
 
 fn default_cluster_metadata_shards(
+    data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     file_system: &sinomo_dfs::DfsFileSystem,
 ) -> Result<Vec<DfsMetadataShardConfig>, DaemonError> {
     Ok(vec![
         default_cluster_metadata_shard(
+            data_dir,
             cluster_paths,
             state,
             file_system,
             "root",
             DfsMetadataShardAssignment::Root,
+            0,
         )?,
         default_cluster_metadata_shard(
+            data_dir,
             cluster_paths,
             state,
             file_system,
@@ -899,8 +903,10 @@ fn default_cluster_metadata_shards(
             DfsMetadataShardAssignment::PathPrefix {
                 prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
             },
+            1,
         )?,
         default_cluster_metadata_shard(
+            data_dir,
             cluster_paths,
             state,
             file_system,
@@ -908,44 +914,53 @@ fn default_cluster_metadata_shards(
             DfsMetadataShardAssignment::PathPrefix {
                 prefix: sinomo_dfs::SIFS_USERS_PATH.to_string(),
             },
+            2,
         )?,
     ])
 }
 
 #[cfg(test)]
 fn default_cluster_root_metadata_shard(
+    data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     file_system: &sinomo_dfs::DfsFileSystem,
 ) -> Result<DfsMetadataShardConfig, DaemonError> {
     default_cluster_metadata_shard(
+        data_dir,
         cluster_paths,
         state,
         file_system,
         "root",
         DfsMetadataShardAssignment::Root,
+        0,
     )
 }
 
 fn default_cluster_metadata_shard(
+    data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     file_system: &sinomo_dfs::DfsFileSystem,
     shard_id: &str,
     assignment: DfsMetadataShardAssignment,
+    primary_offset: usize,
 ) -> Result<DfsMetadataShardConfig, DaemonError> {
-    let primary_node_id = default_cluster_sifs_owner(state);
-    let replica_node_ids = stable_dfs_service_node_ids(state)
-        .into_iter()
-        .filter(|node_id| node_id != &primary_node_id)
-        .take(2)
-        .collect::<Vec<_>>();
+    let service_node_ids = stable_dfs_service_node_ids(state);
+    let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
+    let target_primary_node_id = default_metadata_shard_primary_node_id(
+        &service_node_ids,
+        &bootstrap_primary_node_id,
+        primary_offset,
+    );
+    let target_replica_node_ids =
+        metadata_shard_replica_node_ids(&service_node_ids, &target_primary_node_id, 2);
     let key = metadata_shard_key(&file_system.file_system_id, shard_id);
     let mut desired = DfsMetadataShardConfig {
         file_system_id: file_system.file_system_id.clone(),
         shard_id: shard_id.to_string(),
-        primary_node_id,
-        replica_node_ids,
+        primary_node_id: target_primary_node_id,
+        replica_node_ids: target_replica_node_ids,
         epoch: 1,
         assignment,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
@@ -953,13 +968,93 @@ fn default_cluster_metadata_shard(
     let Some(current) =
         sinomo_network::read_cluster_kv_value::<DfsMetadataShardConfig>(cluster_paths, &key)?
     else {
+        desired.primary_node_id = bootstrap_primary_node_id.clone();
+        desired.replica_node_ids =
+            metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id, 2);
         return Ok(desired);
     };
+    if current.primary_node_id != desired.primary_node_id
+        && !default_metadata_shard_primary_transfer_ready(
+            data_dir,
+            state,
+            &current,
+            &desired.primary_node_id,
+        )?
+    {
+        return Ok(current);
+    }
     if metadata_shard_layout_matches(&current, &desired) {
         return Ok(current);
     }
     desired.epoch = current.epoch.saturating_add(1);
     Ok(desired)
+}
+
+fn default_metadata_shard_primary_node_id(
+    service_node_ids: &[sinomo_node::NodeId],
+    fallback_node_id: &sinomo_node::NodeId,
+    primary_offset: usize,
+) -> sinomo_node::NodeId {
+    if service_node_ids.is_empty() {
+        return fallback_node_id.clone();
+    }
+    service_node_ids[primary_offset % service_node_ids.len()].clone()
+}
+
+fn metadata_shard_replica_node_ids(
+    service_node_ids: &[sinomo_node::NodeId],
+    primary_node_id: &sinomo_node::NodeId,
+    max_replicas: usize,
+) -> Vec<sinomo_node::NodeId> {
+    if service_node_ids.len() <= 1 || max_replicas == 0 {
+        return Vec::new();
+    }
+    let primary_index = service_node_ids
+        .iter()
+        .position(|node_id| node_id == primary_node_id)
+        .unwrap_or(0);
+    (1..service_node_ids.len())
+        .map(|offset| service_node_ids[(primary_index + offset) % service_node_ids.len()].clone())
+        .take(max_replicas)
+        .collect()
+}
+
+fn default_metadata_shard_primary_transfer_ready(
+    data_dir: &SinomoDataDir,
+    state: &ClusterBootstrapState,
+    current: &DfsMetadataShardConfig,
+    target_primary_node_id: &sinomo_node::NodeId,
+) -> Result<bool, DaemonError> {
+    if current.primary_node_id == *target_primary_node_id {
+        return Ok(true);
+    }
+    if current.primary_node_id != state.local_node_id {
+        return Ok(false);
+    }
+    if !current
+        .replica_node_ids
+        .iter()
+        .any(|node_id| node_id == target_primary_node_id)
+    {
+        return Ok(false);
+    }
+    let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
+    let backend = LocalJsonMetadataBackend::new(
+        shard_id.clone(),
+        data_dir
+            .dfs_dir()
+            .join("metadata")
+            .join(path_safe_segment(&current.shard_id)),
+    )?;
+    let journal_last_sequence = backend
+        .metadata_shard_statuses()?
+        .into_iter()
+        .find(|status| status.shard_id == shard_id)
+        .map(|status| status.journal_last_sequence)
+        .unwrap_or(0);
+    let target_replayed_through =
+        backend.metadata_replication_cursor(target_primary_node_id, &shard_id)?;
+    Ok(target_replayed_through >= journal_last_sequence)
 }
 
 fn metadata_shard_layout_matches(
@@ -3550,15 +3645,10 @@ mod tests {
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
         let file_system = default_cluster_sifs(&state);
         let expected_primary = stable_dfs_service_node_ids(&state)[0].clone();
-        let old_primary = stable_dfs_service_node_ids(&state)
-            .into_iter()
-            .rev()
-            .find(|node_id| node_id != &expected_primary)
-            .expect("remote primary");
         let old_shard = DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
             shard_id: "root".to_string(),
-            primary_node_id: old_primary,
+            primary_node_id: expected_primary.clone(),
             replica_node_ids: Vec::new(),
             epoch: 9,
             assignment: DfsMetadataShardAssignment::Root,
@@ -3578,8 +3668,9 @@ mod tests {
         )
         .expect("write old shard");
 
-        let migrated = default_cluster_root_metadata_shard(&cluster_paths, &state, &file_system)
-            .expect("default shard");
+        let migrated =
+            default_cluster_root_metadata_shard(&data_dir, &cluster_paths, &state, &file_system)
+                .expect("default shard");
         assert_eq!(migrated.primary_node_id, expected_primary);
         assert_eq!(migrated.epoch, 10);
 
@@ -3596,8 +3687,9 @@ mod tests {
             ),
         )
         .expect("write migrated shard");
-        let stable = default_cluster_root_metadata_shard(&cluster_paths, &state, &file_system)
-            .expect("stable shard");
+        let stable =
+            default_cluster_root_metadata_shard(&data_dir, &cluster_paths, &state, &file_system)
+                .expect("stable shard");
         assert_eq!(stable, migrated);
 
         cleanup(&root);
@@ -3619,8 +3711,9 @@ mod tests {
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
         let file_system = default_cluster_sifs(&state);
-        let shards = default_cluster_metadata_shards(&cluster_paths, &state, &file_system)
-            .expect("metadata shards");
+        let shards =
+            default_cluster_metadata_shards(&data_dir, &cluster_paths, &state, &file_system)
+                .expect("metadata shards");
         let by_id = shards
             .into_iter()
             .map(|shard| (shard.shard_id.clone(), shard))
@@ -3648,6 +3741,100 @@ mod tests {
                 .primary_node_id,
             by_id.get("root").expect("root shard").primary_node_id,
             "default path-prefix shards start on the root primary until explicit primary transfer is used"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn default_cluster_metadata_shard_transfers_after_candidate_replays_journal() {
+        let root = temp_root("default_cluster_metadata_shard_transfer_after_replay");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_default_path_shard_transfer",
+            "node_dfs_default_transfer_local",
+            &[
+                "node_dfs_default_transfer_remote_a",
+                "node_dfs_default_transfer_remote_b",
+            ],
+        );
+        let service_nodes = stable_dfs_service_node_ids(&state);
+        let bootstrap_primary = service_nodes[0].clone();
+        let target_primary = service_nodes[1].clone();
+        state.local_node_id = bootstrap_primary.clone();
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let file_system = default_cluster_sifs(&state);
+        let services_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: bootstrap_primary.clone(),
+            replica_node_ids: service_nodes
+                .iter()
+                .filter(|node_id| *node_id != &bootstrap_primary)
+                .cloned()
+                .collect(),
+            epoch: 3,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &state.local_node_id,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "services"),
+                    &services_shard,
+                    None,
+                )
+                .expect("put services shard op"),
+            ),
+        )
+        .expect("write services shard");
+        let shard_id = DfsMetadataShardId::new("services");
+        let mut backend = LocalJsonMetadataBackend::new(
+            shard_id.clone(),
+            data_dir
+                .dfs_dir()
+                .join("metadata")
+                .join(path_safe_segment("services")),
+        )
+        .expect("services backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        let waiting =
+            default_cluster_metadata_shards(&data_dir, &cluster_paths, &state, &file_system)
+                .expect("waiting shards")
+                .into_iter()
+                .find(|shard| shard.shard_id == "services")
+                .expect("services shard");
+        assert_eq!(
+            waiting.primary_node_id, bootstrap_primary,
+            "primary transfer should wait until the candidate has replayed the current journal"
+        );
+        assert_eq!(waiting.epoch, services_shard.epoch);
+
+        backend
+            .put_metadata_replication_cursor(&target_primary, &shard_id, 1)
+            .expect("candidate replay cursor");
+
+        let transferred =
+            default_cluster_metadata_shards(&data_dir, &cluster_paths, &state, &file_system)
+                .expect("transferred shards")
+                .into_iter()
+                .find(|shard| shard.shard_id == "services")
+                .expect("services shard");
+        assert_eq!(transferred.primary_node_id, target_primary);
+        assert_eq!(transferred.epoch, services_shard.epoch + 1);
+        assert!(
+            transferred
+                .replica_node_ids
+                .iter()
+                .any(|node_id| node_id == &state.local_node_id)
         );
 
         cleanup(&root);
