@@ -624,13 +624,15 @@ pub(crate) fn rollout_cluster_targets(
         }
         let rollout_endpoints = network::cluster_rollout_endpoint_candidates(&paths, state);
         for endpoint in network::cluster_main_daemon_command_targets(&paths, state) {
-            let rollout_endpoint = network::cluster_rollout_target_endpoint_for_main(
-                &paths,
-                state,
-                &endpoint.node_id,
-                &rollout_endpoints,
-            )
-            .unwrap_or_else(|| endpoint.clone());
+            let rollout_endpoint =
+                network::cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+                    &paths,
+                    state,
+                    &endpoint.node_id,
+                    Some(&endpoint),
+                    &rollout_endpoints,
+                )
+                .unwrap_or_else(|| endpoint.clone());
             push_unique_rollout_target(&mut targets, RolloutTarget::endpoint(rollout_endpoint));
         }
         return Ok(targets);

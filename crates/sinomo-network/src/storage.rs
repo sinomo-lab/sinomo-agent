@@ -2074,8 +2074,27 @@ pub fn cluster_rollout_target_endpoint_for_main(
     main_node_id: &NodeId,
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
+    cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+        paths,
+        state,
+        main_node_id,
+        None,
+        candidates,
+    )
+}
+
+pub fn cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    main_node_id: &NodeId,
+    command_endpoint: Option<&ClusterEndpointRecord>,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
     let shadow_node_id = shadow_daemon_node_id(main_node_id);
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    let command_route_rank = command_endpoint
+        .filter(|endpoint| endpoint.node_id == *main_node_id)
+        .map(cluster_endpoint_static_fallback_rank);
     let mut candidates = candidates
         .iter()
         .filter(|endpoint| {
@@ -2087,8 +2106,13 @@ pub fn cluster_rollout_target_endpoint_for_main(
     candidates.sort_by_key(|endpoint| {
         let unreachable_shadow_endpoint =
             endpoint.node_id == shadow_node_id && graph.unavailability_rank(endpoint) != 0;
+        let shadow_endpoint_less_reachable_than_command_context = endpoint.node_id
+            == shadow_node_id
+            && command_route_rank
+                .is_some_and(|rank| cluster_endpoint_static_fallback_rank(endpoint) < rank);
         (
             unreachable_shadow_endpoint,
+            shadow_endpoint_less_reachable_than_command_context,
             endpoint.node_id != shadow_node_id,
             graph.unavailability_rank(endpoint),
             cluster_endpoint_static_fallback_rank(endpoint),

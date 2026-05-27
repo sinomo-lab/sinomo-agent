@@ -1320,6 +1320,75 @@ fn rollout_target_selection_prefers_shadow_route_until_shadow_is_unreachable() {
 }
 
 #[test]
+fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-rollout-shadow-context-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_rollout_shadow_context").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_rollout_shadow_context_local").expect("local");
+    let main = NodeId::from_legacy_named("node_network_rollout_shadow_context_main").expect("main");
+    let shadow = shadow_daemon_node_id(&main);
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "network rollout shadow context",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let private_main = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
+    let public_main = daemon_lan_endpoint(&main, "203.0.113.41:21353".to_string(), 10);
+    let private_shadow = daemon_lan_endpoint(&shadow, "10.0.0.42:21354".to_string(), 10);
+    let shadow_iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&shadow, "iroh_public_key_rollout_shadow_context"),
+        node_id: shadow.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_rollout_shadow_context?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+
+    let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+        &paths,
+        &state,
+        &main,
+        Some(&public_main),
+        &[
+            private_shadow.clone(),
+            shadow_iroh.clone(),
+            public_main.clone(),
+        ],
+    )
+    .expect("public-context rollout endpoint");
+    assert_eq!(selected.endpoint_id, shadow_iroh.endpoint_id);
+
+    let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+        &paths,
+        &state,
+        &main,
+        Some(&private_main),
+        &[private_shadow.clone(), shadow_iroh, private_main.clone()],
+    )
+    .expect("private-context rollout endpoint");
+    assert_eq!(selected.endpoint_id, private_shadow.endpoint_id);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
     let now = OffsetDateTime::now_utc();
     let cluster_id = ClusterId::from_legacy_named("cluster_network_probe_shadow").expect("cluster");

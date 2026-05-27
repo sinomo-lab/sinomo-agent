@@ -443,7 +443,9 @@ pub fn advertise_daemon_iroh_endpoint(
         let published_member = member.clone();
         state.updated_at = OffsetDateTime::now_utc();
         sinomo_network::write_cluster_state(&cluster_paths, &state)?;
-        sync_cluster_state_to_kv(&cluster_paths, &state)?;
+        if let Err(error) = sync_cluster_state_to_kv(&cluster_paths, &state) {
+            eprintln!("sinomo iroh endpoint cluster state publication failed: {error}");
+        }
         let mut commit_state = state.clone();
         let publish_result = commit_cluster_kv_txn_with_quorum(
             &cluster_paths,

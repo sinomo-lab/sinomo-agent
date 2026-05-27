@@ -30,6 +30,7 @@ use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -232,11 +233,14 @@ pub fn run_shadow_daemon_supervision_loop<E, F>(
     cluster: Option<DaemonClusterStatus>,
     finalize_timeout: Duration,
     probe_timeout: Duration,
-    mut handle_connection: F,
+    handle_connection: F,
 ) -> Result<(), DaemonError>
 where
-    E: Display,
-    F: FnMut(&mut sinomo_network::DaemonControlStream, &DaemonPaths) -> Result<bool, E>,
+    E: Display + Send + 'static,
+    F: Fn(&mut sinomo_network::DaemonControlStream, &DaemonPaths) -> Result<bool, E>
+        + Send
+        + Sync
+        + 'static,
 {
     let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster.clone())?;
     let bind_address = format!("{}:{}", options.host, options.port);
@@ -260,15 +264,33 @@ where
     let mut last_main_probe = Instant::now() - shadow_main_probe_interval(false);
     let mut next_pending_activation_shutdown_nudge = Instant::now();
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
+    let handle_connection = Arc::new(handle_connection);
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
     loop {
+        if shutdown_rx.try_recv().is_ok() {
+            break;
+        }
         let now = Instant::now();
         match listener.accept() {
-            Ok(Some(mut stream)) => match handle_connection(&mut stream, &shadow_paths) {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => eprintln!("sinomo shadow daemon client error: {error}"),
-            },
+            Ok(Some(mut stream)) => {
+                let client_paths = shadow_paths.clone();
+                let client_handler = Arc::clone(&handle_connection);
+                let client_shutdown_tx = shutdown_tx.clone();
+                thread::Builder::new()
+                    .name("sinomo-shadow-client".to_string())
+                    .spawn(move || match client_handler(&mut stream, &client_paths) {
+                        Ok(true) => {
+                            let _ = client_shutdown_tx.send(());
+                        }
+                        Ok(false) => {}
+                        Err(error) => eprintln!("sinomo shadow daemon client error: {error}"),
+                    })
+                    .map_err(|source| DaemonError::Io {
+                        path: "spawn shadow daemon client handler".to_string(),
+                        detail: source.to_string(),
+                    })?;
+            }
             Ok(None) => {}
             Err(source) => {
                 return Err(DaemonError::Network {
