@@ -157,7 +157,7 @@ pub fn daemon_advertised_endpoints_for_state(
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
-    let allow_public_ip_discovery = *node_id == state.local_node_id;
+    let allow_public_ip_discovery = sinomo_network::cluster_node_is_local_process(state, node_id);
     daemon_advertised_endpoints_from_ips(
         node_id,
         options,
@@ -601,4 +601,43 @@ pub fn write_daemon_status(paths: &DaemonPaths, status: &DaemonStatus) -> Result
         path: paths.status.display().to_string(),
         detail: source.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_core::ClusterTransportKind;
+    use sinomo_node::shadow_daemon_node_id;
+
+    #[test]
+    fn local_shadow_advertisement_includes_public_route_ip() {
+        let now = OffsetDateTime::now_utc();
+        let state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_shadow_public_route").expect("cluster"),
+            "shadow public route".to_string(),
+            NodeId::from_legacy_named("node_shadow_public_route").expect("node"),
+            "shadow public route".to_string(),
+            "main-public-key".to_string(),
+            now,
+        );
+        let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+        let endpoints = daemon_advertised_endpoints_for_state(
+            &state,
+            &shadow_node_id,
+            &DaemonRunOptions {
+                host: "0.0.0.0".to_string(),
+                port: 21_354,
+            },
+            10,
+            &[],
+            &["198.18.0.76".parse().expect("benchmark-network ip")],
+        );
+
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.node_id == shadow_node_id
+                && endpoint.transport == ClusterTransportKind::LanTcp
+                && endpoint.address == "198.18.0.76:21354"
+                && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
+        }));
+    }
 }
