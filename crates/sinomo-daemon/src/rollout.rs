@@ -14,17 +14,18 @@ use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
     LocalRolloutArtifacts, MainExitObservation, PendingShadowRolloutContext,
     ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutFailureDiagnostics, RolloutMainActivation,
-    SelfRolloutPaths, activate_staged_rollout_binary, classify_main_exit,
-    deploy_managed_source_bundle, ensure_rollout_layout, install_binary_atomically,
-    managed_source_status, read_pending_shadow_rollout, read_rollout_main_activation,
-    read_rollout_status, read_tail_lossy, record_activation_failure, record_main_activation_staged,
-    record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
-    record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
-    restore_rollout_binary_from_backup, rollout_artifact_suffix, rollout_build_dev_binary,
-    rollout_diagnostics_report, rollout_main_activation_path, rollout_remote_repo_path,
-    rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
-    source_heads_match, stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
-    write_json, write_main_activation, write_rollout_status,
+    SelfRolloutPaths, activate_staged_rollout_binary, binary_should_update, classify_main_exit,
+    current_executable_path, deploy_managed_source_bundle, ensure_rollout_layout,
+    install_binary_atomically, managed_source_status, read_pending_shadow_rollout,
+    read_rollout_main_activation, read_rollout_status, read_tail_lossy, record_activation_failure,
+    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
+    record_rollout_main_exit, record_shadow_rollout_finalized, remove_main_activation,
+    remove_shadow_finalize, restore_rollout_binary_from_backup, rollout_artifact_suffix,
+    rollout_build_dev_binary, rollout_diagnostics_report, rollout_main_activation_path,
+    rollout_remote_repo_path, rollout_shadow_finalize_path, rollout_staged_main_binary,
+    rollout_staged_shadow_binary, source_heads_match, stage_pending_shadow_rollout,
+    stage_rollout_bytes, stage_rollout_file, write_json, write_main_activation,
+    write_rollout_status,
 };
 use std::env;
 use std::fmt::Display;
@@ -581,6 +582,45 @@ pub fn prepare_main_self_restart_from_env() -> Result<(), DaemonError> {
     Ok(())
 }
 
+pub fn complete_pending_main_activation_from_startup(data_dir: &Path) -> Result<(), DaemonError> {
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    let Some(activation) = read_rollout_main_activation(&rollout_paths)? else {
+        return Ok(());
+    };
+    if !pending_main_activation_matches_current_executable(&activation)? {
+        return Ok(());
+    }
+    if let Some(staged_shadow) = activation
+        .staged_shadow_binary
+        .as_ref()
+        .filter(|path| path.exists())
+        && let Err(error) = activate_staged_rollout_binary(staged_shadow, &activation.shadow_binary)
+    {
+        eprintln!("sinomo main startup could not refresh shadow binary: {error}");
+    }
+    record_main_activation_completed(
+        &rollout_paths,
+        &activation,
+        "main daemon finalized pending rollout activation",
+    )?;
+    remove_main_activation(&rollout_paths);
+    Ok(())
+}
+
+fn pending_main_activation_matches_current_executable(
+    activation: &RolloutMainActivation,
+) -> Result<bool, DaemonError> {
+    let Some(staged_main) = activation
+        .staged_main_binary
+        .as_ref()
+        .filter(|path| path.exists())
+    else {
+        return Ok(true);
+    };
+    let current = current_executable_path()?;
+    Ok(!binary_should_update(staged_main, &current)?)
+}
+
 fn take_rollout_env(key: &str) -> Option<String> {
     let value = env::var(key).ok();
     // This runs at daemon process startup, before worker threads are created.
@@ -600,6 +640,36 @@ fn sleep_for_main_self_restart_delay(delay: Option<String>) -> Result<(), Daemon
     if delay > 0 {
         thread::sleep(Duration::from_millis(delay));
     }
+    Ok(())
+}
+
+fn record_main_activation_completed(
+    rollout_paths: &SelfRolloutPaths,
+    activation: &RolloutMainActivation,
+    detail: &str,
+) -> Result<(), DaemonError> {
+    write_rollout_status(
+        rollout_paths,
+        &ClusterNodeRolloutStatus {
+            status: "accepted".to_string(),
+            mode: Some(activation.mode.clone()),
+            detail: Some(detail.to_string()),
+            source: Some(activation.source.clone()),
+            requested_at: Some(activation.requested_at.clone()),
+            staged_at: None,
+            updated_at: Some(
+                OffsetDateTime::now_utc()
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            failed_at: None,
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        },
+    )?;
     Ok(())
 }
 
@@ -1850,6 +1920,51 @@ mod tests {
         assert_eq!(plan.activation.main_port, 21353);
         assert_eq!(plan.activation.shadow_port, 21354);
         assert_eq!(plan.activation.mode, "local-apply");
+    }
+
+    #[test]
+    fn main_startup_completes_pending_activation_after_main_is_applied() {
+        let root = temp_rollout_test_root("main-startup-completes-activation");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let activation = test_main_activation(&rollout_paths);
+        write_main_activation(&rollout_paths, &activation).expect("write activation");
+
+        complete_pending_main_activation_from_startup(&root).expect("complete activation");
+
+        let status = read_rollout_status(&rollout_paths)
+            .expect("read status")
+            .expect("status recorded");
+        assert_eq!(status.status, "accepted");
+        assert_eq!(
+            status.detail.as_deref(),
+            Some("main daemon finalized pending rollout activation")
+        );
+        assert!(!rollout_main_activation_path(&rollout_paths).exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn main_startup_keeps_pending_activation_when_staged_main_differs() {
+        let root = temp_rollout_test_root("main-startup-keeps-unapplied");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let staged_main = rollout_staged_main_binary(&rollout_paths);
+        std::fs::create_dir_all(staged_main.parent().expect("staged parent"))
+            .expect("staged parent dir");
+        std::fs::write(&staged_main, b"not the current executable").expect("staged main");
+        let activation = test_main_activation(&rollout_paths);
+        write_main_activation(&rollout_paths, &activation).expect("write activation");
+
+        complete_pending_main_activation_from_startup(&root).expect("skip activation");
+
+        assert!(rollout_main_activation_path(&rollout_paths).exists());
+        assert!(
+            read_rollout_status(&rollout_paths)
+                .expect("read status")
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn temp_rollout_test_root(label: &str) -> PathBuf {
