@@ -7590,17 +7590,19 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error),
         };
-        if let Some(shard) = self.select_metadata_shard_for_object(&object)?
-            && &shard.primary_node_id != requester_node_id
-        {
-            return Err(DfsError::UnauthorizedReplicaCommand {
-                source_node_id: requester_node_id.clone(),
-                reason: format!(
-                    "source is not current metadata shard primary for {}; primary is {} at epoch {}",
-                    object.file_system_id, shard.primary_node_id, shard.epoch
-                ),
-            });
-        }
+        let requester_is_metadata_primary = match self.select_metadata_shard_for_object(&object)? {
+            Some(shard) if &shard.primary_node_id != requester_node_id => {
+                return Err(DfsError::UnauthorizedReplicaCommand {
+                    source_node_id: requester_node_id.clone(),
+                    reason: format!(
+                        "source is not current metadata shard primary for {}; primary is {} at epoch {}",
+                        object.file_system_id, shard.primary_node_id, shard.epoch
+                    ),
+                });
+            }
+            Some(_) => true,
+            None => false,
+        };
         if let Some(backend) = self.metadata_backend.as_ref() {
             if let Some(intent) = backend.get_intent(object_id, intent_id)? {
                 if &intent.coordinator_node_id != requester_node_id {
@@ -7621,6 +7623,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 }
                 return Ok(());
             }
+        }
+        if requester_is_metadata_primary && object_metadata.is_some() {
+            return Ok(());
         }
 
         if &object.owner_node_id == requester_node_id {
@@ -13266,6 +13271,97 @@ mod tests {
                 .read_manifest(object_id.as_str(), version_2.as_str())
                 .is_err(),
             "stage receipt preflight should reject before storing orphaned content"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
+        let root = temp_root("stage-command-accepts-shard-primary-transient");
+        let owner = NodeId::from_legacy_named("node_stage_transient_owner").expect("owner");
+        let primary = NodeId::from_legacy_named("node_stage_transient_primary").expect("primary");
+        let replica = NodeId::from_legacy_named("node_stage_transient_replica").expect("replica");
+        let object_id =
+            DfsObjectId::from_legacy_named("obj_stage_transient_primary").expect("object");
+        let version_1 =
+            DfsVersion::from_legacy_named("version_stage_transient_1").expect("base version");
+        let version_2 =
+            DfsVersion::from_legacy_named("version_stage_transient_2").expect("target version");
+        let file_system = file_system(owner.clone());
+        let shared_kv = SharedDfsControlPlaneKvClient::new(
+            InProcessRaftKvCluster::new(vec![primary.clone()]).expect("kv"),
+        );
+        shared_kv.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+                .expect("filesystem config");
+            control
+                .put_metadata_shard(&DfsMetadataShardConfig {
+                    file_system_id: file_system.file_system_id.clone(),
+                    shard_id: "services".to_string(),
+                    primary_node_id: primary.clone(),
+                    replica_node_ids: vec![owner.clone(), replica.clone()],
+                    epoch: 1,
+                    assignment: DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                    default_policy: DfsObjectPolicy::ReplicatedEventual,
+                })
+                .expect("metadata shard");
+        });
+        let network = InProcessNetwork::new();
+        let _primary_mailbox = network.add_node(primary.clone());
+        let content = LocalContentStore::new(root.join("content")).expect("content");
+        let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+        let mut dfs = NetworkedDfsService::new(network.add_node(replica.clone()), content)
+            .with_control_plane(shared_kv)
+            .with_metadata_backend(metadata)
+            .expect("metadata backend");
+        let mut object = file_metadata(owner);
+        object.file_system_id = file_system.file_system_id.clone();
+        object.object_id = object_id.clone();
+        object.path = "/services/transient/stage.txt".to_string();
+        object.version = version_1.clone();
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        object.current_locations = vec![primary.clone()];
+        let bytes = b"metadata shard primary can stage a transient object";
+        let content_hash = content_hash(bytes);
+
+        let event = dfs
+            .handle_stage_blob(
+                primary.clone(),
+                DfsStageBlobCommand {
+                    request_id: "dfs_stage_transient_1".to_string(),
+                    intent_id: "dfs_intent_stage_transient_1".to_string(),
+                    file_system_id: file_system.file_system_id,
+                    object_id: object_id.clone(),
+                    expected_base_version: Some(version_1),
+                    version: version_2.clone(),
+                    content_hash: content_hash.clone(),
+                    bytes: bytes.to_vec(),
+                    object_metadata: Some(object),
+                },
+            )
+            .expect("stage command");
+        assert!(matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobStaged {
+                replica_node_id,
+                ..
+            } if replica_node_id == replica
+        ));
+        let manifest = dfs
+            .content()
+            .read_manifest(object_id.as_str(), version_2.as_str())
+            .expect("staged manifest");
+        assert_eq!(manifest.content_hash, content_hash);
+        assert_eq!(
+            dfs.content()
+                .read_blob(&manifest.content_hash)
+                .expect("staged blob"),
+            bytes
         );
 
         std::fs::remove_dir_all(root).ok();
