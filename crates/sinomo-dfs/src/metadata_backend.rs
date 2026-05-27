@@ -14,6 +14,7 @@ use sinomo_core::DfsWriteReceipt;
 use sinomo_events::EventId;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -1970,6 +1971,25 @@ impl LocalJsonMetadataBackend {
             replay_metadata_table_batches_from(&path, self.table_log_offset, &mut self.tables)?;
         Ok(())
     }
+
+    fn current_tables_snapshot(&self) -> Result<Cow<'_, DfsMetadataTables>> {
+        let path = metadata_table_path(&self.root);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(Cow::Borrowed(&self.tables));
+            }
+            Err(source) => {
+                return Err(MetadataBackendError::Io { path, source });
+            }
+        };
+        if metadata.len() <= self.table_log_offset {
+            return Ok(Cow::Borrowed(&self.tables));
+        }
+        let mut tables = self.tables.clone();
+        replay_metadata_table_batches_from(&path, self.table_log_offset, &mut tables)?;
+        Ok(Cow::Owned(tables))
+    }
 }
 
 #[derive(Debug)]
@@ -2030,11 +2050,13 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>> {
-        Ok(self.tables.file_systems.get(file_system_id).cloned())
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.file_systems.get(file_system_id).cloned())
     }
 
     fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>> {
-        Ok(self.tables.file_systems.values().cloned().collect())
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.file_systems.values().cloned().collect())
     }
 
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
@@ -2059,7 +2081,8 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
-        Ok(self.tables.objects.get(object_id).cloned())
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.objects.get(object_id).cloned())
     }
 
     fn get_object_by_path(
@@ -2068,8 +2091,8 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
         let normalized_path = normalize_path(path);
-        let Some(path_record) = self
-            .tables
+        let tables = self.current_tables_snapshot()?;
+        let Some(path_record) = tables
             .paths
             .get(&(file_system_id.clone(), normalized_path.clone()))
             .cloned()
@@ -2082,7 +2105,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         if normalize_path(&path_record.path) != normalized_path {
             return Ok(None);
         }
-        let Some(object) = self.get_object(&path_record.object_id)? else {
+        let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
             return Ok(None);
         };
         if object.file_system_id != *file_system_id {
@@ -2098,9 +2121,9 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>> {
+        let tables = self.current_tables_snapshot()?;
         let mut objects = Vec::new();
-        for path_record in self
-            .tables
+        for path_record in tables
             .file_system_objects
             .values()
             .filter(|path_record| path_record.file_system_id == *file_system_id)
@@ -2108,7 +2131,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             if path_record.file_system_id != *file_system_id {
                 continue;
             }
-            let Some(object) = self.get_object(&path_record.object_id)? else {
+            let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
                 continue;
             };
             if object.file_system_id == *file_system_id
@@ -2132,14 +2155,14 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     ) -> Result<Vec<DfsObjectMetadata>> {
         let directory_path = normalize_posix_path(directory_path);
         let parent_inode_id = directory_inode_id(file_system_id, &directory_path);
+        let tables = self.current_tables_snapshot()?;
         let mut objects = Vec::new();
         let parent_dentry_root = self
             .records_root()
             .join("dentries")
             .join(key_segment(&parent_inode_id.0));
         let _ = parent_dentry_root;
-        for path_record in self
-            .tables
+        for path_record in tables
             .dentries
             .values()
             .filter(|path_record| path_record.parent_inode_id == parent_inode_id)
@@ -2149,7 +2172,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             {
                 continue;
             }
-            let Some(object) = self.get_object(&path_record.object_id)? else {
+            let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
                 continue;
             };
             if object.kind == DfsObjectKind::Tombstone
@@ -2173,15 +2196,16 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         file_system_id: &DfsFileSystemId,
         target_object_id: &DfsObjectId,
     ) -> Result<Vec<DfsObjectMetadata>> {
+        let tables = self.current_tables_snapshot()?;
         let mut hardlinks = Vec::new();
-        for ((target_id, _), path_record) in &self.tables.hardlinks {
+        for ((target_id, _), path_record) in &tables.hardlinks {
             if target_id != target_object_id {
                 continue;
             }
             if path_record.file_system_id != *file_system_id {
                 continue;
             }
-            let Some(object) = self.get_object(&path_record.object_id)? else {
+            let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
                 continue;
             };
             if object.kind == DfsObjectKind::Hardlink
@@ -2230,16 +2254,16 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Option<DfsObjectVersionRecord>> {
-        Ok(self
-            .tables
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
             .versions
             .get(&(object_id.clone(), version.clone()))
             .cloned())
     }
 
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
-        let mut versions = self
-            .tables
+        let tables = self.current_tables_snapshot()?;
+        let mut versions = tables
             .versions
             .values()
             .filter(|version| version.object_id == *object_id)
@@ -2276,8 +2300,8 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Vec<DfsReplicaReceiptRecord>> {
-        Ok(self
-            .tables
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
             .receipts
             .values()
             .filter(|receipt| {
@@ -2312,16 +2336,16 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>> {
-        Ok(self
-            .tables
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
             .intents
             .get(&(object_id.clone(), intent_id.to_string()))
             .cloned())
     }
 
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
-        let mut intents = self
-            .tables
+        let tables = self.current_tables_snapshot()?;
+        let mut intents = tables
             .intents
             .values()
             .filter(|intent| intent.object_id == *object_id)
@@ -2455,16 +2479,16 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         conflict_id: &str,
     ) -> Result<Option<DfsConflictRecord>> {
-        Ok(self
-            .tables
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
             .conflicts
             .get(&(object_id.clone(), conflict_id.to_string()))
             .cloned())
     }
 
     fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>> {
-        Ok(self
-            .tables
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
             .conflicts
             .values()
             .filter(|conflict| conflict.object_id == *object_id)
@@ -4601,6 +4625,41 @@ mod tests {
             journal[1].mutation,
             DfsMetadataMutation::PutObject { .. }
         ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_readers_see_table_batches_from_other_open_handles() {
+        let root = temp_root("local_backend_readers_see_table_batches_from_other_open_handles");
+        let mut first = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("first backend");
+        let second = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("second backend");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+
+        first.put_file_system(&file_system).expect("filesystem");
+        first.put_object(&object).expect("object");
+
+        assert_eq!(
+            second
+                .get_file_system(&file_system.file_system_id)
+                .expect("filesystem from second handle"),
+            Some(file_system.clone())
+        );
+        assert_eq!(
+            second
+                .get_object(&object.object_id)
+                .expect("object from second handle"),
+            Some(object.clone())
+        );
+        assert_eq!(
+            second
+                .objects_for_file_system(&file_system.file_system_id)
+                .expect("objects from second handle"),
+            vec![object]
+        );
 
         cleanup(&root);
     }

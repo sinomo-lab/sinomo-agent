@@ -57,8 +57,9 @@ pub use operator::{
 };
 pub use posix::{DfsDirEntry, DfsPosixError, DfsStat, DfsWriteOptions};
 pub use protocol::{
-    DfsBlobTransferResult, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsFetchBlobCommand,
-    DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
+    DfsBlobTransferResult, DfsCommitVersionCommand, DfsCommitVersionResponse,
+    DfsDistributedWriteCommand, DfsDistributedWriteResponse, DfsDistributedWriteResult,
+    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsNetworkMessage, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReadData,
     DfsReadRequest, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
@@ -880,6 +881,8 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
                 | DfsNetworkMessage::FetchBlob(_)
                 | DfsNetworkMessage::FetchBlobResponse(_)
                 | DfsNetworkMessage::FetchBlobResponseChunk(_)
+                | DfsNetworkMessage::DistributedWriteRequest(_)
+                | DfsNetworkMessage::DistributedWriteResponse(_)
                 | DfsNetworkMessage::MetadataJournalBatch(_)
                 | DfsNetworkMessage::MetadataJournalBatchResponse(_)
                 | DfsNetworkMessage::ReadResponseChunk(_) => {}
@@ -1201,6 +1204,22 @@ struct PendingMetadataReplication {
     next_after_sequence: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingRoutedWrite {
+    object_id: DfsObjectId,
+    primary_node_id: NodeId,
+    durable_receipts: usize,
+    required_receipts: usize,
+    result: Option<Result<NetworkedDfsWriteOutcome, DfsError>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingRemoteWriteResponse {
+    requester_node_id: NodeId,
+    request_id: String,
+    object_id: DfsObjectId,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum NetworkedDfsServiceEvent {
     BlobStaged {
@@ -1254,6 +1273,18 @@ pub enum NetworkedDfsServiceEvent {
         source_node_id: NodeId,
         result: DfsReadResult,
     },
+    RemoteWriteServed {
+        request_id: String,
+        object_id: DfsObjectId,
+        requester_node_id: NodeId,
+        result: DfsDistributedWriteResult,
+    },
+    RemoteWriteCompleted {
+        request_id: String,
+        object_id: DfsObjectId,
+        primary_node_id: NodeId,
+        result: DfsDistributedWriteResult,
+    },
     RepairRejected {
         intent_id: String,
         object_id: DfsObjectId,
@@ -1302,6 +1333,8 @@ pub struct NetworkedDfsService<T> {
     incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
     metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
     pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
+    pending_routed_writes: BTreeMap<String, PendingRoutedWrite>,
+    pending_remote_write_responses: BTreeMap<String, PendingRemoteWriteResponse>,
     last_events: Vec<NetworkedDfsServiceEvent>,
     transport: T,
     repair_retry_tick: u64,
@@ -1330,6 +1363,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             incoming_blob_transfers: BTreeMap::new(),
             metadata_replication_cursors: BTreeMap::new(),
             pending_metadata_replications: BTreeMap::new(),
+            pending_routed_writes: BTreeMap::new(),
+            pending_remote_write_responses: BTreeMap::new(),
             last_events: Vec::new(),
             transport,
             repair_retry_tick: 0,
@@ -2419,7 +2454,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             });
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let owner_epoch = self.ensure_object_write_authority(&object)?;
+        let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
+            Some(shard) if shard.primary_node_id != self.node_id => {
+                return self.route_distributed_write_to_metadata_primary(
+                    request,
+                    expected_base_version,
+                    bytes,
+                    desired_replica_nodes,
+                    policy,
+                    object,
+                    shard,
+                );
+            }
+            Some(shard) => shard.epoch,
+            None => 0,
+        };
 
         if expected_base_version
             .as_ref()
@@ -2613,6 +2662,55 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(outcome)
     }
 
+    fn route_distributed_write_to_metadata_primary(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        bytes: Vec<u8>,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        object: DfsObjectMetadata,
+        shard: DfsMetadataShardConfig,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let request_id = self.next_request_id();
+        let primary_node_id = shard.primary_node_id.clone();
+        let sent = self.send_dfs_message_if_routable(
+            &primary_node_id,
+            DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                request_id: request_id.clone(),
+                request,
+                expected_base_version,
+                bytes,
+                desired_replica_nodes,
+                policy,
+                object_metadata: Some(object.clone()),
+            }),
+        )?;
+        if !sent {
+            return Err(DfsError::Network {
+                message: format!(
+                    "metadata shard {} primary {} is not routable",
+                    shard.shard_id, primary_node_id
+                ),
+            });
+        }
+        self.pending_routed_writes.insert(
+            request_id.clone(),
+            PendingRoutedWrite {
+                object_id: object.object_id,
+                primary_node_id,
+                durable_receipts: 0,
+                required_receipts: 1,
+                result: None,
+            },
+        );
+        Ok(NetworkedDfsWriteOutcome::Pending {
+            intent_id: request_id,
+            durable_receipts: 0,
+            required_receipts: 1,
+        })
+    }
+
     pub fn process_incoming(&mut self) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.prune_idle_chunk_transfers();
         let inbound_frames = self
@@ -2691,6 +2789,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         events.push(event);
                     }
                 }
+                DfsNetworkMessage::DistributedWriteRequest(command) => {
+                    events.push(self.handle_distributed_write_request(source_node_id, command)?);
+                }
+                DfsNetworkMessage::DistributedWriteResponse(response) => {
+                    events.push(self.handle_distributed_write_response(source_node_id, response)?);
+                }
                 DfsNetworkMessage::MetadataJournalBatch(command) => {
                     events.push(self.handle_metadata_journal_batch(source_node_id, command)?);
                 }
@@ -2705,6 +2809,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 | DfsNetworkMessage::WriteRequest(_)
                 | DfsNetworkMessage::WriteResponse(_) => {}
             }
+            self.flush_completed_pending_remote_write_responses(&mut events)?;
         }
 
         self.prune_expired_pending_remote_reads();
@@ -2732,6 +2837,214 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             self.pending_reads.remove(&request_id);
             self.incoming_read_transfers.remove(&request_id);
         }
+    }
+
+    fn handle_distributed_write_request(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsDistributedWriteCommand,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let request_id = command.request_id.clone();
+        let object_id = command.request.object_id.clone();
+        let result = if requester_node_id != command.request.requesting_node_id {
+            DfsDistributedWriteResult::Rejected {
+                reason: format!(
+                    "distributed write requester mismatch: frame source {}, payload requester {}",
+                    requester_node_id, command.request.requesting_node_id
+                ),
+            }
+        } else {
+            match self
+                .ensure_routed_write_object_metadata(
+                    &command.request,
+                    command.object_metadata.as_ref(),
+                )
+                .and_then(|()| {
+                    self.write_distributed_eventual_with_base(
+                        command.request,
+                        command.expected_base_version,
+                        command.bytes,
+                        command.desired_replica_nodes,
+                        command.policy,
+                    )
+                }) {
+                Ok(outcome) => {
+                    if let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome {
+                        self.pending_remote_write_responses.insert(
+                            intent_id.clone(),
+                            PendingRemoteWriteResponse {
+                                requester_node_id: requester_node_id.clone(),
+                                request_id: request_id.clone(),
+                                object_id: object_id.clone(),
+                            },
+                        );
+                    }
+                    DfsDistributedWriteResult::Outcome { outcome }
+                }
+                Err(error) => DfsDistributedWriteResult::Rejected {
+                    reason: error.to_string(),
+                },
+            }
+        };
+        self.send_dfs_message_if_routable(
+            &requester_node_id,
+            DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                request_id: request_id.clone(),
+                object_id: object_id.clone(),
+                result: result.clone(),
+            }),
+        )?;
+        Ok(NetworkedDfsServiceEvent::RemoteWriteServed {
+            request_id,
+            object_id,
+            requester_node_id,
+            result,
+        })
+    }
+
+    fn handle_distributed_write_response(
+        &mut self,
+        primary_node_id: NodeId,
+        response: DfsDistributedWriteResponse,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let pending = self
+            .pending_routed_writes
+            .get_mut(&response.request_id)
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!(
+                    "received distributed write response for unknown request {}",
+                    response.request_id
+                ),
+            })?;
+        if pending.primary_node_id != primary_node_id {
+            return Err(DfsError::UnauthorizedReplicaCommand {
+                source_node_id: primary_node_id,
+                reason: format!(
+                    "distributed write response for {} did not come from primary {}",
+                    response.request_id, pending.primary_node_id
+                ),
+            });
+        }
+        if pending.object_id != response.object_id {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "distributed write response object mismatch for {}: expected {}, actual {}",
+                    response.request_id, pending.object_id, response.object_id
+                ),
+            });
+        }
+        match &response.result {
+            DfsDistributedWriteResult::Outcome {
+                outcome:
+                    NetworkedDfsWriteOutcome::Pending {
+                        durable_receipts,
+                        required_receipts,
+                        ..
+                    },
+            } => {
+                pending.durable_receipts = *durable_receipts;
+                pending.required_receipts = *required_receipts;
+                pending.result = None;
+            }
+            DfsDistributedWriteResult::Outcome { outcome } => {
+                pending.result = Some(Ok(outcome.clone()));
+            }
+            DfsDistributedWriteResult::Rejected { reason } => {
+                pending.result = Some(Err(DfsError::Distributed {
+                    message: reason.clone(),
+                }));
+            }
+        }
+        Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
+            request_id: response.request_id,
+            object_id: response.object_id,
+            primary_node_id,
+            result: response.result,
+        })
+    }
+
+    fn flush_completed_pending_remote_write_responses(
+        &mut self,
+        events: &mut Vec<NetworkedDfsServiceEvent>,
+    ) -> Result<(), DfsError> {
+        if self.pending_remote_write_responses.is_empty() {
+            return Ok(());
+        }
+        let intent_ids = self
+            .pending_remote_write_responses
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for intent_id in intent_ids {
+            let result = match self.write_outcome(&intent_id) {
+                Ok(NetworkedDfsWriteOutcome::Pending { .. }) => continue,
+                Ok(outcome) => DfsDistributedWriteResult::Outcome { outcome },
+                Err(error) => DfsDistributedWriteResult::Rejected {
+                    reason: error.to_string(),
+                },
+            };
+            let Some(pending) = self.pending_remote_write_responses.remove(&intent_id) else {
+                continue;
+            };
+            self.send_dfs_message_if_routable(
+                &pending.requester_node_id,
+                DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                    request_id: pending.request_id.clone(),
+                    object_id: pending.object_id.clone(),
+                    result: result.clone(),
+                }),
+            )?;
+            events.push(NetworkedDfsServiceEvent::RemoteWriteServed {
+                request_id: pending.request_id,
+                object_id: pending.object_id,
+                requester_node_id: pending.requester_node_id,
+                result,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_routed_write_object_metadata(
+        &mut self,
+        request: &DfsWriteRequest,
+        object_metadata: Option<&DfsObjectMetadata>,
+    ) -> Result<(), DfsError> {
+        match self.current_object_for_write(&request.object_id) {
+            Ok(_) => return Ok(()),
+            Err(DfsError::UnknownObject { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        let Some(object) = object_metadata else {
+            return Err(DfsError::UnknownObject {
+                object_id: request.object_id.clone(),
+            });
+        };
+        if object.object_id != request.object_id || object.file_system_id != request.file_system_id
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed write metadata mismatch for object {}",
+                    request.object_id
+                ),
+            });
+        }
+        let Some(shard) = self.select_metadata_shard_for_object(object)? else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed write for {} has no metadata shard assignment",
+                    request.object_id
+                ),
+            });
+        };
+        if shard.primary_node_id != self.node_id {
+            return Err(DfsError::StaleOwnerEpoch {
+                file_system_id: object.file_system_id.clone(),
+                local_node_id: self.node_id.clone(),
+                primary_node_id: shard.primary_node_id,
+                epoch: shard.epoch,
+            });
+        }
+        self.add_transient_object_metadata(object.clone())
     }
 
     fn handle_metadata_journal_batch_response(
@@ -3413,24 +3726,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         DfsControlPlaneStore::new(kv.as_mut())
             .select_metadata_shard_for_path(&object.file_system_id, &object.path)
             .map_err(DfsError::from)
-    }
-
-    fn ensure_object_write_authority(
-        &mut self,
-        object: &DfsObjectMetadata,
-    ) -> Result<u64, DfsError> {
-        let Some(shard) = self.select_metadata_shard_for_object(object)? else {
-            return Ok(0);
-        };
-        if shard.primary_node_id != self.node_id {
-            return Err(DfsError::StaleOwnerEpoch {
-                file_system_id: object.file_system_id.clone(),
-                local_node_id: self.node_id.clone(),
-                primary_node_id: shard.primary_node_id,
-                epoch: shard.epoch,
-            });
-        }
-        Ok(shard.epoch)
     }
 
     fn ensure_intent_epoch_current(
@@ -7213,6 +7508,17 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     }
 
     fn write_outcome(&self, intent_id: &str) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if let Some(pending) = self.pending_routed_writes.get(intent_id) {
+            return match &pending.result {
+                Some(Ok(outcome)) => Ok(outcome.clone()),
+                Some(Err(error)) => Err(error.clone()),
+                None => Ok(NetworkedDfsWriteOutcome::Pending {
+                    intent_id: intent_id.to_string(),
+                    durable_receipts: pending.durable_receipts,
+                    required_receipts: pending.required_receipts,
+                }),
+            };
+        }
         let intent = self
             .coordinator
             .intent(intent_id)

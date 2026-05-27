@@ -1,6 +1,6 @@
 use crate::{
     DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardId, DfsObjectId, DfsObjectMetadata,
-    DfsVersion,
+    DfsReplicationPolicy, DfsVersion, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
@@ -76,6 +76,33 @@ pub enum DfsWriteResult {
     Rejected {
         reason: String,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsDistributedWriteCommand {
+    pub request_id: String,
+    pub request: DfsWriteRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_base_version: Option<DfsVersion>,
+    pub bytes: Vec<u8>,
+    pub desired_replica_nodes: Vec<NodeId>,
+    pub policy: DfsReplicationPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_metadata: Option<DfsObjectMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsDistributedWriteResponse {
+    pub request_id: String,
+    pub object_id: DfsObjectId,
+    pub result: DfsDistributedWriteResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsDistributedWriteResult {
+    Outcome { outcome: NetworkedDfsWriteOutcome },
+    Rejected { reason: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -287,6 +314,8 @@ pub enum DfsNetworkMessage {
     ReadResponseChunk(DfsReadResponseChunk),
     WriteRequest(DfsWriteCommand),
     WriteResponse(DfsWriteResponse),
+    DistributedWriteRequest(DfsDistributedWriteCommand),
+    DistributedWriteResponse(DfsDistributedWriteResponse),
     StageBlob(DfsStageBlobCommand),
     StageBlobChunk(DfsStageBlobChunkCommand),
     StageBlobResponse(DfsStageBlobResponse),

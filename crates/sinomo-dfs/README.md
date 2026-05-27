@@ -82,7 +82,7 @@ Legacy per-record `.sobj` metadata layouts are loaded into the packed table log 
 - distributed write coordinator,
 - data-plane DFS network messages.
 
-Distributed writes create a persisted intent, stage content to desired replicas, record durable receipts, commit the visible version after the policy threshold, and keep repair jobs until the desired replica set converges.
+Distributed writes are coordinated by the responsible metadata-shard primary. A node that receives a write for a shard it does not currently primary routes the request to that primary instead of creating a local intent. The primary creates the persisted intent, stages content to desired replicas, records durable receipts, commits the visible version after the policy threshold, and keeps repair jobs until the desired replica set converges.
 
 Replica-side commands are authorized against object ownership, metadata-shard primary state when available, desired replica membership, persisted intent records, and content hashes. Rejected replica commands do not create replica metadata.
 

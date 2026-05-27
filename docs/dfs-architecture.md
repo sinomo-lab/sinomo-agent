@@ -317,7 +317,7 @@ This is the main roaming recovery loop.
 - Too few eligible receipts for distributed eventual objects: commit waits, degrades to pending, or rejects based on timeout policy.
 - Some desired replicas offline after threshold commit: visible version may commit, and repair later converges replicas toward policy.
 - Cache stale: reads can continue only when caller and policy allow stale reads.
-- Split brain: stale owner epochs are fenced by KV; reconnected old owners must reject writes from obsolete epochs.
+- Split brain: stale owner epochs are fenced by KV; reconnected old owners must not coordinate writes from obsolete epochs. They may route client writes to the current metadata-shard primary, or reject if that route is unavailable.
 
 ### Why This Algorithm
 
@@ -825,9 +825,9 @@ These events should carry node, filesystem, object, version, policy, content has
 - Make conflict metadata operational: `DfsMetadataBackend` can persist, fetch, list, and update conflict records; `NetworkedDfsService` keeps a local conflict cache and exposes open conflict read views before returning current or stale bytes.
 - For `replicated-eventual`, stale base writes and duplicate concurrent target versions become explicit branch-style conflict records with local candidate hash, visible competing hash, base version, producing node, and status. `replicated-confirmed` keeps the stricter Phase 4 behavior: stale commits reject instead of silently branching.
 - Reconnect reconciliation compares local manifests with visible object metadata: matching current manifests refresh durable receipts and current locations, while divergent non-visible manifests create conflict records for operator or agent resolution.
-- Owner epoch fencing uses the control-plane metadata-shard epoch. Write intents capture the current shard epoch, commits re-check that epoch before advancing the visible version, and old owners reject new writes after a shard primary handoff.
+- Owner epoch fencing uses the control-plane metadata-shard epoch. Write intents capture the current shard epoch and commits re-check that epoch before advancing the visible version. Nodes from an older epoch cannot coordinate new writes after a shard primary handoff; they route the request to the current primary when reachable.
 - Conservative handoff is explicit: the candidate node must already have the latest visible content hash locally, the control-plane shard primary transfer must compare the expected epoch, the epoch increments on success, and local filesystem/object ownership metadata is updated only after the fenced transfer succeeds.
-- Added tests for conflict persistence/update, stale-write conflict read views, reconnect receipt/conflict reconciliation, epoch-CAS shard transfer, and old owner fencing after handoff.
+- Added tests for conflict persistence/update, stale-write conflict read views, reconnect receipt/conflict reconciliation, epoch-CAS shard transfer, and old-owner routing after handoff.
 
 ### Phase 6: Operator and Agent Surfaces
 
