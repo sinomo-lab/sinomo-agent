@@ -1584,7 +1584,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let mut objects = Vec::new();
         let mut conflicts = Vec::new();
         let mut intents = Vec::new();
-        let mut receipts_by_intent = BTreeMap::<String, Vec<DfsReplicaReceiptRecord>>::new();
+        let mut receipts_by_intent =
+            BTreeMap::<(DfsObjectId, String), Vec<DfsReplicaReceiptRecord>>::new();
 
         for file_system in &file_systems {
             for object in backend.objects_for_file_system(&file_system.file_system_id)? {
@@ -1592,7 +1593,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 for intent in backend.intents_for_object(&object.object_id)? {
                     let receipts =
                         backend.receipts_for_version(&object.object_id, &intent.target_version)?;
-                    receipts_by_intent.insert(intent.intent_id.clone(), receipts);
+                    receipts_by_intent.insert(
+                        (object.object_id.clone(), intent.intent_id.clone()),
+                        receipts,
+                    );
                     intents.push(intent);
                 }
                 objects.push(object);
@@ -1680,9 +1684,46 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         .restore_intent(distributed_intent_from_record(&conflict_record))?;
                     continue;
                 }
+                Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
+                    if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
+                        && self
+                            .current_read_object_metadata(&intent_record.object_id)
+                            .is_ok_and(|object| {
+                                object.version == intent_record.target_version
+                                    && intent_record.content_hash.as_deref().is_none_or(
+                                        |content_hash| {
+                                            object.content_hash.as_deref() == Some(content_hash)
+                                        },
+                                    )
+                            })
+                    {
+                        self.restore_visible_committed_object_location_receipts(&intent_record)?;
+                        continue;
+                    }
+                    let object = self.current_read_object_metadata(&intent_record.object_id)?;
+                    self.create_write_conflict(
+                        &object,
+                        intent_record.base_version.clone(),
+                        intent_record.target_version.clone(),
+                        intent_record.coordinator_node_id.clone(),
+                        intent_record.content_hash.clone(),
+                        error.to_string(),
+                        Some(intent_record.intent_id.clone()),
+                    )?;
+                    let mut conflict_record = intent_record.clone();
+                    conflict_record.status = DfsWriteIntentStatus::Conflict;
+                    conflict_record.updated_at = Some(OffsetDateTime::now_utc());
+                    if let Some(backend) = self.metadata_backend.as_mut() {
+                        backend.put_intent(&conflict_record)?;
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             }
-            if let Some(receipts) = receipts_by_intent.get(&intent_record.intent_id) {
+            if let Some(receipts) = receipts_by_intent.get(&(
+                intent_record.object_id.clone(),
+                intent_record.intent_id.clone(),
+            )) {
                 for receipt in receipts {
                     if let Some(expected_hash) = intent_record.content_hash.as_deref()
                         && receipt.content_hash.as_deref() != Some(expected_hash)
@@ -1721,6 +1762,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .collect();
         let mut recovered_commit_ready_intent_ids = Vec::new();
         for intent_record in pending_write_records {
+            let Some(restored_intent) = self.coordinator.intent(&intent_record.intent_id) else {
+                continue;
+            };
+            if !distributed_intent_matches_record(restored_intent, &intent_record) {
+                continue;
+            }
             let needs_pending_write =
                 matches!(
                     intent_record.status,
@@ -6805,6 +6852,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsError::Distributed {
                     message: format!("missing pending write for committed intent: {intent_id}"),
                 })?;
+        if intent.object_id != pending.object_id || intent.target_version != pending.version {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "committed intent {intent_id} state does not match pending write: intent {} {}, pending {} {}",
+                    intent.object_id, intent.target_version, pending.object_id, pending.version
+                ),
+            });
+        }
         let write_time = dfs_now_unix_nanos();
         self.commit_visible_version_in_metadata_backend(&intent, &pending, write_time)?;
         self.put_metadata_intent(&intent, Some(&pending.content_hash))?;
@@ -7844,6 +7899,15 @@ fn distributed_intent_from_record(record: &DfsWriteIntentRecord) -> DistributedW
         policy: record.policy.clone(),
         state: distributed_intent_state_from_status(&record.status),
     }
+}
+
+fn distributed_intent_matches_record(
+    intent: &DistributedWriteIntent,
+    record: &DfsWriteIntentRecord,
+) -> bool {
+    intent.file_system_id == record.file_system_id
+        && intent.object_id == record.object_id
+        && intent.target_version == record.target_version
 }
 
 fn distributed_intent_state_from_status(status: &DfsWriteIntentStatus) -> DfsWriteIntentState {
@@ -9460,6 +9524,156 @@ mod tests {
                 .status,
             DfsWriteIntentStatus::Committed
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn hydrate_from_metadata_backend_does_not_mix_duplicate_intent_ids() {
+        let root = temp_root("hydrate-duplicate-intent-ids");
+        let owner = NodeId::from_legacy_named("node_hydrate_dup_owner").expect("node");
+        let replica = NodeId::from_legacy_named("node_hydrate_dup_replica").expect("node");
+        let other_replica =
+            NodeId::from_legacy_named("node_hydrate_dup_other_replica").expect("node");
+        let pending_object_id =
+            DfsObjectId::from_legacy_named("obj_hydrate_dup_pending").expect("object");
+        let committed_object_id =
+            DfsObjectId::from_legacy_named("obj_hydrate_dup_committed").expect("object");
+        let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+        let pending_version = DfsVersion::from_legacy_named("version_2").expect("version");
+        let committed_version = DfsVersion::from_legacy_named("version_3").expect("version");
+        let intent_id = format!("dfs_intent_{}_20", owner.as_str());
+        let network = InProcessNetwork::new();
+        let metadata_root = root.join("metadata");
+        let content_root = root.join("owner-content");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
+                .expect("backend");
+        let file_system = file_system(owner.clone());
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        let mut pending_object = file_metadata(owner.clone());
+        pending_object.object_id = pending_object_id.clone();
+        pending_object.path = "/services/dfs-smoke/pending-duplicate-intent.txt".to_string();
+        pending_object.version = version_1.clone();
+        pending_object.policy = DfsObjectPolicy::ReplicatedEventual;
+        backend.put_object(&pending_object).expect("pending object");
+
+        let content = LocalContentStore::new(&content_root).expect("content");
+        let pending_manifest = content
+            .put_object_version(
+                pending_object_id.as_str(),
+                pending_version.as_str(),
+                b"pending duplicate intent bytes",
+            )
+            .expect("pending manifest");
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: intent_id.clone(),
+                file_system_id: sifs_file_system_id(),
+                object_id: pending_object_id.clone(),
+                base_version: Some(version_1.clone()),
+                target_version: pending_version.clone(),
+                coordinator_node_id: owner.clone(),
+                owner_epoch: 0,
+                desired_replica_node_ids: vec![owner.clone(), replica.clone()],
+                policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+                status: DfsWriteIntentStatus::ReceiptsPending,
+                content_hash: Some(pending_manifest.content_hash.clone()),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            })
+            .expect("pending intent");
+        for node_id in [&owner, &replica] {
+            backend
+                .put_receipt(&DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: sifs_file_system_id(),
+                        object_id: pending_object_id.clone(),
+                        committed_version: pending_version.clone(),
+                        owner_node_id: owner.clone(),
+                        event_id: EventId::generate(),
+                    },
+                    replica_node_id: node_id.clone(),
+                    content_hash: Some(pending_manifest.content_hash.clone()),
+                    received_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .expect("pending receipt");
+        }
+
+        let mut committed_object = file_metadata(owner.clone());
+        committed_object.object_id = committed_object_id.clone();
+        committed_object.path = "/services/dfs-smoke/committed-duplicate-intent.txt".to_string();
+        committed_object.version = committed_version.clone();
+        committed_object.policy = DfsObjectPolicy::ReplicatedEventual;
+        committed_object.current_locations = vec![owner.clone(), other_replica.clone()];
+        committed_object.content_hash = Some("blake3:committed-duplicate".to_string());
+        committed_object.content_size_bytes = Some(3);
+        backend
+            .put_object(&committed_object)
+            .expect("committed object");
+        backend
+            .put_version(&object_version_record(&committed_object, Some(3)))
+            .expect("committed version");
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: intent_id.clone(),
+                file_system_id: sifs_file_system_id(),
+                object_id: committed_object_id.clone(),
+                base_version: Some(version_1),
+                target_version: committed_version,
+                coordinator_node_id: owner.clone(),
+                owner_epoch: 0,
+                desired_replica_node_ids: vec![owner.clone(), other_replica.clone()],
+                policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+                status: DfsWriteIntentStatus::Committed,
+                content_hash: committed_object.content_hash.clone(),
+                created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+            })
+            .expect("committed duplicate intent");
+        for node_id in [&owner, &other_replica] {
+            backend
+                .put_receipt(&DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: sifs_file_system_id(),
+                        object_id: committed_object_id.clone(),
+                        committed_version: committed_object.version.clone(),
+                        owner_node_id: owner.clone(),
+                        event_id: EventId::generate(),
+                    },
+                    replica_node_id: node_id.clone(),
+                    content_hash: committed_object.content_hash.clone(),
+                    received_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .expect("committed receipt");
+        }
+        drop(backend);
+
+        let recovered_backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
+                .expect("recovered backend");
+        let recovered_owner = NetworkedDfsService::new(
+            network.add_node(owner.clone()),
+            LocalContentStore::new(content_root).expect("recovered content"),
+        )
+        .with_metadata_backend(recovered_backend)
+        .expect("duplicate intent ids should not poison hydration");
+
+        let pending_object = recovered_owner
+            .metadata_backend()
+            .expect("backend")
+            .get_object(&pending_object_id)
+            .expect("pending object")
+            .expect("pending object");
+        assert_eq!(pending_object.version, pending_version);
+        assert_eq!(
+            pending_object
+                .current_locations
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([owner, replica])
+        );
+        assert!(recovered_owner.pending_writes.get(&intent_id).is_none());
         std::fs::remove_dir_all(root).ok();
     }
 

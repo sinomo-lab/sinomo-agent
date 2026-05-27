@@ -267,7 +267,7 @@ impl DistributedEventualCoordinator {
             &policy,
         )?;
 
-        let intent_id = self.next_intent_id(&requesting_node_id);
+        let intent_id = self.next_intent_id(&requesting_node_id, &object_id);
         let intent = DistributedWriteIntent {
             intent_id: intent_id.clone(),
             file_system_id,
@@ -346,6 +346,17 @@ impl DistributedEventualCoordinator {
         intent: DistributedWriteIntent,
     ) -> Result<(), DfsDistributedError> {
         validate_replication_plan(&intent.desired_replica_nodes, &intent.policy)?;
+        if let Some(existing) = self.intents.get(&intent.intent_id)
+            && (existing.file_system_id != intent.file_system_id
+                || existing.object_id != intent.object_id
+                || existing.target_version != intent.target_version)
+        {
+            return Err(DfsDistributedError::DuplicateIntentId {
+                intent_id: intent.intent_id.clone(),
+                existing_object_id: existing.object_id.clone(),
+                new_object_id: intent.object_id.clone(),
+            });
+        }
         if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
             self.validate_new_intent(
                 &intent.file_system_id,
@@ -611,11 +622,14 @@ impl DistributedEventualCoordinator {
             .collect()
     }
 
-    fn next_intent_id(&mut self, requesting_node_id: &NodeId) -> String {
+    fn next_intent_id(&mut self, requesting_node_id: &NodeId, object_id: &DfsObjectId) -> String {
+        let object_hash = blake3::hash(object_id.as_str().as_bytes()).to_hex();
+        let object_hash = &object_hash[..16];
         let intent_id = format!(
-            "dfs_intent_{}_{}",
+            "dfs_intent_{}_{}_{}",
             requesting_node_id.as_str(),
-            self.next_intent_id
+            object_hash,
+            self.next_intent_id,
         );
         self.next_intent_id += 1;
         intent_id
@@ -751,6 +765,14 @@ pub enum DfsDistributedError {
         target_version: DfsVersion,
     },
     #[error(
+        "duplicate DFS write intent id {intent_id} is used for both {existing_object_id} and {new_object_id}"
+    )]
+    DuplicateIntentId {
+        intent_id: String,
+        existing_object_id: DfsObjectId,
+        new_object_id: DfsObjectId,
+    },
+    #[error(
         "pending DFS write intent {pending_intent_id} for {object_id} at {pending_target_version} conflicts with requested target {requested_target_version}"
     )]
     PendingIntentConflict {
@@ -859,9 +881,11 @@ mod tests {
     }
 
     #[test]
-    fn intent_ids_include_requesting_node_to_avoid_cross_node_collisions() {
+    fn intent_ids_include_requesting_node_and_object_to_avoid_collisions() {
         let mut left = DistributedEventualCoordinator::new();
         let mut right = DistributedEventualCoordinator::new();
+        let mut same_node = DistributedEventualCoordinator::new();
+        let other_object = DfsObjectId::from_legacy_named("obj_other_file").expect("object");
 
         let left_intent = left
             .create_intent(
@@ -885,8 +909,20 @@ mod tests {
                 policy(2, 2),
             )
             .expect("right intent");
+        let same_node_other_object = same_node
+            .create_intent(
+                file_system_id(),
+                other_object,
+                Some(version("version_1")),
+                version("version_2"),
+                node("node_left"),
+                vec![node("node_left"), node("node_replica")],
+                policy(2, 2),
+            )
+            .expect("same node other object intent");
 
         assert_ne!(left_intent.intent_id, right_intent.intent_id);
+        assert_ne!(left_intent.intent_id, same_node_other_object.intent_id);
         assert!(left_intent.intent_id.contains(node("node_left").as_str()));
         assert!(right_intent.intent_id.contains(node("node_right").as_str()));
     }
