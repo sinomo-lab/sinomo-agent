@@ -1278,13 +1278,14 @@ impl LocalShardedMetadataBackend {
         let object = normalized_object_metadata(object);
         let target_shard_id =
             self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
-        if let Some(index) = self.read_object_shard_index(&object.object_id)? {
-            self.put_cross_shard_tombstone(&object, &index.shard_id, &target_shard_id)?;
-        }
+        let source_shard_id = self.shard_id_for_object(&object.object_id)?;
         let entry = self
             .shard_backend_mut(&target_shard_id)?
             .put_object(&object)?;
         self.write_object_shard_index(&object, &target_shard_id)?;
+        if let Some(source_shard_id) = source_shard_id {
+            self.put_cross_shard_tombstone(&object, &source_shard_id, &target_shard_id)?;
+        }
         Ok(entry)
     }
 }
@@ -1349,8 +1350,17 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
         let shard_id = self.select_shard_id_for_path(file_system_id, path)?;
-        self.shard_backend(&shard_id)?
-            .get_object_by_path(file_system_id, path)
+        let object = self
+            .shard_backend(&shard_id)?
+            .get_object_by_path(file_system_id, path)?;
+        if let Some(object) = object.as_ref()
+            && object.kind != DfsObjectKind::Tombstone
+            && let Some(index) = self.read_object_shard_index(&object.object_id)?
+            && index.shard_id != shard_id
+        {
+            return Ok(None);
+        }
+        Ok(object)
     }
 
     fn objects_for_file_system(
@@ -1495,12 +1505,20 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry> {
         let mut objects_by_shard = BTreeMap::<DfsMetadataShardId, Vec<DfsObjectMetadata>>::new();
+        let mut cross_shard_tombstones =
+            Vec::<(DfsObjectMetadata, DfsMetadataShardId, DfsMetadataShardId)>::new();
         for object in &transaction.objects {
             let object = normalized_object_metadata(object);
             let target_shard_id =
                 self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
-            if let Some(index) = self.read_object_shard_index(&object.object_id)? {
-                self.put_cross_shard_tombstone(&object, &index.shard_id, &target_shard_id)?;
+            if let Some(source_shard_id) = self.shard_id_for_object(&object.object_id)?
+                && source_shard_id != target_shard_id
+            {
+                cross_shard_tombstones.push((
+                    object.clone(),
+                    source_shard_id,
+                    target_shard_id.clone(),
+                ));
             }
             objects_by_shard
                 .entry(target_shard_id)
@@ -1522,6 +1540,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 self.write_object_shard_index(object, &shard_id)?;
             }
             last_entry = Some(entry);
+        }
+        for (object, source_shard_id, target_shard_id) in cross_shard_tombstones {
+            self.put_cross_shard_tombstone(&object, &source_shard_id, &target_shard_id)?;
         }
         last_entry.ok_or_else(|| {
             MetadataBackendError::Serde(format!(
@@ -5257,6 +5278,15 @@ mod tests {
         count
     }
 
+    fn block_shard_journal_writes(root: &Path, shard_id: &str) {
+        let segments = root
+            .join(key_segment(&shard_id))
+            .join("journal")
+            .join("segments");
+        fs::remove_dir_all(&segments).expect("remove journal segments directory");
+        fs::write(&segments, b"not a directory").expect("block journal segment writes");
+    }
+
     #[test]
     fn local_backend_persists_file_system_object_path_and_journal() {
         let root = temp_root("local_backend_persists_file_system_object_path_and_journal");
@@ -5461,6 +5491,182 @@ mod tests {
                 .expect("old path")
                 .map(|object| object.kind),
             Some(DfsObjectKind::Tombstone)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_keeps_source_object_when_cross_shard_target_write_fails() {
+        let root = temp_root("sharded_backend_cross_shard_target_failure");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("root object");
+        block_shard_journal_writes(&root, "services");
+
+        let mut moved = object.clone();
+        moved.path = "/services/readme.md".to_string();
+        moved.version = version("version_2");
+        let error = backend
+            .put_object(&moved)
+            .expect_err("target shard journal failure should reject move");
+
+        assert!(
+            matches!(error, MetadataBackendError::Io { .. }),
+            "target journal append failure should be surfaced as I/O: {error:?}"
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &object.path)
+                .expect("source path")
+                .as_ref()
+                .map(|object| (&object.path, &object.version, &object.kind)),
+            Some((&object.path, &object.version, &DfsObjectKind::File)),
+            "failed target write must not tombstone or move the source object"
+        );
+        assert_eq!(
+            backend
+                .read_object_shard_index(&object.object_id)
+                .expect("object shard index")
+                .as_ref()
+                .map(|index| (&index.path, &index.shard_id)),
+            Some((&object.path, &DfsMetadataShardId::new("root"))),
+            "failed target write must leave the object shard index on the source shard"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_keeps_source_namespace_when_cross_shard_target_transaction_fails() {
+        let root = temp_root("sharded_backend_cross_shard_transaction_failure");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("root object");
+        block_shard_journal_writes(&root, "services");
+
+        let mut moved = object.clone();
+        moved.path = "/services/readme.md".to_string();
+        moved.version = version("version_2");
+        let error = backend
+            .apply_namespace_transaction(&DfsNamespaceTransaction {
+                transaction_id: "move-to-services".to_string(),
+                file_system_id: file_system.file_system_id.clone(),
+                objects: vec![moved],
+                created_at: OffsetDateTime::now_utc(),
+            })
+            .expect_err("target shard journal failure should reject namespace move");
+
+        assert!(
+            matches!(error, MetadataBackendError::Io { .. }),
+            "target namespace journal append failure should be surfaced as I/O: {error:?}"
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &object.path)
+                .expect("source path")
+                .as_ref()
+                .map(|object| (&object.path, &object.version, &object.kind)),
+            Some((&object.path, &object.version, &DfsObjectKind::File)),
+            "failed target namespace transaction must keep the source object visible"
+        );
+        assert_eq!(
+            backend
+                .read_object_shard_index(&object.object_id)
+                .expect("object shard index")
+                .as_ref()
+                .map(|index| (&index.path, &index.shard_id)),
+            Some((&object.path, &DfsMetadataShardId::new("root"))),
+            "failed target namespace transaction must leave the object shard index on the source shard"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_hides_stale_source_path_when_cross_shard_tombstone_fails() {
+        let root = temp_root("sharded_backend_cross_shard_tombstone_failure");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("root object");
+        block_shard_journal_writes(&root, "root");
+
+        let mut moved = object.clone();
+        moved.path = "/services/readme.md".to_string();
+        moved.version = version("version_2");
+        let error = backend
+            .put_object(&moved)
+            .expect_err("source tombstone journal failure should be surfaced");
+
+        assert!(
+            matches!(error, MetadataBackendError::Io { .. }),
+            "source tombstone journal failure should be surfaced as I/O: {error:?}"
+        );
+        assert_eq!(
+            backend
+                .get_object(&object.object_id)
+                .expect("object by id")
+                .as_ref()
+                .map(|object| (&object.path, &object.version)),
+            Some((&moved.path, &moved.version)),
+            "object id lookups should use the target shard after the target write and index update"
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &object.path)
+                .expect("old source path"),
+            None,
+            "a stale non-tombstoned source object must not remain visible once the index points at the target shard"
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &moved.path)
+                .expect("target path")
+                .as_ref()
+                .map(|object| (&object.path, &object.version)),
+            Some((&moved.path, &moved.version))
         );
 
         cleanup(&root);
