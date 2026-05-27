@@ -2786,14 +2786,24 @@ fn commit_cluster_kv_txn_with_quorum_response_with_forwarding(
             ),
         });
     }
-    if !locked_cluster_raft_local_is_leader(paths, state)?
-        && !elect_cluster_raft_leader(paths, state)?
-    {
+    if !locked_cluster_raft_local_is_leader(paths, state)? {
         if allow_forwarding
             && let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn)
         {
             return response;
         }
+        if !allow_forwarding {
+            return Err(DaemonError::ClusterReadOnly {
+                detail: "forwarded cluster KV transaction reached a non-leader voter".to_string(),
+            });
+        }
+        if !elect_cluster_raft_leader(paths, state)? {
+            return Err(DaemonError::ClusterReadOnly {
+                detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
+            });
+        }
+    }
+    if !locked_cluster_raft_local_is_leader(paths, state)? {
         return Err(DaemonError::ClusterReadOnly {
             detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
         });
@@ -3508,6 +3518,62 @@ mod tests {
         assert_eq!(
             store.get("/test/local-lock-wait").expect("committed").value,
             b"ok"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forwarded_cluster_kv_txn_does_not_start_local_election() {
+        let root = unique_cluster_test_root("sinomo-daemon-forwarded-kv-no-election");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_forwarded_kv_no_election")
+            .expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_daemon_forwarded_kv_no_election").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "forwarded kv no election",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+        sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state to raft");
+        sinomo_network::clear_cluster_raft_leader(&paths, &state.local_node_id)
+            .expect("clear known leader");
+        assert_eq!(
+            sinomo_network::cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+            None
+        );
+
+        let error = commit_cluster_kv_txn_with_quorum_response_with_forwarding(
+            &paths,
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/test/forwarded-no-election".to_string(),
+                    value: b"blocked".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+            false,
+        )
+        .expect_err("forwarded non-leader must reject instead of electing");
+        assert!(error.to_string().contains("non-leader voter"));
+        assert_eq!(
+            sinomo_network::cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+            None
         );
         let _ = std::fs::remove_dir_all(root);
     }
