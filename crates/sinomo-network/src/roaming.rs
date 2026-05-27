@@ -712,11 +712,15 @@ pub fn send_iroh_daemon_rpc_raw(
             operation: "start iroh client runtime".to_string(),
             detail: source.to_string(),
         })?;
-    let response = runtime.block_on(send_iroh_daemon_rpc_raw_async(
-        record, command, auth, request, timeout,
-    ));
+    let response = runtime.block_on(async {
+        tokio::time::timeout(
+            timeout.saturating_add(Duration::from_millis(250)),
+            send_iroh_daemon_rpc_raw_async(record, command, auth, request, timeout),
+        )
+        .await
+    });
     runtime.shutdown_timeout(Duration::from_millis(250));
-    response
+    response.unwrap_or_else(|_| Err(iroh_daemon_command_timeout_error(timeout)))
 }
 
 #[cfg(not(feature = "iroh-transport"))]
