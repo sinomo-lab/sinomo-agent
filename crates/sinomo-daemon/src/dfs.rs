@@ -22,6 +22,7 @@ use sinomo_dfs::{
     distributed_sifs, distributed_sifs_bootstrap_objects, fallback_dfs_node_id,
     file_system_config_key, metadata_service_key, metadata_shard_key, sifs_node_files_path,
 };
+use sinomo_kv::{KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
 use std::collections::{BTreeMap, VecDeque};
@@ -38,6 +39,64 @@ const DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET: usize = 3;
 const DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Debug)]
+struct DaemonDfsControlPlaneKvClient {
+    cluster_paths: ClusterPaths,
+}
+
+impl DaemonDfsControlPlaneKvClient {
+    fn new(cluster_paths: &ClusterPaths) -> Self {
+        Self {
+            cluster_paths: cluster_paths.clone(),
+        }
+    }
+
+    fn network_error(&self, source: NetworkError) -> KvError {
+        KvError::Io {
+            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            detail: source.to_string(),
+        }
+    }
+
+    fn read_only_error(&self) -> KvError {
+        KvError::Io {
+            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            detail: "daemon DFS control-plane client is read-only; update cluster DFS control records through cluster KV".to_string(),
+        }
+    }
+}
+
+impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+        sinomo_network::read_cluster_kv_entry(&self.cluster_paths, key)
+            .map_err(|source| self.network_error(source))
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        sinomo_network::read_cluster_kv_prefix_entries(&self.cluster_paths, prefix)
+            .map_err(|source| self.network_error(source))
+    }
+
+    fn put(&mut self, _key: String, _value: Vec<u8>) -> Result<KvRevision, KvError> {
+        Err(self.read_only_error())
+    }
+
+    fn txn(&mut self, _txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        Err(self.read_only_error())
+    }
+}
+
+pub(crate) fn with_daemon_dfs_control_plane<T: NetworkTransport>(
+    service: NetworkedDfsService<T>,
+    cluster_paths: &ClusterPaths,
+) -> NetworkedDfsService<T> {
+    if cluster_paths.kv_snapshot.exists() {
+        service.with_control_plane(DaemonDfsControlPlaneKvClient::new(cluster_paths))
+    } else {
+        service
+    }
+}
 
 type DfsProtocolFrameSender = Arc<
     dyn Fn(
@@ -495,8 +554,11 @@ pub fn handle_daemon_dfs_protocol_frame(
     let metadata_backend = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let content_store = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let transport = DaemonDfsProtocolTransport::new(local_node_id, command.frame);
-    let mut service = NetworkedDfsService::new(transport, content_store)
-        .with_boxed_metadata_backend(metadata_backend)?;
+    let mut service = with_daemon_dfs_control_plane(
+        NetworkedDfsService::new(transport, content_store),
+        &cluster_paths,
+    )
+    .with_boxed_metadata_backend(metadata_backend)?;
     service.process_incoming()?;
     let outbound_frames = service.into_transport().outbound_frames;
     Ok(DfsProtocolFrameResponse {
@@ -592,9 +654,12 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
-    let mut service = NetworkedDfsService::new(
-        DaemonDfsEndpointTransport::new(state.local_node_id, endpoints),
-        content,
+    let mut service = with_daemon_dfs_control_plane(
+        NetworkedDfsService::new(
+            DaemonDfsEndpointTransport::new(state.local_node_id, endpoints),
+            content,
+        ),
+        &cluster_paths,
     )
     .with_boxed_metadata_backend(metadata)?;
     let scheduled_repairs = service.retry_pending_repairs()?;
@@ -1445,9 +1510,12 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
 
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
-    let mut service = NetworkedDfsService::new(
-        DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
-        content,
+    let mut service = with_daemon_dfs_control_plane(
+        NetworkedDfsService::new(
+            DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
+            content,
+        ),
+        &cluster_paths,
     )
     .with_boxed_metadata_backend(metadata)?;
     service.bootstrap_distributed_sifs()?;
@@ -2964,7 +3032,42 @@ mod tests {
         let owner = NodeId::from_legacy_named("node_dfs_protocol_owner").expect("owner");
         let replica = NodeId::from_legacy_named("node_dfs_protocol_replica").expect("replica");
         write_test_cluster_state(&data_root, &replica);
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
         let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let file_system = distributed_sifs(owner.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![owner.clone(), replica.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &replica,
+            sinomo_kv::KvCommand::Txn(sinomo_kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_kv::KvOp::put_serde(
+                        file_system_config_key(&file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config op"),
+                    sinomo_kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system_id, "root"),
+                        &shard,
+                        None,
+                    )
+                    .expect("metadata shard op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("write dfs control plane");
         let object_id = DfsObjectId::from_legacy_named("obj_dfs_protocol_stage").expect("object");
         let version = DfsVersion::from_legacy_named("version_dfs_protocol_stage").expect("version");
         let bytes = b"daemon dfs protocol frame bytes".to_vec();
@@ -3049,6 +3152,16 @@ mod tests {
             .expect("read staged manifest");
         let read = store.read_blob(&manifest.content_hash).expect("read blob");
         assert_eq!(read, bytes);
+        let backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+            .expect("open sharded backend")
+            .expect("configured backend");
+        assert!(
+            backend
+                .get_object(&object_id)
+                .expect("backend object")
+                .is_none(),
+            "non-primary content replicas must not append authoritative metadata while handling DFS protocol frames"
+        );
 
         cleanup(&root);
     }

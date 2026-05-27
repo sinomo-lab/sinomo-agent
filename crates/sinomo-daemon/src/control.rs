@@ -2869,6 +2869,7 @@ pub fn open_daemon_sandbox_dfs_service(
         DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
         content,
     );
+    let dfs = crate::dfs::with_daemon_dfs_control_plane(dfs, &cluster_paths);
     let metadata = crate::dfs::open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let mut dfs = dfs
         .with_boxed_metadata_backend(metadata)
