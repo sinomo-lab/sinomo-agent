@@ -278,7 +278,9 @@ fn inspect_daemon_dfs_status(
         .map_err(DaemonError::from)?;
     if let Ok(state) = sinomo_network::read_cluster_state_without_kv(cluster_paths) {
         for shard in &mut status.metadata_shards {
-            if shard.primary_node_id.as_ref() != Some(&state.local_node_id) {
+            if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
+                shard.replay_cursors.clear();
+            } else {
                 shard.replica_lag.clear();
             }
         }
@@ -1640,6 +1642,7 @@ mod tests {
             .find(|shard| shard.shard_id == DfsMetadataShardId::new("services"))
             .expect("services shard status");
         assert_eq!(services_status.journal_last_sequence, 3);
+        assert!(services_status.replay_cursors.is_empty());
         assert_eq!(services_status.replica_lag.len(), 1);
         assert_eq!(
             services_status.replica_lag[0],
