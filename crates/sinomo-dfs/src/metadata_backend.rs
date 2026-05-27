@@ -3933,25 +3933,43 @@ fn archive_metadata_backend_state(root: &Path) -> Result<bool> {
         "{}",
         OffsetDateTime::now_utc().unix_timestamp_nanos()
     ));
-    for name in ["records", "journal"] {
-        let source = root.join(name);
-        if !source.exists() {
-            continue;
-        }
+    let records = root.join("records");
+    if records.exists() {
         if !archived {
             create_dir_all(archive_root.clone())?;
         }
-        let destination = archive_root.join(name);
-        fs::rename(&source, &destination).map_err(|source_error| MetadataBackendError::Io {
-            path: source.clone(),
-            source: source_error,
-        })?;
+        move_metadata_archive_path(&records, &archive_root.join("records"))?;
         archived = true;
+    }
+    let journal = root.join("journal");
+    if journal.exists() {
+        for entry in read_dir(&journal)? {
+            let source = entry.path();
+            if source.file_name().and_then(|name| name.to_str()) == Some("write.lock") {
+                continue;
+            }
+            if !archived {
+                create_dir_all(archive_root.clone())?;
+            }
+            let destination = archive_root.join("journal").join(entry.file_name());
+            move_metadata_archive_path(&source, &destination)?;
+            archived = true;
+        }
     }
     if archived {
         sync_dir(root)?;
     }
     Ok(archived)
+}
+
+fn move_metadata_archive_path(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    fs::rename(source, destination).map_err(|source_error| MetadataBackendError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })
 }
 
 #[cfg(test)]
@@ -6861,6 +6879,11 @@ mod tests {
         follower
             .put_file_system(&follower_file_system)
             .expect("follower filesystem");
+        let mut follower_object = object(version("follower-v1"));
+        follower_object.content_hash = Some("blake3:follower-diverged".to_string());
+        follower
+            .put_object(&follower_object)
+            .expect("follower object");
         assert!(
             follower
                 .apply_journal_batch(
@@ -6892,6 +6915,36 @@ mod tests {
             follower_root.join("replica-repair-archives").exists(),
             "divergent replica state should be archived before replacement"
         );
+        let archive_dir = read_dir(&follower_root.join("replica-repair-archives"))
+            .expect("repair archives")
+            .into_iter()
+            .next()
+            .expect("repair archive")
+            .path();
+        assert!(
+            archive_dir.join("journal").join("segments").exists(),
+            "journal segments should be archived without moving the live journal lock directory"
+        );
+        assert!(
+            follower_root.join("journal").join("write.lock").exists(),
+            "snapshot repair must keep the live journal directory in place for Windows"
+        );
+        let leader_object = object(version("leader-v1"));
+        leader.put_object(&leader_object).expect("leader object");
+        follower
+            .apply_journal_batch(
+                &leader
+                    .journal_batch_since_limited(1, 1, usize::MAX)
+                    .expect("leader object batch")
+                    .expect("leader object batch"),
+            )
+            .expect("repaired follower should accept future primary sequences");
+        assert_eq!(
+            follower
+                .get_object(&leader_object.object_id)
+                .expect("follower object"),
+            Some(leader_object)
+        );
         let status = follower
             .metadata_shard_statuses()
             .expect("metadata status")
@@ -6901,7 +6954,7 @@ mod tests {
         assert_eq!(
             status.replay_cursors,
             vec![DfsMetadataReplayCursorStatus {
-                source_shard_id: shard_id,
+                source_shard_id: shard_id.clone(),
                 replayed_through_sequence: leader.journal_last_sequence(),
             }]
         );
