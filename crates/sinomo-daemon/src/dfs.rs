@@ -10,14 +10,15 @@ use sinomo_core::{
 };
 use sinomo_dfs::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-    DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNodeAdvertisement,
-    DfsObjectVersionRecord, DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView,
-    DfsOperatorRepairView, DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
-    DfsReplicationPolicy, DfsSubtreePolicy, DfsWriteOptions, LocalContentStore,
-    LocalJsonMetadataBackend, LocalShardedMetadataBackend, NetworkedDfsService,
+    DfsDistributedWriteResult, DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsMetadataSnapshotInstallResult, DfsNodeAdvertisement, DfsObjectVersionRecord,
+    DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
+    DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy,
+    DfsSubtreePolicy, DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend,
+    LocalShardedMetadataBackend, NetworkedDfsService, NetworkedDfsServiceEvent,
     content_service_key, content_services_prefix, default_dfs_metadata_shards_root,
     distributed_sifs, distributed_sifs_bootstrap_objects, fallback_dfs_node_id,
     file_system_config_key, metadata_service_key, metadata_shard_key, sifs_node_files_path,
@@ -28,6 +29,8 @@ use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, Net
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::sync::Arc;
+#[cfg(not(test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
@@ -39,6 +42,14 @@ const DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET: usize = 3;
 const DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(test))]
+const DFS_PROTOCOL_METADATA_PUBLISH_RETRY_ROUNDS: usize = 3;
+#[cfg(not(test))]
+const DFS_PROTOCOL_METADATA_PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(750);
+#[cfg(not(test))]
+static DFS_PROTOCOL_METADATA_PUBLISH_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static DFS_PROTOCOL_METADATA_PUBLISH_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 struct DaemonDfsControlPlaneKvClient {
@@ -559,8 +570,9 @@ pub fn handle_daemon_dfs_protocol_frame(
         &cluster_paths,
     )
     .with_boxed_metadata_backend(metadata_backend)?;
-    service.process_incoming()?;
+    let events = service.process_incoming()?;
     let outbound_frames = service.into_transport().outbound_frames;
+    publish_dfs_metadata_after_mutating_protocol_events(paths, &events);
     Ok(DfsProtocolFrameResponse {
         request_id: command.request_id,
         outbound_frames,
@@ -1831,6 +1843,121 @@ fn dfs_event_summary(events: &[sinomo_dfs::NetworkedDfsServiceEvent]) -> Vec<Str
         .collect()
 }
 
+fn publish_dfs_metadata_after_mutating_protocol_events(
+    paths: &DaemonPaths,
+    events: &[NetworkedDfsServiceEvent],
+) {
+    if !dfs_protocol_events_should_publish_metadata(events) {
+        return;
+    }
+    publish_dfs_metadata_after_protocol_mutation(paths);
+}
+
+#[cfg(not(test))]
+fn publish_dfs_metadata_after_protocol_mutation(paths: &DaemonPaths) {
+    DFS_PROTOCOL_METADATA_PUBLISH_PENDING.store(true, Ordering::Release);
+    if DFS_PROTOCOL_METADATA_PUBLISH_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let paths = paths.clone();
+    if let Err(source) = std::thread::Builder::new()
+        .name("sinomo-dfs-metadata-publish".to_string())
+        .spawn(move || run_scheduled_dfs_metadata_publish(paths))
+    {
+        DFS_PROTOCOL_METADATA_PUBLISH_RUNNING.store(false, Ordering::Release);
+        eprintln!(
+            "sinomo daemon failed to spawn DFS metadata publish after protocol mutation: {source}"
+        );
+    }
+}
+
+#[cfg(not(test))]
+fn run_scheduled_dfs_metadata_publish(paths: DaemonPaths) {
+    let mut retry_rounds = 0usize;
+    loop {
+        DFS_PROTOCOL_METADATA_PUBLISH_PENDING.store(false, Ordering::Release);
+        let needs_retry = match publish_default_dfs_metadata_journal(&paths) {
+            Ok(report) => {
+                let needs_retry = dfs_metadata_replication_report_needs_retry(&report);
+                log_dfs_metadata_replication_report(report);
+                needs_retry
+            }
+            Err(error) => {
+                eprintln!(
+                    "sinomo daemon DFS metadata publish after protocol mutation failed: {error}"
+                );
+                true
+            }
+        };
+        if DFS_PROTOCOL_METADATA_PUBLISH_PENDING.load(Ordering::Acquire) {
+            retry_rounds = 0;
+            continue;
+        }
+        if needs_retry && retry_rounds < DFS_PROTOCOL_METADATA_PUBLISH_RETRY_ROUNDS {
+            retry_rounds += 1;
+            std::thread::sleep(DFS_PROTOCOL_METADATA_PUBLISH_RETRY_DELAY);
+            continue;
+        }
+        DFS_PROTOCOL_METADATA_PUBLISH_RUNNING.store(false, Ordering::Release);
+        if DFS_PROTOCOL_METADATA_PUBLISH_PENDING.load(Ordering::Acquire)
+            && DFS_PROTOCOL_METADATA_PUBLISH_RUNNING
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            retry_rounds = 0;
+            continue;
+        }
+        break;
+    }
+}
+
+#[cfg(test)]
+fn publish_dfs_metadata_after_protocol_mutation(paths: &DaemonPaths) {
+    match publish_default_dfs_metadata_journal(paths) {
+        Ok(report) => log_dfs_metadata_replication_report(report),
+        Err(error) => {
+            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
+        }
+    }
+}
+
+fn dfs_protocol_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -> bool {
+    events.iter().any(|event| match event {
+        NetworkedDfsServiceEvent::BlobStaged { .. }
+        | NetworkedDfsServiceEvent::VersionCommitted { .. }
+        | NetworkedDfsServiceEvent::ReplicaRepaired { .. }
+        | NetworkedDfsServiceEvent::WriteConflictCreated { .. }
+        | NetworkedDfsServiceEvent::OwnerHandoffCompleted { .. } => true,
+        NetworkedDfsServiceEvent::RemoteWriteServed { result, .. }
+        | NetworkedDfsServiceEvent::RemoteWriteCompleted { result, .. } => {
+            matches!(result, DfsDistributedWriteResult::Outcome { .. })
+        }
+        NetworkedDfsServiceEvent::BlobStageRejected { .. }
+        | NetworkedDfsServiceEvent::BlobFetched { .. }
+        | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
+        | NetworkedDfsServiceEvent::RemoteReadServed { .. }
+        | NetworkedDfsServiceEvent::RemoteReadCompleted { .. }
+        | NetworkedDfsServiceEvent::RepairRejected { .. }
+        | NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
+        | NetworkedDfsServiceEvent::MetadataJournalBatchRejected { .. } => false,
+    })
+}
+
+fn dfs_metadata_replication_report_needs_retry(
+    report: &DaemonDfsMetadataReplicationReport,
+) -> bool {
+    report.outcomes.iter().any(|outcome| {
+        matches!(
+            outcome,
+            DaemonDfsMetadataReplicationOutcome::Failed { .. }
+                | DaemonDfsMetadataReplicationOutcome::BacklogRemaining { .. }
+        )
+    })
+}
+
 fn local_dfs_protocol_node_id(
     data_dir: &SinomoDataDir,
 ) -> Result<sinomo_node::NodeId, DaemonError> {
@@ -1964,6 +2091,101 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn dfs_protocol_metadata_publish_gate_tracks_mutating_events() {
+        let node = NodeId::from_legacy_named("node_dfs_publish_gate").expect("node");
+        let object_id = DfsObjectId::from_legacy_named("obj_dfs_publish_gate").expect("object");
+        let version = DfsVersion::from_legacy_named("version_dfs_publish_gate").expect("version");
+        let content_hash =
+            "blake3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+        assert!(!dfs_protocol_events_should_publish_metadata(&[]));
+        assert!(!dfs_protocol_events_should_publish_metadata(&[
+            NetworkedDfsServiceEvent::BlobFetched {
+                intent_id: "intent_read_only".to_string(),
+                object_id: object_id.clone(),
+                version: version.clone(),
+                source_node_id: node.clone(),
+                content_hash: content_hash.clone(),
+            },
+            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                request_id: "metadata_batch".to_string(),
+                source_node_id: node.clone(),
+                shard_id: DfsMetadataShardId::new("root"),
+                applied_entries: 1,
+                next_after_sequence: 1,
+            },
+            NetworkedDfsServiceEvent::RemoteWriteServed {
+                request_id: "remote_write_rejected".to_string(),
+                object_id: object_id.clone(),
+                requester_node_id: node.clone(),
+                result: DfsDistributedWriteResult::Rejected {
+                    reason: "rejected".to_string(),
+                },
+            },
+        ]));
+        assert!(dfs_protocol_events_should_publish_metadata(&[
+            NetworkedDfsServiceEvent::BlobStaged {
+                intent_id: "intent_staged".to_string(),
+                object_id: object_id.clone(),
+                version: version.clone(),
+                replica_node_id: node.clone(),
+                content_hash: content_hash.clone(),
+            },
+        ]));
+        assert!(dfs_protocol_events_should_publish_metadata(&[
+            NetworkedDfsServiceEvent::VersionCommitted {
+                intent_id: "intent_committed".to_string(),
+                object_id,
+                version,
+                content_hash,
+            },
+        ]));
+    }
+
+    #[test]
+    fn dfs_metadata_replication_retry_gate_tracks_incomplete_outcomes() {
+        let node = NodeId::from_legacy_named("node_dfs_retry_gate").expect("node");
+        let shard_id = DfsMetadataShardId::new("services");
+
+        assert!(!dfs_metadata_replication_report_needs_retry(
+            &DaemonDfsMetadataReplicationReport {
+                outcomes: vec![
+                    DaemonDfsMetadataReplicationOutcome::Applied {
+                        target_node_id: node.clone(),
+                        shard_id: shard_id.clone(),
+                        entries: 1,
+                        next_after_sequence: 8,
+                    },
+                    DaemonDfsMetadataReplicationOutcome::NoChanges {
+                        target_node_id: node.clone(),
+                        shard_id: shard_id.clone(),
+                        after_sequence: 8,
+                    },
+                ],
+            }
+        ));
+        assert!(dfs_metadata_replication_report_needs_retry(
+            &DaemonDfsMetadataReplicationReport {
+                outcomes: vec![DaemonDfsMetadataReplicationOutcome::Failed {
+                    target_node_id: node.clone(),
+                    shard_id: shard_id.clone(),
+                    reason: "target timed out after applying the batch".to_string(),
+                }],
+            }
+        ));
+        assert!(dfs_metadata_replication_report_needs_retry(
+            &DaemonDfsMetadataReplicationReport {
+                outcomes: vec![DaemonDfsMetadataReplicationOutcome::BacklogRemaining {
+                    target_node_id: node,
+                    shard_id,
+                    after_sequence: 64,
+                    max_batches: 64,
+                }],
+            }
+        ));
+    }
 
     #[test]
     fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
