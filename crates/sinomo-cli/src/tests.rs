@@ -50,13 +50,13 @@ use super::{
     parse_usage_options, push_unique_introducer, quickjs_setup_script, read_cluster_kv_snapshot,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, refresh_daemon_node_status_in_kv, rollout_cluster_targets,
-    rollout_endpoint_candidates, rollout_target_endpoint_for_main,
-    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
-    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_cui_with_io_and_daemon_probe,
-    run_evolve_command, run_shadow_daemon_with_paths, sandbox_cat_with_store,
-    sandbox_checkpoint_with_store, sandbox_config_with_store, sandbox_create_with_store,
-    sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
-    sandbox_doctor_findings_with_stores_and_events,
+    rollout_cluster_targets_from_state, rollout_endpoint_candidates,
+    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
+    rollout_target_endpoint_for_main_with_connectivity, run_cui_with_handler_io,
+    run_cui_with_handler_io_and_daemon, run_cui_with_io_and_daemon_probe, run_evolve_command,
+    run_shadow_daemon_with_paths, sandbox_cat_with_store, sandbox_checkpoint_with_store,
+    sandbox_config_with_store, sandbox_create_with_store, sandbox_destroy_with_store,
+    sandbox_doctor_findings_with_stores, sandbox_doctor_findings_with_stores_and_events,
     sandbox_fetch_with_store_transport_and_event_store, sandbox_logs_with_store,
     sandbox_ls_with_store, sandbox_policy_uses_cluster, sandbox_process_plan_with_stores,
     sandbox_reboot_with_store, sandbox_resume_with_store, sandbox_run_with_store,
@@ -11573,6 +11573,69 @@ fn rollout_cluster_targets_deduplicate_explicit_targets() {
         targets[1].address,
         "iroh://iroh_public_key_dedup?relay=https://relay.example./"
     );
+}
+
+#[test]
+fn rollout_cluster_targets_include_shadow_only_repair_route() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-shadow-only-repair-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_shadow_only_repair").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_shadow_only_repair_local").expect("local node");
+    let remote_main_id =
+        NodeId::from_legacy_named("node_rollout_shadow_only_repair_main").expect("main node");
+    let remote_shadow_id = shadow_daemon_node_id(&remote_main_id);
+    let now = OffsetDateTime::now_utc();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout shadow-only repair",
+        local_node_id,
+        "local",
+        "local-key",
+        now,
+    );
+    let mut remote_main = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        remote_main_id.clone(),
+        "remote main",
+        "remote-main-key",
+        now,
+    );
+    remote_main.role = ClusterMemberRole::Learner;
+    remote_main.state = ClusterMemberState::Learner;
+    remote_main.capabilities = main_daemon_capabilities(&ClusterMemberRole::Learner);
+    remote_main.allowed_capabilities = remote_main.capabilities.clone();
+    let mut remote_shadow = ClusterMemberRecord::local_non_voting(
+        cluster_id,
+        remote_shadow_id.clone(),
+        "remote shadow",
+        "remote-shadow-key",
+        now,
+    );
+    let shadow_iroh = invite_introducer_endpoint(
+        &remote_shadow_id,
+        "iroh://rollout_shadow_only_repair?relay=https://relay.example./".to_string(),
+    );
+    remote_shadow.endpoints.push(shadow_iroh.clone());
+    state.members.push(remote_main);
+    state.members.push(remote_shadow);
+
+    let targets = rollout_cluster_targets_from_state(&paths, &state, None);
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].address, shadow_iroh.address);
+    assert_eq!(targets[0].rollout_node_id.as_ref(), Some(&remote_main_id));
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

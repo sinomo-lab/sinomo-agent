@@ -104,6 +104,7 @@ sinomo rollout apply
 ## Cluster Targets
 
 Without `--target`, `sinomo rollout cluster` targets the local daemon and any cluster member endpoints known from local cluster state.
+Target discovery is member-oriented: each authorized remote main daemon member is considered even when its main control endpoint is missing, and Sinomo can choose that member's shadow daemon repair endpoint, including Iroh, as the rollout route.
 
 For explicit rollout targets:
 

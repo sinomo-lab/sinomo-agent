@@ -44,7 +44,6 @@ use sinomo_rollout::{
     source_heads_match,
 };
 use std::collections::BTreeMap;
-use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -361,9 +360,6 @@ pub fn start_daemon_iroh_proxy_if_clustered(
     cluster: Option<&DaemonClusterStatus>,
     label: &str,
 ) -> Result<(), DaemonError> {
-    if env::var("SINOMO_ENABLE_IROH").ok().as_deref() == Some("0") {
-        return Ok(());
-    }
     let paths = paths.clone();
     let options = options.clone();
     let mut cluster = cluster.cloned();

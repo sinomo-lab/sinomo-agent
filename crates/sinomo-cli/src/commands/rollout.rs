@@ -650,37 +650,79 @@ pub(crate) fn rollout_cluster_targets(
         return Ok(targets);
     }
     if let Some(state) = state.as_ref() {
-        let mut targets = Vec::new();
-        if let Some(local_target) = local_target {
-            push_unique_rollout_target(&mut targets, local_target);
-        }
-        let rollout_endpoints = network::cluster_rollout_endpoint_candidates(&paths, state);
-        for endpoint in network::cluster_main_daemon_command_targets(&paths, state) {
-            let mut target_endpoints =
-                network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-                    &paths,
-                    state,
-                    &endpoint.node_id,
-                    Some(&endpoint),
-                    &rollout_endpoints,
-                );
-            if target_endpoints.is_empty() {
-                target_endpoints.push(endpoint.clone());
-            }
-            for rollout_endpoint in target_endpoints {
-                push_unique_rollout_target(
-                    &mut targets,
-                    RolloutTarget::endpoint_for_node(rollout_endpoint, endpoint.node_id.clone()),
-                );
-            }
-        }
-        return Ok(targets);
+        return Ok(rollout_cluster_targets_from_state(
+            &paths,
+            state,
+            local_target,
+        ));
     }
     let mut targets = Vec::new();
     if let Some(local_target) = local_target {
         push_unique_rollout_target(&mut targets, local_target);
     }
     Ok(targets)
+}
+
+pub(crate) fn rollout_cluster_targets_from_state(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_target: Option<RolloutTarget>,
+) -> Vec<RolloutTarget> {
+    let mut targets = Vec::new();
+    if let Some(local_target) = local_target {
+        push_unique_rollout_target(&mut targets, local_target);
+    }
+
+    let command_endpoints = network::cluster_main_daemon_command_targets(paths, state);
+    let mut command_endpoints_by_node = std::collections::BTreeMap::new();
+    let mut main_node_ids = Vec::new();
+    let mut seen_main_node_ids = std::collections::BTreeSet::new();
+    for endpoint in command_endpoints {
+        if seen_main_node_ids.insert(endpoint.node_id.clone()) {
+            main_node_ids.push(endpoint.node_id.clone());
+        }
+        command_endpoints_by_node
+            .entry(endpoint.node_id.clone())
+            .or_insert(endpoint);
+    }
+    for member in state.members.iter().filter(|member| {
+        member.node_id != state.local_node_id
+            && member.state.is_authorized()
+            && member
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == "daemon.main.run")
+    }) {
+        if seen_main_node_ids.insert(member.node_id.clone()) {
+            main_node_ids.push(member.node_id.clone());
+        }
+    }
+
+    let rollout_endpoints = network::cluster_rollout_endpoint_candidates(paths, state);
+    for main_node_id in main_node_ids {
+        let command_endpoint = command_endpoints_by_node.get(&main_node_id);
+        let mut target_endpoints =
+            network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+                paths,
+                state,
+                &main_node_id,
+                command_endpoint,
+                &rollout_endpoints,
+            );
+        if target_endpoints.is_empty()
+            && let Some(command_endpoint) = command_endpoint
+        {
+            target_endpoints.push(command_endpoint.clone());
+        }
+        for rollout_endpoint in target_endpoints {
+            push_unique_rollout_target(
+                &mut targets,
+                RolloutTarget::endpoint_for_node(rollout_endpoint, main_node_id.clone()),
+            );
+        }
+    }
+
+    targets
 }
 
 fn local_rollout_target(options: &RolloutOptions) -> Result<Option<RolloutTarget>, CliError> {
