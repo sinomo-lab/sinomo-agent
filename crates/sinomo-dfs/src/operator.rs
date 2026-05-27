@@ -1,9 +1,9 @@
 //! Operator and agent-facing DFS inspection surfaces.
 
 use crate::{
-    DfsConflictRecord, DfsConflictStatus, DfsFileSystem, DfsMetadataBackend, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
-    MetadataBackendError,
+    DfsConflictRecord, DfsConflictStatus, DfsFileSystem, DfsMetadataBackend,
+    DfsMetadataShardStatus, DfsObjectMetadata, DfsObjectVersionRecord, DfsReplicaReceiptRecord,
+    DfsWriteIntentRecord, DfsWriteIntentStatus, MetadataBackendError,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -26,6 +26,8 @@ pub struct DfsOperatorStatus {
     pub pending_write_count: usize,
     pub open_conflict_count: usize,
     pub pending_repair_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_shards: Vec<DfsMetadataShardStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -146,6 +148,7 @@ impl<'a> DfsOperatorInspector<'a> {
             pending_write_count,
             open_conflict_count,
             pending_repair_count,
+            metadata_shards: self.backend.metadata_shard_statuses()?,
         })
     }
 

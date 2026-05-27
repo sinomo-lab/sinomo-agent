@@ -66,6 +66,30 @@ impl DfsMetadataShardId {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataShardStatus {
+    pub shard_id: DfsMetadataShardId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_system_id: Option<DfsFileSystemId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_node_id: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replica_node_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    pub journal_next_sequence: u64,
+    pub journal_last_sequence: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replica_lag: Vec<DfsMetadataReplicaLagStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataReplicaLagStatus {
+    pub target_node_id: NodeId,
+    pub replicated_through_sequence: u64,
+    pub lag_entries: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DfsInodeId(pub String);
 
@@ -547,6 +571,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<()> {
         Ok(())
     }
+    fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>>;
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription;
     fn poll_subscription(
@@ -1330,6 +1355,37 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<()> {
         self.shard_backend_mut(shard_id)?
             .put_metadata_replication_cursor(target_node_id, shard_id, next_after_sequence)
+    }
+
+    fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>> {
+        let mut statuses = Vec::new();
+        for shard in self.shard_configs.values() {
+            let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+            let backend = self.shard_backend(&shard_id)?;
+            let journal_next_sequence = backend.next_sequence;
+            let journal_last_sequence = journal_next_sequence.saturating_sub(1);
+            let mut replica_lag = Vec::new();
+            for target_node_id in &shard.replica_node_ids {
+                let replicated_through_sequence =
+                    backend.metadata_replication_cursor(target_node_id, &shard_id)?;
+                replica_lag.push(DfsMetadataReplicaLagStatus {
+                    target_node_id: target_node_id.clone(),
+                    replicated_through_sequence,
+                    lag_entries: journal_last_sequence.saturating_sub(replicated_through_sequence),
+                });
+            }
+            statuses.push(DfsMetadataShardStatus {
+                shard_id,
+                file_system_id: Some(shard.file_system_id.clone()),
+                primary_node_id: Some(shard.primary_node_id.clone()),
+                replica_node_ids: shard.replica_node_ids.clone(),
+                epoch: Some(shard.epoch),
+                journal_next_sequence,
+                journal_last_sequence,
+                replica_lag,
+            });
+        }
+        Ok(statuses)
     }
 
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
@@ -2616,6 +2672,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
                 last_sequence: next_after_sequence,
             },
         )
+    }
+
+    fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>> {
+        let journal_next_sequence = self.next_sequence;
+        Ok(vec![DfsMetadataShardStatus {
+            shard_id: self.shard_id.clone(),
+            file_system_id: None,
+            primary_node_id: None,
+            replica_node_ids: Vec::new(),
+            epoch: None,
+            journal_next_sequence,
+            journal_last_sequence: journal_next_sequence.saturating_sub(1),
+            replica_lag: Vec::new(),
+        }])
     }
 
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {

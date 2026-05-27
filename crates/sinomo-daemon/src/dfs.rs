@@ -1543,12 +1543,14 @@ mod tests {
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
             .expect("sync raft");
+        let remote_node_id =
+            NodeId::from_legacy_named("node_daemon_dfs_status_sharded_remote").expect("remote");
         let file_system = distributed_sifs(node_id.clone());
         let root_shard = DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
             shard_id: "root".to_string(),
             primary_node_id: node_id.clone(),
-            replica_node_ids: Vec::new(),
+            replica_node_ids: vec![remote_node_id.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
@@ -1557,7 +1559,7 @@ mod tests {
             file_system_id: file_system.file_system_id.clone(),
             shard_id: "services".to_string(),
             primary_node_id: node_id.clone(),
-            replica_node_ids: Vec::new(),
+            replica_node_ids: vec![remote_node_id.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
@@ -1610,12 +1612,35 @@ mod tests {
                 visible: true,
             })
             .expect("version");
+        backend
+            .put_metadata_replication_cursor(
+                &remote_node_id,
+                &DfsMetadataShardId::new("services"),
+                1,
+            )
+            .expect("metadata cursor");
 
         let status = handle_daemon_dfs_status(&paths).expect("dfs status");
 
         assert_eq!(status.file_system_count, 1);
         assert_eq!(status.object_count, 1);
         assert_eq!(status.version_count, 1);
+        assert_eq!(status.metadata_shards.len(), 2);
+        let services_status = status
+            .metadata_shards
+            .iter()
+            .find(|shard| shard.shard_id == DfsMetadataShardId::new("services"))
+            .expect("services shard status");
+        assert_eq!(services_status.journal_last_sequence, 3);
+        assert_eq!(services_status.replica_lag.len(), 1);
+        assert_eq!(
+            services_status.replica_lag[0],
+            sinomo_dfs::DfsMetadataReplicaLagStatus {
+                target_node_id: remote_node_id,
+                replicated_through_sequence: 1,
+                lag_entries: 2,
+            }
+        );
 
         cleanup(&root);
     }

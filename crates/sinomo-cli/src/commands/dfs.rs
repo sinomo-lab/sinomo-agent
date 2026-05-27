@@ -1028,6 +1028,26 @@ fn print_dfs_cluster_status(report: &DfsClusterStatusReport) {
             println!("    pending writes: {}", status.pending_write_count);
             println!("    pending repairs: {}", status.pending_repair_count);
             println!("    open conflicts: {}", status.open_conflict_count);
+            if !status.metadata_shards.is_empty() {
+                println!("    metadata shards: {}", status.metadata_shards.len());
+                for shard in &status.metadata_shards {
+                    println!(
+                        "      {}: journal {}",
+                        shard.shard_id.0, shard.journal_last_sequence
+                    );
+                    if let Some(primary_node_id) = &shard.primary_node_id {
+                        println!("        primary: {primary_node_id}");
+                    }
+                    for replica in &shard.replica_lag {
+                        println!(
+                            "        replica {}: through {}, lag {}",
+                            replica.target_node_id,
+                            replica.replicated_through_sequence,
+                            replica.lag_entries
+                        );
+                    }
+                }
+            }
         }
         if let Some(error) = &node.error {
             println!("    error: {error}");

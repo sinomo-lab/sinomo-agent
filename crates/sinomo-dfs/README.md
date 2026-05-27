@@ -73,6 +73,8 @@ The table tail log is compacted into the snapshot after it grows large enough, w
 
 Legacy per-record `.sobj` metadata layouts are loaded into the compact table snapshot during backend open. New writes use the packed table path only.
 
+Operator status includes per-shard journal positions and configured replica cursor lag so cluster checks can distinguish object-level repair work from metadata replication backlog.
+
 ### Networked DFS Service
 
 `NetworkedDfsService<T>` is the distributed object service over a `sinomo-network` transport. It combines:
