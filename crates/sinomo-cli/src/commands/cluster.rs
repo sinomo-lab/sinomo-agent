@@ -1038,6 +1038,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let mut state = read_cluster_state(&paths)?;
+    let peer_status = daemon_fetch_daemon_status_from_address(&options.from, DAEMON_JOIN_TIMEOUT)?;
     let peer_snapshot = daemon_fetch_cluster_kv_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?;
     let peer_store = InProcessKvStore::restore(peer_snapshot);
     let mut imported = Vec::new();
@@ -1089,6 +1090,26 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         }
         member.updated_at = OffsetDateTime::now_utc();
         imported.push(member);
+    }
+    if let Some(cluster) = peer_status.cluster.as_ref()
+        && cluster.cluster_id == state.cluster_id
+        && cluster.process == "daemon-main"
+    {
+        let observed_endpoint =
+            network::daemon_lan_endpoint(&cluster.node_id, options.from.clone(), 0);
+        if let Some(existing) = state
+            .members
+            .iter_mut()
+            .find(|candidate| candidate.node_id == observed_endpoint.node_id)
+            && !existing
+                .endpoints
+                .iter()
+                .any(|candidate| candidate.endpoint_id == observed_endpoint.endpoint_id)
+        {
+            existing.endpoints.push(observed_endpoint);
+            existing.updated_at = OffsetDateTime::now_utc();
+            endpoint_updates.push((existing.node_id.clone(), 1));
+        }
     }
     let imported_changed = !imported.is_empty();
     if !imported_changed {

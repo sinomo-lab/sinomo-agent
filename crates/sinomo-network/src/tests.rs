@@ -2426,6 +2426,54 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
 }
 
 #[test]
+fn rollout_target_selection_treats_hostname_tcp_as_direct_before_iroh() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-rollout-hostname-direct-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_hostname_direct").expect("cluster");
+    let local = NodeId::from_legacy_named("node_rollout_hostname_direct_local").expect("local");
+    let main = NodeId::from_legacy_named("node_rollout_hostname_direct_main").expect("main");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "rollout hostname direct",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    let hostname = daemon_lan_endpoint(&main, "node.example.test:21353".to_string(), 10);
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&main, "iroh_public_key_rollout_hostname"),
+        node_id: main.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_rollout_hostname?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+
+    let selected =
+        cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &[iroh, hostname.clone()])
+            .expect("rollout endpoint");
+    assert_eq!(selected.endpoint_id, hostname.endpoint_id);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_storage_syncs_members_and_node_status_to_kv() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-storage-{}",

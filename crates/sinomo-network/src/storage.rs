@@ -2223,7 +2223,12 @@ fn cluster_endpoint_static_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8
 
 fn cluster_direct_endpoint_static_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8 {
     let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
-        return 3;
+        return if !is_loopback_connect_address(&endpoint.address) && endpoint.address.contains(':')
+        {
+            1
+        } else {
+            3
+        };
     };
     match address.ip() {
         IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,

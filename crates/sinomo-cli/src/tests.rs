@@ -11997,8 +11997,7 @@ fn rollout_target_prefers_unknown_private_shadow_tcp_over_public_tcp() {
         OffsetDateTime::now_utc(),
     );
 
-    let private_shadow =
-        invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
+    let private_shadow = invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
     let public_shadow =
         invite_introducer_endpoint(&shadow_node_id, "203.0.113.42:21354".to_string());
 
