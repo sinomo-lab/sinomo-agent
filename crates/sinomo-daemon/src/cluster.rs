@@ -2787,20 +2787,32 @@ fn commit_cluster_kv_txn_with_quorum_response_with_forwarding(
         });
     }
     if !locked_cluster_raft_local_is_leader(paths, state)? {
-        if allow_forwarding
-            && let Some(response) = forward_cluster_kv_txn_to_voter(paths, state, &txn)
-        {
-            return response;
-        }
+        let forwarding_failure = if allow_forwarding {
+            match forward_cluster_kv_txn_to_voter(paths, state, &txn) {
+                Some(Ok(response)) => return Ok(response),
+                Some(Err(error)) => Some(error),
+                None => None,
+            }
+        } else {
+            None
+        };
         if !allow_forwarding {
             return Err(DaemonError::ClusterReadOnly {
                 detail: "forwarded cluster KV transaction reached a non-leader voter".to_string(),
             });
         }
         if !elect_cluster_raft_leader(paths, state)? {
-            return Err(DaemonError::ClusterReadOnly {
+            let mut error = DaemonError::ClusterReadOnly {
                 detail: "local daemon is not the Raft leader and could not win quorum".to_string(),
-            });
+            };
+            if let Some(forwarding_failure) = forwarding_failure {
+                error = DaemonError::ClusterReadOnly {
+                    detail: format!(
+                        "local daemon is not the Raft leader and could not win quorum; forwarding also failed: {forwarding_failure}"
+                    ),
+                };
+            }
+            return Err(error);
         }
     }
     if !locked_cluster_raft_local_is_leader(paths, state)? {
