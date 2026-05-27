@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
+const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -344,11 +345,20 @@ impl ClusterConnectivityGraph {
         &self,
         endpoint: &ClusterEndpointRecord,
     ) -> Option<&ClusterConnectivityRecord> {
-        self.records.get(&(
-            self.source_node_id.clone(),
-            endpoint.node_id.clone(),
-            endpoint.endpoint_id.clone(),
-        ))
+        self.records
+            .get(&(
+                self.source_node_id.clone(),
+                endpoint.node_id.clone(),
+                endpoint.endpoint_id.clone(),
+            ))
+            .or_else(|| {
+                self.records.values().find(|record| {
+                    record.source_node_id == self.source_node_id
+                        && record.target_node_id == endpoint.node_id
+                        && record.transport == endpoint.transport
+                        && record.address == endpoint.address
+                })
+            })
     }
 
     pub fn state_for_endpoint(
@@ -360,7 +370,7 @@ impl ClusterConnectivityGraph {
     }
 
     pub fn unavailability_rank(&self, endpoint: &ClusterEndpointRecord) -> u8 {
-        cluster_route_unavailability_rank(self.state_for_endpoint(endpoint))
+        cluster_route_unavailability_rank(self.record_for_endpoint(endpoint))
     }
 
     pub fn quality_rank(&self, endpoint: &ClusterEndpointRecord) -> u8 {
@@ -2105,7 +2115,7 @@ pub fn cluster_rollout_target_endpoints_for_main_with_command_endpoint(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     main_node_id: &NodeId,
-    _command_endpoint: Option<&ClusterEndpointRecord>,
+    command_endpoint: Option<&ClusterEndpointRecord>,
     candidates: &[ClusterEndpointRecord],
 ) -> Vec<ClusterEndpointRecord> {
     let shadow_node_id = shadow_daemon_node_id(main_node_id);
@@ -2118,6 +2128,15 @@ pub fn cluster_rollout_target_endpoints_for_main_with_command_endpoint(
         })
         .cloned()
         .collect::<Vec<_>>();
+    if let Some(command_endpoint) = command_endpoint
+        && command_endpoint.node_id == *main_node_id
+        && command_endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+        && !candidates
+            .iter()
+            .any(|candidate| candidate.endpoint_id == command_endpoint.endpoint_id)
+    {
+        candidates.push(command_endpoint.clone());
+    }
     candidates.sort_by_key(|endpoint| {
         (
             cluster_rollout_route_process_rank(&graph, endpoint, main_node_id, &shadow_node_id),
@@ -2165,9 +2184,15 @@ pub fn sort_cluster_rollout_endpoints(
     });
 }
 
-fn cluster_route_unavailability_rank(connectivity: Option<&ClusterConnectivityState>) -> u8 {
+fn cluster_route_unavailability_rank(connectivity: Option<&ClusterConnectivityRecord>) -> u8 {
     match connectivity {
-        Some(ClusterConnectivityState::Unreachable) => 1,
+        Some(record)
+            if record.state == ClusterConnectivityState::Unreachable
+                && record.consecutive_failures
+                    >= CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES =>
+        {
+            1
+        }
         _ => 0,
     }
 }

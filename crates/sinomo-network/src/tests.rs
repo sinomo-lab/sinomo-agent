@@ -1320,6 +1320,132 @@ fn rollout_target_selection_prefers_main_route_before_shadow_backup() {
 }
 
 #[test]
+fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-rollout-equivalent-route-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_rollout_equivalent").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_rollout_equivalent_local").expect("local");
+    let main = NodeId::from_legacy_named("node_network_rollout_equivalent_main").expect("main");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "network rollout equivalent",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    let private_recorded = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
+    let mut private_readvertised = private_recorded.clone();
+    private_readvertised.endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_rollout_equivalent_readvertised")
+            .expect("endpoint");
+    let public = daemon_lan_endpoint(&main, "203.0.113.41:21353".to_string(), 20);
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![cluster_connectivity_record(
+            &state,
+            &private_recorded,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some("failed".to_string()),
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity record");
+
+    let selected = cluster_rollout_target_endpoint_for_main(
+        &paths,
+        &state,
+        &main,
+        &[private_readvertised.clone(), public.clone()],
+    )
+    .expect("rollout endpoint");
+
+    assert_eq!(selected.endpoint_id, public.endpoint_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rollout_target_selection_keeps_transient_public_tcp_before_iroh() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-rollout-transient-public-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_rollout_transient").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_rollout_transient_local").expect("local");
+    let main = NodeId::from_legacy_named("node_network_rollout_transient_main").expect("main");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "network rollout transient",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    let public = daemon_lan_endpoint(&main, "203.0.113.41:21353".to_string(), 10);
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&main, "iroh_public_key_rollout_transient"),
+        node_id: main.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_rollout_transient?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![cluster_connectivity_record(
+            &state,
+            &public,
+            ClusterConnectivityState::Unreachable,
+            None,
+            1,
+            None,
+            Some("transient".to_string()),
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity record");
+
+    let selected =
+        cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &[iroh, public.clone()])
+            .expect("rollout endpoint");
+
+    assert_eq!(selected.endpoint_id, public.endpoint_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-rollout-shadow-context-{}",
@@ -1388,6 +1514,14 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
     assert_eq!(ordered[0].endpoint_id, public_main.endpoint_id);
     assert_eq!(ordered[1].endpoint_id, private_shadow.endpoint_id);
     assert_eq!(ordered[2].endpoint_id, shadow_iroh.endpoint_id);
+    let ordered = cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+        &paths,
+        &state,
+        &main,
+        Some(&public_main),
+        &[private_shadow.clone(), shadow_iroh.clone()],
+    );
+    assert_eq!(ordered[0].endpoint_id, public_main.endpoint_id);
 
     let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         &paths,
