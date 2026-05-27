@@ -1962,8 +1962,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     pub fn add_file_system(&mut self, file_system: DfsFileSystem) -> Result<(), DfsError> {
         if let Some(kv) = self.control_plane.as_mut() {
-            DfsControlPlaneStore::new(kv.as_mut())
-                .put_file_system_config(&DfsFileSystemConfig::from(&file_system))?;
+            let file_system_config = DfsFileSystemConfig::from(&file_system);
+            let mut store = DfsControlPlaneStore::new(kv.as_mut());
+            if store.get_file_system_config(&file_system.file_system_id)?
+                != Some(file_system_config.clone())
+            {
+                store.put_file_system_config(&file_system_config)?;
+            }
         }
         if let Some(backend) = self.metadata_backend.as_mut() {
             backend.put_file_system(&file_system)?;
