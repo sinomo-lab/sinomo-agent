@@ -273,9 +273,17 @@ fn inspect_daemon_dfs_status(
     cluster_paths: &ClusterPaths,
 ) -> Result<sinomo_dfs::DfsOperatorStatus, DaemonError> {
     let metadata = open_daemon_dfs_metadata_backend(data_dir, cluster_paths)?;
-    DfsOperatorInspector::new(metadata.as_ref())
+    let mut status = DfsOperatorInspector::new(metadata.as_ref())
         .status()
-        .map_err(DaemonError::from)
+        .map_err(DaemonError::from)?;
+    if let Ok(state) = sinomo_network::read_cluster_state_without_kv(cluster_paths) {
+        for shard in &mut status.metadata_shards {
+            if shard.primary_node_id.as_ref() != Some(&state.local_node_id) {
+                shard.replica_lag.clear();
+            }
+        }
+    }
+    Ok(status)
 }
 
 pub(crate) fn open_daemon_dfs_metadata_backend(
@@ -1641,6 +1649,68 @@ mod tests {
                 lag_entries: 2,
             }
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_status_reports_replica_lag_only_from_primary() {
+        let root = temp_root("daemon_dfs_status_replica_lag_primary_only");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_status_replica_lag")
+                .expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_status_replica_local").expect("local");
+        let primary =
+            NodeId::from_legacy_named("node_dfs_status_replica_primary").expect("primary");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "daemon dfs status replica lag",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+        let file_system = distributed_sifs(local.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary,
+            replica_node_ids: vec![local.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &shard,
+                    None,
+                )
+                .expect("root shard op"),
+            ),
+        )
+        .expect("write shard config");
+        let mut backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+            .expect("open sharded backend")
+            .expect("configured backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        let status = handle_daemon_dfs_status(&paths).expect("dfs status");
+
+        assert_eq!(status.metadata_shards.len(), 1);
+        assert!(status.metadata_shards[0].replica_lag.is_empty());
 
         cleanup(&root);
     }
