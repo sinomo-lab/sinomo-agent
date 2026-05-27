@@ -2261,6 +2261,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             None
         };
         match (memory_object, backend_object) {
+            (Some(memory_object), Some(backend_object))
+                if memory_object.version > backend_object.version =>
+            {
+                Ok(memory_object)
+            }
             (_, Some(backend_object)) => Ok(backend_object),
             (Some(memory_object), None) => Ok(memory_object),
             (None, None) => Err(DfsError::UnknownObject {
@@ -3469,6 +3474,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_ref()
             && let Some(object) = backend.get_object(object_id)?
         {
+            if let Some(memory_object) = memory_object.clone()
+                && memory_object.version > object.version
+            {
+                return Ok(memory_object);
+            }
             if object.kind == DfsObjectKind::Tombstone
                 && let Some(memory_object) = memory_object
                 && memory_object.kind != DfsObjectKind::Tombstone
@@ -3911,12 +3921,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }) {
             Ok(()) => {
                 let local_node_id = self.node_id.clone();
-                self.put_metadata_receipt(
+                self.put_replica_receipt_if_authoritative(
                     &command.file_system_id,
                     &command.object_id,
                     &command.version,
                     &local_node_id,
                     &command.content_hash,
+                    command.object_metadata.as_ref(),
                 )?;
                 DfsBlobTransferResult::Durable {
                     content_hash: command.content_hash.clone(),
@@ -4044,11 +4055,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 command.total_size_bytes,
             ) {
                 let local_node_id = self.node_id.clone();
-                if let Err(error) = self.ensure_metadata_receipt_accepts(
+                if let Err(error) = self.put_replica_receipt_if_authoritative(
+                    &command.file_system_id,
                     &command.object_id,
                     &command.version,
                     &local_node_id,
                     &command.content_hash,
+                    command.object_metadata.as_ref(),
                 ) {
                     return self.reject_stage_blob_chunk(
                         requester_node_id,
@@ -4056,13 +4069,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         error.to_string(),
                     );
                 }
-                self.put_metadata_receipt(
-                    &command.file_system_id,
-                    &command.object_id,
-                    &command.version,
-                    &local_node_id,
-                    &command.content_hash,
-                )?;
                 self.send_dfs_message_if_routable(
                     &requester_node_id,
                     DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
@@ -4163,12 +4169,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
         };
         let local_node_id = self.node_id.clone();
-        self.put_metadata_receipt(
+        self.put_replica_receipt_if_authoritative(
             &transfer.file_system_id,
             &transfer.object_id,
             &transfer.version,
             &local_node_id,
             &manifest.content_hash,
+            None,
         )?;
         self.send_dfs_message_if_routable(
             &requester_node_id,
@@ -4376,35 +4383,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             })
             .and_then(|()| {
                 let local_node_id = self.node_id.clone();
-                self.ensure_metadata_receipt_accepts(
-                    &command.object_id,
-                    &command.version,
-                    &local_node_id,
-                    &command.content_hash,
-                )
-            })
-            .and_then(|()| {
-                let local_node_id = self.node_id.clone();
-                self.put_metadata_receipt(
+                self.commit_replica_metadata_cache(
                     &command.file_system_id,
                     &command.object_id,
                     &command.version,
                     &local_node_id,
                     &command.content_hash,
+                    command.object_metadata.as_ref(),
                 )
-            })
-            .and_then(|_| {
-                let write_time = dfs_now_unix_nanos();
-                self.commit_local_metadata(
-                    &command.object_id,
-                    &command.version,
-                    &command.content_hash,
-                    write_time,
-                )
-                .and_then(|object| {
-                    self.put_visible_object_in_metadata_backend(&object)?;
-                    Ok(())
-                })
             }) {
             Ok(()) => DfsBlobTransferResult::Committed {
                 content_hash: command.content_hash.clone(),
@@ -4644,32 +4630,24 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     &command.bytes,
                 )
             }) {
-            Ok(()) => match self
-                .commit_local_metadata(
+            Ok(()) => {
+                let local_node_id = self.node_id.clone();
+                match self.commit_replica_metadata_cache(
+                    &command.file_system_id,
                     &command.object_id,
                     &command.version,
+                    &local_node_id,
                     &command.content_hash,
-                    dfs_now_unix_nanos(),
-                )
-                .and_then(|object| {
-                    self.put_visible_object_in_metadata_backend(&object)?;
-                    let local_node_id = self.node_id.clone();
-                    self.put_metadata_receipt(
-                        &command.file_system_id,
-                        &command.object_id,
-                        &command.version,
-                        &local_node_id,
-                        &command.content_hash,
-                    )?;
-                    Ok(())
-                }) {
-                Ok(()) => DfsBlobTransferResult::Committed {
-                    content_hash: command.content_hash.clone(),
-                },
-                Err(error) => DfsBlobTransferResult::Rejected {
-                    reason: error.to_string(),
-                },
-            },
+                    command.object_metadata.as_ref(),
+                ) {
+                    Ok(()) => DfsBlobTransferResult::Committed {
+                        content_hash: command.content_hash.clone(),
+                    },
+                    Err(error) => DfsBlobTransferResult::Rejected {
+                        reason: error.to_string(),
+                    },
+                }
+            }
             Err(error) => DfsBlobTransferResult::Rejected {
                 reason: error.to_string(),
             },
@@ -4890,21 +4868,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 &command.content_hash,
                 command.total_size_bytes,
             ) {
-                let write_time = dfs_now_unix_nanos();
-                let object = self.commit_local_metadata(
-                    &command.object_id,
-                    &command.version,
-                    &command.content_hash,
-                    write_time,
-                )?;
-                self.put_visible_object_in_metadata_backend(&object)?;
                 let local_node_id = self.node_id.clone();
-                self.put_metadata_receipt(
+                self.commit_replica_metadata_cache(
                     &command.file_system_id,
                     &command.object_id,
                     &command.version,
                     &local_node_id,
                     &command.content_hash,
+                    command.object_metadata.as_ref(),
                 )?;
                 self.send_dfs_message_if_routable(
                     &requester_node_id,
@@ -5013,20 +4984,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 );
             }
         };
-        let object = self.commit_local_metadata(
-            &transfer.object_id,
-            &transfer.version,
-            &manifest.content_hash,
-            dfs_now_unix_nanos(),
-        )?;
-        self.put_visible_object_in_metadata_backend(&object)?;
         let local_node_id = self.node_id.clone();
-        self.put_metadata_receipt(
+        self.commit_replica_metadata_cache(
             &transfer.file_system_id,
             &transfer.object_id,
             &transfer.version,
             &local_node_id,
             &manifest.content_hash,
+            None,
         )?;
         self.send_dfs_message_if_routable(
             &requester_node_id,
@@ -7413,24 +7378,126 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let Some(object) = object else {
             return Ok(());
         };
+        let persist_authoritative_metadata =
+            self.local_metadata_backend_is_authoritative_for_object(object)?;
         if !self
             .metadata
             .filesystems
             .contains_key(&object.file_system_id)
         {
-            self.add_file_system(DfsFileSystem {
+            let file_system = DfsFileSystem {
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
                 subtree_policies: Vec::new(),
-            })?;
+            };
+            if persist_authoritative_metadata {
+                self.add_file_system(file_system)?;
+            } else {
+                self.metadata.add_file_system(file_system);
+            }
         }
         if let Some(backend) = self.metadata_backend.as_ref()
             && let Some(existing) = backend.get_object(&object.object_id)?
         {
             self.metadata.add_object(existing)?;
         } else if self.metadata.object(&object.object_id).is_none() {
-            self.add_object_metadata(object.clone())?;
+            if persist_authoritative_metadata {
+                self.add_object_metadata(object.clone())?;
+            } else {
+                self.add_transient_object_metadata(object.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn local_metadata_backend_is_authoritative_for_object(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<bool, DfsError> {
+        Ok(self
+            .select_metadata_shard_for_object(object)?
+            .is_none_or(|shard| shard.primary_node_id == self.node_id))
+    }
+
+    fn replica_command_metadata_is_authoritative(
+        &mut self,
+        object_id: &DfsObjectId,
+        object_metadata: Option<&DfsObjectMetadata>,
+    ) -> Result<bool, DfsError> {
+        let object = match self.current_read_object_metadata(object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) => {
+                object_metadata
+                    .cloned()
+                    .ok_or_else(|| DfsError::UnknownObject {
+                        object_id: object_id.clone(),
+                    })?
+            }
+            Err(error) => return Err(error),
+        };
+        self.local_metadata_backend_is_authoritative_for_object(&object)
+    }
+
+    fn put_replica_receipt_if_authoritative(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+        content_hash: &str,
+        object_metadata: Option<&DfsObjectMetadata>,
+    ) -> Result<(), DfsError> {
+        if self.replica_command_metadata_is_authoritative(object_id, object_metadata)? {
+            self.put_metadata_receipt(
+                file_system_id,
+                object_id,
+                version,
+                replica_node_id,
+                content_hash,
+            )?;
+        } else {
+            self.ensure_metadata_receipt_accepts(
+                object_id,
+                version,
+                replica_node_id,
+                content_hash,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn commit_replica_metadata_cache(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+        content_hash: &str,
+        object_metadata: Option<&DfsObjectMetadata>,
+    ) -> Result<(), DfsError> {
+        let persist_authoritative_metadata =
+            self.replica_command_metadata_is_authoritative(object_id, object_metadata)?;
+        if persist_authoritative_metadata {
+            self.put_metadata_receipt(
+                file_system_id,
+                object_id,
+                version,
+                replica_node_id,
+                content_hash,
+            )?;
+        } else {
+            self.ensure_metadata_receipt_accepts(
+                object_id,
+                version,
+                replica_node_id,
+                content_hash,
+            )?;
+        }
+        let object =
+            self.commit_local_metadata(object_id, version, content_hash, dfs_now_unix_nanos())?;
+        if persist_authoritative_metadata {
+            self.put_visible_object_in_metadata_backend(&object)?;
         }
         Ok(())
     }
@@ -13101,6 +13168,138 @@ mod tests {
     }
 
     #[test]
+    fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
+        let root = temp_root("replica-stage-commit-no-authoritative-metadata");
+        let owner = NodeId::from_legacy_named("node_replica_cache_owner").expect("node");
+        let replica = NodeId::from_legacy_named("node_replica_cache_replica").expect("node");
+        let object_id = DfsObjectId::from_legacy_named("obj_replica_cache").expect("object");
+        let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+        let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+        let bytes = b"replica content cache without authoritative metadata append";
+        let mut object = file_metadata(owner.clone());
+        object.object_id = object_id.clone();
+        object.version = version_1.clone();
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        object.current_locations = vec![owner.clone()];
+        let shared_kv = SharedDfsControlPlaneKvClient::new(
+            InProcessRaftKvCluster::new(vec![owner.clone()]).expect("kv"),
+        );
+        shared_kv.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig {
+                    file_system_id: sifs_file_system_id(),
+                    display_name: "SIFS".to_string(),
+                    owner_node_id: owner.clone(),
+                    subtree_policies: Vec::new(),
+                })
+                .expect("filesystem config");
+            control
+                .put_metadata_shard(&DfsMetadataShardConfig {
+                    file_system_id: sifs_file_system_id(),
+                    shard_id: "root".to_string(),
+                    primary_node_id: owner.clone(),
+                    replica_node_ids: vec![owner.clone(), replica.clone()],
+                    epoch: 1,
+                    assignment: DfsMetadataShardAssignment::Root,
+                    default_policy: DfsObjectPolicy::ReplicatedEventual,
+                })
+                .expect("metadata shard");
+        });
+        let mut dfs = NetworkedDfsService::new(
+            ReceiveOnlyTransport::new(replica.clone()),
+            LocalContentStore::new(root.join("content")).expect("content"),
+        )
+        .with_control_plane(shared_kv)
+        .with_metadata_backend(
+            open_root_local_metadata_backend(root.join("metadata")).expect("metadata"),
+        )
+        .expect("metadata backend");
+        dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+        let before_journal = dfs
+            .metadata_backend()
+            .expect("metadata backend")
+            .metadata_shard_statuses()
+            .expect("metadata status")
+            .pop()
+            .expect("root shard status")
+            .journal_last_sequence;
+
+        let stage_event = dfs
+            .handle_stage_blob(
+                owner.clone(),
+                DfsStageBlobCommand {
+                    request_id: "dfs_net_req_replica_stage_cache".to_string(),
+                    intent_id: "dfs_intent_replica_cache".to_string(),
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    expected_base_version: Some(version_1.clone()),
+                    version: version_2.clone(),
+                    content_hash: content_hash(bytes),
+                    bytes: bytes.to_vec(),
+                    object_metadata: Some(object.clone()),
+                },
+            )
+            .expect("replica stage");
+        assert!(matches!(
+            stage_event,
+            NetworkedDfsServiceEvent::BlobStaged { .. }
+        ));
+
+        let commit_event = dfs
+            .handle_commit_version(
+                owner,
+                DfsCommitVersionCommand {
+                    request_id: "dfs_net_req_replica_commit_cache".to_string(),
+                    intent_id: "dfs_intent_replica_cache".to_string(),
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    expected_base_version: Some(version_1),
+                    version: version_2.clone(),
+                    content_hash: content_hash(bytes),
+                    object_metadata: Some({
+                        object.version = version_2.clone();
+                        object.content_hash = Some(content_hash(bytes));
+                        object.current_locations = vec![replica.clone()];
+                        object
+                    }),
+                },
+            )
+            .expect("replica commit");
+        assert!(matches!(
+            commit_event,
+            NetworkedDfsServiceEvent::VersionCommitted { .. }
+        ));
+        assert_eq!(
+            dfs.metadata_backend()
+                .expect("metadata backend")
+                .metadata_shard_statuses()
+                .expect("metadata status")
+                .pop()
+                .expect("root shard status")
+                .journal_last_sequence,
+            before_journal,
+            "replica data-plane commands must wait for primary journal replay before mutating the durable metadata shard"
+        );
+        assert!(
+            dfs.metadata_backend()
+                .expect("metadata backend")
+                .get_object(&object_id)
+                .expect("backend object")
+                .is_none(),
+            "replica cache metadata must not be published to the durable shard backend"
+        );
+        assert_eq!(
+            dfs.current_read_object_metadata(&object_id)
+                .expect("transient local cache")
+                .version,
+            version_2
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn repair_replica_commits_when_response_target_is_unroutable() {
         let root = temp_root("repair-response-target-unroutable");
         let owner = NodeId::from_legacy_named("node_repair_notify_owner").expect("node");
@@ -13604,7 +13803,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_version_repairs_missing_local_receipt_before_visible_commit() {
+    fn commit_version_repairs_missing_local_receipt_when_backend_is_authoritative() {
         let root = temp_root("commit-repairs-missing-local-receipt");
         let owner = NodeId::from_legacy_named("node_commit_receipt_owner").expect("node");
         let replica = NodeId::from_legacy_named("node_commit_receipt_replica").expect("node");
