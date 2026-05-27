@@ -32,7 +32,8 @@ pub const DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 64 * 1024 * 1024;
 const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
-const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
+const LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
+const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 2;
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
 
 #[derive(Debug, Error)]
@@ -627,12 +628,62 @@ struct DfsMetadataTables {
 struct DfsMetadataTableState {
     tables: DfsMetadataTables,
     table_log_offset: u64,
+    snapshot_format_version: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct DfsMetadataTableSnapshot {
     format_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tables: Option<DfsMetadataTableSnapshotTables>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ops: Vec<DfsMetadataTableOp>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsMetadataTableSnapshotTables {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    file_systems: Vec<DfsFileSystem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    objects: Vec<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    file_system_objects: Vec<DfsPathRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<DfsPathRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inodes: Vec<DfsInodeRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dirfrags: Vec<DfsDirFragmentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dentries: Vec<DfsPathRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hardlinks: Vec<DfsHardlinkIndexSnapshotRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<DfsObjectVersionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    receipts: Vec<DfsReplicaReceiptRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    intents: Vec<DfsWriteIntentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    visible_commits: Vec<DfsVisibleCommitSnapshotRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    namespace_transactions: Vec<DfsNamespaceTransaction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsHardlinkIndexSnapshotRecord {
+    target_object_id: DfsObjectId,
+    hardlink_object_id: DfsObjectId,
+    path_record: DfsPathRecord,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsVisibleCommitSnapshotRecord {
+    object_id: DfsObjectId,
+    version: DfsVersion,
+    commit: DfsVisibleVersionCommitRecord,
 }
 
 impl DfsMetadataTables {
@@ -3531,17 +3582,22 @@ fn metadata_table_snapshot_path(root: &Path) -> PathBuf {
 
 fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState> {
     let mut state = read_metadata_table_state(root)?;
+    if state.snapshot_format_version.is_some_and(|version| {
+        version < METADATA_TABLE_SNAPSHOT_FORMAT_VERSION && state.tables.has_materialized_state()
+    }) {
+        persist_metadata_table_snapshot(root, &state.tables)?;
+        state.table_log_offset = 0;
+        state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
+        return Ok(state);
+    }
     if state.tables.has_materialized_state() {
         return Ok(state);
     }
     state.tables = load_legacy_metadata_tables(root)?;
     if state.tables.has_materialized_state() {
         persist_metadata_table_snapshot(root, &state.tables)?;
-        let table_path = metadata_table_path(root);
-        state.table_log_offset = table_path
-            .metadata()
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        state.table_log_offset = 0;
+        state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
     }
     Ok(state)
 }
@@ -3562,20 +3618,35 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
         return Ok(DfsMetadataTableState::default());
     }
     let snapshot: DfsMetadataTableSnapshot = read_json(&path)?;
-    if snapshot.format_version != METADATA_TABLE_SNAPSHOT_FORMAT_VERSION {
-        return Err(MetadataBackendError::Serde(format!(
-            "unsupported DFS metadata table snapshot version {} at {}",
-            snapshot.format_version,
-            path.display()
-        )));
-    }
-    let mut tables = DfsMetadataTables::default();
-    for op in snapshot.ops {
-        tables.apply(op);
-    }
+    let tables = match snapshot.format_version {
+        LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION => {
+            let mut tables = DfsMetadataTables::default();
+            for op in snapshot.ops {
+                tables.apply(op);
+            }
+            tables
+        }
+        METADATA_TABLE_SNAPSHOT_FORMAT_VERSION => {
+            metadata_tables_from_snapshot(snapshot.tables.ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "DFS metadata table snapshot version {} at {} is missing structured tables",
+                    snapshot.format_version,
+                    path.display()
+                ))
+            })?)
+        }
+        _ => {
+            return Err(MetadataBackendError::Serde(format!(
+                "unsupported DFS metadata table snapshot version {} at {}",
+                snapshot.format_version,
+                path.display()
+            )));
+        }
+    };
     Ok(DfsMetadataTableState {
         tables,
         table_log_offset: 0,
+        snapshot_format_version: Some(snapshot.format_version),
     })
 }
 
@@ -3700,13 +3771,109 @@ fn persist_metadata_table_snapshot(root: &Path, tables: &DfsMetadataTables) -> R
         &metadata_table_snapshot_path(root),
         &DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-            ops: metadata_table_snapshot_ops(tables),
+            tables: Some(metadata_tables_snapshot(tables)),
+            ops: Vec::new(),
         },
     )?;
     truncate_metadata_table_log(root)?;
     Ok(())
 }
 
+fn metadata_tables_snapshot(tables: &DfsMetadataTables) -> DfsMetadataTableSnapshotTables {
+    DfsMetadataTableSnapshotTables {
+        file_systems: tables.file_systems.values().cloned().collect(),
+        objects: tables.objects.values().cloned().collect(),
+        file_system_objects: tables.file_system_objects.values().cloned().collect(),
+        paths: tables.paths.values().cloned().collect(),
+        inodes: tables.inodes.values().cloned().collect(),
+        dirfrags: tables.dirfrags.values().cloned().collect(),
+        dentries: tables.dentries.values().cloned().collect(),
+        hardlinks: tables
+            .hardlinks
+            .iter()
+            .map(|((target_object_id, hardlink_object_id), path_record)| {
+                DfsHardlinkIndexSnapshotRecord {
+                    target_object_id: target_object_id.clone(),
+                    hardlink_object_id: hardlink_object_id.clone(),
+                    path_record: path_record.clone(),
+                }
+            })
+            .collect(),
+        versions: tables.versions.values().cloned().collect(),
+        receipts: tables.receipts.values().cloned().collect(),
+        intents: tables.intents.values().cloned().collect(),
+        conflicts: tables.conflicts.values().cloned().collect(),
+        visible_commits: tables
+            .visible_commits
+            .iter()
+            .map(
+                |((object_id, version), commit)| DfsVisibleCommitSnapshotRecord {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                    commit: commit.clone(),
+                },
+            )
+            .collect(),
+        namespace_transactions: tables.namespace_transactions.values().cloned().collect(),
+    }
+}
+
+fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> DfsMetadataTables {
+    let mut tables = DfsMetadataTables::default();
+    for file_system in snapshot.file_systems {
+        tables.apply(DfsMetadataTableOp::PutFileSystem { file_system });
+    }
+    for object in snapshot.objects {
+        tables.apply(DfsMetadataTableOp::PutObject { object });
+    }
+    for path_record in snapshot.file_system_objects {
+        tables.apply(DfsMetadataTableOp::PutFileSystemObject { path_record });
+    }
+    for path_record in snapshot.paths {
+        tables.apply(DfsMetadataTableOp::PutPath { path_record });
+    }
+    for inode in snapshot.inodes {
+        tables.apply(DfsMetadataTableOp::PutInode { inode });
+    }
+    for dirfrag in snapshot.dirfrags {
+        tables.apply(DfsMetadataTableOp::PutDirFragment { dirfrag });
+    }
+    for path_record in snapshot.dentries {
+        tables.apply(DfsMetadataTableOp::PutDentry { path_record });
+    }
+    for hardlink in snapshot.hardlinks {
+        tables.apply(DfsMetadataTableOp::PutHardlink {
+            target_object_id: hardlink.target_object_id,
+            hardlink_object_id: hardlink.hardlink_object_id,
+            path_record: hardlink.path_record,
+        });
+    }
+    for version in snapshot.versions {
+        tables.apply(DfsMetadataTableOp::PutVersion { version });
+    }
+    for receipt in snapshot.receipts {
+        tables.apply(DfsMetadataTableOp::PutReceipt { receipt });
+    }
+    for intent in snapshot.intents {
+        tables.apply(DfsMetadataTableOp::PutIntent { intent });
+    }
+    for conflict in snapshot.conflicts {
+        tables.apply(DfsMetadataTableOp::PutConflict { conflict });
+    }
+    for visible_commit in snapshot.visible_commits {
+        tables.apply(DfsMetadataTableOp::PutVisibleCommit {
+            object_id: visible_commit.object_id,
+            version: visible_commit.version,
+            commit: visible_commit.commit,
+        });
+    }
+    for transaction in snapshot.namespace_transactions {
+        tables.apply(DfsMetadataTableOp::PutNamespaceTransaction { transaction });
+    }
+    tables
+}
+
+#[cfg(test)]
 fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<DfsMetadataTableOp> {
     let mut ops = Vec::new();
     ops.extend(
@@ -5070,6 +5237,14 @@ mod tests {
             metadata_table_snapshot_path(&root).is_file(),
             "compaction should persist a compact materialized table snapshot"
         );
+        let snapshot: DfsMetadataTableSnapshot =
+            read_json(&metadata_table_snapshot_path(&root)).expect("metadata table snapshot");
+        assert_eq!(
+            snapshot.format_version, METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            "new compactions should use structured metadata table snapshots"
+        );
+        assert!(snapshot.tables.is_some());
+        assert!(snapshot.ops.is_empty());
         assert_eq!(
             fs::metadata(&table_path)
                 .expect("truncated metadata table")
@@ -5087,6 +5262,55 @@ mod tests {
                 Some(object)
             );
         }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_migrates_legacy_op_snapshot_to_structured_snapshot() {
+        let root = temp_root("local_backend_migrates_legacy_op_snapshot");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let object = object(version("version_1"));
+        {
+            let mut backend =
+                LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+            backend.put_file_system(&file_system()).expect("filesystem");
+            backend.put_object(&object).expect("object");
+            write_json_atomic(
+                &metadata_table_snapshot_path(&root),
+                &DfsMetadataTableSnapshot {
+                    format_version: LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                    tables: None,
+                    ops: metadata_table_snapshot_ops(&backend.tables),
+                },
+            )
+            .expect("legacy metadata table snapshot");
+            truncate_metadata_table_log(&root).expect("truncate table log");
+        }
+
+        let reopened = LocalJsonMetadataBackend::new(shard_id, &root).expect("reopen");
+
+        assert_eq!(
+            reopened
+                .get_object(&object.object_id)
+                .expect("object lookup"),
+            Some(object)
+        );
+        let snapshot: DfsMetadataTableSnapshot =
+            read_json(&metadata_table_snapshot_path(&root)).expect("migrated snapshot");
+        assert_eq!(
+            snapshot.format_version, METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            "opening a legacy op snapshot should migrate it to the structured snapshot format"
+        );
+        assert!(snapshot.tables.is_some());
+        assert!(snapshot.ops.is_empty());
+        assert_eq!(
+            fs::metadata(metadata_table_path(&root))
+                .expect("metadata table")
+                .len(),
+            0,
+            "snapshot migration should compact any table tail into the structured image"
+        );
+
         cleanup(&root);
     }
 

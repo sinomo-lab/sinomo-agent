@@ -54,7 +54,7 @@ Object versions are protected by hash. Rewriting the same `(object_id, version)`
 
 ### Metadata Backend
 
-`DfsMetadataBackend` is the durable metadata interface. The current `LocalJsonMetadataBackend` stores materialized shard state as a compact table snapshot under `records/tables/snapshot.sobj` plus a packed tail log under `records/tables/materialized.slog`; the shard journal remains the replay and replication source of truth. This avoids creating one host file per object, path, dentry, receipt, or version while preserving the same logical records:
+`DfsMetadataBackend` is the durable metadata interface. The current `LocalJsonMetadataBackend` stores materialized shard state as a structured table snapshot under `records/tables/snapshot.sobj` plus a packed tail log under `records/tables/materialized.slog`; the shard journal remains the replay and replication source of truth. This avoids creating one host file per object, path, dentry, receipt, or version while preserving the same logical records:
 
 - filesystem records,
 - object and path records,
@@ -69,7 +69,7 @@ Visible metadata commits and namespace transactions are written as replayable re
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 
-The table tail log is compacted into the snapshot after it grows large enough, which keeps reopen cost bounded by the latest materialized snapshot plus recent writes instead of all historical namespace churn.
+The table tail log is compacted into a structured snapshot after it grows large enough, which keeps reopen cost bounded by the latest materialized snapshot plus recent writes instead of all historical namespace churn. Older operation-list snapshots are migrated to the structured snapshot format on open.
 
 Legacy per-record `.sobj` metadata layouts are loaded into the compact table snapshot during backend open. New writes use the packed table path only.
 
