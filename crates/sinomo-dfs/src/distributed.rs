@@ -341,6 +341,18 @@ impl DistributedEventualCoordinator {
         self.intents.get(intent_id)
     }
 
+    pub fn has_awaiting_intent_targeting(
+        &self,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+    ) -> bool {
+        self.intents.values().any(|intent| {
+            intent.object_id == *object_id
+                && intent.target_version == *target_version
+                && matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
+        })
+    }
+
     pub fn restore_intent(
         &mut self,
         intent: DistributedWriteIntent,
@@ -406,14 +418,11 @@ impl DistributedEventualCoordinator {
                 state: DfsReplicaReceiptState::Durable,
             },
         );
-        if self.is_commit_ready(intent_id)?
-            && self
-                .intents
-                .get(intent_id)
-                .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::AwaitingReceipts))
+        if self
+            .intents
+            .get(intent_id)
+            .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
         {
-            self.commit_intent(intent_id)?;
-        } else {
             self.rebuild_repair_jobs();
         }
         Ok(())
@@ -488,8 +497,12 @@ impl DistributedEventualCoordinator {
             job.intent_id != intent_id || job.missing_replica_node_id != replica_node_id
         });
 
-        if self.is_commit_ready(intent_id)? {
-            self.commit_intent(intent_id)?;
+        if self
+            .intents
+            .get(intent_id)
+            .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
+        {
+            self.rebuild_repair_jobs();
         }
 
         self.intents
@@ -555,7 +568,6 @@ impl DistributedEventualCoordinator {
             });
         }
 
-        let commit_ready = self.durable_receipt_count(intent_id) >= policy.min_commit_replicas;
         let intent =
             self.intents
                 .get_mut(intent_id)
@@ -563,10 +575,6 @@ impl DistributedEventualCoordinator {
                     intent_id: intent_id.to_string(),
                 })?;
         intent.policy = policy;
-
-        if commit_ready {
-            self.commit_intent(intent_id)?;
-        }
 
         self.intents
             .get(intent_id)
@@ -576,7 +584,25 @@ impl DistributedEventualCoordinator {
             })
     }
 
-    fn commit_intent(&mut self, intent_id: &str) -> Result<(), DfsDistributedError> {
+    pub fn finalize_commit_if_ready(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<bool, DfsDistributedError> {
+        if !self.is_commit_ready(intent_id)? {
+            return Ok(false);
+        }
+        if self
+            .intents
+            .get(intent_id)
+            .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
+        {
+            return Ok(true);
+        }
+        self.commit_intent(intent_id)?;
+        Ok(true)
+    }
+
+    pub(crate) fn commit_intent(&mut self, intent_id: &str) -> Result<(), DfsDistributedError> {
         let durable_nodes = self.durable_receipt_nodes(intent_id);
         let intent =
             self.intents
@@ -935,9 +961,16 @@ mod tests {
         coordinator
             .record_durable_receipt(&intent.intent_id, node("node_a"))
             .expect("first receipt");
-        let updated = coordinator
+        coordinator
             .record_durable_receipt(&intent.intent_id, node("node_b"))
             .expect("second receipt");
+        coordinator
+            .commit_intent(&intent.intent_id)
+            .expect("commit intent");
+        let updated = coordinator
+            .intent(&intent.intent_id)
+            .expect("intent")
+            .clone();
 
         assert_eq!(updated.state, DfsWriteIntentState::Committed);
         assert_eq!(
@@ -1020,6 +1053,9 @@ mod tests {
         coordinator
             .record_durable_receipt(&intent.intent_id, node("node_b"))
             .expect("second receipt");
+        coordinator
+            .commit_intent(&intent.intent_id)
+            .expect("commit intent");
 
         assert_eq!(
             coordinator.repair_jobs(),
@@ -1041,7 +1077,17 @@ mod tests {
         let committed = coordinator
             .record_durable_receipt(&intent.intent_id, node("node_a"))
             .expect("threshold receipt");
-        assert_eq!(committed.state, DfsWriteIntentState::Committed);
+        assert_eq!(committed.state, DfsWriteIntentState::AwaitingReceipts);
+        coordinator
+            .commit_intent(&intent.intent_id)
+            .expect("commit intent");
+        assert_eq!(
+            coordinator
+                .intent(&intent.intent_id)
+                .expect("intent")
+                .state,
+            DfsWriteIntentState::Committed
+        );
         assert_eq!(coordinator.repair_jobs().len(), 2);
 
         coordinator
@@ -1078,7 +1124,17 @@ mod tests {
             .record_durable_receipt(&intent.intent_id, node("node_c"))
             .expect("third receipt");
 
-        assert_eq!(committed.state, DfsWriteIntentState::Committed);
+        assert_eq!(committed.state, DfsWriteIntentState::AwaitingReceipts);
+        coordinator
+            .commit_intent(&intent.intent_id)
+            .expect("commit intent");
+        assert_eq!(
+            coordinator
+                .intent(&intent.intent_id)
+                .expect("intent")
+                .state,
+            DfsWriteIntentState::Committed
+        );
         assert!(coordinator.repair_jobs().is_empty());
     }
 
@@ -1120,7 +1176,17 @@ mod tests {
             .downgrade_intent_policy(&intent.intent_id, policy(1, 3))
             .expect("downgrade intent");
 
-        assert_eq!(downgraded.state, DfsWriteIntentState::Committed);
+        assert_eq!(downgraded.state, DfsWriteIntentState::AwaitingReceipts);
+        coordinator
+            .commit_intent(&intent.intent_id)
+            .expect("commit intent");
+        assert_eq!(
+            coordinator
+                .intent(&intent.intent_id)
+                .expect("intent")
+                .state,
+            DfsWriteIntentState::Committed
+        );
         assert_eq!(
             coordinator.committed_version(&file_system_id(), &object_id()),
             Some(&version("version_2"))

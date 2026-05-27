@@ -60,9 +60,16 @@ fn distributed_eventual_commit_advances_metadata_then_repairs_missing_replica() 
     let manifest = store_a
         .put_object_version(object_id.as_str(), version_2.as_str(), b"replicated bytes")
         .expect("put object");
-    let committed_intent = coordinator
+    coordinator
         .record_durable_receipt(&intent.intent_id, node_a.clone())
         .expect("receipt");
+    coordinator
+        .finalize_commit_if_ready(&intent.intent_id)
+        .expect("commit intent");
+    let committed_intent = coordinator
+        .intent(&intent.intent_id)
+        .expect("intent")
+        .clone();
 
     assert_eq!(committed_intent.state, DfsWriteIntentState::Committed);
     assert_eq!(coordinator.repair_jobs().len(), 1);
