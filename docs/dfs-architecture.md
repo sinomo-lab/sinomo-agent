@@ -107,9 +107,10 @@ The metadata plane is a CephFS-MDS-like service with Sinomo local-first adjustme
 - shard ownership and replica sets are configured by the KV control plane,
 - each shard stores records in a local ordered store, not global KV,
 - the current local backend materializes that ordered store as compact table snapshots plus a bounded tail log, so reopen cost follows current metadata size and recent churn rather than all historical table updates,
+- namespace transactions are the preferred batching primitive for large metadata changes; they can carry object and visible-version records together so first-publication commits do not require a separate version append,
 - each shard has an append-only journal for mutation replication and replay,
 - large directories split into directory fragments by filename hash,
-- shard replicas subscribe to journal entries and compact snapshots,
+- shard replicas accept journal batches and compact snapshots only from the current configured shard primary,
 - roaming devices can hold read caches or learner replicas without becoming quorum voters.
 
 The baseline metadata key model should be:
@@ -794,7 +795,7 @@ These events should carry node, filesystem, object, version, policy, content has
 ### Phase 2: DFS Metadata Plane
 
 - Add serializers and key builders for inodes, dentries, dirfrags, object versions, intents, receipts, and conflicts. The first implementation includes filesystem, path, inode, dirfrag, object-version, write-intent, receipt, and conflict records.
-- Add a `DfsMetadataBackend` facade over a local ordered store plus append-only journal. The first backend is `LocalJsonMetadataBackend`; it stores current ordered-table state as compact snapshots plus a tail log, while the shard journal remains the replication and replay source of truth.
+- Add a `DfsMetadataBackend` facade over a local ordered store plus append-only journal. The first backend is `LocalJsonMetadataBackend`; it stores current ordered-table state as compact snapshots plus a tail log, checkpoints local replay cursors periodically, and batches namespace object/version publication while the shard journal remains the replication and replay source of truth.
 - Wire `NetworkedDfsService` so filesystem/object registration, durable receipts, and visible-version commits can persist through `DfsMetadataBackend` while the in-memory `DfsMetadataStore` remains a routing cache.
 - Add directory fragmentation thresholds for large directories.
 - Use shard-local compare-and-append for object version updates.

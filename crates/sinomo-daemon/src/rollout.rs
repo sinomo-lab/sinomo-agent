@@ -105,6 +105,12 @@ pub enum PendingShadowMainExit {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RolloutActivationStrategy {
+    MainSelfRestart,
+    ShadowSupervised,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalShadowRolloutRestartPlan {
     pub shadow_paths: DaemonPaths,
@@ -884,10 +890,15 @@ pub fn handle_daemon_rollout_binary_request(
         request.requested_at,
         "cluster-binary-push",
     )?;
-    stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
+    let activation_strategy =
+        stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
-        detail: rollout_staged_detail("candidate main staged", plan.current_main_pid),
+        detail: rollout_staged_detail(
+            "candidate main staged",
+            plan.current_main_pid,
+            activation_strategy,
+        ),
         main_binary,
         shadow_binary,
         source_head: None,
@@ -899,7 +910,7 @@ pub fn stage_rollout_main_activation(
     data_dir: &Path,
     rollout_paths: &SelfRolloutPaths,
     activation: RolloutMainActivation,
-) -> Result<(), DaemonError> {
+) -> Result<RolloutActivationStrategy, DaemonError> {
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
     let shadow_running = current_daemon_is_shadow
@@ -908,14 +919,15 @@ pub fn stage_rollout_main_activation(
             DaemonProbeStatus::Running(_)
         );
     if !shadow_running {
-        return stage_main_self_restart_without_shadow(rollout_paths, activation);
+        stage_main_self_restart_without_shadow(rollout_paths, activation)?;
+        return Ok(RolloutActivationStrategy::MainSelfRestart);
     }
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
     if current_daemon_is_shadow {
         request_main_shutdown_for_shadow_rollout(data_dir, &activation)?;
     }
-    Ok(())
+    Ok(RolloutActivationStrategy::ShadowSupervised)
 }
 
 fn stage_main_self_restart_without_shadow(
@@ -1060,13 +1072,23 @@ fn prepare_cluster_rollout_main_activation(
     })
 }
 
-fn rollout_staged_detail(prefix: &str, current_main_pid: Option<u32>) -> String {
-    match current_main_pid {
-        Some(pid) => format!(
+fn rollout_staged_detail(
+    prefix: &str,
+    current_main_pid: Option<u32>,
+    strategy: RolloutActivationStrategy,
+) -> String {
+    match (strategy, current_main_pid) {
+        (RolloutActivationStrategy::ShadowSupervised, Some(pid)) => format!(
             "{prefix}; existing shadow daemon will restart main, verify health, then update shadow (current main pid {pid} will stop)"
         ),
-        None => format!(
+        (RolloutActivationStrategy::ShadowSupervised, None) => format!(
             "{prefix}; existing shadow daemon will start main, verify health, then update shadow"
+        ),
+        (RolloutActivationStrategy::MainSelfRestart, Some(pid)) => format!(
+            "{prefix}; main daemon will stop after this response and the staged candidate will complete activation without shadow supervision (current main pid {pid} will stop)"
+        ),
+        (RolloutActivationStrategy::MainSelfRestart, None) => format!(
+            "{prefix}; staged candidate will complete activation without shadow supervision"
         ),
     }
 }
@@ -1179,7 +1201,7 @@ pub fn wait_for_main_daemon_health(
     }
     Err(DaemonError::Network {
         address: daemon_connect_address(host, port),
-        detail: "rolled out main daemon did not become ready under shadow supervision".to_string(),
+        detail: "rolled out main daemon did not become ready".to_string(),
     })
 }
 
@@ -1553,7 +1575,8 @@ pub fn handle_daemon_rollout_build_request(
         requested_at.clone(),
         "cluster-remote-build",
     )?;
-    stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
+    let activation_strategy =
+        stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
     let _ = (repo, built_binary);
     write_rollout_status(
         &rollout_paths,
@@ -1579,7 +1602,11 @@ pub fn handle_daemon_rollout_build_request(
     )?;
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
-        detail: rollout_staged_detail("remote build staged", plan.current_main_pid),
+        detail: rollout_staged_detail(
+            "remote build staged",
+            plan.current_main_pid,
+            activation_strategy,
+        ),
         main_binary,
         shadow_binary,
         source_head: managed_source_status(&rollout_paths)?.head,
@@ -1759,8 +1786,10 @@ mod tests {
         let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
         let activation = test_main_activation(&rollout_paths);
 
-        stage_rollout_main_activation(&shadow_paths, &root, &rollout_paths, activation.clone())
-            .expect("current shadow can stage activation without recursive status probe");
+        let strategy =
+            stage_rollout_main_activation(&shadow_paths, &root, &rollout_paths, activation.clone())
+                .expect("current shadow can stage activation without recursive status probe");
+        assert_eq!(strategy, RolloutActivationStrategy::ShadowSupervised);
 
         let staged = read_rollout_main_activation(&rollout_paths)
             .expect("read activation")
@@ -1805,8 +1834,10 @@ mod tests {
         activation.main_binary = root.join("bin").join("sinomo-main");
         activation.shadow_binary = root.join("bin").join("sinomo-shadow");
 
-        stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
-            .expect("main daemon can schedule self restart without shadow");
+        let strategy =
+            stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
+                .expect("main daemon can schedule self restart without shadow");
+        assert_eq!(strategy, RolloutActivationStrategy::MainSelfRestart);
 
         let status = read_rollout_status(&rollout_paths)
             .expect("read status")

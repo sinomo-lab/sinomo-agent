@@ -54,7 +54,7 @@ Object versions are protected by hash. Rewriting the same `(object_id, version)`
 
 ### Metadata Backend
 
-`DfsMetadataBackend` is the durable metadata interface. The current `LocalJsonMetadataBackend` stores materialized shard state as a structured table snapshot under `records/tables/snapshot.sobj` plus a packed tail log under `records/tables/materialized.slog`; the shard journal remains the replay and replication source of truth. This avoids creating one host file per object, path, dentry, receipt, or version while preserving the same logical records:
+`DfsMetadataBackend` is the durable metadata interface. The current `LocalJsonMetadataBackend` stores materialized shard state as a structured table snapshot under `records/tables/snapshot.sobj` plus a packed tail log under `records/tables/materialized.slog`; the shard journal remains the replay and replication source of truth. Local materialization cursors are checkpointed periodically instead of after every mutation, and namespace transactions can publish object records and their visible version records in one replayable table batch. This avoids creating one host file per object, path, dentry, receipt, or version while reducing per-file metadata write amplification for large namespace imports and first-visible-version commits.
 
 - filesystem records,
 - object and path records,
@@ -65,7 +65,7 @@ Object versions are protected by hash. Rewriting the same `(object_id, version)`
 - namespace transactions,
 - recoverable visible-version commits.
 
-Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation.
+Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation without duplicating already-materialized table batches.
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 

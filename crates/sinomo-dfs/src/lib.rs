@@ -1443,6 +1443,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             target_node_id,
             DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
                 request_id,
+                source_node_id: Some(self.node_id.clone()),
                 batch: batch.clone(),
             }),
         )?;
@@ -1535,6 +1536,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
                     request_id: request_id.clone(),
+                    source_node_id: Some(self.node_id.clone()),
                     batch,
                 }),
             )?;
@@ -3207,6 +3209,35 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let shard_id = command.batch.shard_id.clone();
         let next_after_sequence = command.batch.next_after_sequence;
+        let source_rejection = if command
+            .source_node_id
+            .as_ref()
+            .is_some_and(|claimed| claimed != &source_node_id)
+        {
+            Some("metadata journal batch source does not match transport source".to_string())
+        } else {
+            self.validate_metadata_journal_batch_source(&source_node_id, &command.batch)?
+        };
+        if let Some(reason) = source_rejection {
+            let _ = self.send_dfs_message_if_routable(
+                &source_node_id,
+                DfsNetworkMessage::MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id.clone(),
+                    shard_id: shard_id.clone(),
+                    next_after_sequence,
+                    applied_entries: 0,
+                    result: DfsMetadataJournalBatchResult::Rejected {
+                        reason: reason.clone(),
+                    },
+                }),
+            )?;
+            return Ok(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                request_id: command.request_id,
+                source_node_id,
+                shard_id,
+                reason,
+            });
+        }
         let Some(backend) = self.metadata_backend.as_mut() else {
             let reason = "local DFS metadata backend is not configured".to_string();
             let _ = self.send_dfs_message_if_routable(
@@ -3276,6 +3307,45 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 })
             }
         }
+    }
+
+    fn validate_metadata_journal_batch_source(
+        &mut self,
+        source_node_id: &NodeId,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<Option<String>, DfsError> {
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(None);
+        };
+        let Some(file_system_id) = metadata_journal_batch_file_system_id(batch) else {
+            return Ok(None);
+        };
+        let Some(shard) = DfsControlPlaneStore::new(control_plane.as_mut())
+            .get_metadata_shard(&file_system_id, &batch.shard_id.0)?
+        else {
+            return Ok(Some(format!(
+                "metadata journal batch has no configured shard {}",
+                batch.shard_id.0
+            )));
+        };
+        if shard.primary_node_id != *source_node_id {
+            return Ok(Some(format!(
+                "metadata journal source {source_node_id} is not shard {} primary {}",
+                shard.shard_id, shard.primary_node_id
+            )));
+        }
+        if shard.primary_node_id == self.node_id {
+            return Ok(Some(
+                "metadata primary must not apply a replica journal batch".to_string(),
+            ));
+        }
+        if !shard.replica_node_ids.contains(&self.node_id) {
+            return Ok(Some(format!(
+                "local node {} is not configured as a replica for metadata shard {}",
+                self.node_id, shard.shard_id
+            )));
+        }
+        Ok(None)
     }
 
     fn prune_idle_chunk_transfers(&mut self) {
@@ -7412,9 +7482,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 ),
                 file_system_id: committed_object.file_system_id.clone(),
                 objects: vec![committed_object.clone()],
+                versions: vec![visible_version],
                 created_at: OffsetDateTime::now_utc(),
             })?;
-            backend.put_version(&visible_version)?;
             return Ok(());
         }
         backend.commit_visible_version(
@@ -7987,6 +8057,26 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
 fn content_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn metadata_journal_batch_file_system_id(
+    batch: &DfsMetadataJournalBatch,
+) -> Option<DfsFileSystemId> {
+    batch
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.mutation {
+            DfsMetadataMutation::PutFileSystem { file_system_id, .. }
+            | DfsMetadataMutation::PutObject { file_system_id, .. }
+            | DfsMetadataMutation::PutVersion { file_system_id, .. }
+            | DfsMetadataMutation::PutReceipt { file_system_id, .. }
+            | DfsMetadataMutation::PutIntent { file_system_id, .. }
+            | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
+            | DfsMetadataMutation::PutConflict { file_system_id, .. }
+            | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. } => {
+                Some(file_system_id.clone())
+            }
+        })
 }
 
 fn read_conflicts_reason(conflicts: Vec<DfsConflictReadView>) -> String {

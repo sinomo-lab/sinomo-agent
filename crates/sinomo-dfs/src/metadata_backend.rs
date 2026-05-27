@@ -33,6 +33,7 @@ pub const DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 64 * 1024 * 1024;
 const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
+const LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL: u64 = 512;
 const LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 2;
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
@@ -402,6 +403,8 @@ pub struct DfsNamespaceTransaction {
     pub transaction_id: String,
     pub file_system_id: DfsFileSystemId,
     pub objects: Vec<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<DfsObjectVersionRecord>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -1806,12 +1809,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry> {
         let mut objects_by_shard = BTreeMap::<DfsMetadataShardId, Vec<DfsObjectMetadata>>::new();
+        let mut versions_by_shard =
+            BTreeMap::<DfsMetadataShardId, Vec<DfsObjectVersionRecord>>::new();
+        let mut object_shards = BTreeMap::<DfsObjectId, DfsMetadataShardId>::new();
         let mut cross_shard_tombstones =
             Vec::<(DfsObjectMetadata, DfsMetadataShardId, DfsMetadataShardId)>::new();
         for object in &transaction.objects {
             let object = normalized_object_metadata(object);
             let target_shard_id =
                 self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+            object_shards.insert(object.object_id.clone(), target_shard_id.clone());
             if let Some(source_shard_id) = self.shard_id_for_object(&object.object_id)?
                 && source_shard_id != target_shard_id
             {
@@ -1826,12 +1833,26 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 .or_default()
                 .push(object);
         }
+        for version in &transaction.versions {
+            let version = normalized_version_record(version);
+            let shard_id = if let Some(shard_id) = object_shards.get(&version.object_id) {
+                shard_id.clone()
+            } else {
+                self.require_shard_id_for_object(&version.object_id)?
+            };
+            versions_by_shard.entry(shard_id).or_default().push(version);
+        }
+        let mut shard_ids = objects_by_shard.keys().cloned().collect::<BTreeSet<_>>();
+        shard_ids.extend(versions_by_shard.keys().cloned());
         let mut last_entry = None;
-        for (shard_id, objects) in objects_by_shard {
+        for shard_id in shard_ids {
+            let objects = objects_by_shard.remove(&shard_id).unwrap_or_default();
+            let versions = versions_by_shard.remove(&shard_id).unwrap_or_default();
             let shard_transaction = DfsNamespaceTransaction {
                 transaction_id: format!("{}:{}", transaction.transaction_id, shard_id.0),
                 file_system_id: transaction.file_system_id.clone(),
                 objects,
+                versions,
                 created_at: transaction.created_at,
             };
             let entry = self
@@ -1847,7 +1868,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         last_entry.ok_or_else(|| {
             MetadataBackendError::Serde(format!(
-                "namespace transaction {} did not contain any objects",
+                "namespace transaction {} did not contain any objects or versions",
                 transaction.transaction_id
             ))
         })
@@ -2338,12 +2359,14 @@ impl LocalJsonMetadataBackend {
                     transaction.as_ref(),
                 )?;
                 let normalized = normalized_namespace_transaction(transaction);
-                if read_json_optional::<DfsNamespaceTransaction>(
-                    &self.namespace_transaction_path(transaction_id),
-                )? == Some(normalized.clone())
+                if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized)
                     && normalized.objects.iter().all(|object| {
                         self.get_object(&object.object_id)
                             .is_ok_and(|stored| stored == Some(normalized_object_metadata(object)))
+                    })
+                    && normalized.versions.iter().all(|version| {
+                        self.get_version(&version.object_id, &version.version)
+                            .is_ok_and(|stored| stored == Some(normalized_version_record(version)))
                     })
                 {
                     return Ok(false);
@@ -2537,6 +2560,20 @@ impl LocalJsonMetadataBackend {
         self.write_local_materialization_cursor(&cursor)
     }
 
+    fn checkpoint_local_materialization_cursor_if_due(&self, sequence: u64) -> Result<()> {
+        let cursor = self.local_materialization_cursor()?;
+        if sequence <= cursor.last_sequence
+            || sequence.saturating_sub(cursor.last_sequence)
+                < LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL
+        {
+            return Ok(());
+        }
+        self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
+            shard_id: cursor.shard_id,
+            last_sequence: sequence,
+        })
+    }
+
     fn write_local_materialization_cursor(&self, cursor: &DfsMetadataReplayCursor) -> Result<()> {
         write_json_atomic(&self.local_materialization_cursor_path(), cursor)
     }
@@ -2679,12 +2716,6 @@ impl LocalJsonMetadataBackend {
                     return Ok(());
                 };
                 let transaction = normalized_namespace_transaction(transaction);
-                self.append_and_apply_table_ops(
-                    entry.sequence,
-                    vec![DfsMetadataTableOp::PutNamespaceTransaction {
-                        transaction: transaction.clone(),
-                    }],
-                )?;
                 self.materialize_namespace_transaction(&transaction, entry.sequence)
             }
         }
@@ -2692,12 +2723,6 @@ impl LocalJsonMetadataBackend {
 
     fn records_root(&self) -> PathBuf {
         self.root.join("records")
-    }
-
-    fn namespace_transaction_path(&self, transaction_id: &str) -> PathBuf {
-        self.records_root()
-            .join("namespace-transactions")
-            .join(format!("{}.sobj", key_segment(&transaction_id)))
     }
 
     fn replay_cursor_path(&self, shard_id: &DfsMetadataShardId) -> PathBuf {
@@ -2914,7 +2939,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
                 file_system: file_system.clone(),
             }],
         )?;
-        self.advance_local_materialization_cursor(entry.sequence)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
 
@@ -2945,7 +2970,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             object: Some(object.clone()),
         })?;
         self.materialize_object_indexes_with_previous(&object, previous.as_ref(), entry.sequence)?;
-        self.advance_local_materialization_cursor(entry.sequence)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
 
@@ -3132,7 +3157,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
                 }],
             )?;
         }
-        self.advance_local_materialization_cursor(entry.sequence)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
 
@@ -3180,7 +3205,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
                 receipt: receipt.clone(),
             }],
         )?;
-        self.advance_local_materialization_cursor(entry.sequence)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
 
@@ -3223,7 +3248,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
                 intent: intent.clone(),
             }],
         )?;
-        self.advance_local_materialization_cursor(entry.sequence)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
 
@@ -3305,7 +3330,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             required_replica_node_ids: commit_record.required_replica_node_ids.clone(),
         })?;
         self.materialize_visible_version_commit(&commit_record, entry.sequence)?;
-        self.advance_local_materialization_cursor(entry.sequence)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
 
@@ -3344,7 +3369,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         {
             self.materialize_namespace_transaction(transaction, entry.sequence)?;
         }
-        self.advance_local_materialization_cursor(entry.sequence)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
 
@@ -3362,7 +3387,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
                 conflict: conflict.clone(),
             }],
         )?;
-        self.advance_local_materialization_cursor(entry.sequence)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
 
@@ -3567,6 +3592,15 @@ impl LocalJsonMetadataBackend {
             {
                 self.plan_object_index_table_ops(object, &mut table_ops, &mut rollback)?;
             }
+            for version in &transaction.versions {
+                self.plan_namespace_transaction_table_op(
+                    DfsMetadataTableOp::PutVersion {
+                        version: normalized_version_record(version),
+                    },
+                    &mut table_ops,
+                    &mut rollback,
+                );
+            }
             Ok(())
         })();
         if let Err(error) = planning_result {
@@ -3595,6 +3629,16 @@ impl LocalJsonMetadataBackend {
             .filter(|object| object.kind != DfsObjectKind::Tombstone)
         {
             changed |= self.materialize_object_indexes_if_current(object, sequence)?;
+        }
+        for version in &transaction.versions {
+            let version = normalized_version_record(version);
+            if self.get_version(&version.object_id, &version.version)? != Some(version.clone()) {
+                self.append_and_apply_table_ops(
+                    sequence,
+                    vec![DfsMetadataTableOp::PutVersion { version }],
+                )?;
+                changed = true;
+            }
         }
         Ok(changed)
     }
@@ -4118,6 +4162,9 @@ fn normalized_namespace_transaction(
     for object in &mut transaction.objects {
         normalize_node_locations(&mut object.current_locations);
     }
+    for version in &mut transaction.versions {
+        normalize_node_locations(&mut version.locations);
+    }
     transaction
 }
 
@@ -4400,6 +4447,7 @@ fn replay_metadata_table_batches(
 
 fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Result<u64> {
     let path = metadata_table_path(root);
+    let existed = path.exists();
     if let Some(parent) = path.parent() {
         create_dir_all(parent.to_owned())?;
     }
@@ -4430,7 +4478,7 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
             source,
         })?;
     drop(file);
-    if let Some(parent) = path.parent() {
+    if !existed && let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
     Ok(u64::try_from(record.len()).unwrap_or(u64::MAX))
@@ -4908,6 +4956,7 @@ fn append_segmented_journal_entry(root: &Path, entry: &DfsMetadataJournalEntry) 
         .join("journal")
         .join("segments")
         .join(format!("{segment_id:020}.slog"));
+    let existed = path.exists();
     if let Some(parent) = path.parent() {
         create_dir_all(parent.to_owned())?;
     }
@@ -4929,7 +4978,7 @@ fn append_segmented_journal_entry(root: &Path, entry: &DfsMetadataJournalEntry) 
             source,
         })?;
     drop(file);
-    if let Some(parent) = path.parent() {
+    if !existed && let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
     Ok(())
@@ -5882,6 +5931,7 @@ mod tests {
                 transaction_id: "move-to-services".to_string(),
                 file_system_id: file_system.file_system_id.clone(),
                 objects: vec![moved],
+                versions: Vec::new(),
                 created_at: OffsetDateTime::now_utc(),
             })
             .expect_err("target shard journal failure should reject namespace move");
@@ -6400,6 +6450,69 @@ mod tests {
                 .len(),
             table_len_before,
             "idempotent cursor recovery must not append duplicate table batches"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_checkpoints_materialization_cursor_instead_of_every_write() {
+        let root = temp_root("local_backend_deferred_materialization_cursor");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut expected_objects = Vec::new();
+        let (last_sequence, table_len_before) = {
+            let mut backend =
+                LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+            backend.put_file_system(&file_system()).expect("filesystem");
+            let mut last_sequence = 0;
+            for index in 0..8 {
+                let mut object = object(version("version_1"));
+                object.object_id =
+                    DfsObjectId::from_legacy_named(format!("obj_cursor_defer_{index}"))
+                        .expect("object id");
+                object.path = format!("/services/cursor-defer/{index}.txt");
+                let entry = backend.put_object(&object).expect("object");
+                last_sequence = entry.sequence;
+                expected_objects.push(object);
+            }
+            let cursor =
+                read_json::<DfsMetadataReplayCursor>(&backend.local_materialization_cursor_path())
+                    .expect("materialization cursor");
+            assert_eq!(
+                cursor.last_sequence, 0,
+                "short local write bursts should not force a cursor fsync for every metadata mutation"
+            );
+            let table_len = fs::metadata(metadata_table_path(&root))
+                .expect("metadata table")
+                .len();
+            (last_sequence, table_len)
+        };
+
+        let reopened =
+            LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("reopen backend");
+
+        for object in expected_objects {
+            assert_eq!(
+                reopened
+                    .get_object(&object.object_id)
+                    .expect("object lookup"),
+                Some(object),
+                "reopen should recover objects whose materialization cursor was not checkpointed"
+            );
+        }
+        assert_eq!(
+            read_json::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
+                .expect("materialization cursor")
+                .last_sequence,
+            last_sequence,
+            "reopen recovery should advance the cursor after idempotent replay"
+        );
+        assert_eq!(
+            fs::metadata(metadata_table_path(&root))
+                .expect("metadata table")
+                .len(),
+            table_len_before,
+            "idempotent replay from a deferred cursor must not duplicate materialized table batches"
         );
 
         cleanup(&root);
@@ -8566,6 +8679,7 @@ mod tests {
             transaction_id: "namespace_test_rename".to_string(),
             file_system_id: file_system_id(),
             objects: vec![source.clone(), destination.clone()],
+            versions: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
         backend
@@ -8623,6 +8737,7 @@ mod tests {
             transaction_id: "namespace_test_rename".to_string(),
             file_system_id: file_system_id(),
             objects: vec![source, destination],
+            versions: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
         backend
@@ -8639,6 +8754,79 @@ mod tests {
             journal_len,
             "opening a healthy backend must not append duplicate namespace transaction journal entries"
         );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn namespace_transaction_publishes_object_and_version_in_one_table_batch() {
+        let root = temp_root("namespace_transaction_object_version_single_batch");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+        let mut object = object(version("version_2"));
+        object.path = "/services/web/app.bin".to_string();
+        object.content_hash = Some("blake3:namespace-version".to_string());
+        object.content_size_bytes = Some(16 * 1024 * 1024 * 1024);
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let table_batches_before = metadata_table_batch_count(&root);
+
+        backend
+            .apply_namespace_transaction(&DfsNamespaceTransaction {
+                transaction_id: "namespace_object_version_single_batch".to_string(),
+                file_system_id: object.file_system_id.clone(),
+                objects: vec![object.clone()],
+                versions: vec![version_record.clone()],
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("transaction");
+
+        assert_eq!(
+            metadata_table_batch_count(&root),
+            table_batches_before + 1,
+            "creating an object and its visible version should materialize in one table batch"
+        );
+        assert_eq!(
+            backend
+                .get_object(&object.object_id)
+                .expect("object lookup"),
+            Some(object.clone())
+        );
+        assert_eq!(
+            backend
+                .get_version(&object.object_id, &object.version)
+                .expect("version lookup"),
+            Some(normalized_version_record(&version_record))
+        );
+        let table_batches_after_transaction = metadata_table_batch_count(&root);
+        drop(backend);
+
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen backend");
+
+        assert_eq!(
+            reopened
+                .get_version(&object.object_id, &object.version)
+                .expect("reopened version lookup"),
+            Some(normalized_version_record(&version_record))
+        );
+        assert_eq!(
+            metadata_table_batch_count(&root),
+            table_batches_after_transaction,
+            "replaying a deferred local cursor must not duplicate namespace transaction table batches"
+        );
+
         cleanup(&root);
     }
 

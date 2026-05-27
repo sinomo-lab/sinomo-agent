@@ -267,6 +267,8 @@ pub enum DfsFetchBlobResult {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataJournalBatchCommand {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<NodeId>,
     pub batch: DfsMetadataJournalBatch,
 }
 

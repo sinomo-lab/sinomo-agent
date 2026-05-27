@@ -330,16 +330,23 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         requested_at,
         DAEMON_PROBE_TIMEOUT,
     );
-    restart_local_shadow_for_rollout(
-        &artifacts.built_binary,
-        &plan.activation.shadow_binary,
-        &plan.activation.main_binary,
-        &data_dir,
-        &options,
-        &plan.activation.main_host,
-        plan.activation.main_port,
-    )?;
-    stage_rollout_main_activation(&data_dir.root(), &paths, plan.activation)?;
+    let shadow_available = matches!(
+        probe_daemon_status(&DaemonPaths::for_shadow(&data_dir), DAEMON_PROBE_TIMEOUT),
+        DaemonProbeStatus::Running(_)
+    );
+    if shadow_available {
+        restart_local_shadow_for_rollout(
+            &artifacts.built_binary,
+            &plan.activation.shadow_binary,
+            &plan.activation.main_binary,
+            &data_dir,
+            &options,
+            &plan.activation.main_host,
+            plan.activation.main_port,
+        )?;
+    }
+    let activation_strategy =
+        stage_rollout_main_activation(&data_dir.root(), &paths, plan.activation)?;
     if let Some(status) = plan.previous_main_status.as_ref() {
         let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
     }
@@ -347,7 +354,12 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         &options,
         plan.previous_main_status.as_ref().map(|status| status.pid),
     )?;
-    wait_for_local_shadow_rollout_completion(&data_dir, &options)?;
+    if matches!(
+        activation_strategy,
+        RolloutActivationStrategy::ShadowSupervised
+    ) {
+        wait_for_local_shadow_rollout_completion(&data_dir, &options)?;
+    }
     println!("rollout applied");
     println!("  source: {}", rollout_plan.build_dir.display());
     println!(

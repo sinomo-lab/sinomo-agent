@@ -9,7 +9,7 @@ Sinomo installs two daemon binaries under `$SINOMO_DATA_DIR/bin/`:
 - `sinomo`: the main daemon binary.
 - `sinomo-shadow`: the shadow daemon binary.
 
-The main daemon serves normal local and cluster control traffic. The shadow daemon supervises the main daemon and owns rollout recovery. During a rollout, Sinomo updates the main daemon first, verifies that it becomes healthy, and only then updates the shadow daemon. This keeps one stable supervisor alive while candidate main code is being tested.
+The main daemon serves normal local and cluster control traffic. The shadow daemon supervises the main daemon and owns rollout recovery, but it is not required for every deployment. When a local shadow supervisor is running, Sinomo uses it for safer candidate main activation and recovery. When only the main daemon is available, the main daemon can stage a candidate, stop after replying to the rollout request, and let the staged candidate complete activation by itself.
 
 The default data directory is `~/.sinomo`. Important rollout paths are:
 
@@ -30,10 +30,9 @@ Cluster rollout is staged through the running main daemon:
 1. The target main daemon receives the rollout request.
 2. It builds or receives candidate bytes.
 3. It writes pending rollout files under `$SINOMO_DATA_DIR/rollout/`.
-4. It exits.
-5. The existing shadow daemon starts the candidate main binary.
-6. The shadow waits for main health checks to pass.
-7. The healthy main daemon finalizes the shadow binary update.
+4. It exits after the accepted response has been flushed.
+5. If the local shadow daemon is running, the shadow starts the candidate main binary, waits for health checks, and lets the healthy main daemon finalize the shadow binary update.
+6. If the local shadow daemon is not running, the staged candidate starts directly and installs itself as the stable main binary without shadow supervision.
 
 If the candidate main cannot start or does not become healthy, the shadow records failure in `rollout/state.sobj`, restores the previous main binary, and keeps supervising. If the candidate shadow fails after main is healthy, the main daemon attempts to restart the previous shadow binary and records the recovery result.
 
@@ -99,7 +98,7 @@ sinomo rollout import-source --repo /path/to/sinomo
 sinomo rollout apply
 ```
 
-`rollout apply` builds the managed source with `cargo build -p sinomo`, stages main and shadow binaries, restarts shadow supervision, and verifies that the main daemon becomes healthy.
+`rollout apply` builds the managed source with `cargo build -p sinomo`, stages main and shadow binaries, restarts local shadow supervision when available, and verifies that the main daemon becomes healthy.
 
 ## Cluster Targets
 
@@ -202,7 +201,7 @@ sinomo cluster health
 sinomo rollout cluster --remote-build --skip-local --target 192.168.1.154:21353
 ```
 
-Do not target the remote shadow daemon for normal rollout while the main daemon is healthy. The safe rollout handler normally runs on the main daemon and requires the target's existing shadow daemon to be running locally so it can supervise activation.
+Do not target the remote shadow daemon for normal rollout while the main daemon is healthy. The normal rollout handler runs on the main daemon. It uses the target's local shadow daemon for supervised activation when that daemon is running, but it can also complete a main-only activation without the shadow daemon.
 
 If the main daemon or cluster control path is broken but the shadow daemon is still alive, use the shadow daemon as the repair surface. `sinomo daemon shadow status` prints the local shadow Iroh endpoint, and remote operators can use that endpoint directly for diagnostics or a repair rollout:
 

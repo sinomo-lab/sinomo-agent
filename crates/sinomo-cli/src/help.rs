@@ -129,13 +129,13 @@ pub(super) fn print_rollout_help() {
     );
     println!("  sinomo rollout apply [--repo <path>] [--host <host>] [--port <port>]");
     println!(
-        "      Build the data-directory source repo, install bin/sinomo and bin/sinomo-shadow, restart shadow supervision, then verify main health."
+        "      Build the data-directory source repo, stage main and shadow binaries, then verify main health."
     );
     println!(
         "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--remote-repo <path>] [--skip-local]"
     );
     println!(
-        "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then restart each node through its shadow daemon."
+        "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then let each target activate through shadow supervision or main-only self restart."
     );
     println!("  sinomo rollout diagnostics [--target <host:port>]");
     println!(

@@ -1272,6 +1272,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         ),
                         file_system_id: promoted.file_system_id.clone(),
                         objects: vec![old_path_tombstone, alias_tombstone, promoted],
+                        versions: Vec::new(),
                         created_at: time::OffsetDateTime::now_utc(),
                     })?;
                     continue;
@@ -1467,6 +1468,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             transaction_id: namespace_transaction_id("rename", &source.object_id, &source.path),
             file_system_id: source.file_system_id.clone(),
             objects: transaction_objects,
+            versions: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         self.touch_parent_directory_modified(&from)?;
@@ -2178,6 +2180,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             ),
             file_system_id: object.file_system_id.clone(),
             objects: vec![old_path_tombstone.clone(), alias_tombstone, object],
+            versions: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         self.touch_parent_directory_modified(old_path)?;

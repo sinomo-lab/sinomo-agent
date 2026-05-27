@@ -423,6 +423,9 @@ pub fn handle_daemon_dfs_metadata_journal_batch(
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     data_dir.ensure_root_layout()?;
+    if let Some(response) = validate_dfs_metadata_journal_batch_source(&data_dir, &command)? {
+        return Ok(response);
+    }
     let mut backend = LocalJsonMetadataBackend::new(
         command.batch.shard_id.clone(),
         data_dir
@@ -449,6 +452,76 @@ pub fn handle_daemon_dfs_metadata_journal_batch(
                 reason: error.to_string(),
             },
         }),
+    }
+}
+
+fn validate_dfs_metadata_journal_batch_source(
+    data_dir: &SinomoDataDir,
+    command: &DfsMetadataJournalBatchCommand,
+) -> Result<Option<DfsMetadataJournalBatchResponse>, DaemonError> {
+    let cluster_paths = ClusterPaths::new(data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let shard = sinomo_network::read_cluster_kv_prefix_values::<DfsMetadataShardConfig>(
+        &cluster_paths,
+        &format!(
+            "{}/",
+            sinomo_dfs::metadata_shards_prefix(&sinomo_dfs::sifs_file_system_id())
+        ),
+    )?
+    .into_iter()
+    .find(|shard| shard.shard_id == command.batch.shard_id.0.as_str());
+    let Some(shard) = shard else {
+        return Ok(Some(dfs_metadata_journal_rejection_response(
+            command,
+            "metadata journal batch has no local shard config".to_string(),
+        )));
+    };
+    let Some(source_node_id) = command.source_node_id.as_ref() else {
+        return Ok(Some(dfs_metadata_journal_rejection_response(
+            command,
+            "metadata journal batch is missing source node id".to_string(),
+        )));
+    };
+    if source_node_id != &shard.primary_node_id {
+        return Ok(Some(dfs_metadata_journal_rejection_response(
+            command,
+            format!(
+                "metadata journal source {source_node_id} is not shard {} primary {}",
+                shard.shard_id, shard.primary_node_id
+            ),
+        )));
+    }
+    if shard.primary_node_id == state.local_node_id {
+        return Ok(Some(dfs_metadata_journal_rejection_response(
+            command,
+            "metadata primary must not apply a replica journal batch".to_string(),
+        )));
+    }
+    if !shard.replica_node_ids.contains(&state.local_node_id) {
+        return Ok(Some(dfs_metadata_journal_rejection_response(
+            command,
+            format!(
+                "local node {} is not configured as a replica for metadata shard {}",
+                state.local_node_id, shard.shard_id
+            ),
+        )));
+    }
+    Ok(None)
+}
+
+fn dfs_metadata_journal_rejection_response(
+    command: &DfsMetadataJournalBatchCommand,
+    reason: String,
+) -> DfsMetadataJournalBatchResponse {
+    DfsMetadataJournalBatchResponse {
+        request_id: command.request_id.clone(),
+        shard_id: command.batch.shard_id.clone(),
+        next_after_sequence: command.batch.next_after_sequence,
+        applied_entries: 0,
+        result: DfsMetadataJournalBatchResult::Rejected { reason },
     }
 }
 
@@ -1438,6 +1511,7 @@ fn publish_default_dfs_metadata_journal_with_senders(
                         "dfs_meta_{}_{}_{}",
                         state.local_node_id, target_node_id, next_after_sequence
                     ),
+                    source_node_id: Some(state.local_node_id.clone()),
                     batch,
                 };
                 let mut failures = Vec::new();
@@ -2194,7 +2268,7 @@ mod tests {
         let source_root = root.join("source-meta");
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_metadata").expect("node");
         let file_system = distributed_sifs(node_id.clone());
-        let object = distributed_sifs_bootstrap_objects(node_id)
+        let object = distributed_sifs_bootstrap_objects(node_id.clone())
             .into_iter()
             .next()
             .expect("bootstrap object");
@@ -2225,6 +2299,7 @@ mod tests {
             &paths,
             DfsMetadataJournalBatchCommand {
                 request_id: "dfs_meta_req_1".to_string(),
+                source_node_id: Some(node_id.clone()),
                 batch,
             },
         )
@@ -2252,7 +2327,7 @@ mod tests {
         let source_root = root.join("source-meta");
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_metadata_safe").expect("node");
         let file_system = distributed_sifs(node_id.clone());
-        let object = distributed_sifs_bootstrap_objects(node_id)
+        let object = distributed_sifs_bootstrap_objects(node_id.clone())
             .into_iter()
             .next()
             .expect("bootstrap object");
@@ -2270,6 +2345,7 @@ mod tests {
             &paths,
             DfsMetadataJournalBatchCommand {
                 request_id: "dfs_meta_req_safe".to_string(),
+                source_node_id: Some(node_id.clone()),
                 batch,
             },
         )
@@ -2296,6 +2372,96 @@ mod tests {
                 .join("root")
                 .join("frag")
                 .exists()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_journal_batch_rejects_non_primary_source() {
+        let root = temp_root("daemon_dfs_metadata_journal_batch_rejects_stale_source");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local = NodeId::from_legacy_named("node_daemon_dfs_meta_local").expect("local");
+        let primary = NodeId::from_legacy_named("node_daemon_dfs_meta_primary").expect("primary");
+        let stale = NodeId::from_legacy_named("node_daemon_dfs_meta_stale").expect("stale");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_dfs_meta_reject")
+                .expect("cluster"),
+            "daemon dfs metadata reject",
+            local.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let file_system = distributed_sifs(primary.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary.clone(),
+            replica_node_ids: vec![local.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &shard,
+                    None,
+                )
+                .expect("metadata shard op"),
+            ),
+        )
+        .expect("write shard config");
+        let source_root = root.join("source-meta");
+        let mut source =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), source_root)
+                .expect("source backend");
+        source.put_file_system(&file_system).expect("filesystem");
+        let object = distributed_sifs_bootstrap_objects(primary.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        source.put_object(&object).expect("object");
+        let mut subscription = source.subscribe(0);
+        let batch = source
+            .poll_subscription(&mut subscription)
+            .expect("source batch");
+
+        let response = handle_daemon_dfs_metadata_journal_batch(
+            &paths,
+            DfsMetadataJournalBatchCommand {
+                request_id: "dfs_meta_req_stale_source".to_string(),
+                source_node_id: Some(stale.clone()),
+                batch,
+            },
+        )
+        .expect("reject batch");
+
+        assert!(matches!(
+            response.result,
+            DfsMetadataJournalBatchResult::Rejected { ref reason }
+                if reason.contains(&format!("source {stale} is not shard root primary {primary}"))
+        ));
+        let target = LocalJsonMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("target backend");
+        assert!(
+            target
+                .get_object(&object.object_id)
+                .expect("target object")
+                .is_none(),
+            "rejected non-primary journal batch must not mutate the local replica"
         );
 
         cleanup(&root);

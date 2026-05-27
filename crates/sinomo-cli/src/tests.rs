@@ -11711,7 +11711,7 @@ fn rollout_cluster_target_prefers_main_endpoint_for_healthy_main_member() {
 }
 
 #[test]
-fn rollout_cluster_target_prefers_lower_priority_shadow_endpoint() {
+fn rollout_cluster_target_prefers_direct_shadow_endpoint_before_iroh() {
     let main_node_id =
         NodeId::from_legacy_named("node_rollout_shadow_iroh_main").expect("main node");
     let shadow_node_id = shadow_daemon_node_id(&main_node_id);
@@ -11726,7 +11726,7 @@ fn rollout_cluster_target_prefers_lower_priority_shadow_endpoint() {
         .expect("shadow target");
 
     assert_eq!(selected.node_id, shadow_node_id);
-    assert_eq!(selected.transport, ClusterTransportKind::Iroh);
+    assert_eq!(selected.transport, ClusterTransportKind::LanTcp);
 }
 
 #[test]
@@ -11793,6 +11793,14 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
             sinomo_runtime::network::ClusterConnectivityState::Healthy,
         ),
     ] {
+        let consecutive_failures = if matches!(
+            connectivity_state,
+            sinomo_runtime::network::ClusterConnectivityState::Unreachable
+        ) {
+            3
+        } else {
+            0
+        };
         let record = sinomo_runtime::network::ClusterConnectivityRecord {
             cluster_id: cluster_id.clone(),
             source_node_id: local_node_id.clone(),
@@ -11802,7 +11810,7 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
             address: endpoint.address.clone(),
             state: connectivity_state,
             latency_ms: None,
-            consecutive_failures: 0,
+            consecutive_failures,
             last_success_at: None,
             last_failure_at: None,
             observed_at: now,
