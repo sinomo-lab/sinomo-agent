@@ -53,7 +53,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const DAEMON_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
 pub const DAEMON_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
-pub const DAEMON_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+pub const DAEMON_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 pub const DAEMON_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 pub const DAEMON_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2844,7 +2844,7 @@ fn forward_cluster_kv_txn_to_voter(
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT;
-    for (index, endpoint) in targets.iter().enumerate() {
+    for endpoint in &targets {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -2855,20 +2855,16 @@ fn forward_cluster_kv_txn_to_voter(
             ));
             break;
         }
-        match send_cluster_kv_txn(
-            &endpoint,
-            txn,
-            cluster_endpoint_fair_command_timeout(endpoint, remaining, targets.len() - index),
-        ) {
+        let txn_timeout = cluster_endpoint_command_timeout(endpoint, remaining);
+        match send_cluster_kv_txn(&endpoint, txn, txn_timeout) {
             Ok(response) => {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_default();
                 return Some(
                     fetch_cluster_kv_snapshot_from_endpoint(
                         &endpoint,
-                        cluster_endpoint_fair_command_timeout(
-                            endpoint,
-                            remaining,
-                            targets.len() - index,
-                        ),
+                        cluster_endpoint_command_timeout(endpoint, remaining),
                     )
                     .map(|snapshot| (snapshot, Some(response))),
                 );
