@@ -364,11 +364,9 @@ pub fn start_daemon_iroh_proxy_if_clustered(
     if env::var("SINOMO_ENABLE_IROH").ok().as_deref() == Some("0") {
         return Ok(());
     }
-    let Some(cluster) = cluster.cloned() else {
-        return Ok(());
-    };
     let paths = paths.clone();
     let options = options.clone();
+    let mut cluster = cluster.cloned();
     let label = label.to_string();
     let thread_name = format!("sinomo-{label}-iroh");
     thread::Builder::new()
@@ -382,31 +380,66 @@ pub fn start_daemon_iroh_proxy_if_clustered(
             };
             let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
             let daemon_address = daemon_connect_address(&options.host, options.port);
+            let mut proxy_started = false;
+            let mut next_republish = Instant::now();
             loop {
-                match sinomo_network::start_iroh_daemon_proxy(
-                    cluster_paths.clone(),
-                    cluster.cluster_id.clone(),
-                    cluster.node_id.clone(),
-                    daemon_address.clone(),
-                ) {
-                    Ok(record) => {
-                        let endpoint = record.endpoint();
-                        if let Err(error) = advertise_daemon_iroh_endpoint(&paths, record) {
-                            eprintln!("sinomo {label} iroh endpoint advertisement failed: {error}");
+                if cluster.is_none() {
+                    cluster = daemon_cluster_status_from_paths(&paths).ok().flatten();
+                    if cluster.is_none() {
+                        let retry_delay = if cluster_paths.state.exists() {
+                            Duration::from_secs(5)
                         } else {
-                            println!("sinomo {label} iroh endpoint: {}", endpoint.address);
-                        }
-                        break;
-                    }
-                    Err(error) if error.to_string().contains("without iroh-transport") => {
-                        eprintln!("sinomo {label} iroh proxy disabled: {error}");
-                        break;
-                    }
-                    Err(error) => {
-                        eprintln!("sinomo {label} iroh proxy unavailable, retrying: {error}");
-                        thread::sleep(Duration::from_secs(5));
+                            DAEMON_CLUSTER_PUBLISH_INTERVAL
+                        };
+                        thread::sleep(retry_delay);
+                        continue;
                     }
                 }
+                let Some(current_cluster) = cluster.clone() else {
+                    thread::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL);
+                    continue;
+                };
+                if !proxy_started {
+                    match sinomo_network::start_iroh_daemon_proxy(
+                        cluster_paths.clone(),
+                        current_cluster.cluster_id.clone(),
+                        current_cluster.node_id.clone(),
+                        daemon_address.clone(),
+                    ) {
+                        Ok(record) => {
+                            let endpoint = record.endpoint();
+                            if let Err(error) = advertise_daemon_iroh_endpoint(&paths, record) {
+                                eprintln!(
+                                    "sinomo {label} iroh endpoint advertisement failed: {error}"
+                                );
+                            } else {
+                                println!("sinomo {label} iroh endpoint: {}", endpoint.address);
+                            }
+                            proxy_started = true;
+                            next_republish = Instant::now() + DAEMON_CLUSTER_PUBLISH_INTERVAL;
+                        }
+                        Err(error) if error.to_string().contains("without iroh-transport") => {
+                            eprintln!("sinomo {label} iroh proxy disabled: {error}");
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("sinomo {label} iroh proxy unavailable, retrying: {error}");
+                            thread::sleep(Duration::from_secs(5));
+                        }
+                    }
+                    continue;
+                }
+                if Instant::now() >= next_republish {
+                    if let Err(error) = refresh_daemon_iroh_repair_route(&paths) {
+                        eprintln!("sinomo {label} iroh repair route publish failed: {error}");
+                    } else if let Some(updated) =
+                        daemon_cluster_status_from_paths(&paths).ok().flatten()
+                    {
+                        cluster = Some(updated);
+                    }
+                    next_republish = Instant::now() + DAEMON_CLUSTER_PUBLISH_INTERVAL;
+                }
+                thread::sleep(Duration::from_secs(5));
             }
         })
         .map(|_| ())
@@ -416,6 +449,34 @@ pub fn start_daemon_iroh_proxy_if_clustered(
         })
 }
 
+pub fn daemon_cluster_status_from_paths(
+    paths: &DaemonPaths,
+) -> Result<Option<DaemonClusterStatus>, DaemonError> {
+    let mut status = read_daemon_status(paths)?;
+    ensure_daemon_status_cluster(paths, &mut status)?;
+    Ok(status.cluster)
+}
+
+pub fn refresh_daemon_iroh_repair_route(paths: &DaemonPaths) -> Result<bool, DaemonError> {
+    let Some(cluster) = daemon_cluster_status_from_paths(paths)? else {
+        return Ok(false);
+    };
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    match read_local_iroh_endpoint_record(&cluster_paths, &cluster.node_id) {
+        Ok(record) => {
+            advertise_daemon_iroh_endpoint(paths, record)?;
+            Ok(true)
+        }
+        Err(error) => {
+            eprintln!(
+                "sinomo {} iroh repair route unavailable: {error}",
+                cluster.process
+            );
+            Ok(false)
+        }
+    }
+}
+
 pub fn start_shadow_daemon_status_publisher(paths: &DaemonPaths) -> Result<(), DaemonError> {
     let status_paths = paths.clone();
     thread::Builder::new()
@@ -423,6 +484,9 @@ pub fn start_shadow_daemon_status_publisher(paths: &DaemonPaths) -> Result<(), D
         .spawn(move || {
             loop {
                 thread::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL);
+                if let Err(error) = refresh_daemon_iroh_repair_route(&status_paths) {
+                    eprintln!("sinomo shadow daemon iroh repair route tick failed: {error}");
+                }
                 if let Err(error) = refresh_daemon_node_status_in_kv(&status_paths) {
                     eprintln!("sinomo shadow daemon cluster status tick failed: {error}");
                 }
@@ -3398,6 +3462,75 @@ mod tests {
         assert_eq!(status.process, crate::DAEMON_SHADOW_CLUSTER_ROLE);
         assert_eq!(status.member_role, ClusterMemberRole::NonVoting);
         assert_eq!(status.member_state, ClusterMemberState::NonVoting);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn shadow_iroh_repair_route_refreshes_local_state_from_disk() {
+        let root = unique_cluster_test_root("sinomo-daemon-shadow-iroh-repair-route");
+        let data_dir = SinomoDataDir::new(&root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let shadow_paths = DaemonPaths::for_shadow(&data_dir);
+        shadow_paths.ensure().expect("shadow paths");
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_shadow_iroh_repair_route").expect("cluster"),
+            "shadow iroh repair route".to_string(),
+            NodeId::from_legacy_named("node_shadow_iroh_repair_route").expect("node"),
+            "shadow iroh repair route".to_string(),
+            "main-public-key".to_string(),
+            now,
+        );
+        let main_options = DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 21_353,
+        };
+        let shadow_options = DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 21_354,
+        };
+        ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, now);
+        let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+        let shadow_cluster = daemon_cluster_status(&state, crate::DaemonClusterProcess::Shadow)
+            .expect("shadow cluster status");
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write local state");
+        write_daemon_status(
+            &shadow_paths,
+            &crate::DaemonStatus::new(&shadow_options, &shadow_paths, Some(shadow_cluster)),
+        )
+        .expect("write shadow status");
+        sinomo_network::write_iroh_endpoint_record(
+            &cluster_paths,
+            &IrohEndpointRecord {
+                cluster_id: state.cluster_id.clone(),
+                node_id: shadow_node_id.clone(),
+                endpoint_public_key: "iroh_public_key_shadow_repair_route".to_string(),
+                direct_addresses: Vec::new(),
+                relay_url: Some("https://relay.example./".to_string()),
+                relay_mode: sinomo_network::IrohRelayMode::Default,
+                expires_after_tick: 0,
+            },
+        )
+        .expect("write iroh endpoint record");
+
+        assert!(
+            refresh_daemon_iroh_repair_route(&shadow_paths).expect("refresh repair route"),
+            "shadow repair route should be refreshed from the local iroh endpoint record"
+        );
+        let updated =
+            sinomo_network::read_cluster_state_without_kv(&cluster_paths).expect("read state");
+        let shadow_member = updated
+            .members
+            .iter()
+            .find(|member| member.node_id == shadow_node_id)
+            .expect("shadow member");
+        assert!(shadow_member.endpoints.iter().any(|endpoint| {
+            endpoint.transport == ClusterTransportKind::Iroh
+                && endpoint.address
+                    == "iroh://iroh_public_key_shadow_repair_route?relay=https://relay.example./"
+        }));
 
         std::fs::remove_dir_all(root).ok();
     }

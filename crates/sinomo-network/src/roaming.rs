@@ -560,10 +560,7 @@ async fn run_iroh_daemon_proxy(
     let _ = tokio::time::timeout(IROH_DAEMON_ONLINE_TIMEOUT, endpoint.online()).await;
     let record = iroh_endpoint_record_from_addr(&cluster_id, &node_id, endpoint.addr());
     if let Err(error) = write_iroh_endpoint_record(&paths, &record) {
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(error.clone()));
-        }
-        return Err(error);
+        eprintln!("sinomo iroh daemon endpoint record write failed: {error}");
     }
     if let Some(ready) = ready.take() {
         let _ = ready.send(Ok(record));
