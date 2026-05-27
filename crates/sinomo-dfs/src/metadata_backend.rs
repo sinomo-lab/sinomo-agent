@@ -1454,6 +1454,8 @@ impl LocalJsonMetadataBackend {
     pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         let _lock = self.begin_metadata_write()?;
         let mut applied = 0usize;
+        let mut local_cursor = self.local_materialization_cursor()?;
+        let mut local_cursor_advanced = false;
         let mut replay_cursors = BTreeMap::<DfsMetadataShardId, DfsMetadataReplayCursor>::new();
         let mut advanced_cursors = BTreeSet::<DfsMetadataShardId>::new();
         for entry in &batch.entries {
@@ -1476,9 +1478,15 @@ impl LocalJsonMetadataBackend {
             if self.materialize_replayed_journal_entry_unlocked(entry)? {
                 applied = applied.saturating_add(1);
             }
-            self.advance_local_materialization_cursor(entry.sequence)?;
+            if entry.sequence > local_cursor.last_sequence {
+                local_cursor.last_sequence = entry.sequence;
+                local_cursor_advanced = true;
+            }
             cursor.last_sequence = entry.sequence;
             advanced_cursors.insert(entry.shard_id.clone());
+        }
+        if local_cursor_advanced {
+            self.write_local_materialization_cursor(&local_cursor)?;
         }
         for shard_id in advanced_cursors {
             if let Some(cursor) = replay_cursors.get(&shard_id) {
@@ -1902,14 +1910,16 @@ impl LocalJsonMetadataBackend {
     }
 
     fn advance_local_materialization_cursor(&self, sequence: u64) -> Result<()> {
-        let current = self.local_materialization_cursor()?;
-        write_json_atomic(
-            &self.local_materialization_cursor_path(),
-            &DfsMetadataReplayCursor {
-                shard_id: self.shard_id.clone(),
-                last_sequence: sequence.max(current.last_sequence),
-            },
-        )
+        let mut cursor = self.local_materialization_cursor()?;
+        if sequence <= cursor.last_sequence {
+            return Ok(());
+        }
+        cursor.last_sequence = sequence;
+        self.write_local_materialization_cursor(&cursor)
+    }
+
+    fn write_local_materialization_cursor(&self, cursor: &DfsMetadataReplayCursor) -> Result<()> {
+        write_json_atomic(&self.local_materialization_cursor_path(), cursor)
     }
 
     fn recover_unmaterialized_local_journal_entries(&mut self) -> Result<()> {
@@ -1926,10 +1936,20 @@ impl LocalJsonMetadataBackend {
             if entries.is_empty() {
                 break;
             }
+            let mut advanced = false;
             for entry in entries {
-                self.materialize_local_journal_entry(&entry)?;
-                cursor.last_sequence = entry.sequence;
-                write_json_atomic(&self.local_materialization_cursor_path(), &cursor)?;
+                if journal_entry_has_replay_payloads(&entry) {
+                    self.materialize_replayed_journal_entry_unlocked(&entry)?;
+                } else {
+                    self.materialize_local_journal_entry(&entry)?;
+                }
+                if entry.sequence > cursor.last_sequence {
+                    cursor.last_sequence = entry.sequence;
+                    advanced = true;
+                }
+            }
+            if advanced {
+                self.write_local_materialization_cursor(&cursor)?;
             }
         }
         Ok(())
@@ -3398,6 +3418,23 @@ fn required_replay_payload<'a, T>(
             entry.shard_id.0, entry.sequence
         ))
     })
+}
+
+fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry) -> bool {
+    match &entry.mutation {
+        DfsMetadataMutation::PutFileSystem { file_system, .. } => file_system.is_some(),
+        DfsMetadataMutation::PutObject { object, .. } => object.is_some(),
+        DfsMetadataMutation::PutVersion { version_record, .. } => version_record.is_some(),
+        DfsMetadataMutation::PutReceipt { receipt, .. } => receipt.is_some(),
+        DfsMetadataMutation::PutIntent { intent, .. } => intent.is_some(),
+        DfsMetadataMutation::CommitVisibleVersion {
+            committed_object,
+            visible_version,
+            ..
+        } => committed_object.is_some() && visible_version.is_some(),
+        DfsMetadataMutation::PutConflict { conflict, .. } => conflict.is_some(),
+        DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => transaction.is_some(),
+    }
 }
 
 fn normalized_node_location_list(nodes: &[NodeId]) -> Vec<NodeId> {
@@ -4917,6 +4954,59 @@ mod tests {
                 .expect("materialization cursor")
                 .last_sequence,
             journaled_sequence
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_recovers_stale_materialization_cursor_without_rewriting_table_log() {
+        let root = temp_root("local_backend_stale_materialization_cursor_no_rewrite");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let object = object(version("version_1"));
+        let (last_sequence, table_len_before) = {
+            let mut backend =
+                LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+            backend.put_file_system(&file_system()).expect("filesystem");
+            let entry = backend.put_object(&object).expect("object");
+            let table_len = fs::metadata(metadata_table_path(&root))
+                .expect("metadata table")
+                .len();
+            (entry.sequence, table_len)
+        };
+        write_json_atomic(
+            &root
+                .join("records")
+                .join("local-materialization")
+                .join("cursor.sobj"),
+            &DfsMetadataReplayCursor {
+                shard_id: shard_id.clone(),
+                last_sequence: 0,
+            },
+        )
+        .expect("stale materialization cursor");
+
+        let reopened = LocalJsonMetadataBackend::new(shard_id, &root).expect("reopen");
+
+        assert_eq!(
+            reopened
+                .get_object(&object.object_id)
+                .expect("object lookup"),
+            Some(object),
+            "stale cursor recovery must preserve the materialized object"
+        );
+        assert_eq!(
+            read_json::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
+                .expect("materialization cursor")
+                .last_sequence,
+            last_sequence
+        );
+        assert_eq!(
+            fs::metadata(metadata_table_path(&root))
+                .expect("metadata table")
+                .len(),
+            table_len_before,
+            "idempotent cursor recovery must not append duplicate table batches"
         );
 
         cleanup(&root);
