@@ -29,8 +29,10 @@ use time::OffsetDateTime;
 pub const DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT: u64 = 4096;
 pub const DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT: usize = 512;
 pub const DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 64 * 1024 * 1024;
 const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
+const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
 
 #[derive(Debug, Error)]
@@ -592,6 +594,12 @@ struct DfsMetadataTables {
 struct DfsMetadataTableState {
     tables: DfsMetadataTables,
     table_log_offset: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsMetadataTableSnapshot {
+    format_version: u16,
+    ops: Vec<DfsMetadataTableOp>,
 }
 
 impl DfsMetadataTables {
@@ -1959,6 +1967,29 @@ impl LocalJsonMetadataBackend {
         for op in ops {
             self.tables.apply(op);
         }
+        self.compact_metadata_table_log_if_needed(DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES)?;
+        Ok(())
+    }
+
+    fn compact_metadata_table_log_if_needed(&mut self, max_log_bytes: u64) -> Result<()> {
+        let path = metadata_table_path(&self.root);
+        let len = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(MetadataBackendError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        if len <= max_log_bytes {
+            return Ok(());
+        }
+        persist_metadata_table_snapshot(&self.root, &self.tables)?;
+        self.table_log_offset = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .map_err(|source| MetadataBackendError::Io { path, source })?;
         Ok(())
     }
 
@@ -3266,42 +3297,57 @@ fn metadata_table_path(root: &Path) -> PathBuf {
         .join("materialized.slog")
 }
 
+fn metadata_table_snapshot_path(root: &Path) -> PathBuf {
+    root.join("records").join("tables").join("snapshot.sobj")
+}
+
 fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState> {
-    let table_path = metadata_table_path(root);
-    let mut state = if table_path.is_file() {
-        read_metadata_table_batches(&table_path)?
-    } else {
-        DfsMetadataTableState::default()
-    };
+    let mut state = read_metadata_table_state(root)?;
     if state.tables.has_materialized_state() {
         return Ok(state);
     }
     state.tables = load_legacy_metadata_tables(root)?;
     if state.tables.has_materialized_state() {
         persist_metadata_table_snapshot(root, &state.tables)?;
-        if table_path.is_file() {
-            state.table_log_offset = table_path
-                .metadata()
-                .map_err(|source| MetadataBackendError::Io {
-                    path: table_path.clone(),
-                    source,
-                })?
-                .len();
-        }
+        let table_path = metadata_table_path(root);
+        state.table_log_offset = table_path
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
     }
     Ok(state)
 }
 
-fn read_metadata_table_batches(path: &Path) -> Result<DfsMetadataTableState> {
-    let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
+fn read_metadata_table_state(root: &Path) -> Result<DfsMetadataTableState> {
+    let mut state = read_metadata_table_snapshot(root)?;
+    let table_path = metadata_table_path(root);
+    if table_path.is_file() {
+        state.table_log_offset =
+            replay_metadata_table_batches_from(&table_path, 0, &mut state.tables)?;
+    }
+    Ok(state)
+}
+
+fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
+    let path = metadata_table_snapshot_path(root);
+    if !path.is_file() {
+        return Ok(DfsMetadataTableState::default());
+    }
+    let snapshot: DfsMetadataTableSnapshot = read_json(&path)?;
+    if snapshot.format_version != METADATA_TABLE_SNAPSHOT_FORMAT_VERSION {
+        return Err(MetadataBackendError::Serde(format!(
+            "unsupported DFS metadata table snapshot version {} at {}",
+            snapshot.format_version,
+            path.display()
+        )));
+    }
     let mut tables = DfsMetadataTables::default();
-    let table_log_offset = replay_metadata_table_batches(&mut file, path, &mut tables)?;
+    for op in snapshot.ops {
+        tables.apply(op);
+    }
     Ok(DfsMetadataTableState {
         tables,
-        table_log_offset,
+        table_log_offset: 0,
     })
 }
 
@@ -3422,6 +3468,18 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
 }
 
 fn persist_metadata_table_snapshot(root: &Path, tables: &DfsMetadataTables) -> Result<()> {
+    write_json_atomic(
+        &metadata_table_snapshot_path(root),
+        &DfsMetadataTableSnapshot {
+            format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            ops: metadata_table_snapshot_ops(tables),
+        },
+    )?;
+    truncate_metadata_table_log(root)?;
+    Ok(())
+}
+
+fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<DfsMetadataTableOp> {
     let mut ops = Vec::new();
     ops.extend(
         tables
@@ -3526,14 +3584,30 @@ fn persist_metadata_table_snapshot(root: &Path, tables: &DfsMetadataTables) -> R
             .cloned()
             .map(|transaction| DfsMetadataTableOp::PutNamespaceTransaction { transaction }),
     );
-    for (index, chunk) in ops.chunks(512).enumerate() {
-        append_metadata_table_batch(
-            root,
-            &DfsMetadataTableBatch {
-                sequence: index as u64,
-                ops: chunk.to_vec(),
-            },
-        )?;
+    ops
+}
+
+fn truncate_metadata_table_log(root: &Path) -> Result<()> {
+    let path = metadata_table_path(root);
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    file.sync_all().map_err(|source| MetadataBackendError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
     }
     Ok(())
 }
@@ -4263,6 +4337,8 @@ mod tests {
         last_materialized_sequence: u64,
     ) {
         remove_file_if_exists(&metadata_table_path(root)).expect("remove metadata table log");
+        remove_file_if_exists(&metadata_table_snapshot_path(root))
+            .expect("remove metadata table snapshot");
         write_json_atomic(
             &backend.local_materialization_cursor_path(),
             &DfsMetadataReplayCursor {
@@ -4589,6 +4665,58 @@ mod tests {
             before_len, after_len,
             "opening a healthy backend must not rewrite the materialized metadata table"
         );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_compacts_materialized_table_log_to_snapshot() {
+        let root = temp_root("local_backend_compacts_materialized_table_log");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+        let mut expected_objects = Vec::new();
+        for index in 0..8 {
+            let mut object = object(version("version_1"));
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_compacted_metadata_table_{index}"))
+                    .expect("object");
+            object.path = format!("/docs/compacted-{index}.md");
+            backend.put_object(&object).expect("object");
+            expected_objects.push(object);
+        }
+        let table_path = metadata_table_path(&root);
+        assert!(
+            fs::metadata(&table_path).expect("metadata table").len() > 0,
+            "writes should first append to the materialized table log"
+        );
+
+        backend
+            .compact_metadata_table_log_if_needed(1)
+            .expect("compact metadata table");
+
+        assert!(
+            metadata_table_snapshot_path(&root).is_file(),
+            "compaction should persist a compact materialized table snapshot"
+        );
+        assert_eq!(
+            fs::metadata(&table_path)
+                .expect("truncated metadata table")
+                .len(),
+            0,
+            "compaction should truncate historical table ops after the snapshot is durable"
+        );
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen compacted backend");
+        for object in expected_objects {
+            assert_eq!(
+                reopened
+                    .get_object(&object.object_id)
+                    .expect("object lookup"),
+                Some(object)
+            );
+        }
         cleanup(&root);
     }
 

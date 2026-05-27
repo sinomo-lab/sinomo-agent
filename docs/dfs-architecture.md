@@ -106,6 +106,7 @@ The metadata plane is a CephFS-MDS-like service with Sinomo local-first adjustme
 - metadata is partitioned into SIFS metadata shards,
 - shard ownership and replica sets are configured by the KV control plane,
 - each shard stores records in a local ordered store, not global KV,
+- the current local backend materializes that ordered store as compact table snapshots plus a bounded tail log, so reopen cost follows current metadata size and recent churn rather than all historical table updates,
 - each shard has an append-only journal for mutation replication and replay,
 - large directories split into directory fragments by filename hash,
 - shard replicas subscribe to journal entries and compact snapshots,
@@ -793,7 +794,7 @@ These events should carry node, filesystem, object, version, policy, content has
 ### Phase 2: DFS Metadata Plane
 
 - Add serializers and key builders for inodes, dentries, dirfrags, object versions, intents, receipts, and conflicts. The first implementation includes filesystem, path, inode, dirfrag, object-version, write-intent, receipt, and conflict records.
-- Add a `DfsMetadataBackend` facade over a local ordered store plus append-only journal. The first backend is `LocalJsonMetadataBackend`; it is a durable correctness backend, not the final high-throughput storage engine.
+- Add a `DfsMetadataBackend` facade over a local ordered store plus append-only journal. The first backend is `LocalJsonMetadataBackend`; it stores current ordered-table state as compact snapshots plus a tail log, while the shard journal remains the replication and replay source of truth.
 - Wire `NetworkedDfsService` so filesystem/object registration, durable receipts, and visible-version commits can persist through `DfsMetadataBackend` while the in-memory `DfsMetadataStore` remains a routing cache.
 - Add directory fragmentation thresholds for large directories.
 - Use shard-local compare-and-append for object version updates.
