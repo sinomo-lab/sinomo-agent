@@ -569,6 +569,66 @@ pub(crate) fn parse_dfs_expose_remove(args: &[String]) -> Result<DfsExposeRemove
     })
 }
 
+fn run_dfs_inspection(
+    options: &DfsCommonOptions,
+    request: DaemonDfsInspectionRequest,
+) -> Result<DaemonDfsInspectionResponse, CliError> {
+    if let Some(metadata_root) = options.metadata_root.clone() {
+        return run_dfs_inspection_against_metadata_root(metadata_root, request);
+    }
+    if let Some(status) = default_main_daemon_status()? {
+        return daemon_fetch_dfs_inspection_from_address(
+            &status.address,
+            &request,
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(Into::into);
+    }
+
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    daemon_handle_daemon_dfs_inspection(&DaemonPaths::new(&data_dir), request).map_err(Into::into)
+}
+
+fn run_dfs_inspection_against_metadata_root(
+    metadata_root: PathBuf,
+    request: DaemonDfsInspectionRequest,
+) -> Result<DaemonDfsInspectionResponse, CliError> {
+    let metadata = open_dfs_metadata_for_inspection(Some(metadata_root))?;
+    let inspector = metadata.inspector();
+    Ok(match request {
+        DaemonDfsInspectionRequest::Status => DaemonDfsInspectionResponse::Status {
+            status: inspector.status()?,
+        },
+        DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
+            DaemonDfsInspectionResponse::FileSystem {
+                file_system: inspector.file_system(&file_system_id)?,
+            }
+        }
+        DaemonDfsInspectionRequest::Path {
+            file_system_id,
+            path,
+        } => DaemonDfsInspectionResponse::Path {
+            object: inspector.object_by_path(&file_system_id, &path)?,
+        },
+        DaemonDfsInspectionRequest::Object { object_id } => DaemonDfsInspectionResponse::Object {
+            object: inspector.object(&object_id)?,
+        },
+        DaemonDfsInspectionRequest::Conflicts {
+            file_system_id,
+            object_id,
+        } => DaemonDfsInspectionResponse::Conflicts {
+            conflicts: inspector.conflicts(file_system_id.as_ref(), object_id.as_ref())?,
+        },
+        DaemonDfsInspectionRequest::Repair {
+            file_system_id,
+            object_id,
+        } => DaemonDfsInspectionResponse::Repair {
+            repairs: inspector.repairs(file_system_id.as_ref(), object_id.as_ref())?,
+        },
+    })
+}
+
 pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError> {
     match command {
         DfsCliCommand::Help => {
@@ -588,12 +648,10 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                 }
                 return Ok(());
             }
-            let status = if let Some(metadata_root) = options.metadata_root.clone() {
-                inspect_dfs_status(dfs_metadata_root(Some(metadata_root))?)?
-            } else {
-                let data_dir = SinomoDataDir::from_env_or_home()?;
-                data_dir.ensure_root_layout()?;
-                daemon_handle_daemon_dfs_status(&DaemonPaths::new(&data_dir))?
+            let DaemonDfsInspectionResponse::Status { status } =
+                run_dfs_inspection(&options, DaemonDfsInspectionRequest::Status)?
+            else {
+                return Err(CliError::Usage);
             };
             if options.json {
                 print_json("<dfs-status>", &status)?;
@@ -614,9 +672,16 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             file_system_id,
             options,
         } => {
-            let metadata = open_dfs_metadata_for_inspection(options.metadata_root.clone())?;
-            let inspector = metadata.inspector();
-            let Some(file_system) = inspector.file_system(&file_system_id)? else {
+            let DaemonDfsInspectionResponse::FileSystem { file_system } = run_dfs_inspection(
+                &options,
+                DaemonDfsInspectionRequest::FileSystem {
+                    file_system_id: file_system_id.clone(),
+                },
+            )?
+            else {
+                return Err(CliError::Usage);
+            };
+            let Some(file_system) = file_system else {
                 return Err(CliError::MissingArtifact {
                     artifact: format!("DFS filesystem {file_system_id}"),
                 });
@@ -642,9 +707,17 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             file_system_id,
             options,
         } => {
-            let metadata = open_dfs_metadata_for_inspection(options.metadata_root.clone())?;
-            let inspector = metadata.inspector();
-            let Some(object) = inspector.object_by_path(&file_system_id, &path)? else {
+            let DaemonDfsInspectionResponse::Path { object } = run_dfs_inspection(
+                &options,
+                DaemonDfsInspectionRequest::Path {
+                    file_system_id: file_system_id.clone(),
+                    path: path.clone(),
+                },
+            )?
+            else {
+                return Err(CliError::Usage);
+            };
+            let Some(object) = object else {
                 return Err(CliError::MissingArtifact {
                     artifact: format!("DFS path {path} in filesystem {file_system_id}"),
                 });
@@ -658,9 +731,16 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Object { object_id, options } => {
-            let metadata = open_dfs_metadata_for_inspection(options.metadata_root.clone())?;
-            let inspector = metadata.inspector();
-            let Some(object) = inspector.object(&object_id)? else {
+            let DaemonDfsInspectionResponse::Object { object } = run_dfs_inspection(
+                &options,
+                DaemonDfsInspectionRequest::Object {
+                    object_id: object_id.clone(),
+                },
+            )?
+            else {
+                return Err(CliError::Usage);
+            };
+            let Some(object) = object else {
                 return Err(CliError::MissingArtifact {
                     artifact: format!("DFS object {object_id}"),
                 });
@@ -673,10 +753,16 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Conflicts(options) => {
-            let metadata = open_dfs_metadata_for_inspection(options.common.metadata_root.clone())?;
-            let inspector = metadata.inspector();
-            let conflicts =
-                inspector.conflicts(options.file_system_id.as_ref(), options.object_id.as_ref())?;
+            let DaemonDfsInspectionResponse::Conflicts { conflicts } = run_dfs_inspection(
+                &options.common,
+                DaemonDfsInspectionRequest::Conflicts {
+                    file_system_id: options.file_system_id.clone(),
+                    object_id: options.object_id.clone(),
+                },
+            )?
+            else {
+                return Err(CliError::Usage);
+            };
             if options.common.json {
                 print_json("<dfs-conflicts>", &conflicts)?;
             } else if conflicts.is_empty() {
@@ -697,10 +783,16 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Repair(options) => {
-            let metadata = open_dfs_metadata_for_inspection(options.common.metadata_root.clone())?;
-            let inspector = metadata.inspector();
-            let repairs =
-                inspector.repairs(options.file_system_id.as_ref(), options.object_id.as_ref())?;
+            let DaemonDfsInspectionResponse::Repair { repairs } = run_dfs_inspection(
+                &options.common,
+                DaemonDfsInspectionRequest::Repair {
+                    file_system_id: options.file_system_id.clone(),
+                    object_id: options.object_id.clone(),
+                },
+            )?
+            else {
+                return Err(CliError::Usage);
+            };
             if options.common.json {
                 print_json("<dfs-repair>", &repairs)?;
             } else if repairs.is_empty() {

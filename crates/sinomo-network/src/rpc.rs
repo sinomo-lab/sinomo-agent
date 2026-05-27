@@ -38,6 +38,7 @@ pub const CLUSTER_JOIN_CHALLENGE_ROUTE: &str = "/cluster/join/challenge";
 pub const CLUSTER_JOIN_REGISTER_ROUTE: &str = "/cluster/join/register";
 pub const DFS_RPC_CATEGORY: &str = "dfs";
 pub const DFS_STATUS_ROUTE: &str = "/dfs/status";
+pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
 pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
 pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";

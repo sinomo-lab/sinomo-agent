@@ -12,7 +12,8 @@ use sinomo_dfs::{
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
-    DfsOperatorInspector, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy,
+    DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
+    DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy,
     DfsSubtreePolicy, DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend,
     LocalShardedMetadataBackend, NetworkedDfsService, content_service_key, content_services_prefix,
     default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
@@ -124,6 +125,53 @@ pub struct DaemonDfsSmokeAttempt {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DaemonDfsInspectionRequest {
+    Status,
+    FileSystem {
+        file_system_id: sinomo_dfs::DfsFileSystemId,
+    },
+    Path {
+        file_system_id: sinomo_dfs::DfsFileSystemId,
+        path: String,
+    },
+    Object {
+        object_id: sinomo_dfs::DfsObjectId,
+    },
+    Conflicts {
+        file_system_id: Option<sinomo_dfs::DfsFileSystemId>,
+        object_id: Option<sinomo_dfs::DfsObjectId>,
+    },
+    Repair {
+        file_system_id: Option<sinomo_dfs::DfsFileSystemId>,
+        object_id: Option<sinomo_dfs::DfsObjectId>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DaemonDfsInspectionResponse {
+    Status {
+        status: DfsOperatorStatus,
+    },
+    FileSystem {
+        file_system: Option<DfsOperatorFileSystemView>,
+    },
+    Path {
+        object: Option<DfsOperatorObjectView>,
+    },
+    Object {
+        object: Option<DfsOperatorObjectView>,
+    },
+    Conflicts {
+        conflicts: Vec<sinomo_dfs::DfsConflictRecord>,
+    },
+    Repair {
+        repairs: Vec<DfsOperatorRepairView>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct LegacyDaemonDfsMetadataReplicationCursor {
     target_node_id: sinomo_node::NodeId,
     shard_id: DfsMetadataShardId,
@@ -167,6 +215,50 @@ pub fn handle_daemon_dfs_status(
     data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
     inspect_daemon_dfs_status(&data_dir, &cluster_paths)
+}
+
+pub fn handle_daemon_dfs_inspection(
+    paths: &DaemonPaths,
+    request: DaemonDfsInspectionRequest,
+) -> Result<DaemonDfsInspectionResponse, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
+    let inspector = DfsOperatorInspector::new(metadata.as_ref());
+    let response = match request {
+        DaemonDfsInspectionRequest::Status => DaemonDfsInspectionResponse::Status {
+            status: inspector.status()?,
+        },
+        DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
+            DaemonDfsInspectionResponse::FileSystem {
+                file_system: inspector.file_system(&file_system_id)?,
+            }
+        }
+        DaemonDfsInspectionRequest::Path {
+            file_system_id,
+            path,
+        } => DaemonDfsInspectionResponse::Path {
+            object: inspector.object_by_path(&file_system_id, &path)?,
+        },
+        DaemonDfsInspectionRequest::Object { object_id } => DaemonDfsInspectionResponse::Object {
+            object: inspector.object(&object_id)?,
+        },
+        DaemonDfsInspectionRequest::Conflicts {
+            file_system_id,
+            object_id,
+        } => DaemonDfsInspectionResponse::Conflicts {
+            conflicts: inspector.conflicts(file_system_id.as_ref(), object_id.as_ref())?,
+        },
+        DaemonDfsInspectionRequest::Repair {
+            file_system_id,
+            object_id,
+        } => DaemonDfsInspectionResponse::Repair {
+            repairs: inspector.repairs(file_system_id.as_ref(), object_id.as_ref())?,
+        },
+    };
+    Ok(response)
 }
 
 fn inspect_daemon_dfs_status(

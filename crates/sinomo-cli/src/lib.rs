@@ -96,10 +96,12 @@ use sinomo_runtime::daemon::{
     ensure_rollout_target_platform_matches_local as daemon_ensure_rollout_target_platform_matches_local,
     fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
+    fetch_dfs_inspection_from_address as daemon_fetch_dfs_inspection_from_address,
     fetch_dfs_status_from_endpoint as daemon_fetch_dfs_status_from_endpoint,
     git_is_available as daemon_git_is_available,
     handle_daemon_cluster_kv_range_prefix as daemon_handle_daemon_cluster_kv_range_prefix,
     handle_daemon_connection as daemon_handle_daemon_connection,
+    handle_daemon_dfs_inspection as daemon_handle_daemon_dfs_inspection,
     handle_daemon_dfs_status as daemon_handle_daemon_dfs_status,
     initialize_local_cluster as daemon_initialize_local_cluster,
     install_managed_source_repo as daemon_install_managed_source_repo,
@@ -145,6 +147,7 @@ use sinomo_runtime::daemon::{
     write_install_boot_entries as daemon_write_install_boot_entries,
     write_local_cluster_state as daemon_write_local_cluster_state,
 };
+use sinomo_runtime::daemon::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 #[cfg(test)]
 use sinomo_runtime::daemon::{
     DaemonLock, daemon_rpc_command,
@@ -189,10 +192,10 @@ use sinomo_runtime::daemon::{
 use sinomo_runtime::dfs::{
     DfsExposeAddRequest, DfsPinAddRequest, DfsPinMode, add_dfs_expose_entry, add_local_dfs_pin,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_expose_config_path,
-    ensure_default_dfs_expose_config, fallback_dfs_node_id, inspect_dfs_status,
-    list_local_dfs_pins, load_dfs_expose_config, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend, remove_dfs_expose_entry,
-    remove_local_dfs_pin, resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
+    ensure_default_dfs_expose_config, fallback_dfs_node_id, list_local_dfs_pins,
+    load_dfs_expose_config, metadata_shards_prefix, open_local_sharded_metadata_backend,
+    open_root_local_metadata_backend, remove_dfs_expose_entry, remove_local_dfs_pin,
+    resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
 };
 use sinomo_runtime::dfs::{
     DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId, DfsOperatorInspector,
