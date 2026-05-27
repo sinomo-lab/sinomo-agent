@@ -1741,6 +1741,9 @@ impl LocalJsonMetadataBackend {
 
     fn recover_unmaterialized_local_journal_entries(&mut self) -> Result<()> {
         let mut cursor = self.local_materialization_cursor()?;
+        if cursor.last_sequence >= self.next_sequence.saturating_sub(1) {
+            return Ok(());
+        }
         loop {
             let entries = journal_entries_since_limited(
                 &self.root,
@@ -3712,27 +3715,75 @@ fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     if !journal_dir.exists() {
         return Ok(1);
     }
-    let mut max_sequence =
-        read_json_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
-            .map(|head| head.next_sequence.saturating_sub(1))
-            .unwrap_or(0);
-    for entry in read_dir(&journal_dir)? {
+    let head_path = journal_dir.join("head.sobj");
+    let head_next_sequence =
+        read_json_optional::<DfsMetadataJournalHead>(&head_path)?.map(|head| head.next_sequence);
+    let mut max_sequence = head_next_sequence
+        .map(|next_sequence| next_sequence.saturating_sub(1))
+        .unwrap_or(0);
+
+    max_sequence = max_sequence.max(max_segmented_journal_sequence(root)?);
+    for (sequence, _, _) in legacy_journal_entry_paths_since(root, 0)? {
+        max_sequence = max_sequence.max(sequence);
+    }
+
+    let next_sequence = max_sequence.saturating_add(1).max(1);
+    if head_next_sequence != Some(next_sequence) {
+        write_json_atomic(&head_path, &DfsMetadataJournalHead { next_sequence })?;
+    }
+    Ok(next_sequence)
+}
+
+fn highest_segmented_journal_path(root: &Path) -> Result<Option<PathBuf>> {
+    let segments_dir = root.join("journal").join("segments");
+    if !segments_dir.exists() {
+        return Ok(None);
+    }
+    let mut highest: Option<(u64, PathBuf)> = None;
+    for entry in read_dir(&segments_dir)? {
         let path = entry.path();
-        if path.file_name().and_then(|name| name.to_str()) == Some("head.sobj") {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("slog") {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let Ok(sequence) = stem.parse::<u64>() else {
+        let Ok(segment_id) = stem.parse::<u64>() else {
             continue;
         };
-        max_sequence = max_sequence.max(sequence);
+        if highest
+            .as_ref()
+            .is_none_or(|(highest_segment_id, _)| segment_id > *highest_segment_id)
+        {
+            highest = Some((segment_id, path));
+        }
     }
-    for entry in journal_entries_since(root, 0)? {
+    Ok(highest.map(|(_, path)| path))
+}
+
+fn journal_head_next_sequence(root: &Path) -> Result<Option<u64>> {
+    Ok(
+        read_json_optional::<DfsMetadataJournalHead>(&root.join("journal").join("head.sobj"))?
+            .and_then(|head| (head.next_sequence > 0).then_some(head.next_sequence)),
+    )
+}
+
+fn journal_has_entries_after_head(root: &Path, after_sequence: u64) -> Result<bool> {
+    let Some(next_sequence) = journal_head_next_sequence(root)? else {
+        return Ok(true);
+    };
+    Ok(after_sequence < next_sequence.saturating_sub(1))
+}
+
+fn max_segmented_journal_sequence(root: &Path) -> Result<u64> {
+    let Some(path) = highest_segmented_journal_path(root)? else {
+        return Ok(0);
+    };
+    let mut max_sequence = 0;
+    for entry in read_segmented_journal_file_since_limited(&path, 0, usize::MAX)? {
         max_sequence = max_sequence.max(entry.sequence);
     }
-    Ok(max_sequence.saturating_add(1).max(1))
+    Ok(max_sequence)
 }
 
 fn append_segmented_journal_entry(root: &Path, entry: &DfsMetadataJournalEntry) -> Result<()> {
@@ -3840,17 +3891,33 @@ fn metadata_journal_batch_encoded_len(batch: &DfsMetadataJournalBatch) -> Result
 }
 
 fn migrate_legacy_journal_entries(root: &Path) -> Result<()> {
-    let existing_segment_sequences = segmented_journal_entries_since(root, 0)?
-        .into_iter()
-        .map(|entry| entry.sequence)
-        .collect::<BTreeSet<_>>();
-    for (sequence, path, entry) in legacy_journal_entry_paths_since(root, 0)? {
-        if !existing_segment_sequences.contains(&sequence) {
+    let legacy_entries = legacy_journal_entry_paths_since(root, 0)?;
+    if legacy_entries.is_empty() {
+        return Ok(());
+    }
+    for (sequence, path, entry) in legacy_entries {
+        if !segmented_journal_contains_sequence(root, sequence)? {
             append_segmented_journal_entry(root, &entry)?;
         }
         remove_file_if_exists(&path)?;
     }
     Ok(())
+}
+
+fn segmented_journal_contains_sequence(root: &Path, sequence: u64) -> Result<bool> {
+    let segment_id = journal_segment_id(sequence);
+    let path = root
+        .join("journal")
+        .join("segments")
+        .join(format!("{segment_id:020}.slog"));
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(
+        read_segmented_journal_file_since_limited(&path, sequence.saturating_sub(1), 1)?
+            .first()
+            .is_some_and(|entry| entry.sequence == sequence),
+    )
 }
 
 fn legacy_journal_entry_paths_since(
@@ -3887,19 +3954,15 @@ fn legacy_journal_entry_paths_since(
     Ok(entries)
 }
 
-fn segmented_journal_entries_since(
-    root: &Path,
-    after_sequence: u64,
-) -> Result<Vec<DfsMetadataJournalEntry>> {
-    segmented_journal_entries_since_limited(root, after_sequence, usize::MAX)
-}
-
 fn segmented_journal_entries_since_limited(
     root: &Path,
     after_sequence: u64,
     max_entries: usize,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
     if max_entries == 0 {
+        return Ok(Vec::new());
+    }
+    if !journal_has_entries_after_head(root, after_sequence)? {
         return Ok(Vec::new());
     }
     let segments_dir = root.join("journal").join("segments");
@@ -4889,6 +4952,73 @@ mod tests {
         let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(reopened.journal_since(0).expect("journal").len(), 2);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reopen_uses_head_and_cursor_without_scanning_consumed_segments() {
+        let root = temp_root("local_backend_reopen_uses_head_and_cursor");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+        let mut backend = LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        backend
+            .compact_metadata_table_log_if_needed(1)
+            .expect("compact table snapshot");
+
+        let high_sequence = JOURNAL_SEGMENT_ENTRY_LIMIT + 1;
+        append_segmented_journal_entry(
+            &root,
+            &DfsMetadataJournalEntry {
+                shard_id: shard_id.clone(),
+                sequence: high_sequence,
+                created_at: OffsetDateTime::now_utc(),
+                mutation: DfsMetadataMutation::PutFileSystem {
+                    file_system_id: file_system.file_system_id.clone(),
+                    file_system: Some(file_system.clone()),
+                },
+            },
+        )
+        .expect("high segment entry");
+        write_json_atomic(
+            &root.join("journal").join("head.sobj"),
+            &DfsMetadataJournalHead {
+                next_sequence: high_sequence + 1,
+            },
+        )
+        .expect("journal head");
+        write_json_atomic(
+            &backend.local_materialization_cursor_path(),
+            &DfsMetadataReplayCursor {
+                shard_id: shard_id.clone(),
+                last_sequence: high_sequence,
+            },
+        )
+        .expect("local cursor");
+        fs::write(
+            root.join("journal")
+                .join("segments")
+                .join("00000000000000000001.slog"),
+            [1_u8, 0, 0, 0, 0xff],
+        )
+        .expect("corrupt consumed segment");
+        drop(backend);
+
+        let reopened = LocalJsonMetadataBackend::new(shard_id, &root)
+            .expect("reopen should not scan consumed journal segments");
+        assert_eq!(
+            reopened.get_object(&object.object_id).expect("object"),
+            Some(object)
+        );
+        assert!(
+            reopened
+                .journal_since(high_sequence)
+                .expect("journal after head")
+                .is_empty()
+        );
 
         cleanup(&root);
     }
