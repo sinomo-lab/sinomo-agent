@@ -585,26 +585,44 @@ pub fn ensure_default_distributed_dfs(
         sinomo_network::read_cluster_state_without_kv(&cluster_paths)?
     };
     let file_system = default_cluster_sifs(&state);
-    let local_is_root_primary = if publish_cluster_control {
+    let local_has_primary_metadata_shards = if publish_cluster_control {
         put_cluster_kv_control_record(
             &cluster_paths,
             &state.local_node_id,
             file_system_config_key(&file_system.file_system_id),
             &DfsFileSystemConfig::from(&file_system),
         )?;
-        let root_shard = default_cluster_root_metadata_shard(&cluster_paths, &state, &file_system)?;
-        put_cluster_kv_control_record(
-            &cluster_paths,
-            &state.local_node_id,
-            metadata_shard_key(&file_system.file_system_id, "root"),
-            &root_shard,
-        )?;
+        let metadata_shards =
+            default_cluster_metadata_shards(&cluster_paths, &state, &file_system)?;
+        let local_has_primary_metadata_shards = metadata_shards
+            .iter()
+            .any(|shard| shard.primary_node_id == state.local_node_id);
+        if local_has_primary_metadata_shards {
+            materialize_default_cluster_sifs_metadata_with_shards(
+                &data_dir,
+                &state,
+                &file_system,
+                &metadata_shards,
+            )?;
+        }
+        let publishable_shards = metadata_shards.iter().filter(|shard| {
+            local_has_primary_metadata_shards
+                || matches!(shard.assignment, DfsMetadataShardAssignment::Root)
+        });
+        for shard in publishable_shards {
+            put_cluster_kv_control_record(
+                &cluster_paths,
+                &state.local_node_id,
+                metadata_shard_key(&file_system.file_system_id, &shard.shard_id),
+                shard,
+            )?;
+        }
         publish_dfs_service_advertisements_for_cluster(&cluster_paths, &state, options)?;
-        root_shard.primary_node_id == state.local_node_id
+        local_has_primary_metadata_shards
     } else {
         default_cluster_sifs_owner(&state) == state.local_node_id
     };
-    if local_is_root_primary {
+    if local_has_primary_metadata_shards && !publish_cluster_control {
         materialize_default_cluster_sifs_metadata(&data_dir, &cluster_paths, &state, &file_system)?;
     }
     Ok(())
@@ -617,6 +635,30 @@ fn materialize_default_cluster_sifs_metadata(
     file_system: &sinomo_dfs::DfsFileSystem,
 ) -> Result<(), DaemonError> {
     let mut backend = open_daemon_dfs_metadata_backend(data_dir, cluster_paths)?;
+    materialize_default_cluster_sifs_metadata_in_backend(backend.as_mut(), state, file_system)
+}
+
+fn materialize_default_cluster_sifs_metadata_with_shards(
+    data_dir: &SinomoDataDir,
+    state: &ClusterBootstrapState,
+    file_system: &sinomo_dfs::DfsFileSystem,
+    shards: &[DfsMetadataShardConfig],
+) -> Result<(), DaemonError> {
+    let mut backend = sinomo_dfs::open_local_sharded_metadata_backend(
+        default_dfs_metadata_shards_root(data_dir),
+        shards.to_vec(),
+    )?;
+    backend.ensure_file_system_on_all_shards(file_system)?;
+    materialize_default_cluster_sifs_metadata_in_backend(&mut backend, state, file_system)?;
+    backend.migrate_objects_to_configured_shards(&file_system.file_system_id, usize::MAX)?;
+    Ok(())
+}
+
+fn materialize_default_cluster_sifs_metadata_in_backend(
+    backend: &mut dyn DfsMetadataBackend,
+    state: &ClusterBootstrapState,
+    file_system: &sinomo_dfs::DfsFileSystem,
+) -> Result<(), DaemonError> {
     if backend.get_file_system(&file_system.file_system_id)? != Some(file_system.clone()) {
         backend.put_file_system(file_system)?;
     }
@@ -836,10 +878,61 @@ fn default_cluster_sifs_bootstrap_objects(
     objects
 }
 
+fn default_cluster_metadata_shards(
+    cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    file_system: &sinomo_dfs::DfsFileSystem,
+) -> Result<Vec<DfsMetadataShardConfig>, DaemonError> {
+    Ok(vec![
+        default_cluster_metadata_shard(
+            cluster_paths,
+            state,
+            file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+        )?,
+        default_cluster_metadata_shard(
+            cluster_paths,
+            state,
+            file_system,
+            "services",
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
+            },
+        )?,
+        default_cluster_metadata_shard(
+            cluster_paths,
+            state,
+            file_system,
+            "users",
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: sinomo_dfs::SIFS_USERS_PATH.to_string(),
+            },
+        )?,
+    ])
+}
+
+#[cfg(test)]
 fn default_cluster_root_metadata_shard(
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     file_system: &sinomo_dfs::DfsFileSystem,
+) -> Result<DfsMetadataShardConfig, DaemonError> {
+    default_cluster_metadata_shard(
+        cluster_paths,
+        state,
+        file_system,
+        "root",
+        DfsMetadataShardAssignment::Root,
+    )
+}
+
+fn default_cluster_metadata_shard(
+    cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    file_system: &sinomo_dfs::DfsFileSystem,
+    shard_id: &str,
+    assignment: DfsMetadataShardAssignment,
 ) -> Result<DfsMetadataShardConfig, DaemonError> {
     let primary_node_id = default_cluster_sifs_owner(state);
     let replica_node_ids = stable_dfs_service_node_ids(state)
@@ -847,14 +940,14 @@ fn default_cluster_root_metadata_shard(
         .filter(|node_id| node_id != &primary_node_id)
         .take(2)
         .collect::<Vec<_>>();
-    let key = metadata_shard_key(&file_system.file_system_id, "root");
+    let key = metadata_shard_key(&file_system.file_system_id, shard_id);
     let mut desired = DfsMetadataShardConfig {
         file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
+        shard_id: shard_id.to_string(),
         primary_node_id,
         replica_node_ids,
         epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
+        assignment,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let Some(current) =
@@ -3506,6 +3599,154 @@ mod tests {
         let stable = default_cluster_root_metadata_shard(&cluster_paths, &state, &file_system)
             .expect("stable shard");
         assert_eq!(stable, migrated);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn default_cluster_metadata_shards_cover_root_users_and_services() {
+        let root = temp_root("default_cluster_metadata_shards_cover_sifs_paths");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let state = test_cluster_state_with_members(
+            "cluster_dfs_default_path_shards",
+            "node_dfs_default_path_shards_local",
+            &[
+                "node_dfs_default_path_shards_remote_a",
+                "node_dfs_default_path_shards_remote_b",
+            ],
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let file_system = default_cluster_sifs(&state);
+        let shards = default_cluster_metadata_shards(&cluster_paths, &state, &file_system)
+            .expect("metadata shards");
+        let by_id = shards
+            .into_iter()
+            .map(|shard| (shard.shard_id.clone(), shard))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(by_id.len(), 3);
+        assert!(matches!(
+            by_id.get("root").expect("root shard").assignment,
+            DfsMetadataShardAssignment::Root
+        ));
+        assert!(matches!(
+            &by_id.get("services").expect("services shard").assignment,
+            DfsMetadataShardAssignment::PathPrefix { prefix }
+                if prefix == sinomo_dfs::SIFS_SERVICES_PATH
+        ));
+        assert!(matches!(
+            &by_id.get("users").expect("users shard").assignment,
+            DfsMetadataShardAssignment::PathPrefix { prefix }
+                if prefix == sinomo_dfs::SIFS_USERS_PATH
+        ));
+        assert_eq!(
+            by_id
+                .get("services")
+                .expect("services shard")
+                .primary_node_id,
+            by_id.get("root").expect("root shard").primary_node_id,
+            "default path-prefix shards start on the root primary until explicit primary transfer is used"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn default_distributed_dfs_bootstrap_migrates_legacy_services_metadata_before_publish() {
+        let root = temp_root("default_distributed_dfs_bootstrap_migrates_services");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_bootstrap_migrate_services")
+                .expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_bootstrap_migrate_services").expect("node");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs bootstrap migrate services",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut local_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id,
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        local_member.capabilities =
+            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        state.members.push(local_member);
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+        let file_system = default_cluster_sifs(&state);
+        let mut legacy_object = distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        legacy_object.object_id =
+            DfsObjectId::from_legacy_named("obj_legacy_services_metadata").expect("object");
+        legacy_object.path = "/services/legacy.txt".to_string();
+        {
+            let mut legacy_root = LocalJsonMetadataBackend::new(
+                DfsMetadataShardId::new("root"),
+                data_dir.dfs_dir().join("metadata").join("root"),
+            )
+            .expect("legacy root backend");
+            legacy_root
+                .put_file_system(&file_system)
+                .expect("filesystem");
+            legacy_root
+                .put_object(&legacy_object)
+                .expect("legacy services object");
+        }
+
+        ensure_default_distributed_dfs(&paths, &DaemonRunOptions::default(), true)
+            .expect("bootstrap dfs");
+
+        let shards = sinomo_network::read_cluster_kv_prefix_entries(
+            &cluster_paths,
+            &format!(
+                "{}/",
+                sinomo_dfs::metadata_shards_prefix(&file_system.file_system_id)
+            ),
+        )
+        .expect("shard kv")
+        .into_iter()
+        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode shards");
+        assert_eq!(shards.len(), 3);
+
+        let backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+            .expect("open sharded backend")
+            .expect("configured backend");
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &legacy_object.path)
+                .expect("migrated services path"),
+            Some(legacy_object.clone())
+        );
+        assert_eq!(
+            LocalJsonMetadataBackend::new(
+                DfsMetadataShardId::new("root"),
+                data_dir.dfs_dir().join("metadata").join("root"),
+            )
+            .expect("root shard")
+            .get_object(&legacy_object.object_id)
+            .expect("root object")
+            .as_ref()
+            .map(|object| object.kind.clone()),
+            Some(DfsObjectKind::Tombstone)
+        );
 
         cleanup(&root);
     }

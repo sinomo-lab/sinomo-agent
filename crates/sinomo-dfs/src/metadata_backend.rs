@@ -1265,6 +1265,32 @@ impl LocalShardedMetadataBackend {
         self.select_shard_id_for_path(file_system_id, &object.path)
     }
 
+    pub fn ensure_file_system_on_all_shards(
+        &mut self,
+        file_system: &DfsFileSystem,
+    ) -> Result<usize> {
+        let shard_ids = self
+            .shard_configs_for_file_system(&file_system.file_system_id)
+            .into_iter()
+            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
+            .collect::<Vec<_>>();
+        if shard_ids.is_empty() {
+            return Err(MetadataBackendError::UnknownFileSystem {
+                file_system_id: file_system.file_system_id.clone(),
+            });
+        }
+        let mut written = 0usize;
+        for shard_id in shard_ids {
+            let backend = self.shard_backend_mut(&shard_id)?;
+            if backend.get_file_system(&file_system.file_system_id)? == Some(file_system.clone()) {
+                continue;
+            }
+            backend.put_file_system(file_system)?;
+            written = written.saturating_add(1);
+        }
+        Ok(written)
+    }
+
     pub fn migrate_objects_to_configured_shards(
         &mut self,
         file_system_id: &DfsFileSystemId,
