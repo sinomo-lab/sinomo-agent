@@ -1046,6 +1046,12 @@ fn print_dfs_cluster_status(report: &DfsClusterStatusReport) {
                             replica.lag_entries
                         );
                     }
+                    for cursor in &shard.replay_cursors {
+                        println!(
+                            "        replay {}: through {}",
+                            cursor.source_shard_id.0, cursor.replayed_through_sequence
+                        );
+                    }
                 }
             }
         }

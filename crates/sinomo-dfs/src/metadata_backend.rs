@@ -81,6 +81,8 @@ pub struct DfsMetadataShardStatus {
     pub journal_last_sequence: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replica_lag: Vec<DfsMetadataReplicaLagStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay_cursors: Vec<DfsMetadataReplayCursorStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -88,6 +90,12 @@ pub struct DfsMetadataReplicaLagStatus {
     pub target_node_id: NodeId,
     pub replicated_through_sequence: u64,
     pub lag_entries: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataReplayCursorStatus {
+    pub source_shard_id: DfsMetadataShardId,
+    pub replayed_through_sequence: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -1383,6 +1391,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 journal_next_sequence,
                 journal_last_sequence,
                 replica_lag,
+                replay_cursors: backend.replay_cursor_statuses()?,
             });
         }
         Ok(statuses)
@@ -1668,6 +1677,28 @@ impl LocalJsonMetadataBackend {
             max_entries,
             max_encoded_bytes,
         )
+    }
+
+    fn replay_cursor_statuses(&self) -> Result<Vec<DfsMetadataReplayCursorStatus>> {
+        let cursor_dir = self.records_root().join("replay-cursors");
+        if !cursor_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut cursors = Vec::new();
+        for entry in read_dir(&cursor_dir)? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
+                continue;
+            }
+            if let Some(cursor) = read_json_optional::<DfsMetadataReplayCursor>(&path)? {
+                cursors.push(DfsMetadataReplayCursorStatus {
+                    source_shard_id: cursor.shard_id,
+                    replayed_through_sequence: cursor.last_sequence,
+                });
+            }
+        }
+        cursors.sort_by(|left, right| left.source_shard_id.cmp(&right.source_shard_id));
+        Ok(cursors)
     }
 
     fn hydrate_journal_entry_payload(
@@ -2685,6 +2716,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             journal_next_sequence,
             journal_last_sequence: journal_next_sequence.saturating_sub(1),
             replica_lag: Vec::new(),
+            replay_cursors: self.replay_cursor_statuses()?,
         }])
     }
 
@@ -6255,6 +6287,18 @@ mod tests {
             .last_sequence,
             4,
             "a replicated batch should persist the source cursor once at the batch boundary"
+        );
+        let status = follower
+            .metadata_shard_statuses()
+            .expect("metadata shard status")
+            .pop()
+            .expect("follower shard status");
+        assert_eq!(
+            status.replay_cursors,
+            vec![DfsMetadataReplayCursorStatus {
+                source_shard_id: DfsMetadataShardId::new("shard-leader"),
+                replayed_through_sequence: 4,
+            }]
         );
 
         cleanup(&leader_root);

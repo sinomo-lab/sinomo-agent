@@ -38,10 +38,11 @@ pub use metadata_backend::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsConflictRecord, DfsConflictStatus, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId,
     DfsInodeRecord, DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
-    DfsMetadataMutation, DfsMetadataReplicaLagStatus, DfsMetadataShardId, DfsMetadataShardStatus,
-    DfsMetadataSubscription, DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord,
-    DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalJsonMetadataBackend,
-    LocalShardedMetadataBackend, MetadataBackendError,
+    DfsMetadataMutation, DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus,
+    DfsMetadataShardId, DfsMetadataShardStatus, DfsMetadataSubscription, DfsNamespaceTransaction,
+    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
+    DfsWriteIntentStatus, LocalJsonMetadataBackend, LocalShardedMetadataBackend,
+    MetadataBackendError,
 };
 use namespace::metadata_path;
 pub use namespace::{
