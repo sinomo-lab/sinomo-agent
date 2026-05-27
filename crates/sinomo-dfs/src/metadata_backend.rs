@@ -1226,7 +1226,9 @@ impl LocalShardedMetadataBackend {
 
     fn shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsMetadataShardId>> {
         if let Some(index) = self.read_object_shard_index(object_id)? {
-            return Ok(Some(index.shard_id));
+            if self.shards.contains_key(&index.shard_id) {
+                return Ok(Some(index.shard_id));
+            }
         }
         for (shard_id, backend) in &self.shards {
             if backend.get_object(object_id)?.is_some() {
@@ -1234,6 +1236,23 @@ impl LocalShardedMetadataBackend {
             }
         }
         Ok(None)
+    }
+
+    fn object_is_visible_from_shard(
+        &self,
+        object: &DfsObjectMetadata,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        if object.kind == DfsObjectKind::Tombstone {
+            return Ok(true);
+        }
+        let Some(index) = self.read_object_shard_index(&object.object_id)? else {
+            return Ok(true);
+        };
+        if !self.shards.contains_key(&index.shard_id) {
+            return Ok(true);
+        }
+        Ok(index.shard_id == *shard_id)
     }
 
     fn require_shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<DfsMetadataShardId> {
@@ -1602,13 +1621,25 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .shard_backend(&shard_id)?
             .get_object_by_path(file_system_id, path)?;
         if let Some(object) = object.as_ref()
-            && object.kind != DfsObjectKind::Tombstone
-            && let Some(index) = self.read_object_shard_index(&object.object_id)?
-            && index.shard_id != shard_id
+            && !self.object_is_visible_from_shard(object, &shard_id)?
         {
             return Ok(None);
         }
-        Ok(object)
+        if object.is_some() {
+            return Ok(object);
+        }
+        for (fallback_shard_id, backend) in &self.shards {
+            if fallback_shard_id == &shard_id {
+                continue;
+            }
+            let Some(candidate) = backend.get_object_by_path(file_system_id, path)? else {
+                continue;
+            };
+            if self.object_is_visible_from_shard(&candidate, fallback_shard_id)? {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
     }
 
     fn objects_for_file_system(
@@ -6135,6 +6166,80 @@ mod tests {
                 .count(),
             2,
             "bounded migration must keep both live objects visible through the sharded object index"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_falls_back_to_source_path_during_shard_activation() {
+        let root = temp_root("sharded_backend_activation_path_fallback");
+        let file_system = file_system();
+        let mut object = object(version("version_1"));
+        object.path = "/services/pre-migration.txt".to_string();
+        {
+            let mut root_only = LocalShardedMetadataBackend::new(
+                &root,
+                vec![shard_config("root", DfsMetadataShardAssignment::Root)],
+            )
+            .expect("root-only sharded backend");
+            root_only.put_file_system(&file_system).expect("filesystem");
+            root_only.put_object(&object).expect("root object");
+        }
+
+        let backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &object.path)
+                .expect("activation fallback path"),
+            Some(object),
+            "publishing a new path-prefix shard before migration must not make existing root-shard paths disappear"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_ignores_index_for_unconfigured_local_shard() {
+        let root = temp_root("sharded_backend_unconfigured_index");
+        let file_system = file_system();
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![shard_config("root", DfsMetadataShardAssignment::Root)],
+        )
+        .expect("root-only sharded backend");
+        let mut object = object(version("version_1"));
+        object.path = "/services/indexed-before-kv.txt".to_string();
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("root object");
+        backend
+            .write_object_shard_index(&object, &DfsMetadataShardId::new("services"))
+            .expect("stale object shard index");
+
+        assert_eq!(
+            backend.get_object(&object.object_id).expect("object by id"),
+            Some(object.clone()),
+            "an index that names an unopened shard must not break object-id reads"
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &object.path)
+                .expect("object by path"),
+            Some(object),
+            "an index that names an unopened shard must not hide source-shard path reads"
         );
 
         cleanup(&root);

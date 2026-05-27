@@ -597,14 +597,6 @@ pub fn ensure_default_distributed_dfs(
         let local_has_primary_metadata_shards = metadata_shards
             .iter()
             .any(|shard| shard.primary_node_id == state.local_node_id);
-        if local_has_primary_metadata_shards {
-            materialize_default_cluster_sifs_metadata_with_shards(
-                &data_dir,
-                &state,
-                &file_system,
-                &metadata_shards,
-            )?;
-        }
         let publishable_shards = metadata_shards.iter().filter(|shard| {
             local_has_primary_metadata_shards
                 || matches!(shard.assignment, DfsMetadataShardAssignment::Root)
@@ -615,6 +607,14 @@ pub fn ensure_default_distributed_dfs(
                 &state.local_node_id,
                 metadata_shard_key(&file_system.file_system_id, &shard.shard_id),
                 shard,
+            )?;
+        }
+        if local_has_primary_metadata_shards {
+            materialize_default_cluster_sifs_metadata_with_shards(
+                &data_dir,
+                &state,
+                &file_system,
+                &metadata_shards,
             )?;
         }
         publish_dfs_service_advertisements_for_cluster(&cluster_paths, &state, options)?;
