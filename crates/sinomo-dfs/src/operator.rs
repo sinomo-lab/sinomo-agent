@@ -697,6 +697,7 @@ mod tests {
                 policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
                 status: DfsWriteIntentStatus::Committed,
                 content_hash: Some("blake3:new".to_string()),
+                object_metadata: None,
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 updated_at: Some(OffsetDateTime::UNIX_EPOCH),
             })
@@ -795,6 +796,7 @@ mod tests {
                 policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
                 status: DfsWriteIntentStatus::Staging,
                 content_hash: Some("blake3:new".to_string()),
+                object_metadata: None,
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 updated_at: Some(OffsetDateTime::UNIX_EPOCH),
             })
@@ -914,6 +916,7 @@ mod tests {
                     policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
                     status: DfsWriteIntentStatus::Committed,
                     content_hash: Some(hash.to_string()),
+                    object_metadata: None,
                     created_at: OffsetDateTime::UNIX_EPOCH,
                     updated_at: Some(OffsetDateTime::UNIX_EPOCH),
                 })

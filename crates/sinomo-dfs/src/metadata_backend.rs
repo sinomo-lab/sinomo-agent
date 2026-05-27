@@ -236,6 +236,8 @@ pub struct DfsWriteIntentRecord {
     pub status: DfsWriteIntentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_metadata: Option<DfsObjectMetadata>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1709,7 +1711,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             &receipt.receipt.file_system_id,
             object,
         )?;
-        self.shard_backend_mut(&shard_id)?.put_receipt(receipt)
+        let entry = self.shard_backend_mut(&shard_id)?.put_receipt(receipt)?;
+        if let Some(object) = object {
+            self.write_object_shard_index(&normalized_object_metadata(object), &shard_id)?;
+        }
+        Ok(entry)
     }
 
     fn receipts_for_version(
@@ -1739,7 +1745,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             &intent.file_system_id,
             object,
         )?;
-        self.shard_backend_mut(&shard_id)?.put_intent(intent)
+        let entry = self.shard_backend_mut(&shard_id)?.put_intent(intent)?;
+        if let Some(object) = object {
+            self.write_object_shard_index(&normalized_object_metadata(object), &shard_id)?;
+        }
+        Ok(entry)
     }
 
     fn get_intent(
@@ -1747,18 +1757,30 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         object_id: &DfsObjectId,
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>> {
-        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
-            return Ok(None);
-        };
-        self.shard_backend(&shard_id)?
-            .get_intent(object_id, intent_id)
+        if let Some(shard_id) = self.shard_id_for_object(object_id)? {
+            return self
+                .shard_backend(&shard_id)?
+                .get_intent(object_id, intent_id);
+        }
+        for backend in self.shards.values() {
+            if let Some(intent) = backend.get_intent(object_id, intent_id)? {
+                return Ok(Some(intent));
+            }
+        }
+        Ok(None)
     }
 
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
-        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
-            return Ok(Vec::new());
-        };
-        self.shard_backend(&shard_id)?.intents_for_object(object_id)
+        if let Some(shard_id) = self.shard_id_for_object(object_id)? {
+            return self.shard_backend(&shard_id)?.intents_for_object(object_id);
+        }
+        let mut intents = Vec::new();
+        for backend in self.shards.values() {
+            intents.extend(backend.intents_for_object(object_id)?);
+        }
+        intents.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
+        intents.dedup_by(|left, right| left.intent_id == right.intent_id);
+        Ok(intents)
     }
 
     fn commit_visible_version(
@@ -5994,6 +6016,7 @@ mod tests {
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: object.content_hash.clone(),
+            object_metadata: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: Some(OffsetDateTime::UNIX_EPOCH),
         };
@@ -7675,6 +7698,7 @@ mod tests {
             policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: Some("blake3:new".to_string()),
+            object_metadata: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: Some(OffsetDateTime::UNIX_EPOCH),
         };

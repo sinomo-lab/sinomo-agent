@@ -4257,7 +4257,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         match response.result {
             DfsBlobTransferResult::Durable { ref content_hash }
             | DfsBlobTransferResult::Committed { ref content_hash } => {
-                self.restore_pending_write_for_intent_if_missing(&response.intent_id)?;
+                self.restore_pending_write_for_intent_if_missing(
+                    &response.intent_id,
+                    &response.object_id,
+                )?;
                 if let Err(error) =
                     self.ensure_stage_response_matches_pending(&response, content_hash)
                 {
@@ -6944,9 +6947,48 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     fn restore_pending_write_for_intent_if_missing(
         &mut self,
         intent_id: &str,
+        object_id: &DfsObjectId,
     ) -> Result<(), DfsError> {
         if self.pending_writes.contains_key(intent_id) {
             return Ok(());
+        }
+        let Some(record) = (match self.metadata_backend.as_ref() {
+            Some(backend) => backend.get_intent(object_id, intent_id)?,
+            None => None,
+        }) else {
+            let _ = self
+                .coordinator
+                .intent(intent_id)
+                .ok_or_else(|| DfsError::Distributed {
+                    message: format!("unknown pending write intent: {intent_id}"),
+                })?;
+            return Ok(());
+        };
+        if self.coordinator.intent(intent_id).is_none() {
+            self.coordinator
+                .restore_intent(distributed_intent_from_record(&record))?;
+            if let Some(backend) = self.metadata_backend.as_ref() {
+                for receipt in
+                    backend.receipts_for_version(&record.object_id, &record.target_version)?
+                {
+                    if let Some(expected_hash) = record.content_hash.as_deref()
+                        && receipt.content_hash.as_deref() != Some(expected_hash)
+                    {
+                        continue;
+                    }
+                    match self
+                        .coordinator
+                        .restore_durable_receipt(intent_id, receipt.replica_node_id)
+                    {
+                        Ok(()) => {}
+                        Err(
+                            DfsDistributedError::UnexpectedReplica { .. }
+                            | DfsDistributedError::IntentClosed { .. },
+                        ) => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
         }
         let intent =
             self.coordinator
@@ -6955,18 +6997,19 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsError::Distributed {
                     message: format!("unknown pending write intent: {intent_id}"),
                 })?;
-        let Some(record) = (match self.metadata_backend.as_ref() {
-            Some(backend) => backend.get_intent(&intent.object_id, intent_id)?,
-            None => None,
-        }) else {
-            return Ok(());
-        };
         if !distributed_intent_matches_record(&intent, &record) {
             return Err(DfsError::Distributed {
                 message: format!(
                     "stored intent record does not match coordinator state for {intent_id}"
                 ),
             });
+        }
+        if self
+            .current_read_object_metadata(&record.object_id)
+            .is_err()
+            && let Some(object) = record.object_metadata.clone()
+        {
+            self.add_transient_object_metadata(object)?;
         }
         let Some(content_hash) = record.content_hash.clone() else {
             return Ok(());
@@ -7212,7 +7255,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
-        let mut record = write_intent_record(intent, content_hash);
+        let mut record = write_intent_record(intent, content_hash, object.clone());
         if let Some(existing) = backend.get_intent(&intent.object_id, &intent.intent_id)? {
             record.created_at = existing.created_at;
             let mut comparable_record = record.clone();
@@ -8030,6 +8073,7 @@ fn pending_networked_write(
 fn write_intent_record(
     intent: &DistributedWriteIntent,
     content_hash: Option<&str>,
+    object_metadata: Option<DfsObjectMetadata>,
 ) -> DfsWriteIntentRecord {
     let now = OffsetDateTime::now_utc();
     DfsWriteIntentRecord {
@@ -8044,6 +8088,7 @@ fn write_intent_record(
         policy: intent.policy.clone(),
         status: write_intent_status(&intent.state),
         content_hash: content_hash.map(ToOwned::to_owned),
+        object_metadata,
         created_at: now,
         updated_at: Some(now),
     }
@@ -8917,6 +8962,128 @@ mod tests {
     }
 
     #[test]
+    fn stage_response_restores_transient_intent_record_without_visible_object() {
+        let root = temp_root("stage-response-restores-transient-intent-record");
+        let primary =
+            NodeId::from_legacy_named("node_stage_response_transient_primary").expect("primary");
+        let replica =
+            NodeId::from_legacy_named("node_stage_response_transient_replica").expect("replica");
+        let object_id =
+            DfsObjectId::from_legacy_named("obj_stage_response_transient").expect("object");
+        let version_1 =
+            DfsVersion::from_legacy_named("version_stage_response_transient_1").expect("version");
+        let version_2 =
+            DfsVersion::from_legacy_named("version_stage_response_transient_2").expect("version");
+        let bytes = b"transient intent metadata restores stateless primary commit";
+        let content = LocalContentStore::new(root.join("content")).expect("content");
+        let manifest = content
+            .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
+            .expect("content");
+        let mut object = file_metadata(primary.clone());
+        object.object_id = object_id.clone();
+        object.path = "/services/stateless-transient-stage-response.txt".to_string();
+        object.version = version_1.clone();
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        object.current_locations = vec![primary.clone()];
+        let intent_id = "dfs_intent_stage_response_transient".to_string();
+        let mut backend =
+            open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+        backend
+            .put_file_system(&file_system(primary.clone()))
+            .expect("filesystem");
+        backend
+            .put_intent_for_object(
+                Some(&object),
+                &DfsWriteIntentRecord {
+                    intent_id: intent_id.clone(),
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    base_version: Some(version_1),
+                    target_version: version_2.clone(),
+                    coordinator_node_id: primary.clone(),
+                    owner_epoch: 0,
+                    desired_replica_node_ids: vec![primary.clone(), replica.clone()],
+                    policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+                    status: DfsWriteIntentStatus::ReceiptsPending,
+                    content_hash: Some(manifest.content_hash.clone()),
+                    object_metadata: Some(object.clone()),
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+                },
+            )
+            .expect("intent");
+        backend
+            .put_receipt_for_object(
+                None,
+                &DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: sifs_file_system_id(),
+                        object_id: object_id.clone(),
+                        committed_version: version_2.clone(),
+                        owner_node_id: primary.clone(),
+                        event_id: EventId::generate(),
+                    },
+                    replica_node_id: primary.clone(),
+                    content_hash: Some(manifest.content_hash.clone()),
+                    received_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            )
+            .expect("primary receipt");
+        let network = InProcessNetwork::new();
+        let mut dfs = NetworkedDfsService::new(network.add_node(primary.clone()), content)
+            .with_metadata_backend(backend)
+            .expect("metadata backend");
+        assert!(
+            dfs.coordinator.intent(&intent_id).is_none(),
+            "intent should not be hydrated through visible-object enumeration"
+        );
+        assert!(dfs.current_read_object_metadata(&object_id).is_err());
+
+        let event = dfs
+            .handle_stage_blob_response(
+                replica.clone(),
+                DfsStageBlobResponse {
+                    request_id: "lost-daemon-inflight-request-id".to_string(),
+                    intent_id: intent_id.clone(),
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    version: version_2.clone(),
+                    replica_node_id: replica.clone(),
+                    result: DfsBlobTransferResult::Durable {
+                        content_hash: manifest.content_hash.clone(),
+                    },
+                },
+            )
+            .expect("stage response")
+            .expect("stage event");
+        assert!(matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobStaged {
+                intent_id: ref event_intent_id,
+                ..
+            } if event_intent_id == &intent_id
+        ));
+        assert!(matches!(
+            dfs.write_outcome(&intent_id).expect("write outcome"),
+            NetworkedDfsWriteOutcome::Committed {
+                version,
+                content_hash,
+                ..
+            } if version == version_2 && content_hash == manifest.content_hash
+        ));
+        let committed = dfs
+            .current_read_object_metadata(&object_id)
+            .expect("committed object");
+        assert_eq!(committed.version, version_2);
+        assert_eq!(
+            committed.content_hash.as_deref(),
+            Some(manifest.content_hash.as_str())
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn posix_transient_create_routes_precommit_records_to_path_shard() {
         let root = temp_root("posix-transient-create-path-shard");
         let owner = NodeId::from_legacy_named("node_transient_path_shard_owner").expect("owner");
@@ -9275,6 +9442,7 @@ mod tests {
                 policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
                 status: DfsWriteIntentStatus::ReceiptsPending,
                 content_hash: Some(second_hash.clone()),
+                object_metadata: None,
                 created_at: OffsetDateTime::now_utc() + time::Duration::seconds(1),
                 updated_at: Some(OffsetDateTime::now_utc() + time::Duration::seconds(1)),
             })
@@ -9380,6 +9548,7 @@ mod tests {
                 policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
                 status: DfsWriteIntentStatus::ReceiptsPending,
                 content_hash: Some(manifest.content_hash.clone()),
+                object_metadata: None,
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: Some(OffsetDateTime::now_utc()),
             })
@@ -9962,6 +10131,7 @@ mod tests {
                 policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
                 status: DfsWriteIntentStatus::ReceiptsPending,
                 content_hash: Some(pending_manifest.content_hash.clone()),
+                object_metadata: None,
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 updated_at: Some(OffsetDateTime::UNIX_EPOCH),
             })
@@ -10010,6 +10180,7 @@ mod tests {
                 policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
                 status: DfsWriteIntentStatus::Committed,
                 content_hash: committed_object.content_hash.clone(),
+                object_metadata: None,
                 created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
                 updated_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
             })
