@@ -100,6 +100,16 @@ pub struct DfsMetadataReplayCursorStatus {
     pub replayed_through_sequence: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataShardMigrationReport {
+    pub file_system_id: DfsFileSystemId,
+    pub scanned_objects: usize,
+    pub indexed_objects: usize,
+    pub migrated_objects: usize,
+    pub skipped_stale_sources: usize,
+    pub reached_limit: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DfsInodeId(pub String);
 
@@ -1093,6 +1103,15 @@ pub struct LocalShardedMetadataBackend {
     shards: BTreeMap<DfsMetadataShardId, LocalJsonMetadataBackend>,
 }
 
+#[derive(Clone, Debug)]
+struct DfsObjectShardMigrationBundle {
+    object: DfsObjectMetadata,
+    versions: Vec<DfsObjectVersionRecord>,
+    receipts: Vec<DfsReplicaReceiptRecord>,
+    intents: Vec<DfsWriteIntentRecord>,
+    conflicts: Vec<DfsConflictRecord>,
+}
+
 impl LocalShardedMetadataBackend {
     pub fn new(root: impl Into<PathBuf>, shards: Vec<DfsMetadataShardConfig>) -> Result<Self> {
         let root = root.into();
@@ -1244,6 +1263,209 @@ impl LocalShardedMetadataBackend {
             });
         }
         self.select_shard_id_for_path(file_system_id, &object.path)
+    }
+
+    pub fn migrate_objects_to_configured_shards(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        max_migrations: usize,
+    ) -> Result<DfsMetadataShardMigrationReport> {
+        let file_system = self.get_file_system(file_system_id)?.ok_or_else(|| {
+            MetadataBackendError::UnknownFileSystem {
+                file_system_id: file_system_id.clone(),
+            }
+        })?;
+        let mut report = DfsMetadataShardMigrationReport {
+            file_system_id: file_system_id.clone(),
+            scanned_objects: 0,
+            indexed_objects: 0,
+            migrated_objects: 0,
+            skipped_stale_sources: 0,
+            reached_limit: false,
+        };
+        let mut candidates = Vec::<(DfsMetadataShardId, DfsObjectMetadata)>::new();
+        for (source_shard_id, backend) in &self.shards {
+            for object in backend.objects_for_file_system(file_system_id)? {
+                report.scanned_objects = report.scanned_objects.saturating_add(1);
+                candidates.push((source_shard_id.clone(), object));
+            }
+        }
+        candidates.sort_by(|(left_shard, left), (right_shard, right)| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+                .then_with(|| left_shard.cmp(right_shard))
+        });
+
+        for (source_shard_id, object) in candidates {
+            if let Some(index) = self.read_object_shard_index(&object.object_id)?
+                && index.shard_id != source_shard_id
+            {
+                report.skipped_stale_sources = report.skipped_stale_sources.saturating_add(1);
+                continue;
+            }
+            let target_shard_id =
+                self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+            if source_shard_id == target_shard_id {
+                let expected_path = normalize_path(&object.path);
+                let needs_index =
+                    self.read_object_shard_index(&object.object_id)?
+                        .is_none_or(|index| {
+                            index.shard_id != target_shard_id || index.path != expected_path
+                        });
+                if needs_index {
+                    self.write_object_shard_index(&object, &target_shard_id)?;
+                    report.indexed_objects = report.indexed_objects.saturating_add(1);
+                }
+                continue;
+            }
+            if report.migrated_objects >= max_migrations {
+                report.reached_limit = true;
+                break;
+            }
+            let bundle = self.object_shard_migration_bundle(&source_shard_id, &object.object_id)?;
+            self.install_object_shard_migration_bundle(&file_system, &bundle, &target_shard_id)?;
+            self.write_object_shard_index(&bundle.object, &target_shard_id)?;
+            self.put_cross_shard_tombstone(&bundle.object, &source_shard_id, &target_shard_id)?;
+            report.migrated_objects = report.migrated_objects.saturating_add(1);
+        }
+        Ok(report)
+    }
+
+    fn object_shard_migration_bundle(
+        &self,
+        source_shard_id: &DfsMetadataShardId,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsObjectShardMigrationBundle> {
+        let source = self.shard_backend(source_shard_id)?;
+        let object =
+            source
+                .get_object(object_id)?
+                .ok_or_else(|| MetadataBackendError::UnknownObject {
+                    object_id: object_id.clone(),
+                })?;
+        let versions = source.versions_for_object(object_id)?;
+        let mut receipts = Vec::new();
+        for version in &versions {
+            receipts.extend(source.receipts_for_version(object_id, &version.version)?);
+        }
+        let intents = source.intents_for_object(object_id)?;
+        let conflicts = source.conflicts_for_object(object_id)?;
+        Ok(DfsObjectShardMigrationBundle {
+            object,
+            versions,
+            receipts,
+            intents,
+            conflicts,
+        })
+    }
+
+    fn install_object_shard_migration_bundle(
+        &mut self,
+        file_system: &DfsFileSystem,
+        bundle: &DfsObjectShardMigrationBundle,
+        target_shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        {
+            let target = self.shard_backend_mut(target_shard_id)?;
+            match target.get_file_system(&file_system.file_system_id)? {
+                Some(existing) if existing != *file_system => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "target metadata shard {} has conflicting filesystem {} during migration",
+                        target_shard_id.0, file_system.file_system_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    target.put_file_system(file_system)?;
+                }
+            }
+        }
+
+        for version in &bundle.versions {
+            let target = self.shard_backend_mut(target_shard_id)?;
+            match target.get_version(&version.object_id, &version.version)? {
+                Some(existing) if existing != *version => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "target metadata shard {} has conflicting version {} for object {} during migration",
+                        target_shard_id.0, version.version, version.object_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    target.put_version(version)?;
+                }
+            }
+        }
+        for receipt in &bundle.receipts {
+            let target = self.shard_backend_mut(target_shard_id)?;
+            let existing = target.receipts_for_version(
+                &receipt.receipt.object_id,
+                &receipt.receipt.committed_version,
+            )?;
+            if let Some(existing) = existing
+                .iter()
+                .find(|existing| existing.replica_node_id == receipt.replica_node_id)
+            {
+                if existing != receipt {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "target metadata shard {} has conflicting receipt for object {} version {} replica {} during migration",
+                        target_shard_id.0,
+                        receipt.receipt.object_id,
+                        receipt.receipt.committed_version,
+                        receipt.replica_node_id
+                    )));
+                }
+            } else {
+                target.put_receipt(receipt)?;
+            }
+        }
+        for intent in &bundle.intents {
+            let target = self.shard_backend_mut(target_shard_id)?;
+            match target.get_intent(&intent.object_id, &intent.intent_id)? {
+                Some(existing) if existing != *intent => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "target metadata shard {} has conflicting intent {} for object {} during migration",
+                        target_shard_id.0, intent.intent_id, intent.object_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    target.put_intent(intent)?;
+                }
+            }
+        }
+        for conflict in &bundle.conflicts {
+            let target = self.shard_backend_mut(target_shard_id)?;
+            match target.get_conflict(&conflict.object_id, &conflict.conflict_id)? {
+                Some(existing) if existing != *conflict => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "target metadata shard {} has conflicting conflict {} for object {} during migration",
+                        target_shard_id.0, conflict.conflict_id, conflict.object_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    target.put_conflict(conflict)?;
+                }
+            }
+        }
+        {
+            let target = self.shard_backend_mut(target_shard_id)?;
+            match target.get_object(&bundle.object.object_id)? {
+                Some(existing) if existing != bundle.object => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "target metadata shard {} has conflicting object {} during migration",
+                        target_shard_id.0, bundle.object.object_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    target.put_object(&bundle.object)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn put_cross_shard_tombstone(
@@ -5667,6 +5889,226 @@ mod tests {
                 .as_ref()
                 .map(|object| (&object.path, &object.version)),
             Some((&moved.path, &moved.version))
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_migrates_existing_root_object_to_new_path_shard() {
+        let root = temp_root("sharded_backend_migrates_existing_root_object");
+        let file_system = file_system();
+        let mut object = object(version("version_1"));
+        object.path = "/services/readme.md".to_string();
+        object.content_hash = Some("blake3:migrated".to_string());
+        object.content_size_bytes = Some(8);
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: object.created_by_event_id.clone(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                committed_version: object.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_migrate_receipt").expect("event"),
+            },
+            replica_node_id: node("node_owner"),
+            content_hash: object.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let intent = DfsWriteIntentRecord {
+            intent_id: "dfs_intent_migrate".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            base_version: Some(object.version.clone()),
+            target_version: version("version_2"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("node_owner")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: object.content_hash.clone(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+        let conflict = DfsConflictRecord {
+            conflict_id: "conflict_migrate".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            path: object.path.clone(),
+            base_version: Some(object.version.clone()),
+            local_version: version("version_local"),
+            remote_version: version("version_remote"),
+            detected_by_node_id: node("node_owner"),
+            reason: "migration coverage".to_string(),
+            local_content_hash: Some("blake3:local".to_string()),
+            remote_content_hash: Some("blake3:remote".to_string()),
+            created_by_intent_id: Some(intent.intent_id.clone()),
+            strategy: Some("manual".to_string()),
+            status: DfsConflictStatus::Open,
+            detected_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        {
+            let mut root_only = LocalShardedMetadataBackend::new(
+                &root,
+                vec![shard_config("root", DfsMetadataShardAssignment::Root)],
+            )
+            .expect("root-only sharded backend");
+            root_only.put_file_system(&file_system).expect("filesystem");
+            root_only.put_object(&object).expect("root object");
+            root_only.put_version(&version_record).expect("version");
+            root_only.put_receipt(&receipt).expect("receipt");
+            root_only.put_intent(&intent).expect("intent");
+            root_only.put_conflict(&conflict).expect("conflict");
+        }
+
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let report = backend
+            .migrate_objects_to_configured_shards(&file_system.file_system_id, 16)
+            .expect("migrate objects");
+
+        assert_eq!(
+            report,
+            DfsMetadataShardMigrationReport {
+                file_system_id: file_system.file_system_id.clone(),
+                scanned_objects: 1,
+                indexed_objects: 0,
+                migrated_objects: 1,
+                skipped_stale_sources: 0,
+                reached_limit: false,
+            }
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &object.path)
+                .expect("migrated path"),
+            Some(object.clone())
+        );
+        assert_eq!(
+            backend
+                .get_version(&object.object_id, &object.version)
+                .expect("migrated version"),
+            Some(version_record.clone())
+        );
+        assert_eq!(
+            backend
+                .receipts_for_version(&object.object_id, &object.version)
+                .expect("migrated receipts"),
+            vec![receipt.clone()]
+        );
+        assert_eq!(
+            backend
+                .get_intent(&object.object_id, &intent.intent_id)
+                .expect("migrated intent"),
+            Some(intent)
+        );
+        assert_eq!(
+            backend
+                .get_conflict(&object.object_id, &conflict.conflict_id)
+                .expect("migrated conflict"),
+            Some(conflict)
+        );
+        assert_eq!(
+            backend
+                .shard_backend(&DfsMetadataShardId::new("root"))
+                .expect("root shard")
+                .get_object(&object.object_id)
+                .expect("root object")
+                .as_ref()
+                .map(|object| object.kind.clone()),
+            Some(DfsObjectKind::Tombstone),
+            "source shard should retain an explicit tombstone for path-history replay"
+        );
+        assert_eq!(
+            backend
+                .read_object_shard_index(&object.object_id)
+                .expect("object index")
+                .as_ref()
+                .map(|index| (&index.path, &index.shard_id)),
+            Some((
+                &normalize_path(&object.path),
+                &DfsMetadataShardId::new("services")
+            ))
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_bounds_configured_shard_migration() {
+        let root = temp_root("sharded_backend_bounds_configured_shard_migration");
+        let file_system = file_system();
+        let mut first = object(version("version_1"));
+        first.path = "/services/a.txt".to_string();
+        let mut second = object(version("version_1"));
+        second.object_id = DfsObjectId::from_legacy_named("obj_second").expect("object");
+        second.path = "/users/b.txt".to_string();
+        {
+            let mut root_only = LocalShardedMetadataBackend::new(
+                &root,
+                vec![shard_config("root", DfsMetadataShardAssignment::Root)],
+            )
+            .expect("root-only sharded backend");
+            root_only.put_file_system(&file_system).expect("filesystem");
+            root_only.put_object(&first).expect("first root object");
+            root_only.put_object(&second).expect("second root object");
+        }
+
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+                shard_config(
+                    "users",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/users".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let report = backend
+            .migrate_objects_to_configured_shards(&file_system.file_system_id, 1)
+            .expect("bounded migration");
+
+        assert_eq!(report.migrated_objects, 1);
+        assert!(report.reached_limit);
+        assert_eq!(
+            backend
+                .objects_for_file_system(&file_system.file_system_id)
+                .expect("objects")
+                .into_iter()
+                .filter(|object| object.kind != DfsObjectKind::Tombstone)
+                .count(),
+            2,
+            "bounded migration must keep both live objects visible through the sharded object index"
         );
 
         cleanup(&root);
