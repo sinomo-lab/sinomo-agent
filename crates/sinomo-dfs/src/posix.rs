@@ -1787,10 +1787,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         {
             return Ok(Some(tombstone.clone()));
         }
-        if let Some(backend) = self.metadata_backend.as_ref() {
-            return Ok(backend.get_object_by_path(file_system_id, &metadata_path(path))?);
-        }
-        Ok(self
+        let memory_object = self
             .metadata
             .objects
             .values()
@@ -1801,7 +1798,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         .map(|normalized| normalized == path)
                         .unwrap_or(false)
             })
-            .cloned())
+            .cloned();
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            let backend_object =
+                backend.get_object_by_path(file_system_id, &metadata_path(path))?;
+            return Ok(match (memory_object, backend_object) {
+                (Some(memory_object), Some(backend_object))
+                    if memory_object.version > backend_object.version =>
+                {
+                    Some(memory_object)
+                }
+                (Some(memory_object), None) => Some(memory_object),
+                (_, backend_object) => backend_object,
+            });
+        }
+        Ok(memory_object)
     }
 
     fn has_tombstone_ancestor(&self, file_system_id: &DfsFileSystemId, path: &str) -> Result<bool> {
