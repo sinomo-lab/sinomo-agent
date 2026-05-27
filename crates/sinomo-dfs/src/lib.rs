@@ -1789,20 +1789,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     .unwrap_or(0);
                 self.pending_writes.insert(
                     intent_record.intent_id.clone(),
-                    PendingNetworkedWrite {
-                        object_id: intent_record.object_id.clone(),
-                        version: intent_record.target_version.clone(),
+                    pending_networked_write(
+                        intent_record.object_id.clone(),
+                        intent_record.target_version.clone(),
                         content_hash,
                         size_bytes,
-                        stage_retries: BTreeMap::new(),
-                        repair_retries: BTreeMap::new(),
-                        stage_inflight_request_ids: BTreeMap::new(),
-                        repair_inflight_request_ids: BTreeMap::new(),
-                        fetch_inflight_from: BTreeSet::new(),
-                        fetch_inflight_request_ids: BTreeMap::new(),
-                        fetch_inflight_started_ticks: BTreeMap::new(),
-                        fetch_failed_from: BTreeSet::new(),
-                    },
+                    ),
                 );
                 if matches!(
                     intent_record.status,
@@ -2654,20 +2646,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
         self.pending_writes.insert(
             intent.intent_id.clone(),
-            PendingNetworkedWrite {
-                object_id: request.object_id.clone(),
-                version: request.target_version.clone(),
-                content_hash: manifest.content_hash.clone(),
-                size_bytes: manifest.size_bytes,
-                stage_retries: BTreeMap::new(),
-                repair_retries: BTreeMap::new(),
-                stage_inflight_request_ids: BTreeMap::new(),
-                repair_inflight_request_ids: BTreeMap::new(),
-                fetch_inflight_from: BTreeSet::new(),
-                fetch_inflight_request_ids: BTreeMap::new(),
-                fetch_inflight_started_ticks: BTreeMap::new(),
-                fetch_failed_from: BTreeSet::new(),
-            },
+            pending_networked_write(
+                request.object_id.clone(),
+                request.target_version.clone(),
+                manifest.content_hash.clone(),
+                manifest.size_bytes,
+            ),
         );
 
         let updated_intent = if desired_replica_nodes.contains(&self.node_id) {
@@ -4273,6 +4257,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         match response.result {
             DfsBlobTransferResult::Durable { ref content_hash }
             | DfsBlobTransferResult::Committed { ref content_hash } => {
+                self.restore_pending_write_for_intent_if_missing(&response.intent_id)?;
                 if let Err(error) =
                     self.ensure_stage_response_matches_pending(&response, content_hash)
                 {
@@ -4566,21 +4551,26 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         };
         let expected_request_id = pending
             .stage_inflight_request_ids
-            .get(&response.replica_node_id)
-            .ok_or_else(|| DfsError::Distributed {
+            .get(&response.replica_node_id);
+        if let Some(expected_request_id) = expected_request_id {
+            if expected_request_id != &response.request_id {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "unexpected DFS stage response request id for intent {} from {}: expected {}, actual {}",
+                        response.intent_id,
+                        response.replica_node_id,
+                        expected_request_id,
+                        response.request_id
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        if !pending.stage_inflight_request_ids.is_empty() {
+            return Err(DfsError::Distributed {
                 message: format!(
                     "unexpected DFS stage response source for intent {}: {}",
                     response.intent_id, response.replica_node_id
-                ),
-            })?;
-        if expected_request_id != &response.request_id {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "unexpected DFS stage response request id for intent {} from {}: expected {}, actual {}",
-                    response.intent_id,
-                    response.replica_node_id,
-                    expected_request_id,
-                    response.request_id
                 ),
             });
         }
@@ -6951,6 +6941,51 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn restore_pending_write_for_intent_if_missing(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<(), DfsError> {
+        if self.pending_writes.contains_key(intent_id) {
+            return Ok(());
+        }
+        let intent =
+            self.coordinator
+                .intent(intent_id)
+                .cloned()
+                .ok_or_else(|| DfsError::Distributed {
+                    message: format!("unknown pending write intent: {intent_id}"),
+                })?;
+        let Some(record) = (match self.metadata_backend.as_ref() {
+            Some(backend) => backend.get_intent(&intent.object_id, intent_id)?,
+            None => None,
+        }) else {
+            return Ok(());
+        };
+        if !distributed_intent_matches_record(&intent, &record) {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "stored intent record does not match coordinator state for {intent_id}"
+                ),
+            });
+        }
+        let Some(content_hash) = record.content_hash.clone() else {
+            return Ok(());
+        };
+        let size_bytes = self
+            .pending_write_size_hint(&record.object_id, &record.target_version, &content_hash)?
+            .unwrap_or(0);
+        self.pending_writes.insert(
+            intent_id.to_string(),
+            pending_networked_write(
+                record.object_id,
+                record.target_version,
+                content_hash,
+                size_bytes,
+            ),
+        );
+        Ok(())
+    }
+
     fn commit_local_metadata(
         &mut self,
         object_id: &DfsObjectId,
@@ -7965,6 +8000,28 @@ fn remote_read_rejection_prunes_location(reason: &str) -> bool {
     reason.contains("is not a current location for DFS object")
 }
 
+fn pending_networked_write(
+    object_id: DfsObjectId,
+    version: DfsVersion,
+    content_hash: String,
+    size_bytes: u64,
+) -> PendingNetworkedWrite {
+    PendingNetworkedWrite {
+        object_id,
+        version,
+        content_hash,
+        size_bytes,
+        stage_retries: BTreeMap::new(),
+        repair_retries: BTreeMap::new(),
+        stage_inflight_request_ids: BTreeMap::new(),
+        repair_inflight_request_ids: BTreeMap::new(),
+        fetch_inflight_from: BTreeSet::new(),
+        fetch_inflight_request_ids: BTreeMap::new(),
+        fetch_inflight_started_ticks: BTreeMap::new(),
+        fetch_failed_from: BTreeSet::new(),
+    }
+}
+
 fn write_intent_record(
     intent: &DistributedWriteIntent,
     content_hash: Option<&str>,
@@ -8726,6 +8783,130 @@ mod tests {
                 ..
             } if intent_id == "intent_remote_alias" && committed_version == version
         ));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stage_response_commits_restored_pending_intent_without_inflight_request_id() {
+        let root = temp_root("stage-response-commits-restored-pending-intent");
+        let primary =
+            NodeId::from_legacy_named("node_stage_response_restore_primary").expect("primary");
+        let replica =
+            NodeId::from_legacy_named("node_stage_response_restore_replica").expect("replica");
+        let object_id =
+            DfsObjectId::from_legacy_named("obj_stage_response_restore").expect("object");
+        let version_1 =
+            DfsVersion::from_legacy_named("version_stage_response_restore_1").expect("version");
+        let version_2 =
+            DfsVersion::from_legacy_named("version_stage_response_restore_2").expect("version");
+        let bytes = b"stage response must survive stateless daemon handling";
+        let network = InProcessNetwork::new();
+        let content = LocalContentStore::new(root.join("content")).expect("content");
+        let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+        let mut dfs = NetworkedDfsService::new(network.add_node(primary.clone()), content)
+            .with_metadata_backend(metadata)
+            .expect("metadata backend");
+        dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+        let mut object = file_metadata(primary.clone());
+        object.object_id = object_id.clone();
+        object.path = "/services/stateless-stage-response.txt".to_string();
+        object.version = version_1.clone();
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        object.current_locations = vec![primary.clone()];
+        dfs.add_object_metadata(object).expect("object metadata");
+
+        let outcome = dfs
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    target_version: version_2.clone(),
+                    requesting_node_id: primary.clone(),
+                },
+                bytes.to_vec(),
+                vec![primary.clone(), replica.clone()],
+                DfsReplicationPolicy::new(2, 2).expect("policy"),
+            )
+            .expect("pending distributed write");
+        let NetworkedDfsWriteOutcome::Pending {
+            intent_id,
+            durable_receipts,
+            required_receipts,
+        } = outcome
+        else {
+            panic!("expected pending write, got {outcome:?}");
+        };
+        assert_eq!(durable_receipts, 1);
+        assert_eq!(required_receipts, 2);
+        let content_hash = dfs
+            .metadata_backend()
+            .expect("metadata backend")
+            .get_intent(&object_id, &intent_id)
+            .expect("intent read")
+            .expect("intent")
+            .content_hash
+            .expect("intent content hash");
+        drop(dfs);
+
+        let restarted_network = InProcessNetwork::new();
+        let content = LocalContentStore::new(root.join("content")).expect("content");
+        let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+        let mut restarted =
+            NetworkedDfsService::new(restarted_network.add_node(primary.clone()), content)
+                .with_metadata_backend(metadata)
+                .expect("restored metadata backend");
+        assert!(
+            restarted
+                .pending_writes
+                .get(&intent_id)
+                .is_some_and(|pending| pending.stage_inflight_request_ids.is_empty()),
+            "restored daemon state should not rely on ephemeral inflight request ids"
+        );
+
+        let event = restarted
+            .handle_stage_blob_response(
+                replica.clone(),
+                DfsStageBlobResponse {
+                    request_id: "lost-daemon-inflight-request-id".to_string(),
+                    intent_id: intent_id.clone(),
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    version: version_2.clone(),
+                    replica_node_id: replica.clone(),
+                    result: DfsBlobTransferResult::Durable {
+                        content_hash: content_hash.clone(),
+                    },
+                },
+            )
+            .expect("stage response")
+            .expect("stage event");
+        assert!(matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobStaged {
+                intent_id: ref event_intent_id,
+                ref replica_node_id,
+                ..
+            } if event_intent_id == &intent_id && replica_node_id == &replica
+        ));
+        assert!(matches!(
+            restarted.write_outcome(&intent_id).expect("write outcome"),
+            NetworkedDfsWriteOutcome::Committed {
+                version,
+                content_hash: ref committed_hash,
+                ..
+            } if version == version_2 && committed_hash == &content_hash
+        ));
+        let committed = restarted
+            .current_read_object_metadata(&object_id)
+            .expect("committed object");
+        assert_eq!(committed.version, version_2);
+        assert_eq!(
+            committed.content_hash.as_deref(),
+            Some(content_hash.as_str())
+        );
+        assert!(committed.current_locations.contains(&primary));
+        assert!(committed.current_locations.contains(&replica));
 
         std::fs::remove_dir_all(root).ok();
     }
