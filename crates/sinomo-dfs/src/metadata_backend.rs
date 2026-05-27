@@ -523,6 +523,51 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>>;
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>>;
+    /// Returns every version record in the backend. The default aggregates per
+    /// object so any backend stays correct; backends with a materialized table
+    /// should override this with a single scan to avoid per-object queries.
+    fn all_versions(&self) -> Result<Vec<DfsObjectVersionRecord>> {
+        let mut versions = Vec::new();
+        for file_system in self.list_file_systems()? {
+            for object in self.objects_for_file_system(&file_system.file_system_id)? {
+                versions.extend(self.versions_for_object(&object.object_id)?);
+            }
+        }
+        Ok(versions)
+    }
+    /// Returns every replica receipt in the backend. See [`Self::all_versions`].
+    fn all_receipts(&self) -> Result<Vec<DfsReplicaReceiptRecord>> {
+        let mut receipts = Vec::new();
+        for file_system in self.list_file_systems()? {
+            for object in self.objects_for_file_system(&file_system.file_system_id)? {
+                for version in self.versions_for_object(&object.object_id)? {
+                    receipts
+                        .extend(self.receipts_for_version(&object.object_id, &version.version)?);
+                }
+            }
+        }
+        Ok(receipts)
+    }
+    /// Returns every write intent in the backend. See [`Self::all_versions`].
+    fn all_intents(&self) -> Result<Vec<DfsWriteIntentRecord>> {
+        let mut intents = Vec::new();
+        for file_system in self.list_file_systems()? {
+            for object in self.objects_for_file_system(&file_system.file_system_id)? {
+                intents.extend(self.intents_for_object(&object.object_id)?);
+            }
+        }
+        Ok(intents)
+    }
+    /// Returns every conflict record in the backend. See [`Self::all_versions`].
+    fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
+        let mut conflicts = Vec::new();
+        for file_system in self.list_file_systems()? {
+            for object in self.objects_for_file_system(&file_system.file_system_id)? {
+                conflicts.extend(self.conflicts_for_object(&object.object_id)?);
+            }
+        }
+        Ok(conflicts)
+    }
     fn commit_visible_version(
         &mut self,
         expected_version: &DfsVersion,
@@ -3185,6 +3230,26 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             .collect::<Vec<_>>();
         versions.sort_by(|left, right| left.version.cmp(&right.version));
         Ok(versions)
+    }
+
+    fn all_versions(&self) -> Result<Vec<DfsObjectVersionRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.versions.values().cloned().collect())
+    }
+
+    fn all_receipts(&self) -> Result<Vec<DfsReplicaReceiptRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.receipts.values().cloned().collect())
+    }
+
+    fn all_intents(&self) -> Result<Vec<DfsWriteIntentRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.intents.values().cloned().collect())
+    }
+
+    fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.conflicts.values().cloned().collect())
     }
 
     fn put_receipt(

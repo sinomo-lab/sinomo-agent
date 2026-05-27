@@ -97,51 +97,80 @@ impl<'a> DfsOperatorInspector<'a> {
 
     pub fn status(&self) -> Result<DfsOperatorStatus, MetadataBackendError> {
         let filesystems = self.backend.list_file_systems()?;
-        let mut object_count = 0;
-        let mut version_count = 0;
-        let mut receipt_count = 0;
-        let mut intent_count = 0;
-        let mut pending_write_count = 0;
-        let mut open_conflict_count = 0;
-        let mut pending_repair_count = 0;
-
+        let mut objects = Vec::new();
         for file_system in &filesystems {
-            for object in self
-                .backend
-                .objects_for_file_system(&file_system.file_system_id)?
+            objects.extend(
+                self.backend
+                    .objects_for_file_system(&file_system.file_system_id)?,
+            );
+        }
+
+        // Fetch each record kind in one bulk call instead of querying per object
+        // (and per version for receipts), then aggregate in memory.
+        let versions = self.backend.all_versions()?;
+        let receipts = self.backend.all_receipts()?;
+        let intents = self.backend.all_intents()?;
+        let conflicts = self.backend.all_conflicts()?;
+
+        let version_count = versions.len();
+        let receipt_count = receipts.len();
+        let intent_count = intents.len();
+        let pending_write_count = intents
+            .iter()
+            .filter(|intent| write_intent_is_active(&intent.status))
+            .count();
+        let open_conflict_count = conflicts
+            .iter()
+            .filter(|conflict| conflict.status == DfsConflictStatus::Open)
+            .count();
+
+        let mut intents_by_object = BTreeMap::<DfsObjectId, Vec<DfsWriteIntentRecord>>::new();
+        for intent in intents {
+            intents_by_object
+                .entry(intent.object_id.clone())
+                .or_default()
+                .push(intent);
+        }
+        let mut receipts_by_object_version =
+            BTreeMap::<(DfsObjectId, DfsVersion), Vec<DfsReplicaReceiptRecord>>::new();
+        for receipt in receipts {
+            receipts_by_object_version
+                .entry((
+                    receipt.receipt.object_id.clone(),
+                    receipt.receipt.committed_version.clone(),
+                ))
+                .or_default()
+                .push(receipt);
+        }
+
+        let mut pending_repair_count = 0;
+        for object in &objects {
+            let Some(object_intents) = intents_by_object.get(&object.object_id) else {
+                continue;
+            };
+            let mut receipts_by_version =
+                BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
+            for intent in object_intents
+                .iter()
+                .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
             {
-                object_count += 1;
-                let versions = self.backend.versions_for_object(&object.object_id)?;
-                version_count += versions.len();
-                let mut receipts_by_version = BTreeMap::new();
-                for version in &versions {
-                    let receipts = self
-                        .backend
-                        .receipts_for_version(&object.object_id, &version.version)?;
-                    receipt_count += receipts.len();
-                    receipts_by_version.insert(version.version.clone(), receipts);
-                }
-                let intents = self.backend.intents_for_object(&object.object_id)?;
-                pending_write_count += intents
-                    .iter()
-                    .filter(|intent| write_intent_is_active(&intent.status))
-                    .count();
-                intent_count += intents.len();
-                open_conflict_count += self
-                    .backend
-                    .conflicts_for_object(&object.object_id)?
-                    .into_iter()
-                    .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-                    .count();
-                pending_repair_count +=
-                    repairs_from_intents_and_receipts(&object, &intents, &receipts_by_version)
-                        .len();
+                receipts_by_version
+                    .entry(intent.target_version.clone())
+                    .or_insert_with(|| {
+                        receipts_by_object_version
+                            .get(&(object.object_id.clone(), intent.target_version.clone()))
+                            .cloned()
+                            .unwrap_or_default()
+                    });
             }
+            pending_repair_count +=
+                repairs_from_intents_and_receipts(object, object_intents, &receipts_by_version)
+                    .len();
         }
 
         Ok(DfsOperatorStatus {
             file_system_count: filesystems.len(),
-            object_count,
+            object_count: objects.len(),
             version_count,
             receipt_count,
             intent_count,
@@ -1003,6 +1032,193 @@ mod tests {
                 .expect("remove slash")
         );
         assert_eq!(store.list_pins(None).expect("pins"), vec![backslash]);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn operator_status_aggregates_counts_across_multiple_objects() {
+        let root = temp_root("operator_status_aggregates_counts_across_multiple_objects");
+        let mut backend =
+            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend
+            .put_file_system(&DfsFileSystem {
+                file_system_id: file_system_id(),
+                display_name: "repo".to_string(),
+                owner_node_id: node("node_owner"),
+                subtree_policies: Vec::new(),
+            })
+            .expect("filesystem");
+
+        let object_a = DfsObjectId::from_legacy_named("obj_alpha").expect("object");
+        let object_b = DfsObjectId::from_legacy_named("obj_beta").expect("object");
+        let make_object = |object_id: &DfsObjectId, path: &str, current: DfsVersion| {
+            DfsObjectMetadata {
+                object_id: object_id.clone(),
+                file_system_id: file_system_id(),
+                path: path.to_string(),
+                kind: DfsObjectKind::Artifact,
+                owner_node_id: node("node_owner"),
+                current_locations: vec![node("node_owner")],
+                content_hash: Some("blake3:new".to_string()),
+                content_size_bytes: Some(3),
+                link_target_object_id: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                version: current,
+                policy: DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            }
+        };
+        backend
+            .put_object(&make_object(&object_a, "alpha.bin", version("version_2")))
+            .expect("object a");
+        backend
+            .put_object(&make_object(&object_b, "beta.bin", version("version_1")))
+            .expect("object b");
+
+        // object_a: two versions, one receipt, a committed intent missing a
+        // replica (one repair), and an open conflict.
+        for version_id in [version("version_1"), version("version_2")] {
+            backend
+                .put_version(&DfsObjectVersionRecord {
+                    file_system_id: file_system_id(),
+                    object_id: object_a.clone(),
+                    version: version_id.clone(),
+                    content_hash: Some("blake3:new".to_string()),
+                    size_bytes: Some(3),
+                    locations: vec![node("node_owner")],
+                    created_by_event_id: None,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    visible: true,
+                })
+                .expect("version a");
+        }
+        backend
+            .put_receipt(&DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: file_system_id(),
+                    object_id: object_a.clone(),
+                    committed_version: version("version_2"),
+                    owner_node_id: node("node_owner"),
+                    event_id: EventId::from_legacy_named("evt_a").expect("event"),
+                },
+                replica_node_id: node("node_owner"),
+                content_hash: Some("blake3:new".to_string()),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("receipt a");
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: "dfs_intent_a".to_string(),
+                file_system_id: file_system_id(),
+                object_id: object_a.clone(),
+                base_version: Some(version("version_1")),
+                target_version: version("version_2"),
+                coordinator_node_id: node("node_owner"),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                status: DfsWriteIntentStatus::Committed,
+                content_hash: Some("blake3:new".to_string()),
+                object_metadata: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            })
+            .expect("intent a");
+        backend
+            .put_conflict(&DfsConflictRecord {
+                conflict_id: "conflict_a".to_string(),
+                file_system_id: file_system_id(),
+                object_id: object_a.clone(),
+                path: "alpha.bin".to_string(),
+                base_version: Some(version("version_1")),
+                local_version: version("version_2_local"),
+                remote_version: version("version_2"),
+                detected_by_node_id: node("node_laptop"),
+                reason: "offline edit".to_string(),
+                local_content_hash: Some("blake3:local".to_string()),
+                remote_content_hash: Some("blake3:new".to_string()),
+                created_by_intent_id: None,
+                strategy: None,
+                status: DfsConflictStatus::Open,
+                detected_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("conflict a");
+
+        // object_b: one version, one receipt, and a staging intent (pending write,
+        // no repair, no conflict).
+        backend
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: file_system_id(),
+                object_id: object_b.clone(),
+                version: version("version_1"),
+                content_hash: Some("blake3:new".to_string()),
+                size_bytes: Some(3),
+                locations: vec![node("node_owner")],
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: true,
+            })
+            .expect("version b");
+        backend
+            .put_receipt(&DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: file_system_id(),
+                    object_id: object_b.clone(),
+                    committed_version: version("version_1"),
+                    owner_node_id: node("node_owner"),
+                    event_id: EventId::from_legacy_named("evt_b").expect("event"),
+                },
+                replica_node_id: node("node_owner"),
+                content_hash: Some("blake3:new".to_string()),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("receipt b");
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: "dfs_intent_b".to_string(),
+                file_system_id: file_system_id(),
+                object_id: object_b.clone(),
+                base_version: Some(version("version_1")),
+                target_version: version("version_2"),
+                coordinator_node_id: node("node_owner"),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
+                policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+                status: DfsWriteIntentStatus::Staging,
+                content_hash: Some("blake3:newer".to_string()),
+                object_metadata: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            })
+            .expect("intent b");
+
+        // Bulk accessors return whole-backend totals in one call each.
+        assert_eq!(backend.all_versions().expect("versions").len(), 3);
+        assert_eq!(backend.all_receipts().expect("receipts").len(), 2);
+        assert_eq!(backend.all_intents().expect("intents").len(), 2);
+        assert_eq!(backend.all_conflicts().expect("conflicts").len(), 1);
+
+        let status = DfsOperatorInspector::new(&backend).status().expect("status");
+        assert_eq!(status.file_system_count, 1);
+        assert_eq!(status.object_count, 2);
+        assert_eq!(status.version_count, 3);
+        assert_eq!(status.receipt_count, 2);
+        assert_eq!(status.intent_count, 2);
+        assert_eq!(status.pending_write_count, 1, "object_b staging intent");
+        assert_eq!(status.open_conflict_count, 1, "object_a open conflict");
+        assert_eq!(
+            status.pending_repair_count, 1,
+            "object_a committed intent is missing node_replica"
+        );
 
         fs::remove_dir_all(&root).expect("cleanup");
     }
