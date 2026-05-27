@@ -811,6 +811,204 @@ impl DfsMetadataTables {
             }
         }
     }
+
+    fn apply_with_rollback(
+        &mut self,
+        op: DfsMetadataTableOp,
+        rollback: &mut DfsMetadataTableRollback,
+    ) {
+        rollback.record(self, &op);
+        self.apply(op);
+    }
+}
+
+#[derive(Debug, Default)]
+struct DfsMetadataTableRollback {
+    file_systems: BTreeMap<DfsFileSystemId, Option<DfsFileSystem>>,
+    objects: BTreeMap<DfsObjectId, Option<DfsObjectMetadata>>,
+    file_system_objects: BTreeMap<(DfsFileSystemId, DfsObjectId), Option<DfsPathRecord>>,
+    paths: BTreeMap<(DfsFileSystemId, String), Option<DfsPathRecord>>,
+    inodes: BTreeMap<DfsInodeId, Option<DfsInodeRecord>>,
+    dirfrags: BTreeMap<(DfsInodeId, DfsDirFragmentId), Option<DfsDirFragmentRecord>>,
+    dentries: BTreeMap<(DfsInodeId, DfsDirFragmentId, u64, String), Option<DfsPathRecord>>,
+    hardlinks: BTreeMap<(DfsObjectId, DfsObjectId), Option<DfsPathRecord>>,
+    versions: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsObjectVersionRecord>>,
+    receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), Option<DfsReplicaReceiptRecord>>,
+    intents: BTreeMap<(DfsObjectId, String), Option<DfsWriteIntentRecord>>,
+    conflicts: BTreeMap<(DfsObjectId, String), Option<DfsConflictRecord>>,
+    visible_commits: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsVisibleVersionCommitRecord>>,
+    namespace_transactions: BTreeMap<String, Option<DfsNamespaceTransaction>>,
+}
+
+impl DfsMetadataTableRollback {
+    fn record(&mut self, tables: &DfsMetadataTables, op: &DfsMetadataTableOp) {
+        match op {
+            DfsMetadataTableOp::PutFileSystem { file_system } => record_rollback_value(
+                &mut self.file_systems,
+                &tables.file_systems,
+                file_system.file_system_id.clone(),
+            ),
+            DfsMetadataTableOp::PutObject { object } => {
+                record_rollback_value(&mut self.objects, &tables.objects, object.object_id.clone())
+            }
+            DfsMetadataTableOp::PutFileSystemObject { path_record } => record_rollback_value(
+                &mut self.file_system_objects,
+                &tables.file_system_objects,
+                (
+                    path_record.file_system_id.clone(),
+                    path_record.object_id.clone(),
+                ),
+            ),
+            DfsMetadataTableOp::RemoveFileSystemObject {
+                file_system_id,
+                object_id,
+            } => record_rollback_value(
+                &mut self.file_system_objects,
+                &tables.file_system_objects,
+                (file_system_id.clone(), object_id.clone()),
+            ),
+            DfsMetadataTableOp::PutPath { path_record } => record_rollback_value(
+                &mut self.paths,
+                &tables.paths,
+                (path_record.file_system_id.clone(), path_record.path.clone()),
+            ),
+            DfsMetadataTableOp::RemovePath {
+                file_system_id,
+                path,
+            } => record_rollback_value(
+                &mut self.paths,
+                &tables.paths,
+                (file_system_id.clone(), path.clone()),
+            ),
+            DfsMetadataTableOp::PutInode { inode } => {
+                record_rollback_value(&mut self.inodes, &tables.inodes, inode.inode_id.clone())
+            }
+            DfsMetadataTableOp::PutDirFragment { dirfrag } => record_rollback_value(
+                &mut self.dirfrags,
+                &tables.dirfrags,
+                (dirfrag.dir_inode_id.clone(), dirfrag.dirfrag_id.clone()),
+            ),
+            DfsMetadataTableOp::PutDentry { path_record } => record_rollback_value(
+                &mut self.dentries,
+                &tables.dentries,
+                dentry_key(path_record),
+            ),
+            DfsMetadataTableOp::RemoveDentry {
+                parent_inode_id,
+                dirfrag_id,
+                name_hash,
+                name,
+            } => record_rollback_value(
+                &mut self.dentries,
+                &tables.dentries,
+                (
+                    parent_inode_id.clone(),
+                    dirfrag_id.clone(),
+                    *name_hash,
+                    name.clone(),
+                ),
+            ),
+            DfsMetadataTableOp::PutHardlink {
+                target_object_id,
+                hardlink_object_id,
+                ..
+            } => record_rollback_value(
+                &mut self.hardlinks,
+                &tables.hardlinks,
+                (target_object_id.clone(), hardlink_object_id.clone()),
+            ),
+            DfsMetadataTableOp::RemoveHardlink {
+                target_object_id,
+                hardlink_object_id,
+            } => record_rollback_value(
+                &mut self.hardlinks,
+                &tables.hardlinks,
+                (target_object_id.clone(), hardlink_object_id.clone()),
+            ),
+            DfsMetadataTableOp::PutVersion { version } => record_rollback_value(
+                &mut self.versions,
+                &tables.versions,
+                (version.object_id.clone(), version.version.clone()),
+            ),
+            DfsMetadataTableOp::PutReceipt { receipt } => record_rollback_value(
+                &mut self.receipts,
+                &tables.receipts,
+                (
+                    receipt.receipt.object_id.clone(),
+                    receipt.receipt.committed_version.clone(),
+                    receipt.replica_node_id.clone(),
+                ),
+            ),
+            DfsMetadataTableOp::PutIntent { intent } => record_rollback_value(
+                &mut self.intents,
+                &tables.intents,
+                (intent.object_id.clone(), intent.intent_id.clone()),
+            ),
+            DfsMetadataTableOp::PutConflict { conflict } => record_rollback_value(
+                &mut self.conflicts,
+                &tables.conflicts,
+                (conflict.object_id.clone(), conflict.conflict_id.clone()),
+            ),
+            DfsMetadataTableOp::PutVisibleCommit {
+                object_id, version, ..
+            } => record_rollback_value(
+                &mut self.visible_commits,
+                &tables.visible_commits,
+                (object_id.clone(), version.clone()),
+            ),
+            DfsMetadataTableOp::PutNamespaceTransaction { transaction } => record_rollback_value(
+                &mut self.namespace_transactions,
+                &tables.namespace_transactions,
+                transaction.transaction_id.clone(),
+            ),
+        }
+    }
+
+    fn rollback(self, tables: &mut DfsMetadataTables) {
+        rollback_map(&mut tables.file_systems, self.file_systems);
+        rollback_map(&mut tables.objects, self.objects);
+        rollback_map(&mut tables.file_system_objects, self.file_system_objects);
+        rollback_map(&mut tables.paths, self.paths);
+        rollback_map(&mut tables.inodes, self.inodes);
+        rollback_map(&mut tables.dirfrags, self.dirfrags);
+        rollback_map(&mut tables.dentries, self.dentries);
+        rollback_map(&mut tables.hardlinks, self.hardlinks);
+        rollback_map(&mut tables.versions, self.versions);
+        rollback_map(&mut tables.receipts, self.receipts);
+        rollback_map(&mut tables.intents, self.intents);
+        rollback_map(&mut tables.conflicts, self.conflicts);
+        rollback_map(&mut tables.visible_commits, self.visible_commits);
+        rollback_map(
+            &mut tables.namespace_transactions,
+            self.namespace_transactions,
+        );
+    }
+}
+
+fn record_rollback_value<K, V>(
+    rollback: &mut BTreeMap<K, Option<V>>,
+    table: &BTreeMap<K, V>,
+    key: K,
+) where
+    K: Clone + Ord,
+    V: Clone,
+{
+    if !rollback.contains_key(&key) {
+        rollback.insert(key.clone(), table.get(&key).cloned());
+    }
+}
+
+fn rollback_map<K, V>(table: &mut BTreeMap<K, V>, rollback: BTreeMap<K, Option<V>>)
+where
+    K: Ord,
+{
+    for (key, value) in rollback {
+        if let Some(value) = value {
+            table.insert(key, value);
+        } else {
+            table.remove(&key);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2266,6 +2464,29 @@ impl LocalJsonMetadataBackend {
         Ok(())
     }
 
+    fn append_preapplied_table_ops(
+        &mut self,
+        sequence: u64,
+        ops: Vec<DfsMetadataTableOp>,
+        rollback: DfsMetadataTableRollback,
+    ) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let written =
+            match append_metadata_table_batch(&self.root, &DfsMetadataTableBatch { sequence, ops })
+            {
+                Ok(written) => written,
+                Err(error) => {
+                    rollback.rollback(&mut self.tables);
+                    return Err(error);
+                }
+            };
+        self.table_log_offset = self.table_log_offset.saturating_add(written);
+        self.compact_metadata_table_log_if_needed(DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES)?;
+        Ok(())
+    }
+
     fn compact_metadata_table_log_if_needed(&mut self, max_log_bytes: u64) -> Result<()> {
         let path = metadata_table_path(&self.root);
         let len = match fs::metadata(&path) {
@@ -2799,12 +3020,6 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             ..
         } = &entry.mutation
         {
-            self.append_and_apply_table_ops(
-                entry.sequence,
-                vec![DfsMetadataTableOp::PutNamespaceTransaction {
-                    transaction: transaction.clone(),
-                }],
-            )?;
             self.materialize_namespace_transaction(transaction, entry.sequence)?;
         }
         self.advance_local_materialization_cursor(entry.sequence)?;
@@ -3006,21 +3221,37 @@ impl LocalJsonMetadataBackend {
         transaction: &DfsNamespaceTransaction,
         sequence: u64,
     ) -> Result<()> {
-        for object in transaction
-            .objects
-            .iter()
-            .filter(|object| object.kind == DfsObjectKind::Tombstone)
-        {
-            self.materialize_object_indexes(object, sequence)?;
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        let planning_result = (|| -> Result<()> {
+            self.plan_namespace_transaction_table_op(
+                DfsMetadataTableOp::PutNamespaceTransaction {
+                    transaction: transaction.clone(),
+                },
+                &mut table_ops,
+                &mut rollback,
+            );
+            for object in transaction
+                .objects
+                .iter()
+                .filter(|object| object.kind == DfsObjectKind::Tombstone)
+            {
+                self.plan_object_index_table_ops(object, &mut table_ops, &mut rollback)?;
+            }
+            for object in transaction
+                .objects
+                .iter()
+                .filter(|object| object.kind != DfsObjectKind::Tombstone)
+            {
+                self.plan_object_index_table_ops(object, &mut table_ops, &mut rollback)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = planning_result {
+            rollback.rollback(&mut self.tables);
+            return Err(error);
         }
-        for object in transaction
-            .objects
-            .iter()
-            .filter(|object| object.kind != DfsObjectKind::Tombstone)
-        {
-            self.materialize_object_indexes(object, sequence)?;
-        }
-        Ok(())
+        self.append_preapplied_table_ops(sequence, table_ops, rollback)
     }
 
     fn materialize_namespace_transaction_for_recovery(
@@ -3127,6 +3358,29 @@ impl LocalJsonMetadataBackend {
     ) -> Result<()> {
         let table_ops = self.object_index_table_ops_with_previous(object, previous)?;
         self.append_and_apply_table_ops(sequence, table_ops)
+    }
+
+    fn plan_object_index_table_ops(
+        &mut self,
+        object: &DfsObjectMetadata,
+        table_ops: &mut Vec<DfsMetadataTableOp>,
+        rollback: &mut DfsMetadataTableRollback,
+    ) -> Result<()> {
+        let object_ops = self.object_index_table_ops_with_previous(object, None)?;
+        for op in object_ops {
+            self.plan_namespace_transaction_table_op(op, table_ops, rollback);
+        }
+        Ok(())
+    }
+
+    fn plan_namespace_transaction_table_op(
+        &mut self,
+        op: DfsMetadataTableOp,
+        table_ops: &mut Vec<DfsMetadataTableOp>,
+        rollback: &mut DfsMetadataTableRollback,
+    ) {
+        self.tables.apply_with_rollback(op.clone(), rollback);
+        table_ops.push(op);
     }
 
     fn object_index_table_ops_with_previous(
@@ -7514,6 +7768,11 @@ mod tests {
         backend
             .apply_namespace_transaction(&transaction)
             .expect("transaction");
+        assert_eq!(
+            metadata_table_batch_count(&root),
+            4,
+            "namespace transactions should materialize all table mutations for one journal entry in one table batch"
+        );
 
         force_table_replay_from_journal(&backend, &root, 0);
         drop(backend);
