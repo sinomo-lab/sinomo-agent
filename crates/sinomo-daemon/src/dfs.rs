@@ -1224,24 +1224,29 @@ impl DaemonDfsEndpointTransport {
             });
             return Ok(());
         }
-        self.send(&target_node_id, frame)
-    }
-}
-
-impl NetworkTransport for DaemonDfsEndpointTransport {
-    fn local_node_id(&self) -> &sinomo_node::NodeId {
-        &self.local_node_id
+        self.send_frame_to_endpoint(&target_node_id, frame, false)
     }
 
-    fn send(
+    fn send_frame_to_endpoint(
         &mut self,
         target_node_id: &sinomo_node::NodeId,
         frame: NetworkFrame,
+        require_local_source: bool,
     ) -> Result<(), NetworkError> {
-        if &frame.source_node_id != self.local_node_id() {
+        if require_local_source && &frame.source_node_id != self.local_node_id() {
             return Err(NetworkError::FrameSourceMismatch {
                 local_node_id: self.local_node_id.clone(),
                 source_node_id: frame.source_node_id,
+            });
+        }
+        if !require_local_source
+            && frame.source_node_id != self.local_node_id
+            && !self
+                .endpoints_by_node_id
+                .contains_key(&frame.source_node_id)
+        {
+            return Err(NetworkError::UnknownNode {
+                node_id: frame.source_node_id,
             });
         }
         if &frame.target_node_id != target_node_id {
@@ -1277,6 +1282,20 @@ impl NetworkTransport for DaemonDfsEndpointTransport {
             operation: format!("send DFS protocol frame to {target_node_id}"),
             detail: failures.join("; "),
         })
+    }
+}
+
+impl NetworkTransport for DaemonDfsEndpointTransport {
+    fn local_node_id(&self) -> &sinomo_node::NodeId {
+        &self.local_node_id
+    }
+
+    fn send(
+        &mut self,
+        target_node_id: &sinomo_node::NodeId,
+        frame: NetworkFrame,
+    ) -> Result<(), NetworkError> {
+        self.send_frame_to_endpoint(target_node_id, frame, true)
     }
 
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
@@ -3451,6 +3470,105 @@ mod tests {
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].received_by, local);
         assert_eq!(incoming[0].frame.source_node_id, remote);
+    }
+
+    #[test]
+    fn daemon_dfs_endpoint_transport_relays_remote_returned_frames_preserving_source() {
+        let local = NodeId::from_legacy_named("node_dfs_endpoint_relay_local").expect("local");
+        let primary =
+            NodeId::from_legacy_named("node_dfs_endpoint_relay_primary").expect("primary");
+        let replica =
+            NodeId::from_legacy_named("node_dfs_endpoint_relay_replica").expect("replica");
+        let primary_endpoint = test_endpoint(&primary, "192.0.2.12:21353");
+        let replica_endpoint = test_endpoint(&replica, "192.0.2.13:21353");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_sender = Arc::clone(&calls);
+        let local_for_sender = local.clone();
+        let primary_for_sender = primary.clone();
+        let replica_for_sender = replica.clone();
+        let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+            calls_for_sender.lock().expect("calls lock").push((
+                endpoint.node_id.clone(),
+                command.frame.source_node_id.clone(),
+                command.frame.target_node_id.clone(),
+            ));
+            if command.frame.target_node_id == primary_for_sender {
+                return Ok(DfsProtocolFrameResponse {
+                    request_id: command.request_id.clone(),
+                    outbound_frames: vec![NetworkFrame {
+                        frame_id: NetworkFrameId(101),
+                        source_node_id: primary_for_sender.clone(),
+                        target_node_id: replica_for_sender.clone(),
+                        message: MeshMessage {
+                            message_id: MeshMessageId(101),
+                            origin_node_id: primary_for_sender.clone(),
+                            target_node_id: replica_for_sender.clone(),
+                            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                                node_id: primary_for_sender.clone(),
+                                tick: 1,
+                            }),
+                        },
+                    }],
+                });
+            }
+            if command.frame.target_node_id == replica_for_sender {
+                return Ok(DfsProtocolFrameResponse {
+                    request_id: command.request_id.clone(),
+                    outbound_frames: vec![NetworkFrame {
+                        frame_id: NetworkFrameId(102),
+                        source_node_id: replica_for_sender.clone(),
+                        target_node_id: local_for_sender.clone(),
+                        message: MeshMessage {
+                            message_id: MeshMessageId(102),
+                            origin_node_id: replica_for_sender.clone(),
+                            target_node_id: local_for_sender.clone(),
+                            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                                node_id: replica_for_sender.clone(),
+                                tick: 2,
+                            }),
+                        },
+                    }],
+                });
+            }
+            Ok(DfsProtocolFrameResponse {
+                request_id: command.request_id.clone(),
+                outbound_frames: Vec::new(),
+            })
+        });
+        let mut transport = DaemonDfsEndpointTransport::with_sender(
+            local.clone(),
+            vec![primary_endpoint, replica_endpoint],
+            Duration::from_millis(1),
+            sender,
+        );
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(9),
+            source_node_id: local.clone(),
+            target_node_id: primary.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(9),
+                origin_node_id: local.clone(),
+                target_node_id: primary.clone(),
+                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                    node_id: local.clone(),
+                    tick: 9,
+                }),
+            },
+        };
+
+        transport.send(&primary, frame).expect("send through relay");
+
+        assert_eq!(
+            calls.lock().expect("calls lock").as_slice(),
+            &[
+                (primary.clone(), local.clone(), primary.clone()),
+                (replica.clone(), primary.clone(), replica.clone()),
+            ]
+        );
+        let incoming = transport.drain_incoming().expect("incoming frames");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].received_by, local);
+        assert_eq!(incoming[0].frame.source_node_id, replica);
     }
 
     #[test]

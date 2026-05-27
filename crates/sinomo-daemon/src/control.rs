@@ -288,7 +288,10 @@ pub fn run_daemon_control_loop(
         .name(format!("sinomo-{label}-cluster"))
         .spawn(move || {
             let mut cluster_network = ClusterNetworkMaintenance::new();
-            let mut last_dfs_maintenance = std::time::Instant::now();
+            let maintenance_started = std::time::Instant::now();
+            let mut last_dfs_maintenance = maintenance_started
+                .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL)
+                .unwrap_or(maintenance_started);
             loop {
                 if let Err(error) = cluster_network.tick(&maintenance_paths, &maintenance_options) {
                     eprintln!("sinomo {maintenance_label} cluster network tick failed: {error}");
