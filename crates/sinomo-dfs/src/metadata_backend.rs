@@ -1452,6 +1452,7 @@ impl LocalJsonMetadataBackend {
     }
 
     pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
+        let _lock = self.begin_metadata_write()?;
         let mut applied = 0usize;
         let mut replay_cursors = BTreeMap::<DfsMetadataShardId, DfsMetadataReplayCursor>::new();
         let mut advanced_cursors = BTreeSet::<DfsMetadataShardId>::new();
@@ -1471,9 +1472,11 @@ impl LocalJsonMetadataBackend {
             if entry.sequence <= cursor.last_sequence {
                 continue;
             }
-            if self.apply_journal_entry(entry)?.is_some() {
+            self.persist_replayed_journal_entry_unlocked(entry)?;
+            if self.materialize_replayed_journal_entry_unlocked(entry)? {
                 applied = applied.saturating_add(1);
             }
+            self.advance_local_materialization_cursor(entry.sequence)?;
             cursor.last_sequence = entry.sequence;
             advanced_cursors.insert(entry.shard_id.clone());
         }
@@ -1489,6 +1492,53 @@ impl LocalJsonMetadataBackend {
         &mut self,
         entry: &DfsMetadataJournalEntry,
     ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _lock = self.begin_metadata_write()?;
+        self.persist_replayed_journal_entry_unlocked(entry)?;
+        let changed = self.materialize_replayed_journal_entry_unlocked(entry)?;
+        if changed {
+            self.advance_local_materialization_cursor(entry.sequence)?;
+            Ok(Some(entry.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn persist_replayed_journal_entry_unlocked(
+        &mut self,
+        entry: &DfsMetadataJournalEntry,
+    ) -> Result<()> {
+        if let Some(existing) = segmented_journal_entry_at_sequence(&self.root, entry.sequence)? {
+            if existing == *entry {
+                self.advance_journal_head_after_replayed_entry(entry.sequence)?;
+                return Ok(());
+            }
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata journal sequence {} already exists with a different entry while replaying shard {}",
+                entry.sequence, entry.shard_id.0
+            )));
+        }
+        append_segmented_journal_entry(&self.root, entry)?;
+        self.advance_journal_head_after_replayed_entry(entry.sequence)
+    }
+
+    fn advance_journal_head_after_replayed_entry(&mut self, sequence: u64) -> Result<()> {
+        let next_sequence = sequence.saturating_add(1).max(1).max(self.next_sequence);
+        if next_sequence == self.next_sequence {
+            return Ok(());
+        }
+        self.next_sequence = next_sequence;
+        write_json_atomic(
+            &self.journal_head_path(),
+            &DfsMetadataJournalHead {
+                next_sequence: self.next_sequence,
+            },
+        )
+    }
+
+    fn materialize_replayed_journal_entry_unlocked(
+        &mut self,
+        entry: &DfsMetadataJournalEntry,
+    ) -> Result<bool> {
         match &entry.mutation {
             DfsMetadataMutation::PutFileSystem {
                 file_system_id,
@@ -1497,18 +1547,20 @@ impl LocalJsonMetadataBackend {
                 let file_system =
                     required_replay_payload(entry, "put-file-system", file_system.as_ref())?;
                 if self.get_file_system(file_system_id)?.as_ref() == Some(file_system) {
-                    return Ok(None);
+                    return Ok(false);
                 }
-                self.put_file_system(file_system).map(Some)
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
             }
             DfsMetadataMutation::PutObject {
                 object_id, object, ..
             } => {
                 let object = required_replay_payload(entry, "put-object", object.as_ref())?;
                 if self.get_object(object_id)? == Some(normalized_object_metadata(object)) {
-                    return Ok(None);
+                    return Ok(false);
                 }
-                self.put_object(object).map(Some)
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
             }
             DfsMetadataMutation::PutVersion {
                 object_id,
@@ -1521,9 +1573,10 @@ impl LocalJsonMetadataBackend {
                 if self.get_version(object_id, version)?
                     == Some(normalized_version_record(version_record))
                 {
-                    return Ok(None);
+                    return Ok(false);
                 }
-                self.put_version(version_record).map(Some)
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
             }
             DfsMetadataMutation::PutReceipt {
                 object_id,
@@ -1538,7 +1591,7 @@ impl LocalJsonMetadataBackend {
                         continue;
                     }
                     if &existing == receipt {
-                        return Ok(None);
+                        return Ok(false);
                     }
                     if existing.receipt.file_system_id == receipt.receipt.file_system_id
                         && existing.receipt.object_id == receipt.receipt.object_id
@@ -1546,14 +1599,15 @@ impl LocalJsonMetadataBackend {
                         && existing.replica_node_id == receipt.replica_node_id
                         && existing.content_hash == receipt.content_hash
                     {
-                        return Ok(None);
+                        return Ok(false);
                     }
                     return Err(MetadataBackendError::Serde(format!(
                         "metadata journal entry {}:{} conflicts with an existing receipt for replica {}",
                         entry.shard_id.0, entry.sequence, replica_node_id
                     )));
                 }
-                self.put_receipt(receipt).map(Some)
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
             }
             DfsMetadataMutation::PutIntent {
                 object_id,
@@ -1563,9 +1617,10 @@ impl LocalJsonMetadataBackend {
             } => {
                 let intent = required_replay_payload(entry, "put-intent", intent.as_ref())?;
                 if self.get_intent(object_id, intent_id)?.as_ref() == Some(intent) {
-                    return Ok(None);
+                    return Ok(false);
                 }
-                self.put_intent(intent).map(Some)
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
             }
             DfsMetadataMutation::CommitVisibleVersion {
                 object_id,
@@ -1593,15 +1648,44 @@ impl LocalJsonMetadataBackend {
                     && self.get_version(object_id, committed_version)?.as_ref()
                         == Some(&normalized_version_record(visible_version))
                 {
-                    return Ok(None);
+                    return Ok(false);
                 }
-                self.commit_visible_version(
-                    previous_version,
-                    committed_object,
-                    visible_version,
-                    required_replica_node_ids,
-                )
-                .map(Some)
+                let current = self.get_object(object_id)?.ok_or_else(|| {
+                    MetadataBackendError::UnknownObject {
+                        object_id: object_id.clone(),
+                    }
+                })?;
+                if &current.version != previous_version {
+                    return Err(MetadataBackendError::Conflict {
+                        object_id: object_id.clone(),
+                        expected: previous_version.clone(),
+                        current: current.version,
+                    });
+                }
+                for node_id in required_replica_node_ids {
+                    if !self.tables.receipts.contains_key(&(
+                        object_id.clone(),
+                        committed_version.clone(),
+                        node_id.clone(),
+                    )) {
+                        return Err(MetadataBackendError::Conflict {
+                            object_id: object_id.clone(),
+                            expected: previous_version.clone(),
+                            current: current.version.clone(),
+                        });
+                    }
+                }
+                let commit_record = DfsVisibleVersionCommitRecord {
+                    expected_version: previous_version.clone(),
+                    committed_object: normalized_object_metadata(committed_object),
+                    visible_version: normalized_version_record(visible_version),
+                    required_replica_node_ids: normalized_node_location_list(
+                        required_replica_node_ids,
+                    ),
+                    created_at: entry.created_at,
+                };
+                self.materialize_visible_version_commit(&commit_record, entry.sequence)?;
+                Ok(true)
             }
             DfsMetadataMutation::PutConflict {
                 object_id,
@@ -1611,9 +1695,10 @@ impl LocalJsonMetadataBackend {
             } => {
                 let conflict = required_replay_payload(entry, "put-conflict", conflict.as_ref())?;
                 if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
-                    return Ok(None);
+                    return Ok(false);
                 }
-                self.put_conflict(conflict).map(Some)
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
             }
             DfsMetadataMutation::ApplyNamespaceTransaction {
                 transaction_id,
@@ -1634,9 +1719,10 @@ impl LocalJsonMetadataBackend {
                             .is_ok_and(|stored| stored == Some(normalized_object_metadata(object)))
                     })
                 {
-                    return Ok(None);
+                    return Ok(false);
                 }
-                self.apply_namespace_transaction(transaction).map(Some)
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
             }
         }
     }
@@ -4007,19 +4093,22 @@ fn migrate_legacy_journal_entries(root: &Path) -> Result<()> {
 }
 
 fn segmented_journal_contains_sequence(root: &Path, sequence: u64) -> Result<bool> {
+    Ok(segmented_journal_entry_at_sequence(root, sequence)?.is_some())
+}
+
+fn segmented_journal_entry_at_sequence(
+    root: &Path,
+    sequence: u64,
+) -> Result<Option<DfsMetadataJournalEntry>> {
     let segment_id = journal_segment_id(sequence);
     let path = root
         .join("journal")
         .join("segments")
         .join(format!("{segment_id:020}.slog"));
     if !path.exists() {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(
-        read_segmented_journal_file_since_limited(&path, sequence.saturating_sub(1), 1)?
-            .first()
-            .is_some_and(|entry| entry.sequence == sequence),
-    )
+    read_segmented_journal_file_at_sequence(&path, sequence)
 }
 
 fn legacy_journal_entry_paths_since(
@@ -4118,32 +4207,7 @@ fn read_segmented_journal_file_since_limited(
         source,
     })?;
     let mut entries = Vec::new();
-    loop {
-        let mut length_bytes = [0_u8; 4];
-        match file.read_exact(&mut length_bytes) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(source) => {
-                return Err(MetadataBackendError::Io {
-                    path: path.to_owned(),
-                    source,
-                });
-            }
-        }
-        let length = u32::from_le_bytes(length_bytes) as usize;
-        let mut bytes = vec![0_u8; length];
-        match file.read_exact(&mut bytes) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(source) => {
-                return Err(MetadataBackendError::Io {
-                    path: path.to_owned(),
-                    source,
-                });
-            }
-        }
-        let entry: DfsMetadataJournalEntry = sinomo_object_serde::from_bytes(&bytes)
-            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    while let Some(entry) = read_next_segmented_journal_entry(&mut file, path)? {
         if entry.sequence > after_sequence {
             entries.push(entry);
             if entries.len() >= max_entries {
@@ -4152,6 +4216,57 @@ fn read_segmented_journal_file_since_limited(
         }
     }
     Ok(entries)
+}
+
+fn read_segmented_journal_file_at_sequence(
+    path: &Path,
+    sequence: u64,
+) -> Result<Option<DfsMetadataJournalEntry>> {
+    let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    while let Some(entry) = read_next_segmented_journal_entry(&mut file, path)? {
+        if entry.sequence == sequence {
+            return Ok(Some(entry));
+        }
+        if entry.sequence > sequence {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+fn read_next_segmented_journal_entry(
+    file: &mut fs::File,
+    path: &Path,
+) -> Result<Option<DfsMetadataJournalEntry>> {
+    let mut length_bytes = [0_u8; 4];
+    match file.read_exact(&mut length_bytes) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    }
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    let mut bytes = vec![0_u8; length];
+    match file.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    }
+    let entry = sinomo_object_serde::from_bytes(&bytes)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    Ok(Some(entry))
 }
 
 fn journal_segment_id(sequence: u64) -> u64 {
@@ -6247,6 +6362,11 @@ mod tests {
             4
         );
         assert_eq!(
+            follower.journal_since(0).expect("follower journal"),
+            batch.entries,
+            "replicated metadata replay should persist source journal entries instead of appending follower-local replacements"
+        );
+        assert_eq!(
             follower
                 .get_file_system(&file_system.file_system_id)
                 .expect("filesystem"),
@@ -6278,6 +6398,11 @@ mod tests {
                 .apply_journal_batch(&batch)
                 .expect("reapply journal batch"),
             0
+        );
+        assert_eq!(
+            follower.journal_since(0).expect("follower journal reapply"),
+            batch.entries,
+            "idempotent replays must not append duplicate follower journal entries"
         );
         assert_eq!(
             read_json::<DfsMetadataReplayCursor>(
