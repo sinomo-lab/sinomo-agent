@@ -18,6 +18,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Bound::{Included, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -2448,12 +2449,17 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     ) -> Result<Vec<DfsObjectMetadata>> {
         let tables = self.current_tables_snapshot()?;
         let mut objects = Vec::new();
-        for path_record in tables
+        for ((record_file_system_id, _), path_record) in tables
             .file_system_objects
-            .values()
-            .filter(|path_record| path_record.file_system_id == *file_system_id)
+            .range((
+                Included((file_system_id.clone(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
         {
-            if path_record.file_system_id != *file_system_id {
+            if record_file_system_id != file_system_id
+                || path_record.file_system_id != *file_system_id
+            {
                 continue;
             }
             let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
@@ -2482,17 +2488,23 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         let parent_inode_id = directory_inode_id(file_system_id, &directory_path);
         let tables = self.current_tables_snapshot()?;
         let mut objects = Vec::new();
-        let parent_dentry_root = self
-            .records_root()
-            .join("dentries")
-            .join(key_segment(&parent_inode_id.0));
-        let _ = parent_dentry_root;
-        for path_record in tables
+        for ((record_parent_inode_id, _, _, _), path_record) in tables
             .dentries
-            .values()
-            .filter(|path_record| path_record.parent_inode_id == parent_inode_id)
+            .range((
+                Included((
+                    parent_inode_id.clone(),
+                    DfsDirFragmentId::new(""),
+                    0,
+                    String::new(),
+                )),
+                Unbounded,
+            ))
+            .take_while(|((record_parent_inode_id, _, _, _), _)| {
+                record_parent_inode_id == &parent_inode_id
+            })
         {
             if path_record.file_system_id != *file_system_id
+                || record_parent_inode_id != &parent_inode_id
                 || path_record.parent_inode_id != parent_inode_id
             {
                 continue;
@@ -2523,7 +2535,14 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     ) -> Result<Vec<DfsObjectMetadata>> {
         let tables = self.current_tables_snapshot()?;
         let mut hardlinks = Vec::new();
-        for ((target_id, _), path_record) in &tables.hardlinks {
+        for ((target_id, _), path_record) in tables
+            .hardlinks
+            .range((
+                Included((target_object_id.clone(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((target_id, _), _)| target_id == target_object_id)
+        {
             if target_id != target_object_id {
                 continue;
             }
@@ -2590,7 +2609,9 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         let tables = self.current_tables_snapshot()?;
         let mut versions = tables
             .versions
-            .values()
+            .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
+            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+            .map(|(_, version)| version)
             .filter(|version| version.object_id == *object_id)
             .cloned()
             .collect::<Vec<_>>();
@@ -2628,7 +2649,14 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         let tables = self.current_tables_snapshot()?;
         Ok(tables
             .receipts
-            .values()
+            .range((
+                Included((object_id.clone(), version.clone(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((record_object_id, record_version, _), _)| {
+                record_object_id == object_id && record_version == version
+            })
+            .map(|(_, receipt)| receipt)
             .filter(|receipt| {
                 receipt.receipt.object_id == *object_id
                     && receipt.receipt.committed_version == *version
@@ -2672,7 +2700,9 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         let tables = self.current_tables_snapshot()?;
         let mut intents = tables
             .intents
-            .values()
+            .range((Included((object_id.clone(), String::new())), Unbounded))
+            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+            .map(|(_, intent)| intent)
             .filter(|intent| intent.object_id == *object_id)
             .cloned()
             .collect::<Vec<_>>();
@@ -2815,7 +2845,9 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         let tables = self.current_tables_snapshot()?;
         Ok(tables
             .conflicts
-            .values()
+            .range((Included((object_id.clone(), String::new())), Unbounded))
+            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+            .map(|(_, conflict)| conflict)
             .filter(|conflict| conflict.object_id == *object_id)
             .cloned()
             .collect())
@@ -3093,6 +3125,15 @@ impl LocalJsonMetadataBackend {
         previous: Option<&DfsObjectMetadata>,
         sequence: u64,
     ) -> Result<()> {
+        let table_ops = self.object_index_table_ops_with_previous(object, previous)?;
+        self.append_and_apply_table_ops(sequence, table_ops)
+    }
+
+    fn object_index_table_ops_with_previous(
+        &self,
+        object: &DfsObjectMetadata,
+        previous: Option<&DfsObjectMetadata>,
+    ) -> Result<Vec<DfsMetadataTableOp>> {
         let object = normalized_object_metadata(object);
         let inode = DfsInodeRecord::from(&object);
         let previous_path_record = previous
@@ -3176,8 +3217,7 @@ impl LocalJsonMetadataBackend {
         if object.kind == DfsObjectKind::Tombstone {
             self.remove_dentry_index(&path_record, &mut table_ops)?;
             table_ops.push(DfsMetadataTableOp::PutPath { path_record });
-            self.append_and_apply_table_ops(sequence, table_ops)?;
-            return Ok(());
+            return Ok(table_ops);
         }
 
         let removed_from_new_dirfrag = removed_dentry.as_ref().is_some_and(|removed| {
@@ -3197,7 +3237,7 @@ impl LocalJsonMetadataBackend {
         });
         table_ops.push(DfsMetadataTableOp::PutDentry { path_record });
         table_ops.push(DfsMetadataTableOp::PutDirFragment { dirfrag });
-        self.append_and_apply_table_ops(sequence, table_ops)
+        Ok(table_ops)
     }
 
     fn remove_dentry_index(
@@ -3378,22 +3418,18 @@ impl LocalJsonMetadataBackend {
         commit: &DfsVisibleVersionCommitRecord,
         sequence: u64,
     ) -> Result<()> {
-        self.append_and_apply_table_ops(
-            sequence,
-            vec![DfsMetadataTableOp::PutVisibleCommit {
-                object_id: commit.committed_object.object_id.clone(),
-                version: commit.committed_object.version.clone(),
-                commit: commit.clone(),
-            }],
-        )?;
-        self.materialize_object_indexes(&commit.committed_object, sequence)?;
         let visible_version = normalized_version_record(&commit.visible_version);
-        self.append_and_apply_table_ops(
-            sequence,
-            vec![DfsMetadataTableOp::PutVersion {
-                version: visible_version,
-            }],
-        )
+        let mut table_ops = vec![DfsMetadataTableOp::PutVisibleCommit {
+            object_id: commit.committed_object.object_id.clone(),
+            version: commit.committed_object.version.clone(),
+            commit: commit.clone(),
+        }];
+        table_ops
+            .extend(self.object_index_table_ops_with_previous(&commit.committed_object, None)?);
+        table_ops.push(DfsMetadataTableOp::PutVersion {
+            version: visible_version,
+        });
+        self.append_and_apply_table_ops(sequence, table_ops)
     }
 
     fn read_or_create_dirfrag(
@@ -3450,6 +3486,10 @@ fn path_record_for_object(object: &DfsObjectMetadata) -> DfsPathRecord {
 fn bucket_dirfrag_id(name_hash: u64) -> DfsDirFragmentId {
     let bucket = dirfrag_bucket(name_hash);
     DfsDirFragmentId::new(format!("bucket-{bucket:02x}"))
+}
+
+fn id_lower_bound() -> sinomo_core::Id {
+    sinomo_core::Id::new("00000000000000000000000000").expect("static zero ULID")
 }
 
 fn dirfrag_bucket(name_hash: u64) -> u64 {
@@ -4930,6 +4970,37 @@ mod tests {
             },
         )
         .expect("rewind materialization cursor");
+    }
+
+    fn metadata_table_batch_count(root: &Path) -> usize {
+        use std::io::Read as _;
+
+        let path = metadata_table_path(root);
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return 0,
+            Err(source) => panic!("open metadata table log {}: {source}", path.display()),
+        };
+        let mut count = 0usize;
+        loop {
+            let mut length_bytes = [0_u8; 4];
+            match file.read_exact(&mut length_bytes) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(source) => panic!("read metadata table length {}: {source}", path.display()),
+            }
+            let length = u32::from_le_bytes(length_bytes) as usize;
+            let mut bytes = vec![0_u8; length];
+            file.read_exact(&mut bytes).unwrap_or_else(|source| {
+                panic!("read metadata table batch {}: {source}", path.display())
+            });
+            let _: DfsMetadataTableBatch =
+                sinomo_object_serde::from_bytes(&bytes).unwrap_or_else(|source| {
+                    panic!("decode metadata table batch {}: {source}", path.display())
+                });
+            count = count.saturating_add(1);
+        }
+        count
     }
 
     #[test]
@@ -6670,6 +6741,7 @@ mod tests {
         ));
 
         backend.put_receipt(&receipt).expect("receipt");
+        let table_batches_before_commit = metadata_table_batch_count(&root);
         let commit = backend
             .commit_visible_version(
                 &initial.version,
@@ -6682,6 +6754,11 @@ mod tests {
             commit.mutation,
             DfsMetadataMutation::CommitVisibleVersion { .. }
         ));
+        assert_eq!(
+            metadata_table_batch_count(&root),
+            table_batches_before_commit + 1,
+            "one visible-version journal entry should materialize into one table batch"
+        );
         assert_eq!(
             backend
                 .get_object(&committed.object_id)
