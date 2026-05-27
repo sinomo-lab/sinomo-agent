@@ -6350,10 +6350,19 @@ mod tests {
             .expect("commit");
 
         let mut subscription = leader.subscribe(0);
-        let batch = leader
+        let mut batch = leader
             .poll_subscription(&mut subscription)
             .expect("journal batch");
         assert_eq!(batch.entries.len(), 4);
+        let source_sequence_base = JOURNAL_SEGMENT_ENTRY_LIMIT + 64;
+        for (offset, entry) in batch.entries.iter_mut().enumerate() {
+            entry.sequence = source_sequence_base + offset as u64;
+        }
+        batch.next_after_sequence = batch
+            .entries
+            .last()
+            .expect("non-empty replay batch")
+            .sequence;
 
         assert_eq!(
             follower
@@ -6410,7 +6419,7 @@ mod tests {
             )
             .expect("replay cursor")
             .last_sequence,
-            4,
+            batch.next_after_sequence,
             "a replicated batch should persist the source cursor once at the batch boundary"
         );
         let status = follower
@@ -6419,10 +6428,18 @@ mod tests {
             .pop()
             .expect("follower shard status");
         assert_eq!(
+            status.journal_last_sequence, batch.next_after_sequence,
+            "a replayed source batch must advance the local journal head to the source sequence"
+        );
+        assert_eq!(
+            status.journal_next_sequence,
+            batch.next_after_sequence.saturating_add(1)
+        );
+        assert_eq!(
             status.replay_cursors,
             vec![DfsMetadataReplayCursorStatus {
                 source_shard_id: DfsMetadataShardId::new("shard-leader"),
-                replayed_through_sequence: 4,
+                replayed_through_sequence: batch.next_after_sequence,
             }]
         );
 
