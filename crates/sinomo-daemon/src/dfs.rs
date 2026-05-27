@@ -32,6 +32,7 @@ const DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
 const DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES: usize =
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT;
 const DFS_METADATA_REPLICATION_MAX_BATCH_BYTES: usize = DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT;
+const DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
 type DfsProtocolFrameSender = Arc<
@@ -98,6 +99,12 @@ pub enum DaemonDfsMetadataReplicationOutcome {
         target_node_id: sinomo_node::NodeId,
         shard_id: DfsMetadataShardId,
         reason: String,
+    },
+    BacklogRemaining {
+        target_node_id: sinomo_node::NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+        max_batches: usize,
     },
 }
 
@@ -486,6 +493,15 @@ pub fn log_dfs_metadata_replication_report(report: DaemonDfsMetadataReplicationR
             } => {
                 eprintln!(
                     "sinomo daemon DFS metadata replication to {target_node_id} failed: {reason}"
+                );
+            }
+            DaemonDfsMetadataReplicationOutcome::BacklogRemaining {
+                target_node_id,
+                max_batches,
+                ..
+            } => {
+                eprintln!(
+                    "sinomo daemon DFS metadata replication to {target_node_id} still has backlog after {max_batches} batches"
                 );
             }
             DaemonDfsMetadataReplicationOutcome::NoChanges { .. }
@@ -938,87 +954,126 @@ fn publish_default_dfs_metadata_journal_with_sender(
             .into_iter()
             .filter(|target_node_id| target_node_id != &state.local_node_id)
         {
-            let after_sequence = migrate_legacy_dfs_metadata_replication_cursor(
+            let mut after_sequence = migrate_legacy_dfs_metadata_replication_cursor(
                 &mut backend,
                 &data_dir,
                 &target_node_id,
                 &shard_id,
             )?;
-            let Some(batch) = backend.journal_batch_since_limited(
-                after_sequence,
-                DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
-                DFS_METADATA_REPLICATION_MAX_BATCH_BYTES,
-            )?
-            else {
-                outcomes.push(DaemonDfsMetadataReplicationOutcome::NoChanges {
-                    target_node_id,
-                    shard_id: shard_id.clone(),
-                    after_sequence,
-                });
-                continue;
-            };
             let target_endpoints = endpoints
                 .iter()
                 .filter(|endpoint| endpoint.node_id == target_node_id)
                 .collect::<Vec<_>>();
-            if target_endpoints.is_empty() {
-                outcomes.push(DaemonDfsMetadataReplicationOutcome::MissingEndpoint {
-                    target_node_id,
-                    shard_id: shard_id.clone(),
+
+            let mut sent_batches = 0usize;
+            loop {
+                let Some(batch) = backend.journal_batch_since_limited(
                     after_sequence,
-                });
-                continue;
-            }
-            let next_after_sequence = batch.next_after_sequence;
-            let entry_count = batch.entries.len();
-            let command = DfsMetadataJournalBatchCommand {
-                request_id: format!(
-                    "dfs_meta_{}_{}_{}",
-                    state.local_node_id, target_node_id, next_after_sequence
-                ),
-                batch,
-            };
-            let mut failures = Vec::new();
-            let mut delivered = false;
-            for endpoint in target_endpoints {
-                match sender(endpoint, &command, DFS_METADATA_REPLICATION_TIMEOUT) {
-                    Ok(response) => match response.result {
-                        DfsMetadataJournalBatchResult::Applied => {
-                            backend.put_metadata_replication_cursor(
-                                &target_node_id,
-                                &shard_id,
-                                next_after_sequence,
-                            )?;
-                            outcomes.push(DaemonDfsMetadataReplicationOutcome::Applied {
-                                target_node_id: target_node_id.clone(),
-                                shard_id: shard_id.clone(),
-                                entries: entry_count,
-                                next_after_sequence,
-                            });
-                            delivered = true;
-                            break;
+                    DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+                    DFS_METADATA_REPLICATION_MAX_BATCH_BYTES,
+                )?
+                else {
+                    if sent_batches == 0 {
+                        outcomes.push(DaemonDfsMetadataReplicationOutcome::NoChanges {
+                            target_node_id,
+                            shard_id: shard_id.clone(),
+                            after_sequence,
+                        });
+                    }
+                    break;
+                };
+                if target_endpoints.is_empty() {
+                    outcomes.push(DaemonDfsMetadataReplicationOutcome::MissingEndpoint {
+                        target_node_id,
+                        shard_id: shard_id.clone(),
+                        after_sequence,
+                    });
+                    break;
+                }
+                let next_after_sequence = batch.next_after_sequence;
+                let entry_count = batch.entries.len();
+                let command = DfsMetadataJournalBatchCommand {
+                    request_id: format!(
+                        "dfs_meta_{}_{}_{}",
+                        state.local_node_id, target_node_id, next_after_sequence
+                    ),
+                    batch,
+                };
+                let mut failures = Vec::new();
+                let mut delivered = false;
+                for endpoint in &target_endpoints {
+                    match sender(endpoint, &command, DFS_METADATA_REPLICATION_TIMEOUT) {
+                        Ok(response) => {
+                            if response.request_id != command.request_id
+                                || response.shard_id != shard_id
+                                || response.next_after_sequence != next_after_sequence
+                            {
+                                failures.push(format!(
+                                    "{} returned mismatched metadata journal response",
+                                    endpoint.address
+                                ));
+                                continue;
+                            }
+                            match response.result {
+                                DfsMetadataJournalBatchResult::Applied => {
+                                    backend.put_metadata_replication_cursor(
+                                        &target_node_id,
+                                        &shard_id,
+                                        next_after_sequence,
+                                    )?;
+                                    after_sequence = next_after_sequence;
+                                    sent_batches += 1;
+                                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Applied {
+                                        target_node_id: target_node_id.clone(),
+                                        shard_id: shard_id.clone(),
+                                        entries: entry_count,
+                                        next_after_sequence,
+                                    });
+                                    delivered = true;
+                                    break;
+                                }
+                                DfsMetadataJournalBatchResult::Rejected { reason } => {
+                                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Rejected {
+                                        target_node_id: target_node_id.clone(),
+                                        shard_id: shard_id.clone(),
+                                        reason,
+                                    });
+                                    delivered = true;
+                                    break;
+                                }
+                            }
                         }
-                        DfsMetadataJournalBatchResult::Rejected { reason } => {
-                            outcomes.push(DaemonDfsMetadataReplicationOutcome::Rejected {
-                                target_node_id: target_node_id.clone(),
-                                shard_id: shard_id.clone(),
-                                reason,
-                            });
-                            delivered = true;
-                            break;
+                        Err(error) => {
+                            failures.push(format!("{} failed: {error}", endpoint.address));
                         }
-                    },
-                    Err(error) => {
-                        failures.push(format!("{} failed: {error}", endpoint.address));
                     }
                 }
-            }
-            if !delivered {
-                outcomes.push(DaemonDfsMetadataReplicationOutcome::Failed {
-                    target_node_id,
-                    shard_id: shard_id.clone(),
-                    reason: failures.join("; "),
-                });
+                if !delivered {
+                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Failed {
+                        target_node_id,
+                        shard_id: shard_id.clone(),
+                        reason: failures.join("; "),
+                    });
+                    break;
+                }
+                if sent_batches >= DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET {
+                    if backend
+                        .journal_batch_since_limited(
+                            after_sequence,
+                            DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+                            DFS_METADATA_REPLICATION_MAX_BATCH_BYTES,
+                        )?
+                        .is_some()
+                    {
+                        outcomes.push(DaemonDfsMetadataReplicationOutcome::BacklogRemaining {
+                            target_node_id,
+                            shard_id: shard_id.clone(),
+                            after_sequence,
+                            max_batches: DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
+                        });
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1854,6 +1909,263 @@ mod tests {
                 DfsMetadataShardId::new("root"),
                 DfsMetadataShardId::new("services")
             ]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_journal_publish_drains_bounded_batches() {
+        let root = temp_root("daemon_dfs_metadata_journal_publish_drains_batches");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_drain")
+                .expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_dfs_metadata_publish_drain_local").expect("local node");
+        let remote = NodeId::from_legacy_named("node_dfs_metadata_publish_drain_remote")
+            .expect("remote node");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "daemon dfs metadata publish drain",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut remote_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities =
+            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.23:21353")];
+        state.members.push(remote_member);
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+
+        let file_system = distributed_sifs(local.clone());
+        let shard_id = DfsMetadataShardId::new("root");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &shard,
+                    None,
+                )
+                .expect("put shard op"),
+            ),
+        )
+        .expect("write shard config");
+
+        let mut backend = LocalJsonMetadataBackend::new(
+            shard_id.clone(),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        let base_object = distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        let object_count = DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES + 7;
+        for index in 0..object_count {
+            let mut object = base_object.clone();
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_daemon_metadata_drain_{index}"))
+                    .expect("object");
+            object.path = format!("/services/daemon-metadata-drain-{index}.txt");
+            object.version =
+                DfsVersion::from_legacy_named(format!("version_daemon_metadata_drain_{index}"))
+                    .expect("version");
+            object.content_hash = Some(format!("blake3:daemon-metadata-drain-{index}"));
+            object.content_size_bytes = Some(index as u64);
+            backend.put_object(&object).expect("object");
+        }
+        drop(backend);
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let sender: DfsMetadataJournalBatchSender =
+            Arc::new(move |_endpoint, command, _timeout| {
+                sent_for_sender
+                    .lock()
+                    .expect("sent lock")
+                    .push(command.clone());
+                Ok(DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id.clone(),
+                    shard_id: command.batch.shard_id.clone(),
+                    next_after_sequence: command.batch.next_after_sequence,
+                    applied_entries: command.batch.entries.len(),
+                    result: DfsMetadataJournalBatchResult::Applied,
+                })
+            });
+
+        let report = publish_default_dfs_metadata_journal_with_sender(&paths, sender)
+            .expect("publish metadata journal");
+
+        let expected_entries = 1 + object_count;
+        assert_eq!(
+            report.outcomes,
+            vec![
+                DaemonDfsMetadataReplicationOutcome::Applied {
+                    target_node_id: remote.clone(),
+                    shard_id: shard_id.clone(),
+                    entries: DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+                    next_after_sequence: DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES as u64,
+                },
+                DaemonDfsMetadataReplicationOutcome::Applied {
+                    target_node_id: remote.clone(),
+                    shard_id: shard_id.clone(),
+                    entries: expected_entries - DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+                    next_after_sequence: expected_entries as u64,
+                },
+            ]
+        );
+        let sent = sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent.iter()
+                .map(|command| command.batch.entries.len())
+                .collect::<Vec<_>>(),
+            vec![
+                DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+                expected_entries - DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+            ]
+        );
+        drop(sent);
+        let backend = LocalJsonMetadataBackend::new(
+            shard_id.clone(),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend reload");
+        assert_eq!(
+            backend
+                .metadata_replication_cursor(&remote, &shard_id)
+                .expect("backend cursor"),
+            expected_entries as u64
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_journal_publish_rejects_mismatched_ack_cursor() {
+        let root = temp_root("daemon_dfs_metadata_journal_publish_mismatched_ack");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bad_ack")
+                .expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_dfs_metadata_publish_bad_ack_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_metadata_publish_bad_ack_remote").expect("remote");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "daemon dfs metadata publish bad ack",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut remote_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities =
+            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.24:21353")];
+        state.members.push(remote_member);
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+
+        let file_system = distributed_sifs(local.clone());
+        let shard_id = DfsMetadataShardId::new("root");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &shard,
+                    None,
+                )
+                .expect("put shard op"),
+            ),
+        )
+        .expect("write shard config");
+
+        let mut backend = LocalJsonMetadataBackend::new(
+            shard_id.clone(),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        drop(backend);
+
+        let sender: DfsMetadataJournalBatchSender =
+            Arc::new(move |_endpoint, command, _timeout| {
+                Ok(DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id.clone(),
+                    shard_id: command.batch.shard_id.clone(),
+                    next_after_sequence: command.batch.next_after_sequence + 1,
+                    applied_entries: command.batch.entries.len(),
+                    result: DfsMetadataJournalBatchResult::Applied,
+                })
+            });
+
+        let report = publish_default_dfs_metadata_journal_with_sender(&paths, sender)
+            .expect("publish metadata journal");
+
+        assert!(matches!(
+            report.outcomes.as_slice(),
+            [DaemonDfsMetadataReplicationOutcome::Failed { reason, .. }]
+                if reason.contains("mismatched metadata journal response")
+        ));
+        let backend = LocalJsonMetadataBackend::new(
+            shard_id.clone(),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend reload");
+        assert_eq!(
+            backend
+                .metadata_replication_cursor(&remote, &shard_id)
+                .expect("backend cursor"),
+            0
         );
 
         cleanup(&root);

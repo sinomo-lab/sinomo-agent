@@ -67,7 +67,7 @@ Object versions are protected by hash. Rewriting the same `(object_id, version)`
 
 Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation.
 
-Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever.
+Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 
 The table tail log is compacted into the snapshot after it grows large enough, which keeps reopen cost bounded by the latest materialized snapshot plus recent writes instead of all historical namespace churn.
 
