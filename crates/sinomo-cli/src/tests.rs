@@ -11693,7 +11693,7 @@ fn rollout_endpoint_candidates_include_remote_shadow_members() {
 }
 
 #[test]
-fn rollout_cluster_target_prefers_shadow_endpoint_for_main_member() {
+fn rollout_cluster_target_prefers_main_endpoint_for_healthy_main_member() {
     let main_node_id = NodeId::from_legacy_named("node_rollout_shadow_main").expect("main node");
     let shadow_node_id = shadow_daemon_node_id(&main_node_id);
     let main_endpoint = invite_introducer_endpoint(&main_node_id, "10.0.0.42:21353".to_string());
@@ -11704,10 +11704,10 @@ fn rollout_cluster_target_prefers_shadow_endpoint_for_main_member() {
         &main_node_id,
         &[main_endpoint.clone(), shadow_endpoint.clone()],
     )
-    .expect("shadow target");
+    .expect("rollout target");
 
-    assert_eq!(selected.node_id, shadow_node_id);
-    assert_eq!(selected.address, "10.0.0.42:21354");
+    assert_eq!(selected.node_id, main_node_id);
+    assert_eq!(selected.address, "10.0.0.42:21353");
 }
 
 #[test]
@@ -11998,9 +11998,9 @@ fn rollout_target_prefers_unknown_private_shadow_tcp_over_public_tcp() {
     );
 
     let private_shadow =
-        invite_introducer_endpoint(&shadow_node_id, "10.14.5.15:21354".to_string());
+        invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
     let public_shadow =
-        invite_introducer_endpoint(&shadow_node_id, "98.6.32.186:21354".to_string());
+        invite_introducer_endpoint(&shadow_node_id, "203.0.113.42:21354".to_string());
 
     let selected = rollout_target_endpoint_for_main_with_connectivity(
         &paths,
@@ -12016,7 +12016,7 @@ fn rollout_target_prefers_unknown_private_shadow_tcp_over_public_tcp() {
 }
 
 #[test]
-fn rollout_target_prefers_unknown_shadow_iroh_over_healthy_main_tcp() {
+fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-rollout-shadow-before-main-{}",
         SystemTime::now()
@@ -12083,12 +12083,12 @@ fn rollout_target_prefers_unknown_shadow_iroh_over_healthy_main_tcp() {
         &paths,
         &state,
         &main_node_id,
-        &[main_endpoint, shadow_endpoint.clone()],
+        &[main_endpoint.clone(), shadow_endpoint.clone()],
     )
     .expect("rollout target");
 
-    assert_eq!(selected.node_id, shadow_node_id);
-    assert_eq!(selected.endpoint_id, shadow_endpoint.endpoint_id);
+    assert_eq!(selected.node_id, main_node_id);
+    assert_eq!(selected.endpoint_id, main_endpoint.endpoint_id);
     std::fs::remove_dir_all(root).ok();
 }
 

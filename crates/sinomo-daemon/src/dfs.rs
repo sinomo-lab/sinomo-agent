@@ -4367,7 +4367,7 @@ mod tests {
                 .expect("endpoint id"),
                 node_id: remote,
                 transport: sinomo_core::ClusterTransportKind::LanTcp,
-                address: "129.146.106.76:21353".to_string(),
+                address: "198.18.0.76:21353".to_string(),
                 source: sinomo_core::ClusterEndpointSource::Observed,
                 privacy: ClusterEndpointPrivacy::InternetDirect,
                 priority: 20,
@@ -4377,7 +4377,7 @@ mod tests {
 
         assert_eq!(
             dfs_service_endpoint_for_member(&state, &member, &DaemonRunOptions::default()),
-            "129.146.106.76:21353"
+            "198.18.0.76:21353"
         );
     }
 

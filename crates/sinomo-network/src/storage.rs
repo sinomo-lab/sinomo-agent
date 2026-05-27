@@ -2105,14 +2105,11 @@ pub fn cluster_rollout_target_endpoints_for_main_with_command_endpoint(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     main_node_id: &NodeId,
-    command_endpoint: Option<&ClusterEndpointRecord>,
+    _command_endpoint: Option<&ClusterEndpointRecord>,
     candidates: &[ClusterEndpointRecord],
 ) -> Vec<ClusterEndpointRecord> {
     let shadow_node_id = shadow_daemon_node_id(main_node_id);
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let command_route_rank = command_endpoint
-        .filter(|endpoint| endpoint.node_id == *main_node_id)
-        .map(cluster_endpoint_static_fallback_rank);
     let mut candidates = candidates
         .iter()
         .filter(|endpoint| {
@@ -2122,16 +2119,8 @@ pub fn cluster_rollout_target_endpoints_for_main_with_command_endpoint(
         .cloned()
         .collect::<Vec<_>>();
     candidates.sort_by_key(|endpoint| {
-        let unreachable_shadow_endpoint =
-            endpoint.node_id == shadow_node_id && graph.unavailability_rank(endpoint) != 0;
-        let shadow_endpoint_less_reachable_than_command_context = endpoint.node_id
-            == shadow_node_id
-            && command_route_rank
-                .is_some_and(|rank| cluster_endpoint_static_fallback_rank(endpoint) < rank);
         (
-            unreachable_shadow_endpoint,
-            shadow_endpoint_less_reachable_than_command_context,
-            endpoint.node_id != shadow_node_id,
+            cluster_rollout_route_process_rank(&graph, endpoint, main_node_id, &shadow_node_id),
             graph.unavailability_rank(endpoint),
             cluster_endpoint_static_fallback_rank(endpoint),
             graph.quality_rank(endpoint),
@@ -2140,6 +2129,22 @@ pub fn cluster_rollout_target_endpoints_for_main_with_command_endpoint(
         )
     });
     candidates
+}
+
+fn cluster_rollout_route_process_rank(
+    graph: &ClusterConnectivityGraph,
+    endpoint: &ClusterEndpointRecord,
+    main_node_id: &NodeId,
+    shadow_node_id: &NodeId,
+) -> u8 {
+    let unavailable = graph.unavailability_rank(endpoint) != 0;
+    if endpoint.node_id == *main_node_id {
+        if unavailable { 2 } else { 0 }
+    } else if endpoint.node_id == *shadow_node_id {
+        if unavailable { 3 } else { 1 }
+    } else {
+        4
+    }
 }
 
 pub fn sort_cluster_rollout_endpoints(

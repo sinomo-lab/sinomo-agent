@@ -1089,8 +1089,8 @@ fn raft_command_targets_prefer_fresh_online_voter_before_stale_voter() {
         "pk-local",
         now,
     );
-    let fresh_endpoint = daemon_lan_endpoint(&fresh, "129.146.106.76:21353".to_string(), 10);
-    let stale_endpoint = daemon_lan_endpoint(&stale, "10.14.5.15:21353".to_string(), 10);
+    let fresh_endpoint = daemon_lan_endpoint(&fresh, "198.18.0.76:21353".to_string(), 10);
+    let stale_endpoint = daemon_lan_endpoint(&stale, "10.0.0.15:21353".to_string(), 10);
     for (node_id, endpoint) in [
         (fresh.clone(), fresh_endpoint.clone()),
         (stale.clone(), stale_endpoint.clone()),
@@ -1279,7 +1279,7 @@ fn main_daemon_endpoint_candidates_keep_static_fallback_order() {
 }
 
 #[test]
-fn rollout_target_selection_prefers_shadow_route_until_shadow_is_unreachable() {
+fn rollout_target_selection_prefers_main_route_before_shadow_backup() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-rollout-shadow-route-{}",
         std::time::SystemTime::now()
@@ -1311,11 +1311,11 @@ fn rollout_target_selection_prefers_shadow_route_until_shadow_is_unreachable() {
         &paths,
         &state,
         &main,
-        &[main_endpoint, shadow_endpoint.clone()],
+        &[main_endpoint.clone(), shadow_endpoint.clone()],
     )
     .expect("rollout endpoint");
 
-    assert_eq!(selected.endpoint_id, shadow_endpoint.endpoint_id);
+    assert_eq!(selected.endpoint_id, main_endpoint.endpoint_id);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -1373,7 +1373,7 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
         ],
     )
     .expect("public-context rollout endpoint");
-    assert_eq!(selected.endpoint_id, shadow_iroh.endpoint_id);
+    assert_eq!(selected.endpoint_id, public_main.endpoint_id);
     let ordered = cluster_rollout_target_endpoints_for_main_with_command_endpoint(
         &paths,
         &state,
@@ -1385,9 +1385,9 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
             public_main.clone(),
         ],
     );
-    assert_eq!(ordered[0].endpoint_id, shadow_iroh.endpoint_id);
-    assert_eq!(ordered[1].node_id, main);
-    assert_eq!(ordered[2].endpoint_id, private_shadow.endpoint_id);
+    assert_eq!(ordered[0].endpoint_id, public_main.endpoint_id);
+    assert_eq!(ordered[1].endpoint_id, private_shadow.endpoint_id);
+    assert_eq!(ordered[2].endpoint_id, shadow_iroh.endpoint_id);
 
     let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         &paths,
@@ -1397,7 +1397,7 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
         &[private_shadow.clone(), shadow_iroh, private_main.clone()],
     )
     .expect("private-context rollout endpoint");
-    assert_eq!(selected.endpoint_id, private_shadow.endpoint_id);
+    assert_eq!(selected.endpoint_id, private_main.endpoint_id);
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -1459,11 +1459,11 @@ fn public_ip_endpoint_is_marked_internet_direct() {
         21353,
         0,
         &["10.0.0.41".parse().expect("private")],
-        &["129.146.106.76".parse().expect("public")],
+        &["198.18.0.76".parse().expect("public")],
     );
 
     assert!(endpoints.iter().any(|endpoint| {
-        endpoint.address == "129.146.106.76:21353"
+        endpoint.address == "198.18.0.76:21353"
             && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
     }));
 }
@@ -1478,7 +1478,7 @@ fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
         21354,
         10,
         &["10.0.0.41".parse().expect("private")],
-        &["129.146.106.76".parse().expect("public")],
+        &["198.18.0.76".parse().expect("public")],
         false,
     );
 
@@ -1488,7 +1488,7 @@ fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
             .any(|endpoint| endpoint.address == "10.0.0.41:21354")
     );
     assert!(!endpoints.iter().any(|endpoint| {
-        endpoint.address == "129.146.106.76:21354"
+        endpoint.address == "198.18.0.76:21354"
             && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
     }));
 }

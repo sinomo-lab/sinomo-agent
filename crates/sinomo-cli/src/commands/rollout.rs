@@ -799,12 +799,20 @@ pub(crate) fn rollout_target_endpoint_for_main(
     let mut candidates = candidates
         .iter()
         .filter(|endpoint| {
-            endpoint.node_id == shadow_node_id
+            (endpoint.node_id == *main_node_id || endpoint.node_id == shadow_node_id)
                 && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
         })
         .cloned()
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|endpoint| (endpoint.priority, endpoint.address.clone()));
+    candidates.sort_by_key(|endpoint| {
+        (
+            endpoint.node_id != *main_node_id,
+            sinomo_runtime::network::cluster_daemon_command_transport_rank(endpoint),
+            sinomo_runtime::network::cluster_daemon_command_address_rank(endpoint),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
     candidates.into_iter().next()
 }
 
