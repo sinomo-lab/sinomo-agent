@@ -42,6 +42,7 @@ pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
 pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
 pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
+pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
 pub const DFS_PROTOCOL_FRAME_ROUTE: &str = "/dfs/protocol/frame";
 pub const SANDBOX_RPC_CATEGORY: &str = "sandbox";
 pub const SANDBOX_CREATE_ROUTE: &str = "/sandbox/create";

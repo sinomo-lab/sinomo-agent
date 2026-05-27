@@ -1082,6 +1082,7 @@ fn forward_daemon_control_payload(
     Ok(response_bytes)
 }
 
+#[cfg(any(test, feature = "iroh-transport"))]
 pub(crate) fn iroh_daemon_command_forward_timeout(payload: &[u8]) -> Duration {
     let mut cursor = std::io::Cursor::new(payload);
     let request: Result<crate::DaemonControlRequest, _> =

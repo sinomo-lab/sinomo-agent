@@ -632,7 +632,7 @@ struct DfsMetadataTableState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsMetadataTableSnapshot {
+pub struct DfsMetadataTableSnapshot {
     format_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tables: Option<DfsMetadataTableSnapshotTables>,
@@ -641,7 +641,7 @@ struct DfsMetadataTableSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsMetadataTableSnapshotTables {
+pub struct DfsMetadataTableSnapshotTables {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     file_systems: Vec<DfsFileSystem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -673,14 +673,14 @@ struct DfsMetadataTableSnapshotTables {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsHardlinkIndexSnapshotRecord {
+pub struct DfsHardlinkIndexSnapshotRecord {
     target_object_id: DfsObjectId,
     hardlink_object_id: DfsObjectId,
     path_record: DfsPathRecord,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsVisibleCommitSnapshotRecord {
+pub struct DfsVisibleCommitSnapshotRecord {
     object_id: DfsObjectId,
     version: DfsVersion,
     commit: DfsVisibleVersionCommitRecord,
@@ -1545,6 +1545,53 @@ impl LocalJsonMetadataBackend {
             }
         }
         Ok(applied)
+    }
+
+    pub fn journal_last_sequence(&self) -> u64 {
+        self.next_sequence.saturating_sub(1)
+    }
+
+    pub fn export_table_snapshot(&self) -> DfsMetadataTableSnapshot {
+        DfsMetadataTableSnapshot {
+            format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            tables: Some(metadata_tables_snapshot(&self.tables)),
+            ops: Vec::new(),
+        }
+    }
+
+    pub fn replace_with_replicated_snapshot(
+        &mut self,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool> {
+        let _lock = self.begin_metadata_write()?;
+        let tables = metadata_tables_from_table_snapshot(snapshot, "replicated metadata snapshot")?;
+        let archived_existing = archive_metadata_backend_state(&self.root)?;
+        create_dir_all(self.root.join("records"))?;
+        create_dir_all(self.root.join("journal").join("segments"))?;
+        self.tables = tables;
+        self.table_log_offset = 0;
+        self.next_sequence = replayed_through_sequence.saturating_add(1).max(1);
+        persist_metadata_table_snapshot(&self.root, &self.tables)?;
+        write_json_atomic(
+            &self.replay_cursor_path(&source_shard_id),
+            &DfsMetadataReplayCursor {
+                shard_id: source_shard_id,
+                last_sequence: replayed_through_sequence,
+            },
+        )?;
+        self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
+            shard_id: self.shard_id.clone(),
+            last_sequence: replayed_through_sequence,
+        })?;
+        write_json_atomic(
+            &self.journal_head_path(),
+            &DfsMetadataJournalHead {
+                next_sequence: self.next_sequence,
+            },
+        )?;
+        Ok(archived_existing)
     }
 
     pub fn apply_journal_entry(
@@ -3618,36 +3665,43 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
         return Ok(DfsMetadataTableState::default());
     }
     let snapshot: DfsMetadataTableSnapshot = read_json(&path)?;
-    let tables = match snapshot.format_version {
+    let format_version = snapshot.format_version;
+    let tables = metadata_tables_from_table_snapshot(
+        snapshot,
+        &format!("DFS metadata table snapshot at {}", path.display()),
+    )?;
+    Ok(DfsMetadataTableState {
+        tables,
+        table_log_offset: 0,
+        snapshot_format_version: Some(format_version),
+    })
+}
+
+fn metadata_tables_from_table_snapshot(
+    snapshot: DfsMetadataTableSnapshot,
+    description: &str,
+) -> Result<DfsMetadataTables> {
+    match snapshot.format_version {
         LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION => {
             let mut tables = DfsMetadataTables::default();
             for op in snapshot.ops {
                 tables.apply(op);
             }
-            tables
+            Ok(tables)
         }
-        METADATA_TABLE_SNAPSHOT_FORMAT_VERSION => {
-            metadata_tables_from_snapshot(snapshot.tables.ok_or_else(|| {
+        METADATA_TABLE_SNAPSHOT_FORMAT_VERSION => Ok(metadata_tables_from_snapshot(
+            snapshot.tables.ok_or_else(|| {
                 MetadataBackendError::Serde(format!(
-                    "DFS metadata table snapshot version {} at {} is missing structured tables",
-                    snapshot.format_version,
-                    path.display()
+                    "{description} version {} is missing structured tables",
+                    snapshot.format_version
                 ))
-            })?)
-        }
-        _ => {
-            return Err(MetadataBackendError::Serde(format!(
-                "unsupported DFS metadata table snapshot version {} at {}",
-                snapshot.format_version,
-                path.display()
-            )));
-        }
-    };
-    Ok(DfsMetadataTableState {
-        tables,
-        table_log_offset: 0,
-        snapshot_format_version: Some(snapshot.format_version),
-    })
+            })?,
+        )),
+        _ => Err(MetadataBackendError::Serde(format!(
+            "unsupported {description} version {}",
+            snapshot.format_version
+        ))),
+    }
 }
 
 fn replay_metadata_table_batches_from(
@@ -3871,6 +3925,33 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
         tables.apply(DfsMetadataTableOp::PutNamespaceTransaction { transaction });
     }
     tables
+}
+
+fn archive_metadata_backend_state(root: &Path) -> Result<bool> {
+    let mut archived = false;
+    let archive_root = root.join("replica-repair-archives").join(format!(
+        "{}",
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    for name in ["records", "journal"] {
+        let source = root.join(name);
+        if !source.exists() {
+            continue;
+        }
+        if !archived {
+            create_dir_all(archive_root.clone())?;
+        }
+        let destination = archive_root.join(name);
+        fs::rename(&source, &destination).map_err(|source_error| MetadataBackendError::Io {
+            path: source.clone(),
+            source: source_error,
+        })?;
+        archived = true;
+    }
+    if archived {
+        sync_dir(root)?;
+    }
+    Ok(archived)
 }
 
 #[cfg(test)]
@@ -6754,6 +6835,74 @@ mod tests {
             vec![DfsMetadataReplayCursorStatus {
                 source_shard_id: DfsMetadataShardId::new("shard-leader"),
                 replayed_through_sequence: batch.next_after_sequence,
+            }]
+        );
+
+        cleanup(&leader_root);
+        cleanup(&follower_root);
+    }
+
+    #[test]
+    fn local_backend_replaces_divergent_replica_with_replicated_snapshot() {
+        let leader_root = temp_root("local_backend_snapshot_repair_leader");
+        let follower_root = temp_root("local_backend_snapshot_repair_follower");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut leader =
+            LocalJsonMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader backend");
+        let mut follower = LocalJsonMetadataBackend::new(shard_id.clone(), &follower_root)
+            .expect("follower backend");
+
+        let leader_file_system = file_system();
+        leader
+            .put_file_system(&leader_file_system)
+            .expect("leader filesystem");
+        let mut follower_file_system = leader_file_system.clone();
+        follower_file_system.display_name = "diverged".to_string();
+        follower
+            .put_file_system(&follower_file_system)
+            .expect("follower filesystem");
+        assert!(
+            follower
+                .apply_journal_batch(
+                    &leader
+                        .journal_batch_since_limited(0, 1, usize::MAX)
+                        .expect("leader batch")
+                        .expect("leader batch")
+                )
+                .expect_err("conflicting sequence should reject before snapshot repair")
+                .to_string()
+                .contains("already exists with a different entry")
+        );
+
+        let archived = follower
+            .replace_with_replicated_snapshot(
+                shard_id.clone(),
+                leader.journal_last_sequence(),
+                leader.export_table_snapshot(),
+            )
+            .expect("replace snapshot");
+        assert!(archived);
+        assert_eq!(
+            follower
+                .get_file_system(&leader_file_system.file_system_id)
+                .expect("follower filesystem"),
+            Some(leader_file_system)
+        );
+        assert!(
+            follower_root.join("replica-repair-archives").exists(),
+            "divergent replica state should be archived before replacement"
+        );
+        let status = follower
+            .metadata_shard_statuses()
+            .expect("metadata status")
+            .pop()
+            .expect("status");
+        assert_eq!(status.journal_last_sequence, leader.journal_last_sequence());
+        assert_eq!(
+            status.replay_cursors,
+            vec![DfsMetadataReplayCursorStatus {
+                source_shard_id: shard_id,
+                replayed_through_sequence: leader.journal_last_sequence(),
             }]
         );
 

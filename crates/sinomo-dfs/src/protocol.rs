@@ -1,6 +1,6 @@
 use crate::{
-    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardId, DfsObjectId, DfsObjectMetadata,
-    DfsReplicationPolicy, DfsVersion, NetworkedDfsWriteOutcome,
+    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardId, DfsMetadataTableSnapshot,
+    DfsObjectId, DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
@@ -279,6 +279,24 @@ pub struct DfsMetadataJournalBatchResponse {
     pub result: DfsMetadataJournalBatchResult,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataSnapshotInstallCommand {
+    pub request_id: String,
+    pub source_node_id: NodeId,
+    pub shard_id: DfsMetadataShardId,
+    pub next_after_sequence: u64,
+    pub snapshot: DfsMetadataTableSnapshot,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataSnapshotInstallResponse {
+    pub request_id: String,
+    pub shard_id: DfsMetadataShardId,
+    pub next_after_sequence: u64,
+    pub result: DfsMetadataSnapshotInstallResult,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DfsProtocolFrameCommand {
     pub request_id: String,
@@ -295,6 +313,13 @@ pub struct DfsProtocolFrameResponse {
 #[serde(rename_all = "kebab-case")]
 pub enum DfsMetadataJournalBatchResult {
     Applied,
+    Rejected { reason: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsMetadataSnapshotInstallResult {
+    Installed { archived_existing: bool },
     Rejected { reason: String },
 }
 
@@ -329,4 +354,6 @@ pub enum DfsNetworkMessage {
     FetchBlobResponseChunk(DfsFetchBlobResponseChunk),
     MetadataJournalBatch(DfsMetadataJournalBatchCommand),
     MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse),
+    MetadataSnapshotInstall(DfsMetadataSnapshotInstallCommand),
+    MetadataSnapshotInstallResponse(DfsMetadataSnapshotInstallResponse),
 }

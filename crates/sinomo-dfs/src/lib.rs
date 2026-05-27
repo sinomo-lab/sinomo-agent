@@ -39,10 +39,10 @@ pub use metadata_backend::{
     DfsConflictRecord, DfsConflictStatus, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId,
     DfsInodeRecord, DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
     DfsMetadataMutation, DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus,
-    DfsMetadataShardId, DfsMetadataShardStatus, DfsMetadataSubscription, DfsNamespaceTransaction,
-    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
-    DfsWriteIntentStatus, LocalJsonMetadataBackend, LocalShardedMetadataBackend,
-    MetadataBackendError,
+    DfsMetadataShardId, DfsMetadataShardStatus, DfsMetadataSubscription, DfsMetadataTableSnapshot,
+    DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord,
+    DfsWriteIntentRecord, DfsWriteIntentStatus, LocalJsonMetadataBackend,
+    LocalShardedMetadataBackend, MetadataBackendError,
 };
 use namespace::metadata_path;
 pub use namespace::{
@@ -62,9 +62,10 @@ pub use protocol::{
     DfsDistributedWriteCommand, DfsDistributedWriteResponse, DfsDistributedWriteResult,
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
-    DfsNetworkMessage, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReadData,
-    DfsReadRequest, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
-    DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsMetadataSnapshotInstallResult, DfsNetworkMessage, DfsProtocolFrameCommand,
+    DfsProtocolFrameResponse, DfsReadData, DfsReadRequest, DfsReadResponse, DfsReadResponseChunk,
+    DfsReadResult, DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
     DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse, DfsWriteCommand,
     DfsWriteResponse, DfsWriteResult,
 };
@@ -886,6 +887,8 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
                 | DfsNetworkMessage::DistributedWriteResponse(_)
                 | DfsNetworkMessage::MetadataJournalBatch(_)
                 | DfsNetworkMessage::MetadataJournalBatchResponse(_)
+                | DfsNetworkMessage::MetadataSnapshotInstall(_)
+                | DfsNetworkMessage::MetadataSnapshotInstallResponse(_)
                 | DfsNetworkMessage::ReadResponseChunk(_) => {}
             }
         }
@@ -2855,7 +2858,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 }
                 DfsNetworkMessage::CommitVersionResponse(_)
                 | DfsNetworkMessage::WriteRequest(_)
-                | DfsNetworkMessage::WriteResponse(_) => {}
+                | DfsNetworkMessage::WriteResponse(_)
+                | DfsNetworkMessage::MetadataSnapshotInstall(_)
+                | DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {}
             }
             self.flush_completed_pending_remote_write_responses(&mut events)?;
         }

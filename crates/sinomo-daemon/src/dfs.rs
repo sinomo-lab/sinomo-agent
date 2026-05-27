@@ -1,6 +1,7 @@
 use crate::{
     DaemonError, DaemonPaths, DaemonRunOptions, put_cluster_kv_control_record,
-    send_dfs_metadata_journal_batch_to_endpoint, send_dfs_protocol_frame_to_endpoint,
+    send_dfs_metadata_journal_batch_to_endpoint, send_dfs_metadata_snapshot_install_to_endpoint,
+    send_dfs_protocol_frame_to_endpoint,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
@@ -11,14 +12,15 @@ use sinomo_dfs::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeAdvertisement, DfsObjectVersionRecord,
-    DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
-    DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy,
-    DfsSubtreePolicy, DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend,
-    LocalShardedMetadataBackend, NetworkedDfsService, content_service_key, content_services_prefix,
-    default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
-    fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
-    sifs_node_files_path,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNodeAdvertisement,
+    DfsObjectVersionRecord, DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView,
+    DfsOperatorRepairView, DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
+    DfsReplicationPolicy, DfsSubtreePolicy, DfsWriteOptions, LocalContentStore,
+    LocalJsonMetadataBackend, LocalShardedMetadataBackend, NetworkedDfsService,
+    content_service_key, content_services_prefix, default_dfs_metadata_shards_root,
+    distributed_sifs, distributed_sifs_bootstrap_objects, fallback_dfs_node_id,
+    file_system_config_key, metadata_service_key, metadata_shard_key, sifs_node_files_path,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
@@ -53,6 +55,16 @@ type DfsMetadataJournalBatchSender = Arc<
             &DfsMetadataJournalBatchCommand,
             Duration,
         ) -> Result<DfsMetadataJournalBatchResponse, DaemonError>
+        + Send
+        + Sync,
+>;
+
+type DfsMetadataSnapshotInstallSender = Arc<
+    dyn Fn(
+            &ClusterEndpointRecord,
+            &DfsMetadataSnapshotInstallCommand,
+            Duration,
+        ) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError>
         + Send
         + Sync,
 >;
@@ -96,6 +108,12 @@ pub enum DaemonDfsMetadataReplicationOutcome {
         target_node_id: sinomo_node::NodeId,
         shard_id: DfsMetadataShardId,
         reason: String,
+    },
+    SnapshotInstalled {
+        target_node_id: sinomo_node::NodeId,
+        shard_id: DfsMetadataShardId,
+        next_after_sequence: u64,
+        archived_existing: bool,
     },
     Failed {
         target_node_id: sinomo_node::NodeId,
@@ -364,6 +382,99 @@ pub fn handle_daemon_dfs_metadata_journal_batch(
     }
 }
 
+pub fn handle_daemon_dfs_metadata_snapshot_install(
+    paths: &DaemonPaths,
+    command: DfsMetadataSnapshotInstallCommand,
+) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let shard = sinomo_network::read_cluster_kv_prefix_values::<DfsMetadataShardConfig>(
+        &cluster_paths,
+        &format!(
+            "{}/",
+            sinomo_dfs::metadata_shards_prefix(&sinomo_dfs::sifs_file_system_id())
+        ),
+    )?
+    .into_iter()
+    .find(|shard| shard.shard_id == command.shard_id.0.as_str());
+    let Some(shard) = shard else {
+        return Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id,
+            shard_id: command.shard_id,
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Rejected {
+                reason: "metadata snapshot install has no local shard config".to_string(),
+            },
+        });
+    };
+    if shard.primary_node_id != command.source_node_id {
+        return Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id,
+            shard_id: command.shard_id,
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Rejected {
+                reason: format!(
+                    "metadata snapshot source {} is not shard {} primary {}",
+                    command.source_node_id, shard.shard_id, shard.primary_node_id
+                ),
+            },
+        });
+    }
+    if shard.primary_node_id == state.local_node_id {
+        return Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id,
+            shard_id: command.shard_id,
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Rejected {
+                reason: "metadata primary must not install a replica snapshot".to_string(),
+            },
+        });
+    }
+    if !shard.replica_node_ids.contains(&state.local_node_id) {
+        return Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id,
+            shard_id: command.shard_id,
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Rejected {
+                reason: format!(
+                    "local node {} is not configured as a replica for metadata shard {}",
+                    state.local_node_id, shard.shard_id
+                ),
+            },
+        });
+    }
+    let mut backend = LocalJsonMetadataBackend::new(
+        command.shard_id.clone(),
+        data_dir
+            .dfs_dir()
+            .join("metadata")
+            .join(path_safe_segment(&command.shard_id.0)),
+    )?;
+    match backend.replace_with_replicated_snapshot(
+        command.shard_id.clone(),
+        command.next_after_sequence,
+        command.snapshot,
+    ) {
+        Ok(archived_existing) => Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id,
+            shard_id: command.shard_id,
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Installed { archived_existing },
+        }),
+        Err(error) => Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id,
+            shard_id: command.shard_id,
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Rejected {
+                reason: error.to_string(),
+            },
+        }),
+    }
+}
+
 pub fn handle_daemon_dfs_protocol_frame(
     paths: &DaemonPaths,
     command: DfsProtocolFrameCommand,
@@ -504,6 +615,15 @@ pub fn log_dfs_metadata_replication_report(report: DaemonDfsMetadataReplicationR
             } => {
                 eprintln!(
                     "sinomo daemon replicated {entries} DFS metadata journal entries to {target_node_id}"
+                );
+            }
+            DaemonDfsMetadataReplicationOutcome::SnapshotInstalled {
+                target_node_id,
+                next_after_sequence,
+                ..
+            } => {
+                eprintln!(
+                    "sinomo daemon repaired DFS metadata replica {target_node_id} with snapshot through {next_after_sequence}"
                 );
             }
             DaemonDfsMetadataReplicationOutcome::Rejected {
@@ -914,15 +1034,29 @@ impl NetworkTransport for DaemonDfsEndpointTransport {
 pub fn publish_default_dfs_metadata_journal(
     paths: &DaemonPaths,
 ) -> Result<DaemonDfsMetadataReplicationReport, DaemonError> {
-    publish_default_dfs_metadata_journal_with_sender(
+    publish_default_dfs_metadata_journal_with_senders(
         paths,
         Arc::new(send_dfs_metadata_journal_batch_to_endpoint),
+        Arc::new(send_dfs_metadata_snapshot_install_to_endpoint),
     )
 }
 
+#[cfg(test)]
 fn publish_default_dfs_metadata_journal_with_sender(
     paths: &DaemonPaths,
     sender: DfsMetadataJournalBatchSender,
+) -> Result<DaemonDfsMetadataReplicationReport, DaemonError> {
+    publish_default_dfs_metadata_journal_with_senders(
+        paths,
+        sender,
+        Arc::new(send_dfs_metadata_snapshot_install_to_endpoint),
+    )
+}
+
+fn publish_default_dfs_metadata_journal_with_senders(
+    paths: &DaemonPaths,
+    sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
 ) -> Result<DaemonDfsMetadataReplicationReport, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
@@ -1068,6 +1202,91 @@ fn publish_default_dfs_metadata_journal_with_sender(
                                     break;
                                 }
                                 DfsMetadataJournalBatchResult::Rejected { reason } => {
+                                    if metadata_journal_rejection_is_sequence_conflict(&reason) {
+                                        let snapshot_next_after_sequence =
+                                            backend.journal_last_sequence();
+                                        let snapshot_command = DfsMetadataSnapshotInstallCommand {
+                                            request_id: format!(
+                                                "dfs_meta_snapshot_{}_{}_{}",
+                                                state.local_node_id,
+                                                target_node_id,
+                                                snapshot_next_after_sequence
+                                            ),
+                                            source_node_id: state.local_node_id.clone(),
+                                            shard_id: shard_id.clone(),
+                                            next_after_sequence: snapshot_next_after_sequence,
+                                            snapshot: backend.export_table_snapshot(),
+                                            reason: reason.clone(),
+                                        };
+                                        match snapshot_sender(
+                                            endpoint,
+                                            &snapshot_command,
+                                            attempt_timeout,
+                                        ) {
+                                            Ok(snapshot_response) => {
+                                                if snapshot_response.request_id
+                                                    != snapshot_command.request_id
+                                                    || snapshot_response.shard_id != shard_id
+                                                    || snapshot_response.next_after_sequence
+                                                        != snapshot_next_after_sequence
+                                                {
+                                                    failures.push(format!(
+                                                        "{} returned mismatched metadata snapshot install response",
+                                                        endpoint.address
+                                                    ));
+                                                    continue;
+                                                }
+                                                match snapshot_response.result {
+                                                    DfsMetadataSnapshotInstallResult::Installed {
+                                                        archived_existing,
+                                                    } => {
+                                                        backend.put_metadata_replication_cursor(
+                                                            &target_node_id,
+                                                            &shard_id,
+                                                            snapshot_next_after_sequence,
+                                                        )?;
+                                                        after_sequence =
+                                                            snapshot_next_after_sequence;
+                                                        sent_batches += 1;
+                                                        outcomes.push(
+                                                            DaemonDfsMetadataReplicationOutcome::SnapshotInstalled {
+                                                                target_node_id: target_node_id.clone(),
+                                                                shard_id: shard_id.clone(),
+                                                                next_after_sequence:
+                                                                    snapshot_next_after_sequence,
+                                                                archived_existing,
+                                                            },
+                                                        );
+                                                        delivered = true;
+                                                        break;
+                                                    }
+                                                    DfsMetadataSnapshotInstallResult::Rejected {
+                                                        reason: snapshot_reason,
+                                                    } => {
+                                                        outcomes.push(
+                                                            DaemonDfsMetadataReplicationOutcome::Rejected {
+                                                                target_node_id: target_node_id.clone(),
+                                                                shard_id: shard_id.clone(),
+                                                                reason: format!(
+                                                                    "{reason}; snapshot repair rejected: {snapshot_reason}"
+                                                                ),
+                                                            },
+                                                        );
+                                                        delivered = true;
+                                                        terminal = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(error) => {
+                                                failures.push(format!(
+                                                    "{} snapshot repair failed: {error}",
+                                                    endpoint.address
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     outcomes.push(DaemonDfsMetadataReplicationOutcome::Rejected {
                                         target_node_id: target_node_id.clone(),
                                         shard_id: shard_id.clone(),
@@ -1181,6 +1400,11 @@ fn dfs_metadata_replication_endpoint_class(endpoint: &ClusterEndpointRecord) -> 
         (ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback, _) => 3,
         _ => 4,
     }
+}
+
+fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
+    reason.contains("metadata journal sequence")
+        && reason.contains("already exists with a different entry")
 }
 
 pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport, DaemonError> {
@@ -2472,6 +2696,139 @@ mod tests {
                 .metadata_replication_cursor(&remote, &shard_id)
                 .expect("backend cursor"),
             0
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_journal_publish_repairs_sequence_conflict_with_snapshot() {
+        let root = temp_root("daemon_dfs_metadata_journal_publish_snapshot_repair");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_snapshot_repair")
+                .expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_dfs_metadata_snapshot_repair_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_metadata_snapshot_repair_remote").expect("remote");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "daemon dfs metadata snapshot repair",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut remote_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities =
+            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.26:21353")];
+        state.members.push(remote_member);
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+
+        let file_system = distributed_sifs(local.clone());
+        let shard_id = DfsMetadataShardId::new("root");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_network::append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &shard,
+                    None,
+                )
+                .expect("put shard op"),
+            ),
+        )
+        .expect("write shard config");
+
+        let mut backend = LocalJsonMetadataBackend::new(
+            shard_id.clone(),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        drop(backend);
+
+        let sender: DfsMetadataJournalBatchSender = Arc::new(
+            move |_endpoint, command, _timeout| {
+                Ok(DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id.clone(),
+                    shard_id: command.batch.shard_id.clone(),
+                    next_after_sequence: command.batch.next_after_sequence,
+                    applied_entries: 0,
+                    result: DfsMetadataJournalBatchResult::Rejected {
+                        reason: format!(
+                            "metadata journal sequence {} already exists with a different entry while replaying shard root",
+                            command.batch.next_after_sequence
+                        ),
+                    },
+                })
+            },
+        );
+        let snapshot_installs = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_installs_for_sender = Arc::clone(&snapshot_installs);
+        let snapshot_sender: DfsMetadataSnapshotInstallSender =
+            Arc::new(move |_endpoint, command, _timeout| {
+                snapshot_installs_for_sender
+                    .lock()
+                    .expect("snapshot installs lock")
+                    .push(command.clone());
+                Ok(DfsMetadataSnapshotInstallResponse {
+                    request_id: command.request_id.clone(),
+                    shard_id: command.shard_id.clone(),
+                    next_after_sequence: command.next_after_sequence,
+                    result: DfsMetadataSnapshotInstallResult::Installed {
+                        archived_existing: true,
+                    },
+                })
+            });
+
+        let report =
+            publish_default_dfs_metadata_journal_with_senders(&paths, sender, snapshot_sender)
+                .expect("publish metadata journal");
+
+        assert_eq!(
+            report.outcomes,
+            vec![DaemonDfsMetadataReplicationOutcome::SnapshotInstalled {
+                target_node_id: remote.clone(),
+                shard_id: shard_id.clone(),
+                next_after_sequence: 1,
+                archived_existing: true,
+            }]
+        );
+        assert_eq!(snapshot_installs.lock().expect("lock").len(), 1);
+        let backend = LocalJsonMetadataBackend::new(
+            shard_id.clone(),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend reload");
+        assert_eq!(
+            backend
+                .metadata_replication_cursor(&remote, &shard_id)
+                .expect("backend cursor"),
+            1
         );
 
         cleanup(&root);

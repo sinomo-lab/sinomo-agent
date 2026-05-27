@@ -7,7 +7,8 @@ use crate::{
 };
 use sinomo_core::{ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_dfs::{
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsOperatorStatus,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsOperatorStatus,
     DfsProtocolFrameCommand, DfsProtocolFrameResponse,
 };
 use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
@@ -180,6 +181,20 @@ pub fn send_dfs_metadata_journal_batch_to_endpoint(
 ) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
     let rpc_request = ObjectRpcRequest::encode_body(
         sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        sinomo_network::DFS_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn send_dfs_metadata_snapshot_install_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsMetadataSnapshotInstallCommand,
+    timeout: Duration,
+) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
         sinomo_network::DFS_RPC_CATEGORY,
         request,
     )?;

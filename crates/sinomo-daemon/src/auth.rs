@@ -353,6 +353,17 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
+        command
+            if command
+                == daemon_rpc_command(sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE) =>
+        {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         command if command == daemon_rpc_command(sinomo_network::DFS_PROTOCOL_FRAME_ROUTE) => {
             matches!(
                 authenticated.signer,
@@ -811,6 +822,20 @@ mod tests {
             let authenticated = authenticated_command(command.clone(), signer);
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to replicate DFS metadata journals");
+        }
+    }
+
+    #[test]
+    fn dfs_metadata_snapshot_install_authorizes_cluster_members() {
+        let command = daemon_rpc_command(sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE);
+        for signer in [
+            DaemonSignerAuthority::Local,
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+        ] {
+            let authenticated = authenticated_command(command.clone(), signer);
+            authorize_authenticated_daemon_command(&authenticated)
+                .expect("cluster members must be able to repair DFS metadata replicas");
         }
     }
 

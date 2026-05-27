@@ -28,7 +28,8 @@ pub use client::{
     send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_build,
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_diagnostics, send_daemon_rpc,
     send_daemon_rpc_stream, send_daemon_rpc_to_endpoint, send_daemon_shutdown_request,
-    send_dfs_metadata_journal_batch_to_endpoint, send_dfs_protocol_frame_to_endpoint,
+    send_dfs_metadata_journal_batch_to_endpoint, send_dfs_metadata_snapshot_install_to_endpoint,
+    send_dfs_protocol_frame_to_endpoint,
 };
 pub use cluster::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
@@ -84,9 +85,10 @@ pub use dfs::{
     DaemonDfsMetadataReplicationOutcome, DaemonDfsMetadataReplicationReport, DaemonDfsSmokeReport,
     ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     handle_daemon_dfs_expose_config, handle_daemon_dfs_inspection,
-    handle_daemon_dfs_metadata_journal_batch, handle_daemon_dfs_protocol_frame,
-    handle_daemon_dfs_status, log_dfs_metadata_replication_report,
-    publish_default_dfs_metadata_journal, run_daemon_dfs_maintenance_tick, run_daemon_dfs_smoke,
+    handle_daemon_dfs_metadata_journal_batch, handle_daemon_dfs_metadata_snapshot_install,
+    handle_daemon_dfs_protocol_frame, handle_daemon_dfs_status,
+    log_dfs_metadata_replication_report, publish_default_dfs_metadata_journal,
+    run_daemon_dfs_maintenance_tick, run_daemon_dfs_smoke,
 };
 pub use error::DaemonError;
 pub use install::{
