@@ -1791,15 +1791,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
         let memory_object = self
             .metadata
-            .objects
-            .values()
-            .find(|object| {
-                &object.file_system_id == file_system_id
-                    && object.kind != DfsObjectKind::Tombstone
-                    && normalize_posix_path(&object.path)
-                        .map(|normalized| normalized == path)
-                        .unwrap_or(false)
-            })
+            .object_by_normalized_posix_path(file_system_id, path)
             .cloned();
         if let Some(backend) = self.metadata_backend.as_ref() {
             let backend_object =
@@ -2282,6 +2274,13 @@ fn now_unix_nanos() -> u64 {
         .unix_timestamp_nanos()
         .try_into()
         .unwrap_or(1_000_000_000)
+}
+
+/// Returns the canonical POSIX path key used to index objects by path, or
+/// `None` when the path cannot be normalized. This must match the normalization
+/// applied when looking objects up by path so the index and lookups agree.
+pub(crate) fn normalized_posix_path_key(path: &str) -> Option<String> {
+    normalize_posix_path(path).ok()
 }
 
 fn normalize_posix_path(path: &str) -> Result<String> {

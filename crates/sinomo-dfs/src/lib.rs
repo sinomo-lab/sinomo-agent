@@ -460,6 +460,12 @@ impl DfsPolicyViolation {
 pub struct DfsMetadataStore {
     filesystems: BTreeMap<DfsFileSystemId, DfsFileSystem>,
     objects: BTreeMap<DfsObjectId, DfsObjectMetadata>,
+    /// Index from `(file_system_id, normalized posix path)` to the object ids at
+    /// that path, so path lookups avoid scanning every object. A path can hold
+    /// more than one object id transiently (e.g. a tombstone alongside its
+    /// replacement), so the set is resolved to the first non-tombstone object at
+    /// lookup time, matching the previous linear scan exactly.
+    objects_by_path: BTreeMap<(DfsFileSystemId, String), BTreeSet<DfsObjectId>>,
     conflicts: BTreeMap<DfsObjectId, BTreeMap<String, DfsConflictRecord>>,
 }
 
@@ -480,12 +486,59 @@ impl DfsMetadataStore {
             });
         }
         normalize_current_locations(&mut object.current_locations);
+        let new_key = path_index_key(&object.file_system_id, &object.path);
+        let previous_key = self
+            .objects
+            .get(&object.object_id)
+            .and_then(|previous| path_index_key(&previous.file_system_id, &previous.path));
+        if previous_key != new_key {
+            if let Some(previous_key) = previous_key {
+                self.unindex_path(&previous_key, &object.object_id);
+            }
+            if let Some(new_key) = new_key {
+                self.objects_by_path
+                    .entry(new_key)
+                    .or_default()
+                    .insert(object.object_id.clone());
+            }
+        }
         self.objects.insert(object.object_id.clone(), object);
         Ok(())
     }
 
+    fn remove_object(&mut self, object_id: &DfsObjectId) -> Option<DfsObjectMetadata> {
+        let removed = self.objects.remove(object_id)?;
+        if let Some(key) = path_index_key(&removed.file_system_id, &removed.path) {
+            self.unindex_path(&key, object_id);
+        }
+        Some(removed)
+    }
+
+    fn unindex_path(&mut self, key: &(DfsFileSystemId, String), object_id: &DfsObjectId) {
+        if let Some(object_ids) = self.objects_by_path.get_mut(key) {
+            object_ids.remove(object_id);
+            if object_ids.is_empty() {
+                self.objects_by_path.remove(key);
+            }
+        }
+    }
+
     pub fn object(&self, object_id: &DfsObjectId) -> Option<&DfsObjectMetadata> {
         self.objects.get(object_id)
+    }
+
+    /// Resolves the first non-tombstone object at a normalized posix path within
+    /// a filesystem, using the path index instead of a full object scan.
+    pub fn object_by_normalized_posix_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        normalized_path: &str,
+    ) -> Option<&DfsObjectMetadata> {
+        self.objects_by_path
+            .get(&(file_system_id.clone(), normalized_path.to_string()))?
+            .iter()
+            .filter_map(|object_id| self.objects.get(object_id))
+            .find(|object| object.kind != DfsObjectKind::Tombstone)
     }
 
     pub fn add_conflict(&mut self, conflict: DfsConflictRecord) {
@@ -2036,7 +2089,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     }
 
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
-        self.metadata.objects.remove(object_id);
+        self.metadata.remove_object(object_id);
     }
 
     pub fn apply_namespace_transaction(
@@ -8470,6 +8523,16 @@ fn normalize_current_locations(locations: &mut Vec<NodeId>) {
     locations.retain(|node_id| seen.insert(node_id.clone()));
 }
 
+/// Builds the `(file_system_id, normalized path)` key used to index an object by
+/// path, or `None` when the object's path cannot be normalized (such objects are
+/// not reachable by path lookup, matching the previous scan's behavior).
+fn path_index_key(
+    file_system_id: &DfsFileSystemId,
+    path: &str,
+) -> Option<(DfsFileSystemId, String)> {
+    posix::normalized_posix_path_key(path).map(|normalized| (file_system_id.clone(), normalized))
+}
+
 fn remote_read_rejection_prunes_location(reason: &str) -> bool {
     reason.contains("is not a current location for DFS object")
 }
@@ -8839,6 +8902,79 @@ mod tests {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         }
+    }
+
+    #[test]
+    fn metadata_store_path_index_matches_scan_semantics() {
+        let owner = NodeId::from_legacy_named("node_owner").expect("node");
+        let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+        let mut store = DfsMetadataStore::new();
+        store.add_file_system(file_system(owner.clone()));
+
+        let mut file = file_metadata(owner.clone());
+        file.object_id = DfsObjectId::from_legacy_named("obj_live").expect("object");
+        file.kind = DfsObjectKind::File;
+        file.path = "/users/example/./hello.txt".to_string();
+        store.add_object(file.clone()).expect("add file");
+
+        // Lookup uses the normalized key (".." and "." resolved), and a path that
+        // does not normalize to the stored key does not match.
+        let found = store
+            .object_by_normalized_posix_path(&file_system_id, "/users/example/hello.txt")
+            .expect("indexed object");
+        assert_eq!(found.object_id, file.object_id);
+        assert!(
+            store
+                .object_by_normalized_posix_path(&file_system_id, "/users/example/missing.txt")
+                .is_none()
+        );
+
+        // Updating the same object id to a new path moves the index entry.
+        let mut moved = file.clone();
+        moved.path = "/users/example/renamed.txt".to_string();
+        store.add_object(moved.clone()).expect("move file");
+        assert!(
+            store
+                .object_by_normalized_posix_path(&file_system_id, "/users/example/hello.txt")
+                .is_none(),
+            "old path must no longer resolve after a path move"
+        );
+        assert_eq!(
+            store
+                .object_by_normalized_posix_path(&file_system_id, "/users/example/renamed.txt")
+                .expect("moved object")
+                .object_id,
+            file.object_id
+        );
+
+        // A tombstone object sharing the path is skipped in favor of a live object,
+        // regardless of object-id ordering.
+        let mut tombstone = file_metadata(owner.clone());
+        tombstone.object_id = DfsObjectId::from_legacy_named("obj_aaaa_tombstone").expect("object");
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.path = "/users/example/renamed.txt".to_string();
+        store.add_object(tombstone.clone()).expect("add tombstone");
+        assert_eq!(
+            store
+                .object_by_normalized_posix_path(&file_system_id, "/users/example/renamed.txt")
+                .expect("live object preferred over tombstone")
+                .object_id,
+            file.object_id
+        );
+
+        // Removing the live object leaves only the tombstone, so the path no longer
+        // resolves to a visible object.
+        store.remove_object(&file.object_id);
+        assert!(
+            store
+                .object_by_normalized_posix_path(&file_system_id, "/users/example/renamed.txt")
+                .is_none(),
+            "only a tombstone remains, which must not resolve"
+        );
+
+        // Removing the tombstone empties the bucket entirely.
+        store.remove_object(&tombstone.object_id);
+        assert!(store.objects_by_path.is_empty());
     }
 
     fn temp_root(name: &str) -> PathBuf {
