@@ -53,6 +53,17 @@ impl From<&DfsFileSystem> for DfsFileSystemConfig {
     }
 }
 
+impl From<DfsFileSystemConfig> for DfsFileSystem {
+    fn from(config: DfsFileSystemConfig) -> Self {
+        Self {
+            file_system_id: config.file_system_id,
+            display_name: config.display_name,
+            owner_node_id: config.owner_node_id,
+            subtree_policies: config.subtree_policies,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataShardConfig {
     pub file_system_id: DfsFileSystemId,

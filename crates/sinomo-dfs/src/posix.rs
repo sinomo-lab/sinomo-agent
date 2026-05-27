@@ -8,9 +8,9 @@
 
 use crate::namespace::{initial_version, metadata_path, next_version, object_id_for_path};
 use crate::{
-    DfsError, DfsFileSystem, DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata,
-    DfsReadData, DfsReplicationPolicy, NetworkedDfsReadOutcome, NetworkedDfsService,
-    NetworkedDfsWriteOutcome, sifs_file_system_id,
+    DfsControlPlaneStore, DfsError, DfsFileSystem, DfsNamespaceTransaction, DfsObjectKind,
+    DfsObjectMetadata, DfsReadData, DfsReplicationPolicy, NetworkedDfsReadOutcome,
+    NetworkedDfsService, NetworkedDfsWriteOutcome, sifs_file_system_id,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
@@ -128,9 +128,22 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     }
 
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
-        let file_system = crate::namespace::distributed_sifs(self.node_id.clone());
+        let fallback_file_system = crate::namespace::distributed_sifs(self.node_id.clone());
+        let file_system_id = fallback_file_system.file_system_id.clone();
+        let file_system = if let Some(kv) = self.control_plane.as_mut() {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .get_file_system_config(&file_system_id)
+                .map_err(DfsError::from)?
+                .map(DfsFileSystem::from)
+                .unwrap_or(fallback_file_system)
+        } else {
+            fallback_file_system
+        };
+        let bootstrap_owner_node_id = file_system.owner_node_id.clone();
         self.add_file_system(file_system)?;
-        for object in crate::namespace::distributed_sifs_bootstrap_objects(self.node_id.clone()) {
+        for object in
+            crate::namespace::distributed_sifs_bootstrap_objects(bootstrap_owner_node_id.clone())
+        {
             if self
                 .lookup_metadata_path(&object.file_system_id, &object.path)?
                 .is_none()
