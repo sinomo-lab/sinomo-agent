@@ -2607,14 +2607,28 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
         );
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            DfsReplicationPolicy::new(
-                policy.min_commit_replicas.min(desired_replica_nodes.len()),
-                desired_replica_nodes.len(),
-            )?
+            let desired_replicas = desired_replica_nodes.len();
+            // Replicated-confirmed requires every desired replica to confirm before
+            // commit. When normalization widens the replica set (e.g. by injecting
+            // the owner node), the commit threshold must grow with it; otherwise the
+            // write would commit before all desired replicas are durable and silently
+            // degrade to eventual semantics.
+            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
+                desired_replicas
+            } else {
+                policy.min_commit_replicas.min(desired_replicas)
+            };
+            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
         } else {
             policy
         };
         validate_replication_plan(&desired_replica_nodes, &policy)?;
+        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message: "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                    .to_string(),
+            });
+        }
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => {
                 return self.route_distributed_write_to_metadata_primary(
@@ -4657,9 +4671,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     command.object_metadata.as_ref(),
                 )
             }) {
-            Ok(()) => DfsBlobTransferResult::Committed {
-                content_hash: command.content_hash.clone(),
-            },
+            Ok(()) => {
+                // The version is now durably committed on this replica, so the
+                // in-flight stage guard for it is no longer "active". Clearing it
+                // prevents a stale entry from rejecting a later write of a new
+                // version of the same object to this replica.
+                self.clear_active_replica_stage(&command.object_id, &command.version);
+                DfsBlobTransferResult::Committed {
+                    content_hash: command.content_hash.clone(),
+                }
+            }
             Err(error) => DfsBlobTransferResult::Rejected {
                 reason: error.to_string(),
             },
@@ -5457,7 +5478,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let mut sent_chunked_response = false;
         let result = match manifest_result {
             Ok(manifest) if manifest.size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 => {
-                match self.content.open_blob_reader(&command.content_hash) {
+                match self.content.open_blob_stream(&command.content_hash) {
                     Ok(reader) => {
                         self.send_fetch_blob_response_chunks_from_reader(
                             &requester_node_id,
@@ -5578,7 +5599,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .read_exact(&mut buffer[..chunk_len])
                 .map_err(|source| DfsError::ContentStore {
                     message: format!(
-                        "failed to read verified blob {} chunk {}: {}",
+                        "failed to read blob {} chunk {}: {}",
                         command.content_hash, chunk_index, source
                     ),
                 })?;

@@ -493,17 +493,13 @@ impl DistributedEventualCoordinator {
         };
         self.receipts
             .insert((intent_id.to_string(), replica_node_id.clone()), receipt);
+        // A newly durable receipt can only retire this node's repair job for this
+        // intent; it never introduces new missing replicas. Removing exactly that
+        // job is the complete update, so a full `rebuild_repair_jobs` scan would
+        // recompute the identical result at O(committed intents × replicas) cost.
         self.repair_jobs.retain(|job| {
             job.intent_id != intent_id || job.missing_replica_node_id != replica_node_id
         });
-
-        if self
-            .intents
-            .get(intent_id)
-            .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
-        {
-            self.rebuild_repair_jobs();
-        }
 
         self.intents
             .get(intent_id)

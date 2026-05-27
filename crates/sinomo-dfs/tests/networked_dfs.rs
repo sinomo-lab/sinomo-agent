@@ -4954,6 +4954,253 @@ fn networked_dfs_three_nodes_two_replicas_supports_multiple_readers_and_writers(
 }
 
 #[test]
+fn networked_dfs_replica_accepts_second_version_for_same_object() {
+    // Regression: a replica records an active stage when it receives content, but
+    // must clear it once the version commits. Otherwise a later write of a new
+    // version of the same object to the same replica is wrongly rejected as a
+    // "conflicting active DFS stage", and the per-object stage map grows forever.
+    let owner = NodeId::from_legacy_named("node_owner_seq").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica_seq").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_seq_versions").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let version_3 = DfsVersion::from_legacy_named("version_3").expect("version");
+    let root = temp_root("networked_replica_second_version");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
+    );
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "sequential.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone(), replica.clone()],
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version_1.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    for dfs in [&mut owner_dfs, &mut replica_dfs] {
+        dfs.add_file_system(file_system.clone())
+            .expect("filesystem");
+        dfs.add_object_metadata(metadata.clone()).expect("object");
+    }
+
+    // First replicated write commits v2 to {owner, replica}.
+    assert!(matches!(
+        owner_dfs
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    target_version: version_2.clone(),
+                    requesting_node_id: owner.clone(),
+                },
+                b"version two bytes".to_vec(),
+                vec![owner.clone(), replica.clone()],
+                DfsReplicationPolicy::new(2, 2).expect("policy"),
+            )
+            .expect("write v2"),
+        NetworkedDfsWriteOutcome::Pending { .. }
+    ));
+    replica_dfs.process_incoming().expect("replica stages v2");
+    owner_dfs.process_incoming().expect("owner commits v2");
+    replica_dfs.process_incoming().expect("replica applies v2 commit");
+    assert_eq!(
+        replica_dfs
+            .read_local_object(&object_id)
+            .expect("replica v2")
+            .expect("v2 data")
+            .bytes,
+        b"version two bytes"
+    );
+
+    // Second replicated write to the SAME replica set must not be rejected by a
+    // stale active-stage guard left over from v2.
+    assert!(matches!(
+        owner_dfs
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id,
+                    object_id: object_id.clone(),
+                    target_version: version_3.clone(),
+                    requesting_node_id: owner.clone(),
+                },
+                b"version three bytes".to_vec(),
+                vec![owner.clone(), replica.clone()],
+                DfsReplicationPolicy::new(2, 2).expect("policy"),
+            )
+            .expect("write v3"),
+        NetworkedDfsWriteOutcome::Pending { .. }
+    ));
+    let replica_v3_events = replica_dfs.process_incoming().expect("replica handles v3 stage");
+    assert!(
+        !replica_v3_events.iter().any(|event| matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobStageRejected { object_id: rejected, .. }
+                if rejected == &object_id
+        )),
+        "replica must accept the v3 stage after v2 committed: {replica_v3_events:?}"
+    );
+    assert!(replica_v3_events.iter().any(|event| matches!(
+        event,
+        NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. } if staged == &object_id
+    )));
+    owner_dfs.process_incoming().expect("owner commits v3");
+    replica_dfs.process_incoming().expect("replica applies v3 commit");
+    assert_eq!(
+        replica_dfs
+            .read_local_object(&object_id)
+            .expect("replica v3")
+            .expect("v3 data")
+            .bytes,
+        b"version three bytes"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_confirmed_write_keeps_strict_threshold_when_owner_is_added() {
+    // A replicated-confirmed write must wait for every desired replica. When the
+    // owner is not in the caller's replica set it is injected by normalization,
+    // and the commit threshold must grow with the set so the write does not commit
+    // before all replicas are durable.
+    let owner = NodeId::from_legacy_named("node_confirmed_owner").expect("node");
+    let replica_b = NodeId::from_legacy_named("node_confirmed_b").expect("node");
+    let replica_c = NodeId::from_legacy_named("node_confirmed_c").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_confirmed_strict").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("networked_confirmed_strict_threshold");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut dfs_b = NetworkedDfsService::new(
+        network.add_node(replica_b.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("b")).expect("b store"),
+    );
+    let mut dfs_c = NetworkedDfsService::new(
+        network.add_node(replica_c.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("c")).expect("c store"),
+    );
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "confirmed.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone(), replica_b.clone(), replica_c.clone()],
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version_1.clone(),
+        policy: DfsObjectPolicy::ReplicatedConfirmed,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    for dfs in [&mut owner_dfs, &mut dfs_b, &mut dfs_c] {
+        dfs.add_file_system(file_system.clone())
+            .expect("filesystem");
+        dfs.add_object_metadata(metadata.clone()).expect("object");
+    }
+
+    // Owner is deliberately excluded from the requested replica set; normalization
+    // injects it, widening the set from 2 to 3.
+    let outcome = owner_dfs
+        .write_replicated_confirmed(
+            DfsWriteRequest {
+                file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: owner.clone(),
+            },
+            b"confirmed bytes".to_vec(),
+            vec![replica_b.clone(), replica_c.clone()],
+        )
+        .expect("confirmed write starts");
+    assert!(
+        matches!(
+            outcome,
+            NetworkedDfsWriteOutcome::Pending {
+                durable_receipts: 1,
+                required_receipts: 3,
+                ..
+            }
+        ),
+        "confirmed write must require all 3 replicas after the owner is added: {outcome:?}"
+    );
+
+    // Only one replica confirms: still must not commit (owner + b = 2 of 3).
+    dfs_b.process_incoming().expect("b stages");
+    owner_dfs.process_incoming().expect("owner records b receipt");
+    assert_eq!(
+        owner_dfs
+            .metadata()
+            .object(&object_id)
+            .expect("owner object")
+            .version,
+        version_1,
+        "confirmed write must not commit before every replica confirms"
+    );
+
+    // Last replica confirms: now it commits.
+    dfs_c.process_incoming().expect("c stages");
+    owner_dfs.process_incoming().expect("owner records c receipt and commits");
+    assert_eq!(
+        owner_dfs
+            .metadata()
+            .object(&object_id)
+            .expect("owner object committed")
+            .version,
+        version_2,
+        "confirmed write commits once all replicas confirm"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_rejects_cross_staged_concurrent_writers_before_split_brain_commit() {
     let node_a = NodeId::from_legacy_named("node_concurrent_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_concurrent_b").expect("node");

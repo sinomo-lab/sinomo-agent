@@ -372,6 +372,27 @@ impl LocalContentStore {
         Ok(BlobReader { file, size_bytes })
     }
 
+    /// Opens a blob for streaming using a single read pass.
+    ///
+    /// Unlike [`Self::open_blob_reader`], this does not perform a separate
+    /// full-file hash pass to verify the content address before returning. The
+    /// blob size is taken from filesystem metadata. This is intended for serving
+    /// content-addressed bytes to a remote peer that verifies the assembled hash
+    /// itself (and rotates to another source on mismatch), where the extra read
+    /// pass would simply double the I/O for large blobs.
+    pub fn open_blob_stream(&self, hash: &str) -> Result<BlobReader> {
+        let path = self.blob_path(hash)?;
+        let file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let size_bytes = file
+            .metadata()
+            .map_err(|source| ContentStoreError::Io { path, source })?
+            .len();
+        Ok(BlobReader { file, size_bytes })
+    }
+
     pub fn read_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
         let path = self.manifest_path(object_id, version);
         let bytes = read_file(&path)?;
@@ -486,9 +507,10 @@ impl LocalContentStore {
         }
 
         let blob_path = self.blob_path(&hash)?;
-        if !self.has_blob(&hash)? {
-            publish_file_as_blob(source_path, &blob_path, &hash)?;
-        }
+        // `publish_file_as_blob` already verifies an existing content-addressed
+        // blob and repairs it in place when corrupt, so a separate `has_blob`
+        // pre-check would only re-read and re-hash the same file a second time.
+        publish_file_as_blob(source_path, &blob_path, &hash)?;
 
         let manifest = ContentManifest {
             object_id: object_id.to_owned(),
@@ -980,6 +1002,33 @@ mod tests {
         assert!(matches!(
             store.open_blob_reader(&manifest.content_hash),
             Err(ContentStoreError::BlobHashMismatch { .. })
+        ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn open_blob_stream_streams_bytes_in_a_single_pass() {
+        let root = temp_root("open_blob_stream_streams_bytes_in_a_single_pass");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let payload = b"single pass streamed bytes";
+        let manifest = store
+            .put_object_version("object-stream", "v1", payload)
+            .expect("put object version");
+
+        let mut reader = store
+            .open_blob_stream(&manifest.content_hash)
+            .expect("open stream");
+        assert_eq!(reader.size_bytes(), manifest.size_bytes);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read blob stream");
+        assert_eq!(bytes, payload);
+
+        // The streaming reader does not verify the content address itself; that is
+        // enforced end-to-end by the consuming peer. A missing blob still errors.
+        assert!(matches!(
+            store.open_blob_stream("blake3:not-a-real-hash"),
+            Err(ContentStoreError::InvalidHash(_))
         ));
 
         cleanup(&root);

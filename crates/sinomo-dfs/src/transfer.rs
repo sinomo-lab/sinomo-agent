@@ -270,7 +270,10 @@ pub(crate) fn validate_chunk_bytes(
     }
     let chunk_size = DFS_BLOB_CHUNK_BYTES as u64;
     let expected_len = if chunk_index + 1 == total_chunks {
-        total_size_bytes - chunk_size * u64::from(chunk_index)
+        // `validate_chunked_transfer_shape` guarantees this stays in range, but use
+        // saturating arithmetic so a malformed shape can never overflow or underflow.
+        let consumed = chunk_size.saturating_mul(u64::from(chunk_index));
+        total_size_bytes.saturating_sub(consumed)
     } else {
         chunk_size
     };
