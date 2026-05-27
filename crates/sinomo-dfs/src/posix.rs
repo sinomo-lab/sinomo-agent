@@ -14,6 +14,7 @@ use crate::{
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
+use sinomo_events::EventId;
 use sinomo_network::NetworkTransport;
 use sinomo_node::NodeId;
 use std::time::{Duration, Instant};
@@ -271,6 +272,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if !candidates.contains(&self.node_id) {
             candidates.insert(0, self.node_id.clone());
         }
+        let committed_locations = candidates.clone();
         let outcome = self.write_distributed_eventual_with_candidates(
             DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),
@@ -305,7 +307,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             outcome
         };
         match outcome {
-            NetworkedDfsWriteOutcome::Committed { .. } => {
+            NetworkedDfsWriteOutcome::Committed {
+                version,
+                content_hash,
+                ..
+            } => {
+                let mut committed_object = object.clone();
+                committed_object.version = version;
+                committed_object.content_hash = Some(content_hash);
+                committed_object.content_size_bytes = Some(bytes.len() as u64);
+                committed_object.current_locations = committed_locations;
+                let now = crate::dfs_now_unix_nanos();
+                committed_object.modified_at_unix_nanos = now;
+                committed_object.changed_at_unix_nanos = now;
+                committed_object.last_modified_by_event_id = Some(EventId::generate());
+                self.add_transient_object_metadata(committed_object.clone())?;
                 if transient_create {
                     self.touch_parent_directory_modified(&path)?;
                 }
