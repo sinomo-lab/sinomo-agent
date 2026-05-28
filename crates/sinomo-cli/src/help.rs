@@ -135,7 +135,7 @@ pub(super) fn print_rollout_help() {
         "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--remote-repo <path>] [--skip-local]"
     );
     println!(
-        "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then let each target activate through shadow supervision or main-only self restart."
+        "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then activate through shadow supervision or the main-only shadow bootstrap path."
     );
     println!("  sinomo rollout diagnostics [--target <host:port>]");
     println!(

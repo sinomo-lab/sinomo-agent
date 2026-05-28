@@ -396,7 +396,7 @@ pub(crate) fn restart_local_shadow_for_rollout(
         "shadow daemon",
         "local rollout shadow update",
     )?;
-    install_binary_atomically(built_binary, shadow_binary)?;
+    stage_rollout_file(built_binary, shadow_binary)?;
     start_installed_sinomo_daemon(
         shadow_binary,
         &data_dir.root(),

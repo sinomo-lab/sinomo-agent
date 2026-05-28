@@ -132,7 +132,6 @@ pub(crate) fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliErro
 }
 
 pub(crate) fn run_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
-    daemon_prepare_main_self_restart_from_env()?;
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     daemon_complete_pending_main_activation_from_startup(&data_dir.root())?;

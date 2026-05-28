@@ -12279,7 +12279,7 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
 #[test]
 fn rollout_main_activation_without_shadow_requires_staged_binary() {
     let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-main-self-restart-staged-required-{}",
+        "sinomo-cli-rollout-main-shadow-bootstrap-staged-required-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
@@ -12292,8 +12292,8 @@ fn rollout_main_activation_without_shadow_requires_staged_binary() {
         &rollout_paths,
         RolloutMainActivation {
             source: "test".to_string(),
-            main_binary: root.join("bin").join("candidate-main"),
-            shadow_binary: root.join("bin").join("candidate-shadow"),
+            main_binary: rollout_paths.main_binary.clone(),
+            shadow_binary: rollout_paths.shadow_binary.clone(),
             staged_main_binary: None,
             staged_shadow_binary: None,
             previous_main_binary: Some(root.join("bin").join("previous-main")),
