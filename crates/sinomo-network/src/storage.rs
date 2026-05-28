@@ -8,8 +8,9 @@ use crate::{
 use sinomo_kv::cluster_member_key;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 512;
-pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 512;
+pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
+pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
+pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
@@ -867,15 +868,7 @@ pub fn write_cluster_kv_snapshot_if_changed(
 
 fn compact_cluster_kv_snapshot_events(snapshot: &KvSnapshot) -> KvSnapshot {
     let mut snapshot = snapshot.clone();
-    let excess = snapshot
-        .events
-        .len()
-        .saturating_sub(MAX_CLUSTER_KV_MATERIALIZED_EVENTS);
-    if excess > 0 {
-        let compacted = snapshot.events[excess - 1].revision;
-        snapshot.events.drain(..excess);
-        snapshot.compacted_revision = snapshot.compacted_revision.max(compacted);
-    }
+    sinomo_kv::compact_kv_snapshot_event_history(&mut snapshot, MAX_CLUSTER_KV_MATERIALIZED_EVENTS);
     snapshot
 }
 
@@ -1208,10 +1201,13 @@ pub fn compact_cluster_raft_node_if_needed(
     let snapshot_bytes = fs::metadata(&wal_paths.snapshot)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
+    let retained_events = node.store().event_history_len();
     if node.log().len() > MAX_UNCOMPACTED_LOG_ENTRIES
         || wal_bytes > MAX_WAL_BYTES
         || snapshot_bytes > MAX_SNAPSHOT_BYTES
+        || retained_events > MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS
     {
+        node.compact_event_history_to(MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
         node.save_snapshot()?;
     }
     Ok(())

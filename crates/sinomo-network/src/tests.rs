@@ -11,7 +11,7 @@ use sinomo_core::{
 use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
     InProcessKvStore, KvCommand, KvCompare, KvEntry, KvEventKind, KvOp, KvRevision, KvSnapshot,
-    KvTxn, LeaseId, RaftAppendEntriesRequest, cluster_member_key,
+    KvTxn, LeaseId, RaftAppendEntriesRequest, RaftSnapshot, cluster_member_key,
 };
 use sinomo_node::NodeId;
 use std::sync::{Arc, Mutex};
@@ -3645,6 +3645,43 @@ fn committed_raft_index_reports_only_new_events() {
             .events
             .iter()
             .all(|event| event.revision > KvRevision(1))
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-raft-snapshot-events-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_raft_snapshot_events").expect("node");
+
+    for index in 0..(MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS + 80) {
+        let entry = append_cluster_raft_command_uncommitted(
+            &paths,
+            &node_id,
+            KvCommand::Op(KvOp::Put {
+                key: format!("/raft-snapshot/{index}"),
+                value: vec![b'x'; 256],
+                lease_id: None,
+            }),
+        )
+        .expect("append");
+        commit_cluster_raft_index_with_events(&paths, &node_id, entry.index).expect("commit");
+    }
+
+    let wal_paths = cluster_raft_wal_paths(&paths, &node_id);
+    let stored: RaftSnapshot = read_object_file(&wal_paths.snapshot).expect("raft snapshot");
+    assert!(
+        stored.kv.events.len() <= MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+        "raft snapshots should not retain an unbounded event tail"
     );
     std::fs::remove_dir_all(root).ok();
 }

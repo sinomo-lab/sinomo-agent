@@ -637,6 +637,10 @@ impl InProcessKvStore {
         self.compacted_revision
     }
 
+    pub fn event_history_len(&self) -> usize {
+        self.events.len()
+    }
+
     pub fn get(&self, key: &str) -> Option<&KvEntry> {
         self.entries.get(key)
     }
@@ -839,6 +843,10 @@ impl InProcessKvStore {
         Ok(())
     }
 
+    pub fn compact_event_history_to(&mut self, max_events: usize) {
+        compact_snapshot_event_history(&mut self.events, &mut self.compacted_revision, max_events);
+    }
+
     pub fn tick_leases(&mut self, ticks: u64) -> Result<Vec<LeaseId>, KvError> {
         let mut expired = Vec::new();
         for lease in self.leases.values_mut() {
@@ -1030,14 +1038,30 @@ impl InProcessKvStore {
     }
 
     fn trim_event_history(&mut self) {
-        let excess = self.events.len().saturating_sub(MAX_RETAINED_EVENTS);
-        if excess == 0 {
-            return;
-        }
-        let compacted = self.events[excess - 1].revision;
-        self.events.drain(..excess);
-        self.compacted_revision = self.compacted_revision.max(compacted);
+        self.compact_event_history_to(MAX_RETAINED_EVENTS);
     }
+}
+
+pub fn compact_kv_snapshot_event_history(snapshot: &mut KvSnapshot, max_events: usize) {
+    compact_snapshot_event_history(
+        &mut snapshot.events,
+        &mut snapshot.compacted_revision,
+        max_events,
+    );
+}
+
+fn compact_snapshot_event_history(
+    events: &mut Vec<KvEvent>,
+    compacted_revision: &mut KvRevision,
+    max_events: usize,
+) {
+    let excess = events.len().saturating_sub(max_events);
+    if excess == 0 {
+        return;
+    }
+    let compacted = events[excess - 1].revision;
+    events.drain(..excess);
+    *compacted_revision = (*compacted_revision).max(compacted);
 }
 
 #[derive(Clone, Debug)]
@@ -1948,6 +1972,10 @@ impl DurableRaftKvNode {
         rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
         self.persist_hard_state()?;
         Ok(true)
+    }
+
+    pub fn compact_event_history_to(&mut self, max_events: usize) {
+        self.node.store.compact_event_history_to(max_events);
     }
 
     pub fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
