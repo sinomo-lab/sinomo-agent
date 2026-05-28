@@ -1227,7 +1227,9 @@ impl InProcessRaftKvCluster {
             entries,
             leader_commit: self.commit_index,
         };
-        self.node_mut(node_id)?.handle_append_entries(request)
+        self.node_mut(node_id)?
+            .handle_append_entries(request)
+            .map(|outcome| outcome.response)
     }
 
     pub fn catch_up_node(&mut self, node_id: &NodeId) -> Result<(), KvError> {
@@ -1500,7 +1502,8 @@ impl ReplicatedKvNode {
             .map(|entry| entry.term)
     }
 
-    fn append_entries(&mut self, entries: Vec<KvLogEntry>) -> Result<(), KvError> {
+    fn append_entries(&mut self, entries: Vec<KvLogEntry>) -> Result<Vec<KvLogEntry>, KvError> {
+        let mut appended = Vec::new();
         for entry in entries {
             if entry.index <= self.applied_index {
                 continue;
@@ -1512,7 +1515,8 @@ impl ReplicatedKvNode {
             {
                 if self.log[existing_position].term != entry.term {
                     self.log.truncate(existing_position);
-                    self.log.push(entry);
+                    self.log.push(entry.clone());
+                    appended.push(entry);
                 }
             } else {
                 let expected = self.last_log_index().saturating_add(1);
@@ -1522,10 +1526,11 @@ impl ReplicatedKvNode {
                         actual: entry.index,
                     });
                 }
-                self.log.push(entry);
+                self.log.push(entry.clone());
+                appended.push(entry);
             }
         }
-        Ok(())
+        Ok(appended)
     }
 
     fn discard_uncommitted_tail(&mut self) -> bool {
@@ -1540,12 +1545,15 @@ impl ReplicatedKvNode {
     fn handle_append_entries(
         &mut self,
         request: RaftAppendEntriesRequest,
-    ) -> Result<RaftAppendEntriesResponse, KvError> {
+    ) -> Result<RaftAppendEntriesOutcome, KvError> {
         if request.term < self.hard_state.current_term {
-            return Ok(RaftAppendEntriesResponse {
-                term: self.hard_state.current_term,
-                success: false,
-                match_index: self.last_log_index(),
+            return Ok(RaftAppendEntriesOutcome {
+                response: RaftAppendEntriesResponse {
+                    term: self.hard_state.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                },
+                appended_entries: Vec::new(),
             });
         }
         if request.term > self.hard_state.current_term {
@@ -1554,19 +1562,25 @@ impl ReplicatedKvNode {
         self.hard_state.current_term = request.term;
         self.hard_state.leader_id = Some(request.leader_id.clone());
         if self.term_at(request.prev_log_index) != Some(request.prev_log_term) {
-            return Ok(RaftAppendEntriesResponse {
-                term: self.hard_state.current_term,
-                success: false,
-                match_index: self.last_log_index(),
+            return Ok(RaftAppendEntriesOutcome {
+                response: RaftAppendEntriesResponse {
+                    term: self.hard_state.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                },
+                appended_entries: Vec::new(),
             });
         }
-        self.append_entries(request.entries)?;
+        let appended_entries = self.append_entries(request.entries)?;
         let commit_index = request.leader_commit.min(self.last_log_index());
         self.commit_to(commit_index)?;
-        Ok(RaftAppendEntriesResponse {
-            term: self.hard_state.current_term,
-            success: true,
-            match_index: self.last_log_index(),
+        Ok(RaftAppendEntriesOutcome {
+            response: RaftAppendEntriesResponse {
+                term: self.hard_state.current_term,
+                success: true,
+                match_index: self.last_log_index(),
+            },
+            appended_entries,
         })
     }
 
@@ -1658,6 +1672,12 @@ impl ReplicatedKvNode {
 struct RaftCommitOutcome {
     revision: KvRevision,
     txn_response: Option<KvTxnResponse>,
+}
+
+#[derive(Clone, Debug)]
+struct RaftAppendEntriesOutcome {
+    response: RaftAppendEntriesResponse,
+    appended_entries: Vec<KvLogEntry>,
 }
 
 #[derive(Debug)]
@@ -1865,13 +1885,12 @@ impl DurableRaftKvNode {
         &mut self,
         request: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesResponse, KvError> {
-        let entries = request.entries.clone();
-        let response = self.node.handle_append_entries(request)?;
-        if response.success {
-            append_wal_entries(&self.paths.wal, &entries)?;
+        let outcome = self.node.handle_append_entries(request)?;
+        if outcome.response.success {
+            append_wal_entries(&self.paths.wal, &outcome.appended_entries)?;
         }
         self.persist_hard_state()?;
-        Ok(response)
+        Ok(outcome.response)
     }
 
     pub fn request_vote(
@@ -3364,6 +3383,72 @@ mod tests {
 
         assert_eq!(before, after);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_duplicate_append_entries_do_not_grow_wal() {
+        let leader_root = temp_raft_root("sinomo-kv-duplicate-append-leader");
+        let follower_root = temp_raft_root("sinomo-kv-duplicate-append-follower");
+        let leader_id = NodeId::from_legacy_named("node_duplicate_append_leader").expect("leader");
+        let follower_id =
+            NodeId::from_legacy_named("node_duplicate_append_follower").expect("follower");
+        let leader_paths = KvWalPaths::new(&leader_root);
+        let follower_paths = KvWalPaths::new(&follower_root);
+        let entry = {
+            let mut leader =
+                DurableRaftKvNode::open(leader_id.clone(), leader_paths).expect("open leader");
+            let entry = leader
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/config/duplicate".to_string(),
+                        value: b"value".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append leader entry");
+            leader.commit_to(entry.index).expect("commit leader entry");
+            entry
+        };
+        let request = RaftAppendEntriesRequest {
+            term: 1,
+            leader_id,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![entry],
+            leader_commit: 1,
+        };
+
+        {
+            let mut follower = DurableRaftKvNode::open(follower_id.clone(), follower_paths.clone())
+                .expect("open follower");
+            assert!(
+                follower
+                    .append_entries(request.clone())
+                    .expect("append")
+                    .success
+            );
+        }
+        let before_len = fs::metadata(&follower_paths.wal)
+            .expect("follower wal metadata")
+            .len();
+        {
+            let mut follower = DurableRaftKvNode::open(follower_id, follower_paths.clone())
+                .expect("reopen follower");
+            assert!(
+                follower
+                    .append_entries(request)
+                    .expect("duplicate append")
+                    .success
+            );
+        }
+        let after_len = fs::metadata(&follower_paths.wal)
+            .expect("follower wal metadata after")
+            .len();
+
+        assert_eq!(before_len, after_len);
+        std::fs::remove_dir_all(leader_root).ok();
+        std::fs::remove_dir_all(follower_root).ok();
     }
 
     #[test]
