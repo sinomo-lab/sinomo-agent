@@ -8,7 +8,8 @@ use crate::{
 use sinomo_kv::cluster_member_key;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 4096;
+pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 512;
+pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 512;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
@@ -848,8 +849,9 @@ pub fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), NetworkError> {
+    let snapshot = compact_cluster_kv_snapshot_events(snapshot);
     cluster_kv_local_cache(paths)
-        .write_snapshot(snapshot)
+        .write_snapshot(&snapshot)
         .map_err(Into::into)
 }
 
@@ -857,9 +859,24 @@ pub fn write_cluster_kv_snapshot_if_changed(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, NetworkError> {
+    let snapshot = compact_cluster_kv_snapshot_events(snapshot);
     cluster_kv_local_cache(paths)
-        .write_snapshot_if_changed(snapshot)
+        .write_snapshot_if_changed(&snapshot)
         .map_err(Into::into)
+}
+
+fn compact_cluster_kv_snapshot_events(snapshot: &KvSnapshot) -> KvSnapshot {
+    let mut snapshot = snapshot.clone();
+    let excess = snapshot
+        .events
+        .len()
+        .saturating_sub(MAX_CLUSTER_KV_MATERIALIZED_EVENTS);
+    if excess > 0 {
+        let compacted = snapshot.events[excess - 1].revision;
+        snapshot.events.drain(..excess);
+        snapshot.compacted_revision = snapshot.compacted_revision.max(compacted);
+    }
+    snapshot
 }
 
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
@@ -1030,11 +1047,40 @@ pub fn commit_cluster_raft_index(
     node_id: &NodeId,
     commit_index: u64,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
+    let result = commit_cluster_raft_index_with_events(paths, node_id, commit_index)?;
+    Ok((result.snapshot, result.txn_response))
+}
+
+#[derive(Clone, Debug)]
+pub struct ClusterRaftCommitResult {
+    pub snapshot: KvSnapshot,
+    pub txn_response: Option<KvTxnResponse>,
+    pub events: Vec<KvEvent>,
+}
+
+pub fn commit_cluster_raft_index_with_events(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    commit_index: u64,
+) -> Result<ClusterRaftCommitResult, NetworkError> {
     let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    let before_revision = node.store().revision();
     node.commit_to(commit_index)?;
     let txn_response = node.txn_response_at(commit_index).cloned();
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
-    mirror_cluster_raft_snapshot(paths, &node).map(|snapshot| (snapshot, txn_response))
+    let snapshot = node.store().snapshot();
+    let events = snapshot
+        .events
+        .iter()
+        .filter(|event| event.revision > before_revision)
+        .cloned()
+        .collect();
+    write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+    Ok(ClusterRaftCommitResult {
+        snapshot,
+        txn_response,
+        events,
+    })
 }
 
 pub fn apply_cluster_raft_append(

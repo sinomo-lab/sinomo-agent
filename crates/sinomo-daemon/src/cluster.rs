@@ -22,8 +22,9 @@ use sinomo_core::{
     TrustDomain,
 };
 use sinomo_kv::{
-    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
-    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, cluster_member_key,
+    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvEvent, KvOp, KvSnapshot, KvTxn,
+    KvTxnResponse, RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse,
+    cluster_member_key,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -2696,18 +2697,22 @@ pub fn commit_cluster_raft_command_with_quorum(
         });
     }
 
-    let (snapshot, txn_response) = {
+    let commit = {
         let _raft_guard = lock_cluster_raft_operation()?;
-        sinomo_network::commit_cluster_raft_index(paths, &state.local_node_id, entry.index)?
+        sinomo_network::commit_cluster_raft_index_with_events(
+            paths,
+            &state.local_node_id,
+            entry.index,
+        )?
     };
-    fan_out_committed_cluster_raft_command(paths.clone(), state.clone(), snapshot.clone());
-    Ok((snapshot, txn_response))
+    fan_out_committed_cluster_raft_command(paths.clone(), state.clone(), commit.events.clone());
+    Ok((commit.snapshot, commit.txn_response))
 }
 
 fn fan_out_committed_cluster_raft_command(
     paths: ClusterPaths,
     state: ClusterBootstrapState,
-    snapshot: KvSnapshot,
+    events: Vec<KvEvent>,
 ) {
     if CLUSTER_RAFT_FANOUT_ACTIVE.swap(true, Ordering::AcqRel) {
         return;
@@ -2716,7 +2721,7 @@ fn fan_out_committed_cluster_raft_command(
         .name("sinomo-cluster-raft-fanout".to_string())
         .spawn(move || {
             let _guard = ClusterRaftFanoutGuard;
-            fan_out_committed_cluster_raft_command_blocking(&paths, &state, &snapshot);
+            fan_out_committed_cluster_raft_command_blocking(&paths, &state, events);
         })
         .is_err()
     {
@@ -2727,7 +2732,7 @@ fn fan_out_committed_cluster_raft_command(
 fn fan_out_committed_cluster_raft_command_blocking(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    snapshot: &KvSnapshot,
+    events: Vec<KvEvent>,
 ) {
     let mut replicated_nodes = std::collections::BTreeSet::new();
     for endpoint in cluster_raft_live_voter_targets(paths, state) {
@@ -2737,15 +2742,17 @@ fn fan_out_committed_cluster_raft_command_blocking(
         if let Ok(response) = replicate_cluster_raft_to_endpoint(paths, state, &endpoint) {
             if response.accepted {
                 replicated_nodes.insert(endpoint.node_id.clone());
-                let _ = send_cluster_kv_watch_events(
-                    &endpoint,
-                    &ClusterKvWatchEventsRequest {
-                        state: state.clone(),
-                        leader_id: state.local_node_id.clone(),
-                        events: snapshot.events.clone(),
-                    },
-                    DAEMON_CLUSTER_RPC_TIMEOUT,
-                );
+                if !events.is_empty() {
+                    let _ = send_cluster_kv_watch_events(
+                        &endpoint,
+                        &ClusterKvWatchEventsRequest {
+                            state: state.clone(),
+                            leader_id: state.local_node_id.clone(),
+                            events: events.clone(),
+                        },
+                        DAEMON_CLUSTER_RPC_TIMEOUT,
+                    );
+                }
             }
         }
     }

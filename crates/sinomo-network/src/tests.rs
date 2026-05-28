@@ -3549,6 +3549,106 @@ fn cluster_kv_watch_event_log_is_bounded() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn cluster_kv_materialized_snapshot_event_history_is_bounded() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-materialized-events-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let mut store = InProcessKvStore::new();
+    for index in 0..(MAX_CLUSTER_KV_MATERIALIZED_EVENTS + 10) {
+        store
+            .put(
+                format!("/materialized/{index}"),
+                index.to_string().into_bytes(),
+                None,
+            )
+            .expect("put event");
+    }
+
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let stored = read_cluster_kv_snapshot(&paths).expect("read snapshot");
+    assert_eq!(stored.events.len(), MAX_CLUSTER_KV_MATERIALIZED_EVENTS);
+    assert_eq!(stored.compacted_revision, KvRevision(10));
+    assert_eq!(
+        stored.events.first().expect("first retained").revision,
+        KvRevision(11)
+    );
+    assert_eq!(
+        stored.events.last().expect("last retained").revision,
+        KvRevision(MAX_CLUSTER_KV_MATERIALIZED_EVENTS as u64 + 10)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn committed_raft_index_reports_only_new_events() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-committed-events-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_committed_events").expect("node");
+    let first = append_cluster_raft_command_uncommitted(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/committed/one".to_string(),
+            value: b"one".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("append first");
+    commit_cluster_raft_index_with_events(&paths, &node_id, first.index).expect("commit first");
+    let second = append_cluster_raft_command_uncommitted(
+        &paths,
+        &node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::Put {
+                    key: "/committed/two".to_string(),
+                    value: b"two".to_vec(),
+                    lease_id: None,
+                },
+                KvOp::Put {
+                    key: "/committed/three".to_string(),
+                    value: b"three".to_vec(),
+                    lease_id: None,
+                },
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("append second");
+
+    let committed =
+        commit_cluster_raft_index_with_events(&paths, &node_id, second.index).expect("commit");
+
+    assert_eq!(committed.events.len(), 2);
+    assert_eq!(committed.events[0].key, "/committed/two");
+    assert_eq!(committed.events[1].key, "/committed/three");
+    assert!(
+        committed
+            .events
+            .iter()
+            .all(|event| event.revision > KvRevision(1))
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn node(id: &str) -> NodeProfile {
     let mut profile = NodeProfile::local(id).expect("profile");
     profile.node_id = NodeId::from_legacy_named(id).expect("node id");
