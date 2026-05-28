@@ -1,8 +1,5 @@
 use super::*;
 
-const STABLE_BINARY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
-const STABLE_BINARY_COPY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum RolloutCliCommand {
     Help,
@@ -338,14 +335,10 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         DaemonProbeStatus::Running(_)
     );
     if shadow_available {
-        restart_local_shadow_for_rollout(
-            &artifacts.built_binary,
-            &plan.activation.shadow_binary,
-            &plan.activation.main_binary,
-            &data_dir,
-            &options,
-            &plan.activation.main_host,
-            plan.activation.main_port,
+        stop_daemon_before_install(
+            &DaemonPaths::for_shadow(&data_dir),
+            "shadow daemon",
+            "local rollout shadow update",
         )?;
     }
     let activation_strategy =
@@ -374,45 +367,6 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         rollout_plan.install_shadow_binary.display()
     );
     Ok(())
-}
-
-pub(crate) fn restart_local_shadow_for_rollout(
-    built_binary: &Path,
-    shadow_binary: &Path,
-    main_binary: &Path,
-    data_dir: &SinomoDataDir,
-    options: &RolloutOptions,
-    main_host: &str,
-    main_port: u16,
-) -> Result<(), CliError> {
-    let restart = daemon_prepare_local_shadow_rollout_restart(
-        &data_dir.root(),
-        main_binary,
-        main_host,
-        main_port,
-        &options.host,
-        options.shadow_port,
-        DAEMON_PROBE_TIMEOUT,
-    );
-    stop_daemon_before_install(
-        &restart.shadow_paths,
-        "shadow daemon",
-        "local rollout shadow update",
-    )?;
-    stage_rollout_file_with_retry(
-        built_binary,
-        shadow_binary,
-        STABLE_BINARY_COPY_TIMEOUT,
-        STABLE_BINARY_COPY_RETRY_INTERVAL,
-    )?;
-    start_installed_sinomo_daemon(
-        shadow_binary,
-        &data_dir.root(),
-        &restart.args,
-        &restart.shadow_paths,
-        "shadow daemon",
-        &restart.extra_env,
-    )
 }
 
 pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {

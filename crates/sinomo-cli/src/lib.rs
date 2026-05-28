@@ -111,7 +111,6 @@ use sinomo_runtime::daemon::{
     prepare_cluster_join_retry_state as daemon_prepare_cluster_join_retry_state,
     prepare_installed_daemon_install_plan as daemon_prepare_installed_daemon_install_plan,
     prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
-    prepare_local_shadow_rollout_restart as daemon_prepare_local_shadow_rollout_restart,
     prepare_pending_cluster_join_state as daemon_prepare_pending_cluster_join_state,
     probe_daemon_status, publish_cluster_invitation_to_quorum,
     publish_default_dfs_metadata_journal as daemon_publish_default_dfs_metadata_journal,
@@ -230,8 +229,8 @@ use sinomo_runtime::rollout::{
     managed_source_status, prepare_cluster_rollout_binary_request,
     prepare_cluster_rollout_build_request, prepare_local_rollout_artifacts,
     prepare_rollout_dev_binary, prepare_rollout_source_bundle_base64, rollout_source_head,
-    rollout_status_view, source_heads_match, stage_rollout_file_with_retry,
-    sync_external_repo_from_managed, unique_rollout_targets,
+    rollout_status_view, source_heads_match, sync_external_repo_from_managed,
+    unique_rollout_targets,
 };
 use std::env;
 use std::fs;
