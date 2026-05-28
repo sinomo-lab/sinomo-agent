@@ -1044,6 +1044,8 @@ pub fn apply_cluster_raft_append(
     append: RaftAppendEntriesRequest,
 ) -> Result<RaftAppendEntriesResponse, NetworkError> {
     let mut node = open_cluster_raft_kv_node(paths, node_id)?;
+    let before_revision = node.store().revision();
+    let mut snapshot_restored = false;
     if let Some(snapshot) = snapshot {
         let snapshot_matches_append = append.prev_log_index >= snapshot.last_included_index
             && (append.prev_log_index != snapshot.last_included_index
@@ -1058,11 +1060,14 @@ pub fn apply_cluster_raft_append(
             && (snapshot_is_newer || snapshot_repairs_divergent_compaction)
         {
             node.restore_snapshot(snapshot)?;
+            snapshot_restored = true;
         }
     }
     let response = node.append_entries(append)?;
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
-    mirror_cluster_raft_snapshot(paths, &node)?;
+    if snapshot_restored || node.store().revision() != before_revision {
+        mirror_cluster_raft_snapshot(paths, &node)?;
+    }
     Ok(response)
 }
 
@@ -1171,7 +1176,7 @@ pub fn mirror_cluster_raft_snapshot(
     node: &DurableRaftKvNode,
 ) -> Result<KvSnapshot, NetworkError> {
     let snapshot = node.store().snapshot();
-    write_cluster_kv_snapshot(paths, &snapshot)?;
+    write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
     Ok(snapshot)
 }
 

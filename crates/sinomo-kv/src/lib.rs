@@ -2138,6 +2138,9 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         .map_err(|source| KvError::Serialization {
         detail: source.to_string(),
     })?;
+    if fs::read(path).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -3315,6 +3318,51 @@ mod tests {
                 .value,
             b"local"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_unchanged_heartbeat_does_not_rewrite_hard_state() {
+        let root = temp_raft_root("sinomo-kv-unchanged-heartbeat");
+        let follower_id =
+            NodeId::from_legacy_named("node_unchanged_heartbeat_follower").expect("node");
+        let leader_id = NodeId::from_legacy_named("node_unchanged_heartbeat_leader").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let heartbeat = RaftAppendEntriesRequest {
+            term: 2,
+            leader_id,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        };
+
+        {
+            let mut follower =
+                DurableRaftKvNode::open(follower_id.clone(), paths.clone()).expect("open");
+            let response = follower
+                .append_entries(heartbeat.clone())
+                .expect("initial heartbeat");
+            assert!(response.success);
+        }
+        let before = fs::metadata(&paths.hard_state)
+            .expect("hard state metadata")
+            .modified()
+            .expect("hard state modified");
+        thread::sleep(Duration::from_millis(20));
+        {
+            let mut follower = DurableRaftKvNode::open(follower_id, paths.clone()).expect("reopen");
+            let response = follower
+                .append_entries(heartbeat)
+                .expect("unchanged heartbeat");
+            assert!(response.success);
+        }
+        let after = fs::metadata(&paths.hard_state)
+            .expect("hard state metadata after")
+            .modified()
+            .expect("hard state modified after");
+
+        assert_eq!(before, after);
         std::fs::remove_dir_all(root).ok();
     }
 

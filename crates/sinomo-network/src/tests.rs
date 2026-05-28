@@ -11,7 +11,7 @@ use sinomo_core::{
 use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
     InProcessKvStore, KvCommand, KvCompare, KvEntry, KvEventKind, KvOp, KvRevision, KvSnapshot,
-    KvTxn, LeaseId, cluster_member_key,
+    KvTxn, LeaseId, RaftAppendEntriesRequest, cluster_member_key,
 };
 use sinomo_node::NodeId;
 use std::sync::{Arc, Mutex};
@@ -1781,6 +1781,54 @@ fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
     )
     .expect("append uncommitted");
 
+    assert_eq!(
+        std::fs::read(&paths.kv_snapshot).expect("read snapshot"),
+        b"sentinel snapshot"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn raft_heartbeat_does_not_rewrite_materialized_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-raft-heartbeat-snapshot-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_heartbeat_snapshot").expect("node");
+
+    append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/committed".to_string(),
+            value: b"committed".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed snapshot");
+    let heartbeat = {
+        let node = open_cluster_raft_kv_node(&paths, &node_id).expect("open raft");
+        RaftAppendEntriesRequest {
+            term: node.hard_state().current_term,
+            leader_id: node_id.clone(),
+            prev_log_index: node.last_log_index(),
+            prev_log_term: node.last_log_term(),
+            entries: Vec::new(),
+            leader_commit: node.hard_state().commit_index,
+        }
+    };
+    std::fs::write(&paths.kv_snapshot, b"sentinel snapshot").expect("sentinel snapshot");
+
+    let response =
+        apply_cluster_raft_append(&paths, &node_id, None, heartbeat).expect("apply heartbeat");
+
+    assert!(response.success);
     assert_eq!(
         std::fs::read(&paths.kv_snapshot).expect("read snapshot"),
         b"sentinel snapshot"
