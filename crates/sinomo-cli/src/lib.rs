@@ -231,8 +231,8 @@ use sinomo_runtime::rollout::{
     managed_source_status, prepare_cluster_rollout_binary_request,
     prepare_cluster_rollout_build_request, prepare_local_rollout_artifacts,
     prepare_rollout_dev_binary, prepare_rollout_source_bundle_base64, rollout_source_head,
-    rollout_status_view, source_heads_match, stage_rollout_file, sync_external_repo_from_managed,
-    unique_rollout_targets,
+    rollout_status_view, source_heads_match, stage_rollout_file_with_retry,
+    sync_external_repo_from_managed, unique_rollout_targets,
 };
 use std::env;
 use std::fs;

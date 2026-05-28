@@ -1,5 +1,8 @@
 use super::*;
 
+const STABLE_BINARY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
+const STABLE_BINARY_COPY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum RolloutCliCommand {
     Help,
@@ -396,7 +399,12 @@ pub(crate) fn restart_local_shadow_for_rollout(
         "shadow daemon",
         "local rollout shadow update",
     )?;
-    stage_rollout_file(built_binary, shadow_binary)?;
+    stage_rollout_file_with_retry(
+        built_binary,
+        shadow_binary,
+        STABLE_BINARY_COPY_TIMEOUT,
+        STABLE_BINARY_COPY_RETRY_INTERVAL,
+    )?;
     start_installed_sinomo_daemon(
         shadow_binary,
         &data_dir.root(),

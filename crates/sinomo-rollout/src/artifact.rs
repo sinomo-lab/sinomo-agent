@@ -3,6 +3,8 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub fn stage_rollout_bytes(bytes: &[u8], destination: &Path) -> Result<(), RolloutError> {
     if let Some(parent) = destination.parent() {
@@ -30,6 +32,24 @@ pub fn stage_rollout_file(source: &Path, destination: &Path) -> Result<(), Rollo
         detail: error.to_string(),
     })?;
     set_executable(destination)
+}
+
+pub fn stage_rollout_file_with_retry(
+    source: &Path,
+    destination: &Path,
+    timeout: Duration,
+    retry_interval: Duration,
+) -> Result<(), RolloutError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match stage_rollout_file(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(_) if Instant::now() < deadline => {
+                thread::sleep(retry_interval);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub fn install_binary_atomically(source: &Path, destination: &Path) -> Result<(), RolloutError> {

@@ -24,8 +24,8 @@ use sinomo_rollout::{
     rollout_artifact_suffix, rollout_build_dev_binary, rollout_diagnostics_report,
     rollout_main_activation_path, rollout_remote_repo_path, rollout_shadow_finalize_path,
     rollout_staged_main_binary, rollout_staged_shadow_binary, source_heads_match,
-    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file, write_json,
-    write_main_activation, write_rollout_status,
+    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
+    stage_rollout_file_with_retry, write_json, write_main_activation, write_rollout_status,
 };
 use std::env;
 use std::fmt::Display;
@@ -44,6 +44,8 @@ pub const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
 pub const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAIN_ACTIVATION_SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
+const STABLE_BINARY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
+const STABLE_BINARY_COPY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
@@ -577,7 +579,12 @@ pub fn complete_pending_main_activation_from_startup(data_dir: &Path) -> Result<
         .staged_shadow_binary
         .as_ref()
         .filter(|path| path.exists())
-        && let Err(error) = stage_rollout_file(staged_shadow, &activation.shadow_binary)
+        && let Err(error) = stage_rollout_file_with_retry(
+            staged_shadow,
+            &activation.shadow_binary,
+            STABLE_BINARY_COPY_TIMEOUT,
+            STABLE_BINARY_COPY_RETRY_INTERVAL,
+        )
     {
         eprintln!("sinomo main startup could not refresh shadow binary: {error}");
     }
@@ -838,7 +845,12 @@ fn stage_main_only_rollout_without_existing_shadow(
         .ok_or_else(|| DaemonError::NotRunning {
             detail: "main-only rollout requires a staged shadow binary".to_string(),
         })?;
-    stage_rollout_file(staged_shadow, &activation.shadow_binary)?;
+    stage_rollout_file_with_retry(
+        staged_shadow,
+        &activation.shadow_binary,
+        STABLE_BINARY_COPY_TIMEOUT,
+        STABLE_BINARY_COPY_RETRY_INTERVAL,
+    )?;
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
     let shadow_start = spawn_shadow_for_cluster_rollout(
@@ -1029,7 +1041,12 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
         .as_ref()
         .filter(|path| path.exists())
     {
-        stage_rollout_file(staged_shadow, &finalize.shadow_binary)?;
+        stage_rollout_file_with_retry(
+            staged_shadow,
+            &finalize.shadow_binary,
+            STABLE_BINARY_COPY_TIMEOUT,
+            STABLE_BINARY_COPY_RETRY_INTERVAL,
+        )?;
     }
     let candidate_result = spawn_shadow_for_cluster_rollout(
         &finalize.shadow_binary,
@@ -1251,7 +1268,12 @@ pub fn start_shadow_main_if_needed(
             .as_ref()
             .filter(|path| path.exists())
         {
-            stage_rollout_file(staged_main, &activation.main_binary)?;
+            stage_rollout_file_with_retry(
+                staged_main,
+                &activation.main_binary,
+                STABLE_BINARY_COPY_TIMEOUT,
+                STABLE_BINARY_COPY_RETRY_INTERVAL,
+            )?;
         }
         match spawn_candidate_main_daemon_process(
             &activation.main_binary,
