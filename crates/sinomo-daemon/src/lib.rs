@@ -184,6 +184,12 @@ pub fn register_storage_paths(
             ),
         )?;
     }
+    for relative_path in [
+        "daemon/auth-nonces.sobjlog",
+        "shadow-daemon/auth-nonces.sobjlog",
+    ] {
+        layout.register_object_log("sinomo-daemon", StorageRing::R1, relative_path)?;
+    }
     layout.register_escape_path(
         "sinomo-daemon",
         StorageRing::Application,
