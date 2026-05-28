@@ -83,7 +83,6 @@ use sinomo_runtime::daemon::{
     cluster_has_local_quorum, cluster_health_rows,
     cluster_peer_members as daemon_cluster_peer_members, cluster_reachable_voter_count,
     cluster_rollout_should_use_remote_build as daemon_cluster_rollout_should_use_remote_build,
-    complete_pending_main_activation_from_startup as daemon_complete_pending_main_activation_from_startup,
     daemon_bind_address, daemon_cluster_registration,
     daemon_cluster_registration_if_initialized as daemon_registration_if_initialized,
     daemon_cluster_status_from_local_state, daemon_connect_address,
