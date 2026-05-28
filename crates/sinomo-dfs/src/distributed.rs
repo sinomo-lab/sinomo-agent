@@ -1078,10 +1078,7 @@ mod tests {
             .commit_intent(&intent.intent_id)
             .expect("commit intent");
         assert_eq!(
-            coordinator
-                .intent(&intent.intent_id)
-                .expect("intent")
-                .state,
+            coordinator.intent(&intent.intent_id).expect("intent").state,
             DfsWriteIntentState::Committed
         );
         assert_eq!(coordinator.repair_jobs().len(), 2);
@@ -1125,10 +1122,7 @@ mod tests {
             .commit_intent(&intent.intent_id)
             .expect("commit intent");
         assert_eq!(
-            coordinator
-                .intent(&intent.intent_id)
-                .expect("intent")
-                .state,
+            coordinator.intent(&intent.intent_id).expect("intent").state,
             DfsWriteIntentState::Committed
         );
         assert!(coordinator.repair_jobs().is_empty());
@@ -1177,10 +1171,7 @@ mod tests {
             .commit_intent(&intent.intent_id)
             .expect("commit intent");
         assert_eq!(
-            coordinator
-                .intent(&intent.intent_id)
-                .expect("intent")
-                .state,
+            coordinator.intent(&intent.intent_id).expect("intent").state,
             DfsWriteIntentState::Committed
         );
         assert_eq!(

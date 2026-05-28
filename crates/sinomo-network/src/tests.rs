@@ -214,6 +214,22 @@ fn lan_ip_filter_rejects_non_invitable_addresses() {
 }
 
 #[test]
+fn interface_ip_filter_keeps_routable_lan_addresses() {
+    assert!(is_advertisable_interface_ip(
+        "10.14.5.15".parse().expect("wireguard lan")
+    ));
+    assert!(is_advertisable_interface_ip(
+        "192.168.1.154".parse().expect("ethernet lan")
+    ));
+    assert!(!is_advertisable_interface_ip(
+        "169.254.147.92".parse().expect("link local")
+    ));
+    assert!(!is_advertisable_interface_ip(
+        "127.0.0.1".parse().expect("loopback")
+    ));
+}
+
+#[test]
 fn invite_channel_uri_uses_compact_iroh_endpoint() {
     let cluster_id = ClusterId::from_legacy_named("cluster_invite_full_iroh").expect("cluster");
     let node_id = NodeId::from_legacy_named("node_invite_full_iroh").expect("node");

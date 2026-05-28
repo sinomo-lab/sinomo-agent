@@ -1971,10 +1971,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 continue;
             }
             let has_verified_local_blob = replica_node_id == self.node_id
-                && self
-                    .content
-                    .has_blob(content_hash)
-                    .unwrap_or(false);
+                && self.content.has_blob(content_hash).unwrap_or(false);
             if !existing_receipts.contains(&replica_node_id)
                 && has_verified_local_blob
                 && let Some(backend) = self.metadata_backend.as_mut()
@@ -2384,9 +2381,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     ) -> bool {
         match backend_object {
             None => true,
-            Some(backend_object) if memory_object.version > backend_object.version => self
-                .has_pending_write_targeting(object_id, &memory_object.version)
-                || self.has_awaiting_intent_targeting(object_id, &memory_object.version),
+            Some(backend_object) if memory_object.version > backend_object.version => {
+                self.has_pending_write_targeting(object_id, &memory_object.version)
+                    || self.has_awaiting_intent_targeting(object_id, &memory_object.version)
+            }
             Some(backend_object)
                 if memory_object.kind != DfsObjectKind::Tombstone
                     && backend_object.kind == DfsObjectKind::Tombstone
@@ -2400,21 +2398,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn has_pending_write_targeting(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-    ) -> bool {
+    fn has_pending_write_targeting(&self, object_id: &DfsObjectId, version: &DfsVersion) -> bool {
         self.pending_writes
             .values()
             .any(|pending| &pending.object_id == object_id && &pending.version == version)
     }
 
-    fn has_awaiting_intent_targeting(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-    ) -> bool {
+    fn has_awaiting_intent_targeting(&self, object_id: &DfsObjectId, version: &DfsVersion) -> bool {
         self.coordinator
             .has_awaiting_intent_targeting(object_id, version)
     }
@@ -2655,10 +2645,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             });
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let desired_replica_nodes = self.normalize_desired_replica_nodes(
-            &object,
-            desired_replica_nodes,
-        );
+        let desired_replica_nodes =
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
             let desired_replicas = desired_replica_nodes.len();
             // Replicated-confirmed requires every desired replica to confirm before
@@ -2678,8 +2666,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
             return Err(DfsError::InvalidReplicationPolicy {
-                message: "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                    .to_string(),
+                message:
+                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                        .to_string(),
             });
         }
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
@@ -4548,14 +4537,18 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         match response.result {
             DfsBlobTransferResult::Durable { ref content_hash }
             | DfsBlobTransferResult::Committed { ref content_hash } => {
-                if self.coordinator.intent(&response.intent_id).is_some_and(|intent| {
-                    matches!(
-                        intent.state,
-                        DfsWriteIntentState::Aborted
-                            | DfsWriteIntentState::Rejected
-                            | DfsWriteIntentState::Conflict
-                    )
-                }) {
+                if self
+                    .coordinator
+                    .intent(&response.intent_id)
+                    .is_some_and(|intent| {
+                        matches!(
+                            intent.state,
+                            DfsWriteIntentState::Aborted
+                                | DfsWriteIntentState::Rejected
+                                | DfsWriteIntentState::Conflict
+                        )
+                    })
+                {
                     let intent_id = response.intent_id.clone();
                     return Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {
                         intent_id: response.intent_id,
@@ -4609,13 +4602,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     let outcome = self.write_outcome(&updated_intent.intent_id)?;
                     self.send_dfs_message_if_routable(
                         &updated_intent.requesting_node_id,
-                        DfsNetworkMessage::DistributedWriteResponse(
-                            DfsDistributedWriteResponse {
-                                request_id: updated_intent.intent_id.clone(),
-                                object_id: response.object_id.clone(),
-                                result: DfsDistributedWriteResult::Outcome { outcome },
-                            },
-                        ),
+                        DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                            request_id: updated_intent.intent_id.clone(),
+                            object_id: response.object_id.clone(),
+                            result: DfsDistributedWriteResult::Outcome { outcome },
+                        }),
                     )?;
                 }
                 if let Some(pending) = self.pending_writes.get_mut(&response.intent_id) {
@@ -7222,13 +7213,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         self.coordinator
             .commit_intent(intent_id)
             .map_err(DfsError::from)?;
-        let committed_intent = self
-            .coordinator
-            .intent(intent_id)
-            .cloned()
-            .ok_or_else(|| DfsError::Distributed {
-                message: format!("missing committed intent after finalize: {intent_id}"),
-            })?;
+        let committed_intent =
+            self.coordinator
+                .intent(intent_id)
+                .cloned()
+                .ok_or_else(|| DfsError::Distributed {
+                    message: format!("missing committed intent after finalize: {intent_id}"),
+                })?;
         self.put_metadata_intent(&committed_intent, Some(&pending.content_hash))?;
         self.commit_local_metadata(
             &pending.object_id,

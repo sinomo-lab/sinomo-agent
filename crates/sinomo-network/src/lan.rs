@@ -60,7 +60,26 @@ pub fn discover_default_lan_ip_candidates() -> Vec<IpAddr> {
     let targets = ["8.8.8.8:80", "1.1.1.1:80", "192.0.2.1:80"]
         .into_iter()
         .filter_map(|target| target.parse::<SocketAddr>().ok());
-    discover_local_ip_candidates_for_targets(targets)
+    let mut candidates = discover_local_ip_candidates_for_targets(targets);
+    for ip in discover_interface_ip_candidates() {
+        if !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    candidates
+}
+
+pub fn discover_interface_ip_candidates() -> Vec<IpAddr> {
+    let Ok(interfaces) = local_ip_address::list_afinet_netifas() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for (_name, ip) in interfaces {
+        if is_advertisable_interface_ip(ip) && !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    candidates
 }
 
 pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
@@ -171,6 +190,19 @@ where
 
 pub fn is_invitable_ip(ip: IpAddr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+}
+
+pub(crate) fn is_advertisable_interface_ip(ip: IpAddr) -> bool {
+    if !is_invitable_ip(ip) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(ip) => !ip.is_link_local() && !ip.is_broadcast() && !ip.is_documentation(),
+        IpAddr::V6(ip) => {
+            !ip.is_unicast_link_local()
+                && !matches!(ip.segments(), [0x2001, 0x0db8, _, _, _, _, _, _])
+        }
+    }
 }
 
 pub fn format_ip_port(ip: IpAddr, port: u16) -> String {

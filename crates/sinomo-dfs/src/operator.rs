@@ -1053,8 +1053,8 @@ mod tests {
 
         let object_a = DfsObjectId::from_legacy_named("obj_alpha").expect("object");
         let object_b = DfsObjectId::from_legacy_named("obj_beta").expect("object");
-        let make_object = |object_id: &DfsObjectId, path: &str, current: DfsVersion| {
-            DfsObjectMetadata {
+        let make_object =
+            |object_id: &DfsObjectId, path: &str, current: DfsVersion| DfsObjectMetadata {
                 object_id: object_id.clone(),
                 file_system_id: file_system_id(),
                 path: path.to_string(),
@@ -1075,8 +1075,7 @@ mod tests {
                 policy: DfsObjectPolicy::ReplicatedEventual,
                 created_by_event_id: None,
                 last_modified_by_event_id: None,
-            }
-        };
+            };
         backend
             .put_object(&make_object(&object_a, "alpha.bin", version("version_2")))
             .expect("object a");
@@ -1207,7 +1206,9 @@ mod tests {
         assert_eq!(backend.all_intents().expect("intents").len(), 2);
         assert_eq!(backend.all_conflicts().expect("conflicts").len(), 1);
 
-        let status = DfsOperatorInspector::new(&backend).status().expect("status");
+        let status = DfsOperatorInspector::new(&backend)
+            .status()
+            .expect("status");
         assert_eq!(status.file_system_count, 1);
         assert_eq!(status.object_count, 2);
         assert_eq!(status.version_count, 3);

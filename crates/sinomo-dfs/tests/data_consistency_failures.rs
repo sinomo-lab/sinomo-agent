@@ -5,10 +5,10 @@
 
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
-    DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsObjectId,
-    DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy, DfsVersion,
-    DfsWriteIntentState, DfsWriteIntentStatus, LocalJsonMetadataBackend, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
+    LocalJsonMetadataBackend, NetworkedDfsReadOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
 use sinomo_network::{InProcessNetwork, InProcessTransport};
 use sinomo_node::NodeId;
@@ -58,28 +58,25 @@ fn coordinator_stays_awaiting_receipts_until_metadata_commit_applies() {
         "visible metadata must stay at base version until commit applies"
     );
     assert!(
-        !owner_dfs
-            .coordinator()
-            .is_commit_ready(&intent_id)
-            .unwrap(),
+        !owner_dfs.coordinator().is_commit_ready(&intent_id).unwrap(),
         "commit threshold must not be met until the remote replica acknowledges"
     );
 
-    fixture.service_mut(&replica).process_incoming().expect("replica");
-    fixture.service_mut(&owner).process_incoming().expect("owner ack");
+    fixture
+        .service_mut(&replica)
+        .process_incoming()
+        .expect("replica");
+    fixture
+        .service_mut(&owner)
+        .process_incoming()
+        .expect("owner ack");
     let owner_dfs = fixture.service(&owner);
     assert_eq!(
         owner_dfs.coordinator().intent(&intent_id).unwrap().state,
         DfsWriteIntentState::Committed,
         "coordinator should commit only after metadata apply"
     );
-    assert_consistent_committed_object(
-        owner_dfs,
-        &object_id,
-        &version_2,
-        bytes,
-        &[owner.clone()],
-    );
+    assert_consistent_committed_object(owner_dfs, &object_id, &version_2, bytes, &[owner.clone()]);
 
     cleanup(&root);
 }
@@ -96,10 +93,8 @@ fn concurrent_disjoint_replica_writers_do_not_fork_visible_version() {
     let version_c = version("version_c");
     let root = temp_root("disjoint_replicas");
 
-    let mut fixture = ClusterFixture::new(
-        &root,
-        &[owner.clone(), writer_b.clone(), writer_c.clone()],
-    );
+    let mut fixture =
+        ClusterFixture::new(&root, &[owner.clone(), writer_b.clone(), writer_c.clone()]);
     fixture.seed_replicated_object_with_locations(
         &owner,
         object_id.clone(),
@@ -153,8 +148,11 @@ fn concurrent_disjoint_replica_writers_do_not_fork_visible_version() {
             if reason.contains("conflicting pending DFS stage")
     )));
 
-    for (name, node_id) in [("owner", &owner), ("writer_b", &writer_b), ("writer_c", &writer_c)]
-    {
+    for (name, node_id) in [
+        ("owner", &owner),
+        ("writer_b", &writer_b),
+        ("writer_c", &writer_c),
+    ] {
         let object = fixture
             .service(node_id)
             .metadata()
@@ -187,9 +185,8 @@ fn restart_hydration_restores_backend_visible_version_without_fake_receipts() {
     let content_root = root.join("content");
 
     let network = InProcessNetwork::new();
-    let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
-            .expect("backend");
+    let backend = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
+        .expect("backend");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(&content_root).expect("content"),
@@ -217,10 +214,7 @@ fn restart_hydration_restores_backend_visible_version_without_fake_receipts() {
             DfsReplicationPolicy::new(1, 2).expect("policy"),
         )
         .expect("write");
-    assert!(matches!(
-        write,
-        NetworkedDfsWriteOutcome::Committed { .. }
-    ));
+    assert!(matches!(write, NetworkedDfsWriteOutcome::Committed { .. }));
     // Leave the remote replica un-staged so hydration cannot verify it.
     drop(owner_dfs);
     drop(replica_dfs);
@@ -426,8 +420,14 @@ fn partial_receipt_threshold_defers_visible_version_until_repairable_commit() {
         version_1
     );
 
-    fixture.service_mut(&replica_a).process_incoming().expect("a");
-    fixture.service_mut(&owner).process_incoming().expect("owner after a");
+    fixture
+        .service_mut(&replica_a)
+        .process_incoming()
+        .expect("a");
+    fixture
+        .service_mut(&owner)
+        .process_incoming()
+        .expect("owner after a");
     assert_eq!(
         fixture
             .service(&owner)
@@ -442,8 +442,14 @@ fn partial_receipt_threshold_defers_visible_version_until_repairable_commit() {
         version_1
     );
 
-    fixture.service_mut(&replica_b).process_incoming().expect("b");
-    fixture.service_mut(&owner).process_incoming().expect("owner after b");
+    fixture
+        .service_mut(&replica_b)
+        .process_incoming()
+        .expect("b");
+    fixture
+        .service_mut(&owner)
+        .process_incoming()
+        .expect("owner after b");
     assert_eq!(
         fixture
             .service(&owner)
@@ -476,10 +482,7 @@ fn offline_replica_converges_via_repair_after_coordinator_commit() {
     let bytes = b"repair convergence bytes";
     let root = temp_root("offline_repair");
 
-    let mut fixture = ClusterFixture::new(
-        &root,
-        &[owner.clone(), online.clone(), offline.clone()],
-    );
+    let mut fixture = ClusterFixture::new(&root, &[owner.clone(), online.clone(), offline.clone()]);
     fixture.seed_replicated_object(
         &owner,
         object_id.clone(),
@@ -498,8 +501,14 @@ fn offline_replica_converges_via_repair_after_coordinator_commit() {
         .expect("write");
     let intent_id = pending_intent_id(write);
 
-    fixture.service_mut(&online).process_incoming().expect("online");
-    fixture.service_mut(&owner).process_incoming().expect("owner");
+    fixture
+        .service_mut(&online)
+        .process_incoming()
+        .expect("online");
+    fixture
+        .service_mut(&owner)
+        .process_incoming()
+        .expect("owner");
     assert_eq!(
         fixture
             .service(&owner)
@@ -509,15 +518,21 @@ fn offline_replica_converges_via_repair_after_coordinator_commit() {
             .state,
         DfsWriteIntentState::Committed
     );
-    assert_eq!(
-        fixture.service(&owner).coordinator().repair_jobs().len(),
-        1
-    );
+    assert_eq!(fixture.service(&owner).coordinator().repair_jobs().len(), 1);
 
     for _ in 0..8 {
-        fixture.service_mut(&owner).retry_pending_repairs().expect("retry");
-        fixture.service_mut(&offline).process_incoming().expect("offline");
-        fixture.service_mut(&owner).process_incoming().expect("owner");
+        fixture
+            .service_mut(&owner)
+            .retry_pending_repairs()
+            .expect("retry");
+        fixture
+            .service_mut(&offline)
+            .process_incoming()
+            .expect("offline");
+        fixture
+            .service_mut(&owner)
+            .process_incoming()
+            .expect("owner");
         if fixture
             .service(&offline)
             .content()
@@ -532,10 +547,7 @@ fn offline_replica_converges_via_repair_after_coordinator_commit() {
         .service(&offline)
         .read_local_object_with_state(&object_id, false)
         .expect("offline read");
-    assert!(matches!(
-        read,
-        NetworkedDfsReadOutcome::Found { .. }
-    ));
+    assert!(matches!(read, NetworkedDfsReadOutcome::Found { .. }));
     assert_eq!(
         fixture.service(&owner).coordinator().repair_jobs().len(),
         0,
@@ -575,8 +587,14 @@ fn duplicate_replica_ack_does_not_change_visible_version() {
         .expect("write");
     let intent_id = pending_intent_id(write);
 
-    fixture.service_mut(&replica).process_incoming().expect("replica");
-    fixture.service_mut(&owner).process_incoming().expect("owner");
+    fixture
+        .service_mut(&replica)
+        .process_incoming()
+        .expect("replica");
+    fixture
+        .service_mut(&owner)
+        .process_incoming()
+        .expect("owner");
     assert_consistent_committed_object(
         fixture.service(&owner),
         &object_id,
@@ -672,7 +690,8 @@ impl ClusterFixture {
             locations,
         );
         for (_, dfs) in &mut self.services {
-            dfs.add_file_system(file_system.clone()).expect("filesystem");
+            dfs.add_file_system(file_system.clone())
+                .expect("filesystem");
             dfs.add_object_metadata(metadata.clone()).expect("object");
         }
     }
@@ -698,7 +717,8 @@ impl ClusterFixture {
             "consistency.bin",
         );
         for (_, dfs) in &mut self.services {
-            dfs.add_file_system(file_system.clone()).expect("filesystem");
+            dfs.add_file_system(file_system.clone())
+                .expect("filesystem");
             dfs.add_object_metadata(metadata.clone()).expect("object");
         }
     }
@@ -725,21 +745,20 @@ fn seed_replicated_object_on(
         owner_node_id: owner.clone(),
         subtree_policies: Vec::new(),
     };
-    let metadata = replicated_object_metadata(
-        object_id,
-        file_system_id,
-        owner,
-        version,
-        "consistency.bin",
-    );
+    let metadata =
+        replicated_object_metadata(object_id, file_system_id, owner, version, "consistency.bin");
     owner_dfs
         .add_file_system(file_system.clone())
         .expect("owner fs");
-    replica_dfs.add_file_system(file_system).expect("replica fs");
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("replica fs");
     owner_dfs
         .add_object_metadata(metadata.clone())
         .expect("owner object");
-    replica_dfs.add_object_metadata(metadata).expect("replica object");
+    replica_dfs
+        .add_object_metadata(metadata)
+        .expect("replica object");
 }
 
 #[allow(dead_code)]
@@ -756,13 +775,8 @@ fn seed_replicated_object_on_single(
         owner_node_id: owner.clone(),
         subtree_policies: Vec::new(),
     };
-    let metadata = replicated_object_metadata(
-        object_id,
-        file_system_id,
-        owner,
-        version,
-        "consistency.bin",
-    );
+    let metadata =
+        replicated_object_metadata(object_id, file_system_id, owner, version, "consistency.bin");
     owner_dfs.add_file_system(file_system).expect("filesystem");
     owner_dfs.add_object_metadata(metadata).expect("object");
 }
@@ -900,7 +914,10 @@ fn assert_consistent_committed_object(
     }
 }
 
-fn visible_version(dfs: &NetworkedDfsService<InProcessTransport>, object_id: &DfsObjectId) -> DfsVersion {
+fn visible_version(
+    dfs: &NetworkedDfsService<InProcessTransport>,
+    object_id: &DfsObjectId,
+) -> DfsVersion {
     dfs.metadata()
         .object(object_id)
         .unwrap_or_else(|| panic!("missing object {object_id}"))

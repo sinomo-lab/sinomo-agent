@@ -5029,7 +5029,9 @@ fn networked_dfs_replica_accepts_second_version_for_same_object() {
     ));
     replica_dfs.process_incoming().expect("replica stages v2");
     owner_dfs.process_incoming().expect("owner commits v2");
-    replica_dfs.process_incoming().expect("replica applies v2 commit");
+    replica_dfs
+        .process_incoming()
+        .expect("replica applies v2 commit");
     assert_eq!(
         replica_dfs
             .read_local_object(&object_id)
@@ -5057,7 +5059,9 @@ fn networked_dfs_replica_accepts_second_version_for_same_object() {
             .expect("write v3"),
         NetworkedDfsWriteOutcome::Pending { .. }
     ));
-    let replica_v3_events = replica_dfs.process_incoming().expect("replica handles v3 stage");
+    let replica_v3_events = replica_dfs
+        .process_incoming()
+        .expect("replica handles v3 stage");
     assert!(
         !replica_v3_events.iter().any(|event| matches!(
             event,
@@ -5071,7 +5075,9 @@ fn networked_dfs_replica_accepts_second_version_for_same_object() {
         NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. } if staged == &object_id
     )));
     owner_dfs.process_incoming().expect("owner commits v3");
-    replica_dfs.process_incoming().expect("replica applies v3 commit");
+    replica_dfs
+        .process_incoming()
+        .expect("replica applies v3 commit");
     assert_eq!(
         replica_dfs
             .read_local_object(&object_id)
@@ -5173,7 +5179,9 @@ fn networked_dfs_confirmed_write_keeps_strict_threshold_when_owner_is_added() {
 
     // Only one replica confirms: still must not commit (owner + b = 2 of 3).
     dfs_b.process_incoming().expect("b stages");
-    owner_dfs.process_incoming().expect("owner records b receipt");
+    owner_dfs
+        .process_incoming()
+        .expect("owner records b receipt");
     assert_eq!(
         owner_dfs
             .metadata()
@@ -5186,7 +5194,9 @@ fn networked_dfs_confirmed_write_keeps_strict_threshold_when_owner_is_added() {
 
     // Last replica confirms: now it commits.
     dfs_c.process_incoming().expect("c stages");
-    owner_dfs.process_incoming().expect("owner records c receipt and commits");
+    owner_dfs
+        .process_incoming()
+        .expect("owner records c receipt and commits");
     assert_eq!(
         owner_dfs
             .metadata()
