@@ -147,13 +147,15 @@ fn remember_network_info(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) 
 
 fn cached_node_status_matches(paths: &ClusterPaths, status: &ClusterNodeStatusRecord) -> bool {
     let key = publish_cache_key(paths, &status.node_id);
+    let now = OffsetDateTime::now_utc();
     PUBLISHED_NODE_STATUS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
-            cache
-                .get(&key)
-                .is_some_and(|known| sinomo_network::cluster_node_status_stable_eq(known, status))
+            cache.get(&key).is_some_and(|known| {
+                sinomo_network::cluster_node_status_stable_eq(known, status)
+                    && !sinomo_network::cluster_node_status_should_refresh(known.observed_at, now)
+            })
         })
 }
 
@@ -3744,6 +3746,54 @@ mod tests {
 
         std::fs::remove_dir_all(root_a).ok();
         std::fs::remove_dir_all(root_b).ok();
+    }
+
+    #[test]
+    fn node_status_publish_cache_expires_before_status_goes_stale() {
+        let root = unique_cluster_test_root("sinomo-daemon-node-status-cache");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("paths");
+
+        let now = OffsetDateTime::now_utc();
+        let mut status = ClusterNodeStatusRecord {
+            cluster_id: ClusterId::from_legacy_named("cluster_daemon_node_status_cache")
+                .expect("cluster"),
+            node_id: NodeId::from_legacy_named("node_daemon_status_cache").expect("node"),
+            process: crate::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            availability: ClusterNodeAvailability::Online,
+            daemon_version: "0.1.0-test".to_string(),
+            target_os: Some("test-os".to_string()),
+            target_arch: Some("test-arch".to_string()),
+            pid: Some(42),
+            address: Some("127.0.0.1:21353".to_string()),
+            bind_address: Some("0.0.0.0:21353".to_string()),
+            executable: Some("sinomo".to_string()),
+            rollout: None,
+            daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
+            observed_at: now,
+        };
+
+        remember_node_status(&paths, &status);
+        let mut next = status.clone();
+        next.observed_at = now + time::Duration::seconds(1);
+        assert!(
+            cached_node_status_matches(&paths, &next),
+            "fresh stable node status should remain cached"
+        );
+
+        status.observed_at = now
+            - time::Duration::seconds(
+                sinomo_network::CLUSTER_NODE_STATUS_STABLE_REFRESH_MARGIN_SECONDS + 1,
+            );
+        remember_node_status(&paths, &status);
+        let mut refreshed = status;
+        refreshed.observed_at = now;
+        assert!(
+            !cached_node_status_matches(&paths, &refreshed),
+            "stable node status must leave the cache before cluster health can mark it stale"
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

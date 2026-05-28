@@ -2743,6 +2743,72 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn stored_cluster_node_status_matches_refreshes_before_status_goes_stale() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-node-status-refresh-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_status_refresh").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_network_status_refresh").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network status refresh",
+        node_id.clone(),
+        "network node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let mut status = ClusterNodeStatusRecord {
+        cluster_id,
+        node_id,
+        process: "daemon-main".to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        pid: Some(42),
+        address: Some("127.0.0.1:21353".to_string()),
+        bind_address: Some("0.0.0.0:21353".to_string()),
+        executable: Some("sinomo".to_string()),
+        rollout: None,
+        daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+    sync_cluster_node_status_to_kv(&paths, status.clone()).expect("sync fresh status");
+
+    let mut next = status.clone();
+    next.observed_at = now + time::Duration::seconds(1);
+    assert!(
+        stored_cluster_node_status_matches(&paths, &next).expect("fresh status match"),
+        "fresh stable status should not force an immediate KV rewrite"
+    );
+
+    status.observed_at =
+        now - time::Duration::seconds(CLUSTER_NODE_STATUS_STABLE_REFRESH_MARGIN_SECONDS + 1);
+    sync_cluster_node_status_to_kv(&paths, status.clone()).expect("sync aging status");
+    let mut refreshed = status;
+    refreshed.observed_at = now;
+    assert!(
+        !stored_cluster_node_status_matches(&paths, &refreshed).expect("aging status match"),
+        "stable status must refresh before health readers mark it stale"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn sobj_reported_len(bytes: &[u8]) -> usize {
     assert!(bytes.len() >= 12);
     assert_eq!(&bytes[..4], b"SOBJ");

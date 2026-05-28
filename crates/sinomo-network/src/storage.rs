@@ -13,6 +13,7 @@ const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
+pub const CLUSTER_NODE_STATUS_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2620,7 +2621,9 @@ pub fn stored_cluster_node_status_matches(
     let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
         return Ok(false);
     };
-    Ok(cluster_node_status_stable_eq(&existing, status))
+    let now = OffsetDateTime::now_utc();
+    Ok(cluster_node_status_stable_eq(&existing, status)
+        && !cluster_node_status_should_refresh(existing.observed_at, now))
 }
 
 pub fn cluster_node_status_stable_eq(
@@ -2639,6 +2642,18 @@ pub fn cluster_node_status_stable_eq(
         && left.executable == right.executable
         && left.rollout == right.rollout
         && left.daemon_started_at == right.daemon_started_at
+}
+
+pub fn cluster_node_status_should_refresh(
+    observed_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> bool {
+    observed_at
+        + time::Duration::seconds(
+            CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS
+                - CLUSTER_NODE_STATUS_STABLE_REFRESH_MARGIN_SECONDS,
+        )
+        <= now
 }
 
 pub fn stored_cluster_network_info_matches(
