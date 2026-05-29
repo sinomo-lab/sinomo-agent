@@ -5,7 +5,7 @@
 #
 #   docker/measure-idle.sh [window_seconds]   (default 60)
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
 WINDOW="${1:-60}"
 NODES="node1 node2 node3"
 

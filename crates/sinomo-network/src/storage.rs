@@ -1208,11 +1208,14 @@ pub fn cluster_raft_known_leader_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<NodeId>, NetworkError> {
-    let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
-    Ok(node
-        .hard_state()
+    // Read only the tiny hard-state file rather than opening the full raft node
+    // (which replays the multi-MB WAL). This is a read-only leadership query, hit
+    // repeatedly by the maintenance tick and KV-commit preflight; opening the node
+    // here was the dominant source of idle disk reads on the leader.
+    let hard_state =
+        cluster_raft_wal_paths(paths, &state.local_node_id).read_persisted_hard_state()?;
+    Ok(hard_state
         .leader_id
-        .clone()
         .filter(|leader_id| cluster_raft_node_is_voter(state, leader_id)))
 }
 
@@ -1241,12 +1244,22 @@ pub fn compact_cluster_raft_node_if_needed(
     node: &mut DurableRaftKvNode,
 ) -> Result<(), NetworkError> {
     // Snapshotting rewrites the entire WAL (down to the retained tail) plus the
-    // snapshot file. Compaction only drops log entries older than the retained tail,
-    // so it is only useful — and only avoids futilely rewriting the WAL on every
-    // call — once the log holds meaningfully MORE than that tail. Trigger on a
-    // compactable surplus with hysteresis (compact in ~retained-entry batches), not
-    // on the WAL byte size, which is dominated by the un-droppable retained tail and
-    // previously caused a ~1 MB WAL rewrite on every cluster RPC at idle.
+    // snapshot file, so it must only run when it makes durable progress.
+    //
+    // Compaction advances the on-disk snapshot to `applied_index` and drops log
+    // entries older than the retained tail. The ONLY thing it can durably remove is
+    // applied entries that the on-disk snapshot does not already cover, i.e.
+    // `applied_index - snapshot_index`. The in-memory log length and event-history
+    // count are NOT valid triggers: they also include the retained replication tail
+    // plus the single committed entry that `open` replays on top of the snapshot
+    // (the snapshot is taken at `applied_index`, but one committed entry typically
+    // lives beyond it in the WAL). Triggering on those made every raft-node open at
+    // idle rewrite the full WAL+snapshot to drop one entry that the next open simply
+    // regenerated — a perpetual ~MB/s write/read loop with no commits in flight.
+    //
+    // Gate on un-snapshotted applied progress (batched at 2x the retained tail) so an
+    // idle node never compacts, and an active one compacts roughly every `retained`
+    // committed entries. `snapshot_too_large` stays as an absolute safety net.
     const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
     let retained = sinomo_kv::RAFT_COMPACTION_RETAINED_ENTRIES;
     let compaction_high_watermark = retained.saturating_mul(2);
@@ -1255,14 +1268,12 @@ pub fn compact_cluster_raft_node_if_needed(
     let snapshot_bytes = fs::metadata(&wal_paths.snapshot)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let log_len = node.log().len() as u64;
-    let retained_events = node.store().event_history_len();
 
-    let log_has_compactable_surplus = log_len > compaction_high_watermark;
+    let unsnapshotted_applied = node.applied_index().saturating_sub(node.snapshot_index());
+    let has_compactable_progress = unsnapshotted_applied > compaction_high_watermark;
     let snapshot_too_large = snapshot_bytes > MAX_SNAPSHOT_BYTES;
-    let too_many_events = retained_events > MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS;
 
-    if log_has_compactable_surplus || snapshot_too_large || too_many_events {
+    if has_compactable_progress || snapshot_too_large {
         node.compact_event_history_to(MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
         node.save_snapshot()?;
     }

@@ -537,8 +537,15 @@ pub fn advertise_daemon_iroh_endpoint(
         .iter_mut()
         .find(|member| member.node_id == endpoint.node_id)
     {
-        sinomo_network::upsert_member_endpoint(member, endpoint);
-        sinomo_network::cleanup_member_iroh_endpoints(member);
+        // Endpoints are stable; only persist/replicate when they actually change.
+        // Both helpers report whether the member's endpoint set was mutated, so an
+        // idle 60s repair-route tick re-reads the same record and short-circuits
+        // here without touching disk, the KV mirror, or the raft log.
+        let mut changed = sinomo_network::upsert_member_endpoint(member, endpoint);
+        changed |= sinomo_network::cleanup_member_iroh_endpoints(member);
+        if !changed {
+            return Ok(());
+        }
         let published_member = member.clone();
         state.updated_at = OffsetDateTime::now_utc();
         sinomo_network::write_cluster_state(&cluster_paths, &state)?;

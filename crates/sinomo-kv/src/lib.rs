@@ -413,6 +413,16 @@ impl KvWalPaths {
             detail: source.to_string(),
         })
     }
+
+    /// Reads only the persisted hard state (term/vote/leader/commit) without
+    /// opening the full raft node. Opening the node replays the entire WAL — up to
+    /// the retained tail, ~MBs — which is wasteful for read-only leadership/term
+    /// queries that only need this tiny, atomically-rewritten file. The value is a
+    /// lock-free point read: it reflects the last durably persisted hard state and
+    /// is never torn (writes go through a temp-file rename). Defaults when absent.
+    pub fn read_persisted_hard_state(&self) -> Result<RaftHardState, KvError> {
+        Ok(read_optional_object::<RaftHardState>(&self.hard_state)?.unwrap_or_default())
+    }
 }
 
 /// Process-wide memoization of parsed materialized snapshots, keyed by file path
