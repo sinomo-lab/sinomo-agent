@@ -82,6 +82,7 @@ pub const SANDBOX_MVP_COMMANDS: &[&str] = &[
     "dirname",
     "tr",
     "uname",
+    "sleep",
 ];
 
 pub const SANDBOX_MVP_COMMAND_GAPS: &[SandboxMvpCommandGap] = &[];

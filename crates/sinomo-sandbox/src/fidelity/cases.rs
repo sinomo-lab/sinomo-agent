@@ -409,6 +409,14 @@ pub const BUSYBOX_TOOLCHAIN_FIDELITY_CASES: &[SandboxBusyBoxFidelityCase] = &[
         expected_stdout: "",
         expected_exit_status: 0,
     },
+    SandboxBusyBoxFidelityCase {
+        name: "sleep-zero",
+        command: "sleep",
+        argv: &["sleep", "0"],
+        stdin: None,
+        expected_stdout: "",
+        expected_exit_status: 0,
+    },
 ];
 pub const QUICKJS_TOOLCHAIN_FIDELITY_CASES: &[SandboxQuickJsFidelityCase] = &[
     SandboxQuickJsFidelityCase {
