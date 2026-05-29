@@ -71,7 +71,13 @@ pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 900;
 pub const CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS: i64 = 7200;
 pub const CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS: i64 = 120;
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
-const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 1;
+// Endpoints probed per connectivity tick. Probes run in PARALLEL (scoped threads),
+// so the tick's wall time is bounded by one probe timeout regardless of the count;
+// this lets the connectivity graph converge in a single tick after a restart/join
+// instead of one-endpoint-per-60s-tick (which took O(endpoints) minutes to settle).
+// Bounded so a very large cluster doesn't spawn an unreasonable number of threads
+// at once; excess endpoints rotate in over subsequent ticks via connectivity_cursor.
+const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 32;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 const CLUSTER_RAFT_ELECTION_TERM_BUMP: u64 = 64;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -1000,9 +1006,19 @@ impl ClusterNetworkMaintenance {
             environment_id: None,
             last_desired_rollout_attempt: None,
             tick: 0,
-            last_publish: now,
-            last_discovery: now,
-            last_probe: now,
+            // Fire the first maintenance cycle immediately instead of after a full
+            // interval, so a freshly started/joined node publishes its records and
+            // probes its peers right away. Combined with parallel probing this lets
+            // the cluster converge within a tick or two of join instead of ~60s.
+            last_publish: now
+                .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
+                .unwrap_or(now),
+            last_discovery: now
+                .checked_sub(DAEMON_CLUSTER_DISCOVERY_INTERVAL)
+                .unwrap_or(now),
+            last_probe: now
+                .checked_sub(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL)
+                .unwrap_or(now),
             idle_stats,
         }
     }
@@ -1431,73 +1447,101 @@ impl ClusterNetworkMaintenance {
         };
         self.idle_stats
             .add_connectivity_probes_sent(probe_count as u64);
-        for endpoint in probe_targets
-            .iter()
-            .cycle()
-            .skip(probe_start)
-            .take(probe_count)
-        {
-            let key =
-                sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint);
-            let started = Instant::now();
-            let result = fetch_daemon_status_from_endpoint(endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT);
-            let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let previous = self
-                .connectivity
-                .get(&key)
-                .map(|state| state.record.clone());
-            let record = match result {
-                Ok(status) if daemon_cluster_status_matches(state, endpoint, &status) => {
-                    sinomo_network::cluster_connectivity_record(
-                        state,
+        // Snapshot the batch (each endpoint + its previous record), then probe every
+        // due endpoint in PARALLEL. Probing one endpoint per 60s tick (the old serial
+        // cap) made the connectivity graph take O(endpoints x 60s) to converge after a
+        // restart/join, so the cluster churned for minutes before going idle. Scoped
+        // parallel probes converge it in a single tick; the tick's wall time stays at
+        // ~one probe timeout regardless of how many endpoints are due.
+        let batch: Vec<(String, ClusterEndpointRecord, Option<ClusterConnectivityRecord>)> =
+            probe_targets
+                .iter()
+                .cycle()
+                .skip(probe_start)
+                .take(probe_count)
+                .map(|endpoint| {
+                    let key = sinomo_network::cluster_connectivity_probe_key(
+                        &state.local_node_id,
                         endpoint,
-                        sinomo_network::ClusterConnectivityState::Healthy,
-                        Some(latency_ms),
-                        0,
-                        Some(timestamp.clone()),
-                        previous.and_then(|record| record.last_failure_at),
-                        now,
-                        CLUSTER_CONNECTIVITY_TTL_SECONDS,
-                    )
-                }
-                _ => {
-                    let observed_failures = previous
-                        .as_ref()
-                        .map(|record| record.consecutive_failures.saturating_add(1))
-                        .unwrap_or(1);
-                    let retained_success = previous.as_ref().and_then(|record| {
-                        if observed_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
-                            record.last_success_at.clone()
-                        } else {
-                            None
-                        }
-                    });
-                    let state_label = if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
-                    {
-                        sinomo_network::ClusterConnectivityState::Unreachable
-                    } else {
-                        sinomo_network::ClusterConnectivityState::Degraded
-                    };
-                    let failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
-                    let ttl_seconds = if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
-                    {
-                        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
-                    } else {
-                        CLUSTER_CONNECTIVITY_TTL_SECONDS
-                    };
-                    sinomo_network::cluster_connectivity_record(
-                        state,
-                        endpoint,
-                        state_label,
-                        previous.and_then(|record| record.latency_ms),
-                        failures,
-                        retained_success,
-                        Some(timestamp.clone()),
-                        now,
-                        ttl_seconds,
-                    )
-                }
-            };
+                    );
+                    let previous = self.connectivity.get(&key).map(|probe| probe.record.clone());
+                    (key, endpoint.clone(), previous)
+                })
+                .collect();
+        let timestamp = timestamp.as_str();
+        let probed: Vec<(String, ClusterConnectivityRecord)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|(key, endpoint, previous)| {
+                    scope.spawn(move || {
+                        let started = Instant::now();
+                        let result =
+                            fetch_daemon_status_from_endpoint(endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT);
+                        let latency_ms =
+                            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        let record = match result {
+                            Ok(status) if daemon_cluster_status_matches(state, endpoint, &status) => {
+                                sinomo_network::cluster_connectivity_record(
+                                    state,
+                                    endpoint,
+                                    sinomo_network::ClusterConnectivityState::Healthy,
+                                    Some(latency_ms),
+                                    0,
+                                    Some(timestamp.to_string()),
+                                    previous.as_ref().and_then(|record| record.last_failure_at.clone()),
+                                    now,
+                                    CLUSTER_CONNECTIVITY_TTL_SECONDS,
+                                )
+                            }
+                            _ => {
+                                let observed_failures = previous
+                                    .as_ref()
+                                    .map(|record| record.consecutive_failures.saturating_add(1))
+                                    .unwrap_or(1);
+                                let retained_success = previous.as_ref().and_then(|record| {
+                                    if observed_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
+                                        record.last_success_at.clone()
+                                    } else {
+                                        None
+                                    }
+                                });
+                                let state_label =
+                                    if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
+                                        sinomo_network::ClusterConnectivityState::Unreachable
+                                    } else {
+                                        sinomo_network::ClusterConnectivityState::Degraded
+                                    };
+                                let failures =
+                                    observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
+                                let ttl_seconds =
+                                    if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
+                                        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
+                                    } else {
+                                        CLUSTER_CONNECTIVITY_TTL_SECONDS
+                                    };
+                                sinomo_network::cluster_connectivity_record(
+                                    state,
+                                    endpoint,
+                                    state_label,
+                                    previous.as_ref().and_then(|record| record.latency_ms),
+                                    failures,
+                                    retained_success,
+                                    Some(timestamp.to_string()),
+                                    now,
+                                    ttl_seconds,
+                                )
+                            }
+                        };
+                        (key.clone(), record)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .collect()
+        });
+        for (key, record) in probed {
             self.connectivity
                 .insert(key, ClusterConnectivityProbeState { record });
         }
