@@ -25,7 +25,6 @@ pub const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 pub const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
-pub const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonRunOptions {
@@ -428,11 +427,6 @@ pub fn unknown_cluster_node_status(
         daemon_started_at: None,
         observed_at,
     }
-}
-
-pub fn cluster_node_status_is_stale(status: &ClusterNodeStatusRecord) -> bool {
-    (OffsetDateTime::now_utc() - status.observed_at).whole_seconds()
-        > CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS
 }
 
 pub fn invite_introducers_from_daemon_status(

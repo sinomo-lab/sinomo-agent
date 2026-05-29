@@ -13,10 +13,8 @@ pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
-const CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS: i64 = 120;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
-pub const CLUSTER_NODE_STATUS_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Receives notifications about disk and network I/O performed by the network
@@ -2598,6 +2596,43 @@ pub fn live_cluster_member_probe_possible(
     })
 }
 
+/// True when `member` has probeable endpoints but the local node's active
+/// connectivity probes currently mark every one of them unreachable.
+///
+/// This is the probe-based liveness signal: unlike the self-reported node-status
+/// `observed_at` (which is no longer periodically refreshed), it reflects whether
+/// we can actually reach the peer right now. A member we have never probed (no
+/// connectivity record yet) is not reported unreachable.
+pub fn cluster_member_unreachable_via_connectivity(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> bool {
+    if cluster_member_is_local_process(state, member) {
+        return false;
+    }
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    let mut has_probeable_endpoint = false;
+    for endpoint in &member.endpoints {
+        let probeable = endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+            && matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp
+                    | ClusterTransportKind::Loopback
+                    | ClusterTransportKind::Iroh
+            );
+        if !probeable {
+            continue;
+        }
+        has_probeable_endpoint = true;
+        if graph.unavailability_rank(endpoint) == 0 {
+            // At least one probeable endpoint is not marked unreachable.
+            return false;
+        }
+    }
+    has_probeable_endpoint
+}
+
 pub fn cluster_node_is_local_process(state: &ClusterBootstrapState, node_id: &NodeId) -> bool {
     *node_id == state.local_node_id || *node_id == shadow_daemon_node_id(&state.local_node_id)
 }
@@ -2848,18 +2883,6 @@ pub fn cluster_node_status_stable_eq(
         && left.executable == right.executable
         && left.rollout == right.rollout
         && left.daemon_started_at == right.daemon_started_at
-}
-
-pub fn cluster_node_status_should_refresh(
-    observed_at: OffsetDateTime,
-    now: OffsetDateTime,
-) -> bool {
-    observed_at
-        + time::Duration::seconds(
-            CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS
-                - CLUSTER_NODE_STATUS_STABLE_REFRESH_MARGIN_SECONDS,
-        )
-        <= now
 }
 
 pub fn stored_cluster_network_info_matches(

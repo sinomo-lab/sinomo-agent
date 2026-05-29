@@ -143,12 +143,12 @@ pub use rollout::{
     write_rollout_main_failure_diagnostics,
 };
 pub use status::{
-    CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE,
+    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE,
     DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonLock,
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST,
     SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
     authenticated_signer_matches_cluster_node, cluster_node_status_from_daemon_status,
-    cluster_node_status_is_stale, current_shadow_daemon_options,
+    current_shadow_daemon_options,
     daemon_advertised_endpoints_for_state, daemon_advertised_endpoints_from_ips,
     daemon_bind_address, daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
     daemon_cluster_registration, daemon_cluster_status, daemon_cluster_status_matches,

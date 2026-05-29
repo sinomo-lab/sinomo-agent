@@ -539,20 +539,27 @@ pub fn advertise_daemon_iroh_endpoint(
 ) -> Result<(), DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let mut state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    prepare_local_cluster_state(&cluster_paths, &mut state)?;
     let endpoint = record.endpoint();
+    let persisted_endpoints = state
+        .members
+        .iter()
+        .find(|member| member.node_id == endpoint.node_id)
+        .map(|member| member.endpoints.clone());
+    prepare_local_cluster_state(&cluster_paths, &mut state)?;
     if let Some(member) = state
         .members
         .iter_mut()
         .find(|member| member.node_id == endpoint.node_id)
     {
-        // Endpoints are stable; only persist/replicate when they actually change.
-        // Both helpers report whether the member's endpoint set was mutated, so an
-        // idle 60s repair-route tick re-reads the same record and short-circuits
-        // here without touching disk, the KV mirror, or the raft log.
-        let mut changed = sinomo_network::upsert_member_endpoint(member, endpoint);
-        changed |= sinomo_network::cleanup_member_iroh_endpoints(member);
-        if !changed {
+        sinomo_network::upsert_member_endpoint(member, endpoint);
+        sinomo_network::cleanup_member_iroh_endpoints(member);
+        // Persist/replicate only when this member's endpoint set actually differs
+        // from disk. prepare_local_cluster_state already folds iroh endpoints in
+        // from disk, so we compare against the persisted endpoints rather than the
+        // upsert delta: otherwise a brand-new endpoint that prepare merged would
+        // never be written, while an idle re-advertise still short-circuits here
+        // without touching disk, the KV mirror, or the raft log.
+        if persisted_endpoints.as_deref() == Some(member.endpoints.as_slice()) {
             return Ok(());
         }
         let published_member = member.clone();
@@ -1781,10 +1788,11 @@ pub fn cluster_health_rows(
         } else {
             unknown_cluster_node_status(state, member, OffsetDateTime::now_utc())
         };
-        let availability = if live_online
-            || (status.availability == ClusterNodeAvailability::Online
-                && !crate::cluster_node_status_is_stale(&status))
-        {
+        // Liveness is driven by the active status probe above, not by the
+        // self-reported node-status `observed_at` (which is no longer refreshed on
+        // a timer). A reachable peer answers the probe; an addressable peer that
+        // does not answer is Offline; one we cannot probe at all is Unknown.
+        let availability = if live_online {
             ClusterNodeAvailability::Online
         } else if sinomo_network::live_cluster_member_probe_possible(state, member) {
             ClusterNodeAvailability::Offline
@@ -3061,21 +3069,19 @@ fn cluster_node_status_blocks_leader_preference(
     state: &ClusterBootstrapState,
     node_id: &NodeId,
 ) -> bool {
-    sinomo_network::read_cluster_node_statuses_from_kv(paths)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|status| status.node_id == *node_id)
-        .is_some_and(|status| {
-            status.availability == ClusterNodeAvailability::Offline
-                || (status.availability == ClusterNodeAvailability::Online
-                    && crate::cluster_node_status_is_stale(&status)
-                    && state
-                        .members
-                        .iter()
-                        .find(|member| member.node_id == *node_id)
-                        .is_some_and(|member| {
-                            sinomo_network::live_cluster_member_probe_possible(state, member)
-                        }))
+    // A node blocks leader preference if it has gracefully reported itself
+    // offline, or if the active connectivity probes can no longer reach it. The
+    // self-reported `observed_at` is not consulted: it is no longer refreshed on a
+    // timer, so an idle-but-healthy node must not be deprioritized as a candidate.
+    if cluster_node_status_is_offline(paths, node_id) {
+        return true;
+    }
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == *node_id)
+        .is_some_and(|member| {
+            sinomo_network::cluster_member_unreachable_via_connectivity(paths, state, member)
         })
 }
 
@@ -3953,55 +3959,6 @@ mod tests {
     }
 
     #[test]
-    fn node_status_publish_cache_expires_before_status_goes_stale() {
-        let root = unique_cluster_test_root("sinomo-daemon-node-status-cache");
-        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-        paths.ensure().expect("paths");
-
-        let now = OffsetDateTime::now_utc();
-        let mut status = ClusterNodeStatusRecord {
-            cluster_id: ClusterId::from_legacy_named("cluster_daemon_node_status_cache")
-                .expect("cluster"),
-            node_id: NodeId::from_legacy_named("node_daemon_status_cache").expect("node"),
-            process: crate::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
-            availability: ClusterNodeAvailability::Online,
-            daemon_version: "0.1.0-test".to_string(),
-            commit: None,
-            target_os: Some("test-os".to_string()),
-            target_arch: Some("test-arch".to_string()),
-            pid: Some(42),
-            address: Some("127.0.0.1:21353".to_string()),
-            bind_address: Some("0.0.0.0:21353".to_string()),
-            executable: Some("sinomo".to_string()),
-            rollout: None,
-            daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
-            observed_at: now,
-        };
-
-        remember_node_status(&paths, &status);
-        let mut next = status.clone();
-        next.observed_at = now + time::Duration::seconds(1);
-        assert!(
-            cached_node_status_matches(&paths, &next),
-            "fresh stable node status should remain cached"
-        );
-
-        status.observed_at = now
-            - time::Duration::seconds(
-                sinomo_network::CLUSTER_NODE_STATUS_STABLE_REFRESH_MARGIN_SECONDS + 1,
-            );
-        remember_node_status(&paths, &status);
-        let mut refreshed = status;
-        refreshed.observed_at = now;
-        assert!(
-            !cached_node_status_matches(&paths, &refreshed),
-            "stable node status must leave the cache before cluster health can mark it stale"
-        );
-
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
     fn connectivity_probe_state_is_source_local_even_for_non_voters() {
         let root = unique_cluster_test_root("sinomo-daemon-connectivity-non-voter");
         let data_dir = SinomoDataDir::new(&root);
@@ -4357,29 +4314,30 @@ mod tests {
     }
 
     #[test]
-    fn stale_online_status_blocks_leader_preference_without_hiding_voter() {
-        let root = unique_cluster_test_root("sinomo-daemon-stale-leader-status");
+    fn unreachable_member_blocks_leader_preference_without_hiding_voter() {
+        let root = unique_cluster_test_root("sinomo-daemon-unreachable-leader-status");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("cluster paths");
 
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            ClusterId::from_legacy_named("cluster_daemon_stale_leader").expect("cluster id");
+            ClusterId::from_legacy_named("cluster_daemon_unreachable_leader").expect("cluster id");
         let local_node =
-            NodeId::from_legacy_named("node_daemon_stale_leader_local").expect("local node");
+            NodeId::from_legacy_named("node_daemon_unreachable_leader_local").expect("local node");
         let remote_node =
-            NodeId::from_legacy_named("node_daemon_stale_leader_remote").expect("remote node");
+            NodeId::from_legacy_named("node_daemon_unreachable_leader_remote").expect("remote node");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
-            "stale leader status",
-            local_node,
+            "unreachable leader status",
+            local_node.clone(),
             "local",
             "pk-local",
             now,
         );
         let endpoint =
             sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.41:21353".to_string(), 10);
+        let remote_endpoint_id = endpoint.endpoint_id.clone();
         let mut remote_member = ClusterMemberRecord::local_voter(
             cluster_id.clone(),
             remote_node.clone(),
@@ -4395,10 +4353,14 @@ mod tests {
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
             .expect("sync state to raft kv");
+        // The remote still self-reports Online (it never published an explicit
+        // Offline). Liveness now follows the active probes, not the self-reported
+        // observed_at, so a fresh-looking status must not earn leader preference
+        // once the probes can no longer reach the node.
         sinomo_network::sync_cluster_node_status_to_kv(
             &paths,
             ClusterNodeStatusRecord {
-                cluster_id,
+                cluster_id: cluster_id.clone(),
                 node_id: remote_node.clone(),
                 process: "daemon-main".to_string(),
                 availability: ClusterNodeAvailability::Online,
@@ -4412,23 +4374,45 @@ mod tests {
                 executable: Some("sinomo".to_string()),
                 rollout: None,
                 daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
-                observed_at: now - time::Duration::seconds(3600),
+                observed_at: now,
             },
         )
-        .expect("sync stale node status");
+        .expect("sync online node status");
+        // The local node's active connectivity probes can no longer reach the
+        // remote member's only endpoint.
+        sinomo_network::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &local_node,
+            vec![ClusterConnectivityRecord {
+                cluster_id,
+                source_node_id: local_node.clone(),
+                target_node_id: remote_node.clone(),
+                endpoint_id: remote_endpoint_id,
+                transport: ClusterTransportKind::LanTcp,
+                address: "10.0.0.41:21353".to_string(),
+                state: sinomo_network::ClusterConnectivityState::Unreachable,
+                latency_ms: None,
+                consecutive_failures: 5,
+                last_success_at: None,
+                last_failure_at: Some("2026-05-04T00:10:00Z".to_string()),
+                observed_at: now,
+                expires_at: now + time::Duration::seconds(300),
+            }],
+        )
+        .expect("sync unreachable connectivity");
 
         assert!(
             cluster_node_status_blocks_leader_preference(&paths, &state, &remote_node),
-            "a stale online status for a probeable remote member must not be trusted for leader preference"
+            "a remote member the active probes cannot reach must not be preferred as leader"
         );
         assert!(
             !cluster_node_status_is_offline(&paths, &remote_node),
-            "a stale online status is unknown, not explicit offline"
+            "an unreachable member that never self-declared Offline is not explicit offline"
         );
         assert_eq!(
             cluster_raft_live_voter_targets(&paths, &state).len(),
             1,
-            "stale status alone must not hide a voter while KV is recovering"
+            "an unreachable member must remain a voter while connectivity is recovering"
         );
         std::fs::remove_dir_all(root).ok();
     }
