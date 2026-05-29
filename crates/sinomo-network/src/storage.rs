@@ -1240,23 +1240,29 @@ pub fn compact_cluster_raft_node_if_needed(
     paths: &ClusterPaths,
     node: &mut DurableRaftKvNode,
 ) -> Result<(), NetworkError> {
-    const MAX_UNCOMPACTED_LOG_ENTRIES: usize = 128;
-    const MAX_WAL_BYTES: u64 = 512 * 1024;
+    // Snapshotting rewrites the entire WAL (down to the retained tail) plus the
+    // snapshot file. Compaction only drops log entries older than the retained tail,
+    // so it is only useful — and only avoids futilely rewriting the WAL on every
+    // call — once the log holds meaningfully MORE than that tail. Trigger on a
+    // compactable surplus with hysteresis (compact in ~retained-entry batches), not
+    // on the WAL byte size, which is dominated by the un-droppable retained tail and
+    // previously caused a ~1 MB WAL rewrite on every cluster RPC at idle.
     const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+    let retained = sinomo_kv::RAFT_COMPACTION_RETAINED_ENTRIES;
+    let compaction_high_watermark = retained.saturating_mul(2);
 
     let wal_paths = cluster_raft_wal_paths(paths, node.node_id());
-    let wal_bytes = fs::metadata(&wal_paths.wal)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
     let snapshot_bytes = fs::metadata(&wal_paths.snapshot)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
+    let log_len = node.log().len() as u64;
     let retained_events = node.store().event_history_len();
-    if node.log().len() > MAX_UNCOMPACTED_LOG_ENTRIES
-        || wal_bytes > MAX_WAL_BYTES
-        || snapshot_bytes > MAX_SNAPSHOT_BYTES
-        || retained_events > MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS
-    {
+
+    let log_has_compactable_surplus = log_len > compaction_high_watermark;
+    let snapshot_too_large = snapshot_bytes > MAX_SNAPSHOT_BYTES;
+    let too_many_events = retained_events > MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS;
+
+    if log_has_compactable_surplus || snapshot_too_large || too_many_events {
         node.compact_event_history_to(MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
         node.save_snapshot()?;
     }

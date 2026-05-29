@@ -10,10 +10,8 @@ use sinomo_node::{
     NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
     load_or_create_node_identity,
 };
-use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -23,8 +21,14 @@ pub const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
 pub const CLUSTER_INVITE_CHALLENGE_PROTOCOL: &str = "sinomo.cluster-invite-challenge.v1";
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS * 2;
-const DAEMON_AUTH_NONCE_LOG_COMPACT_BYTES: u64 = 256 * 1024;
-static DAEMON_AUTH_NONCE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// In-memory replay-protection nonce sets, keyed by daemon data root. Replacing the
+/// previous per-RPC `auth-nonces.sobjlog` append (a disk read + write on *every*
+/// authenticated request, including idle cluster heartbeats) keeps idle disk I/O at
+/// zero. Replay protection is bounded by the signed-command clock-skew freshness
+/// check, so the only behavioral change is that a process restart forgets nonces
+/// from the trailing skew window — which the freshness check already constrains.
+static DAEMON_AUTH_NONCES: OnceLock<Mutex<HashMap<PathBuf, BTreeMap<String, OffsetDateTime>>>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignedDaemonCommand {
@@ -734,140 +738,33 @@ fn remember_daemon_auth_nonce(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
 ) -> Result<(), DaemonError> {
-    let nonce_path = paths.root.join("auth-nonces.sobj");
-    let nonce_log_path = paths.root.join("auth-nonces.sobjlog");
-    let _guard = DAEMON_AUTH_NONCE_LOCK
-        .get_or_init(|| Mutex::new(()))
+    let now = OffsetDateTime::now_utc();
+    // The signing timestamp is the nonce's freshness anchor; reject malformed ones.
+    let signed_at =
+        OffsetDateTime::parse(&envelope.timestamp, &Rfc3339).map_err(|_| DaemonError::AuthDenied)?;
+    let mut guard = DAEMON_AUTH_NONCES
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|source| DaemonError::Io {
-            path: nonce_path.display().to_string(),
+            path: paths.root.display().to_string(),
             detail: source.to_string(),
         })?;
-    let now = OffsetDateTime::now_utc();
-    let mut nonces = read_daemon_auth_nonces(&nonce_path, &nonce_log_path, now)?;
+    let nonces = guard.entry(paths.root.clone()).or_default();
+    // Drop nonces older than the retention window so the set stays bounded; anything
+    // that old is already rejected by the clock-skew freshness check.
+    nonces.retain(|_, seen_at| {
+        (now - *seen_at).whole_seconds().abs() <= DAEMON_AUTH_NONCE_RETENTION_SECONDS
+    });
     let nonce_key = daemon_auth_nonce_key(envelope);
     if nonces.contains_key(&nonce_key) {
         return Err(DaemonError::AuthDenied);
     }
-    nonces.insert(nonce_key, envelope.timestamp.clone());
-    append_daemon_auth_nonce(&nonce_log_path, envelope)?;
-    compact_daemon_auth_nonce_log_if_needed(&nonce_path, &nonce_log_path, &nonces)
+    nonces.insert(nonce_key, signed_at);
+    Ok(())
 }
 
 fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> String {
     format!("{}:{}", envelope.public_key, envelope.nonce)
-}
-
-fn read_daemon_auth_nonces(
-    nonce_path: &Path,
-    nonce_log_path: &Path,
-    now: OffsetDateTime,
-) -> Result<BTreeMap<String, String>, DaemonError> {
-    let mut nonces = match fs::read(nonce_path) {
-        Ok(bytes) => sinomo_network::SinomoObjectCodec::default()
-            .decode::<BTreeMap<String, String>>(&bytes)
-            .unwrap_or_default(),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(source) => {
-            return Err(DaemonError::Io {
-                path: nonce_path.display().to_string(),
-                detail: source.to_string(),
-            });
-        }
-    };
-    match fs::read(nonce_log_path) {
-        Ok(bytes) => {
-            for line in String::from_utf8_lossy(&bytes).lines() {
-                let Some((nonce_key, timestamp)) = line.split_once('\t') else {
-                    continue;
-                };
-                if !nonce_key.trim().is_empty() && !timestamp.trim().is_empty() {
-                    nonces.insert(nonce_key.to_string(), timestamp.to_string());
-                }
-            }
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(DaemonError::Io {
-                path: nonce_log_path.display().to_string(),
-                detail: source.to_string(),
-            });
-        }
-    }
-    retain_live_daemon_auth_nonces(&mut nonces, now);
-    Ok(nonces)
-}
-
-fn retain_live_daemon_auth_nonces(nonces: &mut BTreeMap<String, String>, now: OffsetDateTime) {
-    nonces.retain(|_, timestamp| {
-        OffsetDateTime::parse(timestamp, &Rfc3339)
-            .map(|seen_at| {
-                (now - seen_at).whole_seconds().abs() <= DAEMON_AUTH_NONCE_RETENTION_SECONDS
-            })
-            .unwrap_or(false)
-    });
-}
-
-fn append_daemon_auth_nonce(
-    nonce_log_path: &Path,
-    envelope: &SignedDaemonCommand,
-) -> Result<(), DaemonError> {
-    if let Some(parent) = nonce_log_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(nonce_log_path)
-        .map_err(|source| DaemonError::Io {
-            path: nonce_log_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    writeln!(
-        file,
-        "{}\t{}",
-        daemon_auth_nonce_key(envelope),
-        envelope.timestamp
-    )
-    .map_err(|source| DaemonError::Io {
-        path: nonce_log_path.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-fn compact_daemon_auth_nonce_log_if_needed(
-    nonce_path: &Path,
-    nonce_log_path: &Path,
-    nonces: &BTreeMap<String, String>,
-) -> Result<(), DaemonError> {
-    let log_bytes = fs::metadata(nonce_log_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if log_bytes < DAEMON_AUTH_NONCE_LOG_COMPACT_BYTES {
-        return Ok(());
-    }
-    write_object(nonce_path, nonces)?;
-    fs::write(nonce_log_path, []).map_err(|source| DaemonError::Io {
-        path: nonce_log_path.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-fn write_object<T: Serialize>(path: &Path, value: &T) -> Result<(), DaemonError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let content = sinomo_network::SinomoObjectCodec::default().encode(value)?;
-    fs::write(path, content).map_err(|source| DaemonError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
 }
 
 fn auth_nonce_suffix() -> String {
@@ -921,52 +818,39 @@ mod tests {
     }
 
     #[test]
-    fn daemon_auth_nonce_appends_log_without_rewriting_snapshot() {
-        let paths = unique_auth_test_paths("sinomo-daemon-auth-nonce-log");
+    fn daemon_auth_nonce_rejects_replays_without_touching_disk() {
+        let paths = unique_auth_test_paths("sinomo-daemon-auth-nonce-mem");
         let first = signed_nonce("nonce-one");
         remember_daemon_auth_nonce(&paths, &first).expect("remember first nonce");
 
-        let nonce_path = paths.root.join("auth-nonces.sobj");
-        let nonce_log_path = paths.root.join("auth-nonces.sobjlog");
-        assert!(
-            !nonce_path.exists(),
-            "nonce snapshot should not be rewritten for every request"
-        );
-        let log_size = std::fs::metadata(&nonce_log_path).expect("nonce log").len();
-        assert!(log_size < 1024, "single nonce append should stay small");
+        // Nonces are tracked in memory: no per-request disk files are created, so an
+        // idle cluster (which still authenticates periodic RPCs) does no disk I/O.
+        assert!(!paths.root.join("auth-nonces.sobj").exists());
+        assert!(!paths.root.join("auth-nonces.sobjlog").exists());
 
-        let duplicate = remember_daemon_auth_nonce(&paths, &first);
-        assert!(matches!(duplicate, Err(DaemonError::AuthDenied)));
-        assert_eq!(
-            std::fs::metadata(&nonce_log_path)
-                .expect("nonce log after duplicate")
-                .len(),
-            log_size,
-            "duplicate nonce rejection must not append another log record"
-        );
-
+        // A replay of the same signed command is rejected.
+        assert!(matches!(
+            remember_daemon_auth_nonce(&paths, &first),
+            Err(DaemonError::AuthDenied)
+        ));
+        // A distinct nonce is accepted.
         let second = signed_nonce("nonce-two");
         remember_daemon_auth_nonce(&paths, &second).expect("remember second nonce");
-        std::fs::remove_dir_all(&paths.root).ok();
     }
 
     #[test]
-    fn daemon_auth_nonce_reads_existing_snapshot_and_log() {
-        let paths = unique_auth_test_paths("sinomo-daemon-auth-nonce-existing");
-        let nonce_path = paths.root.join("auth-nonces.sobj");
-        let existing = signed_nonce("from-snapshot");
-        let mut nonces = BTreeMap::new();
-        nonces.insert(daemon_auth_nonce_key(&existing), existing.timestamp.clone());
-        write_object(&nonce_path, &nonces).expect("write snapshot");
-
-        let duplicate_snapshot = remember_daemon_auth_nonce(&paths, &existing);
-        assert!(matches!(duplicate_snapshot, Err(DaemonError::AuthDenied)));
-
-        let from_log = signed_nonce("from-log");
-        remember_daemon_auth_nonce(&paths, &from_log).expect("remember log nonce");
-        let duplicate_log = remember_daemon_auth_nonce(&paths, &from_log);
-        assert!(matches!(duplicate_log, Err(DaemonError::AuthDenied)));
-        std::fs::remove_dir_all(&paths.root).ok();
+    fn daemon_auth_nonce_sets_are_isolated_per_daemon_root() {
+        let paths_a = unique_auth_test_paths("sinomo-daemon-auth-nonce-root-a");
+        let paths_b = unique_auth_test_paths("sinomo-daemon-auth-nonce-root-b");
+        let nonce = signed_nonce("shared-nonce");
+        remember_daemon_auth_nonce(&paths_a, &nonce).expect("remember under root a");
+        // Replay under the same root is rejected...
+        assert!(matches!(
+            remember_daemon_auth_nonce(&paths_a, &nonce),
+            Err(DaemonError::AuthDenied)
+        ));
+        // ...but a different daemon root tracks its nonces independently.
+        remember_daemon_auth_nonce(&paths_b, &nonce).expect("distinct root accepts nonce");
     }
 
     #[test]

@@ -32,7 +32,11 @@ const MAX_RETAINED_EVENTS: usize = 4096;
 /// redundant with the snapshot (it is dropped on restart) and only the leader's
 /// in-process log carries it, so it never changes the wire protocol or on-disk
 /// recovery semantics.
-const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
+///
+/// Compaction triggers must stay *above* this value: compaction only drops entries
+/// older than this tail, so triggering at or below it rewrites the WAL to the same
+/// tail every time (a busy-idle loop). See `compact_cluster_raft_node_if_needed`.
+pub const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
 const RAFT_NODE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
