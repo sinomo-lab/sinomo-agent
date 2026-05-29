@@ -12,19 +12,27 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sinomo_core::ClusterMemberRecord;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const KV_OBJECT_VERSION_ID: u16 = 1;
 pub const KV_WAL_OBJECT_VERSION_ID: u16 = 2;
 const MAX_RETAINED_EVENTS: usize = 4096;
+/// Committed log entries kept in memory after a local snapshot compaction. A
+/// follower that has fallen at most this many entries behind can be caught up
+/// with small incremental appends instead of a full snapshot install. The tail is
+/// redundant with the snapshot (it is dropped on restart) and only the leader's
+/// in-process log carries it, so it never changes the wire protocol or on-disk
+/// recovery semantics.
+const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
 const RAFT_NODE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
@@ -403,14 +411,79 @@ impl KvWalPaths {
     }
 }
 
+/// Process-wide memoization of parsed materialized snapshots, keyed by file path
+/// and validated by (mtime, len). Lets repeated reads of an unchanged snapshot
+/// skip the disk read + deserialization entirely — the dominant idle read cost.
+/// The writer updates this on every write, so intra-process reads are always
+/// coherent; cross-process edits are caught by the (mtime, len) validation.
+struct MaterializedSnapshotCacheEntry {
+    mtime: Option<SystemTime>,
+    len: u64,
+    snapshot: Arc<KvSnapshot>,
+}
+
+static MATERIALIZED_SNAPSHOT_CACHE: OnceLock<Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>>> =
+    OnceLock::new();
+
+fn materialized_snapshot_cache() -> &'static Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>> {
+    MATERIALIZED_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn file_identity(path: &Path) -> Option<(Option<SystemTime>, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.modified().ok(), metadata.len()))
+}
+
+fn cache_lookup_snapshot(path: &Path, mtime: Option<SystemTime>, len: u64) -> Option<Arc<KvSnapshot>> {
+    let guard = materialized_snapshot_cache().lock().ok()?;
+    let entry = guard.get(path)?;
+    // mtime is the primary key; require it to be present and equal so we never
+    // serve a cache hit we cannot validate.
+    if entry.mtime.is_some() && entry.mtime == mtime && entry.len == len {
+        Some(entry.snapshot.clone())
+    } else {
+        None
+    }
+}
+
+fn cache_store_snapshot(path: &Path, mtime: Option<SystemTime>, len: u64, snapshot: Arc<KvSnapshot>) {
+    if mtime.is_none() {
+        return;
+    }
+    if let Ok(mut guard) = materialized_snapshot_cache().lock() {
+        guard.insert(
+            path.to_path_buf(),
+            MaterializedSnapshotCacheEntry {
+                mtime,
+                len,
+                snapshot,
+            },
+        );
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvMaterializedCache {
     path: PathBuf,
+    /// When set, the persisted snapshot's watch-event history is compacted to at
+    /// most this many events before writing. Keeps the materialized file small and
+    /// — crucially — ensures every writer (the explicit publish path and the
+    /// read-triggered refresh in `read_store_with_raft_view`) persists the same
+    /// event tail, so they don't perpetually rewrite each other's snapshots.
+    max_materialized_events: Option<usize>,
 }
 
 impl KvMaterializedCache {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            max_materialized_events: None,
+        }
+    }
+
+    pub fn with_max_materialized_events(mut self, max_events: usize) -> Self {
+        self.max_materialized_events = Some(max_events);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -422,25 +495,67 @@ impl KvMaterializedCache {
     }
 
     pub fn read_snapshot(&self) -> Result<KvSnapshot, KvError> {
-        read_object_file(&self.path)
+        let identity = file_identity(&self.path);
+        if let Some((mtime, len)) = identity
+            && let Some(cached) = cache_lookup_snapshot(&self.path, mtime, len)
+        {
+            return Ok((*cached).clone());
+        }
+        let snapshot = read_object_file::<KvSnapshot>(&self.path)?;
+        if let Some((mtime, len)) = identity {
+            cache_store_snapshot(&self.path, mtime, len, Arc::new(snapshot.clone()));
+        }
+        Ok(snapshot)
     }
 
     pub fn read_store(&self) -> Result<InProcessKvStore, KvError> {
         self.read_snapshot().map(InProcessKvStore::restore)
     }
 
+    /// Returns the snapshot that should actually be persisted: the input with its
+    /// event history compacted to the configured materialized-event limit.
+    fn materialized(&self, snapshot: &KvSnapshot) -> KvSnapshot {
+        match self.max_materialized_events {
+            Some(max_events) if snapshot.events.len() > max_events => {
+                let mut snapshot = snapshot.clone();
+                compact_kv_snapshot_event_history(&mut snapshot, max_events);
+                snapshot
+            }
+            _ => snapshot.clone(),
+        }
+    }
+
+    /// Persists `snapshot` and refreshes the process-wide read cache so subsequent
+    /// reads hit memory rather than re-reading the file.
+    fn write_and_cache(&self, snapshot: KvSnapshot) -> Result<(), KvError> {
+        write_object_file(&self.path, &snapshot)?;
+        if let Some((mtime, len)) = file_identity(&self.path) {
+            cache_store_snapshot(&self.path, mtime, len, Arc::new(snapshot));
+        }
+        Ok(())
+    }
+
     pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
-        write_object_file(&self.path, snapshot)
+        self.write_and_cache(self.materialized(snapshot))
     }
 
     pub fn write_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
+        let desired = self.materialized(snapshot);
+        // Skip the rewrite when the durable key/value/lease state is unchanged, even
+        // if the snapshot revision, per-entry revision metadata, or watch-event tail
+        // advanced. Re-putting an identical value bumps modify_revision/version and
+        // appends events, which would otherwise rewrite the whole (~25 KiB+)
+        // materialized file for no durable change. The materialized snapshot is only
+        // a fast-restore fallback for a cold node with an empty WAL (the WAL is the
+        // source of truth for revision/version/events), so persisting stale
+        // bookkeeping there is safe.
         if self
             .read_snapshot()
-            .is_ok_and(|existing| existing == *snapshot)
+            .is_ok_and(|existing| kv_snapshot_durable_eq(&existing, &desired))
         {
             return Ok(false);
         }
-        self.write_snapshot(snapshot)?;
+        self.write_and_cache(desired)?;
         Ok(true)
     }
 
@@ -481,6 +596,14 @@ impl KvLocalCache {
             materialized: KvMaterializedCache::new(materialized_snapshot),
             raft_root: raft_root.into(),
         }
+    }
+
+    /// Bound the persisted snapshot's event history to `max_events`, applied
+    /// consistently across the explicit publish path and the read-triggered
+    /// materialized-cache refresh.
+    pub fn with_max_materialized_events(mut self, max_events: usize) -> Self {
+        self.materialized = self.materialized.with_max_materialized_events(max_events);
+        self
     }
 
     pub fn current_store(&self, node_id: NodeId) -> Result<InProcessKvStore, KvError> {
@@ -1042,6 +1165,34 @@ impl InProcessKvStore {
     }
 }
 
+/// Compares two snapshots by their durable key/value/lease state, ignoring the
+/// top-level revision, per-entry revision metadata (`create_revision`,
+/// `modify_revision`, `version`), lease decay (`remaining_ticks`, `granted_at`),
+/// and the watch-event tail. Two snapshots that are durable-equal materialize to
+/// the same observable KV state, so there is no need to rewrite the persisted file.
+pub fn kv_snapshot_durable_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
+    if left.entries.len() != right.entries.len() || left.leases.len() != right.leases.len() {
+        return false;
+    }
+    let left_entries = left
+        .entries
+        .iter()
+        .map(|entry| (&entry.key, &entry.value, &entry.lease_id));
+    let right_entries = right
+        .entries
+        .iter()
+        .map(|entry| (&entry.key, &entry.value, &entry.lease_id));
+    if !left_entries.eq(right_entries) {
+        return false;
+    }
+    let left_leases = left.leases.iter().map(|lease| (&lease.lease_id, lease.ttl_ticks));
+    let right_leases = right
+        .leases
+        .iter()
+        .map(|lease| (&lease.lease_id, lease.ttl_ticks));
+    left_leases.eq(right_leases)
+}
+
 pub fn compact_kv_snapshot_event_history(snapshot: &mut KvSnapshot, max_events: usize) {
     compact_snapshot_event_history(
         &mut snapshot.events,
@@ -1526,6 +1677,36 @@ impl ReplicatedKvNode {
             .map(|entry| entry.term)
     }
 
+    /// Loads persisted WAL entries on open. Entries beyond the installed snapshot
+    /// are appended (and later applied) as normal; already-applied entries are kept
+    /// in the log as a contiguous replication tail (not re-applied — they are
+    /// reflected in the snapshot/store). Any non-contiguous already-applied entry is
+    /// skipped, degrading safely to snapshot-based replication rather than corrupting
+    /// the log.
+    fn load_persisted_entries(&mut self, entries: Vec<KvLogEntry>) -> Result<(), KvError> {
+        for entry in entries {
+            if entry.index == 0 {
+                continue;
+            }
+            if entry.index > self.applied_index {
+                self.append_entries(vec![entry])?;
+                continue;
+            }
+            if self.log.iter().any(|existing| existing.index == entry.index) {
+                continue;
+            }
+            let contiguous = match self.log.last() {
+                Some(last) => entry.index == last.index.saturating_add(1),
+                None => true,
+            };
+            if contiguous {
+                self.log.push(entry);
+            }
+        }
+        self.log.sort_by_key(|entry| entry.index);
+        Ok(())
+    }
+
     fn append_entries(&mut self, entries: Vec<KvLogEntry>) -> Result<Vec<KvLogEntry>, KvError> {
         let mut appended = Vec::new();
         for entry in entries {
@@ -1680,6 +1861,22 @@ impl ReplicatedKvNode {
         Ok(())
     }
 
+    /// Compacts the in-memory log around the already-applied state, keeping the
+    /// most recent `retain` committed entries so slightly-behind followers can be
+    /// replicated incrementally rather than via a full snapshot install. The store,
+    /// applied_index and commit_index are unchanged (this is local compaction, not
+    /// installing a received snapshot).
+    fn local_compact(&mut self, retain: u64) {
+        let snapshot_index = self.applied_index;
+        self.snapshot_term = self
+            .term_at(snapshot_index)
+            .unwrap_or(self.snapshot_term);
+        self.snapshot_index = snapshot_index;
+        let cutoff = snapshot_index.saturating_sub(retain);
+        self.log.retain(|entry| entry.index > cutoff);
+        self.txn_responses.retain(|index, _| *index > cutoff);
+    }
+
     fn install_snapshot(&mut self, snapshot: RaftSnapshot) {
         self.store = InProcessKvStore::restore(snapshot.kv);
         self.snapshot_index = snapshot.last_included_index;
@@ -1769,9 +1966,9 @@ impl DurableRaftKvNode {
             &paths.wal,
             discard_uncommitted_tail.then_some(committed_index),
         )?;
-        for entry in entries {
-            node.append_entries(vec![entry])?;
-        }
+        // Preserve the already-applied tail (kept by local_compact for incremental
+        // replication) instead of discarding it as append_entries would.
+        node.load_persisted_entries(entries)?;
         let commit_index = node.hard_state.commit_index.min(node.last_log_index());
         node.commit_to(commit_index)?;
         if truncated {
@@ -1993,7 +2190,10 @@ impl DurableRaftKvNode {
             kv: self.node.store.snapshot(),
         };
         write_object_file(&self.paths.snapshot, &snapshot)?;
-        self.node.install_snapshot(snapshot.clone());
+        // Local compaction keeps a tail of recent committed entries in memory for
+        // incremental replication; the snapshot file still records the full state at
+        // applied_index for cold recovery.
+        self.node.local_compact(RAFT_COMPACTION_RETAINED_ENTRIES);
         rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
         self.persist_hard_state()?;
         Ok(snapshot)
@@ -2582,6 +2782,88 @@ mod tests {
     }
 
     #[test]
+    fn materialized_cache_skips_rewrite_on_revision_only_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-durable-skip-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
+        let mut store = InProcessKvStore::new();
+        store.put("alpha", b"one".to_vec(), None).expect("seed");
+        assert!(
+            cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("initial write")
+        );
+
+        // Re-put the identical value: modify_revision/version advance and an event is
+        // appended, but the durable key/value state is unchanged -> no rewrite.
+        store.put("alpha", b"one".to_vec(), None).expect("re-put");
+        let snap = store.snapshot();
+        assert!(snap.revision.0 > 1, "revision should have advanced");
+        assert!(
+            !cache
+                .write_snapshot_if_changed(&snap)
+                .expect("durable-equal skip"),
+            "re-putting an identical value must not rewrite the snapshot"
+        );
+
+        // A real value change still rewrites.
+        store.put("alpha", b"two".to_vec(), None).expect("change");
+        assert!(
+            cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("changed write"),
+            "a real value change must rewrite the snapshot"
+        );
+        assert_eq!(cache.read_store().expect("read").get("alpha").expect("a").value, b"two");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn materialized_cache_compacts_event_history_to_configured_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-materialized-compact-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cache =
+            KvMaterializedCache::new(root.join("kv-cache.sobj")).with_max_materialized_events(4);
+        let mut store = InProcessKvStore::new();
+        for index in 0..20 {
+            store
+                .put(format!("k{index}"), vec![index as u8], None)
+                .expect("seed");
+        }
+        assert!(store.snapshot().events.len() > 4);
+        assert!(
+            cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("write cache")
+        );
+        let persisted = cache.read_snapshot().expect("read cache");
+        assert!(
+            persisted.events.len() <= 4,
+            "persisted event history should be compacted to the limit, got {}",
+            persisted.events.len()
+        );
+        // Entries are preserved even though the event tail is trimmed.
+        assert_eq!(persisted.entries.len(), 20);
+        // Re-writing the same store is a no-op (compaction is deterministic).
+        assert!(
+            !cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("skip unchanged")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn materialized_cache_does_not_replace_existing_raft_log() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-kv-cache-does-not-replace-log-{}",
@@ -3116,6 +3398,55 @@ mod tests {
         assert_eq!(node.store().get("/config/a").expect("a").value, b"one");
         assert_eq!(node.store().get("/config/b").expect("b").value, b"two");
         assert_eq!(node.hard_state().commit_index, 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_compaction_retains_log_tail_across_reopen() {
+        let root = temp_raft_root("sinomo-kv-retain-tail");
+        let node_id = NodeId::from_legacy_named("node_retain_tail").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let snapshot_index;
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
+            for index in 1..=400u64 {
+                let entry = node
+                    .append_local_command(
+                        1,
+                        KvCommand::Op(KvOp::Put {
+                            key: format!("/retain/{index:03}"),
+                            value: index.to_le_bytes().to_vec(),
+                            lease_id: None,
+                        }),
+                    )
+                    .expect("append");
+                node.commit_to(entry.index).expect("commit");
+            }
+            node.save_snapshot().expect("snapshot");
+            snapshot_index = node.snapshot_index();
+            assert_eq!(snapshot_index, 400);
+            // Compaction keeps a bounded committed tail rather than truncating to empty.
+            assert!(!node.log().is_empty());
+            assert!(node.log().len() <= 256);
+        }
+
+        // The critical property: reopening from disk reloads the tail (the daemon
+        // opens a fresh node per replication call), so incremental replication keeps
+        // working instead of falling back to a full snapshot every time.
+        let node = DurableRaftKvNode::open(node_id, paths).expect("reopen");
+        assert!(
+            !node.log().is_empty(),
+            "retained tail must survive reopen for incremental replication"
+        );
+        assert!(node.log().len() <= 256);
+        assert_eq!(node.snapshot_index(), snapshot_index);
+        // State is intact and not double-applied.
+        assert_eq!(node.applied_index(), 400);
+        assert_eq!(node.store().revision(), KvRevision(400));
+        assert_eq!(
+            node.store().get("/retain/400").expect("entry").value,
+            400u64.to_le_bytes().to_vec()
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

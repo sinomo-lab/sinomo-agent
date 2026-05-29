@@ -73,7 +73,7 @@ use sinomo_runtime::daemon::{
 };
 use sinomo_runtime::daemon::{
     ClusterDoctorFinding, DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart, IdleStatsSnapshot,
     DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, InstallLayout,
     InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus,
     RolloutActivationStrategy, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,

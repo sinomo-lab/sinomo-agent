@@ -1,5 +1,6 @@
 use crate::{
-    AuthenticatedDaemonCommand, DaemonError, DaemonPaths, DaemonSignerAuthority, send_daemon_rpc,
+    AuthenticatedDaemonCommand, DaemonError, DaemonPaths, DaemonSignerAuthority,
+    IdleStatsSnapshot, send_daemon_rpc,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,8 @@ pub struct DaemonStatus {
     #[serde(default = "daemon_package_version")]
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_arch: Option<String>,
@@ -254,6 +257,8 @@ pub struct DaemonStatus {
     pub lock_file: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<DaemonClusterStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_stats: Option<IdleStatsSnapshot>,
 }
 
 impl DaemonStatus {
@@ -268,6 +273,7 @@ impl DaemonStatus {
             port: options.port,
             address: daemon_connect_address(&options.host, options.port),
             version: daemon_package_version(),
+            commit: daemon_git_commit(),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
             executable: std::env::current_exe().ok(),
@@ -278,12 +284,22 @@ impl DaemonStatus {
             data_dir: paths.root.parent().unwrap_or(&paths.root).to_path_buf(),
             lock_file: paths.lock.clone(),
             cluster,
+            idle_stats: None,
         }
     }
 }
 
 pub fn daemon_package_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Short git commit the daemon binary was built from, embedded by build.rs.
+/// Returns None when the build had no git context (commit recorded as "unknown").
+pub fn daemon_git_commit() -> Option<String> {
+    match option_env!("SINOMO_GIT_COMMIT") {
+        Some(commit) if !commit.is_empty() && commit != "unknown" => Some(commit.to_string()),
+        _ => None,
+    }
 }
 
 pub fn daemon_connect_address(host: &str, port: u16) -> String {
@@ -357,6 +373,11 @@ pub fn cluster_node_status_from_daemon_status(
         process: cluster.process.clone(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: status.version.clone(),
+        // Use the subject daemon's own commit (carried in its DaemonStatus), not
+        // daemon_git_commit() of whatever binary is building this record — otherwise
+        // a CLI of a different build that refreshes KV would stamp the node with its
+        // own commit instead of the daemon's.
+        commit: status.commit.clone(),
         target_os: status.target_os.clone(),
         target_arch: status.target_arch.clone(),
         pid: Some(status.pid),
@@ -391,6 +412,7 @@ pub fn unknown_cluster_node_status(
             .unwrap_or_else(|| "unknown".to_string()),
         availability: ClusterNodeAvailability::Unknown,
         daemon_version: "unknown".to_string(),
+        commit: None,
         target_os: None,
         target_arch: None,
         pid: None,
@@ -522,10 +544,13 @@ impl Drop for DaemonLock {
 pub fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProbeStatus {
     let status = read_daemon_status(paths).ok();
     if let Some(status) = &status {
-        if probe_daemon_status_at_address(&status.address, timeout)
-            .is_some_and(|remote_status| daemon_status_matches_probe(status, &remote_status))
+        // Prefer the live status returned over the wire: it carries fields the
+        // on-disk snapshot never persists (e.g. idle_stats). Fall back to the
+        // on-disk status only for the liveness comparison.
+        if let Some(remote_status) = probe_daemon_status_at_address(&status.address, timeout)
+            && daemon_status_matches_probe(status, &remote_status)
         {
-            return DaemonProbeStatus::Running(status.clone());
+            return DaemonProbeStatus::Running(remote_status);
         }
     }
 

@@ -870,12 +870,12 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
     let rows = cluster_health_rows(&paths, &state)?;
     if rows.is_empty() {
         println!(
-            "node\tprocess\trole\tmember\thealth\tversion\tplatform\tpid\taddress\tlast-seen\trollout"
+            "node\tprocess\trole\tmember\thealth\tversion\tcommit\tplatform\tpid\taddress\tlast-seen\trollout"
         );
         return Ok(());
     }
     println!(
-        "node\tprocess\trole\tmember\thealth\tversion\tplatform\tpid\taddress\tlast-seen\trollout"
+        "node\tprocess\trole\tmember\thealth\tversion\tcommit\tplatform\tpid\taddress\tlast-seen\trollout"
     );
     for row in rows {
         let platform = match (&row.status.target_os, &row.status.target_arch) {
@@ -898,8 +898,13 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
             .as_ref()
             .map(format_rollout_status)
             .unwrap_or_else(|| "-".to_string());
+        let commit = row
+            .status
+            .commit
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "{}\t{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.member.node_id,
             row.status.process,
             format_node_role(&row.member.node_role),
@@ -907,6 +912,7 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
             format_member_state(&row.member.state),
             format_node_availability(&row.availability),
             row.status.daemon_version,
+            commit,
             platform,
             pid,
             address,

@@ -282,13 +282,19 @@ pub fn run_daemon_control_loop(
             })?;
     }
 
+    let idle_stats = Arc::new(crate::IdleStatsAtomics::new());
+    crate::install_process_idle_stats(idle_stats.clone());
+    crate::register_io_observer(idle_stats.clone());
+
     let maintenance_paths = paths.clone();
     let maintenance_options = options.clone();
     let maintenance_label = label.to_string();
+    let maintenance_idle_stats = idle_stats.clone();
     thread::Builder::new()
         .name(format!("sinomo-{label}-cluster"))
         .spawn(move || {
-            let mut cluster_network = ClusterNetworkMaintenance::new();
+            let mut cluster_network =
+                ClusterNetworkMaintenance::with_idle_stats(maintenance_idle_stats);
             let maintenance_started = std::time::Instant::now();
             let mut last_dfs_maintenance = maintenance_started
                 .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL)
@@ -3033,6 +3039,9 @@ fn daemon_status_response(paths: &DaemonPaths) -> Result<crate::DaemonStatus, Da
     ensure_daemon_status_cluster(paths, &mut status)?;
     if let Some(data_dir) = paths.root.parent() {
         status.rollout = read_rollout_status(&SelfRolloutPaths::new(data_dir))?;
+    }
+    if let Some(stats) = crate::process_idle_stats() {
+        status.idle_stats = Some(stats.snapshot());
     }
     Ok(status)
 }

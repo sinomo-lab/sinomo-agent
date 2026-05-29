@@ -4,6 +4,7 @@ mod cluster;
 mod control;
 mod dfs;
 mod error;
+mod idle_stats;
 mod install;
 mod paths;
 mod process;
@@ -36,6 +37,7 @@ pub use cluster::{
     CLUSTER_HEALTH_PROBE_TIMEOUT, CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterConnectivityProbeState,
     ClusterDoctorFinding, ClusterHealthRow, ClusterJoinReconciliation, ClusterMemberRemoval,
     ClusterNetworkMaintenance, ClusterNodeRoleUpdate, ClusterRaftRoleUpdate,
+    NodeStatusPublishOutcome,
     DAEMON_CLUSTER_DISCOVERY_INTERVAL, DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,
     DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT, DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL,
     DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_RPC_TIMEOUT, DAEMON_CLUSTER_TICK_INTERVAL,
@@ -91,6 +93,10 @@ pub use dfs::{
     run_daemon_dfs_maintenance_tick, run_daemon_dfs_smoke,
 };
 pub use error::DaemonError;
+pub use idle_stats::{
+    IdleStatsAtomics, IdleStatsSnapshot, install_process_idle_stats, process_idle_stats,
+    register_io_observer,
+};
 pub use install::{
     DaemonStopBeforeInstallStart, DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus,
     INSTALL_MAIN_BOOT_NAME, INSTALL_SHADOW_BOOT_NAME, InstallLayout, InstalledDaemonInstallPlan,
@@ -146,7 +152,7 @@ pub use status::{
     daemon_advertised_endpoints_for_state, daemon_advertised_endpoints_from_ips,
     daemon_bind_address, daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
     daemon_cluster_registration, daemon_cluster_status, daemon_cluster_status_matches,
-    daemon_connect_address, daemon_options_from_status, daemon_package_version,
+    daemon_connect_address, daemon_git_commit, daemon_options_from_status, daemon_package_version,
     daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
     daemon_status_matches_probe, default_main_daemon_status, ensure_daemon_cluster_members,
     invite_introducers_from_daemon_status, probe_daemon_status, probe_daemon_status_at_address,

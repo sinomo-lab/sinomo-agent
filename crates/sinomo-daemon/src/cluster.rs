@@ -1,7 +1,7 @@
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterRegistration, DaemonClusterStatus, DaemonError,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, SINOMO_DAEMON_DEFAULT_HOST,
-    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, IdleStatsAtomics,
+    SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
     authenticated_signer_matches_cluster_node, cluster_node_status_from_daemon_status,
     current_shadow_daemon_options, daemon_cluster_options_from_status,
     daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
@@ -46,7 +46,7 @@ use sinomo_rollout::{
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -561,6 +561,16 @@ pub fn advertise_daemon_iroh_endpoint(
     Ok(())
 }
 
+/// True when the cluster has at least one member that is not this node's own
+/// main/shadow process and has not been removed. Used to short-circuit periodic
+/// publishes/probes on a solo node, where they would have no audience.
+pub fn cluster_has_remote_peers(state: &ClusterBootstrapState) -> bool {
+    state.members.iter().any(|member| {
+        !matches!(member.state, ClusterMemberState::Removed)
+            && !sinomo_network::cluster_member_is_local_process(state, member)
+    })
+}
+
 pub fn refresh_local_iroh_endpoints_from_disk(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
@@ -957,6 +967,7 @@ pub struct ClusterNetworkMaintenance {
     pub last_publish: Instant,
     pub last_discovery: Instant,
     pub last_probe: Instant,
+    pub idle_stats: Arc<IdleStatsAtomics>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -966,6 +977,10 @@ pub struct ClusterConnectivityProbeState {
 
 impl ClusterNetworkMaintenance {
     pub fn new() -> Self {
+        Self::with_idle_stats(Arc::new(IdleStatsAtomics::new()))
+    }
+
+    pub fn with_idle_stats(idle_stats: Arc<IdleStatsAtomics>) -> Self {
         let now = Instant::now();
         Self {
             discovery: MdnsDiscoverySocket::bind_default().ok(),
@@ -978,6 +993,7 @@ impl ClusterNetworkMaintenance {
             last_publish: now,
             last_discovery: now,
             last_probe: now,
+            idle_stats,
         }
     }
 
@@ -987,6 +1003,7 @@ impl ClusterNetworkMaintenance {
         options: &DaemonRunOptions,
     ) -> Result<(), DaemonError> {
         self.tick = self.tick.saturating_add(1);
+        self.idle_stats.incr_ticks_total();
         let now = Instant::now();
         let publish_due = now.duration_since(self.last_publish) >= DAEMON_CLUSTER_PUBLISH_INTERVAL;
         let probe_due =
@@ -996,6 +1013,7 @@ impl ClusterNetworkMaintenance {
         if !(publish_due || probe_due || discovery_due) {
             return Ok(());
         }
+        self.idle_stats.incr_ticks_with_work();
 
         let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
             path: paths.root.display().to_string(),
@@ -1006,6 +1024,7 @@ impl ClusterNetworkMaintenance {
             return Ok(());
         }
 
+        self.idle_stats.incr_disk_reads_cluster_state();
         let mut state = if publish_due || probe_due {
             sinomo_network::read_cluster_state(&cluster_paths)?
         } else {
@@ -1034,6 +1053,7 @@ impl ClusterNetworkMaintenance {
             assign_local_node_public_keys(&cluster_paths, &mut state)?;
             local_state_changed |=
                 !sinomo_network::cluster_bootstrap_state_stable_eq(&state_before_keys, &state);
+            self.idle_stats.incr_disk_reads_iroh_endpoints();
             local_state_changed |=
                 refresh_local_iroh_endpoints_from_disk(&cluster_paths, &mut state)?;
             if local_state_changed {
@@ -1041,10 +1061,23 @@ impl ClusterNetworkMaintenance {
             }
         }
 
+        // When the cluster has no remote peers (every member is this node's own
+        // main/shadow process) and we are not mid-join, the periodic publishes and
+        // connectivity probes have no audience: they only exist so *other* nodes can
+        // read our liveness/endpoints. Skip them — this removes the node-status
+        // heartbeat that otherwise rewrites the whole KV snapshot every cycle. The
+        // timers are still advanced so we re-evaluate (cheaply) once per interval,
+        // and a peer joining via the join RPC adds a member, which flips this gate
+        // and resumes publishing on the next tick.
+        let cluster_is_solo = !cluster_has_remote_peers(&state)
+            && !sinomo_network::cluster_state_needs_join_registration(&state);
+
         if publish_due {
             self.last_publish = now;
             let mut publish_failed = false;
-            if sinomo_network::cluster_raft_local_is_voter(&state) {
+            if cluster_is_solo {
+                // no-op: nothing to publish to absent peers
+            } else if sinomo_network::cluster_raft_local_is_voter(&state) {
                 if let Err(error) = ensure_default_distributed_dfs(paths, options, true) {
                     eprintln!("sinomo daemon distributed DFS control publish failed: {error}");
                     publish_failed = true;
@@ -1058,44 +1091,52 @@ impl ClusterNetworkMaintenance {
                         publish_failed = true;
                     }
                 }
+                self.idle_stats.incr_kv_publish_member();
                 if let Err(error) =
                     publish_local_members_to_quorum_if_needed(&cluster_paths, &state)
                 {
                     eprintln!("sinomo daemon cluster member publish failed: {error}");
                     publish_failed = true;
                 }
-                let local_network_info = sinomo_network::build_cluster_network_info_record(
-                    &state,
-                    &state.local_node_id,
-                    time::OffsetDateTime::now_utc(),
-                    CLUSTER_NETWORK_INFO_TTL_SECONDS,
-                );
+                // Track environment changes for connectivity-cache invalidation.
+                // The network-info record itself is published (with dedup) by
+                // refresh_daemon_node_status_in_kv below, so we do not write it
+                // here — a second unconditional write was pure churn that rewrote
+                // the KV snapshot every publish cycle even when nothing changed.
+                let local_environment_id =
+                    sinomo_network::build_cluster_network_info_record(
+                        &state,
+                        &state.local_node_id,
+                        time::OffsetDateTime::now_utc(),
+                        CLUSTER_NETWORK_INFO_TTL_SECONDS,
+                    )
+                    .environment_id;
                 if self
                     .environment_id
                     .as_ref()
-                    .is_some_and(|known| known != &local_network_info.environment_id)
+                    .is_some_and(|known| known != &local_environment_id)
                 {
                     self.connectivity.clear();
                 }
-                self.environment_id = Some(local_network_info.environment_id.clone());
-                if let Err(error) =
-                    sync_cluster_network_info_to_kv(&cluster_paths, local_network_info)
-                {
-                    eprintln!("sinomo daemon network info publish failed: {error}");
-                    publish_failed = true;
-                }
-                if let Err(error) = refresh_daemon_node_status_in_kv(paths) {
-                    eprintln!("sinomo daemon node status publish failed: {error}");
-                    publish_failed = true;
+                self.environment_id = Some(local_environment_id);
+                match refresh_daemon_node_status_in_kv(paths) {
+                    Ok(published) => self.record_node_status_publish(&published),
+                    Err(error) => {
+                        eprintln!("sinomo daemon node status publish failed: {error}");
+                        publish_failed = true;
+                    }
                 }
                 let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
                 if matches!(
                     probe_daemon_status(&shadow_paths, DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT),
                     DaemonProbeStatus::Running(_)
                 ) {
-                    if let Err(error) = refresh_daemon_node_status_in_kv(&shadow_paths) {
-                        eprintln!("sinomo daemon shadow status publish failed: {error}");
-                        publish_failed = true;
+                    match refresh_daemon_node_status_in_kv(&shadow_paths) {
+                        Ok(published) => self.record_node_status_publish(&published),
+                        Err(error) => {
+                            eprintln!("sinomo daemon shadow status publish failed: {error}");
+                            publish_failed = true;
+                        }
                     }
                 }
                 if daemon_paths_are_shadow(paths)
@@ -1105,6 +1146,7 @@ impl ClusterNetworkMaintenance {
                     eprintln!("sinomo daemon desired rollout reconcile failed: {error}");
                 }
             } else if !sinomo_network::cluster_raft_local_is_voter(&state) {
+                self.idle_stats.incr_kv_publish_member();
                 if let Err(error) = publish_local_members_via_voter(&cluster_paths, &state) {
                     eprintln!("sinomo daemon cluster member publish via voter failed: {error}");
                     publish_failed = true;
@@ -1119,12 +1161,26 @@ impl ClusterNetworkMaintenance {
 
         if probe_due {
             self.last_probe = now;
-            let records = self.probe_connectivity(&cluster_paths, &state);
-            let _ = sync_cluster_connectivity_records_to_kv(
-                &cluster_paths,
-                &state.local_node_id,
-                records,
-            );
+            if !cluster_is_solo {
+                let records = self.probe_connectivity(&cluster_paths, &state);
+                // Skip the raft append when connectivity is unchanged — otherwise every
+                // probe cycle re-puts identical records (with fresh timestamps) and
+                // rewrites the KV snapshot even on a fully idle cluster.
+                let unchanged = sinomo_network::cluster_connectivity_sync_is_noop(
+                    &cluster_paths,
+                    &state.local_node_id,
+                    &records,
+                )
+                .unwrap_or(false);
+                if !unchanged {
+                    self.idle_stats.incr_kv_publish_connectivity();
+                    let _ = sync_cluster_connectivity_records_to_kv(
+                        &cluster_paths,
+                        &state.local_node_id,
+                        records,
+                    );
+                }
+            }
         }
 
         if discovered
@@ -1225,6 +1281,15 @@ impl ClusterNetworkMaintenance {
         Ok(())
     }
 
+    fn record_node_status_publish(&self, outcome: &NodeStatusPublishOutcome) {
+        if outcome.network_info_published {
+            self.idle_stats.incr_kv_publish_network_info();
+        }
+        if outcome.node_status_published {
+            self.idle_stats.incr_kv_publish_node_status();
+        }
+    }
+
     fn process_discovery(&mut self, state: &mut ClusterBootstrapState) -> bool {
         let Some(discovery) = &self.discovery else {
             return false;
@@ -1232,6 +1297,8 @@ impl ClusterNetworkMaintenance {
         let Ok(advertisements) = discovery.drain() else {
             return false;
         };
+        self.idle_stats
+            .add_mdns_announces_recv(advertisements.len() as u64);
         let mut changed = false;
         for advertisement in advertisements {
             if advertisement.cluster_id != state.cluster_id
@@ -1287,6 +1354,7 @@ impl ClusterNetworkMaintenance {
             endpoints,
             self.tick,
         );
+        self.idle_stats.incr_mdns_announces_sent();
         let _ = discovery.announce(&advertisement);
     }
 
@@ -1351,6 +1419,8 @@ impl ClusterNetworkMaintenance {
         } else {
             (probe_start + probe_count) % probe_targets.len()
         };
+        self.idle_stats
+            .add_connectivity_probes_sent(probe_count as u64);
         for endpoint in probe_targets
             .iter()
             .cycle()
@@ -1431,13 +1501,21 @@ impl ClusterNetworkMaintenance {
     }
 }
 
+/// Records which of the two heartbeat records `refresh_daemon_node_status_in_kv`
+/// actually wrote to cluster KV, so callers can account real publishes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeStatusPublishOutcome {
+    pub network_info_published: bool,
+    pub node_status_published: bool,
+}
+
 pub fn refresh_daemon_node_status_in_kv(
     paths: &DaemonPaths,
-) -> Result<Option<KvSnapshot>, DaemonError> {
+) -> Result<NodeStatusPublishOutcome, DaemonError> {
     let mut status = read_daemon_status(paths)?;
     ensure_daemon_status_cluster(paths, &mut status)?;
     let Some(cluster) = status.cluster.as_ref() else {
-        return Ok(None);
+        return Ok(NodeStatusPublishOutcome::default());
     };
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
@@ -1465,13 +1543,28 @@ pub fn refresh_daemon_node_status_in_kv(
         sinomo_network::stored_cluster_node_status_matches(&cluster_paths, &record)
             .unwrap_or(false);
     if network_info_matches && node_status_matches {
-        return Ok(None);
+        return Ok(NodeStatusPublishOutcome::default());
     }
     if !cluster_has_local_quorum(&cluster_paths, &state) {
-        return Ok(None);
+        return Ok(NodeStatusPublishOutcome::default());
     }
-    let _ = sync_cluster_network_info_to_kv(&cluster_paths, network_info);
-    sync_cluster_node_status_to_kv(&cluster_paths, record)
+    // Publish each record independently so the slow-changing network-info record
+    // is not rewritten on every node-status heartbeat. Node status refreshes on a
+    // ~60s margin; network info on a ~9min margin. Bundling them rewrote the KV
+    // snapshot far more often than necessary.
+    let mut outcome = NodeStatusPublishOutcome::default();
+    if !network_info_matches {
+        if let Err(error) = sync_cluster_network_info_to_kv(&cluster_paths, network_info) {
+            eprintln!("sinomo daemon network info publish failed: {error}");
+        } else {
+            outcome.network_info_published = true;
+        }
+    }
+    if !node_status_matches {
+        sync_cluster_node_status_to_kv(&cluster_paths, record)?;
+        outcome.node_status_published = true;
+    }
+    Ok(outcome)
 }
 
 pub fn ensure_daemon_status_cluster(
@@ -1568,12 +1661,14 @@ pub fn sync_cluster_state_to_kv(
     assign_local_node_public_keys(paths, &mut keyed_state)?;
     refresh_local_iroh_endpoints_from_disk(paths, &mut keyed_state)?;
     sinomo_network::cleanup_cluster_iroh_endpoints(&mut keyed_state);
+    let txn = sinomo_network::cluster_state_sync_txn(paths, &keyed_state)?;
+    if txn.success.is_empty() {
+        // Cluster KV already reflects this state; skip the commit so we don't bump
+        // the KV revision and rewrite the materialized snapshot for no reason.
+        return Ok(sinomo_network::read_cluster_kv_snapshot(paths)?);
+    }
     let mut commit_state = keyed_state.clone();
-    commit_cluster_kv_txn_with_quorum(
-        paths,
-        &mut commit_state,
-        sinomo_network::cluster_state_sync_txn(paths, &keyed_state)?,
-    )
+    commit_cluster_kv_txn_with_quorum(paths, &mut commit_state, txn)
 }
 
 pub fn read_local_cluster_state(
@@ -3066,6 +3161,9 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
             )?
         };
         let attempt_timeout = cluster_raft_append_attempt_timeout(endpoint, remaining, &request);
+        if let Some(stats) = crate::process_idle_stats() {
+            stats.incr_raft_appends_sent();
+        }
         let response = send_cluster_raft_append(endpoint, &request, attempt_timeout)?;
         if response.accepted {
             return Ok(response);
@@ -3136,6 +3234,9 @@ pub fn handle_daemon_cluster_raft_append_request(
     request: ClusterRaftAppendRequest,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<ClusterRaftAppendResponse, DaemonError> {
+    if let Some(stats) = crate::process_idle_stats() {
+        stats.incr_raft_appends_recv();
+    }
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let mut state = sinomo_network::read_cluster_state(&cluster_paths)?;
     let _raft_guard = lock_cluster_raft_operation()?;
@@ -3477,6 +3578,48 @@ mod tests {
     }
 
     #[test]
+    fn cluster_has_remote_peers_treats_main_and_shadow_as_solo() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_solo_check").expect("cluster");
+        let local = NodeId::from_legacy_named("node_solo_check_main").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "solo check",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        // Only the local main member: solo.
+        assert!(!cluster_has_remote_peers(&state));
+
+        // Adding this node's own shadow process is still solo.
+        let shadow = sinomo_node::shadow_daemon_node_id(&local);
+        state.members.push(ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            shadow,
+            "local shadow",
+            "pk-shadow",
+            now,
+        ));
+        assert!(
+            !cluster_has_remote_peers(&state),
+            "main + shadow on one node must count as solo"
+        );
+
+        // A genuine remote member flips the gate.
+        let remote = NodeId::from_legacy_named("node_solo_check_remote").expect("remote");
+        state.members.push(ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote,
+            "remote",
+            "pk-remote",
+            now,
+        ));
+        assert!(cluster_has_remote_peers(&state));
+    }
+
+    #[test]
     fn cluster_kv_commit_waits_for_local_raft_operation_lock() {
         let root = unique_cluster_test_root("sinomo-daemon-raft-local-lock-wait");
         let data_dir = SinomoDataDir::new(root.join("data"));
@@ -3769,6 +3912,7 @@ mod tests {
             process: crate::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
             availability: ClusterNodeAvailability::Online,
             daemon_version: "0.1.0-test".to_string(),
+            commit: None,
             target_os: Some("test-os".to_string()),
             target_arch: Some("test-arch".to_string()),
             pid: Some(42),
@@ -3872,6 +4016,7 @@ mod tests {
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
+            idle_stats: Arc::new(IdleStatsAtomics::new()),
         };
 
         let records = maintenance.probe_connectivity(&paths, &state);
@@ -4204,6 +4349,7 @@ mod tests {
                 process: "daemon-main".to_string(),
                 availability: ClusterNodeAvailability::Online,
                 daemon_version: "0.1.0-test".to_string(),
+                commit: None,
                 target_os: Some("test-os".to_string()),
                 target_arch: Some("test-arch".to_string()),
                 pid: Some(42),

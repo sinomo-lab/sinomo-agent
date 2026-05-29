@@ -7,6 +7,7 @@ use crate::{
 };
 use sinomo_kv::cluster_member_key;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
@@ -17,6 +18,41 @@ const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 pub const CLUSTER_NODE_STATUS_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Receives notifications about disk and network I/O performed by the network
+/// layer: object-file and KV-snapshot writes (op counts), the byte volume of
+/// those reads/writes, and the byte volume of framed RPC traffic. Used by
+/// sinomo-daemon to feed idle-stats counters. All methods default to no-ops so
+/// implementors opt into only the signals they care about.
+pub trait IoObserver: Send + Sync {
+    /// Bytes read from disk (object-file reads, including the read-compare in
+    /// `write_object_file`).
+    fn on_disk_read(&self, _bytes: u64) {}
+    /// Bytes written to disk (object-file and KV-snapshot writes).
+    fn on_disk_write(&self, _bytes: u64) {}
+    fn on_object_file_actual_write(&self) {}
+    fn on_object_file_skipped_write(&self) {}
+    fn on_kv_snapshot_actual_write(&self) {}
+    fn on_kv_snapshot_skipped_write(&self) {}
+    /// Bytes sent over a framed RPC stream (4-byte length prefix + body).
+    fn on_net_sent(&self, _bytes: u64) {}
+    /// Bytes received over a framed RPC stream (4-byte length prefix + body).
+    fn on_net_recv(&self, _bytes: u64) {}
+}
+
+static IO_OBSERVER: Mutex<Option<Arc<dyn IoObserver>>> = Mutex::new(None);
+
+/// Install a process-wide I/O observer. The daemon installs exactly one
+/// observer at startup; tests may swap in their own. The previous observer is
+/// returned so callers can restore it after a scoped change.
+pub fn set_io_observer(observer: Option<Arc<dyn IoObserver>>) -> Option<Arc<dyn IoObserver>> {
+    let mut guard = IO_OBSERVER.lock().ok()?;
+    std::mem::replace(&mut *guard, observer)
+}
+
+pub(crate) fn io_observer() -> Option<Arc<dyn IoObserver>> {
+    IO_OBSERVER.lock().ok().and_then(|guard| guard.clone())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterPaths {
@@ -861,9 +897,22 @@ pub fn write_cluster_kv_snapshot_if_changed(
     snapshot: &KvSnapshot,
 ) -> Result<bool, NetworkError> {
     let snapshot = compact_cluster_kv_snapshot_events(snapshot);
-    cluster_kv_local_cache(paths)
+    let wrote = cluster_kv_local_cache(paths)
         .write_snapshot_if_changed(&snapshot)
-        .map_err(Into::into)
+        .map_err(NetworkError::from)?;
+    if let Some(observer) = io_observer() {
+        if wrote {
+            observer.on_kv_snapshot_actual_write();
+            // The snapshot is written inside sinomo-kv, so account its on-disk
+            // byte size with a single stat after a confirmed write.
+            if let Ok(metadata) = fs::metadata(&paths.kv_snapshot) {
+                observer.on_disk_write(metadata.len());
+            }
+        } else {
+            observer.on_kv_snapshot_skipped_write();
+        }
+    }
+    Ok(wrote)
 }
 
 fn compact_cluster_kv_snapshot_events(snapshot: &KvSnapshot) -> KvSnapshot {
@@ -932,6 +981,7 @@ pub fn read_cluster_kv_snapshot_store(
 
 fn cluster_kv_local_cache(paths: &ClusterPaths) -> KvLocalCache {
     KvLocalCache::new(paths.kv_snapshot.clone(), paths.kv_raft.clone())
+        .with_max_materialized_events(MAX_CLUSTER_KV_MATERIALIZED_EVENTS)
 }
 
 fn read_cluster_kv_reader_node_id(paths: &ClusterPaths) -> Result<NodeId, NetworkError> {
@@ -1720,64 +1770,140 @@ pub fn sync_cluster_state_to_local_raft_unchecked(
     Ok(snapshot)
 }
 
+/// Compares two cluster identity records ignoring volatile bookkeeping fields
+/// (`kv_revision`, `updated_at`) that change on every publish without reflecting
+/// a real configuration change.
+pub fn cluster_identity_record_stable_eq(
+    left: &ClusterIdentityRecord,
+    right: &ClusterIdentityRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.cluster_name == right.cluster_name
+        && left.local_node_id == right.local_node_id
+        && left.local_node_display_name == right.local_node_display_name
+        && left.term == right.term
+        && left.initialized_at == right.initialized_at
+}
+
+/// Compares two raft config records ignoring volatile bookkeeping fields
+/// (`kv_revision`, `updated_at`).
+pub fn cluster_raft_config_record_stable_eq(
+    left: &ClusterRaftConfigRecord,
+    right: &ClusterRaftConfigRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.term == right.term
+        && left.voters == right.voters
+        && left.learners == right.learners
+        && left.non_voting == right.non_voting
+}
+
 pub fn cluster_state_sync_txn(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvTxn, NetworkError> {
     let mut state = state.clone();
     cleanup_cluster_iroh_endpoints(&mut state);
+    let store = read_cluster_kv_store(paths)?;
     let new_config = ClusterRaftConfigRecord::from(&state);
-    let current_config_entry = read_cluster_kv_store(paths)?
-        .get(&cluster_raft_config_key())
-        .cloned();
+    let current_config_entry = store.get(&cluster_raft_config_key()).cloned();
     let mut compares = Vec::new();
-    if let Some(current_config_entry) = current_config_entry {
+    if let Some(current_config_entry) = &current_config_entry {
         let current_config: ClusterRaftConfigRecord = current_config_entry.decode()?;
         validate_raft_config_transition(&current_config, &new_config)?;
         compares.push(KvCompare::ValueEquals {
             key: cluster_raft_config_key(),
-            value: current_config_entry.value,
+            value: current_config_entry.value.clone(),
         });
     } else {
         compares.push(KvCompare::Missing {
             key: cluster_raft_config_key(),
         });
     }
-    let mut success = vec![
-        KvOp::put_serde(
-            cluster_identity_key(),
-            &ClusterIdentityRecord::from(&state),
-            None,
-        )?,
-        KvOp::put_serde(cluster_raft_config_key(), &new_config, None)?,
-    ];
+
+    // Only emit a put when it would actually change stored KV. Re-publishing
+    // semantically-identical state otherwise rewrites identity/raft-config every
+    // cycle (their `updated_at`/`kv_revision` fields differ) and re-puts unchanged
+    // member/endpoint records, each bumping the KV revision and rewriting the whole
+    // materialized snapshot. Dedup so an unchanged state produces an empty txn.
+    let mut success = Vec::new();
+
+    let new_identity = ClusterIdentityRecord::from(&state);
+    let identity_unchanged = store
+        .get(&cluster_identity_key())
+        .and_then(|entry| entry.decode::<ClusterIdentityRecord>().ok())
+        .is_some_and(|stored| cluster_identity_record_stable_eq(&stored, &new_identity));
+    if !identity_unchanged {
+        success.push(KvOp::put_serde(cluster_identity_key(), &new_identity, None)?);
+    }
+
+    let config_unchanged = current_config_entry
+        .as_ref()
+        .and_then(|entry| entry.decode::<ClusterRaftConfigRecord>().ok())
+        .is_some_and(|stored| cluster_raft_config_record_stable_eq(&stored, &new_config));
+    if !config_unchanged {
+        success.push(KvOp::put_serde(cluster_raft_config_key(), &new_config, None)?);
+    }
+
     for member in &state.members {
-        success.push(KvOp::put_serde(
-            cluster_member_key(&member.node_id),
-            member,
-            None,
-        )?);
-        success.push(KvOp::put_serde(
+        let member_op = KvOp::put_serde(cluster_member_key(&member.node_id), member, None)?;
+        if kv_put_changes_store(&store, &member_op) {
+            success.push(member_op);
+        }
+        let policy_op = KvOp::put_serde(
             cluster_capability_policy_key(&member.node_id),
             &ClusterCapabilityPolicyRecord::from(member),
             None,
-        )?);
-        success.push(KvOp::DeletePrefix {
-            prefix: cluster_endpoint_prefix(&member.node_id),
-        });
-        for endpoint in &member.endpoints {
-            success.push(KvOp::put_serde(
-                cluster_endpoint_key(&member.node_id, endpoint),
-                endpoint,
-                None,
-            )?);
+        )?;
+        if kv_put_changes_store(&store, &policy_op) {
+            success.push(policy_op);
         }
+
+        // Endpoints use delete-prefix + re-put; only do so when the stored set differs.
+        let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
+        let stored_endpoints: BTreeMap<String, Vec<u8>> = store
+            .range_prefix(&endpoint_prefix)
+            .into_iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect();
+        let mut desired_endpoints: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for endpoint in &member.endpoints {
+            let key = cluster_endpoint_key(&member.node_id, endpoint);
+            desired_endpoints.insert(key, SinomoObjectCodec::default().encode(endpoint)?);
+        }
+        if stored_endpoints != desired_endpoints {
+            success.push(KvOp::DeletePrefix {
+                prefix: endpoint_prefix,
+            });
+            for (key, value) in desired_endpoints {
+                success.push(KvOp::Put {
+                    key,
+                    value,
+                    lease_id: None,
+                });
+            }
+        }
+    }
+
+    // Nothing changed: return an empty txn so callers can skip committing.
+    if success.is_empty() {
+        compares.clear();
     }
     Ok(KvTxn {
         compares,
         success,
         failure: Vec::new(),
     })
+}
+
+/// True when applying `op` (a Put) would change the stored value for its key.
+fn kv_put_changes_store(store: &InProcessKvStore, op: &KvOp) -> bool {
+    match op {
+        KvOp::Put { key, value, .. } => {
+            store.get(key).map(|entry| &entry.value != value).unwrap_or(true)
+        }
+        _ => true,
+    }
 }
 
 pub fn validate_raft_config_transition(
@@ -1854,12 +1980,30 @@ pub fn build_cluster_raft_append_request_from_next_index(
 ) -> Result<ClusterRaftAppendRequest, NetworkError> {
     let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
     let prev_log_index = next_index.saturating_sub(1).min(node.last_log_index());
-    let include_snapshot = node.snapshot_index() > 0 && prev_log_index < node.snapshot_index();
+    // Send a full snapshot only when we cannot serve the follower incrementally:
+    // the entry at `prev_log_index` is neither the snapshot boundary nor still in
+    // the retained log tail. Keeping a committed-log tail (see RAFT_COMPACTION_-
+    // RETAINED_ENTRIES) lets slightly-behind followers catch up with small appends
+    // instead of a ~hundreds-of-KiB snapshot install on every replication round.
+    let earliest_log_index = node.log().first().map(|entry| entry.index);
+    let prev_log_resolvable = prev_log_index == node.snapshot_index()
+        || earliest_log_index.is_some_and(|first| prev_log_index >= first);
+    let include_snapshot = node.snapshot_index() > 0 && !prev_log_resolvable;
     let (snapshot, prev_log_index, entries) = if include_snapshot {
+        // The live store retains up to MAX_RETAINED_EVENTS (thousands) of watch
+        // events. Shipping all of them in every snapshot install bloats the append
+        // to hundreds of KiB. Compact the event tail to the same bound the raft node
+        // uses for its own saved snapshots — entries/leases/revision are unchanged,
+        // only the best-effort watch-replay tail is trimmed.
+        let mut kv = node.store().snapshot();
+        sinomo_kv::compact_kv_snapshot_event_history(
+            &mut kv,
+            MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+        );
         let snapshot = RaftSnapshot {
             last_included_index: node.applied_index(),
             last_included_term: node.term_at(node.applied_index()).unwrap_or(1),
-            kv: node.store().snapshot(),
+            kv,
         };
         let entries = node
             .log()
@@ -2682,6 +2826,7 @@ pub fn cluster_node_status_stable_eq(
         && left.process == right.process
         && left.availability == right.availability
         && left.daemon_version == right.daemon_version
+        && left.commit == right.commit
         && left.target_os == right.target_os
         && left.target_arch == right.target_arch
         && left.address == right.address
@@ -2770,6 +2915,36 @@ pub fn cluster_connectivity_sync_ops(
         ops.push(KvOp::put_serde(key, record, None)?);
     }
     Ok(ops)
+}
+
+/// Returns true when publishing `records` for `source_node_id` would not change
+/// cluster KV: no records need adding/refreshing and none need deleting. Lets the
+/// caller skip the raft append (and its disk churn) when connectivity is stable.
+pub fn cluster_connectivity_sync_is_noop(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<bool, NetworkError> {
+    let incoming_keys: BTreeSet<String> = records
+        .iter()
+        .map(|record| {
+            cluster_connectivity_key(
+                &record.source_node_id,
+                &record.target_node_id,
+                &record.endpoint_id,
+            )
+        })
+        .collect();
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    // A stored record no longer present in `records` would need deletion.
+    for entry in store.range_prefix(&cluster_connectivity_source_prefix(source_node_id)) {
+        if !incoming_keys.contains(&entry.key) {
+            return Ok(false);
+        }
+    }
+    // Any incoming record that differs from what is stored (or is due for a TTL
+    // refresh) would need a put.
+    Ok(cluster_connectivity_sync_ops(paths, source_node_id, records)?.is_empty())
 }
 
 pub fn expire_cluster_network_record_ops(
@@ -3467,6 +3642,9 @@ pub(crate) fn read_object_file<T: serde::de::DeserializeOwned>(
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    if let Some(observer) = io_observer() {
+        observer.on_disk_read(bytes.len() as u64);
+    }
     SinomoObjectCodec::default().decode(&bytes)
 }
 
@@ -3481,7 +3659,15 @@ pub(crate) fn write_object_file<T: Serialize>(
         })?;
     }
     let desired = SinomoObjectCodec::default().encode(value)?;
-    if fs::read(path).is_ok_and(|existing| existing == desired) {
+    let existing = fs::read(path).ok();
+    if let (Some(observer), Some(existing)) = (io_observer(), existing.as_ref()) {
+        // The read-compare below is a real disk read regardless of outcome.
+        observer.on_disk_read(existing.len() as u64);
+    }
+    if existing.is_some_and(|existing| existing == desired) {
+        if let Some(observer) = io_observer() {
+            observer.on_object_file_skipped_write();
+        }
         return Ok(());
     }
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -3515,7 +3701,12 @@ pub(crate) fn write_object_file<T: Serialize>(
         })?;
     }
     replace_file(&temp_path, path)?;
-    sync_directory(parent)
+    sync_directory(parent)?;
+    if let Some(observer) = io_observer() {
+        observer.on_object_file_actual_write();
+        observer.on_disk_write(desired.len() as u64);
+    }
+    Ok(())
 }
 
 fn replace_file(temp_path: &std::path::Path, path: &std::path::Path) -> Result<(), NetworkError> {

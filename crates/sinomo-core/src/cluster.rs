@@ -164,6 +164,11 @@ pub struct ClusterNodeStatusRecord {
     pub process: String,
     pub availability: ClusterNodeAvailability,
     pub daemon_version: String,
+    /// Short git commit the daemon binary was built from. Lets nodes be told apart
+    /// when the package version (e.g. 0.1.0) is not bumped per build. Absent for
+    /// nodes running older builds that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

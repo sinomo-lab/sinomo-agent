@@ -231,7 +231,11 @@ where
         .map_err(|source| NetworkError::Io {
             operation: "write object frame".to_string(),
             detail: source.to_string(),
-        })
+        })?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_sent(4 + bytes.len() as u64);
+    }
+    Ok(())
 }
 
 pub fn read_object_frame_blocking<R, T>(reader: &mut R, max_bytes: usize) -> Result<T, NetworkError>
@@ -260,6 +264,9 @@ where
             operation: "read object frame body".to_string(),
             detail: source.to_string(),
         })?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_recv(4 + bytes.len() as u64);
+    }
     SinomoObjectCodec::default().decode(&bytes)
 }
 
@@ -286,7 +293,11 @@ where
         .map_err(|source| NetworkError::Io {
             operation: "write async object frame".to_string(),
             detail: source.to_string(),
-        })
+        })?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_sent(4 + bytes.len() as u64);
+    }
+    Ok(())
 }
 
 pub async fn read_object_frame_async<R, T>(
@@ -320,5 +331,8 @@ where
             operation: "read async object frame body".to_string(),
             detail: source.to_string(),
         })?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_recv(4 + bytes.len() as u64);
+    }
     SinomoObjectCodec::default().decode(&bytes)
 }

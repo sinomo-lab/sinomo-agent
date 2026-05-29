@@ -324,6 +324,9 @@ pub(crate) fn print_daemon_status_with_paths(
             println!("sinomo {label} is running");
             println!("  pid: {}", status.pid);
             println!("  version: {}", status.version);
+            if let Some(commit) = &status.commit {
+                println!("  commit: {commit}");
+            }
             println!("  bind: {}", daemon_bind_address(&status));
             println!("  control address: {}", status.address);
             print_daemon_platform(&status);
@@ -344,6 +347,9 @@ pub(crate) fn print_daemon_status_with_paths(
                 );
                 print_local_daemon_iroh_endpoint(&paths, &status);
             }
+            if let Some(stats) = &status.idle_stats {
+                print_daemon_idle_stats(stats);
+            }
             println!("  lock: {}", status.lock_file.display());
             println!("  status: {}", paths.status.display());
             Ok(())
@@ -353,6 +359,9 @@ pub(crate) fn print_daemon_status_with_paths(
             if let Some(status) = status {
                 println!("  pid: {}", status.pid);
                 println!("  version: {}", status.version);
+                if let Some(commit) = &status.commit {
+                    println!("  commit: {commit}");
+                }
                 println!("  bind: {}", daemon_bind_address(&status));
                 println!("  control address: {}", status.address);
                 print_daemon_platform(&status);
@@ -393,6 +402,76 @@ pub(crate) fn print_daemon_status_with_paths(
             Ok(())
         }
     }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn print_daemon_idle_stats(stats: &IdleStatsSnapshot) {
+    println!("  idle stats (cumulative since daemon start):");
+    println!(
+        "    disk io: read {} write {}",
+        format_bytes(stats.disk_bytes_read),
+        format_bytes(stats.disk_bytes_written)
+    );
+    println!(
+        "    net io: sent {} recv {}",
+        format_bytes(stats.net_bytes_sent),
+        format_bytes(stats.net_bytes_recv)
+    );
+    println!(
+        "    ticks: {} total, {} with work",
+        stats.ticks_total, stats.ticks_with_work
+    );
+    println!(
+        "    disk reads: cluster_state={} iroh_endpoints={} dfs_metadata={}",
+        stats.disk_reads_cluster_state,
+        stats.disk_reads_iroh_endpoints,
+        stats.disk_reads_dfs_metadata
+    );
+    println!(
+        "    object file writes: actual={} skipped={}",
+        stats.disk_writes_object_file_actual, stats.disk_writes_object_file_skipped
+    );
+    println!(
+        "    kv snapshot writes: actual={} skipped={}",
+        stats.kv_snapshot_writes_actual, stats.kv_snapshot_writes_skipped
+    );
+    println!(
+        "    kv publishes: member={} node_status={} network_info={} connectivity={}",
+        stats.kv_publish_member,
+        stats.kv_publish_node_status,
+        stats.kv_publish_network_info,
+        stats.kv_publish_connectivity
+    );
+    println!(
+        "    mdns announces: sent={} recv={}",
+        stats.mdns_announces_sent, stats.mdns_announces_recv
+    );
+    println!(
+        "    raft appends: sent={} recv={}",
+        stats.raft_appends_sent, stats.raft_appends_recv
+    );
+    println!(
+        "    connectivity probes sent: {}",
+        stats.connectivity_probes_sent
+    );
+    println!(
+        "    dfs metadata replications sent: {}",
+        stats.dfs_metadata_replications_sent
+    );
 }
 
 fn print_local_daemon_iroh_endpoint(paths: &DaemonPaths, status: &DaemonStatus) {

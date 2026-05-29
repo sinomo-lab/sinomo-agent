@@ -330,17 +330,15 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         requested_at,
         DAEMON_PROBE_TIMEOUT,
     );
-    let shadow_available = matches!(
-        probe_daemon_status(&DaemonPaths::for_shadow(&data_dir), DAEMON_PROBE_TIMEOUT),
-        DaemonProbeStatus::Running(_)
-    );
-    if shadow_available {
-        stop_daemon_before_install(
-            &DaemonPaths::for_shadow(&data_dir),
-            "shadow daemon",
-            "local rollout shadow update",
-        )?;
-    }
+    // Do NOT stop the shadow supervisor here. Stopping it leaves the node
+    // unsupervised whenever the shadow is the root of the process tree — PID 1
+    // in a container, or a dev box with no external init to respawn it — which
+    // is the dead-node rollout failure. Instead keep the shadow running and let
+    // it drive the handoff: it restarts the main on the new binary, then
+    // re-execs its own process image in place to adopt the new shadow binary
+    // (see handle_daemon_finalize_shadow_rollout). The node is supervised the
+    // entire time. When no shadow is running, stage_rollout_main_activation
+    // takes the main-only bootstrap path and brings a fresh supervisor up.
     let activation_strategy =
         stage_rollout_main_activation(&data_dir.root(), &paths, plan.activation)?;
     if let Some(status) = plan.previous_main_status.as_ref() {

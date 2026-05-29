@@ -1,0 +1,68 @@
+# Sinomo 3-node dev cluster.
+#
+#   docker compose up --build          # build the image + start all 3 nodes
+#   docker compose exec node1 sinomo cluster health
+#   docker compose exec node1 sinomo rollout cluster --remote-build --repo /data/source/sinomo
+#   docker compose down -v             # tear down + wipe volumes
+#
+# All nodes are linux/x86_64, so `rollout cluster` uses the binary path for every
+# node — exercising the shadow-supervised rollout handoff (where the dead-node bug
+# lives) without cross-platform builds. Restart policy is "no" so a node that the
+# rollout leaves without a supervisor STAYS down — that is exactly the failure we
+# want the harness to surface rather than mask.
+
+services:
+  node1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: sinomo-dev-node
+    hostname: node1
+    environment:
+      ROLE: seed
+      SEED_HOST: node1:21353
+      NODE_NAME: node1
+      CLUSTER_NAME: dev-cluster
+    volumes:
+      - node1-data:/data
+      - invite:/shared
+    networks: [sinomo]
+    restart: "no"
+
+  node2:
+    image: sinomo-dev-node
+    hostname: node2
+    depends_on: [node1]
+    environment:
+      ROLE: joiner
+      SEED_HOST: node1:21353
+      NODE_NAME: node2
+    volumes:
+      - node2-data:/data
+      - invite:/shared
+    networks: [sinomo]
+    restart: "no"
+
+  node3:
+    image: sinomo-dev-node
+    hostname: node3
+    depends_on: [node1]
+    environment:
+      ROLE: joiner
+      SEED_HOST: node1:21353
+      NODE_NAME: node3
+    volumes:
+      - node3-data:/data
+      - invite:/shared
+    networks: [sinomo]
+    restart: "no"
+
+networks:
+  sinomo:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  invite:

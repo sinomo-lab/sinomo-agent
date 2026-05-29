@@ -777,6 +777,9 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
     if !cluster_paths.state.exists() {
         return Ok(());
     }
+    if let Some(stats) = crate::process_idle_stats() {
+        stats.incr_disk_reads_dfs_metadata();
+    }
     let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
@@ -793,7 +796,19 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
     if !scheduled_repairs.is_empty() {
         service.process_incoming()?;
     }
-    log_dfs_metadata_replication_report(publish_default_dfs_metadata_journal(paths)?);
+    let report = publish_default_dfs_metadata_journal(paths)?;
+    if let Some(stats) = crate::process_idle_stats() {
+        for outcome in &report.outcomes {
+            if matches!(
+                outcome,
+                DaemonDfsMetadataReplicationOutcome::Applied { .. }
+                    | DaemonDfsMetadataReplicationOutcome::SnapshotInstalled { .. }
+            ) {
+                stats.incr_dfs_metadata_replications_sent();
+            }
+        }
+    }
+    log_dfs_metadata_replication_report(report);
     Ok(())
 }
 

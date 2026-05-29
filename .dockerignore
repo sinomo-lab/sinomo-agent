@@ -1,0 +1,18 @@
+# Keep build context small: target/ is rebuilt inside the image, and the host
+# build artifacts (1GB+) must not be shipped into the build context.
+target/
+crates/*/target/
+benchmark-results/
+tmp/
+# Sandbox toolchain build artifacts (multi-GB downloaded sources + built sysroots).
+# The daemon build only needs the small *.fragment / script files, so drop the
+# heavy out*/work* dirs from the context (busybox/work has no hyphen, so the
+# generic patterns below would miss it).
+**/out-*/
+**/work-*/
+crates/sinomo-sandbox/toolchains/**/out/
+crates/sinomo-sandbox/toolchains/**/work/
+__pycache__/
+*.pyc
+# NOTE: .git IS included — the rollout source repo + build.rs commit stamping
+# need the daemon's source to be a real git repository inside the container.

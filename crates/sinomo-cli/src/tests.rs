@@ -6328,6 +6328,7 @@ fn install_detects_daemon_option_mismatch() {
         port: 21_353,
         address: "127.0.0.1:21353".to_string(),
         version: daemon_package_version(),
+        commit: None,
         target_os: Some(std::env::consts::OS.to_string()),
         target_arch: Some(std::env::consts::ARCH.to_string()),
         executable: None,
@@ -6336,6 +6337,7 @@ fn install_detects_daemon_option_mismatch() {
         data_dir: PathBuf::from("data"),
         lock_file: PathBuf::from("data/daemon/daemon.lock"),
         cluster: None,
+        idle_stats: None,
     };
 
     assert!(daemon_status_matches_options(&status, "127.0.0.1", 21_353));
@@ -11184,6 +11186,7 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
         port: 21_353,
         address: "127.0.0.1:21353".to_string(),
         version: daemon_package_version(),
+        commit: None,
         target_os: Some(std::env::consts::OS.to_string()),
         target_arch: Some(std::env::consts::ARCH.to_string()),
         executable: None,
@@ -11198,6 +11201,7 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
             member_role: ClusterMemberRole::Voter,
             member_state: ClusterMemberState::Active,
         }),
+        idle_stats: None,
     };
     write_daemon_status(&daemon_paths, &status).expect("write status");
 
@@ -13585,6 +13589,7 @@ fn cui_loop_uses_connected_daemon_cluster_node_when_available() {
         port: 21_353,
         address: "127.0.0.1:21353".to_string(),
         version: daemon_package_version(),
+        commit: None,
         target_os: Some(std::env::consts::OS.to_string()),
         target_arch: Some(std::env::consts::ARCH.to_string()),
         executable: None,
@@ -13599,6 +13604,7 @@ fn cui_loop_uses_connected_daemon_cluster_node_when_available() {
             member_role: ClusterMemberRole::Voter,
             member_state: ClusterMemberState::Active,
         }),
+        idle_stats: None,
     };
 
     run_cui_with_handler_io_and_daemon(

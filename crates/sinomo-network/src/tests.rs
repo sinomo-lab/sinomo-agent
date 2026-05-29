@@ -766,6 +766,98 @@ fn connectivity_graph_keys_records_by_source_target_and_endpoint() {
 }
 
 #[test]
+fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-noop-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_noop").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_noop_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_noop_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity noop",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.51:21353".to_string(), 10);
+    let mut member_b =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![endpoint_b.clone()];
+    state.members.push(member_b);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let healthy = |observed_at| {
+        cluster_connectivity_record(
+            &state,
+            &endpoint_b,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some("ok".to_string()),
+            None,
+            observed_at,
+            600,
+        )
+    };
+
+    // First publish writes the record.
+    assert!(
+        !cluster_connectivity_sync_is_noop(&paths, &node_a, std::slice::from_ref(&healthy(now)))
+            .expect("noop check"),
+        "first publish should not be a no-op"
+    );
+    sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![healthy(now)])
+        .expect("sync connectivity");
+
+    // Re-publishing the same record (fresh observed_at, far from expiry) is a no-op.
+    let later = now + time::Duration::seconds(5);
+    assert!(
+        cluster_connectivity_sync_is_noop(&paths, &node_a, std::slice::from_ref(&healthy(later)))
+            .expect("noop check"),
+        "stable record should be a no-op"
+    );
+
+    // A changed state is not a no-op.
+    let degraded = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Degraded,
+        Some(5),
+        1,
+        Some("ok".to_string()),
+        Some("blip".to_string()),
+        later,
+        600,
+    );
+    assert!(
+        !cluster_connectivity_sync_is_noop(&paths, &node_a, std::slice::from_ref(&degraded))
+            .expect("noop check"),
+        "changed state should not be a no-op"
+    );
+
+    // Dropping the record entirely (now-empty set) requires a delete, not a no-op.
+    assert!(
+        !cluster_connectivity_sync_is_noop(&paths, &node_a, &[]).expect("noop check"),
+        "removed record should not be a no-op"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn connectivity_sort_prefers_private_tcp_over_unknown_public_tcp() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-public-tcp-sort-{}",
@@ -1132,6 +1224,7 @@ fn raft_command_targets_prefer_fresh_online_voter_before_stale_voter() {
                 process: "daemon-main".to_string(),
                 availability: ClusterNodeAvailability::Online,
                 daemon_version: "0.1.0-test".to_string(),
+                commit: None,
                 target_os: Some("test-os".to_string()),
                 target_arch: Some("test-arch".to_string()),
                 pid: Some(42),
@@ -1984,7 +2077,9 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
         OffsetDateTime::now_utc(),
     );
 
-    for index in 0..130 {
+    // Commit well beyond the retained-tail bound (256) so compaction keeps only a
+    // recent tail and earlier entries are reachable solely via a snapshot.
+    for index in 0..400 {
         append_cluster_raft_command(
             &paths,
             &node_id,
@@ -1999,24 +2094,52 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     let mut node = open_cluster_raft_kv_node(&paths, &node_id).expect("open raft node");
     node.save_snapshot().expect("compact raft node");
     assert!(node.snapshot_index() > 0);
-    assert!(node.log().is_empty());
+    // The log is no longer truncated to empty: a bounded committed tail is kept for
+    // incremental replication.
+    let log = node.log();
+    assert!(!log.is_empty(), "compaction should retain a log tail");
+    assert!(log.len() <= 256, "retained tail must be bounded");
     let snapshot_index = node.snapshot_index();
+    let earliest_retained = log.first().map(|entry| entry.index).expect("tail");
     let last_log_index = node.last_log_index();
     drop(node);
 
+    // A caught-up follower (prev == snapshot index) gets a heartbeat, no snapshot.
     let heartbeat = build_cluster_raft_append_request_from_next_index(
         &paths,
         &state,
         last_log_index.saturating_add(1),
     )
     .expect("build heartbeat");
-    let catchup = build_cluster_raft_append_request_from_next_index(&paths, &state, snapshot_index)
-        .expect("build catchup");
-
     assert!(heartbeat.snapshot.is_none());
     assert!(heartbeat.append.entries.is_empty());
     assert_eq!(heartbeat.append.prev_log_index, snapshot_index);
-    assert!(catchup.snapshot.is_some());
+
+    // A follower a few entries behind, but still within the retained tail, is caught
+    // up with incremental entries — no snapshot install.
+    let near = build_cluster_raft_append_request_from_next_index(
+        &paths,
+        &state,
+        earliest_retained + 1,
+    )
+    .expect("build near catchup");
+    assert!(
+        near.snapshot.is_none(),
+        "follower within the retained tail must be served incrementally"
+    );
+    assert!(!near.append.entries.is_empty());
+
+    // A follower behind the retained tail still requires a full snapshot install.
+    let far = build_cluster_raft_append_request_from_next_index(
+        &paths,
+        &state,
+        earliest_retained.saturating_sub(1).max(1),
+    )
+    .expect("build far catchup");
+    assert!(
+        far.snapshot.is_some(),
+        "follower behind the retained tail must receive a snapshot"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -2672,6 +2795,77 @@ fn rollout_target_selection_treats_hostname_tcp_as_direct_before_iroh() {
 }
 
 #[test]
+fn cluster_state_sync_txn_is_empty_when_kv_already_matches() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-sync-idempotent-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_sync_idem").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_sync_idem").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "sync idem",
+        node_id.clone(),
+        "node",
+        "pk",
+        now,
+    );
+    let member = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == node_id)
+        .expect("local member");
+    member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_sync_idem").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.1:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    }];
+    write_cluster_state(&paths, &state).expect("write state");
+
+    // First sync against an empty KV emits the full state.
+    let first = cluster_state_sync_txn(&paths, &state).expect("first sync txn");
+    assert!(!first.success.is_empty(), "first sync should publish state");
+    append_cluster_raft_command(&paths, &node_id, KvCommand::Txn(first)).expect("apply first sync");
+
+    // Re-syncing identical state is a no-op even though the in-memory state's
+    // updated_at would advance on a real publish.
+    let mut bumped = state.clone();
+    bumped.updated_at = now + time::Duration::seconds(120);
+    bumped.kv_revision = state.kv_revision + 5;
+    let second = cluster_state_sync_txn(&paths, &bumped).expect("second sync txn");
+    assert!(
+        second.success.is_empty(),
+        "re-syncing semantically identical state must be a no-op, got ops: {:?}",
+        second.success
+    );
+
+    // A real change (cluster display name -> identity record) must still publish.
+    bumped.local_node_display_name = "renamed node".to_string();
+    let third = cluster_state_sync_txn(&paths, &bumped).expect("third sync txn");
+    assert!(
+        !third.success.is_empty(),
+        "a real config change must publish"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_storage_syncs_members_and_node_status_to_kv() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-storage-{}",
@@ -2759,6 +2953,7 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         process: "daemon-main".to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
+        commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
         pid: Some(42),
@@ -2841,6 +3036,7 @@ fn stored_cluster_node_status_matches_refreshes_before_status_goes_stale() {
         process: "daemon-main".to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
+        commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
         pid: Some(42),
@@ -5316,4 +5512,87 @@ fn localhost_kv_cluster_catches_up_delayed_node_from_snapshot_over_network_objec
     }
 
     stop_localhost_kv_nodes(nodes);
+}
+
+#[derive(Default)]
+struct CountingIoObserver {
+    actual: std::sync::atomic::AtomicU64,
+    skipped: std::sync::atomic::AtomicU64,
+    disk_read_bytes: std::sync::atomic::AtomicU64,
+    disk_write_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl IoObserver for CountingIoObserver {
+    fn on_disk_read(&self, bytes: u64) {
+        self.disk_read_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn on_disk_write(&self, bytes: u64) {
+        self.disk_write_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn on_object_file_actual_write(&self) {
+        self.actual
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn on_object_file_skipped_write(&self) {
+        self.skipped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+static IO_OBSERVER_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn write_cluster_state_observer_counts_actual_then_skipped() {
+    // Serialize with any other test that swaps the global I/O observer.
+    let _guard = IO_OBSERVER_TEST_MUTEX.lock().expect("test mutex");
+
+    let observer = Arc::new(CountingIoObserver::default());
+    let previous: Option<Arc<dyn IoObserver>> =
+        set_io_observer(Some(observer.clone() as Arc<dyn IoObserver>));
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-storage-observer-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_storage_observer").expect("cluster id");
+    let node = NodeId::from_legacy_named("node_storage_observer").expect("node id");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "storage observer test",
+        node,
+        "node",
+        "pk",
+        OffsetDateTime::now_utc(),
+    );
+
+    write_cluster_state(&paths, &state).expect("first write");
+    write_cluster_state(&paths, &state).expect("second write should short-circuit");
+
+    let actual = observer.actual.load(std::sync::atomic::Ordering::Relaxed);
+    let skipped = observer.skipped.load(std::sync::atomic::Ordering::Relaxed);
+    let write_bytes = observer
+        .disk_write_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let read_bytes = observer
+        .disk_read_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(actual, 1, "expected exactly one actual write");
+    assert_eq!(skipped, 1, "expected exactly one skipped write");
+    assert!(write_bytes > 0, "actual write should report disk bytes");
+    // The second (skipped) write still reads the existing file to compare.
+    assert!(read_bytes > 0, "read-compare should report disk bytes");
+
+    // Restore the previous observer so we don't poison sibling tests.
+    let _ = set_io_observer(previous);
+    let _ = std::fs::remove_dir_all(&root);
 }

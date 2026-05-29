@@ -281,6 +281,72 @@ pub fn prepare_local_shadow_rollout_restart(
     }
 }
 
+fn shadow_reexec_request_path(rollout_paths: &SelfRolloutPaths) -> PathBuf {
+    rollout_paths.root.join("shadow-reexec.request")
+}
+
+/// Records that the running shadow supervisor should re-exec `target` in place the
+/// next time its control loop exits. Rollout self-update uses this so the
+/// supervisor adopts a new binary by replacing its own process image — never by
+/// stopping and relying on an external restarter, which fails when the supervisor
+/// is PID 1 (a container) or has no init supervising it (a bare dev host).
+fn request_shadow_reexec(
+    rollout_paths: &SelfRolloutPaths,
+    target: &Path,
+) -> Result<(), DaemonError> {
+    let path = shadow_reexec_request_path(rollout_paths);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&path, target.display().to_string()).map_err(|source| DaemonError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+/// Consumes a pending shadow re-exec request, returning the target binary if set.
+fn take_shadow_reexec_request(rollout_paths: &SelfRolloutPaths) -> Option<PathBuf> {
+    let path = shadow_reexec_request_path(rollout_paths);
+    let target = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let target = target.trim();
+    if target.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(target))
+    }
+}
+
+/// Re-executes the shadow supervisor in place from `target`, preserving the listen
+/// options and pointing it at the (rolled-out) installed main binary. On success
+/// this never returns (the process image is replaced); on failure it returns Err.
+#[cfg(unix)]
+fn reexec_shadow_supervisor(
+    target: &Path,
+    options: &crate::DaemonRunOptions,
+    main_binary: &Path,
+) -> DaemonError {
+    use std::os::unix::process::CommandExt;
+    let error = Command::new(target)
+        .args([
+            "daemon".to_string(),
+            "shadow".to_string(),
+            "run".to_string(),
+            "--host".to_string(),
+            options.host.clone(),
+            "--port".to_string(),
+            options.port.to_string(),
+        ])
+        .env(SHADOW_MAIN_BINARY_ENV, main_binary)
+        .env(SHADOW_MAIN_HOST_ENV, &options.host)
+        .env(SHADOW_START_DELAY_MS_ENV, "0")
+        .exec();
+    DaemonError::Io {
+        path: target.display().to_string(),
+        detail: format!("shadow supervisor re-exec failed: {error}"),
+    }
+}
+
 pub fn run_shadow_daemon_supervision_loop<E, F>(
     options: crate::DaemonRunOptions,
     shadow_paths: DaemonPaths,
@@ -550,6 +616,36 @@ where
         thread::sleep(shadow_idle_interval);
     }
 
+    // If a rollout asked this supervisor to adopt a new binary, replace our process
+    // image in place rather than exiting and hoping something restarts us. This is
+    // what keeps a node supervised across a rollout even with no external init.
+    let reexec_target = take_shadow_reexec_request(&rollout_paths);
+    let installed_main_binary = rollout_paths.main_binary.clone();
+    drop(_lock);
+    if let Some(target) = reexec_target {
+        let target = if target.exists() {
+            target
+        } else {
+            env::current_exe().unwrap_or(target)
+        };
+        eprintln!(
+            "sinomo shadow daemon re-executing supervisor binary {}",
+            target.display()
+        );
+        #[cfg(unix)]
+        {
+            return Err(reexec_shadow_supervisor(
+                &target,
+                &options,
+                &installed_main_binary,
+            ));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&target, &installed_main_binary);
+        }
+    }
+
     Ok(())
 }
 
@@ -778,25 +874,25 @@ fn stage_main_only_rollout_without_existing_shadow(
     )?;
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
-    let shadow_start = spawn_shadow_for_cluster_rollout(
+    // Bring up the bootstrap shadow with bounded, health-verified retries so a
+    // transient bind/lock race during handoff does not leave the node without a
+    // supervisor. In tests the spawn/probe is skipped.
+    #[cfg(not(test))]
+    let shadow_start = ensure_shadow_supervisor_running(
+        data_dir,
         &activation.shadow_binary,
         &activation.main_binary,
         &activation.main_host,
         activation.main_port,
         &activation.main_host,
         activation.shadow_port,
+        SHADOW_RECOVERY_DEADLINE,
     );
-    #[cfg(not(test))]
-    let shadow_start = shadow_start.and_then(|()| {
-        wait_for_shadow_rollout_health(
-            data_dir,
-            &activation.main_host,
-            activation.shadow_port,
-            Duration::from_secs(10),
-        )
-    });
     #[cfg(test)]
-    let _ = data_dir;
+    let shadow_start: Result<(), DaemonError> = {
+        let _ = data_dir;
+        Ok(())
+    };
     if let Err(error) = shadow_start {
         let previous_main = activation
             .previous_main_binary
@@ -943,24 +1039,11 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
     };
 
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
-    if let DaemonProbeStatus::Running(status) =
-        probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT)
-    {
-        let _ = send_daemon_shutdown_request(&status.address, DAEMON_PROBE_TIMEOUT);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if matches!(
-                probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
-                DaemonProbeStatus::NotRunning
-            ) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
     let mut detail = "shadow rollout finalized".to_string();
     let mut status = "accepted";
+
+    // Stage the new supervisor binary into the installed path first so an in-place
+    // re-exec (below) adopts it.
     if let Some(staged_shadow) = finalize
         .staged_shadow_binary
         .as_ref()
@@ -973,49 +1056,133 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
             STABLE_BINARY_COPY_RETRY_INTERVAL,
         )?;
     }
-    let candidate_result = spawn_shadow_for_cluster_rollout(
-        &finalize.shadow_binary,
-        &finalize.main_binary,
-        &finalize.main_host,
-        finalize.main_port,
-        &finalize.shadow_host,
-        finalize.shadow_port,
-    )
-    .and_then(|()| {
+
+    let outcome = if matches!(
+        probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT),
+        DaemonProbeStatus::Running(_)
+    ) {
+        // Ask the running supervisor to re-exec the new binary in place. It replaces
+        // its own process image rather than stopping, so the node is never left
+        // unsupervised — this is what fixes the dead-node failure when the shadow is
+        // PID 1 (container) or has no external init.
+        request_shadow_reexec(&rollout_paths, &finalize.shadow_binary)?;
+        if let DaemonProbeStatus::Running(running) =
+            probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT)
+        {
+            let _ = send_daemon_shutdown_request(&running.address, DAEMON_PROBE_TIMEOUT);
+        }
+        // Wait past the brief re-exec gap, then confirm a supervisor is healthy. If
+        // the re-exec failed the port stays dead and this errors into recovery.
+        thread::sleep(Duration::from_secs(2));
         wait_for_shadow_rollout_health(
             data_dir,
             &finalize.shadow_host,
             finalize.shadow_port,
-            Duration::from_secs(10),
+            Duration::from_secs(30),
         )
-    });
-    if let Err(error) = candidate_result {
-        if wait_for_shadow_rollout_health(
+    } else {
+        // No supervisor to re-exec (already down) — start a fresh one, verified.
+        ensure_shadow_supervisor_running(
             data_dir,
+            &finalize.shadow_binary,
+            &finalize.main_binary,
+            &finalize.main_host,
+            finalize.main_port,
             &finalize.shadow_host,
             finalize.shadow_port,
-            Duration::from_secs(10),
+            SHADOW_RECOVERY_DEADLINE,
         )
-        .is_ok()
-        {
-            detail = format!("shadow rollout finalized after handoff grace period: {error}");
-        } else {
-            status = "failed";
-            detail = format!("candidate shadow failed: {error}");
-            let _ = spawn_shadow_for_cluster_rollout(
-                &finalize.previous_shadow_binary,
-                &finalize.main_binary,
-                &finalize.main_host,
-                finalize.main_port,
-                &finalize.shadow_host,
-                finalize.shadow_port,
-            );
+    };
+
+    if let Err(error) = outcome {
+        // The new supervisor did not become healthy. Clear the pending re-exec,
+        // restore the previous (known-good) binary, and recover with verified,
+        // bounded retries so the node is never left without a supervisor.
+        let _ = take_shadow_reexec_request(&rollout_paths);
+        let _ = stage_rollout_file_with_retry(
+            &finalize.previous_shadow_binary,
+            &finalize.shadow_binary,
+            STABLE_BINARY_COPY_TIMEOUT,
+            STABLE_BINARY_COPY_RETRY_INTERVAL,
+        );
+        match ensure_shadow_supervisor_running(
+            data_dir,
+            &finalize.shadow_binary,
+            &finalize.main_binary,
+            &finalize.main_host,
+            finalize.main_port,
+            &finalize.shadow_host,
+            finalize.shadow_port,
+            SHADOW_RECOVERY_DEADLINE,
+        ) {
+            Ok(()) => {
+                status = "rolled-back";
+                detail = format!(
+                    "candidate shadow did not become healthy ({error}); restored previous supervisor binary"
+                );
+            }
+            Err(recovery_error) => {
+                status = "failed";
+                detail = format!(
+                    "candidate shadow failed ({error}) and recovery supervisor did not become healthy: {recovery_error}"
+                );
+                eprintln!("sinomo shadow rollout finalize: {detail}");
+            }
         }
     }
 
     record_shadow_rollout_finalized(&rollout_paths, &finalize, status, &detail)?;
     remove_shadow_finalize(&rollout_paths);
     Ok(format!("{status}: {detail}\n"))
+}
+
+/// Maximum time to keep retrying the known-good supervisor binary during rollout
+/// recovery before giving up. Generous because a node with no supervisor is a
+/// hard failure that blocks the whole node.
+const SHADOW_RECOVERY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Brings a shadow supervisor back up using `shadow_binary`, retrying with backoff
+/// until it reports healthy or `deadline` elapses. Used to guarantee a supervisor
+/// is running after a failed rollout handoff. Each attempt re-checks health first,
+/// so a supervisor that came up late (handoff grace) is accepted without respawning.
+#[allow(clippy::too_many_arguments)]
+fn ensure_shadow_supervisor_running(
+    data_dir: &Path,
+    shadow_binary: &Path,
+    main_binary: &Path,
+    main_host: &str,
+    main_port: u16,
+    shadow_host: &str,
+    shadow_port: u16,
+    deadline: Duration,
+) -> Result<(), DaemonError> {
+    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    let overall_deadline = Instant::now() + deadline;
+    loop {
+        if matches!(
+            probe_daemon_status(&shadow_paths, Duration::from_secs(2)),
+            DaemonProbeStatus::Running(_)
+        ) {
+            return Ok(());
+        }
+        let attempt = spawn_shadow_for_cluster_rollout(
+            shadow_binary,
+            main_binary,
+            main_host,
+            main_port,
+            shadow_host,
+            shadow_port,
+        )
+        .and_then(|()| {
+            wait_for_shadow_rollout_health(data_dir, shadow_host, shadow_port, Duration::from_secs(5))
+        });
+        match attempt {
+            Ok(()) => return Ok(()),
+            // Keep retrying until the deadline; surface the most recent failure if we run out.
+            Err(error) if Instant::now() >= overall_deadline => return Err(error),
+            Err(_) => thread::sleep(Duration::from_millis(500)),
+        }
+    }
 }
 
 pub fn wait_for_main_daemon_health(
