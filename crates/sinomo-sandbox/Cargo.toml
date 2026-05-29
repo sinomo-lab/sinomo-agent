@@ -11,6 +11,13 @@ include = ["**/*.rs", "Cargo.toml", "toolchains/**"]
 [package.metadata.sinomo]
 ring = "r1"
 
+[features]
+# Mirrored from sinomo-sandbox-runtime: its `wasix-runtime` feature enables this
+# one so the capability/policy checks in this crate (which gate WASIX command
+# support) reflect whether the WASIX backend is actually linked. This marker adds
+# no dependencies of its own — the contracts crate carries no wasm code.
+wasix-runtime = []
+
 [dependencies]
 blake3.workspace = true
 getrandom = "0.2"
