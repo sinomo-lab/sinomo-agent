@@ -2407,19 +2407,15 @@ fn cluster_route_unavailability_rank(connectivity: Option<&ClusterConnectivityRe
 }
 
 fn cluster_node_status_route_rank(status: Option<&ClusterNodeStatusRecord>) -> u8 {
-    let Some(status) = status else {
-        return 1;
-    };
-    match status.availability {
-        sinomo_core::ClusterNodeAvailability::Online
-            if (OffsetDateTime::now_utc() - status.observed_at).whole_seconds()
-                <= CLUSTER_NODE_STATUS_STALE_AFTER_SECONDS =>
-        {
-            0
-        }
-        sinomo_core::ClusterNodeAvailability::Unknown => 1,
-        sinomo_core::ClusterNodeAvailability::Online => 2,
-        sinomo_core::ClusterNodeAvailability::Offline => 3,
+    // Node status is no longer periodically refreshed, so observed_at age is not a
+    // liveness signal — rank purely by the self-reported availability field. Actual
+    // reachability/freshness is contributed by the connectivity-based rank
+    // components (see cluster_route_connectivity_quality_rank / unavailability_rank),
+    // which are driven by active probes.
+    match status.map(|status| &status.availability) {
+        Some(sinomo_core::ClusterNodeAvailability::Online) => 0,
+        None | Some(sinomo_core::ClusterNodeAvailability::Unknown) => 1,
+        Some(sinomo_core::ClusterNodeAvailability::Offline) => 3,
     }
 }
 
@@ -2829,9 +2825,10 @@ pub fn stored_cluster_node_status_matches(
     let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
         return Ok(false);
     };
-    let now = OffsetDateTime::now_utc();
-    Ok(cluster_node_status_stable_eq(&existing, status)
-        && !cluster_node_status_should_refresh(existing.observed_at, now))
+    // Match on stable content only: node status is not periodically refreshed (no
+    // observed_at heartbeat). A live node's status is republished when its content
+    // changes; crash detection is handled by the active connectivity probes.
+    Ok(cluster_node_status_stable_eq(&existing, status))
 }
 
 pub fn cluster_node_status_stable_eq(

@@ -148,14 +148,17 @@ fn remember_network_info(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) 
 
 fn cached_node_status_matches(paths: &ClusterPaths, status: &ClusterNodeStatusRecord) -> bool {
     let key = publish_cache_key(paths, &status.node_id);
-    let now = OffsetDateTime::now_utc();
+    // Node status is published only when its stable content changes — it is NOT
+    // periodically refreshed. Liveness/crash detection comes from the active
+    // connectivity probes (in-memory, persisted only on state change), so the
+    // observed_at timestamp no longer needs a heartbeat. This keeps an idle cluster
+    // from rewriting the KV snapshot every ~60s purely to bump a timestamp.
     PUBLISHED_NODE_STATUS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
             cache.get(&key).is_some_and(|known| {
                 sinomo_network::cluster_node_status_stable_eq(known, status)
-                    && !sinomo_network::cluster_node_status_should_refresh(known.observed_at, now)
             })
         })
 }
