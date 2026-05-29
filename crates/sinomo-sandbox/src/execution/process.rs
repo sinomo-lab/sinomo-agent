@@ -38,7 +38,7 @@ pub struct SandboxProcessPlanOutcome {
     pub stderr: Vec<u8>,
 }
 
-pub(crate) fn validate_sandbox_process_plan(
+pub fn validate_sandbox_process_plan(
     plan: &SandboxProcessPlan,
 ) -> Result<(), SandboxCommandExecutionError> {
     if plan.steps.is_empty() {
@@ -101,7 +101,7 @@ pub(crate) fn validate_sandbox_process_plan(
     Ok(())
 }
 
-pub(crate) fn validate_sandbox_process_plan_working_directories(
+pub fn validate_sandbox_process_plan_working_directories(
     plan: &SandboxProcessPlan,
     fs: &impl SandboxFileSystem,
     default_cwd: &SandboxPath,
@@ -117,7 +117,7 @@ pub(crate) fn validate_sandbox_process_plan_working_directories(
     Ok(())
 }
 
-pub(crate) fn validate_sandbox_process_plan_invocations(
+pub fn validate_sandbox_process_plan_invocations(
     plan: &SandboxProcessPlan,
     manifest: &SandboxInstanceManifest,
     toolchain: &SandboxToolchainManifest,
@@ -145,7 +145,7 @@ pub(crate) fn validate_sandbox_process_plan_invocations(
     Ok(())
 }
 
-pub(crate) fn validate_sandbox_toolchain_argv(
+pub fn validate_sandbox_toolchain_argv(
     command_name: &str,
     argv: &[String],
 ) -> Result<(), String> {

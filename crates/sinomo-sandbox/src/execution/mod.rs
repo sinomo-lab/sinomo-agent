@@ -1,19 +1,14 @@
+//! Sandbox command execution *contracts*: error types, the output-sink trait,
+//! audit/event-emission helpers, and process-plan request/response/validation
+//! types. The wasmtime/WASIX execution backends that run these live in the
+//! `sinomo-sandbox-runtime` crate, behind the `sandbox` feature.
+
 mod audit;
 mod errors;
-mod local;
-mod local_fidelity;
-mod local_process_plan;
-mod options;
+mod output;
 mod process;
-mod sifs;
-mod sifs_process_plan;
-mod staging;
-mod wasi;
 
 pub use audit::*;
 pub use errors::*;
-pub use local::*;
-pub use options::*;
+pub use output::*;
 pub use process::*;
-pub use sifs::*;
-pub(crate) use wasi::*;

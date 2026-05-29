@@ -236,7 +236,7 @@ pub fn select_sandbox_execution_node(
     ))
 }
 
-pub(crate) fn sandbox_execution_placement_for_node(
+pub fn sandbox_execution_placement_for_node(
     manifest: &SandboxInstanceManifest,
     node_id: &NodeId,
 ) -> Result<SandboxExecutionPlacement, SandboxSchedulingError> {

@@ -10,8 +10,9 @@ rust-version.workspace = true
 ring = "r0-r1-boundary"
 
 [features]
-default = ["wasix-runtime"]
-wasix-runtime = ["sinomo-sandbox/wasix-runtime"]
+# Enable the build-heavy wasm sandbox runtime (off by default). Pulls in the
+# `sinomo-sandbox-runtime` backend and re-exposes it as the `sandbox` facade.
+sandbox = ["dep:sinomo-sandbox-runtime", "sinomo-daemon/sandbox"]
 
 [dependencies]
 sinomo-api = { path = "../sinomo-api" }
@@ -30,6 +31,7 @@ sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
+sinomo-sandbox-runtime = { path = "../sinomo-sandbox-runtime", optional = true }
 sinomo-storage = { path = "../sinomo-storage" }
 sinomo-supervision = { path = "../sinomo-supervision" }
 sinomo-sync = { path = "../sinomo-sync" }

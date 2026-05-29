@@ -37,7 +37,14 @@ pub mod r1 {
     pub use sinomo_policy as policy;
     pub use sinomo_registry as registry;
     pub use sinomo_rollout as rollout;
+    // The `sandbox` facade resolves to the lightweight contracts crate by
+    // default, and to the build-heavy `sinomo-sandbox-runtime` backend (which
+    // re-exports all the contracts plus the wasmtime/WASIX runners) when the
+    // `sandbox` feature is enabled.
+    #[cfg(not(feature = "sandbox"))]
     pub use sinomo_sandbox as sandbox;
+    #[cfg(feature = "sandbox")]
+    pub use sinomo_sandbox_runtime as sandbox;
     pub use sinomo_supervision as supervision;
     pub use sinomo_sync as sync;
 

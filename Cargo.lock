@@ -5786,6 +5786,7 @@ dependencies = [
  "sinomo-node",
  "sinomo-rollout",
  "sinomo-sandbox",
+ "sinomo-sandbox-runtime",
  "sinomo-storage",
  "thiserror 2.0.18",
  "time",
@@ -6086,6 +6087,7 @@ dependencies = [
  "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
+ "sinomo-sandbox-runtime",
  "sinomo-storage",
  "sinomo-supervision",
  "sinomo-sync",
@@ -6107,6 +6109,29 @@ dependencies = [
  "sinomo-network",
  "sinomo-node",
  "sinomo-object",
+ "sinomo-storage",
+ "tar",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "sinomo-sandbox-runtime"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "getrandom 0.2.17",
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-dfs",
+ "sinomo-events",
+ "sinomo-kv",
+ "sinomo-module",
+ "sinomo-network",
+ "sinomo-node",
+ "sinomo-object",
+ "sinomo-sandbox",
  "sinomo-storage",
  "tar",
  "thiserror 2.0.18",

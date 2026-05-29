@@ -5,7 +5,7 @@ use super::virtual_devices::*;
 
 #[derive(Debug)]
 pub struct SifsSandboxFileSystem<T: NetworkTransport> {
-    pub(crate) dfs: NetworkedDfsService<T>,
+    pub dfs: NetworkedDfsService<T>,
     root: String,
     mounts: Vec<SandboxMount>,
     temp_epoch: u64,

@@ -1,3 +1,4 @@
+use crate::internal::sandbox_wasi_error_from_wasmtime;
 use super::extensions::add_sinomo_sandbox_wasi_extensions;
 use super::output::spawn_output_watcher;
 use super::state::LocalWasiState;
@@ -25,7 +26,7 @@ impl LocalWasiCommandRunner {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
-        let engine = wasmtime::Engine::new(&config).map_err(SandboxWasiError::from_wasmtime)?;
+        let engine = wasmtime::Engine::new(&config).map_err(sandbox_wasi_error_from_wasmtime)?;
         Ok(Self { engine })
     }
 
@@ -50,7 +51,7 @@ impl LocalWasiCommandRunner {
 
         let wasm = Arc::<[u8]>::from(wasm.as_ref().to_vec());
         let module = wasmtime::Module::new(&self.engine, wasm.as_ref())
-            .map_err(SandboxWasiError::from_wasmtime)?;
+            .map_err(sandbox_wasi_error_from_wasmtime)?;
         let pipe_capacity = options.output_limit_bytes.saturating_add(1);
         let stdout = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(pipe_capacity);
         let stderr = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(pipe_capacity);
@@ -132,7 +133,7 @@ impl LocalWasiCommandRunner {
                 wasmtime_wasi::DirPerms::all(),
                 wasmtime_wasi::FilePerms::all(),
             )
-            .map_err(SandboxWasiError::from_wasmtime)?;
+            .map_err(sandbox_wasi_error_from_wasmtime)?;
         }
         for preopen in &options.preopened_dirs {
             let (dir_perms, file_perms) = match preopen.mode {
@@ -151,7 +152,7 @@ impl LocalWasiCommandRunner {
                 dir_perms,
                 file_perms,
             )
-            .map_err(SandboxWasiError::from_wasmtime)?;
+            .map_err(sandbox_wasi_error_from_wasmtime)?;
         }
         let virtual_devices = if options.enable_virtual_devices {
             let mut proc_env = request
@@ -177,14 +178,14 @@ impl LocalWasiCommandRunner {
                 wasmtime_wasi::DirPerms::READ,
                 wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
             )
-            .map_err(SandboxWasiError::from_wasmtime)?;
+            .map_err(sandbox_wasi_error_from_wasmtime)?;
             wasi.preopened_dir(
                 devices.proc_path(),
                 "proc",
                 wasmtime_wasi::DirPerms::READ,
                 wasmtime_wasi::FilePerms::READ,
             )
-            .map_err(SandboxWasiError::from_wasmtime)?;
+            .map_err(sandbox_wasi_error_from_wasmtime)?;
             if !options
                 .preopened_dirs
                 .iter()
@@ -196,7 +197,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::READ,
                     wasmtime_wasi::FilePerms::READ,
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             if !options
                 .preopened_dirs
@@ -209,7 +210,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::READ,
                     wasmtime_wasi::FilePerms::READ,
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             if !options
                 .preopened_dirs
@@ -222,7 +223,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::all(),
                     wasmtime_wasi::FilePerms::all(),
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             if !options
                 .preopened_dirs
@@ -235,7 +236,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::all(),
                     wasmtime_wasi::FilePerms::all(),
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             if !options
                 .preopened_dirs
@@ -248,7 +249,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::all(),
                     wasmtime_wasi::FilePerms::all(),
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             if !options
                 .preopened_dirs
@@ -261,7 +262,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::all(),
                     wasmtime_wasi::FilePerms::all(),
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             if !options
                 .preopened_dirs
@@ -274,7 +275,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::all(),
                     wasmtime_wasi::FilePerms::all(),
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             if !options
                 .preopened_dirs
@@ -287,7 +288,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::READ,
                     wasmtime_wasi::FilePerms::READ,
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             if !options
                 .preopened_dirs
@@ -300,7 +301,7 @@ impl LocalWasiCommandRunner {
                     wasmtime_wasi::DirPerms::READ,
                     wasmtime_wasi::FilePerms::READ,
                 )
-                .map_err(SandboxWasiError::from_wasmtime)?;
+                .map_err(sandbox_wasi_error_from_wasmtime)?;
             }
             Some(devices)
         } else {
@@ -342,15 +343,15 @@ impl LocalWasiCommandRunner {
         store.limiter(|state| &mut state.limits);
         store
             .set_fuel(options.fuel)
-            .map_err(SandboxWasiError::from_wasmtime)?;
+            .map_err(sandbox_wasi_error_from_wasmtime)?;
         store.set_epoch_deadline(1);
 
         let mut linker = wasmtime::Linker::new(&self.engine);
         wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut LocalWasiState| {
             &mut state.wasi
         })
-        .map_err(SandboxWasiError::from_wasmtime)?;
-        add_sinomo_sandbox_wasi_extensions(&mut linker).map_err(SandboxWasiError::from_wasmtime)?;
+        .map_err(sandbox_wasi_error_from_wasmtime)?;
+        add_sinomo_sandbox_wasi_extensions(&mut linker).map_err(sandbox_wasi_error_from_wasmtime)?;
 
         let done = Arc::new(AtomicBool::new(false));
         let timed_out = Arc::new(AtomicBool::new(false));
@@ -393,7 +394,7 @@ impl LocalWasiCommandRunner {
                         limit: options.memory_limit_bytes,
                     })
                 } else {
-                    Err(SandboxWasiError::from_wasmtime(error))
+                    Err(sandbox_wasi_error_from_wasmtime(error))
                 }
             }
         };

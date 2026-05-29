@@ -2021,6 +2021,7 @@ fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_doctor_reports_coding_toolchain_readiness() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-doctor-coding-{}",
@@ -3230,6 +3231,7 @@ fn sandbox_reboot_respects_retain_tmp_policy_in_local_store() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_run_persists_stdout_and_stderr_logs() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-run-{}",
@@ -3347,6 +3349,7 @@ fn sandbox_run_persists_stdout_and_stderr_logs() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_run_returns_error_when_guest_exits_nonzero() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-run-nonzero-{}",
@@ -3415,6 +3418,7 @@ fn sandbox_run_returns_error_when_guest_exits_nonzero() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_run_rejects_mounts_outside_default_policy() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-mount-policy-{}",
@@ -3473,6 +3477,7 @@ fn sandbox_run_rejects_mounts_outside_default_policy() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_run_uses_pinned_toolchain_command() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-toolchain-run-{}",
@@ -3619,6 +3624,7 @@ fn sandbox_run_uses_pinned_toolchain_command() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-process-plan-{}",
@@ -3750,6 +3756,7 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_shell_invokes_pinned_sh_command() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-shell-{}",
@@ -3830,6 +3837,7 @@ fn sandbox_shell_invokes_pinned_sh_command() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_shell_rejects_toolchain_without_real_sh() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-shell-missing-{}",
@@ -5088,6 +5096,7 @@ fn wasi_stdin_to_stdout_module() -> &'static str {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn sandbox_run_rejects_written_bytes_over_limit() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-sandbox-quota-run-{}",
@@ -8047,6 +8056,7 @@ fn daemon_sandbox_http_fetch_uses_cluster_policy_and_returns_body() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-http-to-file-{}",
@@ -8202,6 +8212,7 @@ fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_records_resource_exhaustion_event() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-http-to-file-quota-{}",
@@ -8327,6 +8338,7 @@ fn daemon_sandbox_http_fetch_to_file_records_resource_exhaustion_event() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_audits_policy_denial_without_sifs_writes() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-http-to-file-denied-{}",
@@ -8424,6 +8436,7 @@ fn daemon_sandbox_http_fetch_to_file_audits_policy_denial_without_sifs_writes() 
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-http-to-file-transport-failure-{}",
@@ -8552,6 +8565,7 @@ fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_import_busybox_preflights_policy_before_sifs_writes() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-busybox-policy-{}",
@@ -8622,6 +8636,7 @@ fn daemon_sandbox_import_busybox_preflights_policy_before_sifs_writes() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_create_status_and_busybox_import_use_sifs() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-create-{}",
@@ -9180,6 +9195,7 @@ fn daemon_sandbox_create_status_and_busybox_import_use_sifs() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-toolchain-add-{}",
@@ -9315,6 +9331,7 @@ fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_add_artifact_persists_sifs_support_file() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-toolchain-artifact-{}",
@@ -9426,6 +9443,7 @@ fn daemon_sandbox_toolchain_add_artifact_persists_sifs_support_file() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-toolchain-package-{}",
@@ -9669,6 +9687,7 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_toolchain_executes_sifs_pinned_command() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-run-{}",
@@ -9799,6 +9818,7 @@ fn daemon_sandbox_run_toolchain_executes_sifs_pinned_command() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_process_plan_executes_sifs_pinned_commands() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-process-plan-{}",
@@ -9939,6 +9959,7 @@ fn daemon_sandbox_run_process_plan_executes_sifs_pinned_commands() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_process_plan_stream_emits_output_and_completion_frames() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-process-plan-stream-{}",
@@ -10118,6 +10139,7 @@ fn daemon_sandbox_run_process_plan_stream_emits_output_and_completion_frames() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_process_plan_records_events_for_resource_exhausted_step() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-process-plan-exhausted-{}",
@@ -10281,6 +10303,7 @@ fn daemon_sandbox_run_process_plan_records_events_for_resource_exhausted_step() 
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_toolchain_stream_emits_output_and_completion_frames() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-run-stream-{}",
@@ -10403,6 +10426,7 @@ fn daemon_sandbox_run_toolchain_stream_emits_output_and_completion_frames() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_toolchain_audits_policy_denial() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-run-denied-{}",
@@ -10487,6 +10511,7 @@ fn daemon_sandbox_run_toolchain_audits_policy_denial() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_toolchain_audits_mount_policy_denial() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-run-mount-denied-{}",
@@ -10633,6 +10658,7 @@ fn daemon_sandbox_run_toolchain_audits_mount_policy_denial() {
 }
 
 #[test]
+#[cfg(feature = "sandbox")]
 fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-daemon-sandbox-write-ro-mount-{}",

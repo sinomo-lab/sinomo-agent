@@ -118,7 +118,7 @@ where
     Ok(receipts)
 }
 
-pub(crate) fn sandbox_output_chunks(
+pub fn sandbox_output_chunks(
     sandbox_id: &SandboxId,
     command_id: &SandboxCommandId,
     stream: SandboxOutputStream,

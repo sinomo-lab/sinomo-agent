@@ -1,7 +1,9 @@
+//! Sandbox runtime *contracts*: the WASI ABI selector and capability descriptors.
+//! The wasmtime/wasmer execution backends live in the `sinomo-sandbox-runtime`
+//! crate, behind the `sandbox` feature.
+
 mod abi;
 mod capabilities;
-pub(crate) mod preview1;
-pub(crate) mod wasix;
 
 pub use abi::{SandboxWasiAbi, default_sandbox_wasi_abi};
 pub use capabilities::{
@@ -13,10 +15,4 @@ pub use capabilities::{
     sandbox_runtime_supports_child_processes_for_abi,
     sandbox_runtime_supports_command_capability_for_abi,
     sandbox_runtime_supports_mvp_virtual_devices,
-};
-pub use preview1::LocalWasiCommandRunner;
-pub(crate) use wasix::run_wasix_module;
-#[cfg(feature = "wasix-runtime")]
-pub(crate) use wasix::{
-    wasix_sandbox_filesystem_preopen, wasix_sandbox_workspace_filesystem_preopens,
 };

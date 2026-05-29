@@ -1,3 +1,4 @@
+use crate::internal::sandbox_wasi_error_from_wasmtime;
 use super::{
     guest::{
         read_guest_cstring_array, read_guest_env_array, read_guest_optional_string,
@@ -267,7 +268,7 @@ fn run_wasi_child_process(
     let child_module_wasm =
         resolve_wasi_child_process_module(parent, argv.first().map(String::as_str), &child_cwd)?;
     let module = wasmtime::Module::new(&engine, &child_module_wasm)
-        .map_err(SandboxWasiError::from_wasmtime)?;
+        .map_err(sandbox_wasi_error_from_wasmtime)?;
     let child_working_directory_host_path =
         sandbox_wasi_extension_host_path(&child_cwd, &parent.preopened_dirs)
             .map(|(_, host_path)| host_path)
@@ -369,7 +370,7 @@ fn run_wasi_child_process(
             wasmtime_wasi::DirPerms::all(),
             wasmtime_wasi::FilePerms::all(),
         )
-        .map_err(SandboxWasiError::from_wasmtime)?;
+        .map_err(sandbox_wasi_error_from_wasmtime)?;
     }
     if let Some(host_path) = &parent.virtual_device_host_path {
         wasi.preopened_dir(
@@ -378,7 +379,7 @@ fn run_wasi_child_process(
             wasmtime_wasi::DirPerms::READ,
             wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
         )
-        .map_err(SandboxWasiError::from_wasmtime)?;
+        .map_err(sandbox_wasi_error_from_wasmtime)?;
     }
     for preopen in &parent.preopened_dirs {
         let (dir_perms, file_perms) = match preopen.mode {
@@ -397,7 +398,7 @@ fn run_wasi_child_process(
             dir_perms,
             file_perms,
         )
-        .map_err(SandboxWasiError::from_wasmtime)?;
+        .map_err(sandbox_wasi_error_from_wasmtime)?;
     }
     let mut store = wasmtime::Store::new(
         &engine,
@@ -433,15 +434,15 @@ fn run_wasi_child_process(
         .min(parent.fuel);
     store
         .set_fuel(child_fuel)
-        .map_err(SandboxWasiError::from_wasmtime)?;
+        .map_err(sandbox_wasi_error_from_wasmtime)?;
     store.set_epoch_deadline(1);
     let mut linker = wasmtime::Linker::new(&engine);
     wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut LocalWasiState| {
         &mut state.wasi
     })
-    .map_err(SandboxWasiError::from_wasmtime)?;
+    .map_err(sandbox_wasi_error_from_wasmtime)?;
     super::extensions::add_sinomo_sandbox_wasi_extensions(&mut linker)
-        .map_err(SandboxWasiError::from_wasmtime)?;
+        .map_err(sandbox_wasi_error_from_wasmtime)?;
     let exit_status = match run_wasi_start(&mut store, &linker, &module) {
         Ok(exit_status) => exit_status,
         Err(error) => {
@@ -455,10 +456,10 @@ fn run_wasi_child_process(
                     limit: parent.output_limit_bytes,
                 });
             }
-            return Err(SandboxWasiError::from_wasmtime(error));
+            return Err(sandbox_wasi_error_from_wasmtime(error));
         }
     };
-    let remaining_fuel = store.get_fuel().map_err(SandboxWasiError::from_wasmtime)?;
+    let remaining_fuel = store.get_fuel().map_err(sandbox_wasi_error_from_wasmtime)?;
     parent
         .fuel_remaining
         .fetch_min(remaining_fuel, Ordering::SeqCst);

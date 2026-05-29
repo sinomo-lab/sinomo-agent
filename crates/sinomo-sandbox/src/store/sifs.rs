@@ -4,7 +4,7 @@ use super::{decode_instance_manifest, encode_instance_manifest};
 
 #[derive(Debug)]
 pub struct SifsSandboxInstanceStore<T: NetworkTransport> {
-    pub(crate) dfs: NetworkedDfsService<T>,
+    pub dfs: NetworkedDfsService<T>,
     replica_candidates: Vec<NodeId>,
 }
 

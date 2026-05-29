@@ -3205,6 +3205,27 @@ pub(crate) fn sandbox_toolchain_verify_busybox(
     }
 }
 
+/// Error surfaced by local sandbox-execution CLI commands when the binary was
+/// built without the `sandbox` feature, so the wasmtime/WASIX backend in
+/// `sinomo-sandbox-runtime` is not linked in.
+#[cfg(not(feature = "sandbox"))]
+fn sandbox_runtime_not_compiled_error() -> CliError {
+    CliError::Parse {
+        detail: "sandbox runtime not compiled in; rebuild with `--features sandbox` or use a daemon-backed run (`--daemon`)"
+            .to_string(),
+    }
+}
+
+#[cfg(not(feature = "sandbox"))]
+pub(crate) fn sandbox_toolchain_verify_busybox_with_stores(
+    _options: SandboxToolchainVerifyBusyBoxOptions,
+    _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    _toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+#[cfg(feature = "sandbox")]
 pub(crate) fn sandbox_toolchain_verify_busybox_with_stores(
     options: SandboxToolchainVerifyBusyBoxOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
@@ -3379,6 +3400,16 @@ fn sandbox_toolchain_verify_full_coding_surface(
     })
 }
 
+#[cfg(not(feature = "sandbox"))]
+fn sandbox_toolchain_verify_coding_workflow_with_stores(
+    _options: SandboxToolchainVerifyCodingOptions,
+    _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    _toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+#[cfg(feature = "sandbox")]
 fn sandbox_toolchain_verify_coding_workflow_with_stores(
     options: SandboxToolchainVerifyCodingOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
@@ -3849,6 +3880,20 @@ fn sandbox_tool_fidelity_result_from_command_case(
     }
 }
 
+#[cfg(not(feature = "sandbox"))]
+fn sandbox_toolchain_verify_command_cases_with_stores(
+    _sandbox_id: &sinomo_runtime::sandbox::SandboxId,
+    _allow_unsigned: bool,
+    _allowed_capabilities: &[&str],
+    _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    _toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+    _cases: &[sinomo_runtime::sandbox::SandboxCommandFidelityCase],
+    _failure_detail: &str,
+) -> Result<(), CliError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+#[cfg(feature = "sandbox")]
 fn sandbox_toolchain_verify_command_cases_with_stores(
     sandbox_id: &sinomo_runtime::sandbox::SandboxId,
     allow_unsigned: bool,
@@ -4116,6 +4161,16 @@ pub(crate) fn sandbox_toolchain_verify_python(
     }
 }
 
+#[cfg(not(feature = "sandbox"))]
+pub(crate) fn sandbox_toolchain_verify_quickjs_with_stores(
+    _options: SandboxToolchainVerifyQuickJsOptions,
+    _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    _toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+#[cfg(feature = "sandbox")]
 pub(crate) fn sandbox_toolchain_verify_quickjs_with_stores(
     options: SandboxToolchainVerifyQuickJsOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
@@ -5166,6 +5221,16 @@ pub(crate) fn sandbox_run_with_stores(
     sandbox_run_with_stores_and_stdin(options, None, store, toolchain_store)
 }
 
+#[cfg(not(feature = "sandbox"))]
+pub(crate) fn sandbox_process_plan_with_stores(
+    _options: SandboxProcessPlanOptions,
+    _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    _toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+#[cfg(feature = "sandbox")]
 pub(crate) fn sandbox_process_plan_with_stores(
     options: SandboxProcessPlanOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
@@ -5308,6 +5373,17 @@ pub(crate) fn sandbox_shell_with_daemon(
     )
 }
 
+#[cfg(not(feature = "sandbox"))]
+pub(crate) fn sandbox_run_with_stores_and_stdin(
+    _options: SandboxRunOptions,
+    _stdin: Option<Vec<u8>>,
+    _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    _toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+#[cfg(feature = "sandbox")]
 pub(crate) fn sandbox_run_with_stores_and_stdin(
     options: SandboxRunOptions,
     stdin: Option<Vec<u8>>,

@@ -1,7 +1,6 @@
 use crate::internal::*;
 
-#[cfg(test)]
-pub(crate) const BUSYBOX_WASI_CONFIG_FRAGMENT: &str =
+pub const BUSYBOX_WASI_CONFIG_FRAGMENT: &str =
     include_str!("../toolchains/busybox/busybox-wasi.fragment");
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]

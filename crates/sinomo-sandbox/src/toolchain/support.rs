@@ -151,7 +151,7 @@ impl Default for SandboxModuleHasher {
     }
 }
 
-pub(crate) fn validate_toolchain_command_name(name: &str) -> Result<(), SandboxToolchainError> {
+pub fn validate_toolchain_command_name(name: &str) -> Result<(), SandboxToolchainError> {
     if name.is_empty()
         || name == "."
         || name == ".."
@@ -168,7 +168,7 @@ pub(crate) fn validate_toolchain_command_name(name: &str) -> Result<(), SandboxT
     Ok(())
 }
 
-pub(crate) fn validate_toolchain_artifact_relative_path(
+pub fn validate_toolchain_artifact_relative_path(
     path: &str,
 ) -> Result<String, SandboxToolchainError> {
     let trimmed = path.trim();

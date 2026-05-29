@@ -2220,6 +2220,26 @@ pub fn handle_daemon_sandbox_run_process_plan(
     handle_daemon_sandbox_run_process_plan_with_output_sink(paths, request, None)
 }
 
+/// Error returned by sandbox-execution RPC handlers when the daemon was built
+/// without the `sandbox` feature, so the build-heavy `sinomo-sandbox-runtime`
+/// backend is not linked in.
+#[cfg(not(feature = "sandbox"))]
+fn sandbox_runtime_not_compiled_error() -> DaemonError {
+    DaemonError::Parse {
+        detail: "sandbox runtime not compiled in; rebuild with `--features sandbox`".to_string(),
+    }
+}
+
+#[cfg(not(feature = "sandbox"))]
+fn handle_daemon_sandbox_run_process_plan_with_output_sink(
+    _paths: &DaemonPaths,
+    _request: sinomo_sandbox::SandboxRunProcessPlanRequest,
+    _output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
+) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+#[cfg(feature = "sandbox")]
 fn handle_daemon_sandbox_run_process_plan_with_output_sink(
     paths: &DaemonPaths,
     request: sinomo_sandbox::SandboxRunProcessPlanRequest,
@@ -2257,7 +2277,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink(
         dfs = store.into_inner();
         manifest.command_history
     };
-    let runner = sinomo_sandbox::SifsStagedSandboxCommandRunner::new()
+    let runner = sinomo_sandbox_runtime::SifsStagedSandboxCommandRunner::new()
         .map_err(|source| DaemonError::Parse {
             detail: source.to_string(),
         })?
@@ -2417,6 +2437,16 @@ fn append_daemon_sandbox_new_command_record_events<T: sinomo_network::NetworkTra
     Ok(())
 }
 
+#[cfg(not(feature = "sandbox"))]
+fn handle_daemon_sandbox_run_toolchain_with_output_sink(
+    _paths: &DaemonPaths,
+    _request: sinomo_sandbox::SandboxRunToolchainRequest,
+    _output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
+) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+#[cfg(feature = "sandbox")]
 fn handle_daemon_sandbox_run_toolchain_with_output_sink(
     paths: &DaemonPaths,
     request: sinomo_sandbox::SandboxRunToolchainRequest,
@@ -2448,7 +2478,7 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink(
     let local_store = sinomo_sandbox::LocalSandboxInstanceStore::new(
         data_dir.join("sandbox").join("tmp").join("daemon-staging"),
     );
-    let runner = sinomo_sandbox::SifsStagedSandboxCommandRunner::new()
+    let runner = sinomo_sandbox_runtime::SifsStagedSandboxCommandRunner::new()
         .map_err(|source| DaemonError::Parse {
             detail: source.to_string(),
         })?

@@ -172,7 +172,7 @@ impl LocalSandboxFileSystem {
         }
     }
 
-    pub(crate) fn host_path(&self, path: &SandboxPath) -> Result<PathBuf, SandboxFsError> {
+    pub fn host_path(&self, path: &SandboxPath) -> Result<PathBuf, SandboxFsError> {
         if path.as_str() == "/" {
             return Ok(self.layout.root.clone());
         }

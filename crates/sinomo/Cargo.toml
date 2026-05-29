@@ -10,8 +10,9 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "application"
 [features]
-default = ["wasix-runtime"]
-wasix-runtime = ["sinomo-cli/wasix-runtime"]
+# Enable the build-heavy wasm sandbox runtime. OFF by default so `cargo build -p
+# sinomo` skips wasmtime/wasmer; build with `--features sandbox` for the full runtime.
+sandbox = ["sinomo-cli/sandbox"]
 
 [dependencies]
 sinomo-cli = { path = "../sinomo-cli" }

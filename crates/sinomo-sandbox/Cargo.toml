@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-sandbox"
 version.workspace = true
-description = "Sinomo SIFS-backed agent sandbox contracts"
+description = "Sinomo SIFS-backed agent sandbox contracts (types, paths, policy, capabilities)"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
@@ -10,20 +10,6 @@ include = ["**/*.rs", "Cargo.toml", "toolchains/**"]
 
 [package.metadata.sinomo]
 ring = "r1"
-
-[features]
-default = ["wasix-runtime"]
-wasix-runtime = [
-    "dep:tokio",
-    "dep:virtual-fs",
-    "dep:virtual-mio",
-    "dep:wasmer",
-    "dep:wasmer-types",
-    "dep:wasmer-vm",
-    "dep:wasmer-wasix",
-    "dep:wasmparser",
-    "dep:webc",
-]
 
 [dependencies]
 blake3.workspace = true
@@ -42,17 +28,3 @@ sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-storage = { path = "../sinomo-storage" }
-wasmtime = { version = "41.0.4", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
-wasmtime-wasi = { version = "41.0.4", default-features = false, features = ["p1"] }
-tokio = { version = "1.44", features = ["rt-multi-thread", "time"], optional = true }
-virtual-fs = { version = "0.700.0-alpha.2", default-features = false, features = ["host-fs"], optional = true }
-virtual-mio = { version = "0.700.0-alpha.2", default-features = false, optional = true }
-wasmer = { version = "=7.0.0-alpha.2", default-features = false, features = ["sys-default", "cranelift", "experimental-async"], optional = true }
-wasmer-types = { version = "=7.0.0-alpha.2", default-features = false, optional = true }
-wasmer-vm = { version = "=7.0.0-alpha.2", default-features = false, optional = true }
-wasmer-wasix = { version = "0.700.0-alpha.2", default-features = false, features = ["sys-minimal", "host-fs", "host-vnet"], optional = true }
-wasmparser = { version = "0.244.0", default-features = false, optional = true }
-webc = { version = "10.0.1", default-features = false, optional = true }
-
-[dev-dependencies]
-wat = "1.248.0"

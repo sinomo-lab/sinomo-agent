@@ -82,7 +82,7 @@ pub(crate) fn ensure_host_path_is_within(
     Ok(())
 }
 
-pub(crate) fn reject_symlink_chain(
+pub fn reject_symlink_chain(
     host_path: &Path,
     sandbox_path: &SandboxPath,
 ) -> Result<(), SandboxFsError> {

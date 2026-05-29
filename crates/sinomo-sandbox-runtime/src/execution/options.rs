@@ -54,19 +54,6 @@ impl fmt::Debug for SandboxWasiVirtualPreopen {
     }
 }
 
-pub trait SandboxOutputSink: Send + Sync {
-    fn output_chunk(&self, chunk: SandboxOutputChunk);
-}
-
-impl<F> SandboxOutputSink for F
-where
-    F: Fn(SandboxOutputChunk) + Send + Sync,
-{
-    fn output_chunk(&self, chunk: SandboxOutputChunk) {
-        self(chunk)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxWasixCommandOverride {
     pub name: String,

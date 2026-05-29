@@ -1,6 +1,6 @@
 use crate::internal::*;
 
-pub(crate) fn sandbox_command_record_status_for_wasi_error(
+pub fn sandbox_command_record_status_for_wasi_error(
     error: &SandboxWasiError,
 ) -> SandboxCommandRecordStatus {
     match error {
@@ -49,12 +49,4 @@ pub enum SandboxWasiError {
     OutputLimitExceeded { limit: usize },
     #[error("sandbox WASI runtime error: {detail}")]
     Runtime { detail: String },
-}
-
-impl SandboxWasiError {
-    pub(crate) fn from_wasmtime(error: wasmtime::Error) -> Self {
-        Self::Runtime {
-            detail: format!("{error:?}"),
-        }
-    }
 }

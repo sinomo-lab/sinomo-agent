@@ -23,10 +23,10 @@ incremental = false
 opt-level = 2
 
 [patch.crates-io]
-virtual-fs = { path = "crates/sinomo-sandbox/vendor/virtual-fs" }
-wasmer-compiler = { path = "crates/sinomo-sandbox/vendor/wasmer-compiler" }
-wasmer-vm = { path = "crates/sinomo-sandbox/vendor/wasmer-vm" }
-wasmer-wasix = { path = "crates/sinomo-sandbox/vendor/wasmer-wasix" }
+virtual-fs = { path = "crates/sinomo-sandbox-runtime/vendor/virtual-fs" }
+wasmer-compiler = { path = "crates/sinomo-sandbox-runtime/vendor/wasmer-compiler" }
+wasmer-vm = { path = "crates/sinomo-sandbox-runtime/vendor/wasmer-vm" }
+wasmer-wasix = { path = "crates/sinomo-sandbox-runtime/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
 blake3 = "1.5"

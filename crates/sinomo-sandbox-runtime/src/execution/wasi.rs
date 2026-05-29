@@ -1,6 +1,6 @@
 use crate::internal::*;
 
-use super::SandboxWasiError;
+use crate::SandboxWasiError;
 use virtual_fs::FileSystem as _;
 
 #[derive(Clone)]

@@ -52,7 +52,7 @@ pub fn persist_command_outputs<F: SandboxFileSystem>(
     persist_command_record(sandbox_fs, record)
 }
 
-pub(crate) fn record_local_command_history(
+pub fn record_local_command_history(
     store: &LocalSandboxInstanceStore,
     sandbox_id: &SandboxId,
     command_id: &SandboxCommandId,

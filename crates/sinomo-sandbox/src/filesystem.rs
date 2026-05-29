@@ -9,9 +9,9 @@ mod virtual_devices;
 
 pub use local::{LocalSandboxFileSnapshot, LocalSandboxFileSystem};
 pub use sifs::SifsSandboxFileSystem;
+pub use support::reject_symlink_chain;
 pub(crate) use support::{
-    normalize_sandbox_sifs_root, reject_symlink_chain, sandbox_store_error_from_dfs,
-    sandbox_toolchain_error_from_dfs,
+    normalize_sandbox_sifs_root, sandbox_store_error_from_dfs, sandbox_toolchain_error_from_dfs,
 };
 pub use types::*;
 pub use usage::{
