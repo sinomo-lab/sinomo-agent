@@ -1172,9 +1172,9 @@ fn raft_command_targets_keep_degraded_direct_before_iroh() {
 }
 
 #[test]
-fn raft_command_targets_prefer_fresh_online_voter_before_stale_voter() {
+fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
     let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-route-stale-voter-{}",
+        "sinomo-network-raft-route-unreachable-voter-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -1185,23 +1185,26 @@ fn raft_command_targets_prefer_fresh_online_voter_before_stale_voter() {
     paths.ensure().expect("paths");
     let now = OffsetDateTime::now_utc();
     let cluster_id =
-        ClusterId::from_legacy_named("cluster_network_raft_stale_voter").expect("cluster");
-    let local = NodeId::from_legacy_named("node_network_raft_stale_voter_local").expect("local");
-    let fresh = NodeId::from_legacy_named("node_network_raft_stale_voter_fresh").expect("fresh");
-    let stale = NodeId::from_legacy_named("node_network_raft_stale_voter_stale").expect("stale");
+        ClusterId::from_legacy_named("cluster_network_raft_unreachable_voter").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_raft_unreachable_voter_local").expect("local");
+    let reachable = NodeId::from_legacy_named("node_network_raft_unreachable_voter_reachable")
+        .expect("reachable");
+    let unreachable = NodeId::from_legacy_named("node_network_raft_unreachable_voter_unreachable")
+        .expect("unreachable");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
-        "network raft stale voter",
+        "network raft unreachable voter",
         local.clone(),
         "local",
         "pk-local",
         now,
     );
-    let fresh_endpoint = daemon_lan_endpoint(&fresh, "198.18.0.76:21353".to_string(), 10);
-    let stale_endpoint = daemon_lan_endpoint(&stale, "10.0.0.15:21353".to_string(), 10);
+    let reachable_endpoint = daemon_lan_endpoint(&reachable, "198.18.0.76:21353".to_string(), 10);
+    let unreachable_endpoint = daemon_lan_endpoint(&unreachable, "10.0.0.15:21353".to_string(), 10);
     for (node_id, endpoint) in [
-        (fresh.clone(), fresh_endpoint.clone()),
-        (stale.clone(), stale_endpoint.clone()),
+        (reachable.clone(), reachable_endpoint.clone()),
+        (unreachable.clone(), unreachable_endpoint.clone()),
     ] {
         let mut member =
             ClusterMemberRecord::local_voter(cluster_id.clone(), node_id, "remote", "pk", now);
@@ -1212,10 +1215,11 @@ fn raft_command_targets_prefer_fresh_online_voter_before_stale_voter() {
     }
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
-    for (node_id, observed_at) in [
-        (fresh.clone(), now),
-        (stale.clone(), now - time::Duration::seconds(300)),
-    ] {
+    // Both voters are equally Online — node-status observed_at is no longer a
+    // routing/liveness signal — so the preference comes from the active
+    // connectivity probes: the reachable peer must outrank the one the probes can
+    // no longer reach.
+    for node_id in [reachable.clone(), unreachable.clone()] {
         sync_cluster_node_status_to_kv(
             &paths,
             ClusterNodeStatusRecord {
@@ -1233,17 +1237,46 @@ fn raft_command_targets_prefer_fresh_online_voter_before_stale_voter() {
                 executable: Some("sinomo".to_string()),
                 rollout: None,
                 daemon_started_at: None,
-                observed_at,
+                observed_at: now,
             },
         )
         .expect("sync status");
     }
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &state.local_node_id,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &reachable_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(9),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                300,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &unreachable_endpoint,
+                ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("failed".to_string()),
+                now,
+                300,
+            ),
+        ],
+    )
+    .expect("sync connectivity");
 
     let targets = cluster_raft_command_targets(&paths, &state);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.node_id),
-        Some(&fresh)
+        Some(&reachable)
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -2690,6 +2723,9 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
         .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, lan.endpoint_id);
 
+    // A route must fail CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES (3)
+    // consecutive probes before it is demoted below a healthier fallback; a single
+    // failure keeps the preferred LAN route to avoid flapping.
     sync_cluster_connectivity_records_to_kv(
         &paths,
         &state.local_node_id,
@@ -2698,7 +2734,7 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
             &lan,
             ClusterConnectivityState::Unreachable,
             None,
-            1,
+            3,
             None,
             Some("failed".to_string()),
             now,
@@ -2719,7 +2755,7 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
                 &lan,
                 ClusterConnectivityState::Unreachable,
                 None,
-                1,
+                3,
                 None,
                 Some("failed".to_string()),
                 now,
@@ -2730,7 +2766,7 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
                 &public,
                 ClusterConnectivityState::Unreachable,
                 None,
-                1,
+                3,
                 None,
                 Some("failed".to_string()),
                 now,
@@ -3792,7 +3828,11 @@ fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
     paths.ensure().expect("cluster paths");
     let node_id = NodeId::from_legacy_named("node_raft_snapshot_events").expect("node");
 
-    for index in 0..(MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS + 80) {
+    // Compaction only fires once the un-snapshotted applied tail exceeds
+    // 2 * RAFT_COMPACTION_RETAINED_ENTRIES, so commit well past that watermark for a
+    // snapshot to be written at all; compaction then truncates the snapshot's event
+    // history to MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS.
+    for index in 0..(2 * sinomo_kv::RAFT_COMPACTION_RETAINED_ENTRIES as usize + 80) {
         let entry = append_cluster_raft_command_uncommitted(
             &paths,
             &node_id,
