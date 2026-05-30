@@ -44,8 +44,10 @@ const SINOMO_WASIX_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "wasix-runtime")]
 fn bundled_wasm_opt_path() -> Option<PathBuf> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("toolchains")
+    // The toolchain assets are bundled in the sinomo-sandbox (contracts) crate's
+    // source tree, so resolve them through its helper rather than this crate's
+    // CARGO_MANIFEST_DIR.
+    let path = crate::bundled_toolchains_dir()
         .join("python")
         .join("work-wasix")
         .join("binaryen-version_124")

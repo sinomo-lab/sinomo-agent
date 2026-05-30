@@ -10,6 +10,15 @@ pub fn sandbox_instance_root(sandbox_id: &SandboxId) -> String {
     format!("{SIFS_SANDBOX_ROOT}/instances/{sandbox_id}")
 }
 
+/// Absolute path to this crate's bundled sandbox toolchain assets (busybox /
+/// python / etc. wasm modules plus the Binaryen `wasm-opt` binary the WASIX
+/// runner uses for asyncify). The assets live in the contracts crate's source
+/// tree, so they are resolved relative to *its* manifest dir — the runtime crate
+/// reaches them through this helper rather than its own `CARGO_MANIFEST_DIR`.
+pub fn bundled_toolchains_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("toolchains")
+}
+
 pub fn sandbox_manifest_path(sandbox_id: &SandboxId) -> String {
     format!("{}/manifest.sobj", sandbox_instance_root(sandbox_id))
 }
