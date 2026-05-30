@@ -12,8 +12,8 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
-base64 = "0.22"
 serde.workspace = true
+serde_bytes = "0.11"
 serde_json.workspace = true
 time.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }

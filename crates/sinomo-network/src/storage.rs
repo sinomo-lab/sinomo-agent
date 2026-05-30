@@ -280,8 +280,8 @@ pub struct ClusterRolloutDesiredRecord {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_head: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_bundle_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub source_bundle: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_repo: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1745,7 +1745,7 @@ pub fn sync_cluster_state_to_local_raft_unchecked(
                 source: None,
                 mode: None,
                 source_head: None,
-                source_bundle_base64: None,
+                source_bundle: None,
                 remote_repo: None,
                 host: None,
                 port: None,

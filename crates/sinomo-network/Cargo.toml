@@ -19,6 +19,7 @@ iroh-transport = ["dep:iroh"]
 base64 = "0.22"
 ring = "0.17"
 serde.workspace = true
+serde_bytes = "0.11"
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true

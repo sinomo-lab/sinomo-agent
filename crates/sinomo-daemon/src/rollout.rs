@@ -6,7 +6,6 @@ use crate::{
     spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     start_daemon_iroh_proxy_if_clustered, start_shadow_daemon_status_publisher,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sinomo_core::ClusterNodeRolloutStatus;
 use sinomo_network::is_loopback_connect_address;
 #[cfg(test)]
@@ -781,11 +780,7 @@ pub fn handle_daemon_rollout_binary_request(
 
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
-    let binary = URL_SAFE_NO_PAD
-        .decode(request.binary_base64.as_bytes())
-        .map_err(|source| DaemonError::Parse {
-            detail: format!("invalid rollout binary encoding: {source}"),
-        })?;
+    let binary = request.binary;
     let main_binary = rollout_paths.main_binary.clone();
     let shadow_binary = rollout_paths.shadow_binary.clone();
     let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
@@ -1492,12 +1487,7 @@ pub fn handle_daemon_rollout_build_request(
     let data_dir = daemon_data_dir(paths)?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
-    let repo = if let Some(bundle_base64) = request.source_bundle_base64.as_deref() {
-        let bundle_bytes = URL_SAFE_NO_PAD
-            .decode(bundle_base64.as_bytes())
-            .map_err(|source| DaemonError::Parse {
-                detail: format!("invalid rollout source bundle encoding: {source}"),
-            })?;
+    let repo = if let Some(bundle_bytes) = request.source_bundle.as_deref() {
         let bundle_path = rollout_paths
             .root
             .join("staged")

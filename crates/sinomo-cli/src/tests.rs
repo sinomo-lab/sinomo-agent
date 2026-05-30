@@ -12193,7 +12193,7 @@ fn daemon_rollout_build_rejects_missing_remote_repo() {
     let request = ClusterRolloutBuildRequest {
         source: "test".to_string(),
         remote_repo: None,
-        source_bundle_base64: None,
+        source_bundle: None,
         source_head: None,
         host: "127.0.0.1".to_string(),
         port: 21_353,
@@ -12280,9 +12280,7 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
     let request = ClusterRolloutBuildRequest {
         source: "test".to_string(),
         remote_repo: None,
-        source_bundle_base64: Some(
-            super::URL_SAFE_NO_PAD.encode(std::fs::read(&bundle).expect("bundle bytes")),
-        ),
+        source_bundle: Some(std::fs::read(&bundle).expect("bundle bytes")),
         source_head: Some(expected_head.clone()),
         host: "127.0.0.1".to_string(),
         port: 21_353,

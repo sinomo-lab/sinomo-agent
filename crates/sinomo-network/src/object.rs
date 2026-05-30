@@ -336,3 +336,55 @@ where
     }
     SinomoObjectCodec::default().decode(&bytes)
 }
+
+#[cfg(test)]
+mod serde_bytes_tests {
+    use super::SinomoObjectCodec;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct BundleRecord {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+        payload: Option<Vec<u8>>,
+    }
+
+    #[test]
+    fn serde_bytes_option_round_trips_through_sobj_as_raw_blob() {
+        // Representative binary payload: full byte range, not valid UTF-8.
+        let payload: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let record = BundleRecord {
+            name: "bundle".to_string(),
+            payload: Some(payload.clone()),
+        };
+
+        let encoded = SinomoObjectCodec::default().encode(&record).expect("encode");
+        let decoded: BundleRecord =
+            SinomoObjectCodec::default().decode(&encoded).expect("decode");
+        assert_eq!(decoded, record);
+
+        // Stored as a native SOBJ bytes blob, not base64: the encoding stays
+        // close to the raw payload (base64 of 4096 would be ~5462 bytes)...
+        assert!(
+            encoded.len() < payload.len() + 256,
+            "expected ~raw payload size (no base64 inflation), got {} for {} payload bytes",
+            encoded.len(),
+            payload.len()
+        );
+        // ...and the raw bytes appear verbatim in the stream (impossible if base64'd).
+        assert!(
+            encoded.windows(payload.len()).any(|w| w == payload.as_slice()),
+            "raw payload bytes must be embedded verbatim"
+        );
+
+        // `None` is skipped on the wire and round-trips.
+        let none = BundleRecord {
+            name: "x".to_string(),
+            payload: None,
+        };
+        let encoded_none = SinomoObjectCodec::default().encode(&none).expect("encode none");
+        let decoded_none: BundleRecord =
+            SinomoObjectCodec::default().decode(&encoded_none).expect("decode none");
+        assert_eq!(decoded_none, none);
+    }
+}

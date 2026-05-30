@@ -393,7 +393,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         requested_at.clone(),
     );
     let mut binary_request: Option<ClusterRolloutBinaryRequest> = None;
-    let mut source_bundle: Option<(String, String)> = None;
+    let mut source_bundle: Option<(Vec<u8>, String)> = None;
     let mut desired_source_head = None;
     if options.targets.is_empty() && options.remote_build && options.remote_repo.is_none() {
         let repo = rollout_source_repo_from_options(&options)?;
@@ -439,10 +439,10 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             let mut request = build_request.clone();
             if request.remote_repo.is_none() {
                 if source_bundle.is_none() {
-                    source_bundle = Some(rollout_source_bundle_base64(&options)?);
+                    source_bundle = Some(rollout_source_bundle(&options)?);
                 }
                 if let Some((bundle, head)) = source_bundle.as_ref() {
-                    request.source_bundle_base64 = Some(bundle.clone());
+                    request.source_bundle = Some(bundle.clone());
                     request.source_head = Some(head.clone());
                 }
             }
@@ -531,7 +531,7 @@ fn publish_cluster_rollout_desired(
         source: Some(source.to_string()),
         mode: Some("cluster-remote-build".to_string()),
         source_head: source_head.map(str::to_string),
-        source_bundle_base64: None,
+        source_bundle: None,
         remote_repo: options.remote_repo.clone(),
         host: Some(options.host.clone()),
         port: Some(options.port),
@@ -568,12 +568,12 @@ fn publish_cluster_rollout_desired(
     Ok(())
 }
 
-pub(crate) fn rollout_source_bundle_base64(
+pub(crate) fn rollout_source_bundle(
     options: &RolloutOptions,
-) -> Result<(String, String), CliError> {
+) -> Result<(Vec<u8>, String), CliError> {
     let repo = rollout_source_repo_from_options(options)?;
     let paths = rollout_paths_from_defaults()?;
-    prepare_rollout_source_bundle_base64(&paths, &repo).map_err(Into::into)
+    prepare_rollout_source_bundle(&paths, &repo).map_err(Into::into)
 }
 
 pub(crate) fn rollout_prepare_dev_binary(options: &RolloutOptions) -> Result<PathBuf, CliError> {

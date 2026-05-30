@@ -32,10 +32,10 @@ pub use protocol::{
 };
 pub use source::{
     LocalRolloutArtifacts, ManagedSourceStatus, RolloutStatusView, create_source_repo_bundle,
-    create_source_repo_bundle_base64, deploy_managed_source_bundle, deploy_managed_source_repo,
+    create_source_repo_bundle_bytes, deploy_managed_source_bundle, deploy_managed_source_repo,
     deploy_managed_source_repo_or_current, discover_current_git_repo, ensure_rollout_source_repo,
     managed_source_status, prepare_local_rollout_artifacts, prepare_rollout_dev_binary,
-    prepare_rollout_source_bundle_base64, remove_dir_if_exists, rollout_artifact_suffix,
+    prepare_rollout_source_bundle, remove_dir_if_exists, rollout_artifact_suffix,
     rollout_build_dev_binary, rollout_remote_repo_path, rollout_source_head, rollout_status_view,
     source_heads_match, stage_local_rollout_artifacts, sync_external_repo_from_managed,
 };

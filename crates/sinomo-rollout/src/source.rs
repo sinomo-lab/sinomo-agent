@@ -2,7 +2,6 @@ use crate::{
     RolloutError, SelfRolloutPaths, ensure_rollout_layout, rollout_staged_main_binary,
     rollout_staged_shadow_binary, stage_rollout_file,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::env;
 use std::fs;
 use std::io;
@@ -174,10 +173,10 @@ pub fn ensure_rollout_source_repo(
     deploy_managed_source_repo_or_current(paths, repo).map(|_| ())
 }
 
-pub fn create_source_repo_bundle_base64(
+pub fn create_source_repo_bundle_bytes(
     paths: &SelfRolloutPaths,
     repo: &Path,
-) -> Result<(String, String), RolloutError> {
+) -> Result<(Vec<u8>, String), RolloutError> {
     let bundle = paths
         .root
         .join("staged")
@@ -187,15 +186,15 @@ pub fn create_source_repo_bundle_base64(
         path: bundle.display().to_string(),
         detail: source.to_string(),
     })?;
-    Ok((URL_SAFE_NO_PAD.encode(bytes), rollout_source_head(repo)?))
+    Ok((bytes, rollout_source_head(repo)?))
 }
 
-pub fn prepare_rollout_source_bundle_base64(
+pub fn prepare_rollout_source_bundle(
     paths: &SelfRolloutPaths,
     repo: &Path,
-) -> Result<(String, String), RolloutError> {
+) -> Result<(Vec<u8>, String), RolloutError> {
     ensure_rollout_layout(paths)?;
-    create_source_repo_bundle_base64(paths, repo)
+    create_source_repo_bundle_bytes(paths, repo)
 }
 
 pub fn deploy_managed_source_repo(
@@ -700,8 +699,8 @@ mod tests {
     }
 
     #[test]
-    fn create_source_repo_bundle_base64_returns_bundle_and_head() {
-        let root = unique_temp("sinomo-rollout-source-bundle-base64");
+    fn create_source_repo_bundle_bytes_returns_bundle_and_head() {
+        let root = unique_temp("sinomo-rollout-source-bundle-bytes");
         let external = root.join("external");
         let data = root.join("data");
         fs::create_dir_all(&external).expect("external dir");
@@ -715,7 +714,7 @@ mod tests {
             git_one_line(&external, &["rev-parse", "--short=8", "HEAD"]).expect("head");
 
         let paths = SelfRolloutPaths::new(&data);
-        let (bundle, head) = create_source_repo_bundle_base64(&paths, &external).expect("bundle");
+        let (bundle, head) = create_source_repo_bundle_bytes(&paths, &external).expect("bundle");
 
         assert!(!bundle.is_empty());
         assert_eq!(head, expected_head);

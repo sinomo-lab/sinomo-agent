@@ -1236,7 +1236,7 @@ impl ClusterNetworkMaintenance {
         };
         if desired.state != "active"
             || desired.mode.as_deref() != Some("cluster-remote-build")
-            || (desired.source_bundle_base64.is_none() && desired.remote_repo.is_none())
+            || (desired.source_bundle.is_none() && desired.remote_repo.is_none())
         {
             return Ok(());
         }
@@ -1288,7 +1288,7 @@ impl ClusterNetworkMaintenance {
                     .source
                     .unwrap_or_else(|| "cluster desired rollout".to_string()),
                 remote_repo: desired.remote_repo,
-                source_bundle_base64: desired.source_bundle_base64,
+                source_bundle: desired.source_bundle,
                 source_head: desired.source_head,
                 host: desired
                     .host

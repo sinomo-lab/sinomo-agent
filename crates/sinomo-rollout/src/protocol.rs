@@ -1,5 +1,4 @@
 use crate::RolloutError;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointPrivacy};
 use std::path::{Path, PathBuf};
@@ -7,7 +6,8 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRolloutBinaryRequest {
     pub source: String,
-    pub binary_base64: String,
+    #[serde(with = "serde_bytes")]
+    pub binary: Vec<u8>,
     #[serde(default)]
     pub target_os: String,
     #[serde(default)]
@@ -23,8 +23,8 @@ pub struct ClusterRolloutBuildRequest {
     pub source: String,
     #[serde(default)]
     pub remote_repo: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_bundle_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub source_bundle: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_head: Option<String>,
     pub host: String,
@@ -57,7 +57,7 @@ pub fn prepare_cluster_rollout_binary_request(
     })?;
     Ok(ClusterRolloutBinaryRequest {
         source: source.into(),
-        binary_base64: URL_SAFE_NO_PAD.encode(binary_bytes),
+        binary: binary_bytes,
         target_os: std::env::consts::OS.to_string(),
         target_arch: std::env::consts::ARCH.to_string(),
         host: host.into(),
@@ -78,7 +78,7 @@ pub fn prepare_cluster_rollout_build_request(
     ClusterRolloutBuildRequest {
         source: source.into(),
         remote_repo,
-        source_bundle_base64: None,
+        source_bundle: None,
         source_head: None,
         host: host.into(),
         port,
@@ -169,10 +169,7 @@ mod tests {
         .expect("request");
 
         assert_eq!(request.source, "source");
-        assert_eq!(
-            request.binary_base64,
-            URL_SAFE_NO_PAD.encode(b"binary-bytes")
-        );
+        assert_eq!(request.binary, b"binary-bytes".to_vec());
         assert_eq!(request.host, "127.0.0.1");
         assert_eq!(request.port, 21353);
         assert_eq!(request.shadow_port, 21354);
@@ -194,7 +191,7 @@ mod tests {
 
         assert_eq!(request.source, "source");
         assert_eq!(request.remote_repo, Some(PathBuf::from("/repo")));
-        assert_eq!(request.source_bundle_base64, None);
+        assert_eq!(request.source_bundle, None);
         assert_eq!(request.source_head, None);
         assert_eq!(request.host, "127.0.0.1");
         assert_eq!(request.port, 21353);
