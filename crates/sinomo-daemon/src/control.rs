@@ -25,7 +25,9 @@ use sinomo_sandbox::SandboxFileSystem;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, mpsc};
+#[cfg(feature = "sandbox")]
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -37,19 +39,26 @@ pub const DAEMON_ACCEPT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
+// The sandbox concurrency tracker is only exercised by the sandbox-exec RPC
+// handlers below, which are gated on the `sandbox` feature. Gate it to match so
+// the default (sandbox-off) build does not carry it as dead code.
+#[cfg(feature = "sandbox")]
 static SANDBOX_ACTIVE_EXECUTIONS: OnceLock<Mutex<SandboxActiveExecutions>> = OnceLock::new();
 
+#[cfg(feature = "sandbox")]
 #[derive(Default)]
 struct SandboxActiveExecutions {
     counts: BTreeMap<(PathBuf, sinomo_sandbox::SandboxId), u64>,
 }
 
+#[cfg(feature = "sandbox")]
 #[derive(Debug)]
 struct SandboxActiveExecutionGuard {
     root: PathBuf,
     sandbox_id: sinomo_sandbox::SandboxId,
 }
 
+#[cfg(feature = "sandbox")]
 impl Drop for SandboxActiveExecutionGuard {
     fn drop(&mut self) {
         let Some(lock) = SANDBOX_ACTIVE_EXECUTIONS.get() else {
@@ -68,6 +77,7 @@ impl Drop for SandboxActiveExecutionGuard {
     }
 }
 
+#[cfg(feature = "sandbox")]
 fn acquire_sandbox_active_execution(
     paths: &DaemonPaths,
     sandbox_id: &sinomo_sandbox::SandboxId,
@@ -2367,6 +2377,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink(
     Ok(process)
 }
 
+#[cfg(feature = "sandbox")]
 fn append_daemon_sandbox_new_command_record_events<T: sinomo_network::NetworkTransport>(
     event_store: &mut sinomo_events::JsonlEventStore,
     node_id: sinomo_node::NodeId,
@@ -2549,6 +2560,7 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink(
     Ok(command)
 }
 
+#[cfg(feature = "sandbox")]
 fn append_daemon_sandbox_command_events<T: sinomo_network::NetworkTransport>(
     event_store: &mut sinomo_events::JsonlEventStore,
     node_id: sinomo_node::NodeId,
