@@ -3302,6 +3302,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(feature = "sandbox")]
     #[test]
     fn sandbox_active_execution_guard_enforces_policy_limits_and_releases() {
         let root = std::env::temp_dir().join(format!(
