@@ -4787,12 +4787,24 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if let Some(expected_base_version) = expected_base_version
             && &current.version != expected_base_version
         {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "stale DFS {operation} base for {object_id}: expected {}, current {}, command {}",
-                    expected_base_version, current.version, version
-                ),
-            });
+            // Content is addressed by hash, so a repair/stage carrying the exact
+            // bytes the object *currently* references is never stale in a harmful
+            // way — even when the version label advanced past `version`. This
+            // happens when a metadata-only change bumps the version (chmod, chown,
+            // utimes, hardlink/rename) while leaving content unchanged: the
+            // content repair queued for the older version would otherwise be
+            // rejected here as a stale base, dropping the only copy of the
+            // content-addressed blob the replica needs to serve the current
+            // version. Accept it; a genuinely stale write carries a different hash
+            // and is still rejected below.
+            if current.content_hash.as_deref() != Some(content_hash) {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "stale DFS {operation} base for {object_id}: expected {}, current {}, command {}",
+                        expected_base_version, current.version, version
+                    ),
+                });
+            }
         }
         if current.version == *version
             && let Some(current_hash) = current.content_hash.as_deref()
