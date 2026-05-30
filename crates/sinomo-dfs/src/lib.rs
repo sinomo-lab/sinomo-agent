@@ -14530,6 +14530,74 @@ mod tests {
     }
 
     #[test]
+    fn repair_replica_accepts_stale_base_when_content_hash_matches_current() {
+        // Regression: a metadata-only version bump (chmod/chown/utimes/hardlink/
+        // rename) advances an object past the version a queued content repair
+        // targets, while leaving content unchanged. The repair's base no longer
+        // matches current, but its content hash equals what the current version
+        // still references. Content is addressed by hash, so the repair must be
+        // accepted -- otherwise the only copy of the content never reaches the
+        // replica and reads fail with NotFound despite metadata being present.
+        let root = temp_root("repair-stale-base-matching-content");
+        let owner = NodeId::from_legacy_named("node_stale_base_owner").expect("node");
+        let replica = NodeId::from_legacy_named("node_stale_base_replica").expect("node");
+        let object_id = DfsObjectId::from_legacy_named("obj_stale_base").expect("object");
+        let base_version = DfsVersion::from_legacy_named("version_0").expect("version");
+        let content_version = DfsVersion::from_legacy_named("version_1").expect("version");
+        let current_version = DfsVersion::from_legacy_named("version_2").expect("version");
+        let bytes = b"content unchanged across a metadata-only version bump";
+        let hash = content_hash(bytes);
+
+        // The replica's view of the object has already advanced to the
+        // metadata-only bump (version_2), still referencing the same content. The
+        // queued content repair, however, still targets the content write
+        // (version_1) whose intent based off version_0.
+        let mut metadata = file_metadata(owner.clone());
+        metadata.object_id = object_id.clone();
+        metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+        metadata.version = current_version.clone();
+        metadata.content_hash = Some(hash.clone());
+        metadata.current_locations = vec![owner.clone()];
+
+        let mut dfs = NetworkedDfsService::new(
+            ReceiveOnlyTransport::new(replica.clone()),
+            LocalContentStore::new(root.join("content")).expect("content"),
+        );
+
+        let event = dfs
+            .handle_repair_replica(
+                owner,
+                DfsRepairReplicaCommand {
+                    request_id: "dfs_net_req_stale_base".to_string(),
+                    intent_id: "dfs_intent_stale_base".to_string(),
+                    file_system_id: metadata.file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    expected_base_version: Some(base_version),
+                    version: content_version.clone(),
+                    content_hash: hash.clone(),
+                    bytes: bytes.to_vec(),
+                    object_metadata: Some(metadata),
+                },
+            )
+            .expect("repair with matching content hash should be accepted");
+
+        assert!(
+            matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { .. }),
+            "stale-base repair whose content matches current must commit"
+        );
+
+        let read = dfs
+            .read_local_object_with_state(&object_id, false)
+            .expect("read repaired object");
+        assert!(
+            matches!(read, NetworkedDfsReadOutcome::Found { data, .. } if data.bytes == bytes),
+            "replica must serve the repaired content-addressed blob"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn chunked_stage_to_unroutable_target_stops_after_first_unsent_chunk() {
         let root = temp_root("chunked-stage-unroutable-stops");
         let owner = NodeId::from_legacy_named("node_chunk_stage_owner").expect("node");
