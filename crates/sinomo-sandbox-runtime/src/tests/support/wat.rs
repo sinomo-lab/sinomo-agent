@@ -3347,12 +3347,12 @@ pub(in crate::tests) fn wasix_relative_create_remove_directory_module(
               (memory (export "memory") 1 128)
               (data (i32.const 96) "{escaped_directory}")
               (data (i32.const 192) "{escaped_child_name}")
-              (func $exit_if_errno (param $errno i32)
+              (func $exit_if_errno (param $errno i32) (param $code i32)
                 local.get $errno
                 i32.eqz
                 if
                 else
-                  local.get $errno
+                  local.get $code
                   call $proc_exit
                 end)
               (func $close_then_exit (param $fd i32) (param $step i32)
@@ -3451,12 +3451,12 @@ pub(in crate::tests) fn wasix_relative_create_rename_unlink_file_module(
               (data (i32.const 96) "{escaped_directory}")
               (data (i32.const 192) "{escaped_created_name}")
               (data (i32.const 288) "{escaped_renamed_name}")
-              (func $exit_if_errno (param $errno i32)
+              (func $exit_if_errno (param $errno i32) (param $code i32)
                 local.get $errno
                 i32.eqz
                 if
                 else
-                  local.get $errno
+                  local.get $code
                   call $proc_exit
                 end)
               (func (export "_start")
