@@ -309,23 +309,31 @@ impl LocalStagedSandboxCommandRunner {
             &limits,
             extra_preopens,
         );
+        // The WASIX virtual preopens hold only a Weak to this workspace
+        // filesystem, so a strong Arc must stay alive for the whole run — otherwise
+        // cwd validation and command file I/O upgrade a dead Weak and fail with
+        // "WASIX cwd `/work` is invalid: io error". Bind it here so it outlives the
+        // run below.
         #[cfg(feature = "wasix-runtime")]
-        if target_abi == SandboxWasiAbi::Wasix {
+        let _wasix_workspace_fs = if target_abi == SandboxWasiAbi::Wasix {
             wasi_options.preopened_dirs.retain(|preopen| {
                 !matches!(
                     preopen.guest_path.as_str(),
-                    "/root" | "/home" | "/tmp" | "/work" | "/logs" | "/artifacts"
+                    "/root" | "/home" | "/tmp" | "/work" | "/var" | "/logs" | "/artifacts"
                 )
             });
+            let workspace_fs =
+                Arc::new(std::sync::Mutex::new(LocalSandboxFileSystem::new(layout.clone())));
             wasi_options.virtual_preopened_dirs.extend(
                 runtime::wasix_sandbox_workspace_filesystem_preopens(
-                    Arc::new(std::sync::Mutex::new(LocalSandboxFileSystem::new(
-                        layout.clone(),
-                    ))),
+                    workspace_fs.clone(),
                     SandboxMountMode::ReadWrite,
                 ),
             );
-        }
+            Some(workspace_fs)
+        } else {
+            None
+        };
         wasi_options.allow_preview1_pinned_subprocesses = allow_preview1_pinned_subprocesses;
         wasi_options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
         wasi_options.wasix_instruction_metering = wasix_instruction_metering;
