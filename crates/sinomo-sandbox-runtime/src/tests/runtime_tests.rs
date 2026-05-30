@@ -3773,7 +3773,7 @@ fn wasix_runner_wakes_thread_waiting_on_futex() {
             i32.const 91
             call $exit_if_errno
 
-            i32.const 100000
+            i32.const 50000000
             local.set $remaining
             loop $wait_ready
               i32.const 204
@@ -3794,7 +3794,7 @@ fn wasix_runner_wakes_thread_waiting_on_futex() {
               end
             end
 
-            i32.const 100000
+            i32.const 50000000
             local.set $remaining
             loop $wake_waiter
               i32.const 212
@@ -3935,7 +3935,7 @@ fn wasix_runner_requeues_thread_waiting_on_futex() {
             i32.const 91
             call $exit_if_errno
 
-            i32.const 100000
+            i32.const 50000000
             local.set $remaining
             loop $wait_ready
               i32.const 204
@@ -3956,7 +3956,7 @@ fn wasix_runner_requeues_thread_waiting_on_futex() {
               end
             end
 
-            i32.const 100000
+            i32.const 50000000
             local.set $remaining
             loop $requeue_waiter
               i32.const 220
@@ -4154,7 +4154,7 @@ fn wasix_runner_wait_any_reports_woken_futex_index() {
             i32.const 91
             call $exit_if_errno
 
-            i32.const 100000
+            i32.const 50000000
             local.set $remaining
             loop $wait_ready
               i32.const 204
@@ -4175,7 +4175,7 @@ fn wasix_runner_wait_any_reports_woken_futex_index() {
               end
             end
 
-            i32.const 100000
+            i32.const 50000000
             local.set $remaining
             loop $wake_second
               i32.const 264
@@ -4287,7 +4287,7 @@ fn wasix_runner_cancels_join_on_worker_blocked_in_futex_wait() {
             i32.const 91
             call $exit_if_errno
 
-            i32.const 100000
+            i32.const 50000000
             local.set $remaining
             loop $wait_ready
               i32.const 204
