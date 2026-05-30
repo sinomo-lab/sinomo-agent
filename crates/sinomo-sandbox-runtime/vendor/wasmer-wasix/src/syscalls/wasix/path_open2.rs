@@ -561,12 +561,23 @@ pub(crate) fn path_open_internal(
                             identity.effective_uid,
                             identity.effective_gid,
                         ) {
-                            Ok(()) | Err(virtual_fs::FsError::Unsupported) => {}
+                            // Applying the sandbox identity to a freshly created
+                            // file is best-effort: a host-backed mount cannot chown
+                            // to a sandbox uid/gid without privileges (PermissionDenied),
+                            // and some backends do not support ownership at all
+                            // (Unsupported). A successfully created file must not be
+                            // rejected because this metadata could not be applied.
+                            Ok(())
+                            | Err(virtual_fs::FsError::Unsupported)
+                            | Err(virtual_fs::FsError::PermissionDenied) => {}
                             Err(error) => return Ok(Err(fs_error_into_wasi_err(error))),
                         }
                         let mode = 0o666 & !env.process.umask();
                         match state.fs.root_fs.set_mode(&new_file_host_path, mode) {
-                            Ok(()) => {}
+                            // Same best-effort contract as the ownership update above.
+                            Ok(())
+                            | Err(virtual_fs::FsError::Unsupported)
+                            | Err(virtual_fs::FsError::PermissionDenied) => {}
                             Err(error) => return Ok(Err(fs_error_into_wasi_err(error))),
                         }
                         (
