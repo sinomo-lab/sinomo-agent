@@ -1276,6 +1276,132 @@ mod tests {
         assert_eq!(data.len(), 12);
     }
 
+    // Golden byte-exact conformance tests. Round-trip tests only prove the encoder
+    // and decoder agree with each other; these pin the exact on-wire bytes to
+    // docs/sinomo-object-format.md so a systematic deviation (endianness, type-id
+    // values, field order, length width) is caught.
+
+    #[test]
+    fn golden_object_document_matches_spec_byte_layout() {
+        let document = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::Object(Object::new(vec![
+                Field::new("n", Value::Uint8(5)),
+                Field::new("s", Value::String("hi".to_owned())),
+            ])),
+        );
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x53, 0x4F, 0x42, 0x4A,       // magic "SOBJ"
+            0x01, 0x00,                   // version_id = 1 (u16 LE)
+            0x04,                         // length_mode = 4 (U32)
+            0x00,                         // alignment_hint = 0 (not aligned)
+            0x28, 0x00, 0x00, 0x00,       // document_length = 40 (u32 LE)
+            0x00, 0x00, 0x00, 0x00,       // schema type_count = 0
+            0x21,                         // payload element type id = object
+            0x02, 0x00, 0x00, 0x00,       // object length = 2 pairs
+            0x01, 0x00, 0x00, 0x00, 0x6E, // key "n"
+            0x02, 0x05,                   // value element: uint8(5)
+            0x01, 0x00, 0x00, 0x00, 0x73, // key "s"
+            0x24,                         // value element type id = string
+            0x02, 0x00, 0x00, 0x00, 0x68, 0x69, // string "hi"
+        ];
+        assert_eq!(document.to_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn golden_int32_is_little_endian_twos_complement() {
+        let document = Document::dynamic(1, LengthMode::U32, Value::Int32(-2));
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x53, 0x4F, 0x42, 0x4A,
+            0x01, 0x00,
+            0x04,
+            0x00,
+            0x15, 0x00, 0x00, 0x00,   // document_length = 21
+            0x00, 0x00, 0x00, 0x00,   // schema type_count = 0
+            0x07,                     // int32 type id
+            0xFE, 0xFF, 0xFF, 0xFF,   // -2, little-endian two's complement
+        ];
+        assert_eq!(document.to_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn golden_list_writes_element_type_once_then_raw_values() {
+        let document = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::List(List::new(
+                ElementType::Builtin(TypeId::Uint8),
+                vec![Value::Uint8(1), Value::Uint8(2), Value::Uint8(3)],
+            )),
+        );
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x53, 0x4F, 0x42, 0x4A,
+            0x01, 0x00,
+            0x04,
+            0x00,
+            0x19, 0x00, 0x00, 0x00,   // document_length = 25
+            0x00, 0x00, 0x00, 0x00,   // schema type_count = 0
+            0x22,                     // list type id
+            0x02,                     // element type = uint8 (written once)
+            0x03, 0x00, 0x00, 0x00,   // list length = 3
+            0x01, 0x02, 0x03,         // raw values, no per-element type id
+        ];
+        assert_eq!(document.to_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn golden_spec_bytes_decode_to_expected_object() {
+        // Independently verify the decoder reads canonical spec bytes, not just its
+        // own output (a round-trip could not catch a shared encoder/decoder bug).
+        #[rustfmt::skip]
+        let bytes: &[u8] = &[
+            0x53, 0x4F, 0x42, 0x4A, 0x01, 0x00, 0x04, 0x00, 0x28, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x21, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x6E, 0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x73, 0x24, 0x02, 0x00,
+            0x00, 0x00, 0x68, 0x69,
+        ];
+        let view = DocumentView::parse(bytes).unwrap();
+        assert_eq!(view.metadata.version_id, 1);
+        assert_eq!(view.metadata.length_mode, LengthMode::U32);
+        let PayloadView::Dynamic(ElementView::Object(object)) = view.payload else {
+            panic!("expected object payload");
+        };
+        assert_eq!(object.fields[0].key, "n");
+        assert_eq!(object.get("n"), Some(&ElementView::Uint8(5)));
+        assert_eq!(object.fields[1].key, "s");
+        assert_eq!(object.get("s"), Some(&ElementView::String("hi")));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_streaming_path_matches_value_tree_bytes() {
+        // The streaming serde codec must emit bytes identical to the Value-tree
+        // path (which the golden tests pin to the spec).
+        #[derive(serde::Serialize)]
+        struct Rec {
+            n: u8,
+            s: String,
+        }
+        let streamed =
+            crate::serde_ext::to_bytes(&Rec { n: 5, s: "hi".to_owned() }, 1, LengthMode::U32)
+                .unwrap();
+        let value_path = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::Object(Object::new(vec![
+                Field::new("n", Value::Uint8(5)),
+                Field::new("s", Value::String("hi".to_owned())),
+            ])),
+        )
+        .to_bytes()
+        .unwrap();
+        assert_eq!(streamed, value_path);
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn serde_round_trips_derived_structures() {
