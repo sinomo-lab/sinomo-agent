@@ -127,7 +127,7 @@ fn element_type_id(element_type: &ElementType) -> Result<u8> {
         ElementType::List(_) => TypeId::List.byte(),
         ElementType::Array(_) => TypeId::Array.byte(),
         ElementType::Optional(_) => TypeId::Optional.byte(),
-        ElementType::SchemaRef(_) | ElementType::Extension { .. } => {
+        ElementType::SchemaRef(_) | ElementType::Extension(_) => {
             return Err(Error::Serde(
                 "serde serialization does not produce schema or extension types".to_owned(),
             ));
@@ -603,7 +603,7 @@ fn element_type_type_id(element_type: &ElementType) -> Result<TypeId> {
         ElementType::List(_) => TypeId::List,
         ElementType::Array(_) => TypeId::Array,
         ElementType::Optional(_) => TypeId::Optional,
-        ElementType::SchemaRef(_) | ElementType::Extension { .. } => {
+        ElementType::SchemaRef(_) | ElementType::Extension(_) => {
             return Err(Error::Serde(
                 "schema and extension element types are not supported by serde decoding".to_owned(),
             ));
@@ -995,7 +995,7 @@ impl ser::Serializer for ValueSerializer {
     }
 
     fn serialize_none(self) -> Result<Value> {
-        Ok(Value::Optional(OptionalValue::none(ElementType::Builtin(
+        Ok(Value::optional(OptionalValue::none(ElementType::Builtin(
             TypeId::Bytes,
         ))))
     }
@@ -1003,11 +1003,11 @@ impl ser::Serializer for ValueSerializer {
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Value> {
         let value = to_value(value)?;
         let element_type = element_type_for_value(&value);
-        Ok(Value::Optional(OptionalValue::some(element_type, value)))
+        Ok(Value::optional(OptionalValue::some(element_type, value)))
     }
 
     fn serialize_unit(self) -> Result<Value> {
-        Ok(Value::Optional(OptionalValue::none(ElementType::Builtin(
+        Ok(Value::optional(OptionalValue::none(ElementType::Builtin(
             TypeId::Bytes,
         ))))
     }
@@ -1111,7 +1111,7 @@ impl SeqSerializer {
 
     fn finish(self) -> Result<Value> {
         let element_type = common_element_type(&self.values)?;
-        Ok(Value::List(List::new(element_type, self.values)))
+        Ok(Value::list(List::new(element_type, self.values)))
     }
 }
 

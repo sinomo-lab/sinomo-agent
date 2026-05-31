@@ -221,7 +221,24 @@ pub enum ElementType {
     Array(Box<ElementType>),
     Object,
     Optional(Box<ElementType>),
-    Extension { id: u8, data: Vec<u8> },
+    Extension(Box<ExtensionType>),
+}
+
+impl ElementType {
+    /// Constructs an extension element type. The payload is boxed so the rare
+    /// extension variant does not inflate `ElementType` — and every type that
+    /// embeds it — with an inline `Vec`.
+    pub fn extension(id: u8, data: Vec<u8>) -> Self {
+        Self::Extension(Box::new(ExtensionType { id, data }))
+    }
+}
+
+/// Payload of an [`ElementType::Extension`]: a length-delimited extension id and
+/// its bytes. Boxed inside `ElementType` to keep that enum small.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionType {
+    pub id: u8,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,14 +320,31 @@ pub enum Value {
     Float(f32),
     Double(f64),
     Object(Object),
-    List(List),
-    Array(Array),
+    List(Box<List>),
+    Array(Box<Array>),
     String(String),
     Bytes(Vec<u8>),
-    Optional(OptionalValue),
+    Optional(Box<OptionalValue>),
 }
 
 impl Value {
+    /// Wraps a list value. The payload is boxed so the (comparatively rare)
+    /// container variants do not inflate every `Value` to the size of the
+    /// largest one.
+    pub fn list(value: List) -> Self {
+        Self::List(Box::new(value))
+    }
+
+    /// Wraps an array value (boxed; see [`Value::list`]).
+    pub fn array(value: Array) -> Self {
+        Self::Array(Box::new(value))
+    }
+
+    /// Wraps an optional value (boxed; see [`Value::list`]).
+    pub fn optional(value: OptionalValue) -> Self {
+        Self::Optional(Box::new(value))
+    }
+
     pub const fn type_id(&self) -> TypeId {
         match self {
             Self::Boolean(_) => TypeId::Boolean,
@@ -653,11 +687,29 @@ pub enum ElementView<'a> {
     Float(f32),
     Double(f64),
     Object(ObjectView<'a>),
-    List(ListView<'a>),
-    Array(ArrayView<'a>),
+    List(Box<ListView<'a>>),
+    Array(Box<ArrayView<'a>>),
     String(&'a str),
     Bytes(&'a [u8]),
-    Optional(OptionalView<'a>),
+    Optional(Box<OptionalView<'a>>),
+}
+
+impl<'a> ElementView<'a> {
+    /// Wraps a list view (boxed to keep `ElementView` small; mirrors
+    /// [`Value::list`]).
+    fn list(value: ListView<'a>) -> Self {
+        Self::List(Box::new(value))
+    }
+
+    /// Wraps an array view (boxed; see [`ElementView::list`]).
+    fn array(value: ArrayView<'a>) -> Self {
+        Self::Array(Box::new(value))
+    }
+
+    /// Wraps an optional view (boxed; see [`ElementView::list`]).
+    fn optional(value: OptionalView<'a>) -> Self {
+        Self::Optional(Box::new(value))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -825,11 +877,11 @@ impl<'a> Reader<'a> {
                 self.take(8)?.try_into().map_err(|_| Error::UnexpectedEof)?,
             ))),
             TypeId::Object => self.read_object().map(ElementView::Object),
-            TypeId::List => self.read_list().map(ElementView::List),
-            TypeId::Array => self.read_array().map(ElementView::Array),
+            TypeId::List => self.read_list().map(ElementView::list),
+            TypeId::Array => self.read_array().map(ElementView::array),
             TypeId::String => self.read_string().map(ElementView::String),
             TypeId::Bytes => self.read_bytes().map(ElementView::Bytes),
-            TypeId::Optional => self.read_optional().map(ElementView::Optional),
+            TypeId::Optional => self.read_optional().map(ElementView::optional),
             TypeId::Padding | TypeId::Document => Err(Error::UnsupportedTypeId(type_id.byte())),
         }
     }
@@ -915,14 +967,14 @@ impl<'a> Reader<'a> {
                 if list.element_type != **inner {
                     return Err(Error::TypeMismatch);
                 }
-                Ok(ElementView::List(list))
+                Ok(ElementView::list(list))
             }
             ElementType::Array(inner) => {
                 let array = self.read_array()?;
                 if array.element_type != **inner {
                     return Err(Error::TypeMismatch);
                 }
-                Ok(ElementView::Array(array))
+                Ok(ElementView::array(array))
             }
             ElementType::Optional(inner) => {
                 let present = self.read_u8()?;
@@ -931,12 +983,12 @@ impl<'a> Reader<'a> {
                     1 => Some(Box::new(self.read_typed_value(inner)?)),
                     other => return Err(Error::InvalidBoolean(other)),
                 };
-                Ok(ElementView::Optional(OptionalView {
+                Ok(ElementView::optional(OptionalView {
                     element_type: (**inner).clone(),
                     value,
                 }))
             }
-            ElementType::SchemaRef(_) | ElementType::Extension { .. } => {
+            ElementType::SchemaRef(_) | ElementType::Extension(_) => {
                 Err(Error::UnsupportedTypeId(0x40))
             }
         }
@@ -1053,11 +1105,11 @@ fn encode_element_type(
             out.push(0x44);
             encode_element_type(out, mode, inner)?;
         }
-        ElementType::Extension { id, data } if *id >= 0x80 => {
-            out.push(*id);
-            write_bytes(out, mode, data)?;
+        ElementType::Extension(ext) if ext.id >= 0x80 => {
+            out.push(ext.id);
+            write_bytes(out, mode, &ext.data)?;
         }
-        ElementType::Extension { id, .. } => return Err(Error::InvalidTypeId(*id)),
+        ElementType::Extension(ext) => return Err(Error::InvalidTypeId(ext.id)),
     }
     Ok(())
 }
@@ -1073,7 +1125,7 @@ fn read_element_type(reader: &mut Reader<'_>) -> Result<ElementType> {
         0x44 => Ok(ElementType::Optional(Box::new(read_element_type(reader)?))),
         0x80..=0xFF => {
             let data = reader.read_bytes()?.to_vec();
-            Ok(ElementType::Extension { id: byte, data })
+            Ok(ElementType::extension(byte, data))
         }
         other => Err(Error::InvalidTypeId(other)),
     }
@@ -1143,7 +1195,7 @@ mod tests {
                 Field::new("a", Value::String("hello".to_owned())),
                 Field::new(
                     "present",
-                    Value::Optional(OptionalValue::some(
+                    Value::optional(OptionalValue::some(
                         ElementType::Builtin(TypeId::Uint64),
                         Value::Uint64(99),
                     )),
@@ -1184,7 +1236,7 @@ mod tests {
             LengthMode::U32,
             Value::Object(Object::new(vec![
                 Field::new("file", Value::Bytes(vec![1, 2, 3, 4, 5])),
-                Field::new("tensor", Value::Array(array)),
+                Field::new("tensor", Value::array(array)),
             ])),
         );
 
@@ -1332,7 +1384,7 @@ mod tests {
         let document = Document::dynamic(
             1,
             LengthMode::U32,
-            Value::List(List::new(
+            Value::list(List::new(
                 ElementType::Builtin(TypeId::Uint8),
                 vec![Value::Uint8(1), Value::Uint8(2), Value::Uint8(3)],
             )),

@@ -214,9 +214,9 @@ fn write_element_type(out: &mut String, element_type: &ElementType) {
             write_element_type(out, inner);
             out.push('>');
         }
-        ElementType::Extension { id, data } => {
-            let _ = write!(out, "extension(0x{id:02X},");
-            write_hex(out, data);
+        ElementType::Extension(ext) => {
+            let _ = write!(out, "extension(0x{:02X},", ext.id);
+            write_hex(out, &ext.data);
             out.push(')');
         }
     }
@@ -395,9 +395,9 @@ impl<'a> Parser<'a> {
             "float" | "f32" => self.parse_call_f64().map(|v| Value::Float(v as f32)),
             "double" | "f64" => self.parse_call_f64().map(Value::Double),
             "bytes" => self.parse_bytes_call().map(Value::Bytes),
-            "list" => self.parse_list_after_name().map(Value::List),
-            "array" => self.parse_array_after_name().map(Value::Array),
-            "optional" => self.parse_optional_after_name().map(Value::Optional),
+            "list" => self.parse_list_after_name().map(Value::list),
+            "array" => self.parse_array_after_name().map(Value::array),
+            "optional" => self.parse_optional_after_name().map(Value::optional),
             _ => Err(self.error("expected value")),
         }
     }
@@ -614,7 +614,7 @@ impl<'a> Parser<'a> {
                 self.expect_char(',')?;
                 let data = self.parse_hex_bytes()?;
                 self.expect_char(')')?;
-                Ok(ElementType::Extension { id, data })
+                Ok(ElementType::extension(id, data))
             }
             _ => Err(self.error("expected element type")),
         }
