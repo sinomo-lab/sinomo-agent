@@ -5556,13 +5556,18 @@ fn write_cluster_state_observer_counts_actual_then_skipped() {
     let write_bytes = observer
         .disk_write_bytes
         .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(actual, 1, "expected exactly one actual write");
-    assert_eq!(skipped, 1, "expected exactly one skipped write");
+    // `IO_OBSERVER` is process-wide, so a concurrently-running test that writes an
+    // object file is counted here too. Our two writes contribute exactly one
+    // actual write (first) and one skipped write (second, identical content, to a
+    // unique temp dir no other test touches), so assert lower bounds. The precise
+    // "identical re-write is skipped" behavior is covered race-free by
+    // `write_object_file_skips_identical_and_rewrites_after_external_change`.
+    assert!(actual >= 1, "expected at least our one actual write, got {actual}");
+    assert!(
+        skipped >= 1,
+        "expected at least our one skipped write, got {skipped}"
+    );
     assert!(write_bytes > 0, "actual write should report disk bytes");
-    // The second write takes the fast path (cached content hash + an unchanged
-    // stat) and is skipped without reading the file back, so it performs no
-    // read-compare of its own. (disk_read_bytes is a process-wide counter that
-    // concurrent tests can perturb, so it is not asserted here.)
 
     // Restore the previous observer so we don't poison sibling tests.
     let _ = set_io_observer(previous);
