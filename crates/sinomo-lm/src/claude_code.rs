@@ -109,6 +109,10 @@ impl Default for ClaudeCodeProvider {
     }
 }
 
+pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
+    crate::anthropic::inferred_context_window_tokens(model)
+}
+
 impl LanguageModelProvider for ClaudeCodeProvider {
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
@@ -162,6 +166,8 @@ impl LanguageModelProvider for ClaudeCodeProvider {
             provider: Self::PROVIDER_ID.to_string(),
             model,
             content: stdout,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: None,
         })
     }
@@ -189,6 +195,10 @@ mod tests {
                     content: "Say hello.".to_string(),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: None,
             max_output_tokens: Some(32),
             response_format: LanguageModelResponseFormat::Text,

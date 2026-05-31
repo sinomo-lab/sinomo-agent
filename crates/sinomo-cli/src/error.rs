@@ -93,6 +93,10 @@ impl From<sinomo_agent::AgentError> for CliError {
             sinomo_agent::AgentError::Model(error) => Self::LanguageModel(error),
             sinomo_agent::AgentError::ModelRequest { detail }
             | sinomo_agent::AgentError::ModelResponse { detail } => Self::Parse { detail },
+            sinomo_agent::AgentError::TraceStore { detail } => Self::Io {
+                path: "agent trace store".to_string(),
+                detail,
+            },
         }
     }
 }

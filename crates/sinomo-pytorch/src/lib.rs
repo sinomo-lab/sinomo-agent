@@ -334,6 +334,8 @@ impl LanguageModelProvider for PythonPytorchRuntime {
             provider: MINICPM_PROVIDER_ID.to_string(),
             model: self.config.model.clone(),
             content: response.content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: response.usage,
         })
     }
@@ -717,6 +719,8 @@ impl LanguageModelProvider for RemotePytorchRuntime {
             provider: MINICPM_PROVIDER_ID.to_string(),
             model: request.model.clone(),
             content: response.content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: response.usage,
         })
     }
@@ -1164,6 +1168,10 @@ mod tests {
                     content: "hello".to_string(),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: None,
             max_output_tokens: None,
             response_format: LanguageModelResponseFormat::Text,

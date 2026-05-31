@@ -41,16 +41,16 @@ use super::{
     handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
     invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    managed_source_status, models_default_with_data_dir, normalize_model_provider,
-    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cluster_command,
-    parse_cluster_join_invite_argument, parse_daemon_command, parse_dfs_command,
-    parse_install_options, parse_model_default_options, parse_models_list_options,
-    parse_models_runtime_command, parse_propose_options, parse_provider_command,
-    parse_rollout_command, parse_sandbox_command, parse_slash_command, parse_uninstall_options,
-    parse_usage_options, push_unique_introducer, quickjs_setup_script, read_cluster_kv_snapshot,
-    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
-    read_cluster_state, refresh_daemon_node_status_in_kv, rollout_cluster_targets,
-    rollout_cluster_targets_from_state, rollout_endpoint_candidates,
+    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
+    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    parse_models_list_options, parse_models_runtime_command, parse_propose_options,
+    parse_provider_command, parse_rollout_command, parse_sandbox_command, parse_slash_command,
+    parse_uninstall_options, parse_usage_options, push_unique_introducer, quickjs_setup_script,
+    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
+    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
+    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_endpoint_candidates,
     rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
     rollout_target_endpoint_for_main_with_connectivity, run_cui_with_handler_io,
     run_cui_with_handler_io_and_daemon, run_cui_with_io_and_daemon_probe, run_evolve_command,
@@ -69,8 +69,8 @@ use super::{
     sandbox_write_with_store_and_event_store, send_cluster_join_registration_over_iroh,
     shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
     sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, uninstall_with_layout, write_daemon_status,
-    write_model_runtime_config_for_node, write_rollout_status,
+    sync_cluster_state_to_kv, uninstall_with_layout, with_cli_force_local_mode,
+    write_daemon_status, write_model_runtime_config_for_node, write_rollout_status,
     write_sandbox_policy_config_for_node,
 };
 use base64::Engine;
@@ -150,6 +150,19 @@ fn provider_commands_parse_action_before_provider() {
             account: "team-a".to_string(),
         })
     );
+    assert_eq!(
+        parse_provider_command(&[
+            "auth".to_string(),
+            "deepseek".to_string(),
+            "--account".to_string(),
+            "bench".to_string(),
+        ])
+        .expect("provider command"),
+        ProviderCliCommand::Auth(ProviderCommandOptions {
+            provider: ProviderName::DeepSeek,
+            account: "bench".to_string(),
+        })
+    );
 }
 
 #[test]
@@ -157,6 +170,26 @@ fn provider_commands_reject_provider_before_action_order() {
     assert!(matches!(
         parse_provider_command(&["gemini".to_string(), "auth".to_string()]),
         Err(CliError::Usage)
+    ));
+}
+
+#[test]
+fn top_level_cli_parser_accepts_local_flag_before_command() {
+    let invocation = parse_cli_invocation(&[
+        "--local".to_string(),
+        "providers".to_string(),
+        "test".to_string(),
+        "openai".to_string(),
+    ])
+    .expect("local invocation");
+
+    assert!(invocation.options.force_local);
+    assert!(matches!(
+        invocation.command,
+        CliCommand::Providers(ProviderCliCommand::Test(ProviderCommandOptions {
+            provider: ProviderName::OpenAi,
+            account: _,
+        }))
     ));
 }
 
@@ -13525,6 +13558,10 @@ fn minicpm_main_agent_prompt_uses_official_chat_template_shape() {
                 .to_string(),
             },
         ],
+        items: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: None,
         temperature: None,
         max_output_tokens: None,
         response_format: sinomo_lm::LanguageModelResponseFormat::JsonObject,
@@ -13704,6 +13741,8 @@ impl InteractionModel for MainAgentFixtureModel {
                 "next_state": "listening"
             })
             .to_string(),
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: None,
         })
     }
@@ -13745,6 +13784,8 @@ fn main_agent_fixture_response(
             "next_state": "listening"
         })
         .to_string(),
+        items: Vec::new(),
+        tool_calls: Vec::new(),
         usage: None,
     }
 }
@@ -13761,6 +13802,8 @@ impl InteractionModel for FixtureInteractionModel {
             provider: request.provider.clone(),
             model: request.model.clone(),
             content: self.response.to_string(),
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: Some(LanguageModelUsage {
                 input_tokens: Some(1),
                 output_tokens: Some(1),
@@ -13910,6 +13953,58 @@ fn models_default_writes_cluster_model_config_to_kv_for_clustered_node() {
 }
 
 #[test]
+fn local_mode_forces_model_config_to_local_file_on_clustered_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-local-mode-models-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("local_models").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("local_models_node").expect("node")),
+            name: "local models".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+
+    with_cli_force_local_mode(true, || {
+        assert!(!model_config_uses_cluster(&data_dir));
+        models_default_with_data_dir(
+            super::ModelDefaultOptions {
+                provider: "openai".to_string(),
+                account: "local".to_string(),
+                model: "gpt-5.5".to_string(),
+            },
+            &data_dir,
+        )
+    })
+    .expect("write local model defaults");
+
+    assert!(model_config_uses_cluster(&data_dir));
+    let config_path = root.join("config").join("models.json");
+    let config = serde_json::from_str::<sinomo_lm::ModelConfig>(
+        &std::fs::read_to_string(&config_path).expect("model config"),
+    )
+    .expect("model config json");
+    assert_eq!(config.default_provider.as_deref(), Some("openai"));
+    assert_eq!(config.default_account.as_deref(), Some("local"));
+    assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
+
+    let store = sinomo_runtime::kv::InProcessKvStore::restore(
+        sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
+    );
+    assert!(store.get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY).is_none());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn models_runtime_writes_cluster_runtime_config_to_kv_for_clustered_node() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-cluster-model-runtime-{}",
@@ -13956,6 +14051,53 @@ fn models_runtime_writes_cluster_runtime_config_to_kv_for_clustered_node() {
         .expect("lm runtime kv entry");
     let saved: sinomo_lm::ModelRuntimeConfig = entry.decode().expect("runtime config");
     assert_eq!(saved, config);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_mode_writes_model_runtime_config_to_local_file_on_clustered_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-local-mode-model-runtime-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("local_runtime").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("local_runtime_node").expect("node")),
+            name: "local runtime".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+
+    let config = sinomo_lm::ModelRuntimeConfig {
+        pytorch_bridge: sinomo_lm::PytorchBridgeRuntimeConfig {
+            endpoint: Some("http://127.0.0.1:32154".to_string()),
+            timeout_seconds: Some(60),
+            ..sinomo_lm::PytorchBridgeRuntimeConfig::default()
+        },
+        ..sinomo_lm::ModelRuntimeConfig::default()
+    };
+    let path = with_cli_force_local_mode(true, || {
+        write_model_runtime_config_for_node(&data_dir, &config)
+    })
+    .expect("write local runtime config");
+
+    assert_eq!(path, root.join("config").join("models-runtime.json"));
+    let saved: sinomo_lm::ModelRuntimeConfig =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("runtime config"))
+            .expect("runtime config json");
+    assert_eq!(saved, config);
+    let store = sinomo_runtime::kv::InProcessKvStore::restore(
+        sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
+    );
+    assert!(store.get(sinomo_lm::LM_RUNTIME_CONFIG_KV_KEY).is_none());
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -14034,6 +14176,57 @@ fn sandbox_policy_writes_cluster_policy_config_to_kv_for_clustered_node() {
 }
 
 #[test]
+fn local_mode_writes_sandbox_policy_to_local_file_on_clustered_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-local-mode-sandbox-policy-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("local_policy").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("local_policy_node").expect("node")),
+            name: "local policy".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+
+    let mut config = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
+    config.policy.allow_unsigned_toolchains = true;
+    config
+        .policy
+        .allowed_command_capabilities
+        .insert("network".to_string());
+
+    let path = with_cli_force_local_mode(true, || {
+        assert!(!sandbox_policy_uses_cluster(&data_dir));
+        write_sandbox_policy_config_for_node(&data_dir, &config)
+    })
+    .expect("write local sandbox policy");
+
+    assert_eq!(path, root.join("config").join("sandbox-policy.json"));
+    let saved: sinomo_runtime::sandbox::SandboxClusterPolicyConfig =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("sandbox policy config"))
+            .expect("sandbox policy json");
+    assert_eq!(saved, config);
+    let store = sinomo_runtime::kv::InProcessKvStore::restore(
+        sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
+    );
+    assert!(
+        store
+            .get(sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KV_KEY)
+            .is_none()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn models_runtime_parser_accepts_cluster_runtime_settings() {
     let command = parse_models_runtime_command(&[
         "set".to_string(),
@@ -14100,6 +14293,10 @@ fn model_provider_aliases_normalize_to_supported_provider_ids() {
     assert_eq!(
         normalize_model_provider("github-copilot").as_deref(),
         Some("github-copilot")
+    );
+    assert_eq!(
+        normalize_model_provider("deepseek-api").as_deref(),
+        Some("deepseek")
     );
     assert_eq!(normalize_model_provider("codex-api"), None);
     assert_eq!(normalize_model_provider("openai-codex"), None);

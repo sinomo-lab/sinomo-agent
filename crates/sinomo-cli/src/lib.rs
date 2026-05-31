@@ -31,11 +31,11 @@ use sinomo_evolution::{
     write_campaign_stage_evaluation, write_report_record,
 };
 use sinomo_lm::{
-    AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel, GeminiProvider,
-    GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError,
-    LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse, ModelConfig,
-    ModelPaths, ModelRuntimeConfig, NvidiaProvider, OpenAiProvider, codex_provider,
-    collect_provider_model_catalogs, collect_provider_usage,
+    AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel,
+    DeepSeekProvider, GeminiProvider, GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY,
+    LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError, LanguageModelProviderUsage, LanguageModelRequest,
+    LanguageModelResponse, ModelConfig, ModelPaths, ModelRuntimeConfig, NvidiaProvider,
+    OpenAiProvider, codex_provider, collect_provider_model_catalogs, collect_provider_usage,
     complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
     github_copilot_provider, load_model_config, model_config_cluster_kv_txn,
@@ -73,8 +73,8 @@ use sinomo_runtime::daemon::{
 };
 use sinomo_runtime::daemon::{
     ClusterDoctorFinding, DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart, IdleStatsSnapshot,
-    DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, InstallLayout,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart,
+    DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, IdleStatsSnapshot, InstallLayout,
     InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus,
     RolloutActivationStrategy, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
     SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
@@ -232,6 +232,7 @@ use sinomo_runtime::rollout::{
     rollout_status_view, source_heads_match, sync_external_repo_from_managed,
     unique_rollout_targets,
 };
+use std::cell::Cell;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
@@ -257,8 +258,49 @@ use time::format_description::well_known::Rfc3339;
 mod commands;
 pub(crate) use commands::*;
 
+thread_local! {
+    static CLI_FORCE_LOCAL_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
 pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
     matches!(command, CliCommand::Evolve(_))
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct CliRuntimeOptions {
+    pub(crate) force_local: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CliInvocation {
+    pub(crate) command: CliCommand,
+    pub(crate) options: CliRuntimeOptions,
+}
+
+struct CliLocalModeGuard {
+    previous: bool,
+}
+
+impl Drop for CliLocalModeGuard {
+    fn drop(&mut self) {
+        CLI_FORCE_LOCAL_MODE.with(|mode| mode.set(self.previous));
+    }
+}
+
+pub(crate) fn cli_force_local_mode() -> bool {
+    CLI_FORCE_LOCAL_MODE.with(Cell::get)
+}
+
+fn enter_cli_force_local_mode(force_local: bool) -> CliLocalModeGuard {
+    let previous = cli_force_local_mode();
+    CLI_FORCE_LOCAL_MODE.with(|mode| mode.set(previous || force_local));
+    CliLocalModeGuard { previous }
+}
+
+#[cfg(test)]
+pub(crate) fn with_cli_force_local_mode<T>(force_local: bool, f: impl FnOnce() -> T) -> T {
+    let _guard = enter_cli_force_local_mode(force_local);
+    f()
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +320,19 @@ pub(crate) enum CliCommand {
     Providers(ProviderCliCommand),
     Agent(AgentCliCommand),
     Usage(UsageOptions),
+}
+
+pub(crate) fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation, CliError> {
+    let mut force_local = false;
+    let mut command_start = 0;
+    while matches!(args.get(command_start).map(String::as_str), Some("--local")) {
+        force_local = true;
+        command_start += 1;
+    }
+    Ok(CliInvocation {
+        command: parse_cli_command(&args[command_start..])?,
+        options: CliRuntimeOptions { force_local },
+    })
 }
 
 pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
@@ -498,6 +553,8 @@ impl InteractionModel for ConfiguredInteractionModel {
                 provider: MINICPM_PROVIDER_ID.to_string(),
                 model: self.model.clone(),
                 content: response.content,
+                items: Vec::new(),
+                tool_calls: Vec::new(),
                 usage: response.usage,
             });
         }
@@ -544,6 +601,8 @@ impl ConfiguredInteractionModel {
             provider: MINICPM_PROVIDER_ID.to_string(),
             model: model.to_string(),
             content: response.content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: response.usage,
         })
     }
@@ -582,6 +641,8 @@ impl ConfiguredInteractionModel {
             provider: MINICPM_PROVIDER_ID.to_string(),
             model: model.to_string(),
             content: response.content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: response.usage,
         })
     }
@@ -675,6 +736,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         latest_event: input_event,
         context,
         async_update: None,
+        evolution_context: None,
         tool_specs: sinomo_agent::default_main_agent_tools(),
     };
     let provider = options.provider.clone();
@@ -711,15 +773,18 @@ pub(crate) fn is_help_args(args: &[String]) -> bool {
 }
 
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
-    run_parsed_cli_command(parse_cli_command(&args)?)
+    run_parsed_cli_invocation(parse_cli_invocation(&args)?)
 }
 
 fn run_cli_command(args: &[String]) -> Result<(), CliError> {
-    run_parsed_cli_command(parse_cli_command(args)?)
+    run_parsed_cli_invocation(parse_cli_invocation(args)?)
 }
 
-fn run_parsed_cli_command(command: CliCommand) -> Result<(), CliError> {
-    if cli_command_requires_cluster_state(&command) {
+fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
+    let _guard = enter_cli_force_local_mode(invocation.options.force_local);
+    let command = invocation.command;
+
+    if !cli_force_local_mode() && cli_command_requires_cluster_state(&command) {
         require_cluster_runtime_quorum()?;
     }
 

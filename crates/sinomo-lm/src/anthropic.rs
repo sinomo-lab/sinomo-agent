@@ -78,6 +78,10 @@ impl AnthropicProvider {
                 role: LanguageModelRole::User,
                 content: "Reply with ok.".to_string(),
             }],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: None,
             max_output_tokens: Some(4),
             response_format: LanguageModelResponseFormat::Text,
@@ -91,6 +95,17 @@ impl Default for AnthropicProvider {
     fn default() -> Self {
         Self::new(AnthropicConfig::default())
     }
+}
+
+pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
+    crate::parse_declared_context_window_tokens(model).or_else(|| {
+        let model = model.to_ascii_lowercase();
+        if model.contains("claude") {
+            Some(200_000)
+        } else {
+            None
+        }
+    })
 }
 
 impl LanguageModelProvider for AnthropicProvider {
@@ -157,6 +172,8 @@ impl LanguageModelProvider for AnthropicProvider {
             provider: Self::PROVIDER_ID.to_string(),
             model,
             content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage,
         })
     }
@@ -260,6 +277,10 @@ mod tests {
                     content: "Summarize evt_1.".to_string(),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: Some(0.2),
             max_output_tokens: Some(200),
             response_format: LanguageModelResponseFormat::JsonObject,

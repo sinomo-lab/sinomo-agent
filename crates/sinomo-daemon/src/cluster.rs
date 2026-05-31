@@ -1,7 +1,7 @@
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterRegistration, DaemonClusterStatus, DaemonError,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, IdleStatsAtomics,
-    SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, IdleStatsAtomics, SINOMO_DAEMON_DEFAULT_HOST,
+    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
     authenticated_signer_matches_cluster_node, cluster_node_status_from_daemon_status,
     current_shadow_daemon_options, daemon_cluster_options_from_status,
     daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
@@ -163,9 +163,9 @@ fn cached_node_status_matches(paths: &ClusterPaths, status: &ClusterNodeStatusRe
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
-            cache.get(&key).is_some_and(|known| {
-                sinomo_network::cluster_node_status_stable_eq(known, status)
-            })
+            cache
+                .get(&key)
+                .is_some_and(|known| sinomo_network::cluster_node_status_stable_eq(known, status))
         })
 }
 
@@ -1136,14 +1136,13 @@ impl ClusterNetworkMaintenance {
                 // refresh_daemon_node_status_in_kv below, so we do not write it
                 // here — a second unconditional write was pure churn that rewrote
                 // the KV snapshot every publish cycle even when nothing changed.
-                let local_environment_id =
-                    sinomo_network::build_cluster_network_info_record(
-                        &state,
-                        &state.local_node_id,
-                        time::OffsetDateTime::now_utc(),
-                        CLUSTER_NETWORK_INFO_TTL_SECONDS,
-                    )
-                    .environment_id;
+                let local_environment_id = sinomo_network::build_cluster_network_info_record(
+                    &state,
+                    &state.local_node_id,
+                    time::OffsetDateTime::now_utc(),
+                    CLUSTER_NETWORK_INFO_TTL_SECONDS,
+                )
+                .environment_id;
                 if self
                     .environment_id
                     .as_ref()
@@ -1460,21 +1459,25 @@ impl ClusterNetworkMaintenance {
         // restart/join, so the cluster churned for minutes before going idle. Scoped
         // parallel probes converge it in a single tick; the tick's wall time stays at
         // ~one probe timeout regardless of how many endpoints are due.
-        let batch: Vec<(String, ClusterEndpointRecord, Option<ClusterConnectivityRecord>)> =
-            probe_targets
-                .iter()
-                .cycle()
-                .skip(probe_start)
-                .take(probe_count)
-                .map(|endpoint| {
-                    let key = sinomo_network::cluster_connectivity_probe_key(
-                        &state.local_node_id,
-                        endpoint,
-                    );
-                    let previous = self.connectivity.get(&key).map(|probe| probe.record.clone());
-                    (key, endpoint.clone(), previous)
-                })
-                .collect();
+        let batch: Vec<(
+            String,
+            ClusterEndpointRecord,
+            Option<ClusterConnectivityRecord>,
+        )> = probe_targets
+            .iter()
+            .cycle()
+            .skip(probe_start)
+            .take(probe_count)
+            .map(|endpoint| {
+                let key =
+                    sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint);
+                let previous = self
+                    .connectivity
+                    .get(&key)
+                    .map(|probe| probe.record.clone());
+                (key, endpoint.clone(), previous)
+            })
+            .collect();
         let timestamp = timestamp.as_str();
         let probed: Vec<(String, ClusterConnectivityRecord)> = std::thread::scope(|scope| {
             let handles: Vec<_> = batch
@@ -1482,12 +1485,16 @@ impl ClusterNetworkMaintenance {
                 .map(|(key, endpoint, previous)| {
                     scope.spawn(move || {
                         let started = Instant::now();
-                        let result =
-                            fetch_daemon_status_from_endpoint(endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT);
+                        let result = fetch_daemon_status_from_endpoint(
+                            endpoint,
+                            CLUSTER_HEALTH_PROBE_TIMEOUT,
+                        );
                         let latency_ms =
                             started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                         let record = match result {
-                            Ok(status) if daemon_cluster_status_matches(state, endpoint, &status) => {
+                            Ok(status)
+                                if daemon_cluster_status_matches(state, endpoint, &status) =>
+                            {
                                 sinomo_network::cluster_connectivity_record(
                                     state,
                                     endpoint,
@@ -1495,7 +1502,9 @@ impl ClusterNetworkMaintenance {
                                     Some(latency_ms),
                                     0,
                                     Some(timestamp.to_string()),
-                                    previous.as_ref().and_then(|record| record.last_failure_at.clone()),
+                                    previous
+                                        .as_ref()
+                                        .and_then(|record| record.last_failure_at.clone()),
                                     now,
                                     CLUSTER_CONNECTIVITY_TTL_SECONDS,
                                 )
@@ -1512,20 +1521,22 @@ impl ClusterNetworkMaintenance {
                                         None
                                     }
                                 });
-                                let state_label =
-                                    if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
-                                        sinomo_network::ClusterConnectivityState::Unreachable
-                                    } else {
-                                        sinomo_network::ClusterConnectivityState::Degraded
-                                    };
+                                let state_label = if observed_failures
+                                    >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+                                {
+                                    sinomo_network::ClusterConnectivityState::Unreachable
+                                } else {
+                                    sinomo_network::ClusterConnectivityState::Degraded
+                                };
                                 let failures =
                                     observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
-                                let ttl_seconds =
-                                    if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
-                                        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
-                                    } else {
-                                        CLUSTER_CONNECTIVITY_TTL_SECONDS
-                                    };
+                                let ttl_seconds = if observed_failures
+                                    >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+                                {
+                                    CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
+                                } else {
+                                    CLUSTER_CONNECTIVITY_TTL_SECONDS
+                                };
                                 sinomo_network::cluster_connectivity_record(
                                     state,
                                     endpoint,
@@ -4325,8 +4336,8 @@ mod tests {
             ClusterId::from_legacy_named("cluster_daemon_unreachable_leader").expect("cluster id");
         let local_node =
             NodeId::from_legacy_named("node_daemon_unreachable_leader_local").expect("local node");
-        let remote_node =
-            NodeId::from_legacy_named("node_daemon_unreachable_leader_remote").expect("remote node");
+        let remote_node = NodeId::from_legacy_named("node_daemon_unreachable_leader_remote")
+            .expect("remote node");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "unreachable leader status",

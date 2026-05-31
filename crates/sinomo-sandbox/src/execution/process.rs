@@ -145,10 +145,7 @@ pub fn validate_sandbox_process_plan_invocations(
     Ok(())
 }
 
-pub fn validate_sandbox_toolchain_argv(
-    command_name: &str,
-    argv: &[String],
-) -> Result<(), String> {
+pub fn validate_sandbox_toolchain_argv(command_name: &str, argv: &[String]) -> Result<(), String> {
     let Some(argv0) = argv.first() else {
         return Err(format!(
             "toolchain command `{command_name}` must include argv[0]"

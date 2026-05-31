@@ -2150,12 +2150,9 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
 
     // A follower a few entries behind, but still within the retained tail, is caught
     // up with incremental entries — no snapshot install.
-    let near = build_cluster_raft_append_request_from_next_index(
-        &paths,
-        &state,
-        earliest_retained + 1,
-    )
-    .expect("build near catchup");
+    let near =
+        build_cluster_raft_append_request_from_next_index(&paths, &state, earliest_retained + 1)
+            .expect("build near catchup");
     assert!(
         near.snapshot.is_none(),
         "follower within the retained tail must be served incrementally"
@@ -5536,8 +5533,7 @@ fn write_cluster_state_observer_counts_actual_then_skipped() {
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
 
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_storage_observer").expect("cluster id");
+    let cluster_id = ClusterId::from_legacy_named("cluster_storage_observer").expect("cluster id");
     let node = NodeId::from_legacy_named("node_storage_observer").expect("node id");
     let state = ClusterBootstrapState::initialized_locally(
         cluster_id,
@@ -5562,7 +5558,10 @@ fn write_cluster_state_observer_counts_actual_then_skipped() {
     // unique temp dir no other test touches), so assert lower bounds. The precise
     // "identical re-write is skipped" behavior is covered race-free by
     // `write_object_file_skips_identical_and_rewrites_after_external_change`.
-    assert!(actual >= 1, "expected at least our one actual write, got {actual}");
+    assert!(
+        actual >= 1,
+        "expected at least our one actual write, got {actual}"
+    );
     assert!(
         skipped >= 1,
         "expected at least our one skipped write, got {skipped}"

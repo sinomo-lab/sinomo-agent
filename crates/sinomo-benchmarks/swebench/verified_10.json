@@ -1,0 +1,68 @@
+{
+  "name": "swebench-verified-10",
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "split": "test",
+  "selection": "first task from each of the first 10 distinct repositories in dataset order, fetched 2026-05-31",
+  "instances": [
+    {
+      "instance_id": "astropy__astropy-12907",
+      "repo": "astropy/astropy",
+      "base_commit": "d16bfe05a744909de4b27f5875fe0d4ed41ce607",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "django__django-10097",
+      "repo": "django/django",
+      "base_commit": "b9cf764be62e77b4777b3a75ec256f6209a57671",
+      "difficulty": "<15 min fix"
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-13989",
+      "repo": "matplotlib/matplotlib",
+      "base_commit": "a3e2897bfaf9eaac1d6649da535c4e721c89fa69",
+      "difficulty": "<15 min fix"
+    },
+    {
+      "instance_id": "mwaskom__seaborn-3069",
+      "repo": "mwaskom/seaborn",
+      "base_commit": "54cab15bdacfaa05a88fbc5502a5b322d99f148e",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pallets__flask-5014",
+      "repo": "pallets/flask",
+      "base_commit": "7ee9ceb71e868944a46e1ff00b506772a53a4f1d",
+      "difficulty": "<15 min fix"
+    },
+    {
+      "instance_id": "psf__requests-1142",
+      "repo": "psf/requests",
+      "base_commit": "22623bd8c265b78b161542663ee980738441c307",
+      "difficulty": "<15 min fix"
+    },
+    {
+      "instance_id": "pydata__xarray-2905",
+      "repo": "pydata/xarray",
+      "base_commit": "7c4e2ac83f7b4306296ff9b7b51aaf016e5ad614",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pylint-dev__pylint-4551",
+      "repo": "pylint-dev/pylint",
+      "base_commit": "99589b08de8c5a2c6cc61e13a37420a868c80599",
+      "difficulty": "1-4 hours"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-10051",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "aa55975c7d3f6c9f6d7f68accc41bb7cadf0eb9a",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-10297",
+      "repo": "scikit-learn/scikit-learn",
+      "base_commit": "b90661d6a46aa3619d3eec94d5281f5888add501",
+      "difficulty": "15 min - 1 hour"
+    }
+  ]
+}

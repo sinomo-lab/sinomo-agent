@@ -1,9 +1,11 @@
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
 use crate::{
-    LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
-    LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
-    render_plain_prompt, selected_model,
+    LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelError,
+    LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
+    LanguageModelProviderInfo, LanguageModelProviderToolSpec, LanguageModelRequest,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
+    LanguageModelRole, LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec,
+    LanguageModelUsage, PROVIDER_DEFAULT_MODEL, render_plain_prompt, selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -73,6 +75,10 @@ impl OpenAiProvider {
                 role: LanguageModelRole::User,
                 content: "Reply with ok.".to_string(),
             }],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: None,
             max_output_tokens: Some(8),
             response_format: LanguageModelResponseFormat::Text,
@@ -86,6 +92,21 @@ impl Default for OpenAiProvider {
     fn default() -> Self {
         Self::new(OpenAiConfig::default())
     }
+}
+
+pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
+    crate::parse_declared_context_window_tokens(model).or_else(|| {
+        let model = model.to_ascii_lowercase();
+        if model.contains("gpt-5")
+            || model.contains("gpt-4.1")
+            || model.contains("o3")
+            || model.contains("o4")
+        {
+            Some(400_000)
+        } else {
+            None
+        }
+    })
 }
 
 impl LanguageModelProvider for OpenAiProvider {
@@ -139,6 +160,12 @@ impl LanguageModelProvider for OpenAiProvider {
             }
         })?;
         let content = extract_openai_response_text(&value);
+        let tool_calls = extract_openai_tool_calls(&value);
+        let items = tool_calls
+            .iter()
+            .cloned()
+            .map(|call| LanguageModelResponseItem::ToolCall { call })
+            .collect();
         let usage = value.get("usage").map(|usage| LanguageModelUsage {
             input_tokens: usage
                 .get("input_tokens")
@@ -152,6 +179,8 @@ impl LanguageModelProvider for OpenAiProvider {
             provider: Self::PROVIDER_ID.to_string(),
             model,
             content,
+            items,
+            tool_calls,
             usage,
         })
     }
@@ -207,7 +236,93 @@ fn openai_responses_payload(request: &LanguageModelRequest, model: &str) -> serd
             "format": { "type": "json_object" }
         });
     }
+    if !request.tools.is_empty() {
+        payload["tools"] = serde_json::json!(
+            request
+                .tools
+                .iter()
+                .map(openai_responses_tool_spec)
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        payload["tool_choice"] = openai_responses_tool_choice(tool_choice, &request.tools);
+    }
+    if let Some(parallel_tool_calls) = request.parallel_tool_calls {
+        payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
+    }
     payload
+}
+
+fn openai_responses_tool_spec(tool: &LanguageModelToolSpec) -> serde_json::Value {
+    if let Some(custom) = openai_custom_tool_spec(tool) {
+        return serde_json::json!({
+            "type": "custom",
+            "name": tool.name,
+            "description": tool.description,
+            "format": openai_custom_tool_format(&custom.format),
+        });
+    }
+
+    serde_json::json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": normalized_tool_input_schema(tool),
+    })
+}
+
+fn openai_responses_tool_choice(
+    tool_choice: &LanguageModelToolChoice,
+    tools: &[LanguageModelToolSpec],
+) -> serde_json::Value {
+    match tool_choice {
+        LanguageModelToolChoice::Auto => serde_json::json!("auto"),
+        LanguageModelToolChoice::None => serde_json::json!("none"),
+        LanguageModelToolChoice::Required => serde_json::json!("required"),
+        LanguageModelToolChoice::Tool { name } => match tools
+            .iter()
+            .find(|tool| tool.name == *name)
+            .and_then(openai_custom_tool_spec)
+        {
+            Some(_) => serde_json::json!({ "type": "custom", "name": name }),
+            None => serde_json::json!({ "type": "function", "name": name }),
+        },
+    }
+}
+
+fn openai_custom_tool_spec(tool: &LanguageModelToolSpec) -> Option<&LanguageModelCustomToolSpec> {
+    provider_tool_spec(tool, OpenAiProvider::PROVIDER_ID).and_then(|spec| spec.custom.as_ref())
+}
+
+fn provider_tool_spec<'a>(
+    tool: &'a LanguageModelToolSpec,
+    provider: &str,
+) -> Option<&'a LanguageModelProviderToolSpec> {
+    tool.provider_specs
+        .iter()
+        .find(|spec| spec.provider.eq_ignore_ascii_case(provider))
+}
+
+fn openai_custom_tool_format(format: &LanguageModelCustomToolFormat) -> serde_json::Value {
+    match format {
+        LanguageModelCustomToolFormat::Grammar { syntax, definition } => serde_json::json!({
+            "type": "grammar",
+            "syntax": syntax,
+            "definition": definition,
+        }),
+    }
+}
+
+fn normalized_tool_input_schema(tool: &LanguageModelToolSpec) -> serde_json::Value {
+    if tool.input_schema.is_null() {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+        })
+    } else {
+        tool.input_schema.clone()
+    }
 }
 
 fn render_openai_input_prompt(request: &LanguageModelRequest) -> String {
@@ -257,6 +372,60 @@ fn extract_openai_response_text(value: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
+fn extract_openai_tool_calls(value: &serde_json::Value) -> Vec<LanguageModelToolCall> {
+    value
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(openai_output_item_tool_call)
+        .collect()
+}
+
+fn openai_output_item_tool_call(item: &serde_json::Value) -> Option<LanguageModelToolCall> {
+    let item_type = item.get("type").and_then(serde_json::Value::as_str)?;
+    match item_type {
+        "function_call" => Some(LanguageModelToolCall {
+            call_id: item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            name: item.get("name")?.as_str()?.to_string(),
+            input: parse_tool_arguments(item.get("arguments")),
+            summary: None,
+        }),
+        "custom_tool_call" => Some(LanguageModelToolCall {
+            call_id: item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            name: item
+                .get("name")
+                .or_else(|| item.get("tool_name"))?
+                .as_str()?
+                .to_string(),
+            input: item
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| parse_tool_arguments(item.get("arguments"))),
+            summary: None,
+        }),
+        _ => None,
+    }
+}
+
+fn parse_tool_arguments(arguments: Option<&serde_json::Value>) -> serde_json::Value {
+    match arguments {
+        Some(serde_json::Value::String(arguments)) => {
+            serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!(arguments))
+        }
+        Some(value) => value.clone(),
+        None => serde_json::Value::Null,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +444,10 @@ mod tests {
                     content: "Summarize evt_1.".to_string(),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: Some(0.2),
             max_output_tokens: Some(200),
             response_format: LanguageModelResponseFormat::JsonObject,
@@ -297,6 +470,115 @@ mod tests {
                 .unwrap()
                 .contains("user:\nSummarize evt_1.")
         );
+    }
+
+    #[test]
+    fn payload_renders_native_tool_specs() {
+        let mut request = request();
+        request.tools = vec![LanguageModelToolSpec {
+            name: "read_file".to_string(),
+            description: "Read a file.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+            }),
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: Vec::new(),
+        }];
+        request.tool_choice = Some(LanguageModelToolChoice::Tool {
+            name: "read_file".to_string(),
+        });
+        request.parallel_tool_calls = Some(false);
+
+        let payload = openai_responses_payload(&request, "gpt-5.2-codex");
+
+        assert_eq!(payload["tools"][0]["type"], "function");
+        assert_eq!(payload["tools"][0]["name"], "read_file");
+        assert_eq!(
+            payload["tools"][0]["parameters"]["properties"]["path"]["type"],
+            "string"
+        );
+        assert_eq!(payload["tool_choice"]["name"], "read_file");
+        assert_eq!(payload["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn payload_renders_openai_custom_tool_specs() {
+        let mut request = request();
+        request.tools = vec![LanguageModelToolSpec {
+            name: "apply_patch".to_string(),
+            description: "Apply a patch.".to_string(),
+            input_schema: serde_json::Value::Null,
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: vec![LanguageModelProviderToolSpec {
+                provider: OpenAiProvider::PROVIDER_ID.to_string(),
+                custom: Some(LanguageModelCustomToolSpec {
+                    format: LanguageModelCustomToolFormat::Grammar {
+                        syntax: "lark".to_string(),
+                        definition: "start: /.+/".to_string(),
+                    },
+                    raw_input_argument: Some("patch".to_string()),
+                }),
+            }],
+        }];
+        request.tool_choice = Some(LanguageModelToolChoice::Tool {
+            name: "apply_patch".to_string(),
+        });
+
+        let payload = openai_responses_payload(&request, "gpt-5.2-codex");
+
+        assert_eq!(payload["tools"][0]["type"], "custom");
+        assert_eq!(payload["tools"][0]["name"], "apply_patch");
+        assert_eq!(payload["tools"][0]["format"]["type"], "grammar");
+        assert_eq!(payload["tools"][0]["format"]["syntax"], "lark");
+        assert!(payload["tools"][0].get("parameters").is_none());
+        assert_eq!(payload["tool_choice"]["type"], "custom");
+        assert_eq!(payload["tool_choice"]["name"], "apply_patch");
+    }
+
+    #[test]
+    fn response_parser_extracts_native_tool_calls() {
+        let value = serde_json::json!({
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"Cargo.toml\"}"
+                }
+            ]
+        });
+
+        let calls = extract_openai_tool_calls(&value);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id.as_deref(), Some("call_1"));
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].input["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn response_parser_extracts_custom_tool_calls() {
+        let value = serde_json::json!({
+            "output": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_patch",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch\n"
+                }
+            ]
+        });
+
+        let calls = extract_openai_tool_calls(&value);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id.as_deref(), Some("call_patch"));
+        assert_eq!(calls[0].name, "apply_patch");
+        assert_eq!(calls[0].input, "*** Begin Patch\n*** End Patch\n");
     }
 
     #[test]

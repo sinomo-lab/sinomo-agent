@@ -5732,7 +5732,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-agent",
+ "sinomo-lm",
  "sinomo-pytorch",
+ "sinomo-runtime",
  "thiserror 2.0.18",
 ]
 

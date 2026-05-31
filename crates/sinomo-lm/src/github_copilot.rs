@@ -362,6 +362,17 @@ impl Default for GitHubCopilotProvider {
     }
 }
 
+pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
+    crate::parse_declared_context_window_tokens(model).or_else(|| {
+        let model = model.to_ascii_lowercase();
+        if model.contains("claude") {
+            crate::anthropic::inferred_context_window_tokens(&model)
+        } else {
+            crate::openai::inferred_context_window_tokens(&model)
+        }
+    })
+}
+
 impl LanguageModelProvider for GitHubCopilotProvider {
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
@@ -451,6 +462,8 @@ impl LanguageModelProvider for GitHubCopilotProvider {
             provider: Self::PROVIDER_ID.to_string(),
             model,
             content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage,
         })
     }
@@ -607,6 +620,8 @@ impl LanguageModelProvider for GitHubCopilotCliProvider {
             provider: Self::PROVIDER_ID.to_string(),
             model,
             content: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: None,
         })
     }
@@ -953,6 +968,10 @@ mod tests {
                     content: "Summarize evt_1.".to_string(),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: Some(0.2),
             max_output_tokens: Some(200),
             response_format: LanguageModelResponseFormat::JsonObject,

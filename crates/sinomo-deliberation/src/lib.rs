@@ -223,6 +223,10 @@ impl DeliberationWorker {
                         .expect("deliberation context serializes"),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: Some(0.2),
             max_output_tokens: Some(800),
             response_format: LanguageModelResponseFormat::JsonObject,
@@ -490,6 +494,8 @@ mod tests {
                 provider: request.provider.clone(),
                 model: request.model.clone(),
                 content: self.content.clone(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
                 usage: None,
             })
         }

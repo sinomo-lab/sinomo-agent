@@ -6,7 +6,7 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "Cargo.toml"]
+include = ["**/*.rs", "Cargo.toml", "swebench/**"]
 
 [package.metadata.sinomo]
 ring = "application"
@@ -20,4 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
+sinomo-lm = { path = "../sinomo-lm" }
 sinomo-pytorch = { path = "../sinomo-pytorch" }
+sinomo-runtime = { path = "../sinomo-runtime" }

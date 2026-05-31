@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
     LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
+    LanguageModelStreamEvent,
 };
 use sinomo_runtime::core::{
     ActionRequest, Confidence, ContextPacket, EventEnvelope, EventKind, Id, LatencyClass,
@@ -16,7 +17,24 @@ use sinomo_runtime::events::{
 use sinomo_runtime::node::NodeId;
 use thiserror::Error;
 
+mod agent;
+pub mod tools;
+
+pub use agent::*;
+pub use tools::*;
+
 pub type TaskId = Id;
+
+pub fn register_storage_paths(
+    layout: &mut sinomo_runtime::storage::StorageLayout,
+) -> Result<(), sinomo_runtime::storage::StorageContractError> {
+    layout.register_escape_path(
+        "sinomo-agent",
+        sinomo_runtime::storage::StorageRing::R2,
+        "events/agent",
+        "agent traces, context assembly reports, model events, and tool evidence artifacts",
+    )
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentToolSpec {
@@ -49,6 +67,20 @@ pub enum AgentToolKind {
     InspectAsyncTask,
     CancelAsyncTask,
     RunShellCommand,
+    ReadFile,
+    WriteFile,
+    ListFiles,
+    SearchFiles,
+    ApplyPatch,
+    GitStatus,
+    GitDiff,
+    Format,
+    Test,
+    StartCommandSession,
+    InspectCommandSession,
+    WriteCommandStdin,
+    CancelCommandSession,
+    RequestUserInput,
     ReadSifs,
     WriteSifs,
     ListSifs,
@@ -118,6 +150,95 @@ pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
             "observe_vision",
             "Attach a current screen/camera observation for multimodal reasoning.",
             false,
+        ),
+    ]
+}
+
+pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
+    vec![
+        AgentToolSpec::new(
+            AgentToolKind::ReadFile,
+            "read_file",
+            "Read a UTF-8 workspace file with a bounded byte budget.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ListFiles,
+            "list_files",
+            "List workspace files under a directory, optionally recursively.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::SearchFiles,
+            "search",
+            "Search workspace text files for a literal query.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::GitStatus,
+            "git_status",
+            "Return the current workspace git status summary.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::GitDiff,
+            "git_diff",
+            "Return a bounded git diff or diff stat for the workspace.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ApplyPatch,
+            "apply_patch",
+            "Apply a scoped patch to workspace files available in the current sandbox.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::RunShellCommand,
+            "run_command",
+            "Run a bounded workspace command in the current sandbox.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::Format,
+            "format",
+            "Run the configured formatter in the current sandbox.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::Test,
+            "test",
+            "Run the configured test command in the current sandbox.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::StartCommandSession,
+            "start_command_session",
+            "Start a workspace command session with incremental output, stdin, timeout, and cancellation support.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::InspectCommandSession,
+            "inspect_command_session",
+            "Inspect incremental output and status for a workspace command session.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::WriteCommandStdin,
+            "write_command_stdin",
+            "Write stdin to a running workspace command session.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::CancelCommandSession,
+            "cancel_command_session",
+            "Cancel a running workspace command session.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::RequestUserInput,
+            "request_user_input",
+            "Ask the user for a short clarification through the interactive runtime.",
+            true,
         ),
     ]
 }
@@ -201,6 +322,8 @@ pub struct AgentLoopInput {
     pub context: BoundedContext,
     #[serde(default)]
     pub async_update: Option<AsyncTaskUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evolution_context: Option<AgentEvolutionContext>,
     #[serde(default)]
     pub tool_specs: Vec<AgentToolSpec>,
 }
@@ -330,13 +453,18 @@ impl<M: InteractionModel> MainAgentLoop<M> {
     }
 
     pub fn request(&self, input: &AgentLoopInput) -> Result<LanguageModelRequest, AgentError> {
+        let tools = if input.tool_specs.is_empty() {
+            self.tools.as_slice()
+        } else {
+            input.tool_specs.as_slice()
+        };
         Ok(LanguageModelRequest {
             provider: self.provider.clone(),
             model: self.model_id.clone(),
             messages: vec![
                 LanguageModelMessage {
                     role: LanguageModelRole::System,
-                    content: main_agent_system_prompt(&self.tools),
+                    content: main_agent_system_prompt(tools),
                 },
                 LanguageModelMessage {
                     role: LanguageModelRole::User,
@@ -347,6 +475,10 @@ impl<M: InteractionModel> MainAgentLoop<M> {
                     })?,
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: Some(0.2),
             max_output_tokens: Some(900),
             response_format: LanguageModelResponseFormat::JsonObject,
@@ -505,6 +637,38 @@ pub trait InteractionModel {
         let _ = on_delta;
         self.complete(request)
     }
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        on_event(LanguageModelStreamEvent::Started {
+            provider: request.provider.clone(),
+            model: request.model.clone(),
+        });
+        let mut emitted_delta = false;
+        let response = self.complete_streaming(request, &mut |delta| {
+            emitted_delta = true;
+            on_event(LanguageModelStreamEvent::TextDelta {
+                delta: delta.to_string(),
+            });
+        })?;
+        if !emitted_delta && !response.content.is_empty() {
+            on_event(LanguageModelStreamEvent::TextDelta {
+                delta: response.content.clone(),
+            });
+        }
+        if let Some(usage) = &response.usage {
+            on_event(LanguageModelStreamEvent::Usage {
+                usage: usage.clone(),
+            });
+        }
+        on_event(LanguageModelStreamEvent::Finished {
+            finish_reason: None,
+        });
+        Ok(response)
+    }
 }
 
 impl<T: LanguageModelProvider> InteractionModel for T {
@@ -513,6 +677,22 @@ impl<T: LanguageModelProvider> InteractionModel for T {
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         LanguageModelProvider::complete(self, request)
+    }
+
+    fn complete_streaming(
+        &self,
+        request: &LanguageModelRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        LanguageModelProvider::complete_streaming(self, request, on_delta)
+    }
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        LanguageModelProvider::complete_streaming_events(self, request, on_event)
     }
 }
 
@@ -621,6 +801,10 @@ pub fn interaction_model_request<S: EventStore>(
                 .expect("interaction request serializes"),
             },
         ],
+        items: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: None,
         temperature: Some(0.4),
         max_output_tokens: Some(800),
         response_format: LanguageModelResponseFormat::Text,
@@ -866,6 +1050,8 @@ pub enum AgentError {
     ModelRequest { detail: String },
     #[error("failed to parse model response: {detail}")]
     ModelResponse { detail: String },
+    #[error("agent trace store failed: {detail}")]
+    TraceStore { detail: String },
 }
 
 #[cfg(test)]
@@ -897,6 +1083,8 @@ mod tests {
                 provider: "fake".to_string(),
                 model: "fake".to_string(),
                 content: self.response.to_string(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
                 usage: None,
             })
         }
@@ -1064,6 +1252,7 @@ mod tests {
             latest_event,
             context,
             async_update: None,
+            evolution_context: None,
             tool_specs: default_main_agent_tools(),
         };
         let agent_loop = MainAgentLoop::new(
@@ -1145,6 +1334,7 @@ mod tests {
                 result_ref: None,
                 next_action_hint: AsyncTaskNextAction::ContinueSilently,
             }),
+            evolution_context: None,
             tool_specs: default_main_agent_tools(),
         };
         let agent_loop = MainAgentLoop::new(

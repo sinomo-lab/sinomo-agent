@@ -76,7 +76,8 @@ impl IdleStatsAtomics {
         self.ticks_with_work.fetch_add(1, Ordering::Relaxed);
     }
     pub fn incr_disk_reads_cluster_state(&self) {
-        self.disk_reads_cluster_state.fetch_add(1, Ordering::Relaxed);
+        self.disk_reads_cluster_state
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn incr_disk_reads_iroh_endpoints(&self) {
         self.disk_reads_iroh_endpoints
@@ -102,8 +103,7 @@ impl IdleStatsAtomics {
     }
     pub fn add_mdns_announces_recv(&self, count: u64) {
         if count > 0 {
-            self.mdns_announces_recv
-                .fetch_add(count, Ordering::Relaxed);
+            self.mdns_announces_recv.fetch_add(count, Ordering::Relaxed);
         }
     }
     pub fn incr_raft_appends_sent(&self) {
@@ -171,7 +171,9 @@ struct DaemonIoObserver {
 
 impl sinomo_network::IoObserver for DaemonIoObserver {
     fn on_disk_read(&self, bytes: u64) {
-        self.stats.disk_bytes_read.fetch_add(bytes, Ordering::Relaxed);
+        self.stats
+            .disk_bytes_read
+            .fetch_add(bytes, Ordering::Relaxed);
     }
     fn on_disk_write(&self, bytes: u64) {
         self.stats
@@ -199,10 +201,14 @@ impl sinomo_network::IoObserver for DaemonIoObserver {
             .fetch_add(1, Ordering::Relaxed);
     }
     fn on_net_sent(&self, bytes: u64) {
-        self.stats.net_bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        self.stats
+            .net_bytes_sent
+            .fetch_add(bytes, Ordering::Relaxed);
     }
     fn on_net_recv(&self, bytes: u64) {
-        self.stats.net_bytes_recv.fetch_add(bytes, Ordering::Relaxed);
+        self.stats
+            .net_bytes_recv
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 }
 

@@ -69,7 +69,14 @@ fn record_object_file_mark(
     modified: Option<SystemTime>,
 ) {
     if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-        cache.insert(path.to_path_buf(), ObjectFileWriteMark { hash, len, modified });
+        cache.insert(
+            path.to_path_buf(),
+            ObjectFileWriteMark {
+                hash,
+                len,
+                modified,
+            },
+        );
     }
 }
 
@@ -446,10 +453,12 @@ struct MaterializedSnapshotCacheEntry {
     snapshot: Arc<KvSnapshot>,
 }
 
-static MATERIALIZED_SNAPSHOT_CACHE: OnceLock<Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>>> =
-    OnceLock::new();
+static MATERIALIZED_SNAPSHOT_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>>,
+> = OnceLock::new();
 
-fn materialized_snapshot_cache() -> &'static Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>> {
+fn materialized_snapshot_cache() -> &'static Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>>
+{
     MATERIALIZED_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -458,7 +467,11 @@ fn file_identity(path: &Path) -> Option<(Option<SystemTime>, u64)> {
     Some((metadata.modified().ok(), metadata.len()))
 }
 
-fn cache_lookup_snapshot(path: &Path, mtime: Option<SystemTime>, len: u64) -> Option<Arc<KvSnapshot>> {
+fn cache_lookup_snapshot(
+    path: &Path,
+    mtime: Option<SystemTime>,
+    len: u64,
+) -> Option<Arc<KvSnapshot>> {
     let guard = materialized_snapshot_cache().lock().ok()?;
     let entry = guard.get(path)?;
     // mtime is the primary key; require it to be present and equal so we never
@@ -470,7 +483,12 @@ fn cache_lookup_snapshot(path: &Path, mtime: Option<SystemTime>, len: u64) -> Op
     }
 }
 
-fn cache_store_snapshot(path: &Path, mtime: Option<SystemTime>, len: u64, snapshot: Arc<KvSnapshot>) {
+fn cache_store_snapshot(
+    path: &Path,
+    mtime: Option<SystemTime>,
+    len: u64,
+    snapshot: Arc<KvSnapshot>,
+) {
     if mtime.is_none() {
         return;
     }
@@ -1209,7 +1227,10 @@ pub fn kv_snapshot_durable_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
     if !left_entries.eq(right_entries) {
         return false;
     }
-    let left_leases = left.leases.iter().map(|lease| (&lease.lease_id, lease.ttl_ticks));
+    let left_leases = left
+        .leases
+        .iter()
+        .map(|lease| (&lease.lease_id, lease.ttl_ticks));
     let right_leases = right
         .leases
         .iter()
@@ -1716,7 +1737,11 @@ impl ReplicatedKvNode {
                 self.append_entries(vec![entry])?;
                 continue;
             }
-            if self.log.iter().any(|existing| existing.index == entry.index) {
+            if self
+                .log
+                .iter()
+                .any(|existing| existing.index == entry.index)
+            {
                 continue;
             }
             let contiguous = match self.log.last() {
@@ -1892,9 +1917,7 @@ impl ReplicatedKvNode {
     /// installing a received snapshot).
     fn local_compact(&mut self, retain: u64) {
         let snapshot_index = self.applied_index;
-        self.snapshot_term = self
-            .term_at(snapshot_index)
-            .unwrap_or(self.snapshot_term);
+        self.snapshot_term = self.term_at(snapshot_index).unwrap_or(self.snapshot_term);
         self.snapshot_index = snapshot_index;
         let cutoff = snapshot_index.saturating_sub(retain);
         self.log.retain(|entry| entry.index > cutoff);
@@ -2920,7 +2943,15 @@ mod tests {
                 .expect("changed write"),
             "a real value change must rewrite the snapshot"
         );
-        assert_eq!(cache.read_store().expect("read").get("alpha").expect("a").value, b"two");
+        assert_eq!(
+            cache
+                .read_store()
+                .expect("read")
+                .get("alpha")
+                .expect("a")
+                .value,
+            b"two"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

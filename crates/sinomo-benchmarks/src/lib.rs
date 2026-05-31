@@ -6,7 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_agent::{
-    AgentToolKind, AgentToolSpec, default_main_agent_tools, main_agent_system_prompt,
+    AgentToolKind, AgentToolSpec, default_coding_agent_tools, default_main_agent_tools,
+    main_agent_system_prompt,
 };
 use sinomo_pytorch::{MINICPM_DEFAULT_MODEL, PytorchDevice, PytorchRuntimeConfig};
 use std::path::PathBuf;
@@ -19,6 +20,62 @@ pub struct BenchmarkHarnessPlan {
     pub run_command: String,
     pub required_tools: Vec<AgentToolKind>,
     pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BenchmarkFamily {
+    Coding,
+    Terminal,
+    VisionAction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BenchmarkSuiteDescriptor {
+    pub name: String,
+    pub family: BenchmarkFamily,
+    pub task_count: usize,
+    pub dataset: Option<String>,
+    pub split: Option<String>,
+    pub runner: String,
+    pub baseline: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SweBenchSuite {
+    pub name: String,
+    pub dataset: String,
+    pub split: String,
+    pub selection: String,
+    pub instances: Vec<SweBenchInstance>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SweBenchInstance {
+    pub instance_id: String,
+    pub repo: String,
+    pub base_commit: String,
+    pub difficulty: String,
+}
+
+pub fn swebench_verified_10_suite() -> SweBenchSuite {
+    serde_json::from_str(include_str!(
+        "../../sinomo-benchmarks/swebench/verified_10.json"
+    ))
+    .expect("checked-in SWE-bench Verified suite is valid JSON")
+}
+
+pub fn swebench_verified_10_descriptor() -> BenchmarkSuiteDescriptor {
+    let suite = swebench_verified_10_suite();
+    BenchmarkSuiteDescriptor {
+        name: suite.name,
+        family: BenchmarkFamily::Coding,
+        task_count: suite.instances.len(),
+        dataset: Some(suite.dataset),
+        split: Some(suite.split),
+        runner: "crates/sinomo-benchmarks/swebench/run_swebench_verified.py".to_string(),
+        baseline: Some("mini-extra swebench".to_string()),
+    }
 }
 
 pub fn terminalbench_harbor_plan() -> BenchmarkHarnessPlan {
@@ -47,6 +104,41 @@ pub fn terminalbench_harbor_plan() -> BenchmarkHarnessPlan {
             "Harbor custom agents implement BaseAgent or BaseInstalledAgent; current Terminal-Bench 2 dataset id is terminal-bench/terminal-bench-2.".to_string(),
             "The generated adapter uses an external agent so Sinomo can keep tools outside the task container."
                 .to_string(),
+        ],
+    }
+}
+
+pub fn swebench_verified_10_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "swebench-verified-10".to_string(),
+        setup_commands: vec![
+            "python3 -m pip install mini-swe-agent swebench".to_string(),
+            "cargo build -p sinomo-benchmarks --bin sinomo-swebench-agent".to_string(),
+            "sinomo --local providers test deepseek".to_string(),
+        ],
+        run_command: "python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py --mode both --provider deepseek --model deepseek-v4-flash --baseline-model deepseek/deepseek-v4-flash"
+            .to_string(),
+        required_tools: default_coding_agent_tools()
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.kind,
+                    AgentToolKind::ReadFile
+                        | AgentToolKind::ListFiles
+                        | AgentToolKind::SearchFiles
+                        | AgentToolKind::GitStatus
+                        | AgentToolKind::GitDiff
+                        | AgentToolKind::ApplyPatch
+                        | AgentToolKind::RunShellCommand
+                        | AgentToolKind::Test
+                )
+            })
+            .map(|tool| tool.kind)
+            .collect(),
+        notes: vec![
+            "The Sinomo path runs the Rust coding Agent with local workspace tools and writes SWE-bench prediction JSONL.".to_string(),
+            "The baseline path delegates to mini-SWE-agent with a regex filter over the same 10 Verified instance ids.".to_string(),
+            "Official scoring remains the SWE-bench harness over princeton-nlp/SWE-bench_Verified.".to_string(),
         ],
     }
 }
@@ -370,6 +462,7 @@ pub fn docker_smoke_command(plan: &BenchmarkHarnessPlan) -> Result<String, Bench
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn terminalbench_plan_uses_harbor_custom_agent_shape() {
@@ -381,6 +474,52 @@ mod tests {
         assert!(
             plan.required_tools
                 .contains(&AgentToolKind::RunShellCommand)
+        );
+    }
+
+    #[test]
+    fn swebench_verified_suite_is_small_diverse_and_stable() {
+        let suite = swebench_verified_10_suite();
+        assert_eq!(suite.dataset, "princeton-nlp/SWE-bench_Verified");
+        assert_eq!(suite.split, "test");
+        assert_eq!(suite.instances.len(), 10);
+        let instance_ids: BTreeSet<_> = suite
+            .instances
+            .iter()
+            .map(|instance| instance.instance_id.as_str())
+            .collect();
+        let repos: BTreeSet<_> = suite
+            .instances
+            .iter()
+            .map(|instance| instance.repo.as_str())
+            .collect();
+        assert_eq!(instance_ids.len(), 10);
+        assert_eq!(repos.len(), 10);
+        assert!(instance_ids.contains("astropy__astropy-12907"));
+        assert!(instance_ids.contains("django__django-10097"));
+        assert!(instance_ids.contains("scikit-learn__scikit-learn-10297"));
+    }
+
+    #[test]
+    fn swebench_plan_wires_sinomo_and_mini_swe_agent() {
+        let descriptor = swebench_verified_10_descriptor();
+        assert_eq!(descriptor.family, BenchmarkFamily::Coding);
+        assert_eq!(descriptor.task_count, 10);
+        assert_eq!(descriptor.baseline.as_deref(), Some("mini-extra swebench"));
+        let plan = swebench_verified_10_plan();
+        assert!(plan.run_command.contains("run_swebench_verified.py"));
+        assert!(plan.run_command.contains("--mode both"));
+        assert!(plan.run_command.contains("deepseek-v4-flash"));
+        assert!(plan.required_tools.contains(&AgentToolKind::ReadFile));
+        assert!(plan.required_tools.contains(&AgentToolKind::ApplyPatch));
+        assert!(plan.required_tools.contains(&AgentToolKind::Test));
+        assert!(
+            include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
+                .contains("mini-extra")
+        );
+        assert!(
+            include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
+                .contains("swebench.harness.run_evaluation")
         );
     }
 

@@ -157,6 +157,10 @@ impl Default for CodexCliProvider {
     }
 }
 
+pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
+    crate::openai::inferred_context_window_tokens(model)
+}
+
 impl LanguageModelProvider for CodexCliProvider {
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
@@ -249,6 +253,8 @@ impl LanguageModelProvider for CodexCliProvider {
             provider: Self::PROVIDER_ID.to_string(),
             model,
             content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: None,
         })
     }
@@ -279,6 +285,10 @@ mod tests {
                     content: "Say hello.".to_string(),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: None,
             max_output_tokens: Some(32),
             response_format: LanguageModelResponseFormat::Text,

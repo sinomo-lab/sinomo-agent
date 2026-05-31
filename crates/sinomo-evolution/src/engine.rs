@@ -3947,6 +3947,10 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
                 provider: info.provider.clone(),
                 model: self.model.clone(),
                 messages: messages.clone(),
+                items: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: None,
+                parallel_tool_calls: None,
                 temperature: Some(0.2),
                 max_output_tokens: None,
                 response_format: response_format.clone(),
@@ -7328,6 +7332,8 @@ index 3b18e51..6320cd2 100644
                     .or_else(|| self.responses.last())
                     .cloned()
                     .unwrap_or_default(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
                 usage: Some(LanguageModelUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(20),

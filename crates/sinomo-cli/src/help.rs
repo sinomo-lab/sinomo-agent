@@ -16,6 +16,9 @@ pub fn print_usage() {
     println!("  sinomo providers");
     println!("  sinomo evolve");
     println!();
+    println!("Global flags:");
+    println!("  --local                    Force local file-backed mode and ignore cluster KV.");
+    println!();
     println!("Run `sinomo <subcommand> help` for detailed commands.");
     println!();
     println!("CUI:");
@@ -30,6 +33,7 @@ pub fn print_usage() {
     println!("  SINOMO_CODEX_CREDENTIALS_FILE  Overrides Sinomo's Codex credentials file");
     println!("  ANTHROPIC_API_KEY           Used by `providers auth/test anthropic`");
     println!("  OPENAI_API_KEY              Used by `providers auth/test openai`");
+    println!("  DEEPSEEK_API_KEY            Used by `providers auth/test deepseek`");
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
     println!("  NVIDIA_API_KEY              Used by `providers auth/test nvidia`");
     println!("  Cluster runtime settings live in KV; see `sinomo models runtime`.");
@@ -383,6 +387,7 @@ pub(super) fn print_providers_help() {
     println!("  codex");
     println!("  anthropic");
     println!("  openai");
+    println!("  deepseek");
     println!("  gemini");
     println!("  nvidia");
 }

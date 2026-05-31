@@ -1438,9 +1438,15 @@ mod tests {
             n: u8,
             s: String,
         }
-        let streamed =
-            crate::serde_ext::to_bytes(&Rec { n: 5, s: "hi".to_owned() }, 1, LengthMode::U32)
-                .unwrap();
+        let streamed = crate::serde_ext::to_bytes(
+            &Rec {
+                n: 5,
+                s: "hi".to_owned(),
+            },
+            1,
+            LengthMode::U32,
+        )
+        .unwrap();
         let value_path = Document::dynamic(
             1,
             LengthMode::U32,

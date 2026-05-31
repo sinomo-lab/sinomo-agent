@@ -78,6 +78,10 @@ impl GeminiProvider {
                 role: LanguageModelRole::User,
                 content: "Reply with ok.".to_string(),
             }],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: None,
             max_output_tokens: Some(8),
             response_format: LanguageModelResponseFormat::Text,
@@ -91,6 +95,10 @@ impl Default for GeminiProvider {
     fn default() -> Self {
         Self::new(GeminiConfig::default())
     }
+}
+
+pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
+    crate::parse_declared_context_window_tokens(model).or(Some(1_000_000))
 }
 
 impl LanguageModelProvider for GeminiProvider {
@@ -151,6 +159,8 @@ impl LanguageModelProvider for GeminiProvider {
             provider: Self::PROVIDER_ID.to_string(),
             model,
             content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage,
         })
     }

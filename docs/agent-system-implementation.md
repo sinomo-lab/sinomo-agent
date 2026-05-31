@@ -14,7 +14,7 @@ The checked-in bridge supports:
 - a probe mode for dependency diagnostics;
 - a mock mode for CI and benchmark harness smoke tests without downloading the 9B model.
 
-MiniCPM-o remains the first configured backend (`--provider minicpm-o`), but the bridge is intentionally named around the implementation boundary: any local PyTorch/Transformers model that can satisfy the request schema can be hosted behind `sinomo-pytorch-bridge` or `sinomo-pytorch-server`. Product runtime configuration is cluster-scoped and stored in cluster KV at `/config/lm/runtime`; use `sinomo models runtime set` instead of environment variables for model paths, device choices, and token budgets.
+MiniCPM-o remains the first configured backend (`--provider minicpm-o`), but the bridge is intentionally named around the implementation boundary: any local PyTorch/Transformers model that can satisfy the request schema can be hosted behind `sinomo-pytorch-bridge` or `sinomo-pytorch-server`. Product runtime configuration is cluster-scoped and stored in cluster KV at `/config/lm/runtime`; use `sinomo models runtime set` instead of environment variables for model paths, device choices, and token budgets. During feature testing, prefix commands with `sinomo --local` to force local file-backed settings even on a clustered node; model runtime settings then live at `$SINOMO_DATA_DIR/config/models-runtime.json`.
 
 The local model path follows the MiniCPM-o 4.5 PyTorch reference path. Current upstream docs recommend a Linux NVIDIA GPU with more than 28 GB VRAM for the full PyTorch demo. CPU mode is useful for dependency and wiring checks, but it is not expected to be fast enough for interactive full-duplex operation.
 
@@ -35,6 +35,12 @@ Cluster model traffic must go through `sinomo-network`. A configured `pytorch_br
 sinomo models runtime set --pytorch-endpoint ""
 ```
 
+For a local-only test override, use:
+
+```sh
+sinomo --local models runtime set --pytorch-endpoint ""
+```
+
 ## Main Agent Loop
 
 `crates/sinomo-agent` now exposes:
@@ -45,9 +51,55 @@ sinomo models runtime set --pytorch-endpoint ""
 - `AsyncTaskUpdate`;
 - `AgentLoopInput`;
 - `AgentLoopDecision`;
-- `MainAgentLoop`.
+- `MainAgentLoop`;
+- `Agent`;
+- `AgentSession`;
+- `AgentTranscript`;
+- `AgentItem`;
+- `TurnContext`;
+- `ContextAssembler`;
+- `ContextAssemblyReport`;
+- `AgentModelEvent`;
+- `AgentCompactor`;
+- `AgentCompactionSummary`;
+- `AgentPolicyBundle`;
+- `AgentToolPolicy`;
+- `AgentToolCapability`;
+- `AgentToolEvidence`;
+- `AgentTraceStore`;
+- `FileAgentTraceStore`;
+- `AgentStoragePaths`;
+- `AgentTraceRecord`;
+- `AgentToolRegistry`;
+- `LocalWorkspaceAgentConfig`;
+- `default_coding_agent_tools`;
+- `default_agent_tool_descriptors`.
 
 The loop asks the model for a JSON decision with user-visible text, optional tool calls, optional maid handoff, and the next interaction state. Quiet async updates can be consumed without calling the model.
+
+`Agent` is the first coding-agent style loop for deliberation and self-evolution work. It normalizes provider calls through `LanguageModelRequest`, keeps both a model-visible transcript and provider-neutral typed `AgentItem` evidence, executes requested tools through a registry/orchestrator boundary, returns tool results as follow-up user messages, and emits `agent.loop.*` events. By default, agent steps, per-step tool calls, model repair attempts, model output tokens, prompt-reference expansion, context size, and compaction are not hard-capped. Runtime layers can tighten those values when a concrete model or session policy provides real limits; model-window inference belongs to `sinomo-lm` provider implementations, and `AgentContextBudget::for_loaded_model` converts loaded model metadata into an optional byte budget plus ratio-based compaction threshold.
+
+The current architecture surface now has a session/turn split: `Agent::start_turn`, `continue_turn`, `steer`, `follow_up`, `compact`, and `abort` operate on `AgentSession`, while `Agent::run` remains the compatibility helper for one-shot runs. `start_turn` projects typed session transcript into model-visible history, and queued steering/follow-up messages are consumed into the next turn as an `agent_queued_turn_context` user message. Every model step assembles a `TurnContext` and records a `ContextAssemblyReport` with included sources, omitted context, and byte-budget estimates. The model request includes a structured `turn_context` message with workspace facts, async updates, workspace instruction files such as `AGENTS.md` as authored by the user, and prompt-reference expansions for `@file` and `@directory` mentions when `AgentConfig::workspace_root` is configured. `sinomo-lm` exposes provider-neutral `LanguageModelStreamEvent` values for text deltas, reasoning summaries, tool-call start/delta/completion, usage, finish, error, and abort events. `Agent` converts those into `AgentModelEvent` records, while providers that only return a completed response fall back to one completed-response delta.
+
+Self-evolution runs can pass typed `AgentLoopInput::evolution_context` data into each turn. The context carries an optional `EvolutionJob`, `MutationPacket`, prior candidate manifest, prior verification results, and candidate evidence. `ContextAssembler` records it as `TurnContext::evolution_job_facts`, includes its byte cost in `ContextBudgetEstimate`, and renders it into the model-facing `turn_context` message. When evolution context is present, `AgentRun::candidate_evidence_bundle` collects the final response plus patch snapshots and verification results from the run, giving the evolution pipeline a provider-neutral candidate evidence summary before durable rollout packaging is attached.
+
+`Agent` treats malformed deliberation-model output as recoverable. The loop records the unparseable response as `AgentItem::Error` plus `AgentModelEvent::Error`, then sends a focused JSON repair message to the model. `AgentConfig::max_model_repair_attempts` is optional: when a runtime policy sets it, exhaustion fails with `AgentError::ModelResponse` after preserving the failed attempts in trace state; otherwise repair attempts are left unbounded for the session runtime to cancel or steer.
+
+`AgentTraceStore` is the first append-only trace-store boundary. `FileAgentTraceStore` writes JSONL records for run boundaries, context reports, provider-neutral model events, typed transcript items, tool outcomes, compactions, and emitted runtime events. `Agent` uses a no-op trace store by default, and callers opt into durable traces with `Agent::with_trace_store`.
+
+`AgentStoragePaths` derives the Sinomo-owned agent subtree from `SinomoDataDir`: traces live under `events/agent/traces/<session>.jsonl`, and full tool evidence lives under `events/agent/evidence/<session>/...`. `FileAgentTraceStore::for_data_dir_session` and `LocalWorkspaceAgentConfig::with_data_dir_evidence` wire those paths into the first local implementation. `sinomo-agent::register_storage_paths` registers `events/agent` as the R2 escape subtree used by the CLI storage-contract layout.
+
+`AgentPolicyBundle` is the first session availability bundle. It can include or exclude tools by name and by declared `AgentToolCapability` values such as `ReadWorkspace`, `WriteWorkspace`, `ExecuteProcess`, `InspectVersionControl`, `AccessNetwork`, `PromptUser`, `Delegate`, `ObserveEnvironment`, `CallModel`, `ManageBackgroundTask`, and `InspectClusterState`. This is not a human approval model: a tool that is visible in the session is available to the agent. Strictly forbidden resources should be absent from the registry and cut off by the sandbox or tool execution environment. The policy filters model-visible tool schemas before context assembly and keeps a runtime guard for hallucinated or stale hidden-tool calls. Hidden tools are recorded in the `ContextAssemblyReport` omitted-context list, and blocked hidden-tool calls return model-visible blocked tool results with `AgentToolEvidence.policy.allowed = false`.
+
+Tool contracts and implementations now live under `crates/sinomo-agent/src/tools/`. The shared `AgentTool` trait, descriptors, outcomes, evidence, and dynamic `AgentToolRegistry` are separated from the loop. The local workspace built-ins live in `tools/local_workspace/`, with each tool in its own file (`read_file`, `list_files`, `search`, `git_status`, `git_diff`, `apply_patch`, `run_command`, `format`, `test`, and `request_user_input`). `AgentToolRegistry` is an interior-mutable handle: callers can register a tool, replace an existing tool with the same name, remove a tool, clear the registry, or clone the registry handle for runtime extension and future MCP/plugin registration. `Agent::tool_registry`, `Agent::register_tool`, and `Agent::remove_tool` expose that dynamic surface without changing the main turn loop.
+
+Compaction is represented by typed `AgentCompactionSummary` items and `agent.compaction.completed` events. The first compactor is intentionally small: it records the retained tail boundary, budget estimate, verification state, open risks, and policy constraints. It does not yet replace the persistent transcript in a durable store.
+
+The OpenAI Responses implementation path currently lives in `sinomo-lm` through the Codex provider's Responses renderer and stream parser. The Codex parser emits `LanguageModelStreamEvent` records from Responses SSE blocks for text, reasoning, tool calls, usage, completion, and failure. The durable `sinomo-agent` transcript is provider-neutral so future Chat Completions-compatible local servers, Anthropic, Google, process-backed coding agents, and smaller interactive models can render from the same `TurnContext`.
+
+The bundled local workspace registry is intentionally conservative: `read_file`, `list_files`, `search`, `git_status`, and `git_diff` are available under the configured workspace root with bounded outputs and path-escape checks. `apply_patch` is a standalone workspace edit tool: it accepts Codex-style `*** Begin Patch` freeform patches or structured JSON edit operations, applies add/update/delete/move changes directly inside the workspace root, records changed files, preserves the submitted patch as evidence when an evidence directory is configured, and emits an `AgentItem::PatchSnapshot` for review/rollback context. It is blocked unless the caller explicitly enables file writes on `LocalWorkspaceAgentConfig`. `run_command`, `format`, and `test` are blocked unless shell commands are enabled; `test` additionally maps command status into `AgentVerificationState` and emits `AgentItem::VerificationResult`. `request_user_input` is visible in the model contract but blocked until an interactive runtime bridge is attached.
+
+Tool results now carry a generic `AgentToolEvidence` envelope with the runtime availability decision, model-visible output size and truncation marker, durable artifact references, optional execution evidence, typed evidence records, and free-form metadata. Coding tools currently attach a `kind = "coding"` record whose payload is `AgentCodingToolEvidence` for patch refs, changed files, diff summaries, and verification state; non-coding tools can add their own record kinds without changing the envelope. `LocalWorkspaceAgentConfig::with_evidence_dir` lets local tools preserve truncated read or command output behind a `full_output` artifact reference; `with_data_dir_evidence` uses the standard data-dir layout. Wiring those handles to SIFS remains a storage integration point.
 
 ## CLI Smoke Entry
 
@@ -58,7 +110,10 @@ Examples:
 ```sh
 sinomo agent run --prompt "Check cluster health later and tell me if anything is wrong."
 sinomo agent run --provider codex --model gpt-5.2-codex --prompt "Summarize the current repo status."
+sinomo --local agent run --provider deepseek --model deepseek-v4-flash --prompt "Summarize the current repo status."
 ```
+
+`--local` is a global CLI flag. It bypasses cluster quorum/orphan guards for local-capable commands and reads or writes local config instead of cluster KV. This is useful for testing provider authentication, default model selection, runtime model settings, sandbox policy, and local-owned DFS data on a node that may already be part of a cluster. Local model/provider files are under `$SINOMO_DATA_DIR/config/` (`models.json`, `models-runtime.json`, and `sandbox-policy.json`), while provider API-key credentials remain under the local provider credentials directory.
 
 ## Benchmark Harnesses
 

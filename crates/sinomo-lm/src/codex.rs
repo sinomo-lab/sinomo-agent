@@ -2,8 +2,8 @@ use crate::{
     LanguageModelCreditUsage, LanguageModelError, LanguageModelInvocation, LanguageModelMessage,
     LanguageModelProvider, LanguageModelProviderInfo, LanguageModelProviderUsage,
     LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
-    LanguageModelUsage, LanguageModelUsageLimit, LanguageModelUsageProvider,
-    PROVIDER_DEFAULT_MODEL, selected_model, unix_timestamp,
+    LanguageModelStreamEvent, LanguageModelUsage, LanguageModelUsageLimit,
+    LanguageModelUsageProvider, PROVIDER_DEFAULT_MODEL, selected_model, unix_timestamp,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -87,6 +87,10 @@ fn missing_codex_chatgpt_auth() -> LanguageModelError {
         detail: "no Sinomo Codex ChatGPT sign-in found; run `sinomo providers auth codex`"
             .to_string(),
     }
+}
+
+pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
+    crate::openai::inferred_context_window_tokens(model)
 }
 
 fn read_codex_chatgpt_tokens(
@@ -568,6 +572,14 @@ impl CodexClient for OpenAiResponsesCodexClient {
         &self,
         request: &CodexModelRequest,
     ) -> Result<CodexModelResponse, LanguageModelError> {
+        self.complete_streaming(request, &mut |_| {})
+    }
+
+    fn complete_streaming(
+        &self,
+        request: &CodexModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<CodexModelResponse, LanguageModelError> {
         let mut tokens = self.chatgpt_tokens()?;
         let request = request.with_chatgpt_supported_model();
         let url = format!(
@@ -599,7 +611,7 @@ impl CodexClient for OpenAiResponsesCodexClient {
                     detail: source.to_string(),
                 })?;
 
-        parse_openai_responses_codex_body(&body, &request.model)
+        parse_openai_responses_codex_body_with_events(&body, &request.model, on_event)
     }
 }
 
@@ -688,6 +700,18 @@ pub trait CodexClient {
         &self,
         request: &CodexModelRequest,
     ) -> Result<CodexModelResponse, LanguageModelError>;
+
+    fn complete_streaming(
+        &self,
+        request: &CodexModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<CodexModelResponse, LanguageModelError> {
+        let response = self.complete(request)?;
+        for event in &response.stream_events {
+            on_event(event.clone());
+        }
+        Ok(response)
+    }
 }
 
 pub trait CodexTool {
@@ -849,6 +873,10 @@ impl CodexProvider<OpenAiResponsesCodexClient> {
                 role: LanguageModelRole::User,
                 content: "Reply with ok.".to_string(),
             }],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: None,
             max_output_tokens: Some(8),
             response_format: LanguageModelResponseFormat::Text,
@@ -906,6 +934,14 @@ where
         &self,
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
+        self.complete_streaming_events(request, &mut |_| {})
+    }
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
         let model = selected_model(&self.config.default_model, request);
         let mut messages = self.context_manager.prepare_messages(request);
         if let Some(system_prompt) = self.prompt_builder.build_system_prompt(request) {
@@ -914,6 +950,10 @@ where
         let tools = self.tools.descriptors();
 
         for _ in 0..self.config.max_iterations {
+            on_event(LanguageModelStreamEvent::Started {
+                provider: self.config.provider_id.clone(),
+                model: model.clone(),
+            });
             let codex_request = CodexModelRequest {
                 model: model.clone(),
                 messages: messages.clone(),
@@ -923,12 +963,14 @@ where
                 response_format: request.response_format.clone(),
                 metadata: request.metadata.clone(),
             };
-            let response = self.client.complete(&codex_request)?;
+            let response = self.client.complete_streaming(&codex_request, on_event)?;
             if response.tool_calls.is_empty() {
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
                     model,
                     content: response.content,
+                    items: Vec::new(),
+                    tool_calls: Vec::new(),
                     usage: response.usage,
                 });
             }
@@ -1002,6 +1044,8 @@ pub struct CodexModelResponse {
     pub continuation_items: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<LanguageModelUsage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stream_events: Vec<LanguageModelStreamEvent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1423,6 +1467,7 @@ fn parse_openai_responses_codex_response(value: &serde_json::Value) -> CodexMode
         .iter()
         .filter_map(parse_function_call_item)
         .collect::<Vec<_>>();
+    let mut stream_events = stream_events_from_openai_output(&output);
     let continuation_items = output
         .into_iter()
         .filter(|item| {
@@ -1440,33 +1485,56 @@ fn parse_openai_responses_codex_response(value: &serde_json::Value) -> CodexMode
             .get("output_tokens")
             .and_then(serde_json::Value::as_u64),
     });
+    if let Some(usage) = &usage {
+        stream_events.push(LanguageModelStreamEvent::Usage {
+            usage: usage.clone(),
+        });
+    }
+    stream_events.push(LanguageModelStreamEvent::Finished {
+        finish_reason: openai_responses_finish_reason(value),
+    });
     CodexModelResponse {
         content,
         tool_calls,
         continuation_items,
         usage,
+        stream_events,
     }
 }
 
-fn parse_openai_responses_codex_body(
+fn parse_openai_responses_codex_body_with_events(
     body: &str,
     model: &str,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
 ) -> Result<CodexModelResponse, LanguageModelError> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        return Ok(parse_openai_responses_codex_response(
-            value.get("response").unwrap_or(&value),
-        ));
+        let response =
+            parse_openai_responses_codex_response(value.get("response").unwrap_or(&value));
+        for event in &response.stream_events {
+            on_event(event.clone());
+        }
+        return Ok(response);
     }
 
-    parse_openai_responses_codex_sse_response(body, model)
+    parse_openai_responses_codex_sse_response_with_events(body, model, on_event)
 }
 
+#[cfg(test)]
 fn parse_openai_responses_codex_sse_response(
     body: &str,
     model: &str,
 ) -> Result<CodexModelResponse, LanguageModelError> {
+    parse_openai_responses_codex_sse_response_with_events(body, model, &mut |_| {})
+}
+
+fn parse_openai_responses_codex_sse_response_with_events(
+    body: &str,
+    model: &str,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> Result<CodexModelResponse, LanguageModelError> {
     let mut output = Vec::new();
     let mut output_text = String::new();
+    let mut stream_events = Vec::new();
     let normalized = body.replace("\r\n", "\n");
 
     for block in normalized.split("\n\n") {
@@ -1481,12 +1549,21 @@ fn parse_openai_responses_codex_sse_response(
         match kind {
             "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
+                    for stream_event in stream_events_from_openai_output_item(item) {
+                        on_event(stream_event.clone());
+                        stream_events.push(stream_event);
+                    }
                     output.push(item.clone());
                 }
             }
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
                     output_text.push_str(delta);
+                    let stream_event = LanguageModelStreamEvent::TextDelta {
+                        delta: delta.to_string(),
+                    };
+                    on_event(stream_event.clone());
+                    stream_events.push(stream_event);
                 }
             }
             "response.completed" => {
@@ -1504,11 +1581,28 @@ fn parse_openai_responses_codex_sse_response(
                 if response.get("output_text").is_none() && !output_text.is_empty() {
                     response["output_text"] = serde_json::json!(output_text);
                 }
-                return Ok(parse_openai_responses_codex_response(&response));
+                let mut parsed = parse_openai_responses_codex_response(&response);
+                if let Some(usage) = &parsed.usage {
+                    let stream_event = LanguageModelStreamEvent::Usage {
+                        usage: usage.clone(),
+                    };
+                    on_event(stream_event.clone());
+                    stream_events.push(stream_event);
+                }
+                let stream_event = LanguageModelStreamEvent::Finished {
+                    finish_reason: openai_responses_finish_reason(&response),
+                };
+                on_event(stream_event.clone());
+                stream_events.push(stream_event);
+                parsed.stream_events = stream_events;
+                return Ok(parsed);
             }
             "response.failed" => {
                 let detail = openai_responses_event_error_message(&event)
                     .unwrap_or_else(|| format!("Codex backend stream failed: {event}"));
+                on_event(LanguageModelStreamEvent::Error {
+                    detail: detail.clone(),
+                });
                 return Err(codex_provider_invocation_error(model, detail));
             }
             _ => {}
@@ -1520,13 +1614,126 @@ fn parse_openai_responses_codex_sse_response(
         if !output_text.is_empty() {
             response["output_text"] = serde_json::json!(output_text);
         }
-        return Ok(parse_openai_responses_codex_response(&response));
+        let mut parsed = parse_openai_responses_codex_response(&response);
+        if stream_events
+            .iter()
+            .all(|event| !matches!(event, LanguageModelStreamEvent::Finished { .. }))
+        {
+            let stream_event = LanguageModelStreamEvent::Finished {
+                finish_reason: None,
+            };
+            on_event(stream_event.clone());
+            stream_events.push(stream_event);
+        }
+        parsed.stream_events = stream_events;
+        return Ok(parsed);
     }
 
     Err(codex_provider_invocation_error(
         model,
         "Codex backend stream closed before response.completed".to_string(),
     ))
+}
+
+fn stream_events_from_openai_output(output: &[serde_json::Value]) -> Vec<LanguageModelStreamEvent> {
+    output
+        .iter()
+        .flat_map(stream_events_from_openai_output_item)
+        .collect()
+}
+
+fn stream_events_from_openai_output_item(
+    item: &serde_json::Value,
+) -> Vec<LanguageModelStreamEvent> {
+    match item
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+    {
+        "message" => message_text_parts(item)
+            .into_iter()
+            .map(|delta| LanguageModelStreamEvent::TextDelta { delta })
+            .collect(),
+        "reasoning" => reasoning_summaries(item)
+            .into_iter()
+            .map(|summary| LanguageModelStreamEvent::ReasoningSummary { summary })
+            .collect(),
+        "function_call" => parse_function_call_item(item)
+            .map(|call| {
+                vec![
+                    LanguageModelStreamEvent::ToolCallStarted {
+                        call_id: Some(call.call_id.clone()),
+                        name: call.name.clone(),
+                    },
+                    LanguageModelStreamEvent::ToolCallCompleted {
+                        call_id: Some(call.call_id),
+                        name: call.name,
+                        input: call.input,
+                    },
+                ]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn message_text_parts(item: &serde_json::Value) -> Vec<String> {
+    item.get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(
+            |content| match content.get("type").and_then(serde_json::Value::as_str) {
+                Some("output_text" | "text") => content
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+fn reasoning_summaries(item: &serde_json::Value) -> Vec<String> {
+    let Some(summary) = item.get("summary").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    summary
+        .iter()
+        .filter_map(|part| {
+            part.as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    part.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    part.get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .filter(|summary| !summary.trim().is_empty())
+        .collect()
+}
+
+fn openai_responses_finish_reason(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string)
 }
 
 fn parse_sse_event(
@@ -1646,6 +1853,10 @@ mod tests {
                     content: "Inspect the repo.".to_string(),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: Some(0.2),
             max_output_tokens: Some(200),
             response_format: LanguageModelResponseFormat::Text,
@@ -1673,12 +1884,14 @@ mod tests {
                         "arguments": "{\"path\":\"README.md\"}"
                     })],
                     usage: None,
+                    stream_events: Vec::new(),
                 },
                 CodexModelResponse {
                     content: "Done with README context.".to_string(),
                     tool_calls: Vec::new(),
                     continuation_items: Vec::new(),
                     usage: None,
+                    stream_events: Vec::new(),
                 },
             ]),
         };
@@ -1884,7 +2097,7 @@ mod tests {
     fn openai_responses_parser_extracts_tool_calls_and_reasoning_items() {
         let parsed = parse_openai_responses_codex_response(&serde_json::json!({
             "output": [
-                { "type": "reasoning", "id": "rs_1", "summary": [] },
+                { "type": "reasoning", "id": "rs_1", "summary": [{ "text": "checked context" }] },
                 {
                     "type": "function_call",
                     "call_id": "call_1",
@@ -1904,6 +2117,20 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].input["path"], "README.md");
         assert_eq!(parsed.continuation_items.len(), 2);
         assert_eq!(parsed.usage.unwrap().input_tokens, Some(10));
+        assert!(parsed.stream_events.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelStreamEvent::ReasoningSummary { summary }
+                    if summary == "checked context"
+            )
+        }));
+        assert!(parsed.stream_events.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelStreamEvent::ToolCallCompleted { name, input, .. }
+                    if name == "read_context" && input["path"] == "README.md"
+            )
+        }));
     }
 
     #[test]
@@ -1937,6 +2164,65 @@ mod tests {
             parse_openai_responses_codex_sse_response(body, CODEX_DEFAULT_MODEL).expect("sse");
 
         assert_eq!(parsed.content, "hello");
+        assert_eq!(
+            parsed
+                .stream_events
+                .iter()
+                .filter(|event| matches!(event, LanguageModelStreamEvent::TextDelta { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn openai_responses_sse_parser_emits_stream_events() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[{\"text\":\"thinking\"}]}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_context\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        );
+        let mut streamed = Vec::new();
+
+        let parsed = parse_openai_responses_codex_sse_response_with_events(
+            body,
+            CODEX_DEFAULT_MODEL,
+            &mut |event| streamed.push(event),
+        )
+        .expect("sse");
+
+        assert_eq!(parsed.content, "hi");
+        assert!(streamed.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelStreamEvent::ReasoningSummary { summary } if summary == "thinking"
+            )
+        }));
+        assert!(streamed.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelStreamEvent::ToolCallStarted { name, .. } if name == "read_context"
+            )
+        }));
+        assert!(streamed.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelStreamEvent::Usage { usage }
+                    if usage.input_tokens == Some(3)
+            )
+        }));
+        assert!(streamed.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelStreamEvent::Finished { finish_reason }
+                    if finish_reason.as_deref() == Some("completed")
+            )
+        }));
+        assert_eq!(parsed.stream_events, streamed);
     }
 
     #[test]
@@ -1946,10 +2232,18 @@ mod tests {
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"bad stream\"}}}\n\n",
         );
 
-        let error = parse_openai_responses_codex_sse_response(body, CODEX_DEFAULT_MODEL)
-            .expect_err("failed stream");
+        let mut streamed = Vec::new();
+        let error = parse_openai_responses_codex_sse_response_with_events(
+            body,
+            CODEX_DEFAULT_MODEL,
+            &mut |event| streamed.push(event),
+        )
+        .expect_err("failed stream");
 
         assert!(error.to_string().contains("bad stream"));
+        assert!(streamed.iter().any(|event| {
+            matches!(event, LanguageModelStreamEvent::Error { detail } if detail == "bad stream")
+        }));
     }
 
     #[test]

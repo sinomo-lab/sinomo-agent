@@ -10,6 +10,8 @@ It complements the distributed runtime in [architecture.md](architecture.md), th
 
 Sinomo should feel like one continuous entity to users, but internally it is a real-time multimodal agent running on top of a cluster-aware action substrate. The main agent must never block live interaction just because slow work is in progress. Tool calls, research, coding, background cleanup, and delegated agent work run asynchronously and report results back into the session timeline.
 
+The implementation should follow the coding-harness pattern used by mature agent runtimes: a small core loop around a streaming model, a typed transcript/evidence store, runtime-owned tool policy, explicit context assembly, and first-class compaction. Provider-specific behavior belongs at the provider adapter boundary. Prompt text can guide behavior, but it must not be the security, storage, rollout, or tool-execution authority.
+
 The first implementation should use [OpenBMB MiniCPM-o](https://github.com/OpenBMB/MiniCPM-o) as the local core model family. As of 2026-05-10, the repository describes MiniCPM-o 4.5 as a 9B end-to-end multimodal model for image, video, text, and audio input with text and speech output, including full-duplex multimodal live streaming where input streams and output streams do not block each other. The repository also documents local deployment paths including PyTorch inference, llama.cpp-omni, Ollama, vLLM, SGLang, LLaMA-Factory, and SWIFT.
 
 Local inference is preferred over API inference for the main user-facing loop. API and CLI models remain important, but they are helpers for slower or more specialized work rather than the identity of Sinomo.
@@ -84,7 +86,12 @@ Users / Devices / Sessions
       <-> Core full-duplex multimodal model
       <-> Session timeline and world-state
       <-> Async task registry
+      <-> Typed transcript and evidence store
       <-> Deliberation model gateway
+      <-> Deliberation harness
+          <-> Context assembler and compactor
+          <-> Tool registry and executor
+          <-> Provider adapters through sinomo-lm
       <-> Cluster-aware tool/action gateway
       <-> SIFS filesystem view
       <-> Maid handoff queue
@@ -125,6 +132,35 @@ Examples:
 - Reviewing proposed self-evolution candidates.
 - Generating tests, diagnostics, and reproduction steps.
 
+### Deliberation Harness
+
+Async model work should run through a reusable deliberation harness rather than bespoke prompt calls. The first implementation can live in `sinomo-agent` for velocity, but the stable contracts should stay compatible with `sinomo-lm`, `sinomo-events`, `sinomo-deliberation`, and the self-evolution crates.
+
+The harness loop is intentionally small:
+
+```text
+assemble turn context
+  -> render provider request
+  -> stream model events
+  -> persist assistant items
+  -> execute requested tools through runtime policy
+  -> persist tool results as evidence
+  -> compact, retry, or continue if needed
+  -> finish with a final answer and evidence summary
+```
+
+Core harness responsibilities:
+
+- Maintain a typed transcript and evidence view, not only a model-visible text transcript.
+- Normalize provider output into provider-neutral stream events for assistant text, reasoning summaries, tool-call deltas, usage, finish reasons, errors, and aborts.
+- Keep model-visible tool schemas separate from runtime tool handlers.
+- Run every tool through policy, sandbox, scope, and output-size checks before execution.
+- Return tool results to the model as continuation context when another step is needed.
+- Preserve enough evidence for replay, compaction, user explanation, training, and self-evolution review.
+- Stop on final answer, budget exhaustion, explicit cancellation, or a harness-level policy decision.
+
+OpenAI Responses should be the first direct API renderer for the deliberation harness because it maps well to typed text, reasoning, tool-call, and tool-result items. The durable Sinomo transcript must remain provider-neutral so Chat Completions-compatible local servers, Anthropic, Google, process-backed coding agents, and smaller interactive models can be added later without changing the core session contract.
+
 Async work should use the standard task-call schema, with durable task records behind each call:
 
 - `task_id`
@@ -160,6 +196,56 @@ The `summary` should be safe to inject into a live stream. Larger outputs, logs,
 
 The main agent should be able to continue speaking with the user while these tasks run. When a result arrives, it is just another event in the session timeline and can be summarized, ignored, acted on, or handed to the maid.
 
+## Transcript, Context, and Compaction
+
+The agent system should define the transcript before it defines provider payloads. Provider requests are rendered from Sinomo transcript state, not the other way around.
+
+Initial transcript item families:
+
+- user messages;
+- assistant text and optional reasoning summaries;
+- tool calls and tool results;
+- async task creation, progress, completion, failure, and cancellation;
+- context-injection records;
+- model usage and provider diagnostics;
+- patch, diff, snapshot, and verification records;
+- errors, retries, aborts, and policy denials;
+- compaction summaries and retained-tail markers.
+
+Every deliberation turn should be assembled from durable state into a `TurnContext`:
+
+```text
+TurnContext
+  session_id
+  active agent role
+  provider and model
+  stable system/base instructions
+  transcript view
+  workspace and SIFS facts
+  loaded instruction files
+  evolution job facts when relevant
+  available tool specs
+  budget estimates
+  omitted-context report
+```
+
+The context assembler should emit a context assembly report for every turn. The report should list included files, summaries, memory fragments, tool schemas, token or size estimates, omitted items, and omission reasons. This report is evidence; it is also the first place to debug context-packing failures.
+
+Compaction must be explicit typed state. A compaction event should include:
+
+- reason and trigger threshold;
+- summary text;
+- first retained item or event;
+- token or size estimate before compaction;
+- retained-tail size;
+- files read and modified;
+- current objective and latest user request;
+- active plan, completed work, blockers, and next actions;
+- verification state and open risks;
+- policy constraints that must survive the summary.
+
+Compaction summaries are reference material for future model turns, not authority. Runtime policy, tool state, verification state, and rollout decisions remain structured state outside the summary.
+
 ## Cluster-Aware Tooling
 
 All environment interaction runs on top of the Sinomo cluster infrastructure. This does not require distributed model inference. It means tool execution, filesystem access, device control, process execution, diagnostics, rollout, and storage work are cluster-aware by default.
@@ -177,13 +263,31 @@ Tool gateway responsibilities:
 
 - Resolve session defaults into concrete node/device/workspace targets.
 - Check cluster membership and orphan guards before distributed work.
+- Select model-visible tool schemas from the runtime registry according to agent role, trust ring, provider capability, workspace scope, and policy.
+- Validate model tool arguments before execution.
 - Enforce node-local policy and sandbox limits.
 - Route actions to the node closest to the relevant device or data.
 - Return async handles for slow calls.
-- Attach provenance, node identity, and evidence handles to every result.
+- Attach provenance, node identity, policy decision, and evidence handles to every result.
+- Truncate large model-visible output while preserving full-output handles for audit and later inspection.
 - Prefer structured machine-readable output over terminal-only text.
 
 Cluster-operation tasks should be handed to the maid agent unless they are a direct, immediate part of the user's task and safe for the main agent to drive. This keeps cluster details mostly transparent to Sinomo's real-time persona while still preserving explicit control when placement matters.
+
+The initial deliberation tool set should stay small and auditable:
+
+- `read_file`
+- `list_files`
+- `search`
+- `apply_patch`
+- `run_command`
+- `git_status`
+- `git_diff`
+- `format`
+- `test`
+- `request_user_input`
+
+Deferred tool discovery can be added later when the cluster has enough tools that exposing every schema wastes context. Until then, direct visibility plus strict runtime policy is simpler and easier to verify.
 
 ## Maid Wake and Event Aggregation
 
@@ -237,6 +341,7 @@ Collected data classes:
 - Agent decisions: when Sinomo spoke, stayed silent, interrupted, delegated, asked a question, used a tool, or handed off to the maid.
 - Async task traces: task creation, progress, delayed results, cancellations, and user satisfaction signals.
 - Tool traces: structured inputs, outputs, errors, node placement, duration, and policy decisions.
+- Deliberation harness traces: context assembly reports, provider request metadata, normalized stream events, tool-call continuations, compaction events, retries, and final answer evidence.
 - Cluster traces: node health, rollout state, DFS issues, daemon errors, and recovery actions.
 - Self-evolution traces: issue detection, proposal, implementation, evaluation, rollout, rollback, and postmortem outcomes.
 
@@ -276,6 +381,9 @@ Self-evolution handoff rules:
 - Until Sinomo has an autonomous approval system, approval for quick maid-driven operational fixes is delegated to a human. This should use the same approval and rollout surfaces as self-evolution.
 - Large functionality changes use the self-evolution architecture.
 - Evolution jobs must have bounded scope, write-set ownership, evaluation gates, rollback policy, and provenance.
+- Mutation packets and implementation runs should be ordinary deliberation-harness sessions with extra job, scope, verification, and rollback context.
+- Verification commands, patch snapshots, changed-file summaries, tool results, and final model claims should be stored as typed candidate evidence.
+- A candidate cannot be treated as successful only because the model says it is done. Verification evidence and policy decisions remain authoritative.
 - The main agent can explain and negotiate user-facing evolution goals.
 - The maid can provide diagnostics, incident bundles, reproduction steps, and operational constraints.
 
@@ -297,8 +405,14 @@ The main agent and maid agent need different defaults.
 
 Every action should carry the responsible agent role, initiating event, session or maintenance bundle, target node, and policy decision. This is needed for debugging, training, user explanation, and self-evolution evidence.
 
+Tool and rollout permissions are runtime decisions. System prompts should tell models what to expect, but actual permission checks happen before tool schema exposure, file reads, file writes, command execution, network access, memory writes, candidate approval, and rollout activation.
+
 ## Remaining Refinements
 
 - Define the exact JSON schemas for async task updates and maid event-bundle files once the event and task crates stabilize.
+- Define the stable typed transcript and evidence item schema shared by `sinomo-agent`, `sinomo-deliberation`, `sinomo-lm`, and self-evolution jobs.
+- Define the normalized provider stream event enum and the first OpenAI Responses renderer/parser.
+- Define the context assembly report schema and compaction event schema.
+- Define the policy metadata required by tool descriptors before broadening the tool registry.
 - Define the user-facing controls for per-user, per-device, per-session, and per-data-class collection opt-out.
 - Define the human approval UI or CLI flow shared by quick maid fixes and self-evolution rollout approval.

@@ -5,6 +5,7 @@ mod api_key;
 mod claude_code;
 mod codex;
 mod codex_cli;
+mod deepseek;
 mod gemini;
 mod github_copilot;
 mod nvidia;
@@ -24,6 +25,10 @@ pub use codex::{
 };
 pub use codex_cli::{
     CODEX_CLI_DEFAULT_MODEL, CodexCliConfig, CodexCliProvider, CodexColor, CodexSandboxMode,
+};
+pub use deepseek::{
+    DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_V4_FLASH_MODEL, DEEPSEEK_V4_PRO_MODEL, DeepSeekConfig,
+    DeepSeekProvider,
 };
 pub use gemini::{GeminiConfig, GeminiProvider};
 #[cfg(test)]
@@ -53,6 +58,14 @@ pub struct LanguageModelRequest {
     pub provider: String,
     pub model: String,
     pub messages: Vec<LanguageModelMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<LanguageModelRequestItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<LanguageModelToolSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<LanguageModelToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +79,34 @@ pub struct LanguageModelRequest {
 pub struct LanguageModelMessage {
     pub role: LanguageModelRole,
     pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LanguageModelRequestItem {
+    Message {
+        role: LanguageModelRole,
+        content: String,
+    },
+    ToolCallOutput {
+        call_id: String,
+        name: String,
+        #[serde(default)]
+        output: serde_json::Value,
+    },
+    Context {
+        label: String,
+        content: String,
+    },
+}
+
+impl LanguageModelRequestItem {
+    pub fn message(role: LanguageModelRole, content: impl Into<String>) -> Self {
+        Self::Message {
+            role,
+            content: content.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -83,11 +124,90 @@ pub enum LanguageModelResponseFormat {
     JsonObject,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelToolSpec {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    #[serde(default)]
+    pub output_schema: serde_json::Value,
+    #[serde(default)]
+    pub supports_parallel: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_specs: Vec<LanguageModelProviderToolSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelProviderToolSpec {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<LanguageModelCustomToolSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelCustomToolSpec {
+    pub format: LanguageModelCustomToolFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input_argument: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LanguageModelCustomToolFormat {
+    Grammar { syntax: String, definition: String },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LanguageModelToolChoice {
+    Auto,
+    None,
+    Required,
+    Tool { name: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LanguageModelResponseItem {
+    Message {
+        role: LanguageModelRole,
+        content: String,
+    },
+    ReasoningSummary {
+        summary: String,
+    },
+    ToolCall {
+        call: LanguageModelToolCall,
+    },
+    ToolCallOutput {
+        call_id: String,
+        name: String,
+        #[serde(default)]
+        output: serde_json::Value,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LanguageModelResponse {
     pub provider: String,
     pub model: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<LanguageModelResponseItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<LanguageModelToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<LanguageModelUsage>,
 }
@@ -98,6 +218,53 @@ pub struct LanguageModelUsage {
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LanguageModelStreamEvent {
+    Started {
+        provider: String,
+        model: String,
+    },
+    TextDelta {
+        delta: String,
+    },
+    ReasoningSummary {
+        summary: String,
+    },
+    ToolCallStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        name: String,
+    },
+    ToolCallDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        arguments_delta: String,
+    },
+    ToolCallCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    Usage {
+        usage: LanguageModelUsage,
+    },
+    Finished {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+    },
+    Error {
+        detail: String,
+    },
+    Aborted {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -273,6 +440,45 @@ pub struct PytorchBridgeRuntimeConfig {
     pub timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mock: Option<bool>,
+}
+
+pub fn inferred_model_context_window_tokens(provider: &str, model: &str) -> Option<usize> {
+    let provider = normalize_model_provider(provider)?;
+    let model = effective_model_name(&provider, model);
+    match provider.as_str() {
+        GitHubCopilotProvider::PROVIDER_ID | GitHubCopilotCliProvider::PROVIDER_ID => {
+            github_copilot::inferred_context_window_tokens(&model)
+        }
+        CodexCliProvider::PROVIDER_ID => codex_cli::inferred_context_window_tokens(&model),
+        CODEX_PROVIDER_ID => codex::inferred_context_window_tokens(&model),
+        ClaudeCodeProvider::PROVIDER_ID => claude_code::inferred_context_window_tokens(&model),
+        AnthropicProvider::PROVIDER_ID => anthropic::inferred_context_window_tokens(&model),
+        OpenAiProvider::PROVIDER_ID => openai::inferred_context_window_tokens(&model),
+        DeepSeekProvider::PROVIDER_ID => deepseek::inferred_context_window_tokens(&model),
+        GeminiProvider::PROVIDER_ID => gemini::inferred_context_window_tokens(&model),
+        NvidiaProvider::PROVIDER_ID => nvidia::inferred_context_window_tokens(&model),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_declared_context_window_tokens(model: &str) -> Option<usize> {
+    model
+        .to_ascii_lowercase()
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.'))
+        .filter_map(parse_context_token_count)
+        .max()
+}
+
+fn parse_context_token_count(token: &str) -> Option<usize> {
+    let (value, multiplier) = token
+        .strip_suffix('k')
+        .map(|value| (value, 1_000))
+        .or_else(|| token.strip_suffix('m').map(|value| (value, 1_000_000)))?;
+    let scaled = value.parse::<f64>().ok()? * multiplier as f64;
+    if !scaled.is_finite() || scaled <= 0.0 {
+        return None;
+    }
+    Some(scaled.round() as usize)
 }
 
 #[derive(Clone, Debug)]
@@ -574,6 +780,7 @@ pub fn effective_model_name(provider: &str, configured_model: &str) -> String {
         ClaudeCodeProvider::PROVIDER_ID => CLAUDE_CODE_DEFAULT_MODEL.to_string(),
         AnthropicProvider::PROVIDER_ID => AnthropicConfig::default().default_model,
         OpenAiProvider::PROVIDER_ID => OpenAiConfig::default().default_model,
+        DeepSeekProvider::PROVIDER_ID => DeepSeekConfig::default().default_model,
         GeminiProvider::PROVIDER_ID => GeminiConfig::default().default_model,
         NvidiaProvider::PROVIDER_ID => NvidiaConfig::default().default_model,
         _ => configured_model.to_string(),
@@ -596,6 +803,7 @@ pub fn default_model_provider_ids() -> &'static [&'static str] {
         ClaudeCodeProvider::PROVIDER_ID,
         AnthropicProvider::PROVIDER_ID,
         OpenAiProvider::PROVIDER_ID,
+        DeepSeekProvider::PROVIDER_ID,
         GeminiProvider::PROVIDER_ID,
         NvidiaProvider::PROVIDER_ID,
     ]
@@ -616,6 +824,9 @@ pub fn normalize_model_provider(provider: &str) -> Option<String> {
             Some(AnthropicProvider::PROVIDER_ID.to_string())
         }
         OpenAiProvider::PROVIDER_ID | "openai-api" => Some(OpenAiProvider::PROVIDER_ID.to_string()),
+        DeepSeekProvider::PROVIDER_ID | "deepseek-api" => {
+            Some(DeepSeekProvider::PROVIDER_ID.to_string())
+        }
         GeminiProvider::PROVIDER_ID | "google-gemini" => {
             Some(GeminiProvider::PROVIDER_ID.to_string())
         }
@@ -651,6 +862,10 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
             let (provider, _) = openai_provider()?;
             provider.api_key()?;
             Ok(vec![OpenAiConfig::default().default_model])
+        }
+        DeepSeekProvider::PROVIDER_ID => {
+            let (provider, _) = deepseek_provider()?;
+            provider.list_models()
         }
         GeminiProvider::PROVIDER_ID => {
             let (provider, _) = gemini_provider()?;
@@ -827,6 +1042,23 @@ pub fn complete_configured_model_request_with_account(
             });
             provider.complete(&request)
         }
+        DeepSeekProvider::PROVIDER_ID => {
+            let credentials_path =
+                data_dir.provider_credentials_file(DeepSeekProvider::PROVIDER_ID);
+            let default_config = DeepSeekConfig::default();
+            let provider = DeepSeekProvider::new(DeepSeekConfig {
+                api_base_url: account
+                    .and_then(|account| account.api_base_url.clone())
+                    .unwrap_or(default_config.api_base_url),
+                default_model: model_or_default(model, default_config.default_model),
+                api_key: account.and_then(|account| account.api_key.clone()),
+                credentials_path: account
+                    .and_then(|account| account.api_key.as_ref())
+                    .map(|_| None)
+                    .unwrap_or(Some(credentials_path)),
+            });
+            provider.complete(&request)
+        }
         GeminiProvider::PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
             let default_config = GeminiConfig::default();
@@ -918,6 +1150,18 @@ pub fn openai_provider() -> Result<(OpenAiProvider, PathBuf), LanguageModelError
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_base_url: OpenAiConfig::default().api_base_url,
         default_model: OpenAiConfig::default().default_model,
+        api_key: None,
+        credentials_path: Some(credentials_path.clone()),
+    });
+    Ok((provider, credentials_path))
+}
+
+pub fn deepseek_provider() -> Result<(DeepSeekProvider, PathBuf), LanguageModelError> {
+    let data_dir = provider_data_dir(DeepSeekProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(DeepSeekProvider::PROVIDER_ID);
+    let provider = DeepSeekProvider::new(DeepSeekConfig {
+        api_base_url: DeepSeekConfig::default().api_base_url,
+        default_model: DeepSeekConfig::default().default_model,
         api_key: None,
         credentials_path: Some(credentials_path.clone()),
     });
@@ -1032,6 +1276,14 @@ pub fn save_provider_api_key(
                 credentials_path,
             })
         }
+        DeepSeekProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = deepseek_provider()?;
+            provider.save_api_key(api_key, source)?;
+            Ok(ProviderCredentialWrite {
+                provider: DeepSeekProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
         GeminiProvider::PROVIDER_ID => {
             let (provider, credentials_path) = gemini_provider()?;
             provider.save_api_key(api_key, source)?;
@@ -1107,6 +1359,7 @@ pub fn provider_api_key_env_vars(provider: &str) -> Option<&'static [&'static st
             "SINOMO_CLAUDE_API_KEY",
         ]),
         OpenAiProvider::PROVIDER_ID => Some(&["SINOMO_OPENAI_API_KEY", "OPENAI_API_KEY"]),
+        DeepSeekProvider::PROVIDER_ID => Some(&["SINOMO_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"]),
         GeminiProvider::PROVIDER_ID => Some(&[
             "SINOMO_GEMINI_API_KEY",
             "GEMINI_API_KEY",
@@ -1172,6 +1425,15 @@ pub fn test_provider_credentials(
                 credentials_path,
             })
         }
+        DeepSeekProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = deepseek_provider()?;
+            provider.api_key()?;
+            provider.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: DeepSeekProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
         GeminiProvider::PROVIDER_ID => {
             let (provider, credentials_path) = gemini_provider()?;
             provider.api_key()?;
@@ -1217,6 +1479,10 @@ pub fn test_provider_account_credentials(
             role: LanguageModelRole::User,
             content: "Reply with ok.".to_string(),
         }],
+        items: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: None,
         temperature: None,
         max_output_tokens: Some(8),
         response_format: LanguageModelResponseFormat::Text,
@@ -1258,6 +1524,55 @@ pub trait LanguageModelProvider {
         &self,
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError>;
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        on_event(LanguageModelStreamEvent::Started {
+            provider: request.provider.clone(),
+            model: request.model.clone(),
+        });
+        let response = self.complete(request)?;
+        if !response.content.is_empty() {
+            on_event(LanguageModelStreamEvent::TextDelta {
+                delta: response.content.clone(),
+            });
+        }
+        for call in &response.tool_calls {
+            on_event(LanguageModelStreamEvent::ToolCallStarted {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+            });
+            on_event(LanguageModelStreamEvent::ToolCallCompleted {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+            });
+        }
+        if let Some(usage) = &response.usage {
+            on_event(LanguageModelStreamEvent::Usage {
+                usage: usage.clone(),
+            });
+        }
+        on_event(LanguageModelStreamEvent::Finished {
+            finish_reason: None,
+        });
+        Ok(response)
+    }
+
+    fn complete_streaming(
+        &self,
+        request: &LanguageModelRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        self.complete_streaming_events(request, &mut |event| {
+            if let LanguageModelStreamEvent::TextDelta { delta } = event {
+                on_delta(&delta);
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1381,6 +1696,8 @@ impl LanguageModelProvider for CommandLanguageModelProvider {
             provider: self.provider.clone(),
             model: self.model.clone(),
             content: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: None,
         })
     }
@@ -1468,11 +1785,43 @@ mod tests {
                     content: "Summarize evt_1.".to_string(),
                 },
             ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             temperature: Some(0.2),
             max_output_tokens: Some(200),
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::json!({ "job_id": "task_test" }),
         }
+    }
+
+    #[test]
+    fn inferred_model_context_window_tokens_uses_model_metadata_when_known() {
+        assert_eq!(
+            inferred_model_context_window_tokens("openai", "custom-1m"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            inferred_model_context_window_tokens("gemini", "provider-default"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            inferred_model_context_window_tokens("claude", "provider-default"),
+            Some(200_000)
+        );
+        assert_eq!(
+            inferred_model_context_window_tokens(CODEX_PROVIDER_ID, "provider-default"),
+            Some(400_000)
+        );
+        assert_eq!(
+            inferred_model_context_window_tokens("deepseek", "provider-default"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            inferred_model_context_window_tokens("unknown", "custom-1m"),
+            None
+        );
     }
 
     #[test]
@@ -1653,6 +2002,17 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_provider_reports_http_json_capabilities() {
+        let info = DeepSeekProvider::default().info();
+
+        assert_eq!(info.provider, DeepSeekProvider::PROVIDER_ID);
+        assert_eq!(info.default_model, DEEPSEEK_DEFAULT_MODEL);
+        assert_eq!(info.invocation, LanguageModelInvocation::Http);
+        assert!(info.supports_json_object);
+        assert!(!info.supports_tool_permissions);
+    }
+
+    #[test]
     fn gemini_payload_uses_generate_content_shape() {
         let payload = gemini_generate_content_payload(&request(), "gemini-2.5-flash");
 
@@ -1792,6 +2152,10 @@ mod tests {
         assert_eq!(
             provider_api_key_env_vars(OpenAiProvider::PROVIDER_ID),
             Some(&["SINOMO_OPENAI_API_KEY", "OPENAI_API_KEY"][..])
+        );
+        assert_eq!(
+            provider_api_key_env_vars(DeepSeekProvider::PROVIDER_ID),
+            Some(&["SINOMO_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"][..])
         );
         assert!(
             provider_api_key_env_vars(AnthropicProvider::PROVIDER_ID)

@@ -898,11 +898,7 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
             .as_ref()
             .map(format_rollout_status)
             .unwrap_or_else(|| "-".to_string());
-        let commit = row
-            .status
-            .commit
-            .clone()
-            .unwrap_or_else(|| "-".to_string());
+        let commit = row.status.commit.clone().unwrap_or_else(|| "-".to_string());
         println!(
             "{}\t{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.member.node_id,

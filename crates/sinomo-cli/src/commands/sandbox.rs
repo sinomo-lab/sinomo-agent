@@ -2714,14 +2714,22 @@ pub(crate) fn sandbox_policy(command: SandboxPolicyCliCommand) -> Result<(), Cli
             let mut config = load_sandbox_policy_config_for_node(&data_dir)?.0;
             apply_sandbox_policy_set_options(&mut config.policy, options);
             let path = write_sandbox_policy_config_for_node(&data_dir, &config)?;
+            let source = if sandbox_policy_uses_cluster(&data_dir) {
+                "cluster kv".to_string()
+            } else {
+                path.display().to_string()
+            };
             println!("sandbox policy written: {}", path.display());
-            print_sandbox_policy_config(&config, "cluster kv");
+            print_sandbox_policy_config(&config, &source);
             Ok(())
         }
     }
 }
 
 pub(crate) fn sandbox_policy_uses_cluster(data_dir: &SinomoDataDir) -> bool {
+    if cli_force_local_mode() {
+        return false;
+    }
     network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
 }
 
@@ -2736,10 +2744,7 @@ pub(crate) fn load_sandbox_policy_config_for_node(
                 .unwrap_or_default();
         return Ok((config, "cluster kv".to_string()));
     }
-    Ok((
-        sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default(),
-        "built-in default".to_string(),
-    ))
+    load_local_sandbox_policy_config(data_dir)
 }
 
 pub(crate) fn write_sandbox_policy_config_for_node(
@@ -2747,16 +2752,60 @@ pub(crate) fn write_sandbox_policy_config_for_node(
     config: &sinomo_runtime::sandbox::SandboxClusterPolicyConfig,
 ) -> Result<PathBuf, CliError> {
     if !sandbox_policy_uses_cluster(data_dir) {
-        return Err(CliError::DaemonNotRunning {
-            detail: "sandbox policy is cluster scoped and requires an initialized local cluster"
-                .to_string(),
-        });
+        return write_local_sandbox_policy_config(data_dir, config);
     }
     let paths = ClusterPaths::new(data_dir);
     paths.ensure()?;
     let txn = sinomo_runtime::sandbox::sandbox_policy_config_cluster_kv_txn(config)?;
     commit_sandbox_policy_cluster_txn(data_dir, txn)?;
     Ok(paths.kv_snapshot)
+}
+
+fn local_sandbox_policy_config_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir.configs_dir().join("sandbox-policy.json")
+}
+
+fn load_local_sandbox_policy_config(
+    data_dir: &SinomoDataDir,
+) -> Result<(sinomo_runtime::sandbox::SandboxClusterPolicyConfig, String), CliError> {
+    let path = local_sandbox_policy_config_path(data_dir);
+    if !path.exists() {
+        return Ok((
+            sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default(),
+            "built-in default".to_string(),
+        ));
+    }
+    let content = std::fs::read_to_string(&path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let config = serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok((config, path.display().to_string()))
+}
+
+fn write_local_sandbox_policy_config(
+    data_dir: &SinomoDataDir,
+    config: &sinomo_runtime::sandbox::SandboxClusterPolicyConfig,
+) -> Result<PathBuf, CliError> {
+    let path = local_sandbox_policy_config_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let content = serde_json::to_string_pretty(config).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    std::fs::write(&path, content).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(path)
 }
 
 fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {

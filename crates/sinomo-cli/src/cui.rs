@@ -30,13 +30,20 @@ pub(super) fn run_cui_with_io_and_daemon_probe<R: BufRead, W: Write>(
     writer: &mut W,
     daemon: Option<DaemonStatus>,
 ) -> Result<(), CliError> {
-    let daemon = daemon.ok_or_else(|| CliError::DaemonNotRunning {
-        detail: "main-agent chat requires the local daemon so chat session events and commands use the cluster control path".to_string(),
-    })?;
+    if !cli_force_local_mode() {
+        let daemon = daemon.ok_or_else(|| CliError::DaemonNotRunning {
+            detail: "main-agent chat requires the local daemon so chat session events and commands use the cluster control path".to_string(),
+        })?;
+        let data_dir = SinomoDataDir::from_env_or_home()?;
+        let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
+        let handler = MainAgentInteractionHandler::from_runtime_config(&data_dir, runtime_config)?;
+        return run_cui_with_handler_io_and_daemon(reader, writer, handler, Some(daemon));
+    }
+
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
     let handler = MainAgentInteractionHandler::from_runtime_config(&data_dir, runtime_config)?;
-    run_cui_with_handler_io_and_daemon(reader, writer, handler, Some(daemon))
+    run_cui_with_handler_io_and_daemon(reader, writer, handler, None)
 }
 
 pub fn run_cui_with_handler_io<R: BufRead, W: Write, H: InteractionEventHandler>(
@@ -510,6 +517,7 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
             latest_event: message.clone(),
             context,
             async_update: None,
+            evolution_context: None,
             tool_specs: sinomo_agent::default_main_agent_tools(),
         };
         let requested = interaction_event(
@@ -803,6 +811,8 @@ impl RustMiniCpmV46ChatModel {
             provider: RUST_MINICPM_V46_PROVIDER_ID.to_string(),
             model: MINICPM_V46_DEFAULT_MODEL_ID.to_string(),
             content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
             usage: Some(sinomo_lm::LanguageModelUsage {
                 input_tokens: Some(input_tokens as u64),
                 output_tokens: Some(output_tokens as u64),

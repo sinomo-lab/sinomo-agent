@@ -372,6 +372,9 @@ pub(crate) fn models_default_with_data_dir(
 }
 
 pub(crate) fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {
+    if cli_force_local_mode() {
+        return false;
+    }
     network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
 }
 
@@ -437,10 +440,7 @@ pub(crate) fn load_model_runtime_config_for_node(
             .unwrap_or_default();
         return Ok((config, paths.kv_snapshot));
     }
-    Ok((
-        ModelRuntimeConfig::default(),
-        data_dir.configs_dir().join("models-runtime.json"),
-    ))
+    load_local_model_runtime_config(data_dir)
 }
 
 pub(crate) fn write_model_runtime_config_for_node(
@@ -448,17 +448,57 @@ pub(crate) fn write_model_runtime_config_for_node(
     config: &ModelRuntimeConfig,
 ) -> Result<PathBuf, CliError> {
     if !model_config_uses_cluster(data_dir) {
-        return Err(CliError::DaemonNotRunning {
-            detail:
-                "model runtime config is cluster scoped and requires an initialized local cluster"
-                    .to_string(),
-        });
+        return write_local_model_runtime_config(data_dir, config);
     }
     let paths = ClusterPaths::new(data_dir);
     paths.ensure()?;
     let txn = model_runtime_config_cluster_kv_txn(config).map_err(CliError::LanguageModel)?;
     commit_model_config_cluster_txn(data_dir, txn)?;
     Ok(paths.kv_snapshot)
+}
+
+fn local_model_runtime_config_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir.configs_dir().join("models-runtime.json")
+}
+
+fn load_local_model_runtime_config(
+    data_dir: &SinomoDataDir,
+) -> Result<(ModelRuntimeConfig, PathBuf), CliError> {
+    let path = local_model_runtime_config_path(data_dir);
+    if !path.exists() {
+        return Ok((ModelRuntimeConfig::default(), path));
+    }
+    let content = fs::read_to_string(&path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let config = serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok((config, path))
+}
+
+fn write_local_model_runtime_config(
+    data_dir: &SinomoDataDir,
+    config: &ModelRuntimeConfig,
+) -> Result<PathBuf, CliError> {
+    let path = local_model_runtime_config_path(data_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let content = serde_json::to_string_pretty(config).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    fs::write(&path, content).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -593,7 +633,11 @@ pub(crate) fn models_runtime(command: ModelRuntimeCliCommand) -> Result<(), CliE
             let path = write_model_runtime_config_for_node(&data_dir, &config)?;
             println!("model runtime config updated");
             println!("config: {}", path.display());
-            println!("kv key: {LM_RUNTIME_CONFIG_KV_KEY}");
+            if model_config_uses_cluster(&data_dir) {
+                println!("kv key: {LM_RUNTIME_CONFIG_KV_KEY}");
+            } else {
+                println!("mode: local");
+            }
         }
     }
     Ok(())

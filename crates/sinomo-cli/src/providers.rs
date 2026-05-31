@@ -6,6 +6,7 @@ pub(super) enum ProviderName {
     Codex,
     Anthropic,
     OpenAi,
+    DeepSeek,
     Gemini,
     Nvidia,
 }
@@ -45,6 +46,7 @@ pub(super) fn parse_provider_command(args: &[String]) -> Result<ProviderCliComma
         "codex" => ProviderName::Codex,
         "anthropic" => ProviderName::Anthropic,
         "openai" => ProviderName::OpenAi,
+        "deepseek" => ProviderName::DeepSeek,
         "gemini" => ProviderName::Gemini,
         "nvidia" => ProviderName::Nvidia,
         _ => {
@@ -85,6 +87,9 @@ pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), Cl
             ProviderName::OpenAi => {
                 auth_api_key_provider("OpenAI", OpenAiProvider::PROVIDER_ID, &options.account)
             }
+            ProviderName::DeepSeek => {
+                auth_api_key_provider("DeepSeek", DeepSeekProvider::PROVIDER_ID, &options.account)
+            }
             ProviderName::Gemini => {
                 auth_api_key_provider("Gemini", GeminiProvider::PROVIDER_ID, &options.account)
             }
@@ -102,6 +107,9 @@ pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), Cl
             ),
             ProviderName::OpenAi => {
                 test_api_key_provider("OpenAI", OpenAiProvider::PROVIDER_ID, &options.account)
+            }
+            ProviderName::DeepSeek => {
+                test_api_key_provider("DeepSeek", DeepSeekProvider::PROVIDER_ID, &options.account)
             }
             ProviderName::Gemini => {
                 test_api_key_provider("Gemini", GeminiProvider::PROVIDER_ID, &options.account)

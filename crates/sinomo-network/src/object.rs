@@ -358,9 +358,12 @@ mod serde_bytes_tests {
             payload: Some(payload.clone()),
         };
 
-        let encoded = SinomoObjectCodec::default().encode(&record).expect("encode");
-        let decoded: BundleRecord =
-            SinomoObjectCodec::default().decode(&encoded).expect("decode");
+        let encoded = SinomoObjectCodec::default()
+            .encode(&record)
+            .expect("encode");
+        let decoded: BundleRecord = SinomoObjectCodec::default()
+            .decode(&encoded)
+            .expect("decode");
         assert_eq!(decoded, record);
 
         // Stored as a native SOBJ bytes blob, not base64: the encoding stays
@@ -373,7 +376,9 @@ mod serde_bytes_tests {
         );
         // ...and the raw bytes appear verbatim in the stream (impossible if base64'd).
         assert!(
-            encoded.windows(payload.len()).any(|w| w == payload.as_slice()),
+            encoded
+                .windows(payload.len())
+                .any(|w| w == payload.as_slice()),
             "raw payload bytes must be embedded verbatim"
         );
 
@@ -382,9 +387,12 @@ mod serde_bytes_tests {
             name: "x".to_string(),
             payload: None,
         };
-        let encoded_none = SinomoObjectCodec::default().encode(&none).expect("encode none");
-        let decoded_none: BundleRecord =
-            SinomoObjectCodec::default().decode(&encoded_none).expect("decode none");
+        let encoded_none = SinomoObjectCodec::default()
+            .encode(&none)
+            .expect("encode none");
+        let decoded_none: BundleRecord = SinomoObjectCodec::default()
+            .decode(&encoded_none)
+            .expect("decode none");
         assert_eq!(decoded_none, none);
     }
 }
