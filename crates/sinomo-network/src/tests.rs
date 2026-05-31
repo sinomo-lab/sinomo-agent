@@ -5556,16 +5556,65 @@ fn write_cluster_state_observer_counts_actual_then_skipped() {
     let write_bytes = observer
         .disk_write_bytes
         .load(std::sync::atomic::Ordering::Relaxed);
-    let read_bytes = observer
-        .disk_read_bytes
-        .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(actual, 1, "expected exactly one actual write");
     assert_eq!(skipped, 1, "expected exactly one skipped write");
     assert!(write_bytes > 0, "actual write should report disk bytes");
-    // The second (skipped) write still reads the existing file to compare.
-    assert!(read_bytes > 0, "read-compare should report disk bytes");
+    // The second write takes the fast path (cached content hash + an unchanged
+    // stat) and is skipped without reading the file back, so it performs no
+    // read-compare of its own. (disk_read_bytes is a process-wide counter that
+    // concurrent tests can perturb, so it is not asserted here.)
 
     // Restore the previous observer so we don't poison sibling tests.
     let _ = set_io_observer(previous);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn write_object_file_skips_identical_and_rewrites_after_external_change() {
+    // Unique path so this test is independent of the process-wide I/O observer.
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-objfile-guard-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    let path = root.join("obj.sobj");
+
+    let value = "alpha".to_string();
+    crate::storage::write_object_file(&path, &value).expect("initial write");
+    let mtime_after_write = std::fs::metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
+    // An identical re-write takes the fast path and leaves the file untouched.
+    crate::storage::write_object_file(&path, &value).expect("identical re-write");
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        mtime_after_write,
+        "an identical re-write must be skipped without rewriting the file"
+    );
+
+    // Another writer replaces the content behind our back. The different length
+    // trips the stat guard regardless of mtime resolution.
+    std::fs::write(&path, b"externally written content of a different length")
+        .expect("external write");
+
+    // Writing our content again must detect the change via the stat guard, fall
+    // back to read + compare, and actually rewrite -- never falsely skip.
+    crate::storage::write_object_file(&path, &value).expect("rewrite after external change");
+    let restored: String = SinomoObjectCodec::default()
+        .decode(&std::fs::read(&path).expect("read"))
+        .expect("decode");
+    assert_eq!(
+        restored, value,
+        "a file changed since our last write must be rewritten, not skipped"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }

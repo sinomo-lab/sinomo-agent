@@ -6,8 +6,10 @@ use crate::{
     format_ip_port, is_invitable_ip, is_loopback_connect_address,
 };
 use sinomo_kv::cluster_member_key;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
@@ -16,6 +18,37 @@ const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-path record of the last content `write_object_file` wrote (or confirmed
+/// already on disk), used to skip the read-back + compare when nothing changed.
+#[derive(Clone)]
+struct ObjectFileWriteMark {
+    hash: blake3::Hash,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Cache of last-written object files. The cluster directory can be shared by the
+/// main and shadow daemons, so the fast-path skip is guarded by a `stat`: an entry
+/// is trusted only when the file's length and mtime still match what we wrote, so
+/// a write by another process is detected and falls back to a real read + compare.
+static LAST_WRITTEN_OBJECT_FILES: LazyLock<Mutex<HashMap<PathBuf, ObjectFileWriteMark>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_object_file_mark(path: &PathBuf) -> Option<ObjectFileWriteMark> {
+    LAST_WRITTEN_OBJECT_FILES.lock().ok()?.get(path).cloned()
+}
+
+fn record_object_file_mark(
+    path: &PathBuf,
+    hash: blake3::Hash,
+    len: u64,
+    modified: Option<SystemTime>,
+) {
+    if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
+        cache.insert(path.clone(), ObjectFileWriteMark { hash, len, modified });
+    }
+}
 
 /// Receives notifications about disk and network I/O performed by the network
 /// layer: object-file and KV-snapshot writes (op counts), the byte volume of
@@ -3689,23 +3722,46 @@ pub(crate) fn write_object_file<T: Serialize>(
     path: &PathBuf,
     value: &T,
 ) -> Result<(), NetworkError> {
+    let desired = SinomoObjectCodec::default().encode(value)?;
+    let desired_hash = blake3::hash(&desired);
+
+    // Fast path: if we last wrote this exact content and the file is unchanged
+    // since (length + mtime still match our record), skip without reading it back.
+    if let Some(mark) = cached_object_file_mark(path)
+        && mark.hash == desired_hash
+        && let Ok(metadata) = fs::metadata(path)
+        && metadata.len() == mark.len
+        && metadata.modified().ok() == mark.modified
+    {
+        if let Some(observer) = io_observer() {
+            observer.on_object_file_skipped_write();
+        }
+        return Ok(());
+    }
+
+    // Slow path: read the file back and compare. Handles a cold cache and files
+    // changed by another writer (e.g. a shadow daemon sharing the cluster dir).
+    let existing = fs::read(path).ok();
+    if let (Some(observer), Some(existing)) = (io_observer(), existing.as_ref()) {
+        observer.on_disk_read(existing.len() as u64);
+    }
+    if existing.as_deref() == Some(desired.as_slice()) {
+        // Already current: record the mark so subsequent calls take the fast path.
+        let modified = fs::metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        record_object_file_mark(path, desired_hash, desired.len() as u64, modified);
+        if let Some(observer) = io_observer() {
+            observer.on_object_file_skipped_write();
+        }
+        return Ok(());
+    }
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
             path: parent.display().to_string(),
             detail: source.to_string(),
         })?;
-    }
-    let desired = SinomoObjectCodec::default().encode(value)?;
-    let existing = fs::read(path).ok();
-    if let (Some(observer), Some(existing)) = (io_observer(), existing.as_ref()) {
-        // The read-compare below is a real disk read regardless of outcome.
-        observer.on_disk_read(existing.len() as u64);
-    }
-    if existing.is_some_and(|existing| existing == desired) {
-        if let Some(observer) = io_observer() {
-            observer.on_object_file_skipped_write();
-        }
-        return Ok(());
     }
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let file_name = path
@@ -3739,6 +3795,10 @@ pub(crate) fn write_object_file<T: Serialize>(
     }
     replace_file(&temp_path, path)?;
     sync_directory(parent)?;
+    let modified = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    record_object_file_mark(path, desired_hash, desired.len() as u64, modified);
     if let Some(observer) = io_observer() {
         observer.on_object_file_actual_write();
         observer.on_disk_write(desired.len() as u64);
