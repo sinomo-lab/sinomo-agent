@@ -5900,9 +5900,9 @@ dependencies = [
 name = "sinomo-kv"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "fs2",
  "serde",
+ "serde_bytes",
  "sinomo-core",
  "sinomo-node",
  "sinomo-object",

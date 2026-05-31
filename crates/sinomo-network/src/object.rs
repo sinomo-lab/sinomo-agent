@@ -12,7 +12,7 @@ pub struct DaemonControlRequest {
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc: Option<crate::ObjectRpcRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub auth: Option<Vec<u8>>,
 }
 

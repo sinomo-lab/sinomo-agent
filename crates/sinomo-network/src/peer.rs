@@ -469,7 +469,7 @@ pub enum MeshMessageBody {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProtocolMessage {
     pub protocol: String,
-    #[serde(default)]
+    #[serde(default, with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
 
@@ -529,7 +529,7 @@ pub struct NetworkStreamChunkId(pub u64);
 pub struct NetworkStreamOpen {
     pub stream_id: NetworkStreamId,
     pub protocol: String,
-    #[serde(default)]
+    #[serde(default, with = "serde_bytes")]
     pub metadata: Vec<u8>,
 }
 
@@ -558,6 +558,7 @@ pub enum NetworkStreamFrame {
     Data {
         stream_id: NetworkStreamId,
         chunk_id: NetworkStreamChunkId,
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
     End {

@@ -5,10 +5,9 @@
 //! watches, snapshots, and a deterministic Raft replication core for tests,
 //! local development, and daemon integration.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use sinomo_core::ClusterMemberRecord;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
@@ -114,7 +113,7 @@ pub struct WatchId(pub u64);
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KvEntry {
     pub key: String,
-    #[serde(with = "base64_bytes")]
+    #[serde(with = "serde_bytes")]
     pub value: Vec<u8>,
     pub create_revision: KvRevision,
     pub modify_revision: KvRevision,
@@ -159,7 +158,7 @@ pub enum KvCompare {
     },
     ValueEquals {
         key: String,
-        #[serde(with = "base64_bytes")]
+        #[serde(with = "serde_bytes")]
         value: Vec<u8>,
     },
     VersionEquals {
@@ -184,7 +183,7 @@ pub enum KvCompare {
 pub enum KvOp {
     Put {
         key: String,
-        #[serde(with = "base64_bytes")]
+        #[serde(with = "serde_bytes")]
         value: Vec<u8>,
         lease_id: Option<LeaseId>,
     },
@@ -267,7 +266,7 @@ pub enum KvOpResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum KvEventKind {
     Put {
-        #[serde(with = "base64_bytes")]
+        #[serde(with = "serde_bytes")]
         value: Vec<u8>,
     },
     Delete,
@@ -295,27 +294,6 @@ pub struct KvSnapshot {
     pub leases: Vec<KvLease>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<KvEvent>,
-}
-
-mod base64_bytes {
-    use super::*;
-
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        URL_SAFE_NO_PAD
-            .decode(value)
-            .map_err(serde::de::Error::custom)
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
