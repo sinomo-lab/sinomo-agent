@@ -12,6 +12,7 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+blake3.workspace = true
 serde.workspace = true
 serde_bytes = "0.11"
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }

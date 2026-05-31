@@ -16,7 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
@@ -40,6 +40,38 @@ const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
 const RAFT_NODE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-path record of the last content `write_object_file` wrote (or confirmed
+/// already on disk), used to skip the read-back + compare when nothing changed.
+#[derive(Clone)]
+struct ObjectFileWriteMark {
+    hash: blake3::Hash,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Cache of last-written object files. The cluster directory holding these WAL /
+/// snapshot files can be shared by the main and shadow daemons, so the fast-path
+/// skip is guarded by a `stat`: an entry is trusted only when the file's length
+/// and mtime still match what we wrote, so a write by another process is detected
+/// and falls back to a real read + compare.
+static LAST_WRITTEN_OBJECT_FILES: LazyLock<Mutex<HashMap<PathBuf, ObjectFileWriteMark>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_object_file_mark(path: &Path) -> Option<ObjectFileWriteMark> {
+    LAST_WRITTEN_OBJECT_FILES.lock().ok()?.get(path).cloned()
+}
+
+fn record_object_file_mark(
+    path: &Path,
+    hash: blake3::Hash,
+    len: u64,
+    modified: Option<SystemTime>,
+) {
+    if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
+        cache.insert(path.to_path_buf(), ObjectFileWriteMark { hash, len, modified });
+    }
+}
 
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
@@ -2367,18 +2399,39 @@ fn read_object_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, KvEr
 }
 
 fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> {
+    let content = sinomo_object_serde::to_bytes(value, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
+        .map_err(|source| KvError::Serialization {
+        detail: source.to_string(),
+    })?;
+    let content_hash = blake3::hash(&content);
+
+    // Fast path: if we last wrote this exact content and the file is unchanged
+    // since (length + mtime still match our record), skip without reading it back.
+    if let Some(mark) = cached_object_file_mark(path)
+        && mark.hash == content_hash
+        && let Ok(metadata) = fs::metadata(path)
+        && metadata.len() == mark.len
+        && metadata.modified().ok() == mark.modified
+    {
+        return Ok(());
+    }
+
+    // Slow path: read the file back and compare. Handles a cold cache and files
+    // changed by another writer (e.g. a shadow daemon sharing the cluster dir).
+    if fs::read(path).is_ok_and(|existing| existing == content) {
+        // Already current: record the mark so subsequent calls take the fast path.
+        let modified = fs::metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        record_object_file_mark(path, content_hash, content.len() as u64, modified);
+        return Ok(());
+    }
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| KvError::Io {
             path: parent.display().to_string(),
             detail: source.to_string(),
         })?;
-    }
-    let content = sinomo_object_serde::to_bytes(value, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
-        .map_err(|source| KvError::Serialization {
-        detail: source.to_string(),
-    })?;
-    if fs::read(path).is_ok_and(|existing| existing == content) {
-        return Ok(());
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -2413,7 +2466,12 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         path: format!("{} -> {}", temp_path.display(), path.display()),
         detail: source.to_string(),
     })?;
-    sync_directory(parent)
+    sync_directory(parent)?;
+    let modified = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    record_object_file_mark(path, content_hash, content.len() as u64, modified);
+    Ok(())
 }
 
 fn open_node_lock(paths: &KvWalPaths) -> Result<File, KvError> {
@@ -2559,6 +2617,57 @@ mod tests {
     struct TestRecord {
         name: String,
         count: u64,
+    }
+
+    #[test]
+    fn write_object_file_skips_identical_and_rewrites_after_external_change() {
+        // Unique path so the test is independent of any shared state.
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-objfile-guard-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join("obj.sobj");
+
+        let record = TestRecord {
+            name: "alpha".to_string(),
+            count: 7,
+        };
+        write_object_file(&path, &record).expect("initial write");
+        let mtime_after_write = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+
+        // An identical re-write takes the fast path and leaves the file untouched.
+        write_object_file(&path, &record).expect("identical re-write");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
+            mtime_after_write,
+            "an identical re-write must be skipped without rewriting the file"
+        );
+
+        // Another writer replaces the content behind our back. The different
+        // length trips the stat guard regardless of mtime resolution.
+        std::fs::write(&path, b"externally written content of a different length")
+            .expect("external write");
+
+        // Writing our content again must detect the change via the stat guard, fall
+        // back to read + compare, and actually rewrite -- never falsely skip.
+        write_object_file(&path, &record).expect("rewrite after external change");
+        let restored: TestRecord = read_object_file(&path).expect("read back");
+        assert_eq!(
+            restored, record,
+            "a file changed since our last write must be rewritten, not skipped"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
