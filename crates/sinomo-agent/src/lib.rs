@@ -18,9 +18,11 @@ use sinomo_runtime::node::NodeId;
 use thiserror::Error;
 
 mod agent;
+mod session_store;
 pub mod tools;
 
 pub use agent::*;
+pub use session_store::*;
 pub use tools::*;
 
 pub type TaskId = Id;
@@ -32,7 +34,7 @@ pub fn register_storage_paths(
         "sinomo-agent",
         sinomo_runtime::storage::StorageRing::R2,
         "events/agent",
-        "agent traces, context assembly reports, model events, and tool evidence artifacts",
+        "agent sessions, traces, context assembly reports, model events, and tool evidence artifacts",
     )
 }
 
@@ -1017,6 +1019,8 @@ pub enum AgentError {
     ModelResponse { detail: String },
     #[error("agent trace store failed: {detail}")]
     TraceStore { detail: String },
+    #[error("agent session store failed: {detail}")]
+    SessionStore { detail: String },
 }
 
 #[cfg(test)]

@@ -97,6 +97,10 @@ impl From<sinomo_agent::AgentError> for CliError {
                 path: "agent trace store".to_string(),
                 detail,
             },
+            sinomo_agent::AgentError::SessionStore { detail } => Self::Io {
+                path: "agent session store".to_string(),
+                detail,
+            },
         }
     }
 }

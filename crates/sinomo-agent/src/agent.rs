@@ -1,3 +1,6 @@
+use crate::session_store::{
+    AgentSessionStore, AgentSessionStoreRecord, AgentSessionStoreRecordKind, NoopAgentSessionStore,
+};
 use crate::tools::{
     AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentTool, AgentToolCapability,
     AgentToolCustomFormat, AgentToolCustomSpec, AgentToolDescriptor, AgentToolEvidence,
@@ -94,6 +97,10 @@ pub struct AgentSession {
     pub session_id: SessionId,
     pub role: AgentRole,
     pub transcript: AgentTranscript,
+    #[serde(default, skip_serializing_if = "AgentTranscript::is_empty")]
+    pub raw_transcript: AgentTranscript,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<AgentSessionProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steering_queue: Vec<AgentSteeringMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -108,6 +115,8 @@ impl AgentSession {
             session_id,
             role,
             transcript: AgentTranscript::new(),
+            raw_transcript: AgentTranscript::new(),
+            projection: None,
             steering_queue: Vec::new(),
             follow_up_queue: Vec::new(),
             abort: None,
@@ -115,11 +124,33 @@ impl AgentSession {
     }
 
     pub fn append_run(&mut self, run: &AgentRun) {
+        if self.raw_transcript.items.is_empty() && !self.transcript.items.is_empty() {
+            self.raw_transcript = self.transcript.clone();
+        }
         self.transcript.items.extend(run.items.iter().cloned());
+        self.raw_transcript.items.extend(run.items.iter().cloned());
+        if let Some(projection) = run
+            .compactions
+            .last()
+            .map(|compaction| compaction.projection.clone())
+        {
+            self.projection = Some(projection);
+        }
     }
 
     pub fn is_aborted(&self) -> bool {
         self.abort.is_some()
+    }
+
+    fn compaction_source_transcript(&mut self) -> AgentTranscript {
+        if self.raw_transcript.items.is_empty() && !self.transcript.items.is_empty() {
+            self.raw_transcript = self.transcript.clone();
+        }
+        if self.raw_transcript.items.is_empty() {
+            self.transcript.clone()
+        } else {
+            self.raw_transcript.clone()
+        }
     }
 }
 
@@ -132,6 +163,10 @@ pub struct AgentTranscript {
 impl AgentTranscript {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     pub fn push(&mut self, item: AgentItem) {
@@ -251,6 +286,7 @@ pub trait AgentTraceStore: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentStoragePaths {
     pub root: PathBuf,
+    pub sessions_dir: PathBuf,
     pub traces_dir: PathBuf,
     pub evidence_dir: PathBuf,
 }
@@ -259,6 +295,7 @@ impl AgentStoragePaths {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {
+            sessions_dir: root.join("sessions"),
             traces_dir: root.join("traces"),
             evidence_dir: root.join("evidence"),
             root,
@@ -272,6 +309,29 @@ impl AgentStoragePaths {
     pub fn trace_path_for_session(&self, session_id: &SessionId) -> PathBuf {
         self.traces_dir
             .join(format!("{}.jsonl", session_id.as_str()))
+    }
+
+    pub fn session_dir_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.sessions_dir.join(session_id.as_str())
+    }
+
+    pub fn session_snapshot_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir_for_session(session_id)
+            .join("snapshot.json")
+    }
+
+    pub fn session_events_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir_for_session(session_id)
+            .join("events.jsonl")
+    }
+
+    pub fn session_items_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir_for_session(session_id).join("items.jsonl")
+    }
+
+    pub fn session_projections_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir_for_session(session_id)
+            .join("projections.jsonl")
     }
 
     pub fn evidence_dir_for_session(&self, session_id: &SessionId) -> PathBuf {
@@ -443,6 +503,12 @@ pub enum AgentVerificationState {
     Blocked,
 }
 
+impl Default for AgentVerificationState {
+    fn default() -> Self {
+        Self::NotRun
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentEvolutionContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -519,6 +585,8 @@ pub struct TurnContext {
     pub provider: String,
     pub model: String,
     pub system_instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_projection: Option<AgentSessionProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transcript_view: Vec<AgentTranscriptItem>,
     #[serde(default)]
@@ -565,6 +633,12 @@ pub struct ContextOmission {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ContextBudgetEstimate {
     pub system_prompt_bytes: usize,
+    #[serde(default)]
+    pub current_work_bytes: usize,
+    #[serde(default)]
+    pub old_summary_bytes: usize,
+    #[serde(default)]
+    pub retrieved_memory_bytes: usize,
     pub transcript_bytes: usize,
     pub tool_schema_bytes: usize,
     pub workspace_facts_bytes: usize,
@@ -579,6 +653,16 @@ pub struct ContextBudgetEstimate {
     pub max_context_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_threshold_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<ContextBudgetLane>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContextBudgetLane {
+    pub kind: String,
+    pub label: String,
+    pub bytes: usize,
+    pub priority: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -944,6 +1028,7 @@ impl ContextAssembler {
         role: AgentRole,
         config: &AgentConfig,
         transcript: &[AgentTranscriptItem],
+        session_projection: Option<AgentSessionProjection>,
         tool_descriptors: Vec<AgentToolDescriptor>,
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
@@ -976,9 +1061,79 @@ impl ContextAssembler {
             .and_then(|context| serde_json::to_vec(context).ok())
             .map(|bytes| bytes.len())
             .unwrap_or_default();
+        let session_projection_bytes = session_projection
+            .as_ref()
+            .and_then(|projection| serde_json::to_vec(projection).ok())
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        let current_work_bytes = session_projection
+            .as_ref()
+            .and_then(|projection| serde_json::to_vec(&projection.working_state).ok())
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        let old_summary_bytes = session_projection
+            .as_ref()
+            .map(|projection| projection.summary.len())
+            .unwrap_or_default();
+        let retrieved_memory_bytes = 0usize;
         let transcript_bytes: usize = transcript.iter().map(|item| item.content.len()).sum();
+        let mut lanes = vec![
+            ContextBudgetLane {
+                kind: "fixed_prompt".to_string(),
+                label: "system prompt, tool schemas, workspace facts, and instruction files"
+                    .to_string(),
+                bytes: system_instructions.len()
+                    + tool_schema_bytes
+                    + workspace_facts_bytes
+                    + instruction_file_bytes,
+                priority: 0,
+            },
+            ContextBudgetLane {
+                kind: "current_work".to_string(),
+                label: "typed active work state from session projection".to_string(),
+                bytes: current_work_bytes,
+                priority: 1,
+            },
+            ContextBudgetLane {
+                kind: "recent_tail".to_string(),
+                label: format!("{} transcript item(s)", transcript.len()),
+                bytes: transcript_bytes,
+                priority: 2,
+            },
+            ContextBudgetLane {
+                kind: "retrieved_memories".to_string(),
+                label: "retrieved memory/context entries".to_string(),
+                bytes: retrieved_memory_bytes,
+                priority: 3,
+            },
+            ContextBudgetLane {
+                kind: "old_summaries".to_string(),
+                label: "prior compacted session summaries".to_string(),
+                bytes: old_summary_bytes,
+                priority: 4,
+            },
+        ];
+        if prompt_reference_bytes > 0 {
+            lanes.push(ContextBudgetLane {
+                kind: "prompt_references".to_string(),
+                label: "user-requested prompt references".to_string(),
+                bytes: prompt_reference_bytes,
+                priority: 1,
+            });
+        }
+        if evolution_context_bytes > 0 {
+            lanes.push(ContextBudgetLane {
+                kind: "evolution_context".to_string(),
+                label: "evolution job and candidate evidence".to_string(),
+                bytes: evolution_context_bytes,
+                priority: 1,
+            });
+        }
         let budget_estimate = ContextBudgetEstimate {
             system_prompt_bytes: system_instructions.len(),
+            current_work_bytes,
+            old_summary_bytes,
+            retrieved_memory_bytes,
             transcript_bytes,
             tool_schema_bytes,
             workspace_facts_bytes,
@@ -986,6 +1141,7 @@ impl ContextAssembler {
             prompt_reference_bytes,
             evolution_context_bytes,
             total_bytes: system_instructions.len()
+                + session_projection_bytes
                 + transcript_bytes
                 + tool_schema_bytes
                 + workspace_facts_bytes
@@ -994,6 +1150,7 @@ impl ContextAssembler {
                 + evolution_context_bytes,
             max_context_bytes: config.context_budget.max_context_bytes,
             compaction_threshold_bytes: config.context_budget.compaction_threshold_bytes(),
+            lanes,
         };
         let mut included = vec![
             ContextSource {
@@ -1017,6 +1174,13 @@ impl ContextAssembler {
                 bytes: budget_estimate.workspace_facts_bytes,
             },
         ];
+        if session_projection_bytes > 0 {
+            included.push(ContextSource {
+                kind: "session_projection".to_string(),
+                label: "current work projection".to_string(),
+                bytes: session_projection_bytes,
+            });
+        }
         included.extend(instruction_sources);
         included.extend(prompt_reference_sources);
         if input.evolution_context.is_some() {
@@ -1063,6 +1227,7 @@ impl ContextAssembler {
             provider: config.provider.clone(),
             model: config.model.clone(),
             system_instructions,
+            session_projection,
             transcript_view: transcript.to_vec(),
             workspace_facts,
             loaded_instruction_files,
@@ -1412,6 +1577,76 @@ impl AgentModelEvent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionProjection {
+    pub projection_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_projection_id: Option<TaskId>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    pub reason: String,
+    pub summary: String,
+    pub source_item_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_item_ids: Vec<TaskId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_item_ids: Vec<TaskId>,
+    pub working_state: AgentWorkingState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentWorkingState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_user_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_questions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_tool_calls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_read: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_modified: Vec<String>,
+    #[serde(default)]
+    pub verification_state: AgentVerificationState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_risks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_steering: Vec<AgentSteeringMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_follow_ups: Vec<AgentFollowUpMessage>,
+}
+
+impl Default for AgentWorkingState {
+    fn default() -> Self {
+        Self {
+            active_objective: None,
+            current_user_request: None,
+            next_action: None,
+            pending_questions: Vec::new(),
+            open_tool_calls: Vec::new(),
+            files_read: Vec::new(),
+            files_modified: Vec::new(),
+            verification_state: AgentVerificationState::NotRun,
+            blockers: Vec::new(),
+            assumptions: Vec::new(),
+            decisions: Vec::new(),
+            open_risks: Vec::new(),
+            queued_steering: Vec::new(),
+            queued_follow_ups: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentCompactionSummary {
     pub compaction_id: TaskId,
     pub reason: String,
@@ -1420,6 +1655,7 @@ pub struct AgentCompactionSummary {
     pub first_retained_item: Option<TaskId>,
     pub token_estimate_before: usize,
     pub retained_tail_count: usize,
+    pub projection: AgentSessionProjection,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files_read: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1467,22 +1703,69 @@ impl AgentCompactor {
         token_estimate_before: usize,
         retained_tail_count: usize,
     ) -> AgentCompactionSummary {
+        self.compact_retaining_tail_count_with_session_state(
+            transcript,
+            reason,
+            token_estimate_before,
+            retained_tail_count,
+            None,
+            &[],
+            &[],
+        )
+    }
+
+    pub fn compact_retaining_tail_count_with_session_state(
+        &self,
+        transcript: &AgentTranscript,
+        reason: impl Into<String>,
+        token_estimate_before: usize,
+        retained_tail_count: usize,
+        previous_projection: Option<&AgentSessionProjection>,
+        steering: &[AgentSteeringMessage],
+        follow_ups: &[AgentFollowUpMessage],
+    ) -> AgentCompactionSummary {
+        let reason = reason.into();
         let retained = transcript.retained_tail(retained_tail_count);
+        let working_state = working_state_from_items(
+            &transcript.items,
+            steering,
+            follow_ups,
+            previous_projection.map(|projection| &projection.working_state),
+        );
+        let projection_summary = format!(
+            "Compacted {} item(s), retaining {} most recent item(s). Current work: {}",
+            transcript.items.len(),
+            retained.len(),
+            working_state
+                .current_user_request
+                .as_deref()
+                .or(working_state.active_objective.as_deref())
+                .unwrap_or("no active user request recorded")
+        );
+        let projection = AgentSessionProjection {
+            projection_id: TaskId::generate(),
+            previous_projection_id: previous_projection
+                .map(|projection| projection.projection_id.clone()),
+            created_at: time::OffsetDateTime::now_utc(),
+            reason: reason.clone(),
+            summary: projection_summary,
+            source_item_count: transcript.items.len(),
+            source_item_ids: transcript.items.iter().map(agent_item_id).collect(),
+            retained_item_ids: retained.iter().map(agent_item_id).collect(),
+            working_state: working_state.clone(),
+        };
         AgentCompactionSummary {
             compaction_id: TaskId::generate(),
-            reason: reason.into(),
-            summary: format!(
-                "Compacted {} item(s), retaining {} most recent item(s).",
-                transcript.items.len(),
-                retained.len()
-            ),
+            reason,
+            summary: projection.summary.clone(),
             first_retained_item: retained.first().map(agent_item_id),
             token_estimate_before,
             retained_tail_count: retained.len(),
-            files_read: Vec::new(),
-            files_modified: Vec::new(),
-            verification_state: AgentVerificationState::NotRun,
-            open_risks: Vec::new(),
+            files_read: working_state.files_read.clone(),
+            files_modified: working_state.files_modified.clone(),
+            verification_state: working_state.verification_state.clone(),
+            open_risks: working_state.open_risks.clone(),
+            projection,
             policy_constraints: vec![
                 "runtime policy remains authoritative after compaction".to_string(),
                 "verification evidence is structured state, not summary text".to_string(),
@@ -1491,7 +1774,170 @@ impl AgentCompactor {
     }
 }
 
-fn agent_item_id(item: &AgentItem) -> TaskId {
+fn working_state_from_items(
+    items: &[AgentItem],
+    steering: &[AgentSteeringMessage],
+    follow_ups: &[AgentFollowUpMessage],
+    previous: Option<&AgentWorkingState>,
+) -> AgentWorkingState {
+    let mut state = previous.cloned().unwrap_or_default();
+    state.queued_steering = steering.to_vec();
+    state.queued_follow_ups = follow_ups.to_vec();
+    let mut open_tool_calls: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            AgentItem::UserMessage { content, .. } => {
+                if !content.contains("\"kind\": \"agent_queued_turn_context\"") {
+                    state.current_user_request = Some(compact_multiline(content, 2000));
+                    if state.active_objective.is_none() {
+                        state.active_objective = state.current_user_request.clone();
+                    }
+                }
+            }
+            AgentItem::AssistantText { content, .. } => {
+                let text = compact_multiline(content, 1000);
+                if !text.is_empty() {
+                    state.decisions.push(text);
+                    if state.decisions.len() > 5 {
+                        state.decisions.remove(0);
+                    }
+                }
+            }
+            AgentItem::ToolCall { call, .. } => {
+                let description = format!("{}: {}", call.tool, call.summary);
+                open_tool_calls.push(description);
+                if call.tool == "read_file"
+                    && let Some(path) = call.input.get("path").and_then(|value| value.as_str())
+                {
+                    push_unique(&mut state.files_read, path.to_string());
+                }
+            }
+            AgentItem::ToolResult {
+                status,
+                summary,
+                evidence,
+                ..
+            } => {
+                if !open_tool_calls.is_empty() {
+                    open_tool_calls.remove(0);
+                }
+                if matches!(status, AgentToolStatus::Failed | AgentToolStatus::Blocked) {
+                    push_unique(&mut state.blockers, compact_multiline(summary, 500));
+                    state.verification_state = merge_verification_state(
+                        &state.verification_state,
+                        &AgentVerificationState::Blocked,
+                    );
+                }
+                let coding = evidence
+                    .record::<AgentCodingToolEvidence>(AGENT_CODING_EVIDENCE_KIND)
+                    .unwrap_or_default();
+                for changed_file in coding.changed_files {
+                    push_unique(&mut state.files_modified, changed_file);
+                }
+                state.verification_state =
+                    merge_verification_state(&state.verification_state, &coding.verification_state);
+            }
+            AgentItem::PatchSnapshot {
+                status,
+                summary,
+                changed_files,
+                ..
+            } => {
+                for changed_file in changed_files {
+                    push_unique(&mut state.files_modified, changed_file.clone());
+                }
+                if matches!(status, AgentToolStatus::Failed | AgentToolStatus::Blocked) {
+                    push_unique(&mut state.open_risks, compact_multiline(summary, 500));
+                }
+            }
+            AgentItem::VerificationResult {
+                command,
+                status,
+                summary,
+                ..
+            } => {
+                state.verification_state =
+                    merge_verification_state(&state.verification_state, status);
+                if matches!(
+                    status,
+                    AgentVerificationState::Failed | AgentVerificationState::Blocked
+                ) {
+                    push_unique(
+                        &mut state.open_risks,
+                        format!("{}: {}", command, compact_multiline(summary, 500)),
+                    );
+                }
+            }
+            AgentItem::Error { detail, .. } => {
+                push_unique(&mut state.blockers, compact_multiline(detail, 500));
+            }
+            AgentItem::CompactionSummary { summary, .. } => {
+                if state.active_objective.is_none() {
+                    state.active_objective =
+                        summary.projection.working_state.active_objective.clone();
+                }
+                if state.current_user_request.is_none() {
+                    state.current_user_request = summary
+                        .projection
+                        .working_state
+                        .current_user_request
+                        .clone();
+                }
+            }
+            AgentItem::AssistantReasoningSummary { .. }
+            | AgentItem::AsyncTaskUpdate { .. }
+            | AgentItem::ContextInjection { .. }
+            | AgentItem::ModelUsage { .. } => {}
+        }
+    }
+    state.open_tool_calls = open_tool_calls;
+    state.next_action = if !state.open_tool_calls.is_empty() {
+        Some("wait for pending tool results".to_string())
+    } else if state.verification_state == AgentVerificationState::Failed {
+        Some("address failed verification before finalizing".to_string())
+    } else if state.verification_state == AgentVerificationState::NotRun
+        && !state.files_modified.is_empty()
+    {
+        Some("run verification for modified files".to_string())
+    } else {
+        None
+    };
+    state
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn compact_multiline(value: &str, max_chars: usize) -> String {
+    let compacted = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compacted.chars().count() <= max_chars {
+        return compacted;
+    }
+    compacted.chars().take(max_chars).collect::<String>()
+}
+
+fn merge_verification_state(
+    current: &AgentVerificationState,
+    next: &AgentVerificationState,
+) -> AgentVerificationState {
+    match (current, next) {
+        (AgentVerificationState::Failed, _) | (_, AgentVerificationState::Failed) => {
+            AgentVerificationState::Failed
+        }
+        (AgentVerificationState::Blocked, _) | (_, AgentVerificationState::Blocked) => {
+            AgentVerificationState::Blocked
+        }
+        (AgentVerificationState::Passed, _) | (_, AgentVerificationState::Passed) => {
+            AgentVerificationState::Passed
+        }
+        _ => AgentVerificationState::NotRun,
+    }
+}
+
+pub(crate) fn agent_item_id(item: &AgentItem) -> TaskId {
     match item {
         AgentItem::UserMessage { item_id, .. }
         | AgentItem::AssistantText { item_id, .. }
@@ -1890,6 +2336,7 @@ pub struct Agent<M> {
     context_assembler: ContextAssembler,
     compactor: AgentCompactor,
     trace_store: Box<dyn AgentTraceStore>,
+    session_store: Box<dyn AgentSessionStore>,
 }
 
 impl<M: InteractionModel> Agent<M> {
@@ -1904,6 +2351,7 @@ impl<M: InteractionModel> Agent<M> {
             context_assembler: ContextAssembler,
             compactor: AgentCompactor::default(),
             trace_store: Box::new(NoopAgentTraceStore),
+            session_store: Box::new(NoopAgentSessionStore),
         }
     }
 
@@ -1949,6 +2397,27 @@ impl<M: InteractionModel> Agent<M> {
         self
     }
 
+    pub fn with_session_store<T: AgentSessionStore + 'static>(mut self, session_store: T) -> Self {
+        self.session_store = Box::new(session_store);
+        self
+    }
+
+    pub fn load_session(&self, session_id: &SessionId) -> Result<Option<AgentSession>, AgentError> {
+        self.session_store
+            .load_session(session_id)
+            .map_err(|source| AgentError::SessionStore {
+                detail: source.to_string(),
+            })
+    }
+
+    pub fn save_session(&self, session: &AgentSession) -> Result<(), AgentError> {
+        self.session_store
+            .save_session(session)
+            .map_err(|source| AgentError::SessionStore {
+                detail: source.to_string(),
+            })
+    }
+
     fn trace(
         &self,
         session_id: &SessionId,
@@ -1957,6 +2426,42 @@ impl<M: InteractionModel> Agent<M> {
         self.trace_store
             .append(&AgentTraceRecord::new(session_id.clone(), record))
             .map_err(|source| AgentError::TraceStore {
+                detail: source.to_string(),
+            })
+    }
+
+    fn session_store_record(
+        &self,
+        session_id: &SessionId,
+        record: AgentSessionStoreRecordKind,
+    ) -> Result<(), AgentError> {
+        self.session_store
+            .append_record(&AgentSessionStoreRecord::new(session_id.clone(), record))
+            .map_err(|source| AgentError::SessionStore {
+                detail: source.to_string(),
+            })
+    }
+
+    fn session_store_items(
+        &self,
+        session_id: &SessionId,
+        items: &[AgentItem],
+    ) -> Result<(), AgentError> {
+        self.session_store
+            .append_items(session_id, items)
+            .map_err(|source| AgentError::SessionStore {
+                detail: source.to_string(),
+            })
+    }
+
+    fn session_store_projection(
+        &self,
+        session_id: &SessionId,
+        projection: &AgentSessionProjection,
+    ) -> Result<(), AgentError> {
+        self.session_store
+            .append_projection(session_id, projection)
+            .map_err(|source| AgentError::SessionStore {
                 detail: source.to_string(),
             })
     }
@@ -1993,11 +2498,38 @@ impl<M: InteractionModel> Agent<M> {
         )?;
         let steering = session.steering_queue.clone();
         let follow_ups = session.follow_up_queue.clone();
-        let run =
-            self.run_with_session_context(input, transcript_prefix, &steering, &follow_ups)?;
+        let session_projection = session.projection.clone();
+        self.session_store_record(
+            &session.session_id,
+            AgentSessionStoreRecordKind::TurnStarted {
+                provider: self.config.provider.clone(),
+                model: self.config.model.clone(),
+                max_steps: self.config.max_steps,
+            },
+        )?;
+        let run = self.run_with_session_context(
+            input,
+            transcript_prefix,
+            session_projection,
+            &steering,
+            &follow_ups,
+        )?;
         session.steering_queue.clear();
         session.follow_up_queue.clear();
         session.append_run(&run);
+        self.session_store_items(&session.session_id, &run.items)?;
+        for compaction in &run.compactions {
+            self.session_store_projection(&session.session_id, &compaction.projection)?;
+        }
+        self.session_store_record(
+            &session.session_id,
+            AgentSessionStoreRecordKind::TurnCompleted {
+                stop_reason: run.stop_reason.clone(),
+                item_count: run.items.len(),
+                event_count: run.events.len(),
+            },
+        )?;
+        self.save_session(session)?;
         Ok(run)
     }
 
@@ -2013,56 +2545,105 @@ impl<M: InteractionModel> Agent<M> {
         &self,
         session: &mut AgentSession,
         message: impl Into<String>,
-    ) -> AgentSteeringMessage {
+    ) -> Result<AgentSteeringMessage, AgentError> {
         let steering = AgentSteeringMessage::new(message);
         session.steering_queue.push(steering.clone());
-        steering
+        self.session_store_record(
+            &session.session_id,
+            AgentSessionStoreRecordKind::SteeringQueued {
+                steering: steering.clone(),
+            },
+        )?;
+        self.save_session(session)?;
+        Ok(steering)
     }
 
     pub fn follow_up(
         &self,
         session: &mut AgentSession,
         message: impl Into<String>,
-    ) -> AgentFollowUpMessage {
+    ) -> Result<AgentFollowUpMessage, AgentError> {
         let follow_up = AgentFollowUpMessage::new(message);
         session.follow_up_queue.push(follow_up.clone());
-        follow_up
+        self.session_store_record(
+            &session.session_id,
+            AgentSessionStoreRecordKind::FollowUpQueued {
+                follow_up: follow_up.clone(),
+            },
+        )?;
+        self.save_session(session)?;
+        Ok(follow_up)
     }
 
     pub fn compact(
         &self,
         session: &mut AgentSession,
         reason: impl Into<String>,
-    ) -> AgentCompactionSummary {
-        let summary =
-            self.compactor
-                .compact(&session.transcript, reason, session.transcript.items.len());
+    ) -> Result<AgentCompactionSummary, AgentError> {
+        let source_transcript = session.compaction_source_transcript();
+        let summary = self
+            .compactor
+            .compact_retaining_tail_count_with_session_state(
+                &source_transcript,
+                reason,
+                source_transcript.items.len(),
+                self.compactor
+                    .retained_tail_count
+                    .unwrap_or(source_transcript.items.len()),
+                session.projection.as_ref(),
+                &session.steering_queue,
+                &session.follow_up_queue,
+            );
         let compaction_item = AgentItem::CompactionSummary {
             item_id: TaskId::generate(),
             summary: summary.clone(),
         };
+        session.raw_transcript.items.push(compaction_item.clone());
+        session.projection = Some(summary.projection.clone());
         session.transcript.items = compacted_session_items(
-            &session.transcript,
-            compaction_item,
+            &source_transcript,
+            compaction_item.clone(),
             summary.retained_tail_count,
         );
-        summary
+        self.session_store_items(&session.session_id, &[compaction_item])?;
+        self.session_store_projection(&session.session_id, &summary.projection)?;
+        self.session_store_record(
+            &session.session_id,
+            AgentSessionStoreRecordKind::Compacted {
+                summary: summary.clone(),
+                item_count: session.transcript.items.len(),
+            },
+        )?;
+        self.save_session(session)?;
+        Ok(summary)
     }
 
-    pub fn abort(&self, session: &mut AgentSession, reason: impl Into<String>) -> AgentAbortRecord {
+    pub fn abort(
+        &self,
+        session: &mut AgentSession,
+        reason: impl Into<String>,
+    ) -> Result<AgentAbortRecord, AgentError> {
         let abort = AgentAbortRecord::new(reason);
         session.abort = Some(abort.clone());
-        abort
+        self.session_store_record(
+            &session.session_id,
+            AgentSessionStoreRecordKind::Aborted {
+                abort: abort.clone(),
+            },
+        )?;
+        self.save_session(session)?;
+        Ok(abort)
     }
 
     pub fn run(&self, input: &AgentLoopInput) -> Result<AgentRun, AgentError> {
-        self.run_with_session_context(input, Vec::new(), &[], &[])
+        self.run_with_session_context(input, Vec::new(), None, &[], &[])
     }
 
     fn run_with_session_context(
         &self,
         input: &AgentLoopInput,
         transcript_prefix: Vec<AgentTranscriptItem>,
+        mut session_projection: Option<AgentSessionProjection>,
         steering: &[AgentSteeringMessage],
         follow_ups: &[AgentFollowUpMessage],
     ) -> Result<AgentRun, AgentError> {
@@ -2200,7 +2781,12 @@ impl<M: InteractionModel> Agent<M> {
             {
                 break;
             }
-            let mut turn_context = self.assemble_context(input, &transcript, step_index)?;
+            let mut turn_context = self.assemble_context_with_projection(
+                input,
+                &transcript,
+                session_projection.as_ref(),
+                step_index,
+            )?;
             if self
                 .config
                 .context_budget
@@ -2224,12 +2810,17 @@ impl<M: InteractionModel> Agent<M> {
                         .retained_tail_count
                         .unwrap_or(retained_transcript.len())
                         .min(typed_transcript.items.len());
-                    let compaction = self.compactor.compact_retaining_tail_count(
-                        &typed_transcript,
-                        "context budget threshold reached",
-                        turn_context.budget_estimate.total_bytes,
-                        retained_tail_count,
-                    );
+                    let compaction = self
+                        .compactor
+                        .compact_retaining_tail_count_with_session_state(
+                            &typed_transcript,
+                            "context budget threshold reached",
+                            turn_context.budget_estimate.total_bytes,
+                            retained_tail_count,
+                            session_projection.as_ref(),
+                            steering,
+                            follow_ups,
+                        );
                     let compaction_item = AgentItem::CompactionSummary {
                         item_id: TaskId::generate(),
                         summary: compaction.clone(),
@@ -2266,8 +2857,14 @@ impl<M: InteractionModel> Agent<M> {
                         },
                     )?;
                     events.push(compaction_event);
+                    session_projection = Some(compaction.projection.clone());
                     transcript = compacted_transcript_view(&compaction, retained_transcript)?;
-                    turn_context = self.assemble_context(input, &transcript, step_index)?;
+                    turn_context = self.assemble_context_with_projection(
+                        input,
+                        &transcript,
+                        session_projection.as_ref(),
+                        step_index,
+                    )?;
                     compactions.push(compaction);
                 }
             }
@@ -2696,6 +3293,16 @@ impl<M: InteractionModel> Agent<M> {
         transcript: &[AgentTranscriptItem],
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
+        self.assemble_context_with_projection(input, transcript, None, step_index)
+    }
+
+    fn assemble_context_with_projection(
+        &self,
+        input: &AgentLoopInput,
+        transcript: &[AgentTranscriptItem],
+        session_projection: Option<&AgentSessionProjection>,
+        step_index: usize,
+    ) -> Result<TurnContext, AgentError> {
         let all_tool_descriptors = self.tool_plan(input).descriptors();
         let (tool_descriptors, policy_omissions) =
             self.policy.filter_tool_descriptors(all_tool_descriptors);
@@ -2704,6 +3311,7 @@ impl<M: InteractionModel> Agent<M> {
             AgentRole::Deliberation,
             &self.config,
             transcript,
+            session_projection.cloned(),
             tool_descriptors,
             step_index,
         )?;
@@ -2714,6 +3322,12 @@ impl<M: InteractionModel> Agent<M> {
             kind: "agent_policy".to_string(),
             label: self.policy.policy_id.clone(),
             bytes: policy_bytes,
+        });
+        context.budget_estimate.lanes.push(ContextBudgetLane {
+            kind: "fixed_prompt".to_string(),
+            label: "agent policy".to_string(),
+            bytes: policy_bytes,
+            priority: 0,
         });
         context.report.omitted.extend(policy_omissions);
         context.budget_estimate.total_bytes += policy_bytes;
@@ -3168,6 +3782,11 @@ fn render_turn_context_message(
     serde_json::to_string_pretty(&serde_json::json!({
         "kind": "turn_context",
         "step_index": turn_context.report.step_index,
+        "session_projection": turn_context.session_projection,
+        "current_work": turn_context
+            .session_projection
+            .as_ref()
+            .map(|projection| &projection.working_state),
         "workspace_facts": turn_context.workspace_facts,
         "loaded_instruction_files": turn_context.loaded_instruction_files,
         "prompt_references": turn_context.prompt_references,
@@ -4282,8 +4901,41 @@ mod tests {
         let paths = AgentStoragePaths::from_data_dir(&data_dir);
 
         assert_eq!(paths.root, data_dir.root().join("events").join("agent"));
+        assert_eq!(paths.sessions_dir, paths.root.join("sessions"));
         assert_eq!(paths.traces_dir, paths.root.join("traces"));
         assert_eq!(paths.evidence_dir, paths.root.join("evidence"));
+        assert_eq!(
+            paths.session_dir_for_session(&session_id),
+            paths.sessions_dir.join(session_id.as_str())
+        );
+        assert_eq!(
+            paths.session_snapshot_path_for_session(&session_id),
+            paths
+                .sessions_dir
+                .join(session_id.as_str())
+                .join("snapshot.json")
+        );
+        assert_eq!(
+            paths.session_events_path_for_session(&session_id),
+            paths
+                .sessions_dir
+                .join(session_id.as_str())
+                .join("events.jsonl")
+        );
+        assert_eq!(
+            paths.session_items_path_for_session(&session_id),
+            paths
+                .sessions_dir
+                .join(session_id.as_str())
+                .join("items.jsonl")
+        );
+        assert_eq!(
+            paths.session_projections_path_for_session(&session_id),
+            paths
+                .sessions_dir
+                .join(session_id.as_str())
+                .join("projections.jsonl")
+        );
         assert_eq!(
             paths.trace_path_for_session(&session_id),
             paths
@@ -4325,6 +4977,263 @@ mod tests {
                 .expect("trace")
                 .contains("\"run_started\"")
         );
+    }
+
+    #[test]
+    fn file_session_store_persists_and_reloads_session_snapshot() {
+        let data_dir = SinomoDataDir::new(
+            std::env::temp_dir().join(format!("sinomo-agent-session-{}", TaskId::generate())),
+        );
+        let session_id = SessionId::from_legacy_named("sess_agent_store").expect("session");
+        let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
+        let mut session = AgentSession::new(session_id.clone(), AgentRole::Deliberation);
+        session.transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "hello".to_string(),
+            event_id: None,
+        });
+
+        store.save_session(&session).expect("save session");
+        let loaded = store
+            .load_session(&session_id)
+            .expect("load session")
+            .expect("saved session");
+        assert_eq!(loaded, session);
+
+        session
+            .steering_queue
+            .push(AgentSteeringMessage::new("prefer concise answers"));
+        store.save_session(&session).expect("replace session");
+        let loaded = store
+            .load_session(&session_id)
+            .expect("load replaced session")
+            .expect("saved session");
+        assert_eq!(loaded.steering_queue, session.steering_queue);
+
+        let paths = AgentStoragePaths::from_data_dir(&data_dir);
+        let events = fs::read_to_string(paths.session_events_path_for_session(&session_id))
+            .expect("session events");
+        assert!(events.contains("\"snapshot_saved\""));
+        assert!(
+            fs::read_to_string(paths.session_snapshot_path_for_session(&session_id))
+                .expect("snapshot")
+                .contains("\"schema_version\"")
+        );
+    }
+
+    #[test]
+    fn agent_session_store_records_turns_and_queue_updates() {
+        let data_dir = SinomoDataDir::new(
+            std::env::temp_dir().join(format!("sinomo-agent-session-run-{}", TaskId::generate())),
+        );
+        let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Done.",
+            "tool_calls": [],
+            "maid_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let agent = Agent::new(model, "fake", "fake").with_session_store(store.clone());
+        let input = agent_input("persist this turn");
+        let mut session =
+            AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+
+        let run = agent.start_turn(&mut session, &input).expect("run");
+        assert_eq!(run.stop_reason, AgentStopReason::FinalDecision);
+        agent
+            .steer(&mut session, "carry this into the next turn")
+            .expect("steer");
+
+        let loaded = store
+            .load_session(&input.session.session_id)
+            .expect("load session")
+            .expect("saved session");
+        assert_eq!(loaded.transcript.items, session.transcript.items);
+        assert_eq!(loaded.steering_queue, session.steering_queue);
+
+        let paths = AgentStoragePaths::from_data_dir(&data_dir);
+        let events =
+            fs::read_to_string(paths.session_events_path_for_session(&input.session.session_id))
+                .expect("session events");
+        assert!(events.contains("\"turn_started\""));
+        assert!(events.contains("\"turn_completed\""));
+        assert!(events.contains("\"steering_queued\""));
+        assert!(events.contains("\"snapshot_saved\""));
+    }
+
+    #[test]
+    fn explicit_compaction_preserves_raw_history_and_records_working_state() {
+        let model = SequencedModel::new(Vec::<String>::new());
+        let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
+            retained_tail_count: Some(1),
+        });
+        let session_id = SessionId::from_legacy_named("sess_agent_projection").expect("session");
+        let mut session = AgentSession::new(session_id, AgentRole::Deliberation);
+        session.transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "old request".to_string(),
+            event_id: None,
+        });
+        session.transcript.push(AgentItem::AssistantText {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "old answer".to_string(),
+        });
+        session.transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 1,
+            content: "current work request".to_string(),
+            event_id: None,
+        });
+
+        let summary = agent
+            .compact(&mut session, "trim old context")
+            .expect("compact");
+
+        assert_eq!(summary.projection.source_item_count, 3);
+        assert_eq!(summary.projection.retained_item_ids.len(), 1);
+        assert_eq!(
+            summary
+                .projection
+                .working_state
+                .current_user_request
+                .as_deref(),
+            Some("current work request")
+        );
+        assert_eq!(session.projection, Some(summary.projection.clone()));
+        assert_eq!(session.raw_transcript.items.len(), 4);
+        assert!(session.raw_transcript.items.iter().any(|item| {
+            matches!(item, AgentItem::UserMessage { content, .. } if content == "old request")
+        }));
+        assert_eq!(session.transcript.items.len(), 2);
+        assert!(
+            session
+                .transcript
+                .items
+                .first()
+                .is_some_and(|item| matches!(item, AgentItem::CompactionSummary { .. }))
+        );
+    }
+
+    #[test]
+    fn compaction_carries_prior_projection_working_state_forward() {
+        let compactor = AgentCompactor {
+            retained_tail_count: Some(1),
+        };
+        let mut first_transcript = AgentTranscript::new();
+        first_transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "long running objective".to_string(),
+            event_id: None,
+        });
+        let first = compactor.compact_retaining_tail_count_with_session_state(
+            &first_transcript,
+            "first compaction",
+            100,
+            1,
+            None,
+            &[],
+            &[],
+        );
+        let mut second_transcript = AgentTranscript::new();
+        second_transcript.push(AgentItem::AssistantText {
+            item_id: TaskId::generate(),
+            step_index: 1,
+            content: "still working".to_string(),
+        });
+
+        let second = compactor.compact_retaining_tail_count_with_session_state(
+            &second_transcript,
+            "second compaction",
+            100,
+            1,
+            Some(&first.projection),
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            second.projection.previous_projection_id,
+            Some(first.projection.projection_id.clone())
+        );
+        assert_eq!(
+            second.projection.working_state.active_objective.as_deref(),
+            Some("long running objective")
+        );
+        assert_eq!(
+            second
+                .projection
+                .working_state
+                .current_user_request
+                .as_deref(),
+            Some("long running objective")
+        );
+        assert!(
+            second
+                .projection
+                .working_state
+                .decisions
+                .contains(&"still working".to_string())
+        );
+    }
+
+    #[test]
+    fn file_session_store_records_items_and_projections_append_only() {
+        let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-agent-session-projection-{}",
+            TaskId::generate()
+        )));
+        let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Done.",
+            "tool_calls": [],
+            "maid_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let agent = Agent::new(model, "fake", "fake")
+            .with_session_store(store.clone())
+            .with_compactor(AgentCompactor {
+                retained_tail_count: Some(1),
+            });
+        let input = agent_input("persist projection");
+        let mut session =
+            AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+
+        agent.start_turn(&mut session, &input).expect("run");
+        agent
+            .compact(&mut session, "persist compacted projection")
+            .expect("compact");
+
+        let loaded = store
+            .load_session(&input.session.session_id)
+            .expect("load session")
+            .expect("saved session");
+        assert!(loaded.projection.is_some());
+        assert!(
+            loaded.raw_transcript.items.len() > loaded.transcript.items.len(),
+            "raw transcript should retain pre-compaction history"
+        );
+
+        let paths = AgentStoragePaths::from_data_dir(&data_dir);
+        let events =
+            fs::read_to_string(paths.session_events_path_for_session(&input.session.session_id))
+                .expect("session events");
+        let items =
+            fs::read_to_string(paths.session_items_path_for_session(&input.session.session_id))
+                .expect("session items");
+        let projections = fs::read_to_string(
+            paths.session_projections_path_for_session(&input.session.session_id),
+        )
+        .expect("session projections");
+        assert!(events.contains("\"items_appended\""));
+        assert!(events.contains("\"projection_saved\""));
+        assert!(items.contains("\"compaction_summary\""));
+        assert!(projections.contains("\"working_state\""));
     }
 
     #[test]
@@ -6244,6 +7153,57 @@ old
     }
 
     #[test]
+    fn session_projection_is_rendered_as_current_work_budget_lane() {
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Projection-aware answer.",
+            "tool_calls": [],
+            "maid_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
+            retained_tail_count: Some(1),
+        });
+        let input = agent_input("continue after compaction");
+        let mut session =
+            AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+        session.transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "remember this active objective".to_string(),
+            event_id: None,
+        });
+        session.transcript.push(AgentItem::AssistantText {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "I will keep working on it.".to_string(),
+        });
+        agent
+            .compact(&mut session, "test projection context")
+            .expect("compact");
+
+        let run = agent.start_turn(&mut session, &input).expect("run");
+
+        let request_text = agent.model.requests.lock().expect("requests")[0]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(request_text.contains("\"session_projection\""));
+        assert!(request_text.contains("\"current_work\""));
+        assert!(request_text.contains("\"lanes\""));
+        assert!(request_text.contains("\"recent_tail\""));
+        assert!(
+            run.context_reports[0]
+                .budget_estimate
+                .lanes
+                .iter()
+                .any(|lane| lane.kind == "current_work" && lane.bytes > 0)
+        );
+    }
+
+    #[test]
     fn agent_session_api_supports_steer_compact_and_abort() {
         let model = SequencedModel::new([r#"{
             "response_mode": "answer",
@@ -6261,10 +7221,14 @@ old
         assert_eq!(run.stop_reason, AgentStopReason::FinalDecision);
         assert!(!session.transcript.items.is_empty());
 
-        let steering = agent.steer(&mut session, "prefer a concise answer");
+        let steering = agent
+            .steer(&mut session, "prefer a concise answer")
+            .expect("steer");
         assert_eq!(session.steering_queue[0], steering);
 
-        let compaction = agent.compact(&mut session, "test compaction");
+        let compaction = agent
+            .compact(&mut session, "test compaction")
+            .expect("compact");
         assert_eq!(compaction.reason, "test compaction");
         assert!(
             session
@@ -6274,7 +7238,9 @@ old
                 .any(|item| matches!(item, AgentItem::CompactionSummary { .. }))
         );
 
-        let abort = agent.abort(&mut session, "no longer needed");
+        let abort = agent
+            .abort(&mut session, "no longer needed")
+            .expect("abort");
         assert_eq!(session.abort, Some(abort));
         let aborted_run = agent.continue_turn(&mut session, &input).expect("aborted");
         assert_eq!(aborted_run.stop_reason, AgentStopReason::Aborted);
@@ -6304,8 +7270,12 @@ old
             AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
 
         agent.start_turn(&mut session, &input).expect("first turn");
-        agent.steer(&mut session, "prefer concise reasoning");
-        agent.follow_up(&mut session, "also mention tests");
+        agent
+            .steer(&mut session, "prefer concise reasoning")
+            .expect("steer");
+        agent
+            .follow_up(&mut session, "also mention tests")
+            .expect("follow up");
         let second_input = agent_input("second");
         let run = agent
             .continue_turn(&mut session, &second_input)
