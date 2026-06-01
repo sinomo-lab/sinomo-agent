@@ -2879,6 +2879,19 @@ pub fn daemon_advertised_endpoints_from_addresses(
     )
 }
 
+/// How long to wait when probing this node's own public endpoint for reachability.
+const PUBLIC_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Whether this node's own public endpoint (`ip:port`) is actually reachable -- i.e. an
+/// external connection to it lands on this daemon, via a user-configured port-forward (or
+/// NAT hairpin). Only a verified public endpoint should be advertised; an unverified one (a
+/// NAT'd node with no forward) would publish an unreachable address that every peer then
+/// wastes connection attempts on. Manual endpoint configuration is future work.
+fn public_endpoint_is_reachable(ip: IpAddr, port: u16) -> bool {
+    let address = SocketAddr::new(ip, port);
+    std::net::TcpStream::connect_timeout(&address, PUBLIC_ENDPOINT_PROBE_TIMEOUT).is_ok()
+}
+
 pub fn daemon_advertised_endpoints_from_addresses_with_public_discovery(
     node_id: &NodeId,
     loopback_address: String,
@@ -2910,7 +2923,11 @@ pub fn daemon_advertised_endpoints_from_addresses_with_public_discovery(
             .any(|ip| is_invitable_ip(ip) && !crate::is_private_or_link_local_ip(ip));
         if allow_public_ip_discovery && !has_public_candidate {
             for ip in discover_default_public_ip_candidates() {
-                if is_invitable_ip(ip) {
+                // Only advertise a discovered public IP when it is actually reachable on the
+                // daemon port -- i.e. the user has a port-forward (or NAT hairpin) back to
+                // this daemon. An unverified public IP would otherwise pollute every peer's
+                // connection-target list with an unreachable endpoint.
+                if is_invitable_ip(ip) && public_endpoint_is_reachable(ip, port) {
                     push_unique_address(&mut lan_addresses, format_ip_port(ip, port));
                 }
             }
