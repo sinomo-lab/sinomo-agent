@@ -1493,8 +1493,12 @@ impl ClusterNetworkMaintenance {
         let timestamp = now
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string());
+        // Seed the in-memory probe cache from the merged graph (KV + the local probe store,
+        // local-authoritative for our own edges) rather than KV alone: a learner cannot commit
+        // its connectivity edges to KV, so seeding from KV would discard our own last-known
+        // reachability and force a full re-convergence on every restart.
         if self.connectivity.is_empty()
-            && let Ok(records) = sinomo_network::read_cluster_connectivity_graph_from_kv(paths)
+            && let Ok(records) = sinomo_network::read_cluster_connectivity_graph(paths)
         {
             for record in records
                 .into_iter()
@@ -1528,6 +1532,10 @@ impl ClusterNetworkMaintenance {
                         || (probe.record.state != sinomo_network::ClusterConnectivityState::Healthy
                             && probe.record.consecutive_failures
                                 < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD)
+                        // Re-probe promptly after ANY recent failure, including a link still
+                        // reported Healthy under the single-failure grace below, so a real
+                        // outage is confirmed (and drops out of routing) within a couple ticks.
+                        || probe.record.consecutive_failures > 0
                 })
             })
             .cloned()
@@ -1615,7 +1623,19 @@ impl ClusterNetworkMaintenance {
                                         None
                                     }
                                 });
-                                let state_label = if observed_failures
+                                let previously_healthy =
+                                    previous.as_ref().is_some_and(|record| {
+                                        record.state
+                                            == sinomo_network::ClusterConnectivityState::Healthy
+                                    });
+                                let state_label = if previously_healthy && observed_failures == 1 {
+                                    // Single-failure grace: a confirmed-healthy link survives one
+                                    // transient probe failure as Healthy (stays routable through a
+                                    // blip). The probe-selection clause re-probes it next tick, so
+                                    // a real outage still drops it to Degraded within two cycles. A
+                                    // never-confirmed link gets no grace.
+                                    sinomo_network::ClusterConnectivityState::Healthy
+                                } else if observed_failures
                                     >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
                                 {
                                     sinomo_network::ClusterConnectivityState::Unreachable
@@ -3212,15 +3232,24 @@ pub fn handle_daemon_cluster_relay_request(
     }
 }
 
-/// The best (connectivity-ordered) reachable endpoint to relay a hop through `node_id`.
+/// The endpoint to relay a hop through `node_id`, dialed over the link we have actually
+/// confirmed healthy (built straight from the connectivity record). This dials a multi-homed
+/// bridge on the segment we can reach rather than its first-listed command-target address,
+/// which may be on a segment we cannot reach. Falls back to the connectivity-ordered command
+/// target only when no healthy record exists (defensive; routing only picks healthy hops).
 fn cluster_relay_next_hop_endpoint(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     node_id: &NodeId,
 ) -> Option<ClusterEndpointRecord> {
-    sinomo_network::cluster_raft_command_targets(paths, state)
-        .into_iter()
-        .find(|endpoint| endpoint.node_id == *node_id)
+    let graph = sinomo_network::ClusterConnectivityGraph::read_for_local(paths, state);
+    graph
+        .best_healthy_endpoint(&state.local_node_id, node_id)
+        .or_else(|| {
+            sinomo_network::cluster_raft_command_targets(paths, state)
+                .into_iter()
+                .find(|endpoint| endpoint.node_id == *node_id)
+        })
 }
 
 /// On a failed direct dial to `endpoint`, attempt to relay the already-signed `request`
@@ -3232,7 +3261,12 @@ fn cluster_relay_next_hop_endpoint(
 /// Used to skip a doomed direct dial (which would burn the whole timeout) in favor of relaying.
 /// Returns `false` on any read error or when the edge is unknown, so callers fall back to the
 /// normal direct-then-relay path rather than mis-skipping a reachable endpoint.
-pub(crate) fn cluster_endpoint_is_known_unreachable(endpoint: &ClusterEndpointRecord) -> bool {
+/// Whether `send_daemon_rpc_to_endpoint` should skip the direct dial and relay instead:
+/// true when we have no currently-healthy direct edge to the target node BUT do have a healthy
+/// multi-hop route to it, so a direct dial could only burn the timeout. Returns false (i.e.
+/// still try a direct dial) when we DO have a healthy direct edge, or when no route is known at
+/// all (e.g. at startup before the first probe) -- so unprobed-but-reachable peers still work.
+pub(crate) fn cluster_endpoint_prefers_relay(endpoint: &ClusterEndpointRecord) -> bool {
     let Ok(data_dir) = SinomoDataDir::from_env_or_home() else {
         return false;
     };
@@ -3240,11 +3274,27 @@ pub(crate) fn cluster_endpoint_is_known_unreachable(endpoint: &ClusterEndpointRe
     let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
         return false;
     };
+    if endpoint.node_id == state.local_node_id {
+        return false;
+    }
     let graph = sinomo_network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
-    matches!(
-        graph.state_for_endpoint(endpoint),
-        Some(sinomo_network::ClusterConnectivityState::Unreachable)
+    if graph
+        .healthy_targets(&state.local_node_id)
+        .contains(&endpoint.node_id)
+    {
+        return false;
+    }
+    // No healthy direct edge. Relay iff the relay would actually make progress -- i.e. the same
+    // best-effort first-hop the relay uses resolves (a full healthy path OR a healthy neighbor
+    // to hand off to). A learner often lacks the bridge's onward edges in its frozen join
+    // snapshot, so requiring a fully-known path here would wrongly keep dialing direct.
+    sinomo_network::cluster_route_first_hop_best_effort(
+        &graph,
+        &state.local_node_id,
+        &endpoint.node_id,
+        &[],
     )
+    .is_some()
 }
 
 pub(crate) fn relay_request_to_endpoint(

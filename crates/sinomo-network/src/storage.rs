@@ -493,11 +493,19 @@ impl ClusterConnectivityGraph {
                 endpoint.endpoint_id.clone(),
             ))
             .or_else(|| {
+                // Fall back to matching on (source, target, address): the network address is
+                // the stable identity of an endpoint. The same address can be derived with a
+                // different `endpoint_id` or transport classification across code paths (the
+                // probe uses member endpoints; routing queries with command-target endpoints),
+                // which previously caused a silent miss -- so this no longer requires the
+                // transport to match and normalizes the address.
                 self.records.values().find(|record| {
                     record.source_node_id == self.source_node_id
                         && record.target_node_id == endpoint.node_id
-                        && record.transport == endpoint.transport
-                        && record.address == endpoint.address
+                        && cluster_endpoint_addresses_equivalent(
+                            &record.address,
+                            &endpoint.address,
+                        )
                 })
             })
     }
@@ -532,6 +540,70 @@ impl ClusterConnectivityGraph {
             .map(|record| record.target_node_id.clone())
             .collect()
     }
+
+    /// Node ids `source` has a CURRENTLY-HEALTHY connectivity record to (over any endpoint),
+    /// excluding `source`. Unlike [`reachable_targets`], `Degraded` does NOT count: a routing
+    /// first hop must be a link we can dial reliably *now*, so a never-reachable peer that is
+    /// merely mid-convergence (transiently `Degraded`) is not treated as a direct hop. This is
+    /// the adjacency multi-hop route discovery in [`crate::route`] walks.
+    pub fn healthy_targets(&self, source: &NodeId) -> std::collections::BTreeSet<NodeId> {
+        self.records
+            .values()
+            .filter(|record| {
+                &record.source_node_id == source
+                    && record.target_node_id != *source
+                    && record.state == ClusterConnectivityState::Healthy
+            })
+            .map(|record| record.target_node_id.clone())
+            .collect()
+    }
+
+    /// A dialable endpoint to reach `target` from `source` over a currently-healthy link, or
+    /// `None` if no healthy record exists. Built straight from the connectivity record (which
+    /// holds the exact address+transport last probed healthy), so it is immune to the
+    /// endpoint-object matching in [`Self::record_for_endpoint`]; among several healthy
+    /// endpoints it prefers the lowest observed latency. Used to pick the reachable link of a
+    /// multi-homed bridge for relaying.
+    pub fn best_healthy_endpoint(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+    ) -> Option<ClusterEndpointRecord> {
+        self.records
+            .values()
+            .filter(|record| {
+                &record.source_node_id == source
+                    && &record.target_node_id == target
+                    && record.state == ClusterConnectivityState::Healthy
+            })
+            .min_by_key(|record| record.latency_ms.unwrap_or(u64::MAX))
+            .map(|record| ClusterEndpointRecord {
+                endpoint_id: record.endpoint_id.clone(),
+                node_id: record.target_node_id.clone(),
+                transport: record.transport.clone(),
+                address: record.address.clone(),
+                source: ClusterEndpointSource::Observed,
+                privacy: ClusterEndpointPrivacy::Lan,
+                priority: 0,
+                last_observed_latency_ms: record
+                    .latency_ms
+                    .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
+            })
+    }
+}
+
+/// Whether two endpoint address strings denote the same network address. Compares the raw
+/// strings, then a normalized `SocketAddr` parse so equivalent spellings still match. Used by
+/// connectivity-record lookup, where the same address may be derived slightly differently
+/// across code paths (probe targets vs command targets).
+fn cluster_endpoint_addresses_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    matches!(
+        (left.parse::<SocketAddr>(), right.parse::<SocketAddr>()),
+        (Ok(l), Ok(r)) if l == r
+    )
 }
 
 pub fn build_cluster_network_info_record(
@@ -611,11 +683,9 @@ pub fn cluster_connectivity_record(
     observed_at: OffsetDateTime,
     ttl_seconds: i64,
 ) -> ClusterConnectivityRecord {
-    let expires_in = if matches!(connectivity_state, ClusterConnectivityState::Healthy) {
-        ttl_seconds
-    } else {
-        ttl_seconds / 2
-    };
+    // The caller passes an explicit per-state TTL (e.g. CLUSTER_CONNECTIVITY_TTL_SECONDS for
+    // healthy/degraded, CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS for unreachable); honor it
+    // directly rather than silently halving non-healthy lifetimes.
     ClusterConnectivityRecord {
         cluster_id: state.cluster_id.clone(),
         source_node_id: state.local_node_id.clone(),
@@ -629,7 +699,7 @@ pub fn cluster_connectivity_record(
         last_success_at,
         last_failure_at,
         observed_at,
-        expires_at: observed_at + time::Duration::seconds(expires_in),
+        expires_at: observed_at + time::Duration::seconds(ttl_seconds),
     }
 }
 
@@ -1788,9 +1858,27 @@ pub fn read_cluster_connectivity_graph(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
     let now = OffsetDateTime::now_utc();
+    let local_records = read_local_cluster_connectivity_records(paths)?
+        .into_iter()
+        .filter(|record| cluster_network_record_live(record.expires_at, now))
+        .collect::<Vec<_>>();
+    // A node's own live probe results are authoritative for ITS outgoing edges. Drop any
+    // KV-published edge whose source we hold local records for: those KV edges can be stale
+    // (e.g. a `healthy` edge published before the node moved behind a segment boundary and
+    // can no longer reach the target). Keeping both -- they differ by endpoint_id so the
+    // exact-key dedup below does not collapse them -- would let routing treat an
+    // unreachable voter as a directly-reachable next hop and dial it instead of relaying
+    // through the bridge. Other sources' edges (the remote topology) are taken from KV.
+    let local_sources = local_records
+        .iter()
+        .map(|record| record.source_node_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     let mut records_by_key =
         BTreeMap::<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>::new();
     for record in read_cluster_connectivity_graph_from_kv(paths)? {
+        if local_sources.contains(&record.source_node_id) {
+            continue;
+        }
         records_by_key.insert(
             (
                 record.source_node_id.clone(),
@@ -1800,17 +1888,15 @@ pub fn read_cluster_connectivity_graph(
             record,
         );
     }
-    for record in read_local_cluster_connectivity_records(paths)? {
-        if cluster_network_record_live(record.expires_at, now) {
-            records_by_key.insert(
-                (
-                    record.source_node_id.clone(),
-                    record.target_node_id.clone(),
-                    record.endpoint_id.clone(),
-                ),
-                record,
-            );
-        }
+    for record in local_records {
+        records_by_key.insert(
+            (
+                record.source_node_id.clone(),
+                record.target_node_id.clone(),
+                record.endpoint_id.clone(),
+            ),
+            record,
+        );
     }
     let mut records = records_by_key.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut records);

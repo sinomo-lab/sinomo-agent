@@ -36,18 +36,25 @@ to paper over the segmentation** — peers can only talk over direct LAN-TCP wit
 network. The daemon logs `iroh disabled (SINOMO_DISABLE_IROH)` and advertises **no**
 `iroh://` endpoint.
 
-## Expected state: BROKEN across segments (by design)
+## Expected state: all 6 nodes cohere (via native relay)
 
-Native multi-hop routing through the bridge nodes is **not implemented yet**, so:
+Cross-segment cohesion works **without iroh**: a non-voter bridge forwards a joiner's
+challenge + registration to a voter, and cluster control traffic is relayed hop-by-hop over
+the connectivity graph's **healthy** links. So every node integrates into one cluster:
 
-- `{node1,node2,node3}` form a healthy cluster (all in `seg_a`).
-- `{node4,node5,node6}` **cannot integrate** — their cross-segment joins fail (node3/node4
-  can't yet relay a join to the raft leader), so they come up **unclustered**.
-- `sinomo cluster health` on node1 shows only the `seg_a` members; node5/node6 are absent.
+- `{node1,node2,node3}` form directly in `seg_a` (node1 is the voter).
+- `node4` joins across `seg_ab` through `node3` — node3 relays node4's join challenge +
+  registration to the voter node1.
+- `node5,node6` join through `node4`, **two bridges deep**: their joins relay
+  `node5/6 → node4 → node3 → node1`.
+- `sinomo cluster health` on node1 shows **all 6** main daemons (node1 voter + 5 learners);
+  cross-segment members read `offline` there only because node1 cannot dial their segment
+  directly — they are full members.
 
-This red baseline is the target for the routing work. Joins are best-effort and waits are
-time-bounded, so **no node hangs** — every container still ends up running its daemon and
-LAN-announcing within its segment(s).
+Joins are best-effort and time-bounded, so **no node hangs**; a cross-segment joiner retries
+while its upstream bridge finishes joining, so cohesion typically settles within ~a minute of
+startup. (Historically this was the "expected broken" red baseline for the routing work; it
+now coheres.)
 
 ## Layout
 
@@ -72,8 +79,8 @@ docker compose logs -f node1
 docker compose logs node4         # see the cross-segment join attempt + result
 
 # Cluster view from each segment.
-docker compose exec node1 sinomo cluster health   # expect {1,2,3}
-docker compose exec node5 sinomo cluster status   # expect: not integrated with {1,2,3}
+docker compose exec node1 sinomo cluster health   # expect all 6 main daemons
+docker compose exec node5 sinomo cluster status   # expect: integrated (a cluster member)
 
 # Confirm iroh is off (no iroh:// endpoint advertised).
 docker compose logs node1 | grep -i iroh
@@ -102,7 +109,8 @@ docker compose restart node1
 ## Notes
 
 - Within a segment, nodes discover each other via LAN multicast + direct TCP; across
-  segments there is no path until routing exists.
+  segments, cluster control traffic is relayed hop-by-hop through the bridge nodes
+  (node3, node4) over the connectivity graph's healthy links.
 - `SINOMO_DISABLE_IROH` is a runtime switch (the iroh code is still compiled in); unset it
   (or set to `0`) to restore iroh.
 - The git commit each node was built from shows in `sinomo cluster health` (`commit`

@@ -163,6 +163,18 @@ impl From<sinomo_runtime::sandbox::SandboxFsError> for CliError {
     }
 }
 
+impl From<sinomo_runtime::sandbox::SandboxBackendError> for CliError {
+    fn from(error: sinomo_runtime::sandbox::SandboxBackendError) -> Self {
+        match error {
+            // Preserve the existing typed mapping for the underlying store/fs errors.
+            sinomo_runtime::sandbox::SandboxBackendError::Store(error) => error.into(),
+            sinomo_runtime::sandbox::SandboxBackendError::Fs(error) => error.into(),
+            sinomo_runtime::sandbox::SandboxBackendError::PolicyDenied(detail)
+            | sinomo_runtime::sandbox::SandboxBackendError::Other(detail) => Self::Parse { detail },
+        }
+    }
+}
+
 impl From<sinomo_runtime::sandbox::SandboxPathError> for CliError {
     fn from(error: sinomo_runtime::sandbox::SandboxPathError) -> Self {
         Self::Parse {
