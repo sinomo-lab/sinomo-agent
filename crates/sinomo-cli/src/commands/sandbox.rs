@@ -5483,18 +5483,21 @@ pub(crate) fn sandbox_run_with_stores_and_stdin(
                     .allowed_command_capabilities
                     .insert(capability.clone());
             }
-            let outcome = sinomo_runtime::sandbox::LocalStagedSandboxCommandRunner::new()?
-                .run_toolchain_command_with_stdin_policy_and_output_sink(
+            let request = sinomo_runtime::sandbox::SandboxRunToolchainRequest {
+                sandbox_id: options.sandbox_id.clone(),
+                command_name: command_name.clone(),
+                argv: options.argv,
+                stdin,
+                timeout_ms: options.timeout_ms,
+            };
+            let outcome =
+                sinomo_runtime::sandbox::RuntimeSandboxBackend::run_toolchain_command_streaming(
                     store,
                     toolchain_store,
-                    &options.sandbox_id,
-                    command_name,
-                    options.argv,
-                    stdin,
-                    options.timeout_ms,
+                    request,
                     &execution_node_id,
                     &policy,
-                    Some(sandbox_cli_streaming_output_sink()),
+                    sandbox_cli_streaming_output_sink(),
                 )?;
             print_sandbox_command_outcome(&outcome, false)
         }
