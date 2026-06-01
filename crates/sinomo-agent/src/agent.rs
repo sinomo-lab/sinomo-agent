@@ -4553,20 +4553,12 @@ mod tests {
         )
         .with_tool_registry(AgentToolRegistry::new().with_tool(EchoTool));
         let mut input = agent_input("inspect with composed tools");
-        input.tool_specs = vec![
-            AgentToolSpec::new(
-                AgentToolKind::ListFiles,
-                "list_files",
-                "session-visible list tool",
-                false,
-            ),
-            AgentToolSpec::new(
-                AgentToolKind::SearchFiles,
-                "search",
-                "session-visible search tool",
-                false,
-            ),
-        ];
+        input.tool_specs = vec![AgentToolSpec::new(
+            AgentToolKind::SearchFiles,
+            "search",
+            "session-visible search tool",
+            false,
+        )];
 
         let context = agent.assemble_context(&input, &[], 0).expect("context");
         let visible_tools: Vec<_> = context
@@ -4576,7 +4568,6 @@ mod tests {
             .collect();
 
         assert!(visible_tools.contains(&"read_file"));
-        assert!(visible_tools.contains(&"list_files"));
         assert!(visible_tools.contains(&"search"));
         assert_eq!(
             visible_tools
@@ -4622,12 +4613,12 @@ mod tests {
         let model = SequencedModel::new([
             r#"{
                 "response_mode": "defer",
-                "text": "I will list files.",
+                "text": "I will search files.",
                 "tool_calls": [{
-                    "tool": "list_files",
-                    "input": {"path": "."},
+                    "tool": "search",
+                    "input": {"query": "needle", "path": "."},
                     "async": false,
-                    "summary": "List the workspace."
+                    "summary": "Search the workspace."
                 }],
                 "maid_handoff": null,
                 "next_state": "waiting"
@@ -4664,14 +4655,9 @@ mod tests {
 
         for expected in [
             "read_file",
-            "list_files",
             "search",
             "apply_patch",
             "run_command",
-            "git_status",
-            "git_diff",
-            "format",
-            "test",
             "start_command_session",
             "inspect_command_session",
             "write_command_stdin",
@@ -4707,8 +4693,10 @@ mod tests {
             .collect();
 
         assert!(!visible_tools.contains(&"run_command"));
-        assert!(!visible_tools.contains(&"format"));
-        assert!(!visible_tools.contains(&"test"));
+        assert!(!visible_tools.contains(&"start_command_session"));
+        assert!(!visible_tools.contains(&"inspect_command_session"));
+        assert!(!visible_tools.contains(&"write_command_stdin"));
+        assert!(!visible_tools.contains(&"cancel_command_session"));
         assert!(
             context
                 .report
@@ -4989,29 +4977,14 @@ mod tests {
         fs::write(root.join("a.txt"), "needle\n").expect("seed a");
         fs::write(root.join("b.txt"), "other\n").expect("seed b");
         let mut config = LocalWorkspaceAgentConfig::new(&root);
-        config.max_list_entries = 1;
         config.max_search_matches = 10;
         let registry = AgentToolRegistry::local_workspace_with_config(config);
         let input = agent_input("readonly evidence");
 
-        let list = registry.execute(
-            &input.session,
-            0,
-            0,
-            &AgentToolCall {
-                tool: "list_files".to_string(),
-                input: serde_json::json!({
-                    "path": ".",
-                    "max_entries": 1
-                }),
-                r#async: false,
-                summary: "list files".to_string(),
-            },
-        );
         let search = registry.execute(
             &input.session,
             0,
-            1,
+            0,
             &AgentToolCall {
                 tool: "search".to_string(),
                 input: serde_json::json!({
@@ -5024,9 +4997,6 @@ mod tests {
             },
         );
 
-        assert_eq!(list.status, AgentToolStatus::Succeeded);
-        assert!(list.evidence.output.model_visible_bytes > 0);
-        assert!(list.evidence.output.truncated);
         assert_eq!(search.status, AgentToolStatus::Succeeded);
         assert!(search.evidence.output.model_visible_bytes > 0);
         assert!(!search.evidence.output.truncated);
@@ -5051,6 +5021,54 @@ mod tests {
             outcome.output.get("error").and_then(|value| value.as_str()),
             Some("command_execution_disabled")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn local_workspace_run_command_honors_timeout_and_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-command-timeout-{}",
+            TaskId::generate()
+        ));
+        let subdir = root.join("subdir");
+        fs::create_dir_all(&subdir).expect("workspace");
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true),
+        );
+        let input = agent_input("command timeout");
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "run_command".to_string(),
+                input: serde_json::json!({
+                    "command": "pwd; sleep 1",
+                    "cwd": "subdir",
+                    "timeout_ms": 40
+                }),
+                r#async: false,
+                summary: "run timed command".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Failed);
+        assert_eq!(
+            outcome
+                .output
+                .get("timed_out")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            outcome
+                .output
+                .get("cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("subdir")
+        );
+        assert!(outcome.summary.contains("timed out after 40 ms"));
     }
 
     #[test]
@@ -5181,6 +5199,129 @@ mod tests {
         assert_eq!(final_status, "completed");
         assert!(stdout.contains("got:hello"));
         assert!(stdout.contains("done"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn local_workspace_command_session_truncated_offsets_can_be_paged() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-command-session-paging-{}",
+            TaskId::generate()
+        ));
+        fs::create_dir_all(&root).expect("workspace");
+        let mut config = LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true);
+        config.max_command_output_bytes = 4;
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let input = agent_input("command paging");
+        let start = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "start_command_session".to_string(),
+                input: serde_json::json!({
+                    "command": "printf abcdefgh",
+                    "timeout_ms": 5_000
+                }),
+                r#async: true,
+                summary: "start output command".to_string(),
+            },
+        );
+        let session_id = start
+            .output
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("session id")
+            .to_string();
+
+        let mut first_page = None;
+        for _ in 0..50 {
+            let inspect = registry.execute(
+                &input.session,
+                0,
+                1,
+                &AgentToolCall {
+                    tool: "inspect_command_session".to_string(),
+                    input: serde_json::json!({ "session_id": session_id }),
+                    r#async: false,
+                    summary: "inspect first page".to_string(),
+                },
+            );
+            if inspect
+                .output
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                != Some("running")
+                && inspect
+                    .output
+                    .get("stdout_total_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default()
+                    >= 8
+            {
+                first_page = Some(inspect);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let first_page = first_page.expect("first page");
+        assert_eq!(
+            first_page
+                .output
+                .get("stdout")
+                .and_then(serde_json::Value::as_str),
+            Some("abcd")
+        );
+        assert_eq!(
+            first_page
+                .output
+                .get("stdout_offset")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            first_page
+                .output
+                .get("stdout_truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let second_page = registry.execute(
+            &input.session,
+            0,
+            2,
+            &AgentToolCall {
+                tool: "inspect_command_session".to_string(),
+                input: serde_json::json!({
+                    "session_id": session_id,
+                    "stdout_offset": 4
+                }),
+                r#async: false,
+                summary: "inspect second page".to_string(),
+            },
+        );
+        assert_eq!(
+            second_page
+                .output
+                .get("stdout")
+                .and_then(serde_json::Value::as_str),
+            Some("efgh")
+        );
+        assert_eq!(
+            second_page
+                .output
+                .get("stdout_offset")
+                .and_then(serde_json::Value::as_u64),
+            Some(8)
+        );
+        assert_eq!(
+            second_page
+                .output
+                .get("stdout_truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[cfg(not(windows))]
@@ -5927,63 +6068,6 @@ old
     }
 
     #[test]
-    fn agent_records_verification_items_for_test_tool() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-loop-test-{}", TaskId::generate()));
-        fs::create_dir_all(&root).expect("workspace");
-        let tool_turn = serde_json::json!({
-            "response_mode": "defer",
-            "text": "I will verify.",
-            "tool_calls": [{
-                "tool": "test",
-                "input": {"command": "true"},
-                "async": false,
-                "summary": "Run a tiny verifier."
-            }],
-            "maid_handoff": null,
-            "next_state": "waiting"
-        })
-        .to_string();
-        let model = SequencedModel::new([
-            tool_turn,
-            r#"{
-                "response_mode": "answer",
-                "text": "Verified.",
-                "tool_calls": [],
-                "maid_handoff": null,
-                "next_state": "listening"
-            }"#
-            .to_string(),
-        ]);
-        let config = LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true);
-        let agent = Agent::new(model, "fake", "fake")
-            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
-
-        let run = agent.run(&agent_input("verify")).expect("run");
-
-        assert_eq!(
-            coding_evidence(&run.tool_results[0].evidence).verification_state,
-            AgentVerificationState::Passed
-        );
-        let verification = run
-            .items
-            .iter()
-            .find_map(|item| {
-                if let AgentItem::VerificationResult {
-                    command, status, ..
-                } = item
-                {
-                    Some((command, status))
-                } else {
-                    None
-                }
-            })
-            .expect("verification item");
-        assert_eq!(verification.0, "true");
-        assert_eq!(verification.1, &AgentVerificationState::Passed);
-    }
-
-    #[test]
     fn turn_context_renders_evolution_context_for_model() {
         let mut input = agent_input("continue the evolution job");
         input.evolution_context = Some(AgentEvolutionContext {
@@ -6039,19 +6123,13 @@ old
         let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
         let tool_turn = serde_json::json!({
             "response_mode": "defer",
-            "text": "I will patch and verify.",
+            "text": "I will patch the file.",
             "tool_calls": [
                 {
                     "tool": "apply_patch",
                     "input": {"patch": patch},
                     "async": false,
                     "summary": "Patch hello.txt."
-                },
-                {
-                    "tool": "test",
-                    "input": {"command": "true"},
-                    "async": false,
-                    "summary": "Run verifier."
                 }
             ],
             "maid_handoff": null,
@@ -6071,7 +6149,6 @@ old
         ]);
         let config = LocalWorkspaceAgentConfig::new(&root)
             .allowing_file_writes(true)
-            .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "fake", "fake")
             .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
@@ -6095,16 +6172,6 @@ old
                 evidence,
                 AgentCandidateEvidence::Patch { changed_files, .. }
                     if changed_files == &vec!["hello.txt".to_string()]
-            )
-        }));
-        assert!(bundle.evidence.iter().any(|evidence| {
-            matches!(
-                evidence,
-                AgentCandidateEvidence::Verification {
-                    command,
-                    status,
-                    ..
-                } if command == "true" && status == &AgentVerificationState::Passed
             )
         }));
     }

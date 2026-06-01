@@ -29,6 +29,7 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
             "required": ["command"],
             "properties": {
                 "command": { "type": "string" },
+                "cwd": { "type": "string" },
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }))

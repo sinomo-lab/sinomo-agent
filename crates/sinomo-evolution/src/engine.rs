@@ -7023,16 +7023,11 @@ mod tests {
 
         for expected in [
             "read_file",
-            "list_files",
             "search",
             "apply_patch",
             "run_command",
             "interrupt_command",
             "kill_command",
-            "git_diff",
-            "git_status",
-            "format",
-            "test",
         ] {
             assert!(names.iter().any(|name| name == expected), "{expected}");
         }
@@ -7194,7 +7189,7 @@ mod tests {
     }
 
     #[test]
-    fn git_tools_report_status_and_diff_from_candidate_workspace() {
+    fn run_command_can_report_git_status_and_diff_from_candidate_workspace() {
         let root = git_repo("git-tools");
         fs::write(root.join("tracked.txt"), "before\n").expect("write tracked");
         run_in(&root, "git add tracked.txt").expect("git add");
@@ -7206,15 +7201,15 @@ mod tests {
         let status = registry.execute(
             &workspace,
             EvolutionToolCall {
-                tool: "git_status".to_string(),
-                input: serde_json::json!({}),
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "git status --short" }),
             },
         );
         let diff = registry.execute(
             &workspace,
             EvolutionToolCall {
-                tool: "git_diff".to_string(),
-                input: serde_json::json!({}),
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "git diff --binary HEAD --" }),
             },
         );
 

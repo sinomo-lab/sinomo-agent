@@ -124,13 +124,14 @@ pub fn swebench_verified_10_plan() -> BenchmarkHarnessPlan {
                 matches!(
                     tool.kind,
                     AgentToolKind::ReadFile
-                        | AgentToolKind::ListFiles
                         | AgentToolKind::SearchFiles
-                        | AgentToolKind::GitStatus
-                        | AgentToolKind::GitDiff
                         | AgentToolKind::ApplyPatch
                         | AgentToolKind::RunShellCommand
-                        | AgentToolKind::Test
+                        | AgentToolKind::StartCommandSession
+                        | AgentToolKind::InspectCommandSession
+                        | AgentToolKind::WriteCommandStdin
+                        | AgentToolKind::CancelCommandSession
+                        | AgentToolKind::RequestUserInput
                 )
             })
             .map(|tool| tool.kind)
@@ -512,7 +513,10 @@ mod tests {
         assert!(plan.run_command.contains("deepseek-v4-flash"));
         assert!(plan.required_tools.contains(&AgentToolKind::ReadFile));
         assert!(plan.required_tools.contains(&AgentToolKind::ApplyPatch));
-        assert!(plan.required_tools.contains(&AgentToolKind::Test));
+        assert!(
+            plan.required_tools
+                .contains(&AgentToolKind::RunShellCommand)
+        );
         assert!(
             include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
                 .contains("mini-extra")

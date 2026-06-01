@@ -32,7 +32,6 @@ pub enum ToolEffect {
     ReadFile,
     WriteFile,
     RunCommand,
-    ReadGitState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -122,7 +121,6 @@ impl EvolutionToolRegistry {
             registry.command_control.clone(),
         );
         registry.register(ReadFileTool);
-        registry.register(ListFilesTool);
         registry.register(SearchTool);
         registry.register(ApplyPatchTool);
         registry.register(RunCommandTool {
@@ -138,10 +136,6 @@ impl EvolutionToolRegistry {
             action: CommandControlAction::Kill,
             control: registry.command_control.clone(),
         });
-        registry.register(GitDiffTool);
-        registry.register(GitStatusTool);
-        registry.register(FormatTool);
-        registry.register(TestTool);
         registry
     }
 
@@ -229,54 +223,6 @@ impl EvolutionTool for ReadFileTool {
                 vec![path.to_string()],
             ),
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ListFilesTool;
-
-impl EvolutionTool for ListFilesTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "list_files",
-            object_schema(&[("path", "string")]),
-            object_schema(&[("path", "string"), ("files", "array")]),
-            vec![ToolEffect::ReadFile],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let path = string_field(&input, "path").unwrap_or(".");
-        let dir_path = workspace.path.join(path);
-        let entries = match fs::read_dir(&dir_path) {
-            Ok(entries) => entries,
-            Err(error) => {
-                return failed_tool_result(
-                    "list_files",
-                    format!("failed to list {}: {error}", dir_path.display()),
-                    vec![path.to_string()],
-                );
-            }
-        };
-        let mut files = Vec::new();
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            files.push(serde_json::json!({
-                "name": name,
-                "kind": if entry_path.is_dir() { "directory" } else { "file" },
-            }));
-        }
-        succeeded_tool_result(
-            "list_files",
-            serde_json::json!({ "path": path, "files": files }),
-            format!("listed {}", dir_path.display()),
-            vec![path.to_string()],
-        )
     }
 }
 
@@ -585,120 +531,6 @@ fn command_control_action_name(action: CommandControlAction) -> &'static str {
     match action {
         CommandControlAction::Interrupt => "interrupt",
         CommandControlAction::Kill => "kill",
-    }
-}
-
-#[derive(Clone, Debug)]
-struct GitDiffTool;
-
-impl EvolutionTool for GitDiffTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "git_diff",
-            serde_json::json!({ "type": "object", "properties": {} }),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::ReadGitState, ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        _input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        command_tool_result(
-            "git_diff",
-            "git diff --binary HEAD --".to_string(),
-            &workspace.path,
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-struct GitStatusTool;
-
-impl EvolutionTool for GitStatusTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "git_status",
-            serde_json::json!({ "type": "object", "properties": {} }),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::ReadGitState, ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        _input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        command_tool_result(
-            "git_status",
-            "git status --short".to_string(),
-            &workspace.path,
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-struct FormatTool;
-
-impl EvolutionTool for FormatTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "format",
-            object_schema(&[("command", "string")]),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::RunCommand, ToolEffect::WriteFile],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let command = string_field(&input, "command").unwrap_or("cargo fmt");
-        command_tool_result("format", command.to_string(), &workspace.path)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TestTool;
-
-impl EvolutionTool for TestTool {
-    fn descriptor(&self) -> EvolutionToolDescriptor {
-        descriptor(
-            "test",
-            object_schema(&[("command", "string")]),
-            object_schema(&[
-                ("stdout", "string"),
-                ("stderr", "string"),
-                ("exit_code", "integer"),
-            ]),
-            vec![ToolEffect::RunCommand],
-        )
-    }
-
-    fn execute(
-        &self,
-        workspace: &CandidateWorkspace,
-        input: serde_json::Value,
-    ) -> EvolutionToolResult {
-        let command = string_field(&input, "command").unwrap_or("cargo test");
-        command_tool_result("test", command.to_string(), &workspace.path)
     }
 }
 

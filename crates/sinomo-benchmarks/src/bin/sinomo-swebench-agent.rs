@@ -138,7 +138,6 @@ fn run() -> Result<(), String> {
         .with_agent_storage(&storage_paths, &session.session_id);
     workspace_config.max_read_bytes = 256 * 1024;
     workspace_config.max_command_output_bytes = 128 * 1024;
-    workspace_config.max_list_entries = 2_000;
     workspace_config.max_search_matches = 300;
     let model = ConfiguredBenchmarkModel {
         data_dir,

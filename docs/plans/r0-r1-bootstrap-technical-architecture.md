@@ -359,7 +359,6 @@ pub enum ToolEffect {
     ReadFile,
     WriteFile,
     RunCommand,
-    ReadGitState,
     ModelCall,
 }
 ```
@@ -367,15 +366,11 @@ pub enum ToolEffect {
 Minimal tools:
 
 - `read_file`
-- `list_files`
 - `search`
 - `apply_patch`
 - `run_command`
-- `git_status`
-- `git_diff`
-- `test`
 
-Milestone 1 can document these descriptors without exposing them to the model. Milestone 2 can include them in the mutation packet.
+The concrete runtime can add command-session or interrupt/kill controls for long-running commands. `request_user_input` is an interactive-session bridge, not a default autonomous evolution tool. Milestone 1 can document these descriptors without exposing them to the model. Milestone 2 can include them in the mutation packet.
 
 ### 5. `ModelMutationBridge`
 

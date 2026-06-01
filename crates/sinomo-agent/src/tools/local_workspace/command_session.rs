@@ -185,6 +185,7 @@ pub(super) fn start_descriptor() -> AgentToolDescriptor {
             "required": ["command"],
             "properties": {
                 "command": { "type": "string" },
+                "cwd": { "type": "string" },
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }))
@@ -248,8 +249,8 @@ fn start_command_session(
             serde_json::json!({ "error": "missing_command" }),
         );
     };
-    let root = match canonical_workspace_root(config) {
-        Ok(root) => root,
+    let (_root, cwd) = match resolve_workspace_cwd(config, input_string(call, "cwd").as_deref()) {
+        Ok(paths) => paths,
         Err(detail) => {
             return AgentToolResult::blocked(
                 detail.clone(),
@@ -272,10 +273,11 @@ fn start_command_session(
     let mut command = Command::new(program);
     command
         .args(args)
-        .current_dir(&root)
+        .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_command_process_group(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(source) => {
@@ -295,7 +297,7 @@ fn start_command_session(
     let session = Arc::new(CommandSessionState {
         session_id: session_id.clone(),
         command: command_text,
-        cwd: root.display().to_string(),
+        cwd: cwd.display().to_string(),
         started: Instant::now(),
         timeout_ms,
         child: Mutex::new(Some(child)),
@@ -449,7 +451,7 @@ fn cancel_command_session(
         .lock()
         .expect("command child lock poisoned")
         .as_mut()
-        .map(|child| child.kill().is_ok())
+        .map(terminate_child_process_tree)
         .unwrap_or(false);
     let payload = serde_json::json!({
         "session_id": session_id,
@@ -529,7 +531,7 @@ fn spawn_waiter(session: Arc<CommandSessionState>) {
             {
                 let mut child = session.child.lock().expect("command child lock poisoned");
                 if let Some(child) = child.as_mut() {
-                    let _ = child.kill();
+                    let _ = terminate_child_process_tree(child);
                 }
                 let mut status = session.status.lock().expect("command status lock poisoned");
                 status.timed_out = true;
@@ -558,6 +560,8 @@ fn command_session_snapshot_payload(
     let stderr_offset = stderr_offset.min(stderr.len());
     let stdout_delta = truncate_utf8_lossy(&stdout[stdout_offset..], max_output_bytes);
     let stderr_delta = truncate_utf8_lossy(&stderr[stderr_offset..], max_output_bytes);
+    let stdout_next_offset = stdout_offset + stdout_delta.consumed_bytes;
+    let stderr_next_offset = stderr_offset + stderr_delta.consumed_bytes;
     serde_json::json!({
         "session_id": session.session_id,
         "command": session.command,
@@ -571,8 +575,10 @@ fn command_session_snapshot_payload(
         "timeout_ms": session.timeout_ms,
         "stdout": stdout_delta.text,
         "stderr": stderr_delta.text,
-        "stdout_offset": stdout.len(),
-        "stderr_offset": stderr.len(),
+        "stdout_offset": stdout_next_offset,
+        "stderr_offset": stderr_next_offset,
+        "stdout_total_bytes": stdout.len(),
+        "stderr_total_bytes": stderr.len(),
         "stdout_truncated": stdout_delta.truncated,
         "stderr_truncated": stderr_delta.truncated,
     })

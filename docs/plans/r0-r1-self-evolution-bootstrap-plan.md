@@ -166,14 +166,11 @@ Before Sinomo can make useful tool-use prompts, it needs real tools and real fee
 Minimal tool registry:
 
 - `read_file`
-- `list_files`
 - `search`
 - `apply_patch`
 - `run_command`
-- `git_diff`
-- `git_status`
-- `format`
-- `test`
+
+Long-running command control can be exposed as session tools or explicit interrupt/kill controls depending on the runtime. `request_user_input` belongs to interactive sessions once a user bridge is attached.
 
 Each tool should declare:
 
