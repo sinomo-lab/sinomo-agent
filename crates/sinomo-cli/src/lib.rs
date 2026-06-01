@@ -1,5 +1,37 @@
 //! Shared Sinomo command-line handlers.
 
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        $crate::write_cli_stdout(format_args!($($arg)*));
+    }};
+}
+
+macro_rules! println {
+    () => {{
+        $crate::write_cli_stdout(format_args!("\n"));
+    }};
+    ($($arg:tt)*) => {{
+        $crate::write_cli_stdout(format_args!($($arg)*));
+        $crate::write_cli_stdout(format_args!("\n"));
+    }};
+}
+
+macro_rules! eprint {
+    ($($arg:tt)*) => {{
+        $crate::write_cli_stderr(format_args!($($arg)*));
+    }};
+}
+
+macro_rules! eprintln {
+    () => {{
+        $crate::write_cli_stderr(format_args!("\n"));
+    }};
+    ($($arg:tt)*) => {{
+        $crate::write_cli_stderr(format_args!($($arg)*));
+        $crate::write_cli_stderr(format_args!("\n"));
+    }};
+}
+
 #[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sinomo_agent::{
@@ -240,8 +272,9 @@ use sinomo_runtime::rollout::{
     rollout_status_view, shadow_telemetry_scorecard_from_event_store, source_heads_match,
     sync_external_repo_from_managed, unique_rollout_targets, write_rollout_telemetry_gate_config,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -264,10 +297,131 @@ pub use providers::*;
 use time::format_description::well_known::Rfc3339;
 
 mod commands;
+mod completion;
 pub(crate) use commands::*;
+pub(crate) use completion::*;
 
 thread_local! {
     static CLI_FORCE_LOCAL_MODE: Cell<bool> = const { Cell::new(false) };
+    static CLI_OUTPUT_CAPTURE: RefCell<Option<CliOutputBuffer>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct CliCommandOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CliCommandStatus {
+    Completed,
+    Failed { error: String },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CapturedCliCommand {
+    pub output: CliCommandOutput,
+    pub status: CliCommandStatus,
+}
+
+#[derive(Debug, Default)]
+struct CliOutputBuffer {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+enum CliOutputStream {
+    Stdout,
+    Stderr,
+}
+
+pub(crate) fn write_cli_stdout(args: fmt::Arguments<'_>) {
+    write_cli_output(CliOutputStream::Stdout, args.to_string());
+}
+
+pub(crate) fn write_cli_stderr(args: fmt::Arguments<'_>) {
+    write_cli_output(CliOutputStream::Stderr, args.to_string());
+}
+
+pub(crate) fn write_cli_stdout_bytes(bytes: &[u8]) -> io::Result<()> {
+    write_cli_output_bytes(CliOutputStream::Stdout, bytes)
+}
+
+pub(crate) fn write_cli_stderr_bytes(bytes: &[u8]) -> io::Result<()> {
+    write_cli_output_bytes(CliOutputStream::Stderr, bytes)
+}
+
+fn write_cli_output(stream: CliOutputStream, text: String) {
+    let _ = write_cli_output_bytes(stream, text.as_bytes());
+}
+
+fn write_cli_output_bytes(stream: CliOutputStream, bytes: &[u8]) -> io::Result<()> {
+    let captured = CLI_OUTPUT_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        let Some(buffer) = capture.as_mut() else {
+            return false;
+        };
+        match stream {
+            CliOutputStream::Stdout => buffer.stdout.extend_from_slice(bytes),
+            CliOutputStream::Stderr => buffer.stderr.extend_from_slice(bytes),
+        }
+        true
+    });
+    if captured {
+        return Ok(());
+    }
+
+    match stream {
+        CliOutputStream::Stdout => {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(bytes)?;
+            stdout.flush()
+        }
+        CliOutputStream::Stderr => {
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(bytes)?;
+            stderr.flush()
+        }
+    }
+}
+
+pub fn execute_cli_command_captured(args: &[String]) -> CapturedCliCommand {
+    let execution = run_cli_command_with_capture(args);
+    let status = match execution.result {
+        Ok(()) => CliCommandStatus::Completed,
+        Err(error) => CliCommandStatus::Failed {
+            error: error.to_string(),
+        },
+    };
+    CapturedCliCommand {
+        output: execution.output,
+        status,
+    }
+}
+
+struct CliCommandCaptureExecution {
+    output: CliCommandOutput,
+    result: Result<(), CliError>,
+}
+
+fn run_cli_command_with_capture(args: &[String]) -> CliCommandCaptureExecution {
+    let previous = CLI_OUTPUT_CAPTURE.with(|capture| {
+        capture.replace(Some(CliOutputBuffer {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }))
+    });
+    let result = run_cli_command(args);
+    let buffer = CLI_OUTPUT_CAPTURE
+        .with(|capture| capture.replace(previous))
+        .expect("CLI output capture installed");
+    CliCommandCaptureExecution {
+        output: CliCommandOutput {
+            stdout: buffer.stdout,
+            stderr: buffer.stderr,
+        },
+        result,
+    }
 }
 
 pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {

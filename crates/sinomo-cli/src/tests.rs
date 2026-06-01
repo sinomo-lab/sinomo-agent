@@ -42,8 +42,9 @@ use super::{
     handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
     invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    managed_source_status, merge_benchmark_gate_requests, merge_module_replay_report_refs,
-    model_config_uses_cluster, models_default_with_data_dir, normalize_model_provider,
+    load_cui_model_runtime_config, main_agent_handler_for_cui_with_data_dir, managed_source_status,
+    merge_benchmark_gate_requests, merge_module_replay_report_refs, model_config_uses_cluster,
+    models_default_with_data_dir, normalize_model_provider,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
     parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
     parse_dfs_command, parse_install_options, parse_model_default_options,
@@ -52,11 +53,11 @@ use super::{
     parse_uninstall_options, parse_usage_options, push_unique_introducer, quickjs_setup_script,
     read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
     read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
-    rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
-    rollout_endpoint_candidates, rollout_target_endpoint_for_main,
-    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
-    rollout_telemetry_gates_set_with_data_dir, run_cui_with_handler_io,
-    run_cui_with_handler_io_and_daemon, run_cui_with_io_and_daemon_probe, run_evolve_command,
+    require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
+    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_endpoint_candidates,
+    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
+    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
+    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
     run_shadow_daemon_with_paths, sandbox_cat_with_store, sandbox_checkpoint_with_store,
     sandbox_config_with_store, sandbox_create_with_store, sandbox_destroy_with_store,
     sandbox_doctor_findings_with_stores, sandbox_doctor_findings_with_stores_and_events,
@@ -7527,6 +7528,44 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
     assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(
         ProviderCliCommand::Help
     )));
+}
+
+#[test]
+fn cluster_runtime_quorum_requires_local_daemon_even_with_local_voter_quorum() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cluster-daemon-guard-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("daemon_guard").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("daemon_guard_node").expect("node")),
+            name: "daemon guard".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    assert!(cluster_has_local_quorum(
+        &paths,
+        &read_cluster_state(&paths).expect("cluster state")
+    ));
+
+    let error = require_cluster_runtime_quorum_with_paths_and_daemon(&paths, None)
+        .expect_err("daemon required");
+
+    match error {
+        CliError::ClusterReadOnly { detail } => {
+            assert!(detail.contains("local daemon is not running"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 fn signed_test_invite_uri(
@@ -15331,6 +15370,50 @@ fn slash_commands_reuse_cli_argument_shape() {
 }
 
 #[test]
+fn captured_cli_command_collects_stdout_for_embedded_callers() {
+    let captured = super::execute_cli_command_captured(&["help".to_string()]);
+
+    assert_eq!(captured.status, super::CliCommandStatus::Completed);
+    let stdout = String::from_utf8_lossy(&captured.output.stdout);
+    assert!(stdout.contains("Usage:"));
+    assert!(stdout.contains("sinomo cluster"));
+    assert!(captured.output.stderr.is_empty());
+}
+
+#[test]
+fn slash_command_returns_captured_cli_output_as_interaction_lines() {
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_slash_capture_test").expect("session"),
+        NodeId::from_legacy_named("node_slash_capture_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        MainAgentInteractionHandler::new(
+            MainAgentFixtureModel,
+            "fixture-provider",
+            "fixture-model",
+        ),
+        session,
+    );
+
+    let outputs = runtime.ingest_user_input("/help").expect("slash help");
+
+    assert!(outputs.iter().any(|output| {
+        matches!(
+            output,
+            super::InteractionOutput::Line(line) if line.contains("Usage:")
+        )
+    }));
+    assert!(!outputs.iter().any(|output| {
+        matches!(
+            output,
+            super::InteractionOutput::Line(line) if line == "completed command: /help"
+        )
+    }));
+}
+
+#[test]
 fn interaction_runtime_records_message_input_as_events() {
     let session = InteractionSession::new(
         SessionId::from_legacy_named("sess_cli_test").expect("session"),
@@ -15586,18 +15669,70 @@ fn minicpm_tool_call_response_maps_to_agent_decision_json() {
 }
 
 #[test]
-fn cui_entry_reports_daemon_requirement_before_loading_chat_model() {
-    let mut output = Vec::new();
-    let error = run_cui_with_io_and_daemon_probe(&mut Cursor::new("/quit\n"), &mut output, None)
-        .expect_err("daemon required");
+fn cui_entry_starts_without_daemon_using_local_runtime_config() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-cui-no-daemon-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("cui_no_daemon").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("cui_no_daemon_node").expect("node")),
+            name: "cui no daemon".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+    assert!(model_config_uses_cluster(&data_dir));
 
-    match error {
-        CliError::DaemonNotRunning { detail } => {
-            assert!(detail.contains("main-agent chat requires the local daemon"));
-        }
-        other => panic!("unexpected error: {other}"),
-    }
-    assert!(output.is_empty());
+    let cluster_config = sinomo_lm::ModelRuntimeConfig {
+        pytorch_bridge: sinomo_lm::PytorchBridgeRuntimeConfig {
+            endpoint: Some("http://127.0.0.1:41111".to_string()),
+            timeout_seconds: Some(45),
+            ..sinomo_lm::PytorchBridgeRuntimeConfig::default()
+        },
+        ..sinomo_lm::ModelRuntimeConfig::default()
+    };
+    write_model_runtime_config_for_node(&data_dir, &cluster_config)
+        .expect("write clustered runtime config");
+
+    let local_config = sinomo_lm::ModelRuntimeConfig {
+        pytorch_bridge: sinomo_lm::PytorchBridgeRuntimeConfig {
+            endpoint: Some("http://127.0.0.1:42222".to_string()),
+            timeout_seconds: Some(30),
+            ..sinomo_lm::PytorchBridgeRuntimeConfig::default()
+        },
+        ..sinomo_lm::ModelRuntimeConfig::default()
+    };
+    let local_path = with_cli_force_local_mode(true, || {
+        write_model_runtime_config_for_node(&data_dir, &local_config)
+    })
+    .expect("write local runtime config");
+
+    let (loaded, loaded_path) = load_cui_model_runtime_config(&data_dir, false)
+        .expect("load daemonless cui runtime config");
+    assert_eq!(loaded, local_config);
+    assert_eq!(loaded_path, local_path);
+
+    let (handler, daemon) =
+        main_agent_handler_for_cui_with_data_dir(None, &data_dir).expect("daemonless handler");
+    assert!(daemon.is_none());
+    let mut output = Vec::new();
+
+    run_cui_with_handler_io_and_daemon(Cursor::new("/quit\n"), &mut output, handler, daemon)
+        .expect("daemonless cui starts");
+
+    let output = String::from_utf8(output).expect("utf8");
+    assert!(output.contains("Sinomo main agent"));
+    assert!(output.contains("daemon: not connected"));
+    assert!(output.contains("ending session"));
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

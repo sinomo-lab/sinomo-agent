@@ -479,6 +479,14 @@ pub(crate) fn require_cluster_bootstrap_state() -> Result<ClusterBootstrapState,
 
 pub(crate) fn require_cluster_runtime_quorum() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
+    let daemon = default_main_daemon_status()?;
+    require_cluster_runtime_quorum_with_paths_and_daemon(&paths, daemon.as_ref())
+}
+
+pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
+    paths: &ClusterPaths,
+    daemon: Option<&DaemonStatus>,
+) -> Result<(), CliError> {
     let state = read_cluster_state(&paths).map_err(|error| match error {
         CliError::ClusterOrphan => CliError::ClusterReadOnly {
             detail: "local node has no cluster state; cluster-dependent operations are paused"
@@ -486,6 +494,12 @@ pub(crate) fn require_cluster_runtime_quorum() -> Result<(), CliError> {
         },
         other => other,
     })?;
+    if daemon.is_none() {
+        return Err(CliError::ClusterReadOnly {
+            detail: "local daemon is not running; cluster-dependent operations are paused"
+                .to_string(),
+        });
+    }
     if cluster_has_local_quorum(&paths, &state) {
         Ok(())
     } else {

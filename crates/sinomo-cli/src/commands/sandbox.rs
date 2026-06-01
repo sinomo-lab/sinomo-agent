@@ -6195,14 +6195,10 @@ fn sandbox_cli_streaming_output_sink()
     std::sync::Arc::new(
         |chunk: sinomo_runtime::sandbox::SandboxOutputChunk| match chunk.stream {
             sinomo_runtime::sandbox::SandboxOutputStream::Stdout => {
-                let mut stdout = io::stdout().lock();
-                let _ = stdout.write_all(&chunk.bytes);
-                let _ = stdout.flush();
+                let _ = write_cli_stdout_bytes(&chunk.bytes);
             }
             sinomo_runtime::sandbox::SandboxOutputStream::Stderr => {
-                let mut stderr = io::stderr().lock();
-                let _ = stderr.write_all(&chunk.bytes);
-                let _ = stderr.flush();
+                let _ = write_cli_stderr_bytes(&chunk.bytes);
             }
         },
     )
@@ -6276,14 +6272,10 @@ fn write_sandbox_output_chunk(
 ) -> Result<(), CliError> {
     match chunk.stream {
         sinomo_runtime::sandbox::SandboxOutputStream::Stdout => {
-            let mut stdout = io::stdout().lock();
-            stdout.write_all(&chunk.bytes).map_err(CliError::stdio)?;
-            stdout.flush().map_err(CliError::stdio)
+            write_cli_stdout_bytes(&chunk.bytes).map_err(CliError::stdio)
         }
         sinomo_runtime::sandbox::SandboxOutputStream::Stderr => {
-            let mut stderr = io::stderr().lock();
-            stderr.write_all(&chunk.bytes).map_err(CliError::stdio)?;
-            stderr.flush().map_err(CliError::stdio)
+            write_cli_stderr_bytes(&chunk.bytes).map_err(CliError::stdio)
         }
     }
 }
@@ -6293,20 +6285,16 @@ fn print_sandbox_command_outcome(
     replay_output: bool,
 ) -> Result<(), CliError> {
     if replay_output {
-        let mut stdout = io::stdout().lock();
-        let mut stderr = io::stderr().lock();
         for chunk in &outcome.output_chunks {
             match chunk.stream {
                 sinomo_runtime::sandbox::SandboxOutputStream::Stdout => {
-                    stdout.write_all(&chunk.bytes).map_err(CliError::stdio)?;
+                    write_cli_stdout_bytes(&chunk.bytes).map_err(CliError::stdio)?;
                 }
                 sinomo_runtime::sandbox::SandboxOutputStream::Stderr => {
-                    stderr.write_all(&chunk.bytes).map_err(CliError::stdio)?;
+                    write_cli_stderr_bytes(&chunk.bytes).map_err(CliError::stdio)?;
                 }
             }
         }
-        stdout.flush().map_err(CliError::stdio)?;
-        stderr.flush().map_err(CliError::stdio)?;
     }
 
     println!("sandbox command: {}", outcome.response.command_id);
@@ -6331,12 +6319,8 @@ fn print_sandbox_process_plan_outcome(
     replay_output: bool,
 ) -> Result<(), CliError> {
     if replay_output {
-        let mut stdout = io::stdout().lock();
-        let mut stderr = io::stderr().lock();
-        stdout.write_all(&outcome.stdout).map_err(CliError::stdio)?;
-        stderr.write_all(&outcome.stderr).map_err(CliError::stdio)?;
-        stdout.flush().map_err(CliError::stdio)?;
-        stderr.flush().map_err(CliError::stdio)?;
+        write_cli_stdout_bytes(&outcome.stdout).map_err(CliError::stdio)?;
+        write_cli_stderr_bytes(&outcome.stderr).map_err(CliError::stdio)?;
     }
     println!(
         "sandbox process plan steps: {}",
@@ -6646,18 +6630,12 @@ pub(crate) fn sandbox_cat_with_store(
     let (_manifest, layout) = store.load(&options.sandbox_id)?;
     let sandbox_fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
     let bytes = sandbox_fs.read(&options.path, options.range)?;
-    io::stdout()
-        .lock()
-        .write_all(&bytes)
-        .map_err(CliError::stdio)
+    write_cli_stdout_bytes(&bytes).map_err(CliError::stdio)
 }
 
 pub(crate) fn sandbox_cat_with_daemon(options: SandboxCatOptions) -> Result<(), CliError> {
     let bytes = daemon_sandbox_read_file(&options.sandbox_id, options.path, options.range)?;
-    io::stdout()
-        .lock()
-        .write_all(&bytes)
-        .map_err(CliError::stdio)
+    write_cli_stdout_bytes(&bytes).map_err(CliError::stdio)
 }
 
 #[cfg(test)]

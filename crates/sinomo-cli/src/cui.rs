@@ -1,11 +1,25 @@
 use super::*;
 #[cfg(feature = "native-models")]
 use candle_core::{DType, Device, Tensor};
+use crossterm::{
+    event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Position, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph, Wrap},
+};
 #[cfg(feature = "native-models")]
 use sinomo_models::minicpm_v46::{
     DEFAULT_MODEL_ID as MINICPM_V46_DEFAULT_MODEL_ID, MiniCpmV46Config,
     MiniCpmV46ForConditionalGeneration, Qwen3_5TextCache,
 };
+use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "native-models")]
 use tokenizers::Tokenizer;
@@ -15,6 +29,12 @@ const RUST_MINICPM_V46_PROVIDER_ID: &str = "sinomo-models";
 const DEFAULT_RUST_MINICPM_V46_CACHE_SUBDIR: &str = "openbmb--MiniCPM-V-4_6";
 
 pub fn run_cui() -> Result<(), CliError> {
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        let daemon = default_main_daemon_status()?;
+        let (handler, daemon) = main_agent_handler_for_cui(daemon)?;
+        return run_cui_tui_with_handler_and_daemon(handler, daemon);
+    }
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     run_cui_with_io(stdin.lock(), stdout.lock())
@@ -30,20 +50,48 @@ pub(super) fn run_cui_with_io_and_daemon_probe<R: BufRead, W: Write>(
     writer: &mut W,
     daemon: Option<DaemonStatus>,
 ) -> Result<(), CliError> {
-    if !cli_force_local_mode() {
-        let daemon = daemon.ok_or_else(|| CliError::DaemonNotRunning {
-            detail: "main-agent chat requires the local daemon so chat session events and commands use the cluster control path".to_string(),
-        })?;
-        let data_dir = SinomoDataDir::from_env_or_home()?;
-        let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
-        let handler = MainAgentInteractionHandler::from_runtime_config(&data_dir, runtime_config)?;
-        return run_cui_with_handler_io_and_daemon(reader, writer, handler, Some(daemon));
+    let (handler, daemon) = main_agent_handler_for_cui(daemon)?;
+    run_cui_with_handler_io_and_daemon(reader, writer, handler, daemon)
+}
+
+fn main_agent_handler_for_cui(
+    daemon: Option<DaemonStatus>,
+) -> Result<
+    (
+        MainAgentInteractionHandler<DefaultMainAgentChatModel>,
+        Option<DaemonStatus>,
+    ),
+    CliError,
+> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    main_agent_handler_for_cui_with_data_dir(daemon, &data_dir)
+}
+
+pub(crate) fn main_agent_handler_for_cui_with_data_dir(
+    daemon: Option<DaemonStatus>,
+    data_dir: &SinomoDataDir,
+) -> Result<
+    (
+        MainAgentInteractionHandler<DefaultMainAgentChatModel>,
+        Option<DaemonStatus>,
+    ),
+    CliError,
+> {
+    let (runtime_config, _) = load_cui_model_runtime_config(data_dir, daemon.is_some())?;
+    let handler = MainAgentInteractionHandler::from_runtime_config(&data_dir, runtime_config)?;
+    Ok((handler, daemon))
+}
+
+pub(crate) fn load_cui_model_runtime_config(
+    data_dir: &SinomoDataDir,
+    daemon_connected: bool,
+) -> Result<(ModelRuntimeConfig, PathBuf), CliError> {
+    if daemon_connected || cli_force_local_mode() {
+        return load_model_runtime_config_for_node(data_dir);
     }
 
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
-    let handler = MainAgentInteractionHandler::from_runtime_config(&data_dir, runtime_config)?;
-    run_cui_with_handler_io_and_daemon(reader, writer, handler, None)
+    let _guard = enter_cli_force_local_mode(true);
+    load_model_runtime_config_for_node(data_dir)
 }
 
 pub fn run_cui_with_handler_io<R: BufRead, W: Write, H: InteractionEventHandler>(
@@ -64,18 +112,8 @@ pub(super) fn run_cui_with_handler_io_and_daemon<
     handler: H,
     daemon: Option<DaemonStatus>,
 ) -> Result<(), CliError> {
-    let node_id = daemon
-        .as_ref()
-        .and_then(|status| status.cluster.as_ref())
-        .map(|cluster| cluster.node_id.clone())
-        .unwrap_or_else(|| NodeId::from_legacy_named("node_cli").expect("valid node id"));
-    let session = InteractionSession::new(
-        SessionId::generate(),
-        node_id,
-        InteractionSurface::new("surface.cli", InteractionSurfaceKind::CommandLine),
-    );
-    let mut runtime = InteractionRuntime::new(InMemoryEventStore::new(), handler, session.clone());
-    runtime.append_session_context(daemon_context_event(&session, daemon.as_ref()))?;
+    let mut runtime = new_interaction_runtime(handler, daemon.as_ref())?;
+    let session = runtime.session().clone();
 
     writeln!(writer, "Sinomo main agent").map_err(CliError::stdio)?;
     writeln!(writer, "session: {}", session.session_id).map_err(CliError::stdio)?;
@@ -140,6 +178,952 @@ pub(super) fn run_cui_with_handler_io_and_daemon<
     }
 
     Ok(())
+}
+
+fn new_interaction_runtime<H: InteractionEventHandler>(
+    handler: H,
+    daemon: Option<&DaemonStatus>,
+) -> Result<InteractionRuntime<InMemoryEventStore, H>, CliError> {
+    let node_id = daemon
+        .and_then(|status| status.cluster.as_ref())
+        .map(|cluster| cluster.node_id.clone())
+        .unwrap_or_else(|| NodeId::from_legacy_named("node_cli").expect("valid node id"));
+    let session = InteractionSession::new(
+        SessionId::generate(),
+        node_id,
+        InteractionSurface::new("surface.cli", InteractionSurfaceKind::CommandLine),
+    );
+    let mut runtime = InteractionRuntime::new(InMemoryEventStore::new(), handler, session.clone());
+    runtime.append_session_context(daemon_context_event(&session, daemon))?;
+    Ok(runtime)
+}
+
+fn run_cui_tui_with_handler_and_daemon<H: InteractionEventHandler>(
+    handler: H,
+    daemon: Option<DaemonStatus>,
+) -> Result<(), CliError> {
+    let mut runtime = new_interaction_runtime(handler, daemon.as_ref())?;
+    let mut state = CuiTuiState::new(runtime.session(), daemon.as_ref());
+    let mut terminal = TuiTerminalSession::enter()?;
+
+    terminal.draw(&state)?;
+    loop {
+        if state.exit_requested {
+            break;
+        }
+        if !event::poll(Duration::from_millis(250)).map_err(CliError::stdio)? {
+            continue;
+        }
+        match event::read().map_err(CliError::stdio)? {
+            CrosstermEvent::Key(key) => {
+                match state.apply_key_event(key) {
+                    TuiInputAction::None => {}
+                    TuiInputAction::Exit => {
+                        submit_tui_input(
+                            &mut runtime,
+                            &mut state,
+                            &mut terminal,
+                            "/quit".to_string(),
+                        )?;
+                    }
+                    TuiInputAction::Submit(line) => {
+                        submit_tui_input(&mut runtime, &mut state, &mut terminal, line)?;
+                    }
+                }
+                terminal.draw(&state)?;
+            }
+            CrosstermEvent::Paste(text) => {
+                state.insert_str(&text);
+                terminal.draw(&state)?;
+            }
+            CrosstermEvent::Resize(_, _) => terminal.draw(&state)?,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn submit_tui_input<H: InteractionEventHandler>(
+    runtime: &mut InteractionRuntime<InMemoryEventStore, H>,
+    state: &mut CuiTuiState,
+    terminal: &mut TuiTerminalSession,
+    line: String,
+) -> Result<(), CliError> {
+    state.begin_submission(&line);
+    terminal.draw(state)?;
+
+    let mut render_error = None;
+    let result = {
+        let mut emit = |output: InteractionOutput| {
+            state.apply_output(output);
+            if render_error.is_none() {
+                if let Err(error) = terminal.draw(state) {
+                    render_error = Some(error);
+                }
+            }
+        };
+        runtime.ingest_user_input_streaming(&line, &mut emit)
+    };
+    if let Some(error) = render_error {
+        return Err(error);
+    }
+    for output in result? {
+        state.apply_output(output);
+    }
+    state.finish_submission();
+    Ok(())
+}
+
+struct TuiTerminalSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TuiTerminalSession {
+    fn enter() -> Result<Self, CliError> {
+        enable_raw_mode().map_err(CliError::stdio)?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(CliError::stdio(error));
+        }
+        let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                let mut stdout = io::stdout();
+                let _ = execute!(stdout, LeaveAlternateScreen);
+                return Err(CliError::stdio(error));
+            }
+        };
+        Ok(Self { terminal })
+    }
+
+    fn draw(&mut self, state: &CuiTuiState) -> Result<(), CliError> {
+        self.terminal
+            .draw(|frame| render_cui_tui(frame, state))
+            .map(|_| ())
+            .map_err(CliError::stdio)
+    }
+}
+
+impl Drop for TuiTerminalSession {
+    fn drop(&mut self) {
+        let _ = self.terminal.show_cursor();
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TuiInputAction {
+    None,
+    Submit(String),
+    Exit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiCompletionState {
+    replace_start: usize,
+    replace_end: usize,
+    selected: Option<usize>,
+    items: Vec<SlashCompletionItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TuiMessageKind {
+    User,
+    Command,
+    Agent,
+    Thinking,
+    System,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiMessage {
+    kind: TuiMessageKind,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
+struct CuiTuiState {
+    session_id: String,
+    node_id: String,
+    daemon_label: String,
+    cluster_label: Option<String>,
+    input: String,
+    input_cursor: usize,
+    messages: Vec<TuiMessage>,
+    stream_message: Option<usize>,
+    completions: Option<TuiCompletionState>,
+    status: String,
+    scrollback: u16,
+    exit_requested: bool,
+}
+
+impl CuiTuiState {
+    fn new(session: &InteractionSession, daemon: Option<&DaemonStatus>) -> Self {
+        let daemon_label = daemon
+            .map(|status| format!("daemon pid={} address={}", status.pid, status.address))
+            .unwrap_or_else(|| "daemon not connected".to_string());
+        let cluster_label = daemon
+            .and_then(|status| status.cluster.as_ref())
+            .map(|cluster| format!("cluster {}", cluster.cluster_id));
+        let mut state = Self {
+            session_id: session.session_id.to_string(),
+            node_id: session.node_id.to_string(),
+            daemon_label,
+            cluster_label,
+            input: String::new(),
+            input_cursor: 0,
+            messages: Vec::new(),
+            stream_message: None,
+            completions: None,
+            status: "listening".to_string(),
+            scrollback: 0,
+            exit_requested: false,
+        };
+        state.push_message(TuiMessageKind::System, "main agent session started");
+        state
+    }
+
+    fn apply_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return TuiInputAction::None;
+        }
+
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                TuiInputAction::Exit
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.refresh_completions();
+                TuiInputAction::None
+            }
+            KeyCode::Esc => TuiInputAction::Exit,
+            KeyCode::Enter => self.take_submission(),
+            KeyCode::Tab => {
+                self.accept_completion();
+                TuiInputAction::None
+            }
+            KeyCode::Backspace => {
+                self.backspace();
+                TuiInputAction::None
+            }
+            KeyCode::Delete => {
+                self.delete();
+                TuiInputAction::None
+            }
+            KeyCode::Left => {
+                self.move_cursor_left();
+                TuiInputAction::None
+            }
+            KeyCode::Right => {
+                if self.completions.is_some() {
+                    self.accept_completion();
+                } else {
+                    self.move_cursor_right();
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Up => {
+                if self.completions.is_some() {
+                    self.select_previous_completion();
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Down => {
+                if self.completions.is_some() {
+                    self.select_next_completion();
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Home => {
+                self.input_cursor = 0;
+                self.refresh_completions();
+                TuiInputAction::None
+            }
+            KeyCode::End => {
+                self.input_cursor = self.input.len();
+                self.refresh_completions();
+                TuiInputAction::None
+            }
+            KeyCode::PageUp => {
+                self.scrollback = self.scrollback.saturating_add(8);
+                TuiInputAction::None
+            }
+            KeyCode::PageDown => {
+                self.scrollback = self.scrollback.saturating_sub(8);
+                TuiInputAction::None
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.insert_char(character);
+                TuiInputAction::None
+            }
+            _ => TuiInputAction::None,
+        }
+    }
+
+    fn request_exit(&mut self) {
+        self.exit_requested = true;
+        self.status = "ending session".to_string();
+    }
+
+    fn take_submission(&mut self) -> TuiInputAction {
+        let line = std::mem::take(&mut self.input);
+        self.input_cursor = 0;
+        self.completions = None;
+        if line.trim().is_empty() {
+            return TuiInputAction::None;
+        }
+        TuiInputAction::Submit(line)
+    }
+
+    fn begin_submission(&mut self, line: &str) {
+        let kind = if line.trim_start().starts_with('/') {
+            TuiMessageKind::Command
+        } else {
+            TuiMessageKind::User
+        };
+        self.push_message(kind, line);
+        self.stream_message = None;
+        self.scrollback = 0;
+        self.status = if line.trim_start().starts_with('/') {
+            "running command".to_string()
+        } else {
+            "working".to_string()
+        };
+    }
+
+    fn finish_submission(&mut self) {
+        self.stream_message = None;
+        if !self.exit_requested {
+            self.status = "listening".to_string();
+        }
+    }
+
+    fn apply_output(&mut self, output: InteractionOutput) {
+        match output {
+            InteractionOutput::Chunk(chunk) => self.append_chunk(&chunk),
+            InteractionOutput::Line(line) => self.append_line(&line),
+            InteractionOutput::Exit => self.request_exit(),
+        }
+    }
+
+    fn append_chunk(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let (kind, text) = if let Some(text) = chunk.strip_prefix("thinking> ") {
+            (TuiMessageKind::Thinking, text)
+        } else if let Some(text) = chunk.strip_prefix("model> ") {
+            (TuiMessageKind::System, text)
+        } else {
+            (TuiMessageKind::Thinking, chunk)
+        };
+        let index = match self.stream_message {
+            Some(index)
+                if self
+                    .messages
+                    .get(index)
+                    .is_some_and(|message| message.kind == kind) =>
+            {
+                index
+            }
+            _ => {
+                self.messages.push(TuiMessage {
+                    kind,
+                    text: String::new(),
+                });
+                self.messages.len() - 1
+            }
+        };
+        self.messages[index].text.push_str(text);
+        self.stream_message = Some(index);
+        self.status = "streaming".to_string();
+        self.scrollback = 0;
+    }
+
+    fn append_line(&mut self, line: &str) {
+        self.stream_message = None;
+        if let Some(text) = line.strip_prefix("sinomo: ") {
+            self.push_message(TuiMessageKind::Agent, text);
+        } else if line.starts_with("command failed:") {
+            self.push_message(TuiMessageKind::Error, line);
+        } else {
+            self.push_message(TuiMessageKind::System, line);
+        }
+        self.status = if line == "ending session" {
+            "ending session".to_string()
+        } else {
+            "listening".to_string()
+        };
+    }
+
+    fn push_message(&mut self, kind: TuiMessageKind, text: impl Into<String>) {
+        self.messages.push(TuiMessage {
+            kind,
+            text: text.into(),
+        });
+        self.scrollback = 0;
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        for character in text.chars() {
+            if character != '\n' && character != '\r' {
+                self.insert_char(character);
+            }
+        }
+    }
+
+    fn insert_char(&mut self, character: char) {
+        self.input.insert(self.input_cursor, character);
+        self.input_cursor += character.len_utf8();
+        self.refresh_completions();
+    }
+
+    fn backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        if let Some((previous, _)) = self.input[..self.input_cursor].char_indices().next_back() {
+            self.input.drain(previous..self.input_cursor);
+            self.input_cursor = previous;
+            self.refresh_completions();
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+        let next = self.input[self.input_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.input_cursor + index)
+            .unwrap_or(self.input.len());
+        self.input.drain(self.input_cursor..next);
+        self.refresh_completions();
+    }
+
+    fn move_cursor_left(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        if let Some((previous, _)) = self.input[..self.input_cursor].char_indices().next_back() {
+            self.input_cursor = previous;
+            self.refresh_completions();
+        }
+    }
+
+    fn move_cursor_right(&mut self) {
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+        self.input_cursor = self.input[self.input_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.input_cursor + index)
+            .unwrap_or(self.input.len());
+        self.refresh_completions();
+    }
+
+    fn refresh_completions(&mut self) {
+        self.completions =
+            slash_completions(&self.input, self.input_cursor).map(|set| TuiCompletionState {
+                replace_start: set.replace_start,
+                replace_end: set.replace_end,
+                selected: None,
+                items: set.items,
+            });
+    }
+
+    fn select_next_completion(&mut self) {
+        let Some(completions) = self.completions.as_mut() else {
+            return;
+        };
+        if completions.items.is_empty() {
+            return;
+        }
+        let selected = completions
+            .selected
+            .map(|index| (index + 1) % completions.items.len())
+            .unwrap_or(0);
+        completions.selected = Some(selected);
+        self.apply_selected_completion_preview();
+    }
+
+    fn select_previous_completion(&mut self) {
+        let Some(completions) = self.completions.as_mut() else {
+            return;
+        };
+        if completions.items.is_empty() {
+            return;
+        }
+        let selected = completions
+            .selected
+            .map(|index| {
+                if index == 0 {
+                    completions.items.len() - 1
+                } else {
+                    index - 1
+                }
+            })
+            .unwrap_or_else(|| completions.items.len() - 1);
+        completions.selected = Some(selected);
+        self.apply_selected_completion_preview();
+    }
+
+    fn accept_completion(&mut self) {
+        if self.completions.is_none() {
+            return;
+        }
+        let needs_preview = self
+            .completions
+            .as_ref()
+            .and_then(|completions| completions.selected)
+            .is_none();
+        if needs_preview {
+            if let Some(completions) = self.completions.as_mut() {
+                completions.selected = Some(0);
+            }
+            self.apply_selected_completion_preview();
+        }
+        self.refresh_completions();
+    }
+
+    fn apply_selected_completion_preview(&mut self) {
+        let Some(completions) = self.completions.as_mut() else {
+            return;
+        };
+        let Some(selected) = completions.selected else {
+            return;
+        };
+        let Some(insert) = completions
+            .items
+            .get(selected)
+            .and_then(|item| item.insert.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        if completions.replace_start > completions.replace_end
+            || completions.replace_end > self.input.len()
+        {
+            return;
+        }
+        self.input
+            .replace_range(completions.replace_start..completions.replace_end, &insert);
+        completions.replace_end = completions.replace_start + insert.len();
+        self.input_cursor = completions.replace_end;
+    }
+
+    fn input_view(&self, width: u16) -> (String, u16) {
+        let width = usize::from(width.max(1));
+        let cursor_chars = self.input[..self.input_cursor].chars().count();
+        let chars = self.input.chars().collect::<Vec<_>>();
+        let start = cursor_chars.saturating_sub(width.saturating_sub(1));
+        let end = (start + width).min(chars.len());
+        let text = chars[start..end].iter().collect::<String>();
+        let cursor_column = cursor_chars
+            .saturating_sub(start)
+            .min(width.saturating_sub(1));
+        (text, cursor_column as u16)
+    }
+}
+
+fn render_cui_tui(frame: &mut Frame<'_>, state: &CuiTuiState) {
+    let area = frame.area();
+    let completion_height = state
+        .completions
+        .as_ref()
+        .map(|completions| (completions.items.len() as u16 + 2).clamp(3, 8))
+        .unwrap_or(0);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(1),
+            Constraint::Length(completion_height),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_tui_header(frame, chunks[0], state);
+    render_tui_transcript(frame, chunks[1], state);
+    if completion_height > 0 {
+        render_tui_completions(frame, chunks[2], state);
+    }
+    render_tui_input(frame, chunks[3], state);
+    render_tui_status(frame, chunks[4], state);
+}
+
+fn render_tui_header(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
+    let mut runtime_line = vec![
+        Span::styled("session ", Style::default().fg(Color::DarkGray)),
+        Span::raw(state.session_id.clone()),
+        Span::raw("  "),
+        Span::styled("node ", Style::default().fg(Color::DarkGray)),
+        Span::raw(state.node_id.clone()),
+    ];
+    if let Some(cluster) = &state.cluster_label {
+        runtime_line.push(Span::raw("  "));
+        runtime_line.push(Span::styled(
+            "cluster ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        runtime_line.push(Span::raw(
+            cluster
+                .strip_prefix("cluster ")
+                .unwrap_or(cluster)
+                .to_string(),
+        ));
+    }
+    let text = Text::from(vec![
+        Line::from(runtime_line),
+        Line::from(vec![
+            Span::styled("runtime ", Style::default().fg(Color::DarkGray)),
+            Span::raw(state.daemon_label.clone()),
+        ]),
+    ]);
+    let block = Block::default()
+        .title("Sinomo")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(Paragraph::new(text).block(block), area);
+}
+
+fn render_tui_transcript(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
+    let lines = tui_message_lines(&state.messages);
+    let visible_height = area.height.saturating_sub(2);
+    let max_scroll = lines
+        .len()
+        .saturating_sub(usize::from(visible_height))
+        .min(usize::from(u16::MAX)) as u16;
+    let scroll = max_scroll.saturating_sub(state.scrollback.min(max_scroll));
+    let block = Block::default()
+        .title("Session")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let transcript = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(transcript, area);
+}
+
+fn render_tui_completions(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
+    let Some(completions) = &state.completions else {
+        return;
+    };
+    let visible_height = usize::from(area.height.saturating_sub(2));
+    if visible_height == 0 {
+        return;
+    }
+    let (visible_start, visible_end) = completion_visible_range(
+        completions.items.len(),
+        completions.selected,
+        visible_height,
+    );
+    let lines = completions
+        .items
+        .iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(visible_end.saturating_sub(visible_start))
+        .map(|(index, item)| {
+            let selected = completions.selected == Some(index);
+            let prefix_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let detail_style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let marker = if selected { "> " } else { "  " };
+            Line::from(vec![
+                Span::styled(marker, prefix_style),
+                Span::styled(item.label.clone(), prefix_style),
+                Span::styled("  ", detail_style),
+                Span::styled(item.detail.clone(), detail_style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let title = if visible_start > 0 || visible_end < completions.items.len() {
+        format!(
+            "Slash Commands {}-{}/{}",
+            visible_start + 1,
+            visible_end,
+            completions.items.len()
+        )
+    } else {
+        "Slash Commands".to_string()
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+fn completion_visible_range(
+    item_count: usize,
+    selected: Option<usize>,
+    visible_height: usize,
+) -> (usize, usize) {
+    if item_count == 0 || visible_height == 0 {
+        return (0, 0);
+    }
+    if item_count <= visible_height {
+        return (0, item_count);
+    }
+
+    let selected = selected.unwrap_or(0).min(item_count - 1);
+    let max_start = item_count - visible_height;
+    let start = selected.saturating_sub(visible_height / 2).min(max_start);
+    (start, start + visible_height)
+}
+
+fn render_tui_input(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let display_width = inner_width.saturating_sub(1).max(1);
+    let (input, cursor_column) = state.input_view(display_width);
+    let block = Block::default()
+        .title("Message")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+    frame.render_widget(Paragraph::new(input).block(block), area);
+    if area.width > 2 && area.height > 2 {
+        let cursor_x = area
+            .x
+            .saturating_add(1)
+            .saturating_add(cursor_column.min(inner_width.saturating_sub(1)));
+        let cursor_y = area.y.saturating_add(1);
+        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
+}
+
+fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
+    let status_style = match state.status.as_str() {
+        "working" | "streaming" => Style::default().fg(Color::Yellow),
+        "ending session" => Style::default().fg(Color::Red),
+        _ => Style::default().fg(Color::Green),
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            state.status.clone(),
+            status_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("Enter", Style::default().fg(Color::DarkGray)),
+        Span::raw(" send   "),
+        Span::styled("Up/Down", Style::default().fg(Color::DarkGray)),
+        Span::raw(" select   "),
+        Span::styled("Tab/Right", Style::default().fg(Color::DarkGray)),
+        Span::raw(" accept   "),
+        Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+        Span::raw(" quit   "),
+        Span::styled("PgUp/PgDn", Style::default().fg(Color::DarkGray)),
+        Span::raw(" scroll"),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn tui_message_lines(messages: &[TuiMessage]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for message in messages {
+        let prefix = tui_message_prefix(&message.kind);
+        let style = tui_message_style(&message.kind);
+        if message.text.is_empty() {
+            lines.push(Line::from(vec![Span::styled(prefix, style)]));
+            continue;
+        }
+        for (line_index, text) in message.text.lines().enumerate() {
+            let display_prefix = if line_index == 0 {
+                prefix.to_string()
+            } else {
+                " ".repeat(prefix.len())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(display_prefix, style),
+                Span::raw(text.to_string()),
+            ]));
+        }
+    }
+    lines
+}
+
+fn tui_message_prefix(kind: &TuiMessageKind) -> &'static str {
+    match kind {
+        TuiMessageKind::User => "you> ",
+        TuiMessageKind::Command => "cmd> ",
+        TuiMessageKind::Agent => "sinomo> ",
+        TuiMessageKind::Thinking => "think> ",
+        TuiMessageKind::System => "system> ",
+        TuiMessageKind::Error => "error> ",
+    }
+}
+
+fn tui_message_style(kind: &TuiMessageKind) -> Style {
+    match kind {
+        TuiMessageKind::User => Style::default().fg(Color::Blue),
+        TuiMessageKind::Command => Style::default().fg(Color::Magenta),
+        TuiMessageKind::Agent => Style::default().fg(Color::Green),
+        TuiMessageKind::Thinking => Style::default().fg(Color::Yellow),
+        TuiMessageKind::System => Style::default().fg(Color::DarkGray),
+        TuiMessageKind::Error => Style::default().fg(Color::Red),
+    }
+}
+
+#[cfg(test)]
+mod tui_tests {
+    use super::*;
+
+    fn fixture_tui_state() -> CuiTuiState {
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_test").expect("node"),
+            InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+        );
+        CuiTuiState::new(&session, None)
+    }
+
+    #[test]
+    fn tui_state_edits_input_at_cursor() {
+        let mut state = fixture_tui_state();
+
+        state.insert_str("ab");
+        state.move_cursor_left();
+        state.insert_char('x');
+        state.backspace();
+        state.insert_char('y');
+
+        assert_eq!(state.input, "ayb");
+        assert_eq!(state.input_cursor, 2);
+    }
+
+    #[test]
+    fn tui_state_records_submission_and_streamed_outputs() {
+        let mut state = fixture_tui_state();
+
+        state.begin_submission("hello");
+        state.apply_output(InteractionOutput::Chunk("thinking> checking".to_string()));
+        state.apply_output(InteractionOutput::Chunk(" cluster".to_string()));
+        state.apply_output(InteractionOutput::Line("sinomo: done".to_string()));
+        state.finish_submission();
+
+        assert_eq!(state.messages[1].kind, TuiMessageKind::User);
+        assert_eq!(state.messages[1].text, "hello");
+        assert_eq!(state.messages[2].kind, TuiMessageKind::Thinking);
+        assert_eq!(state.messages[2].text, "checking cluster");
+        assert_eq!(state.messages[3].kind, TuiMessageKind::Agent);
+        assert_eq!(state.messages[3].text, "done");
+        assert_eq!(state.status, "listening");
+    }
+
+    #[test]
+    fn tui_state_marks_command_failures_and_exit() {
+        let mut state = fixture_tui_state();
+
+        state.begin_submission("/models");
+        state.apply_output(InteractionOutput::Line(
+            "command failed: missing config".to_string(),
+        ));
+        state.apply_output(InteractionOutput::Exit);
+
+        assert_eq!(state.messages[1].kind, TuiMessageKind::Command);
+        assert_eq!(state.messages[2].kind, TuiMessageKind::Error);
+        assert!(state.exit_requested);
+        assert_eq!(state.status, "ending session");
+    }
+
+    #[test]
+    fn tui_state_updates_completion_list_only_after_typed_edits() {
+        let mut state = fixture_tui_state();
+
+        state.insert_char('/');
+        let initial_labels = state
+            .completions
+            .as_ref()
+            .expect("completions")
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        assert!(initial_labels.contains(&"cluster".to_string()));
+
+        while state.input != "/cluster " {
+            state.select_next_completion();
+        }
+        let selected_input = state.input.clone();
+        let labels_after_selection = state
+            .completions
+            .as_ref()
+            .expect("completions")
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(labels_after_selection, initial_labels);
+        assert!(selected_input.starts_with('/'));
+        assert_ne!(selected_input, "/");
+
+        state.accept_completion();
+        let labels_after_accept = state
+            .completions
+            .as_ref()
+            .expect("next completions")
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        assert_ne!(labels_after_accept, initial_labels);
+    }
+
+    #[test]
+    fn tui_state_can_build_option_value_with_completion_selection() {
+        let mut state = fixture_tui_state();
+
+        state.insert_str("/dfs pin add --m");
+        state.select_next_completion();
+        assert_eq!(state.input, "/dfs pin add --mode ");
+        state.accept_completion();
+        assert!(
+            state
+                .completions
+                .as_ref()
+                .expect("value completions")
+                .items
+                .iter()
+                .any(|item| item.label == "metadata")
+        );
+
+        state.select_next_completion();
+        assert_eq!(state.input, "/dfs pin add --mode metadata ");
+    }
+
+    #[test]
+    fn completion_visible_range_keeps_selection_in_view() {
+        assert_eq!(completion_visible_range(20, None, 6), (0, 6));
+        assert_eq!(completion_visible_range(20, Some(0), 6), (0, 6));
+        assert_eq!(completion_visible_range(20, Some(7), 6), (4, 10));
+        assert_eq!(completion_visible_range(20, Some(19), 6), (14, 20));
+        assert_eq!(completion_visible_range(4, Some(3), 6), (0, 4));
+    }
 }
 
 pub trait InteractionEventHandler {
@@ -675,61 +1659,7 @@ impl<M: InteractionModel> InteractionEventHandler for ModelBackedInteractionHand
             }
         };
 
-        if matches!(args.first().map(String::as_str), Some("quit" | "exit")) {
-            let quit = interaction_event(
-                session,
-                "interaction.session.ended",
-                serde_json::json!({
-                    "input_event_id": event.event_id,
-                    "reason": "user-requested"
-                }),
-            )
-            .caused_by(&event.event_id);
-            store.append(quit)?;
-            return Ok(vec![
-                InteractionOutput::Line("ending session".to_string()),
-                InteractionOutput::Exit,
-            ]);
-        }
-
-        let command = interaction_event(
-            session,
-            "interaction.command.requested",
-            serde_json::json!({
-                "input_event_id": event.event_id,
-                "args": args,
-                "command": args.join(" ")
-            }),
-        )
-        .caused_by(&event.event_id);
-        store.append(command.clone())?;
-
-        let result = run_cli_command(&args);
-        let (kind, status, output) = match result {
-            Ok(()) => (
-                "interaction.command.completed",
-                "completed",
-                format!("completed command: /{}", args.join(" ")),
-            ),
-            Err(error) => (
-                "interaction.command.failed",
-                "failed",
-                format!("command failed: {error}"),
-            ),
-        };
-        let outcome = interaction_event(
-            session,
-            kind,
-            serde_json::json!({
-                "command_event_id": command.event_id,
-                "status": status,
-                "args": args
-            }),
-        )
-        .caused_by(&command.event_id);
-        store.append(outcome)?;
-
-        Ok(vec![InteractionOutput::Line(output)])
+        execute_slash_command(store, session, event, args)
     }
 }
 
@@ -1513,6 +2443,15 @@ fn handle_slash_command<S: EventStore>(
     event: &EventEnvelope,
     args: Vec<String>,
 ) -> Result<Vec<InteractionOutput>, CliError> {
+    execute_slash_command(store, session, event, args)
+}
+
+fn execute_slash_command<S: EventStore>(
+    store: &mut S,
+    session: &InteractionSession,
+    event: &EventEnvelope,
+    args: Vec<String>,
+) -> Result<Vec<InteractionOutput>, CliError> {
     if matches!(args.first().map(String::as_str), Some("quit" | "exit")) {
         let quit = interaction_event(
             session,
@@ -1542,32 +2481,57 @@ fn handle_slash_command<S: EventStore>(
     .caused_by(&event.event_id);
     store.append(command.clone())?;
 
-    let result = run_cli_command(&args);
-    let (kind, status, output) = match result {
-        Ok(()) => (
-            "interaction.command.completed",
-            "completed",
-            format!("completed command: /{}", args.join(" ")),
-        ),
-        Err(error) => (
-            "interaction.command.failed",
-            "failed",
-            format!("command failed: {error}"),
-        ),
+    let execution = run_cli_command_with_capture(&args);
+    let mut outputs = captured_cli_command_outputs(&execution.output);
+    let command_text = args.join(" ");
+    let error_text = execution.result.as_ref().err().map(ToString::to_string);
+    let (kind, status) = match &execution.result {
+        Ok(()) => ("interaction.command.completed", "completed"),
+        Err(_) => ("interaction.command.failed", "failed"),
     };
+    if let Some(error) = error_text {
+        outputs.push(InteractionOutput::Line(format!("command failed: {error}")));
+    } else if outputs.is_empty() {
+        outputs.push(InteractionOutput::Line(format!(
+            "completed command: /{command_text}"
+        )));
+    }
     let outcome = interaction_event(
         session,
         kind,
         serde_json::json!({
             "command_event_id": command.event_id,
             "status": status,
-            "args": args
+            "args": args,
+            "stdout_bytes": execution.output.stdout.len(),
+            "stderr_bytes": execution.output.stderr.len()
         }),
     )
     .caused_by(&command.event_id);
     store.append(outcome)?;
 
-    Ok(vec![InteractionOutput::Line(output)])
+    Ok(outputs)
+}
+
+fn captured_cli_command_outputs(output: &CliCommandOutput) -> Vec<InteractionOutput> {
+    let mut outputs = Vec::new();
+    push_captured_cli_stream(&mut outputs, None, &output.stdout);
+    push_captured_cli_stream(&mut outputs, Some("stderr: "), &output.stderr);
+    outputs
+}
+
+fn push_captured_cli_stream(
+    outputs: &mut Vec<InteractionOutput>,
+    prefix: Option<&str>,
+    bytes: &[u8],
+) {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines() {
+        outputs.push(InteractionOutput::Line(match prefix {
+            Some(prefix) => format!("{prefix}{line}"),
+            None => line.to_string(),
+        }));
+    }
 }
 
 pub fn parse_slash_command(input: &str) -> Result<Option<Vec<String>>, CliError> {
