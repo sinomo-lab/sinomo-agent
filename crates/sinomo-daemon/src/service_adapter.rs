@@ -77,11 +77,14 @@ use crate::paths::DaemonPaths;
 use crate::rollout::{handle_daemon_rollout_binary_request, handle_daemon_rollout_build_request};
 
 /// Shared executor for driving service futures from connection threads. A multi-thread
-/// runtime so concurrent connection threads can `block_on` it; service handlers do
-/// blocking std IO, so no tokio IO/time driver is needed.
+/// runtime so concurrent connection threads can `block_on` it. `enable_all` is required:
+/// handlers may make synchronous daemon-to-daemon RPCs, which now drive their async I/O on
+/// this ambient runtime (via `block_in_place`) instead of building a nested one, so the IO
+/// and time drivers must be present.
 static SERVICE_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .enable_all()
         .build()
         .expect("build daemon service runtime")
 });

@@ -48,6 +48,25 @@ pub fn prepare_background_command(command: &mut Command) {
     }
 }
 
+/// Stdio for the supervised main daemon's stdout/stderr. Captures to
+/// `<SINOMO_DATA_DIR>/daemon/<name>` (appended) instead of discarding to `/dev/null`, so
+/// panics and errors raised while handling requests (e.g. a rollout activation) survive
+/// for diagnosis. Falls back to a null sink when no data dir is set or the file can't be
+/// opened, so spawning never fails on account of logging.
+fn supervised_main_daemon_log_stdio(name: &str) -> Stdio {
+    let Some(data_dir) = env::var_os("SINOMO_DATA_DIR") else {
+        return Stdio::null();
+    };
+    let dir = PathBuf::from(data_dir).join("daemon");
+    if fs::create_dir_all(&dir).is_err() {
+        return Stdio::null();
+    }
+    match File::options().create(true).append(true).open(dir.join(name)) {
+        Ok(file) => Stdio::from(file),
+        Err(_) => Stdio::null(),
+    }
+}
+
 pub fn spawn_main_daemon_process(
     binary: &Path,
     options: &DaemonRunOptions,
@@ -70,8 +89,8 @@ pub fn spawn_main_daemon_process_with_env(
         .arg("--port")
         .arg(options.port.to_string())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(supervised_main_daemon_log_stdio("main.stdout.log"))
+        .stderr(supervised_main_daemon_log_stdio("main.stderr.log"));
     for (key, value) in extra_env {
         command.env(key, value);
     }
