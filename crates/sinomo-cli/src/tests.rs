@@ -8,8 +8,9 @@ use super::{
     InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
     InteractionSurfaceKind, MainAgentInteractionHandler, ModelBackedInteractionHandler,
     ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
-    ProviderCommandOptions, ProviderName, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    SandboxCliCommand, SandboxToolchainVerifyMakeOptions, SandboxToolchainVerifyMakepkgOptions,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutOptions, RolloutTelemetryGateSetOptions, SandboxCliCommand,
+    SandboxToolchainVerifyMakeOptions, SandboxToolchainVerifyMakepkgOptions,
     SandboxToolchainVerifyTccOptions, SelfRolloutPaths, UninstallOptions,
     advertised_peer_route_targets, apply_cluster_node_role, apply_cluster_raft_role,
     authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
@@ -50,9 +51,10 @@ use super::{
     parse_uninstall_options, parse_usage_options, push_unique_introducer, quickjs_setup_script,
     read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
     read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
-    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_endpoint_candidates,
-    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
-    rollout_target_endpoint_for_main_with_connectivity, run_cui_with_handler_io,
+    rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
+    rollout_endpoint_candidates, rollout_target_endpoint_for_main,
+    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
+    rollout_telemetry_gates_set_with_data_dir, run_cui_with_handler_io,
     run_cui_with_handler_io_and_daemon, run_cui_with_io_and_daemon_probe, run_evolve_command,
     run_shadow_daemon_with_paths, sandbox_cat_with_store, sandbox_checkpoint_with_store,
     sandbox_config_with_store, sandbox_create_with_store, sandbox_destroy_with_store,
@@ -81,25 +83,38 @@ use sinomo_lm::{
 use sinomo_runtime::core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
     ClusterEndpointSource, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
-    ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole, ClusterTransportKind,
-    DfsObjectPolicy, TrustDomain, TrustRing,
+    ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole, ClusterTransportKind, Confidence,
+    DfsObjectPolicy, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, Id,
+    LatencyClass, PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy,
+    RoutingMetadata, RoutingScope, Salience, Source, TrustDomain, TrustRing,
 };
 use sinomo_runtime::daemon::daemon_status_matches_options;
 use sinomo_runtime::dfs::{
     DfsMetadataBackend, DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsObjectVersionRecord,
     distributed_sifs, distributed_sifs_bootstrap_objects, metadata_shard_key,
 };
-use sinomo_runtime::events::{EventStore, InMemoryEventStore, ReplayQuery, SessionId};
+use sinomo_runtime::events::{
+    EventId, EventStore, InMemoryEventStore, JsonlEventStore, ReplayQuery, SessionId,
+};
 use sinomo_runtime::kv::{InProcessKvStore, KvCommand, KvCompare, KvOp, KvRevision, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::module::{
+    MODULE_SHADOW_DECISION_EVENT_KIND, ModuleInvocationOutcome, ModuleInvocationRequest,
+    ModuleReplayCaseOutcome, ModuleReplayReport, ModuleRouteLane, ModuleRouteRequest,
+    execute_routed_module_invocation_with_event_store, read_module_loader_runtime_state,
+    route_module_invocation,
+};
 use sinomo_runtime::network::{ClusterEndpointId, ClusterId, ClusterInviteId, daemon_lan_endpoint};
 use sinomo_runtime::node::{NodeId, main_daemon_capabilities};
-use sinomo_runtime::rollout::create_source_repo_bundle;
+use sinomo_runtime::rollout::{
+    RolloutAction, RolloutController, RolloutStage, create_source_repo_bundle,
+    read_rollout_runtime_state, write_rollout_runtime_state,
+};
 use sinomo_runtime::sandbox::SandboxFileSystem;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -884,6 +899,153 @@ fn sandbox_toolchain_hash_parser_accepts_file() {
         panic!("expected toolchain hash");
     };
     assert_eq!(options.path, PathBuf::from("/tmp/qjs.wasm"));
+}
+
+#[test]
+fn sandbox_module_artifact_parser_accepts_component_register() {
+    let artifact_id = sinomo_runtime::module::ArtifactId::generate();
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
+    let command = parse_sandbox_command(&[
+        "module-artifact".to_string(),
+        "register".to_string(),
+        "--artifact".to_string(),
+        artifact_id.to_string(),
+        "--component-model".to_string(),
+        "--abi".to_string(),
+        "preview1".to_string(),
+        "--sandbox".to_string(),
+        sandbox_id.to_string(),
+        "--argv".to_string(),
+        "component.wasm".to_string(),
+        "--cwd".to_string(),
+        "/work".to_string(),
+        "--env".to_string(),
+        "RUST_LOG=debug".to_string(),
+        "--memory-mb".to_string(),
+        "128".to_string(),
+        "--wall-time-ms".to_string(),
+        "2000".to_string(),
+        "--max-output-bytes".to_string(),
+        "4096".to_string(),
+        "--timeout-ms".to_string(),
+        "1500".to_string(),
+        "/tmp/component.wasm".to_string(),
+    ])
+    .expect("module artifact register");
+
+    let SandboxCliCommand::ModuleArtifact(super::SandboxModuleArtifactCliCommand::Register(
+        options,
+    )) = command
+    else {
+        panic!("expected module artifact register");
+    };
+    assert_eq!(options.artifact_id, artifact_id);
+    assert_eq!(options.source_path, PathBuf::from("/tmp/component.wasm"));
+    assert_eq!(
+        options.interface_version.as_deref(),
+        Some(sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION)
+    );
+    assert!(options.component_model);
+    assert_eq!(
+        options.abi,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1
+    );
+    assert_eq!(options.sandbox_id, Some(sandbox_id));
+    assert_eq!(options.argv, vec!["component.wasm"]);
+    assert_eq!(options.cwd.expect("cwd").as_str(), "/work");
+    assert_eq!(
+        options.env.get("RUST_LOG").map(String::as_str),
+        Some("debug")
+    );
+    assert_eq!(options.limits.memory_mb, 128);
+    assert_eq!(options.limits.wall_time_ms, 2000);
+    assert_eq!(options.limits.max_output_bytes, 4096);
+    assert_eq!(options.timeout_ms, Some(1500));
+    assert_eq!(options.rollout_material, None);
+}
+
+#[test]
+fn sandbox_module_artifact_parser_accepts_rollout_material_options() {
+    let artifact_id = sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_candidate")
+        .expect("artifact");
+    let module_id =
+        sinomo_runtime::module::ModuleId::from_legacy_named("module.trigger.silence_policy")
+            .expect("module");
+    let active_artifact_id =
+        sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_active").expect("active");
+    let rollout_plan_id = Id::from_legacy_named("rollout_candidate").expect("rollout");
+    let policy_decision_id = Id::from_legacy_named("policy_candidate").expect("policy");
+    let command = parse_sandbox_command(&[
+        "module-artifact".to_string(),
+        "register".to_string(),
+        "--artifact".to_string(),
+        artifact_id.to_string(),
+        "--component-model".to_string(),
+        "--candidate-bundle".to_string(),
+        "/tmp/bundle".to_string(),
+        "--module".to_string(),
+        module_id.to_string(),
+        "--active-artifact".to_string(),
+        active_artifact_id.to_string(),
+        "--rollout-plan".to_string(),
+        rollout_plan_id.to_string(),
+        "--policy-decision".to_string(),
+        policy_decision_id.to_string(),
+        "--module-version".to_string(),
+        "0.2.0".to_string(),
+        "--module-owner".to_string(),
+        "trigger".to_string(),
+        "--evidence".to_string(),
+        "module-replay://report".to_string(),
+        "/tmp/component.wasm".to_string(),
+    ])
+    .expect("module artifact register");
+
+    let SandboxCliCommand::ModuleArtifact(super::SandboxModuleArtifactCliCommand::Register(
+        options,
+    )) = command
+    else {
+        panic!("expected module artifact register");
+    };
+    let rollout_material = options.rollout_material.expect("rollout material");
+    assert_eq!(
+        rollout_material.candidate_bundle_path,
+        PathBuf::from("/tmp/bundle")
+    );
+    assert_eq!(rollout_material.module_id, module_id);
+    assert_eq!(rollout_material.active_artifact_id, active_artifact_id);
+    assert_eq!(rollout_material.rollout_plan_id, Some(rollout_plan_id));
+    assert_eq!(
+        rollout_material.policy_decision_id,
+        Some(policy_decision_id)
+    );
+    assert_eq!(rollout_material.module_version, "0.2.0");
+    assert_eq!(rollout_material.module_owner, "trigger");
+    assert_eq!(
+        rollout_material.evidence_refs,
+        vec!["module-replay://report".to_string()]
+    );
+}
+
+#[test]
+fn sandbox_module_replay_parser_accepts_fixture_and_report() {
+    let command = parse_sandbox_command(&[
+        "module-replay".to_string(),
+        "run".to_string(),
+        "--fixture".to_string(),
+        "/tmp/fixture.json".to_string(),
+        "--report".to_string(),
+        "/tmp/report.json".to_string(),
+    ])
+    .expect("module replay run");
+
+    let SandboxCliCommand::ModuleReplay(super::SandboxModuleReplayCliCommand::Run(options)) =
+        command
+    else {
+        panic!("expected module replay run");
+    };
+    assert_eq!(options.fixture_path, PathBuf::from("/tmp/fixture.json"));
+    assert_eq!(options.report_path, PathBuf::from("/tmp/report.json"));
 }
 
 #[test]
@@ -4014,6 +4176,966 @@ fn sandbox_toolchain_add_command_installs_local_command_module() {
         std::fs::read(module_path).expect("module bytes")
     );
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sandbox_module_artifact_register_writes_registry_and_copies_bytes() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-sandbox-module-artifact-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    let source_path = root.join("source.wasm");
+    std::fs::write(&source_path, b"module bytes").expect("source");
+    let artifact_id = sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_cli_module")
+        .expect("artifact");
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
+    let cwd = sinomo_runtime::sandbox::SandboxPath::new("/work".to_string()).expect("cwd");
+    let mut env = BTreeMap::new();
+    env.insert("RUST_LOG".to_string(), "debug".to_string());
+    let limits = sinomo_runtime::sandbox::SandboxResourceLimits {
+        memory_mb: 128,
+        wall_time_ms: 2_000,
+        ..sinomo_runtime::sandbox::SandboxResourceLimits::default()
+    };
+
+    super::sandbox_module_artifact_register_with_data_dir(
+        super::SandboxModuleArtifactRegisterOptions {
+            artifact_id: artifact_id.clone(),
+            source_path: source_path.clone(),
+            interface_version: Some("custom-v0".to_string()),
+            component_model: false,
+            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            sandbox_id: Some(sandbox_id.clone()),
+            argv: vec!["module.wasm".to_string()],
+            cwd: Some(cwd.clone()),
+            env: env.clone(),
+            limits: limits.clone(),
+            timeout_ms: Some(1_500),
+            rollout_material: None,
+        },
+        &root,
+    )
+    .expect("register module artifact");
+
+    let artifact_path = root
+        .join("sandbox")
+        .join("module-artifacts")
+        .join(format!("{artifact_id}.wasm"));
+    assert_eq!(
+        std::fs::read(&artifact_path).expect("artifact bytes"),
+        b"module bytes"
+    );
+    let registry = sinomo_runtime::sandbox::read_sandbox_wasm_module_artifact_registry(&root)
+        .expect("read registry")
+        .expect("registry");
+    let artifact = registry
+        .artifact(&artifact_id)
+        .expect("registered artifact");
+    assert_eq!(
+        artifact.wasm_path,
+        PathBuf::from(format!("sandbox/module-artifacts/{artifact_id}.wasm"))
+    );
+    assert_eq!(
+        artifact.content_hash,
+        sinomo_runtime::sandbox::sandbox_module_hash(b"module bytes")
+    );
+    assert_eq!(artifact.interface_version.as_deref(), Some("custom-v0"));
+    assert!(!artifact.component_model);
+    assert_eq!(
+        artifact.abi,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1
+    );
+    assert_eq!(artifact.sandbox_id, Some(sandbox_id));
+    assert_eq!(artifact.argv, vec!["module.wasm"]);
+    assert_eq!(artifact.cwd, Some(cwd));
+    assert_eq!(artifact.env, env);
+    assert_eq!(artifact.limits, limits);
+    assert_eq!(artifact.timeout_ms, Some(1_500));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-sandbox-module-rollout-material-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    let source_path = root.join("candidate.wasm");
+    std::fs::write(&source_path, b"candidate module bytes").expect("source");
+    let bundle_dir = root.join("candidate-bundle");
+    std::fs::create_dir_all(&bundle_dir).expect("bundle");
+    let mutation_packet_path = bundle_dir.join("mutation-packet.json");
+    std::fs::write(
+        &mutation_packet_path,
+        "{\"objective\":\"module rollout\"}\n",
+    )
+    .expect("mutation packet");
+    let job_id = EvolutionJobId::from_legacy_named("evojob_module_rollout_material").expect("job");
+    let manifest = sinomo_runtime::core::CandidateBundleManifest {
+        job_id: job_id.clone(),
+        bundle_path: bundle_dir.display().to_string(),
+        created_at: OffsetDateTime::now_utc(),
+        mutation_packet_path: mutation_packet_path.display().to_string(),
+        job_path: None,
+        model_output_path: None,
+        agent_run_path: None,
+        agent_summary_path: None,
+        benchmark_results_path: None,
+        resource_usage_path: None,
+        content_manifest_path: None,
+        attestation_path: None,
+        registry_record_path: None,
+        bundle_content_hash: None,
+        changed_files_path: None,
+        diff_path: None,
+        scorecard_path: None,
+        candidate_summary_path: None,
+        decision_path: None,
+        command_logs: Vec::new(),
+    };
+    std::fs::write(
+        bundle_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write manifest");
+    let artifact_id =
+        sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_cli_rollout_candidate")
+            .expect("artifact");
+    let active_artifact_id =
+        sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_cli_rollout_active")
+            .expect("active");
+    let module_id =
+        sinomo_runtime::module::ModuleId::from_legacy_named("module.trigger.silence_policy")
+            .expect("module");
+
+    super::sandbox_module_artifact_register_with_data_dir(
+        super::SandboxModuleArtifactRegisterOptions {
+            artifact_id: artifact_id.clone(),
+            source_path: source_path.clone(),
+            interface_version: Some(
+                sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string(),
+            ),
+            component_model: false,
+            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            sandbox_id: None,
+            argv: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            limits: sinomo_runtime::sandbox::SandboxResourceLimits::default(),
+            timeout_ms: Some(1_500),
+            rollout_material: Some(super::SandboxModuleArtifactRolloutMaterialOptions {
+                candidate_bundle_path: bundle_dir.clone(),
+                module_id: module_id.clone(),
+                active_artifact_id: active_artifact_id.clone(),
+                rollout_plan_id: Some(
+                    Id::from_legacy_named("rollout_cli_material").expect("rollout"),
+                ),
+                policy_decision_id: Some(
+                    Id::from_legacy_named("policy_cli_material").expect("policy"),
+                ),
+                module_version: "0.2.0".to_string(),
+                module_owner: "trigger".to_string(),
+                evidence_refs: vec!["module-replay://silence-policy".to_string()],
+            }),
+        },
+        &root,
+    )
+    .expect("register module artifact with rollout material");
+
+    let material_path =
+        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(&manifest);
+    assert!(material_path.exists());
+    let material: sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord =
+        serde_json::from_str(
+            &std::fs::read_to_string(&material_path).expect("rollout material json"),
+        )
+        .expect("rollout material");
+    assert_eq!(material.candidate_bundle_job_id, job_id);
+    assert_eq!(material.artifact.artifact_id, artifact_id);
+    assert_eq!(material.artifact.module_id, module_id);
+    assert_eq!(
+        material.artifact.content_hash,
+        sinomo_runtime::sandbox::sandbox_module_hash(b"candidate module bytes")
+    );
+    assert_eq!(material.active_artifact_id, active_artifact_id);
+    assert_eq!(
+        material.policy_decision.action,
+        sinomo_runtime::core::PolicyAction::Allow
+    );
+    assert_eq!(
+        material.rollout_plan.strategy,
+        sinomo_runtime::core::RolloutStrategy::Shadow
+    );
+    assert_eq!(material.rollout_plan.initial_weight_bps, 0);
+    assert!(
+        material
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == &format!("candidate-bundle://{job_id}"))
+    );
+    assert!(
+        material
+            .artifact
+            .provenance
+            .attestations
+            .iter()
+            .any(|evidence| evidence == &format!("registry://candidate-bundle/{job_id}"))
+    );
+    sinomo_runtime::module::verify_artifact_signature(&material.artifact)
+        .expect("artifact signature verifies");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-self-evolution-module-flow-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("data dir layout");
+    let evolution_paths = sinomo_evolution::EvolutionPaths::new(&data_dir);
+    evolution_paths.ensure().expect("evolution paths");
+
+    let source_repo = root.join("source");
+    create_self_evolution_test_source_repo(&source_repo);
+    let module_id =
+        sinomo_runtime::module::ModuleId::from_legacy_named("module.trigger.silence_policy")
+            .expect("module");
+    let artifact_id =
+        sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_module_candidate_flow")
+            .expect("artifact");
+    let active_artifact_id =
+        sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_module_active_flow")
+            .expect("active");
+    let model = SelfEvolutionModuleAgentModel::new([
+        serde_json::json!({
+            "response_mode": "defer",
+            "text": "Updating the low-risk trigger module candidate source.",
+            "tool_calls": [{
+                "tool": "apply_patch",
+                "input": {
+                    "patch": self_evolution_candidate_module_source_patch()
+                },
+                "async": false,
+                "summary": "Write the candidate module source."
+            }],
+            "maid_handoff": null,
+            "next_state": "waiting"
+        })
+        .to_string(),
+        serde_json::json!({
+            "response_mode": "answer",
+            "text": "Produced the low-risk silence-policy candidate module source and left verification to the requested replay gate.",
+            "tool_calls": [],
+            "maid_handoff": null,
+            "next_state": "listening"
+        })
+        .to_string(),
+    ]);
+    let mutation_worker =
+        sinomo_evolution::AgentMutationWorker::new(model, "fixture", "fixture-model")
+            .with_max_steps(Some(4));
+    let replay_runner = SelfEvolutionModuleReplayCommandRunner {
+        data_dir_root: root.clone(),
+        module_id: module_id.clone(),
+        active_artifact_id: active_artifact_id.clone(),
+        candidate_artifact_id: artifact_id.clone(),
+    };
+    let orchestrator = sinomo_evolution::EvolutionOrchestrator::new(
+        sinomo_evolution::GitWorkspaceAdapter::new(&source_repo, &evolution_paths.jobs),
+        sinomo_runtime::eval::ExecutingEvalHarness::new(replay_runner),
+        sinomo_evolution::LocalCandidateBundleStore::new(&evolution_paths.jobs),
+    );
+    let report = orchestrator
+        .propose(
+            sinomo_evolution::EvolutionRequest {
+                objective: "roll out a verified low-risk module artifact".to_string(),
+                target_ring: TrustRing::R3SandboxedModule,
+                intended_paths: vec![
+                    "README.md".to_string(),
+                    SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL.to_string(),
+                ],
+                verification_commands: vec![sinomo_runtime::core::VerificationCommand {
+                    name: "generate-module-replay-report".to_string(),
+                    command: "sinomo-test:module-replay".to_string(),
+                    expected_exit_code: 0,
+                    gate: sinomo_runtime::core::EvaluationGate::ReplayTests,
+                }],
+                benchmark_gates: Vec::new(),
+                module_replay_reports: vec![sinomo_runtime::core::ModuleReplayReportRef {
+                    name: "candidate-flow-replay".to_string(),
+                    report_path: SELF_EVOLUTION_MODULE_REPLAY_REPORT_REL.to_string(),
+                    baseline_artifact_id: Some(active_artifact_id.clone()),
+                    candidate_artifact_id: Some(artifact_id.clone()),
+                }],
+                model_provider: Some("fixture".to_string()),
+                model: Some("fixture-model".to_string()),
+                dry_run: false,
+            },
+            Some(&mutation_worker),
+        )
+        .expect("agent-backed module candidate proposal");
+    let scorecard: EvaluationScorecard = report.scorecard.clone().expect("scorecard");
+    assert_eq!(scorecard.outcome, EvaluationOutcome::Passed);
+    assert!(scorecard.gates.iter().any(|gate| {
+        gate.gate == sinomo_runtime::core::EvaluationGate::ReplayTests
+            && gate
+                .summary
+                .contains("module replay `candidate-flow-replay`")
+    }));
+    assert!(scorecard.gates.iter().any(|gate| {
+        gate.gate == sinomo_runtime::core::EvaluationGate::ShadowMode
+            && gate.outcome == EvaluationOutcome::Passed
+    }));
+    assert!(
+        report
+            .changed_files
+            .iter()
+            .any(|path| path == SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL)
+    );
+    let diff_path = report.bundle.diff_path.as_ref().expect("diff path");
+    let diff = std::fs::read_to_string(diff_path).expect("diff");
+    assert!(diff.contains("br $spin"));
+    assert!(report.bundle.agent_run_path.is_some());
+    assert!(report.bundle.agent_summary_path.is_some());
+
+    let mut record = sinomo_evolution::StoredEvolutionJob {
+        job: report.job.clone(),
+        candidate_workspace: report.candidate_workspace.clone(),
+        bundle: report.bundle.clone(),
+        verification_outcome: Some(scorecard.outcome.clone()),
+        changed_files: report.changed_files.clone(),
+        decision: None,
+    };
+    record.job.target_module_id = Some(module_id.clone());
+    let job_path = record
+        .bundle
+        .job_path
+        .as_ref()
+        .map(PathBuf::from)
+        .expect("job path");
+    std::fs::write(
+        &job_path,
+        serde_json::to_string_pretty(&record.job).expect("job json"),
+    )
+    .expect("write module-targeted job");
+    let bundle_dir = PathBuf::from(&record.bundle.bundle_path);
+    let candidate_replay_report_path = record
+        .candidate_workspace
+        .path
+        .join(SELF_EVOLUTION_MODULE_REPLAY_REPORT_REL);
+    let bundled_replay_report_path = bundle_dir.join(SELF_EVOLUTION_MODULE_REPLAY_REPORT_REL);
+    std::fs::copy(&candidate_replay_report_path, &bundled_replay_report_path)
+        .expect("bundle module replay report");
+    record.job.verification.module_replay_reports[0].report_path =
+        bundled_replay_report_path.display().to_string();
+    std::fs::write(
+        &job_path,
+        serde_json::to_string_pretty(&record.job).expect("job json"),
+    )
+    .expect("write bundled replay report path");
+    sinomo_evolution::write_stored_job(&evolution_paths, &record).expect("write stored record");
+    let job_id = record.job.job_id.clone();
+
+    let module_wasm = root.join("candidate.wasm");
+    write_self_evolution_module_wasm_from_wat(
+        &record
+            .candidate_workspace
+            .path
+            .join(SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL),
+        &module_wasm,
+    );
+    super::sandbox_module_artifact_register_with_data_dir(
+        super::SandboxModuleArtifactRegisterOptions {
+            artifact_id: artifact_id.clone(),
+            source_path: module_wasm,
+            interface_version: Some(
+                sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string(),
+            ),
+            component_model: false,
+            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            sandbox_id: None,
+            argv: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            limits: sinomo_runtime::sandbox::SandboxResourceLimits::default(),
+            timeout_ms: Some(100),
+            rollout_material: Some(super::SandboxModuleArtifactRolloutMaterialOptions {
+                candidate_bundle_path: bundle_dir.clone(),
+                module_id: module_id.clone(),
+                active_artifact_id: active_artifact_id.clone(),
+                rollout_plan_id: Some(
+                    Id::from_legacy_named("rollout_module_candidate_flow").expect("rollout"),
+                ),
+                policy_decision_id: Some(
+                    Id::from_legacy_named("policy_module_candidate_flow").expect("policy"),
+                ),
+                module_version: "0.2.0".to_string(),
+                module_owner: "trigger".to_string(),
+                evidence_refs: vec!["module-replay://candidate-flow".to_string()],
+            }),
+        },
+        &root,
+    )
+    .expect("register module artifact");
+
+    let material_path =
+        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(&record.bundle);
+    let material: sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord =
+        serde_json::from_str(
+            &std::fs::read_to_string(&material_path).expect("candidate rollout material"),
+        )
+        .expect("material json");
+    let signer_public_key =
+        sinomo_runtime::module::artifact_signature_signer_public_key(&material.artifact)
+            .expect("material signer");
+    let signer = sinomo_runtime::registry::TrustedArtifactSigner::local_ed25519(
+        "sandbox-main-node",
+        signer_public_key,
+        "sandbox module artifact registration signer",
+    );
+    sinomo_runtime::registry::write_trusted_artifact_signers(&root, std::slice::from_ref(&signer))
+        .expect("write trusted signer");
+    sinomo_evolution::refresh_stored_candidate_bundle_integrity(&evolution_paths, &mut record)
+        .expect("refresh bundle integrity");
+
+    let recorded = sinomo_evolution::decide_stored_evolution_job(
+        &evolution_paths,
+        record.clone(),
+        sinomo_runtime::core::CandidateDecisionOutcome::Approved,
+        "test-reviewer",
+        "approve verified low-risk module artifact",
+    )
+    .expect("approve candidate");
+    let preflight = recorded
+        .record
+        .decision
+        .as_ref()
+        .and_then(|decision| decision.approval_preflight.as_ref())
+        .expect("approval preflight");
+    assert!(preflight.checks.iter().any(|check| {
+        check.name == "candidate-verified-rollout-material"
+            && check.outcome == EvaluationOutcome::Passed
+    }));
+    let bundle_record =
+        sinomo_runtime::registry::read_candidate_bundle_registry_record(&root, &job_id)
+            .expect("read bundle record")
+            .expect("bundle record");
+    let durable_material =
+        sinomo_runtime::registry::read_verified_candidate_rollout_material(&root, &job_id)
+            .expect("read durable material")
+            .expect("durable material");
+
+    let cluster_paths = sinomo_runtime::network::ClusterPaths::new(&data_dir);
+    cluster_paths.ensure().expect("cluster paths");
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_self_evolution_module_flow").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_self_evolution_module_flow").expect("node");
+    let cluster_state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "self evolution module flow",
+        node_id.clone(),
+        "local node",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+    sinomo_runtime::network::write_cluster_state(&cluster_paths, &cluster_state)
+        .expect("write cluster state");
+    sinomo_runtime::network::sync_cluster_state_to_local_raft_unchecked(
+        &cluster_paths,
+        &cluster_state,
+    )
+    .expect("sync cluster state");
+    let desired = sinomo_runtime::network::ClusterModuleRolloutDesiredRecord {
+        cluster_id: cluster_id.clone(),
+        state: "active".to_string(),
+        rollout_plan: durable_material.rollout_plan.clone(),
+        requested_by_node_id: node_id.clone(),
+        candidate_bundle_job_id: Some(job_id.clone()),
+        bundle_content_hash: Some(bundle_record.bundle_content_hash.clone()),
+        evidence_refs: vec![format!("registry://candidate-bundle/{job_id}")],
+        requested_at: Some("2026-06-01T00:00:00Z".to_string()),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    sinomo_runtime::network::sync_cluster_module_rollout_desired_to_kv(&cluster_paths, &desired)
+        .expect("sync desired rollout");
+
+    let reconciliations =
+        sinomo_runtime::daemon::run_daemon_module_rollout_desired_reconciliation_tick(
+            &DaemonPaths::with_root(root.join("daemon")),
+        )
+        .expect("reconcile desired rollout");
+    assert_eq!(reconciliations.len(), 1, "{reconciliations:?}");
+    assert_eq!(
+        reconciliations[0].state, "prepared",
+        "{}",
+        reconciliations[0].reason
+    );
+    let runtime_state = read_rollout_runtime_state(&SelfRolloutPaths::new(&root))
+        .expect("read rollout runtime")
+        .expect("rollout runtime");
+    assert_eq!(
+        reconciliations[0].candidate_bundle_job_id.as_ref(),
+        Some(&job_id)
+    );
+    assert_eq!(
+        runtime_state.loader_state.active_artifact_id,
+        active_artifact_id
+    );
+    assert_eq!(
+        runtime_state.loader_state.candidate_artifact_id.as_ref(),
+        Some(&artifact_id)
+    );
+    assert_eq!(
+        runtime_state.stage,
+        sinomo_runtime::rollout::RolloutStage::Shadow
+    );
+
+    let mut event_store = JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
+    event_store
+        .append(module_shadow_telemetry_event(
+            &node_id,
+            &module_id,
+            &active_artifact_id,
+            &artifact_id,
+            true,
+        ))
+        .expect("append shadow telemetry");
+    let shadow_transition = sinomo_runtime::daemon::run_daemon_rollout_telemetry_maintenance_tick(
+        &DaemonPaths::with_root(root.join("daemon")),
+    )
+    .expect("shadow telemetry tick")
+    .expect("shadow transition");
+    assert_eq!(
+        shadow_transition.transition.action,
+        RolloutAction::AdvanceCanary
+    );
+    let canary_state = read_rollout_runtime_state(&SelfRolloutPaths::new(&root))
+        .expect("read canary runtime")
+        .expect("canary runtime");
+    assert_eq!(canary_state.stage, RolloutStage::Canary);
+    assert_eq!(canary_state.current_weight_bps, 500);
+    let canary_module_state = read_module_loader_runtime_state(&root, &module_id)
+        .expect("read canary module state")
+        .expect("canary module state");
+    assert_eq!(canary_module_state.traffic_weight_bps, 500);
+    assert_eq!(canary_module_state.last_rollout_action, "advance-canary");
+
+    let candidate_route_key = candidate_canary_route_key(&root, &module_id);
+    let bad_candidate_outcome = invoke_bad_candidate_for_self_evolution_flow(
+        &root,
+        &module_id,
+        &active_artifact_id,
+        &artifact_id,
+        candidate_route_key,
+        &mut event_store,
+    );
+    assert_eq!(
+        bad_candidate_outcome.primary.lane,
+        sinomo_runtime::module::ModuleInvocationLane::Candidate
+    );
+    assert!(
+        bad_candidate_outcome
+            .primary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")),
+        "{bad_candidate_outcome:?}"
+    );
+    let rollback_transition =
+        sinomo_runtime::daemon::run_daemon_rollout_telemetry_maintenance_tick(
+            &DaemonPaths::with_root(root.join("daemon")),
+        )
+        .expect("canary telemetry tick")
+        .expect("rollback transition");
+    assert_eq!(
+        rollback_transition.transition.action,
+        RolloutAction::RollBack
+    );
+    assert!(rollback_transition.transition.reason.contains("timeout"));
+    let rolled_back_state = read_rollout_runtime_state(&SelfRolloutPaths::new(&root))
+        .expect("read rolled back runtime")
+        .expect("rolled back runtime");
+    assert_eq!(rolled_back_state.stage, RolloutStage::RolledBack);
+    assert_eq!(
+        rolled_back_state.loader_state.active_artifact_id,
+        active_artifact_id
+    );
+    assert_eq!(rolled_back_state.loader_state.candidate_artifact_id, None);
+    let rolled_back_module_state = read_module_loader_runtime_state(&root, &module_id)
+        .expect("read rolled back module state")
+        .expect("rolled back module state");
+    assert_eq!(rolled_back_module_state.traffic_weight_bps, 0);
+    assert_eq!(rolled_back_module_state.last_rollout_action, "rollback");
+    assert!(
+        std::fs::read_to_string(source_repo.join(SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL))
+            .expect("promoted candidate source")
+            .contains("br $spin")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+const SELF_EVOLUTION_ACTIVE_MODULE_WAT_REL: &str = "modules/trigger/silence_policy_active.wat";
+const SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL: &str =
+    "modules/trigger/silence_policy_candidate.wat";
+const SELF_EVOLUTION_MODULE_REPLAY_REPORT_REL: &str = "module-replay-report.json";
+
+fn create_self_evolution_test_source_repo(path: &Path) {
+    std::fs::create_dir_all(path).expect("source repo");
+    run_self_evolution_test_git(path, &["init"]);
+    run_self_evolution_test_git(path, &["config", "user.email", "sinomo@example.test"]);
+    run_self_evolution_test_git(path, &["config", "user.name", "Sinomo Test"]);
+    std::fs::write(path.join("README.md"), "# source\n").expect("source readme");
+    std::fs::create_dir_all(path.join("modules/trigger")).expect("module source dir");
+    std::fs::write(
+        path.join(SELF_EVOLUTION_ACTIVE_MODULE_WAT_REL),
+        self_evolution_active_module_wat(),
+    )
+    .expect("active module source");
+    std::fs::write(
+        path.join(SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL),
+        self_evolution_candidate_placeholder_module_wat(),
+    )
+    .expect("candidate module placeholder");
+    run_self_evolution_test_git(path, &["add", "README.md", "modules/trigger"]);
+    run_self_evolution_test_git(path, &["commit", "-m", "init"]);
+}
+
+fn run_self_evolution_test_git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {} failed\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[derive(Clone, Debug)]
+struct SelfEvolutionModuleAgentModel {
+    responses: std::sync::Arc<std::sync::Mutex<VecDeque<String>>>,
+}
+
+impl SelfEvolutionModuleAgentModel {
+    fn new(responses: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            responses: std::sync::Arc::new(std::sync::Mutex::new(
+                responses.into_iter().map(Into::into).collect(),
+            )),
+        }
+    }
+}
+
+impl InteractionModel for SelfEvolutionModuleAgentModel {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let content = self
+            .responses
+            .lock()
+            .expect("self-evolution model responses")
+            .pop_front()
+            .ok_or_else(|| LanguageModelError::ProviderInvocationFailed {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                detail: "no self-evolution fixture response queued".to_string(),
+            })?;
+        Ok(LanguageModelResponse {
+            provider: request.provider.clone(),
+            model: request.model.clone(),
+            content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
+            usage: Some(LanguageModelUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(17),
+            }),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SelfEvolutionModuleReplayCommandRunner {
+    data_dir_root: PathBuf,
+    module_id: Id,
+    active_artifact_id: Id,
+    candidate_artifact_id: Id,
+}
+
+impl sinomo_runtime::eval::CommandRunner for SelfEvolutionModuleReplayCommandRunner {
+    fn run(
+        &self,
+        command: &sinomo_runtime::core::VerificationCommand,
+        cwd: &Path,
+    ) -> Result<sinomo_runtime::eval::CommandRunResult, sinomo_runtime::eval::EvalError> {
+        if command.command != "sinomo-test:module-replay" {
+            return sinomo_runtime::eval::LocalCommandRunner::new().run(command, cwd);
+        }
+
+        let started = Instant::now();
+        let report_path = cwd.join(SELF_EVOLUTION_MODULE_REPLAY_REPORT_REL);
+        write_self_evolution_module_replay_report(
+            &self.data_dir_root,
+            cwd,
+            &report_path,
+            &self.module_id,
+            &self.active_artifact_id,
+            &self.candidate_artifact_id,
+        );
+        Ok(sinomo_runtime::eval::CommandRunResult {
+            run_id: Some("cmd_self_evolution_module_replay".to_string()),
+            name: command.name.clone(),
+            command: command.command.clone(),
+            expected_exit_code: command.expected_exit_code,
+            exit_code: 0,
+            stdout: format!("wrote module replay report {}\n", report_path.display()),
+            stderr: String::new(),
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+}
+
+fn write_self_evolution_module_wasm_from_wat(wat_path: &Path, wasm_path: &Path) {
+    let source = std::fs::read_to_string(wat_path).expect("module wat source");
+    let wasm = wat::parse_str(&source).expect("module wat compiles");
+    std::fs::write(wasm_path, wasm).expect("module wasm");
+}
+
+fn write_self_evolution_module_replay_report(
+    data_dir_root: &Path,
+    candidate_workspace_root: &Path,
+    report_path: &Path,
+    module_id: &Id,
+    active_artifact_id: &Id,
+    candidate_artifact_id: &Id,
+) {
+    let active_wasm = data_dir_root.join("active.wasm");
+    let candidate_wasm = data_dir_root.join("candidate-replay.wasm");
+    write_self_evolution_module_wasm_from_wat(
+        &candidate_workspace_root.join(SELF_EVOLUTION_ACTIVE_MODULE_WAT_REL),
+        &active_wasm,
+    );
+    write_self_evolution_module_wasm_from_wat(
+        &candidate_workspace_root.join(SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL),
+        &candidate_wasm,
+    );
+    register_self_evolution_replay_artifact(data_dir_root, active_artifact_id.clone(), active_wasm);
+    register_self_evolution_replay_artifact(
+        data_dir_root,
+        candidate_artifact_id.clone(),
+        candidate_wasm,
+    );
+    sinomo_runtime::module::write_module_loader_runtime_state(
+        data_dir_root,
+        &sinomo_runtime::module::ModuleLoaderRuntimeState {
+            node_id: NodeId::from_legacy_named("node_self_evolution_module_replay").expect("node"),
+            rollout_plan_id: Id::from_legacy_named("rollout_module_candidate_replay")
+                .expect("rollout"),
+            module_id: module_id.clone(),
+            loader_state: sinomo_runtime::core::ModuleLoaderState {
+                module_id: module_id.clone(),
+                active_artifact_id: active_artifact_id.clone(),
+                previous_artifact_id: None,
+                shadow_artifact_id: Some(candidate_artifact_id.clone()),
+                candidate_artifact_id: Some(candidate_artifact_id.clone()),
+                hot_swap_state: sinomo_runtime::core::HotSwapState::Shadowing,
+            },
+            traffic_weight_bps: 0,
+            last_rollout_action: "start-shadow".to_string(),
+            last_rollout_stage: "shadow".to_string(),
+            last_transition_record_id: Id::from_legacy_named("transition_module_candidate_replay")
+                .expect("transition"),
+            reason: "self-evolution sandbox replay evidence".to_string(),
+            applied_at: OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("time"),
+        },
+    )
+    .expect("write replay module loader state");
+    let fixture = sinomo_runtime::module::ModuleReplayFixture {
+        fixture_id: Id::from_legacy_named("fixture_module_candidate_flow").expect("fixture"),
+        module_id: module_id.clone(),
+        cases: vec![sinomo_runtime::module::ModuleReplayCase {
+            case_id: "case-1".to_string(),
+            route_key: "replay-session".to_string(),
+            input: "replay-safe".to_string(),
+            source_event: None,
+        }],
+    };
+    let report =
+        sinomo_sandbox_runtime::run_sandbox_wasm_module_replay_fixture(data_dir_root, &fixture)
+            .expect("sandbox module replay");
+    assert_eq!(report.missing_route_count, 0);
+    assert_eq!(report.primary_error_count, 0);
+    assert_eq!(report.shadow_error_count, 0);
+    assert_eq!(report.shadow_mismatch_count, 0);
+    assert_eq!(report.cases[0].shadow_matched, Some(true));
+    std::fs::write(
+        report_path,
+        serde_json::to_string_pretty(&report).expect("module replay report json"),
+    )
+    .expect("write module replay report");
+}
+
+fn self_evolution_candidate_module_source_patch() -> String {
+    codex_replace_file_patch(
+        SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL,
+        self_evolution_candidate_placeholder_module_wat(),
+        self_evolution_timeout_candidate_module_wat(),
+    )
+}
+
+fn codex_replace_file_patch(path: &str, old: &str, new: &str) -> String {
+    let mut patch = format!("*** Begin Patch\n*** Update File: {path}\n@@\n");
+    for line in old.lines() {
+        patch.push('-');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    for line in new.lines() {
+        patch.push('+');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    patch.push_str("*** End Patch");
+    patch
+}
+
+fn self_evolution_candidate_placeholder_module_wat() -> &'static str {
+    r#";; Placeholder candidate module source. The evolution agent replaces this
+;; with a low-risk silence-policy candidate before replay and rollout.
+(module
+  (func (export "_start")))
+"#
+}
+
+fn self_evolution_active_module_wat() -> &'static str {
+    r#";; Low-risk active module source used by the self-evolution rollout E2E.
+;; It returns a valid sinomo-module-v1 JSON result for any input.
+(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 128) "{\"status\":\"ok\",\"events_json\":[],\"metrics_json\":\"{}\"}\n")
+  (func $write_result
+    i32.const 0
+    i32.const 128
+    i32.store
+    i32.const 4
+    i32.const 53
+    i32.store
+    i32.const 1
+    i32.const 0
+    i32.const 1
+    i32.const 8
+    call $fd_write
+    drop)
+  (func (export "_start")
+    call $write_result))
+"#
+}
+
+fn self_evolution_timeout_candidate_module_wat() -> &'static str {
+    r#";; Low-risk candidate module source produced by the agent-backed evolution
+;; smoke path. It returns a valid sinomo-module-v1 JSON result for normal replay
+;; input, but spins when live canary input starts with `{`, producing timeout
+;; telemetry through the real routed invocation path.
+(module
+  (import "wasi_snapshot_preview1" "fd_read"
+    (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 128) "{\"status\":\"ok\",\"events_json\":[],\"metrics_json\":\"{}\"}\n")
+  (func $write_result
+    i32.const 0
+    i32.const 128
+    i32.store
+    i32.const 4
+    i32.const 53
+    i32.store
+    i32.const 1
+    i32.const 0
+    i32.const 1
+    i32.const 8
+    call $fd_write
+    drop)
+  (func (export "_start")
+    ;; iovec at 16: buffer ptr 256, len 8. nread at 24.
+    i32.const 16
+    i32.const 256
+    i32.store
+    i32.const 20
+    i32.const 8
+    i32.store
+    i32.const 0
+    i32.const 16
+    i32.const 1
+    i32.const 24
+    call $fd_read
+    drop
+    i32.const 24
+    i32.load
+    i32.const 0
+    i32.gt_u
+    if
+      i32.const 256
+      i32.load8_u
+      i32.const 123
+      i32.eq
+      if
+        (loop $spin
+          br $spin)
+      end
+    end
+    call $write_result))
+"#
+}
+
+fn register_self_evolution_replay_artifact(
+    data_dir_root: &Path,
+    artifact_id: Id,
+    source_path: PathBuf,
+) {
+    super::sandbox_module_artifact_register_with_data_dir(
+        super::SandboxModuleArtifactRegisterOptions {
+            artifact_id,
+            source_path,
+            interface_version: Some(
+                sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string(),
+            ),
+            component_model: false,
+            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            sandbox_id: None,
+            argv: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            limits: sinomo_runtime::sandbox::SandboxResourceLimits::default(),
+            timeout_ms: Some(100),
+            rollout_material: None,
+        },
+        data_dir_root,
+    )
+    .expect("register replay artifact");
 }
 
 #[test]
@@ -11604,6 +12726,99 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
             ..RolloutOptions::default()
         })
     );
+    assert_eq!(
+        parse_rollout_command(&[
+            "advance".to_string(),
+            "--node".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d5".to_string(),
+            "--scorecard".to_string(),
+            "/tmp/scorecard.json".to_string(),
+            "--incident".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
+            "--user-corrections".to_string(),
+            "2".to_string(),
+            "--rollback-trigger".to_string(),
+            "timeout".to_string(),
+            "--evidence".to_string(),
+            "manual://operator-note".to_string(),
+        ])
+        .expect("advance"),
+        RolloutCliCommand::Advance(RolloutAdvanceOptions {
+            node_id: Some(NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node")),
+            scorecard: Some(PathBuf::from("/tmp/scorecard.json")),
+            module_replay_report: None,
+            shadow_telemetry_limit: None,
+            incident_event_ids: vec![EventId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("event")],
+            user_correction_count: 2,
+            rollback_triggers: vec![RollbackTrigger::Timeout],
+            evidence_refs: vec!["manual://operator-note".to_string()],
+        })
+    );
+    assert_eq!(
+        parse_rollout_command(&[
+            "advance".to_string(),
+            "--module-replay-report".to_string(),
+            "/tmp/replay-report.json".to_string(),
+        ])
+        .expect("advance replay"),
+        RolloutCliCommand::Advance(RolloutAdvanceOptions {
+            node_id: None,
+            scorecard: None,
+            module_replay_report: Some(PathBuf::from("/tmp/replay-report.json")),
+            shadow_telemetry_limit: None,
+            incident_event_ids: Vec::new(),
+            user_correction_count: 0,
+            rollback_triggers: Vec::new(),
+            evidence_refs: Vec::new(),
+        })
+    );
+    assert_eq!(
+        parse_rollout_command(&[
+            "advance".to_string(),
+            "--shadow-telemetry".to_string(),
+            "--shadow-telemetry-limit".to_string(),
+            "25".to_string(),
+        ])
+        .expect("advance shadow telemetry"),
+        RolloutCliCommand::Advance(RolloutAdvanceOptions {
+            node_id: None,
+            scorecard: None,
+            module_replay_report: None,
+            shadow_telemetry_limit: Some(25),
+            incident_event_ids: Vec::new(),
+            user_correction_count: 0,
+            rollback_triggers: Vec::new(),
+            evidence_refs: Vec::new(),
+        })
+    );
+    assert_eq!(
+        parse_rollout_command(&[
+            "telemetry-gates".to_string(),
+            "set".to_string(),
+            "--disable-auto-promotion".to_string(),
+            "--event-limit".to_string(),
+            "250".to_string(),
+            "--min-events".to_string(),
+            "20".to_string(),
+            "--max-auto-weight-bps".to_string(),
+            "750".to_string(),
+            "--max-candidate-latency-p95-ms".to_string(),
+            "125".to_string(),
+        ])
+        .expect("telemetry gates set"),
+        RolloutCliCommand::TelemetryGatesSet(RolloutTelemetryGateSetOptions {
+            automatic_promotion_enabled: Some(false),
+            event_limit: Some(250),
+            minimum_event_count: Some(20),
+            maximum_automatic_weight_bps: Some(Some(750)),
+            maximum_candidate_latency_p95_ms: Some(Some(125)),
+        })
+    );
+    assert_eq!(
+        parse_rollout_command(&["telemetry-gates".to_string(), "show".to_string(),])
+            .expect("telemetry gates show"),
+        RolloutCliCommand::TelemetryGatesShow
+    );
 }
 
 #[test]
@@ -12373,6 +13588,365 @@ fn rollout_main_activation_without_shadow_requires_staged_binary() {
 }
 
 #[test]
+fn rollout_advance_with_data_dir_records_persisted_runtime_transition() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-advance-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let rollout_paths = SelfRolloutPaths::new(&root);
+    let node_id = NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node");
+    let artifact_id = Id::from_legacy_named("artifact_cli_rollout_candidate").expect("artifact");
+    let active_artifact_id = Id::from_legacy_named("artifact_cli_rollout_active").expect("active");
+    let module_id = Id::from_legacy_named("module.cli.rollout").expect("module");
+    let plan = RolloutPlan {
+        rollout_plan_id: Id::from_legacy_named("rollout_cli_advance").expect("rollout"),
+        artifact_id: artifact_id.clone(),
+        module_id,
+        target_ring: TrustRing::R3SandboxedModule,
+        strategy: RolloutStrategy::Shadow,
+        target_nodes: vec![node_id.clone()],
+        initial_weight_bps: 0,
+        promotion_steps_bps: vec![500],
+        rollback_policy: RollbackPolicy::default(),
+    };
+    let controller = RolloutController::new(node_id.clone());
+    let state = controller.initial_state(plan, active_artifact_id);
+    write_rollout_runtime_state(&rollout_paths, &state).expect("runtime state");
+
+    let scorecard = EvaluationScorecard {
+        scorecard_id: Id::from_legacy_named("score_cli_rollout_pass").expect("scorecard"),
+        baseline_artifact_id: None,
+        candidate_artifact_id: Some(artifact_id),
+        outcome: EvaluationOutcome::Passed,
+        gates: Vec::new(),
+        metrics: Vec::new(),
+    };
+    let scorecard_path = root.join("scorecard.json");
+    std::fs::write(
+        &scorecard_path,
+        serde_json::to_string_pretty(&scorecard).expect("scorecard json"),
+    )
+    .expect("write scorecard");
+
+    let applied = rollout_advance_with_data_dir(
+        &data_dir,
+        RolloutAdvanceOptions {
+            node_id: Some(node_id),
+            scorecard: Some(scorecard_path.clone()),
+            module_replay_report: None,
+            shadow_telemetry_limit: None,
+            incident_event_ids: Vec::new(),
+            user_correction_count: 0,
+            rollback_triggers: Vec::new(),
+            evidence_refs: vec!["manual://promotion-review".to_string()],
+        },
+    )
+    .expect("rollout advance");
+
+    assert_eq!(applied.transition.action, RolloutAction::AdvanceCanary);
+    assert_eq!(applied.transition.current_weight_bps, 500);
+    assert_eq!(
+        read_rollout_runtime_state(&rollout_paths)
+            .expect("read runtime")
+            .expect("runtime")
+            .current_weight_bps,
+        500
+    );
+    let transition = std::fs::read_to_string(&applied.transition_path).expect("transition record");
+    assert!(transition.contains("manual://promotion-review"));
+    assert!(transition.contains(&format!("scorecard:{}", scorecard_path.display())));
+    assert_eq!(applied.module_state.traffic_weight_bps, 500);
+    assert_eq!(
+        read_module_loader_runtime_state(&root, &applied.module_state.module_id)
+            .expect("read module state"),
+        Some(applied.module_state)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rollout_advance_with_data_dir_accepts_module_replay_report_evidence() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-advance-replay-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let rollout_paths = SelfRolloutPaths::new(&root);
+    let node_id = NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node");
+    let artifact_id =
+        Id::from_legacy_named("artifact_cli_rollout_replay_candidate").expect("artifact");
+    let active_artifact_id =
+        Id::from_legacy_named("artifact_cli_rollout_replay_active").expect("active");
+    let module_id = Id::from_legacy_named("module.cli.rollout.replay").expect("module");
+    let plan = RolloutPlan {
+        rollout_plan_id: Id::from_legacy_named("rollout_cli_advance_replay").expect("rollout"),
+        artifact_id: artifact_id.clone(),
+        module_id: module_id.clone(),
+        target_ring: TrustRing::R3SandboxedModule,
+        strategy: RolloutStrategy::Shadow,
+        target_nodes: vec![node_id.clone()],
+        initial_weight_bps: 0,
+        promotion_steps_bps: vec![250],
+        rollback_policy: RollbackPolicy::default(),
+    };
+    let controller = RolloutController::new(node_id.clone());
+    let state = controller.initial_state(plan, active_artifact_id.clone());
+    write_rollout_runtime_state(&rollout_paths, &state).expect("runtime state");
+
+    let report = ModuleReplayReport {
+        fixture_id: Id::from_legacy_named("fixture_cli_rollout_replay").expect("fixture"),
+        module_id,
+        cases: vec![ModuleReplayCaseOutcome {
+            case_id: "case-1".to_string(),
+            route_key: "default".to_string(),
+            source_event_id: None,
+            outcome: None,
+            shadow_matched: Some(true),
+        }],
+        replay_event_count: 1,
+        missing_route_count: 0,
+        primary_error_count: 0,
+        shadow_error_count: 0,
+        shadow_mismatch_count: 0,
+        events: Vec::new(),
+    };
+    let report_path = root.join("module-replay-report.json");
+    std::fs::write(
+        &report_path,
+        serde_json::to_string_pretty(&report).expect("report json"),
+    )
+    .expect("write report");
+
+    let applied = rollout_advance_with_data_dir(
+        &data_dir,
+        RolloutAdvanceOptions {
+            node_id: Some(node_id),
+            scorecard: None,
+            module_replay_report: Some(report_path.clone()),
+            shadow_telemetry_limit: None,
+            incident_event_ids: Vec::new(),
+            user_correction_count: 0,
+            rollback_triggers: Vec::new(),
+            evidence_refs: Vec::new(),
+        },
+    )
+    .expect("rollout advance");
+
+    assert_eq!(applied.transition.action, RolloutAction::AdvanceCanary);
+    assert_eq!(applied.transition.current_weight_bps, 250);
+    assert_eq!(applied.transition.active_artifact_id, active_artifact_id);
+    assert_eq!(applied.transition.candidate_artifact_id, Some(artifact_id));
+    let transition = std::fs::read_to_string(&applied.transition_path).expect("transition record");
+    assert!(transition.contains(&format!("module-replay-report:{}", report_path.display())));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rollout_advance_with_data_dir_accepts_shadow_telemetry_evidence() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-advance-shadow-telemetry-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let rollout_paths = SelfRolloutPaths::new(&root);
+    let node_id = NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node");
+    let artifact_id =
+        Id::from_legacy_named("artifact_cli_rollout_shadow_candidate").expect("artifact");
+    let active_artifact_id =
+        Id::from_legacy_named("artifact_cli_rollout_shadow_active").expect("active");
+    let module_id = Id::from_legacy_named("module.cli.rollout.shadow").expect("module");
+    let plan = RolloutPlan {
+        rollout_plan_id: Id::from_legacy_named("rollout_cli_advance_shadow").expect("rollout"),
+        artifact_id: artifact_id.clone(),
+        module_id: module_id.clone(),
+        target_ring: TrustRing::R3SandboxedModule,
+        strategy: RolloutStrategy::Shadow,
+        target_nodes: vec![node_id.clone()],
+        initial_weight_bps: 0,
+        promotion_steps_bps: vec![300],
+        rollback_policy: RollbackPolicy::default(),
+    };
+    let controller = RolloutController::new(node_id.clone());
+    let state = controller.initial_state(plan, active_artifact_id.clone());
+    write_rollout_runtime_state(&rollout_paths, &state).expect("runtime state");
+
+    let mut event_store = JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
+    event_store
+        .append(module_shadow_telemetry_event(
+            &node_id,
+            &module_id,
+            &active_artifact_id,
+            &artifact_id,
+            true,
+        ))
+        .expect("append event");
+    event_store
+        .append(module_shadow_telemetry_event(
+            &node_id,
+            &module_id,
+            &active_artifact_id,
+            &artifact_id,
+            true,
+        ))
+        .expect("append event");
+
+    let applied = rollout_advance_with_data_dir(
+        &data_dir,
+        RolloutAdvanceOptions {
+            node_id: Some(node_id),
+            scorecard: None,
+            module_replay_report: None,
+            shadow_telemetry_limit: Some(10),
+            incident_event_ids: Vec::new(),
+            user_correction_count: 0,
+            rollback_triggers: Vec::new(),
+            evidence_refs: Vec::new(),
+        },
+    )
+    .expect("rollout advance");
+
+    assert_eq!(applied.transition.action, RolloutAction::AdvanceCanary);
+    assert_eq!(applied.transition.current_weight_bps, 300);
+    assert_eq!(applied.transition.active_artifact_id, active_artifact_id);
+    assert_eq!(applied.transition.candidate_artifact_id, Some(artifact_id));
+    let transition = std::fs::read_to_string(&applied.transition_path).expect("transition record");
+    assert!(transition.contains("module-shadow-telemetry:events/event-log.jsonl?limit=10"));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rollout_telemetry_gates_set_with_data_dir_persists_config() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-telemetry-gates-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let rollout_paths = SelfRolloutPaths::new(&root);
+
+    let config = rollout_telemetry_gates_set_with_data_dir(
+        &data_dir,
+        RolloutTelemetryGateSetOptions {
+            automatic_promotion_enabled: Some(false),
+            event_limit: Some(250),
+            minimum_event_count: Some(20),
+            maximum_automatic_weight_bps: Some(None),
+            maximum_candidate_latency_p95_ms: Some(Some(125)),
+        },
+    )
+    .expect("set telemetry gates");
+    let stored = sinomo_runtime::rollout::read_rollout_telemetry_gate_config(&rollout_paths)
+        .expect("read telemetry gates")
+        .expect("telemetry gates");
+
+    assert_eq!(stored, config);
+    assert!(!stored.automatic_promotion_enabled);
+    assert_eq!(stored.event_limit, 250);
+    assert_eq!(stored.minimum_event_count, 20);
+    assert_eq!(stored.maximum_automatic_weight_bps, None);
+    assert_eq!(stored.maximum_candidate_latency_p95_ms, Some(125));
+    std::fs::remove_dir_all(root).ok();
+}
+
+fn candidate_canary_route_key(data_dir_root: &Path, module_id: &Id) -> String {
+    for index in 0..10_000 {
+        let route_key = format!("canary-session-{index}");
+        let route = route_module_invocation(
+            data_dir_root,
+            &ModuleRouteRequest {
+                module_id: module_id.clone(),
+                route_key: route_key.clone(),
+            },
+        )
+        .expect("route candidate canary invocation")
+        .expect("loader state");
+        if route.primary_lane == ModuleRouteLane::Candidate {
+            return route_key;
+        }
+    }
+    panic!("no candidate canary route found for {module_id}");
+}
+
+fn invoke_bad_candidate_for_self_evolution_flow(
+    data_dir_root: &Path,
+    module_id: &Id,
+    _active_artifact_id: &Id,
+    _candidate_artifact_id: &Id,
+    route_key: String,
+    event_store: &mut JsonlEventStore,
+) -> ModuleInvocationOutcome {
+    let runner =
+        sinomo_sandbox_runtime::SandboxWasmModuleArtifactRunner::from_data_dir(data_dir_root)
+            .expect("sandbox wasm module runner");
+    execute_routed_module_invocation_with_event_store(
+        data_dir_root,
+        &ModuleInvocationRequest {
+            module_id: module_id.clone(),
+            route_key,
+            input: "{}".to_string(),
+        },
+        &runner,
+        event_store,
+    )
+    .expect("execute sandbox bad candidate")
+    .expect("candidate route")
+}
+
+fn module_shadow_telemetry_event(
+    node_id: &NodeId,
+    module_id: &Id,
+    primary_artifact_id: &Id,
+    shadow_artifact_id: &Id,
+    matched: bool,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        EventId::generate(),
+        OffsetDateTime::now_utc(),
+        node_id.clone(),
+        Source::new("module.live").expect("valid source"),
+        EventKind::new(MODULE_SHADOW_DECISION_EVENT_KIND).expect("valid event kind"),
+        Salience::new(0.72).expect("valid salience"),
+        Confidence::new(0.95).expect("valid confidence"),
+        RoutingMetadata::new(
+            RoutingScope::TrustedNetwork,
+            LatencyClass::Background,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_target_node(node_id.clone())
+    .with_payload(serde_json::json!({
+        "case_id": null,
+        "route_key": "live-session",
+        "telemetry_source": "live",
+        "module_id": module_id.as_str(),
+        "primary_artifact_id": primary_artifact_id.as_str(),
+        "primary_lane": "active",
+        "shadow_artifact_id": shadow_artifact_id.as_str(),
+        "shadow_matched": matched,
+        "primary_output_bytes": 12,
+        "shadow_output_bytes": 12,
+        "primary_error": null,
+        "shadow_error": null,
+    }))
+}
+
+#[test]
 fn rollout_parser_reuses_daemon_endpoint_defaults() {
     assert_eq!(
         parse_rollout_command(&[
@@ -12791,6 +14365,10 @@ fn evolve_propose_parser_accepts_common_flags() {
         "crates/sinomo-eval/**".to_string(),
         "--verify".to_string(),
         "cargo test -p sinomo-eval".to_string(),
+        "--benchmark".to_string(),
+        "swebench:psf__requests-1142".to_string(),
+        "--module-replay-report".to_string(),
+        "trigger=reports/trigger-replay.json".to_string(),
         "--target-ring".to_string(),
         "r1".to_string(),
         "--dry-run".to_string(),
@@ -12802,6 +14380,11 @@ fn evolve_propose_parser_accepts_common_flags() {
     assert_eq!(options.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(options.allow, vec!["crates/sinomo-eval/**"]);
     assert_eq!(options.verify, vec!["cargo test -p sinomo-eval"]);
+    assert_eq!(options.benchmark, vec!["swebench:psf__requests-1142"]);
+    assert_eq!(
+        options.module_replay_report,
+        vec!["trigger=reports/trigger-replay.json"]
+    );
     assert_eq!(options.target_ring, TrustRing::R1TrustedRuntime);
     assert!(options.dry_run);
 }
@@ -12928,6 +14511,36 @@ fn evolve_tick_parser_accepts_phase_four_background_flags() {
 }
 
 #[test]
+fn evolve_trusted_signers_parser_accepts_registry_trust_commands() {
+    let list = super::parse_evolve_command(&[
+        "trusted-signers".to_string(),
+        "list".to_string(),
+        "--json".to_string(),
+    ])
+    .expect("trusted signer list");
+    assert!(matches!(
+        list,
+        super::EvolveCliCommand::TrustedSigners(super::TrustedSignersCliCommand::List(_))
+    ));
+
+    let publish =
+        super::parse_evolve_command(&["trust-signers".to_string(), "publish".to_string()])
+            .expect("trusted signer publish");
+    assert!(matches!(
+        publish,
+        super::EvolveCliCommand::TrustedSigners(super::TrustedSignersCliCommand::Publish)
+    ));
+
+    let hydrate =
+        super::parse_evolve_command(&["trusted-signers".to_string(), "hydrate".to_string()])
+            .expect("trusted signer hydrate");
+    assert!(matches!(
+        hydrate,
+        super::EvolveCliCommand::TrustedSigners(super::TrustedSignersCliCommand::Hydrate)
+    ));
+}
+
+#[test]
 fn evolve_tick_parser_rejects_cluster_identifier_flags() {
     let result = super::parse_background_tick_options(&[
         "--dry-run".to_string(),
@@ -13027,7 +14640,51 @@ fn evolve_iterate_parser_accepts_phase_two_dry_run_flags() {
         options.verification_commands,
         vec!["cargo test -p sinomo-evolution --lib".to_string()]
     );
+    assert!(options.provider.is_none());
+    assert!(options.model.is_none());
+    assert!(options.repo.is_none());
+    assert!(options.benchmark.is_empty());
+    assert!(options.module_replay_report.is_empty());
     assert!(options.dry_run);
+}
+
+#[test]
+fn evolve_iterate_parser_accepts_agent_execution_flags() {
+    let options = super::parse_iteration_options(&[
+        "--campaign".to_string(),
+        "camp_demo".to_string(),
+        "--task".to_string(),
+        "task_demo".to_string(),
+        "--repo".to_string(),
+        "/workspace/sinomo".to_string(),
+        "--provider".to_string(),
+        "deepseek".to_string(),
+        "--model".to_string(),
+        "deepseek-v4-pro".to_string(),
+        "--benchmark".to_string(),
+        "swebench:psf__requests-1142".to_string(),
+        "--module-replay-report".to_string(),
+        "reports/agent-replay.json".to_string(),
+        "--path".to_string(),
+        "crates/sinomo-agent/**".to_string(),
+    ])
+    .expect("iteration options");
+
+    assert_eq!(options.campaign_id, "camp_demo");
+    assert_eq!(options.task_id.as_deref(), Some("task_demo"));
+    assert_eq!(
+        options.repo.as_deref(),
+        Some(Path::new("/workspace/sinomo"))
+    );
+    assert_eq!(options.provider.as_deref(), Some("deepseek"));
+    assert_eq!(options.model.as_deref(), Some("deepseek-v4-pro"));
+    assert_eq!(options.benchmark, vec!["swebench:psf__requests-1142"]);
+    assert_eq!(
+        options.module_replay_report,
+        vec!["reports/agent-replay.json"]
+    );
+    assert_eq!(options.intended_paths, vec!["crates/sinomo-agent/**"]);
+    assert!(!options.dry_run);
 }
 
 #[test]
@@ -14098,6 +15755,129 @@ fn local_mode_writes_model_runtime_config_to_local_file_on_clustered_node() {
         sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
     );
     assert!(store.get(sinomo_lm::LM_RUNTIME_CONFIG_KV_KEY).is_none());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn trusted_signers_publish_and_hydrate_through_cluster_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-trusted-signers-cluster-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("registry_trust").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("registry_trust_node").expect("node")),
+            name: "registry trust".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+
+    let signer = sinomo_runtime::registry::TrustedArtifactSigner::local_ed25519(
+        "test-signer",
+        "test-public-key",
+        "test signer",
+    );
+    sinomo_runtime::registry::write_trusted_artifact_signers(
+        data_dir.root(),
+        std::slice::from_ref(&signer),
+    )
+    .expect("write local trusted signer");
+
+    let publish =
+        super::publish_trusted_signers_to_cluster(&data_dir).expect("publish trusted signers");
+    assert_eq!(publish.count, 1);
+    assert_eq!(
+        publish.destination,
+        sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX
+    );
+
+    let store = InProcessKvStore::restore(
+        sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
+    );
+    let entries =
+        store.range_prefix(sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX);
+    let signers = sinomo_runtime::registry::trusted_artifact_signers_from_kv_entries(&entries)
+        .expect("decode trusted signers");
+    assert_eq!(signers, vec![signer.clone()]);
+
+    sinomo_runtime::registry::write_trusted_artifact_signers(data_dir.root(), &[])
+        .expect("clear local trusted signers");
+    let hydrate =
+        super::hydrate_trusted_signers_from_cluster(&data_dir).expect("hydrate trusted signers");
+    assert_eq!(hydrate.count, 1);
+    assert_eq!(
+        sinomo_runtime::registry::read_trusted_artifact_signers(data_dir.root())
+            .expect("read local trusted signers"),
+        vec![signer]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_mode_lists_local_trusted_signers_on_clustered_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-trusted-signers-local-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(
+                ClusterId::from_legacy_named("local_registry_trust").expect("cluster"),
+            ),
+            node_id: Some(NodeId::from_legacy_named("local_registry_trust_node").expect("node")),
+            name: "local registry trust".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+
+    let local_signer = sinomo_runtime::registry::TrustedArtifactSigner::local_ed25519(
+        "local-signer",
+        "local-public-key",
+        "local signer",
+    );
+    sinomo_runtime::registry::write_trusted_artifact_signers(
+        data_dir.root(),
+        std::slice::from_ref(&local_signer),
+    )
+    .expect("write local trusted signer");
+
+    let cluster_signer = sinomo_runtime::registry::TrustedArtifactSigner::local_ed25519(
+        "cluster-signer",
+        "cluster-public-key",
+        "cluster signer",
+    );
+    let txn = sinomo_runtime::registry::trusted_artifact_signers_kv_txn(std::slice::from_ref(
+        &cluster_signer,
+    ))
+    .expect("trusted signer txn");
+    handle_daemon_cluster_kv_txn_request(&DaemonPaths::new(&data_dir), txn)
+        .expect("write cluster trusted signer");
+
+    let (_source, clustered) =
+        super::read_trusted_signers_for_node(&data_dir).expect("read cluster trusted signers");
+    assert_eq!(clustered, vec![cluster_signer]);
+
+    let (_source, local) = with_cli_force_local_mode(true, || {
+        assert!(!super::registry_trust_uses_cluster(&data_dir));
+        super::read_trusted_signers_for_node(&data_dir)
+    })
+    .expect("read local trusted signers");
+    assert_eq!(local, vec![local_signer]);
 
     std::fs::remove_dir_all(root).ok();
 }

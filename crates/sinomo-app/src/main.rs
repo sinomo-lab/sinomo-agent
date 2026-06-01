@@ -481,6 +481,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scorecard: Some(scorecard.clone()),
             incident_event_ids: Vec::new(),
             user_correction_count: 0,
+            rollback_triggers: Vec::new(),
         },
     );
     store.append(rollout_controller.decision_event(&rollout_decision))?;

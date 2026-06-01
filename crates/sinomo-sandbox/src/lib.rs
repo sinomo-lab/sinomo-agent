@@ -11,6 +11,7 @@ mod harness;
 mod http;
 mod internal;
 mod model;
+mod module_artifact;
 mod paths;
 mod policy;
 mod runtime;
@@ -28,6 +29,7 @@ pub use filesystem::*;
 pub use harness::*;
 pub use http::*;
 pub use model::*;
+pub use module_artifact::*;
 pub use paths::*;
 pub use policy::*;
 pub use runtime::{

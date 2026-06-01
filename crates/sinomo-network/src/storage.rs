@@ -337,6 +337,70 @@ pub struct ClusterRolloutDesiredRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterModuleRolloutStatusRecord {
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    pub rollout_plan_id: sinomo_core::Id,
+    pub module_id: sinomo_core::Id,
+    pub artifact_id: sinomo_core::Id,
+    pub stage: String,
+    pub current_weight_bps: u16,
+    pub active_artifact_id: sinomo_core::Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_artifact_id: Option<sinomo_core::Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_artifact_id: Option<sinomo_core::Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_artifact_id: Option<sinomo_core::Id>,
+    pub hot_swap_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_last_consumed_sequence: Option<EventSequence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_record_id: Option<sinomo_core::Id>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterModuleRolloutDesiredRecord {
+    pub cluster_id: ClusterId,
+    pub state: String,
+    pub rollout_plan: sinomo_core::RolloutPlan,
+    pub requested_by_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_bundle_job_id: Option<sinomo_core::Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterModuleRolloutReconciliationRecord {
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    pub rollout_plan_id: sinomo_core::Id,
+    pub module_id: sinomo_core::Id,
+    pub artifact_id: sinomo_core::Id,
+    pub state: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_bundle_job_id: Option<sinomo_core::Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_runtime_stage: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterNetworkInfoRecord {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
@@ -1590,6 +1654,70 @@ pub fn read_cluster_node_statuses_from_kv(
     }
     statuses.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(statuses)
+}
+
+pub fn read_cluster_module_rollout_statuses_from_kv(
+    paths: &ClusterPaths,
+) -> Result<Vec<ClusterModuleRolloutStatusRecord>, NetworkError> {
+    if !paths.kv_snapshot.exists() {
+        return Ok(Vec::new());
+    }
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    let mut statuses: Vec<ClusterModuleRolloutStatusRecord> = Vec::new();
+    for entry in store.range_prefix(&cluster_module_rollout_node_prefix()) {
+        statuses.push(entry.decode()?);
+    }
+    statuses.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.module_id.cmp(&right.module_id))
+            .then_with(|| left.rollout_plan_id.cmp(&right.rollout_plan_id))
+    });
+    Ok(statuses)
+}
+
+pub fn read_cluster_module_rollout_desired_from_kv(
+    paths: &ClusterPaths,
+) -> Result<Vec<ClusterModuleRolloutDesiredRecord>, NetworkError> {
+    if !paths.kv_snapshot.exists() {
+        return Ok(Vec::new());
+    }
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    let mut desired: Vec<ClusterModuleRolloutDesiredRecord> = Vec::new();
+    for entry in store.range_prefix(&cluster_module_rollout_desired_prefix()) {
+        desired.push(entry.decode()?);
+    }
+    desired.sort_by(|left, right| {
+        left.rollout_plan
+            .module_id
+            .cmp(&right.rollout_plan.module_id)
+            .then_with(|| {
+                left.rollout_plan
+                    .rollout_plan_id
+                    .cmp(&right.rollout_plan.rollout_plan_id)
+            })
+    });
+    Ok(desired)
+}
+
+pub fn read_cluster_module_rollout_reconciliations_from_kv(
+    paths: &ClusterPaths,
+) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, NetworkError> {
+    if !paths.kv_snapshot.exists() {
+        return Ok(Vec::new());
+    }
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    let mut reconciliations: Vec<ClusterModuleRolloutReconciliationRecord> = Vec::new();
+    for entry in store.range_prefix(&cluster_module_rollout_reconcile_prefix()) {
+        reconciliations.push(entry.decode()?);
+    }
+    reconciliations.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.module_id.cmp(&right.module_id))
+            .then_with(|| left.rollout_plan_id.cmp(&right.rollout_plan_id))
+    });
+    Ok(reconciliations)
 }
 
 pub fn read_cluster_network_info_from_kv(
@@ -3306,6 +3434,46 @@ pub fn cluster_rollout_node_key(node_id: &NodeId) -> String {
     format!("/cluster/rollout/nodes/{node_id}")
 }
 
+pub fn cluster_module_rollout_node_prefix() -> String {
+    "/cluster/module-rollouts/nodes/".to_string()
+}
+
+pub fn cluster_module_rollout_node_key(node_id: &NodeId, module_id: &sinomo_core::Id) -> String {
+    format!(
+        "{}{node_id}/{module_id}",
+        cluster_module_rollout_node_prefix()
+    )
+}
+
+pub fn cluster_module_rollout_desired_prefix() -> String {
+    "/cluster/module-rollouts/desired/".to_string()
+}
+
+pub fn cluster_module_rollout_desired_key(
+    module_id: &sinomo_core::Id,
+    rollout_plan_id: &sinomo_core::Id,
+) -> String {
+    format!(
+        "{}{module_id}/{rollout_plan_id}",
+        cluster_module_rollout_desired_prefix()
+    )
+}
+
+pub fn cluster_module_rollout_reconcile_prefix() -> String {
+    "/cluster/module-rollouts/reconcile/".to_string()
+}
+
+pub fn cluster_module_rollout_reconcile_key(
+    node_id: &NodeId,
+    module_id: &sinomo_core::Id,
+    rollout_plan_id: &sinomo_core::Id,
+) -> String {
+    format!(
+        "{}{node_id}/{module_id}/{rollout_plan_id}",
+        cluster_module_rollout_reconcile_prefix()
+    )
+}
+
 pub fn read_cluster_rollout_desired_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Option<ClusterRolloutDesiredRecord>, NetworkError> {
@@ -3418,6 +3586,52 @@ pub fn sync_cluster_rollout_node_to_kv(
         &state.local_node_id,
         cluster_rollout_node_key(node_id),
         status,
+    )
+}
+
+pub fn sync_cluster_module_rollout_node_to_kv(
+    paths: &ClusterPaths,
+    status: &ClusterModuleRolloutStatusRecord,
+) -> Result<KvSnapshot, NetworkError> {
+    let state = read_cluster_state_without_kv(paths)?;
+    put_cluster_kv_value(
+        paths,
+        &state.local_node_id,
+        cluster_module_rollout_node_key(&status.node_id, &status.module_id),
+        status,
+    )
+}
+
+pub fn sync_cluster_module_rollout_desired_to_kv(
+    paths: &ClusterPaths,
+    desired: &ClusterModuleRolloutDesiredRecord,
+) -> Result<KvSnapshot, NetworkError> {
+    let state = read_cluster_state_without_kv(paths)?;
+    put_cluster_kv_value(
+        paths,
+        &state.local_node_id,
+        cluster_module_rollout_desired_key(
+            &desired.rollout_plan.module_id,
+            &desired.rollout_plan.rollout_plan_id,
+        ),
+        desired,
+    )
+}
+
+pub fn sync_cluster_module_rollout_reconciliation_to_kv(
+    paths: &ClusterPaths,
+    reconciliation: &ClusterModuleRolloutReconciliationRecord,
+) -> Result<KvSnapshot, NetworkError> {
+    let state = read_cluster_state_without_kv(paths)?;
+    put_cluster_kv_value(
+        paths,
+        &state.local_node_id,
+        cluster_module_rollout_reconcile_key(
+            &reconciliation.node_id,
+            &reconciliation.module_id,
+            &reconciliation.rollout_plan_id,
+        ),
+        reconciliation,
     )
 }
 

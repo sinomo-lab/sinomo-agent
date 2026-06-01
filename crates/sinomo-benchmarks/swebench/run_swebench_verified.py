@@ -214,6 +214,181 @@ def evaluate_predictions(args: argparse.Namespace, predictions_path: Path, suite
     run_command(command, cwd=evaluation_dir, dry_run=args.dry_run)
 
 
+def collect_official_evaluation_summary(args: argparse.Namespace, suite: dict) -> dict:
+    evaluation_dir = args.results_dir / "evaluation"
+    instance_ids = [item["instance_id"] for item in suite["instances"]]
+    summary = {
+        "requested": bool(args.evaluate),
+        "results_dir": str(evaluation_dir),
+        "parse_status": "not-requested" if not args.evaluate else "not-run",
+        "resolved_instances": None,
+        "unresolved_instances": None,
+        "error_instances": None,
+        "summary_path": None,
+    }
+    if not args.evaluate:
+        return summary
+    if args.dry_run:
+        summary["parse_status"] = "dry-run"
+        return summary
+    if not evaluation_dir.exists():
+        summary["parse_status"] = "missing-results-dir"
+        return summary
+
+    parsed = parse_official_evaluation_results(evaluation_dir, instance_ids)
+    summary.update(parsed)
+    return summary
+
+
+def parse_official_evaluation_results(evaluation_dir: Path, instance_ids: list[str]) -> dict:
+    wanted = set(instance_ids)
+    resolved: set[str] = set()
+    unresolved: set[str] = set()
+    errors: set[str] = set()
+    summary_path: Path | None = None
+    for path in sorted(evaluation_dir.rglob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        before = (len(resolved), len(unresolved), len(errors))
+        resolved.update(extract_id_list(payload, wanted, {"resolved_ids", "resolved"}))
+        unresolved.update(extract_id_list(payload, wanted, {"unresolved_ids", "unresolved"}))
+        errors.update(extract_id_list(payload, wanted, {"error_ids", "errored_ids", "failed_ids"}))
+        for instance_id, was_resolved in extract_instance_resolution_flags(payload, path, wanted):
+            if was_resolved:
+                resolved.add(instance_id)
+            else:
+                unresolved.add(instance_id)
+        after = (len(resolved), len(unresolved), len(errors))
+        if after != before and summary_path is None:
+            summary_path = path
+
+    resolved &= wanted
+    unresolved &= wanted
+    errors &= wanted
+    if resolved or unresolved or errors:
+        unresolved.update(wanted.difference(resolved).difference(errors))
+        return {
+            "parse_status": "parsed",
+            "resolved_instances": len(resolved),
+            "unresolved_instances": len(unresolved),
+            "error_instances": len(errors),
+            "summary_path": str(summary_path) if summary_path else None,
+        }
+    return {
+        "parse_status": "unparsed",
+        "resolved_instances": None,
+        "unresolved_instances": None,
+        "error_instances": None,
+        "summary_path": None,
+    }
+
+
+def extract_id_list(payload: object, wanted: set[str], keys: set[str]) -> set[str]:
+    found: set[str] = set()
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in keys:
+                found.update(ids_from_value(value, wanted))
+            else:
+                found.update(extract_id_list(value, wanted, keys))
+    elif isinstance(payload, list):
+        for value in payload:
+            found.update(extract_id_list(value, wanted, keys))
+    return found
+
+
+def ids_from_value(value: object, wanted: set[str]) -> set[str]:
+    if isinstance(value, str):
+        return {value} if value in wanted else set()
+    if isinstance(value, list):
+        ids: set[str] = set()
+        for item in value:
+            ids.update(ids_from_value(item, wanted))
+        return ids
+    if isinstance(value, dict):
+        return {key for key in value.keys() if key in wanted}
+    return set()
+
+
+def extract_instance_resolution_flags(
+    payload: object,
+    path: Path,
+    wanted: set[str],
+) -> list[tuple[str, bool]]:
+    flags: list[tuple[str, bool]] = []
+    if isinstance(payload, dict):
+        instance_id = payload.get("instance_id")
+        resolved = payload.get("resolved")
+        if isinstance(instance_id, str) and instance_id in wanted and isinstance(resolved, bool):
+            flags.append((instance_id, resolved))
+        for key, value in payload.items():
+            if key in wanted and isinstance(value, dict):
+                resolved = value.get("resolved")
+                if isinstance(resolved, bool):
+                    flags.append((key, resolved))
+            flags.extend(extract_instance_resolution_flags(value, path, wanted))
+    elif isinstance(payload, list):
+        for value in payload:
+            flags.extend(extract_instance_resolution_flags(value, path, wanted))
+    else:
+        for instance_id in wanted:
+            if instance_id in path.name:
+                return []
+    return flags
+
+
+def write_summary(
+    args: argparse.Namespace,
+    suite: dict,
+    *,
+    predictions_path: Path | None,
+    mini_predictions_path: Path | None,
+) -> None:
+    if not args.summary_out:
+        return
+    instance_ids = [item["instance_id"] for item in suite["instances"]]
+    reports_dir = args.results_dir / "sinomo" / "reports"
+    reports = []
+    for instance_id in instance_ids:
+        report_path = reports_dir / f"{instance_id}.json"
+        if report_path.exists():
+            reports.append(json.loads(report_path.read_text(encoding="utf-8")))
+    official_evaluation = collect_official_evaluation_summary(args, suite)
+    sinomo_summary = {
+        "prediction_path": str(predictions_path) if predictions_path else None,
+        "report_dir": str(reports_dir),
+        "report_count": len(reports),
+        "error_instances": len(instance_ids) - len(reports),
+        "resolved_instances": official_evaluation.get("resolved_instances"),
+        "unresolved_instances": official_evaluation.get("unresolved_instances"),
+        "agent_model_turns": sum(int(report.get("model_turns", 0)) for report in reports),
+        "agent_tool_results": sum(int(report.get("tool_results", 0)) for report in reports),
+        "agent_input_tokens": sum(int(report.get("agent_input_tokens", 0)) for report in reports),
+        "agent_output_tokens": sum(int(report.get("agent_output_tokens", 0)) for report in reports),
+    }
+    summary = {
+        "benchmark": "swebench",
+        "suite": suite["name"],
+        "dataset": suite["dataset"],
+        "split": suite["split"],
+        "instances": instance_ids,
+        "total_instances": len(instance_ids),
+        "mode": args.mode,
+        "results_dir": str(args.results_dir),
+        "sinomo": sinomo_summary,
+        "mini_swe_agent": {
+            "prediction_path": str(mini_predictions_path) if mini_predictions_path else None,
+        },
+        "official_evaluation": official_evaluation,
+    }
+    if not args.dry_run:
+        args.summary_out.parent.mkdir(parents=True, exist_ok=True)
+        args.summary_out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"summary: {args.summary_out}")
+
+
 def print_plan(args: argparse.Namespace, suite: dict) -> None:
     instance_ids = [item["instance_id"] for item in suite["instances"]]
     print(json.dumps({
@@ -252,10 +427,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--environment-class", choices=["docker", "singularity", "bubblewrap", "local"], default=None)
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--run-id", default="sinomo-deepseek-v4-flash-verified-10")
+    parser.add_argument("--summary-out", type=Path, help="write a machine-readable benchmark summary JSON")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     args.results_dir = args.results_dir.resolve()
     args.sinomo_agent_bin = args.sinomo_agent_bin.resolve()
+    if args.summary_out:
+        args.summary_out = args.summary_out.resolve()
     return args
 
 
@@ -265,14 +443,21 @@ def main() -> int:
     suite = select_suite_instances(suite, instance_id=args.instance_id, limit=args.limit)
     print_plan(args, suite)
     predictions_path: Path | None = None
+    mini_predictions_path: Path | None = None
     if args.mode in {"sinomo", "both"}:
         predictions_path = run_sinomo(args, suite)
     if args.mode in {"mini", "both"}:
-        run_mini(args, suite)
+        mini_predictions_path = run_mini(args, suite)
     if args.evaluate:
         if predictions_path is None:
             predictions_path = args.results_dir / "sinomo" / "predictions.jsonl"
         evaluate_predictions(args, predictions_path, suite)
+    write_summary(
+        args,
+        suite,
+        predictions_path=predictions_path,
+        mini_predictions_path=mini_predictions_path,
+    )
     return 0
 
 

@@ -6,8 +6,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{
-    CandidateBundleManifest, CandidateDecision, CandidateDecisionOutcome, EvaluationOutcome,
-    EvaluationScorecard, EvolutionJob, EvolutionJobStatus,
+    CandidateApprovalPreflightReport, CandidateBundleManifest, CandidateDecision,
+    CandidateDecisionOutcome, EvaluationOutcome, EvaluationScorecard, EvolutionJob,
+    EvolutionJobStatus,
 };
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::local::SinomoDataDir;
@@ -69,6 +70,7 @@ pub enum StoredJobArtifactKind {
 
 #[derive(Clone, Debug)]
 pub struct EvolutionPaths {
+    pub data_dir: PathBuf,
     pub root: PathBuf,
     pub jobs: PathBuf,
     pub campaigns: PathBuf,
@@ -78,8 +80,10 @@ pub struct EvolutionPaths {
 
 impl EvolutionPaths {
     pub fn new(data_dir: &SinomoDataDir) -> Self {
-        let root = data_dir.root().join("evolution");
+        let data_dir_root = data_dir.root().to_path_buf();
+        let root = data_dir_root.join("evolution");
         Self {
+            data_dir: data_dir_root,
             jobs: root.join("jobs"),
             campaigns: root.join("campaigns"),
             logs: root.join("logs"),
@@ -156,6 +160,8 @@ pub struct CampaignBundlePaths {
     pub lease_decisions_jsonl: PathBuf,
     pub iteration_plan_json: PathBuf,
     pub iteration_request_json: PathBuf,
+    pub iteration_result_json: PathBuf,
+    pub iteration_results_jsonl: PathBuf,
     pub iteration_dispatches_jsonl: PathBuf,
     pub stage_scorecard_json: PathBuf,
     pub stage_scorecards_jsonl: PathBuf,
@@ -180,6 +186,8 @@ impl CampaignBundlePaths {
             lease_decisions_jsonl: root.join("lease-decisions.jsonl"),
             iteration_plan_json: root.join("iteration-plan.json"),
             iteration_request_json: root.join("iteration-request.json"),
+            iteration_result_json: root.join("iteration-result.json"),
+            iteration_results_jsonl: root.join("iteration-results.jsonl"),
             iteration_dispatches_jsonl: root.join("iteration-dispatches.jsonl"),
             stage_scorecard_json: root.join("stage-scorecard.json"),
             stage_scorecards_jsonl: root.join("stage-scorecards.jsonl"),
@@ -230,12 +238,23 @@ pub fn write_stored_job(
 
 pub fn record_candidate_decision(
     paths: &EvolutionPaths,
-    mut record: StoredEvolutionJob,
+    record: StoredEvolutionJob,
     outcome: CandidateDecisionOutcome,
     decided_by: impl Into<String>,
     note: impl Into<String>,
 ) -> Result<RecordedCandidateDecision, EvolutionPersistenceError> {
-    let decision = CandidateDecision::new(
+    record_candidate_decision_with_preflight(paths, record, outcome, decided_by, note, None)
+}
+
+pub fn record_candidate_decision_with_preflight(
+    paths: &EvolutionPaths,
+    mut record: StoredEvolutionJob,
+    outcome: CandidateDecisionOutcome,
+    decided_by: impl Into<String>,
+    note: impl Into<String>,
+    approval_preflight: Option<CandidateApprovalPreflightReport>,
+) -> Result<RecordedCandidateDecision, EvolutionPersistenceError> {
+    let mut decision = CandidateDecision::new(
         &record.job,
         outcome,
         decided_by,
@@ -245,6 +264,7 @@ pub fn record_candidate_decision(
         record.changed_files.clone(),
         note,
     );
+    decision.approval_preflight = approval_preflight;
     let decision_path = PathBuf::from(&record.bundle.bundle_path).join("approval-decision.json");
     write_json(&decision_path, &decision)?;
     record.job.status = decision.resulting_status.clone();
@@ -614,6 +634,25 @@ pub fn write_campaign_iteration_dry_run(
     Ok(bundle)
 }
 
+pub fn write_campaign_iteration_evaluation(
+    paths: &EvolutionPaths,
+    plan: &ScheduledIterationPlan,
+    update: &StageEvaluationUpdate,
+) -> Result<CampaignBundlePaths, EvolutionPersistenceError> {
+    let bundle = write_campaign_stage_evaluation(paths, update)?;
+    write_json(&bundle.iteration_plan_json, plan)?;
+    write_json(&bundle.iteration_request_json, &plan.evolution_request)?;
+    write_jsonl(
+        &bundle.iteration_dispatches_jsonl,
+        std::slice::from_ref(plan),
+    )?;
+    if let Some(result) = update.campaign.iteration_results.last() {
+        write_json(&bundle.iteration_result_json, result)?;
+        append_jsonl(&bundle.iteration_results_jsonl, result)?;
+    }
+    Ok(bundle)
+}
+
 pub fn write_campaign_stage_evaluation(
     paths: &EvolutionPaths,
     update: &StageEvaluationUpdate,
@@ -825,6 +864,7 @@ mod tests {
                 },
                 verification: VerificationPlan {
                     commands: Vec::new(),
+                    module_replay_reports: Vec::new(),
                 },
                 recovery: RecoveryPlan::default(),
                 scope: EvolutionScope {
@@ -855,9 +895,18 @@ mod tests {
                     .to_string(),
                 job_path: Some(job_artifact.display().to_string()),
                 model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: None,
                 diff_path: None,
                 scorecard_path: None,
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -916,6 +965,7 @@ mod tests {
                 },
                 verification: VerificationPlan {
                     commands: Vec::new(),
+                    module_replay_reports: Vec::new(),
                 },
                 recovery: RecoveryPlan::default(),
                 scope: EvolutionScope {
@@ -946,9 +996,18 @@ mod tests {
                     .to_string(),
                 job_path: None,
                 model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: None,
                 diff_path: None,
                 scorecard_path: None,
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -1019,6 +1078,7 @@ mod tests {
                 },
                 verification: VerificationPlan {
                     commands: Vec::new(),
+                    module_replay_reports: Vec::new(),
                 },
                 recovery: RecoveryPlan::default(),
                 scope: EvolutionScope {
@@ -1043,9 +1103,18 @@ mod tests {
                 mutation_packet_path: packet.display().to_string(),
                 job_path: None,
                 model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: None,
                 diff_path: Some(diff.display().to_string()),
                 scorecard_path: None,
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -1118,6 +1187,107 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn write_campaign_iteration_evaluation_persists_iteration_and_stage_artifacts() {
+        let root = temp_dir("campaign-iteration-evaluation");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let mut campaign = crate::propose_evolution_campaign(crate::CampaignProposalRequest {
+            objective: "connect campaign iteration to candidate evaluation".to_string(),
+            horizon: "14 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![crate::ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some(root.display().to_string()),
+        });
+        campaign.status = crate::EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let plan = crate::prepare_scheduled_iteration(crate::ScheduledIterationRequest {
+            campaign: campaign.clone(),
+            task_id: Some(task_id.clone()),
+            intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+            extra_verification_commands: vec!["cargo test -p sinomo-evolution".to_string()],
+            dry_run: false,
+        })
+        .expect("iteration plan");
+        let mut record = stored_record_fixture(&root, EvolutionJobStatus::AwaitingApproval);
+        record.job.objective = plan.evolution_request.objective.clone();
+        record.job.target_ring = campaign.target_ring.clone();
+        record.changed_files = vec!["crates/sinomo-evolution/src/engine.rs".to_string()];
+        record.bundle.scorecard_path = Some(
+            root.join("bundle")
+                .join("scorecard.json")
+                .display()
+                .to_string(),
+        );
+        record.bundle.changed_files_path = Some(
+            root.join("bundle")
+                .join("changed-files.json")
+                .display()
+                .to_string(),
+        );
+        let report = EvolutionReport {
+            job: record.job,
+            candidate_workspace: record.candidate_workspace,
+            bundle: record.bundle,
+            scorecard: Some(EvaluationScorecard {
+                scorecard_id: ScorecardId::generate(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+                outcome: EvaluationOutcome::Passed,
+                gates: Vec::new(),
+                metrics: Vec::new(),
+            }),
+            changed_files: record.changed_files,
+        };
+        let update = crate::evaluate_campaign_stage(crate::StageEvaluationRequest {
+            campaign,
+            task_id: task_id.clone(),
+            report,
+            resource_usage: Vec::new(),
+            failure_class: None,
+            root_cause_summary: None,
+            what_was_learned: Vec::new(),
+        });
+
+        let bundle = write_campaign_iteration_evaluation(&paths, &plan, &update)
+            .expect("iteration evaluation artifacts");
+
+        assert!(bundle.iteration_plan_json.exists());
+        assert!(bundle.iteration_request_json.exists());
+        assert!(bundle.iteration_result_json.exists());
+        assert!(bundle.iteration_results_jsonl.exists());
+        assert!(bundle.stage_scorecard_json.exists());
+        let result: crate::EvolutionIterationResult =
+            read_json_file(&bundle.iteration_result_json).expect("iteration result");
+        assert_eq!(result.task_id, task_id);
+        assert_eq!(
+            fs::read_to_string(&bundle.iteration_results_jsonl)
+                .expect("iteration results jsonl")
+                .lines()
+                .count(),
+            1
+        );
+        let stored: EvolutionCampaign =
+            read_json_file(&bundle.campaign_json).expect("campaign json");
+        assert_eq!(stored.iteration_results.len(), 1);
+        assert!(
+            fs::read_to_string(&bundle.stage_scorecards_jsonl)
+                .expect("stage scorecards jsonl")
+                .contains(&stored.campaign_id)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1141,6 +1311,7 @@ mod tests {
                 },
                 verification: VerificationPlan {
                     commands: Vec::new(),
+                    module_replay_reports: Vec::new(),
                 },
                 recovery: RecoveryPlan::default(),
                 scope: EvolutionScope {
@@ -1177,9 +1348,18 @@ mod tests {
                     .to_string(),
                 job_path: None,
                 model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: None,
                 diff_path: None,
                 scorecard_path: None,
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },

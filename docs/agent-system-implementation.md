@@ -12,7 +12,7 @@ The checked-in bridge supports:
 - vision requests with an image path or base64 image payload;
 - audio and duplex request modes in the stable schema;
 - a probe mode for dependency diagnostics;
-- a mock mode for CI and benchmark harness smoke tests without downloading the 9B model.
+- a mock mode for local smoke tests and benchmark harness checks without downloading the 9B model.
 
 MiniCPM-o remains the first configured backend (`--provider minicpm-o`), but the bridge is intentionally named around the implementation boundary: any local PyTorch/Transformers model that can satisfy the request schema can be hosted behind `sinomo-pytorch-bridge` or `sinomo-pytorch-server`. Product runtime configuration is cluster-scoped and stored in cluster KV at `/config/lm/runtime`; use `sinomo models runtime set` instead of environment variables for model paths, device choices, and token budgets. During feature testing, prefix commands with `sinomo --local` to force local file-backed settings even on a clustered node; model runtime settings then live at `$SINOMO_DATA_DIR/config/models-runtime.json`.
 
@@ -122,7 +122,7 @@ sinomo agent run --provider codex --model gpt-5.2-codex --prompt "Summarize the 
 sinomo --local agent run --provider deepseek --model deepseek-v4-flash --prompt "Summarize the current repo status."
 ```
 
-`--local` is a global CLI flag. It bypasses cluster quorum/orphan guards for local-capable commands and reads or writes local config instead of cluster KV. This is useful for testing provider authentication, default model selection, runtime model settings, sandbox policy, and local-owned DFS data on a node that may already be part of a cluster. Local model/provider files are under `$SINOMO_DATA_DIR/config/` (`models.json`, `models-runtime.json`, and `sandbox-policy.json`), while provider API-key credentials remain under the local provider credentials directory.
+`--local` is a global CLI flag. It bypasses cluster quorum/orphan guards for local-capable commands and reads or writes local config instead of cluster KV. This is useful for testing provider authentication, default model selection, runtime model settings, sandbox policy, registry trusted signer records, and local-owned DFS data on a node that may already be part of a cluster. Local model/provider files are under `$SINOMO_DATA_DIR/config/` (`models.json`, `models-runtime.json`, and `sandbox-policy.json`), registry trusted signer records live at `$SINOMO_DATA_DIR/registry/trusted-artifact-signers.json`, and provider API-key credentials remain under the local provider credentials directory.
 
 ## Benchmark Harnesses
 

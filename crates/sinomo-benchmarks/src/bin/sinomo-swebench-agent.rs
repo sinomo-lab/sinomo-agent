@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sinomo_agent::{
-    Agent, AgentConfig, AgentContextBudget, AgentLoopInput, AgentPolicyBundle, AgentRole,
-    AgentStoragePaths, AgentToolRegistry, BoundedContext, InteractionModel, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
+    Agent, AgentConfig, AgentContextBudget, AgentLoopInput, AgentModelEvent, AgentPolicyBundle,
+    AgentRole, AgentStoragePaths, AgentToolRegistry, BoundedContext, InteractionModel,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
     default_coding_agent_tools, user_interaction_input_event,
 };
 use sinomo_lm::{
@@ -87,6 +87,8 @@ struct SweBenchAgentReport {
     stop_reason: String,
     model_turns: usize,
     tool_results: usize,
+    agent_input_tokens: u64,
+    agent_output_tokens: u64,
     final_text: String,
 }
 
@@ -176,6 +178,7 @@ fn run() -> Result<(), String> {
         tool_specs: default_coding_agent_tools(),
     };
     let run = agent.run(&input).map_err(|source| source.to_string())?;
+    let (agent_input_tokens, agent_output_tokens) = agent_usage_totals(&run);
     add_untracked_to_diff(&options.workspace)?;
     let patch = git_output(&options.workspace, &["diff", "--binary", "--"])?;
     let prediction = SweBenchPrediction {
@@ -202,10 +205,33 @@ fn run() -> Result<(), String> {
         stop_reason: format!("{:?}", run.stop_reason),
         model_turns: run.model_turns.len(),
         tool_results: run.tool_results.len(),
+        agent_input_tokens,
+        agent_output_tokens,
         final_text: run.final_decision.text,
     };
     write_json(&options.report_out, &report)?;
     Ok(())
+}
+
+fn agent_usage_totals(run: &sinomo_agent::AgentRun) -> (u64, u64) {
+    run.model_events
+        .iter()
+        .filter_map(|event| {
+            if let AgentModelEvent::Usage {
+                usage: Some(usage), ..
+            } = event
+            {
+                Some((
+                    usage.input_tokens.unwrap_or_default(),
+                    usage.output_tokens.unwrap_or_default(),
+                ))
+            } else {
+                None
+            }
+        })
+        .fold((0, 0), |(input_total, output_total), (input, output)| {
+            (input_total + input, output_total + output)
+        })
 }
 
 fn parse_options(args: Vec<String>) -> Result<Options, String> {

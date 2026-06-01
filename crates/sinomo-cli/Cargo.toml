@@ -30,3 +30,7 @@ sinomo-pytorch = { path = "../sinomo-pytorch" }
 time.workspace = true
 sinomo-runtime = { path = "../sinomo-runtime" }
 tokenizers = { version = "0.22.2", optional = true }
+
+[dev-dependencies]
+sinomo-sandbox-runtime = { path = "../sinomo-sandbox-runtime" }
+wat = "1.248.0"

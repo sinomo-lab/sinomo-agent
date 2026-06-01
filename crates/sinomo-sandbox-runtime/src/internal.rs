@@ -4,6 +4,8 @@
 //! own execution/runtime impl, so the moved backend modules keep `use
 //! crate::internal::*` unchanged.
 
+#![allow(unused_imports)]
+
 pub(crate) use sinomo_sandbox::*;
 
 pub(crate) use crate::execution::*;

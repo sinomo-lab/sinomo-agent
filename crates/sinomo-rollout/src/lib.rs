@@ -19,8 +19,12 @@ pub use artifact::{
     stage_rollout_bytes, stage_rollout_file, stage_rollout_file_with_retry,
 };
 pub use controller::{
-    RolloutAction, RolloutController, RolloutDecision, RolloutObservation, RolloutRuntimeState,
-    RolloutStage,
+    AppliedRolloutTransition, DEFAULT_SHADOW_TELEMETRY_LIMIT, RolloutAction, RolloutController,
+    RolloutDecision, RolloutObservation, RolloutRuntimeState, RolloutStage,
+    RolloutTelemetryAdvanceOptions, RolloutTelemetryAdvanceResult, RolloutTelemetryAdvanceStatus,
+    VerifiedCandidateRolloutPreparation, VerifiedCandidateRolloutRequest,
+    canary_telemetry_scorecard_from_event_store, canary_telemetry_scorecard_from_events,
+    shadow_telemetry_scorecard_from_event_store, shadow_telemetry_scorecard_from_events,
 };
 pub use error::RolloutError;
 pub use paths::{SelfRolloutPaths, SelfRolloutPlan, ensure_rollout_layout, executable_name};
@@ -41,15 +45,21 @@ pub use source::{
 };
 pub use state::{
     PendingShadowRollout, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
-    RolloutFailureDiagnostics, RolloutMainActivation, RolloutMainExitRecord,
-    read_pending_shadow_rollout, read_rollout_main_activation, read_rollout_main_exit,
-    read_rollout_status, read_tail_lossy, record_activation_failure, record_main_activation_staged,
-    record_main_rollout_failure, record_main_rollout_failure_with_diagnostics,
-    record_rollout_main_exit, record_shadow_rollout_finalized, remove_main_activation,
+    RecordedRolloutTransition, RolloutFailureDiagnostics, RolloutMainActivation,
+    RolloutMainExitRecord, RolloutTelemetryAdvanceState, RolloutTelemetryGateConfig,
+    RolloutTransitionRecord, read_pending_shadow_rollout, read_rollout_main_activation,
+    read_rollout_main_exit, read_rollout_runtime_state, read_rollout_status,
+    read_rollout_telemetry_advance_state, read_rollout_telemetry_gate_config, read_tail_lossy,
+    record_activation_failure, record_main_activation_staged, record_main_rollout_failure,
+    record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
+    record_rollout_transition, record_shadow_rollout_finalized, remove_main_activation,
     remove_shadow_finalize, rollout_diagnostics_report, rollout_main_activation_path,
-    rollout_main_exit_path, rollout_shadow_finalize_path, rollout_staged_main_binary,
-    rollout_staged_shadow_binary, rollout_staging_dir, stage_pending_shadow_rollout, write_json,
-    write_main_activation, write_rollout_status,
+    rollout_main_exit_path, rollout_runtime_state_path, rollout_shadow_finalize_path,
+    rollout_staged_main_binary, rollout_staged_shadow_binary, rollout_staging_dir,
+    rollout_telemetry_advance_state_path, rollout_telemetry_gate_config_path,
+    rollout_transition_history_dir, rollout_transition_record, stage_pending_shadow_rollout,
+    write_json, write_main_activation, write_rollout_runtime_state, write_rollout_status,
+    write_rollout_telemetry_advance_state, write_rollout_telemetry_gate_config,
 };
 
 pub fn register_storage_paths(
@@ -77,6 +87,46 @@ pub fn register_storage_paths(
             .field("kind", "MainExitKind")
             .field("observed_at", "String"),
     )?;
+    layout.register_sinomo_object(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/runtime-state.sobj",
+        ObjectSchema::new("RolloutRuntimeState", STORAGE_CONTRACT_OBJECT_VERSION)
+            .field("plan", "RolloutPlan")
+            .field("loader_state", "ModuleLoaderState")
+            .field("stage", "RolloutStage")
+            .field("current_weight_bps", "u16"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/telemetry-advance-state.sobj",
+        ObjectSchema::new(
+            "RolloutTelemetryAdvanceState",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("rollout_plan_id", "Id")
+        .field("module_id", "Id")
+        .field("candidate_artifact_id", "Id")
+        .field("telemetry_kind", "String")
+        .field("last_consumed_sequence", "Option<EventSequence>")
+        .field("last_transition_record_id", "Option<Id>")
+        .field("updated_at", "String"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-rollout",
+        StorageRing::R1,
+        "rollout/telemetry-gates.sobj",
+        ObjectSchema::new(
+            "RolloutTelemetryGateConfig",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("automatic_promotion_enabled", "bool")
+        .field("event_limit", "usize")
+        .field("minimum_event_count", "u64")
+        .field("maximum_automatic_weight_bps", "Option<u16>")
+        .field("maximum_candidate_latency_p95_ms", "Option<u64>"),
+    )?;
     layout.register_human_text("sinomo-rollout", StorageRing::R1, "rollout/build.log")?;
     layout.register_human_text(
         "sinomo-rollout",
@@ -102,6 +152,10 @@ pub fn register_storage_paths(
         (
             "rollout/logs",
             "operator-readable rollout logs and diagnostics",
+        ),
+        (
+            "rollout/history",
+            "durable rollout promotion and rollback decision records",
         ),
     ] {
         layout.register_escape_path("sinomo-rollout", StorageRing::R1, relative_path, reason)?;

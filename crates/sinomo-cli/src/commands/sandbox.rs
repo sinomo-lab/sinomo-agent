@@ -16,6 +16,8 @@ pub(crate) enum SandboxCliCommand {
     Fetch(SandboxFetchOptions),
     Ls(SandboxLsOptions),
     Logs(SandboxLogsOptions),
+    ModuleArtifact(SandboxModuleArtifactCliCommand),
+    ModuleReplay(SandboxModuleReplayCliCommand),
     Policy(SandboxPolicyCliCommand),
     ProcessPlan(SandboxProcessPlanOptions),
     Reboot(SandboxRebootOptions),
@@ -43,6 +45,50 @@ pub(crate) enum SandboxCliCommand {
     ToolchainVerifyPython(SandboxToolchainVerifyPythonOptions),
     ToolchainVerifyTcc(SandboxToolchainVerifyTccOptions),
     ToolchainVerifyQuickJs(SandboxToolchainVerifyQuickJsOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum SandboxModuleArtifactCliCommand {
+    Register(SandboxModuleArtifactRegisterOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum SandboxModuleReplayCliCommand {
+    Run(SandboxModuleReplayRunOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SandboxModuleArtifactRegisterOptions {
+    pub(crate) artifact_id: sinomo_runtime::module::ArtifactId,
+    pub(crate) source_path: PathBuf,
+    pub(crate) interface_version: Option<String>,
+    pub(crate) component_model: bool,
+    pub(crate) abi: sinomo_runtime::sandbox::SandboxWasiAbi,
+    pub(crate) sandbox_id: Option<sinomo_runtime::sandbox::SandboxId>,
+    pub(crate) argv: Vec<String>,
+    pub(crate) cwd: Option<sinomo_runtime::sandbox::SandboxPath>,
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) limits: sinomo_runtime::sandbox::SandboxResourceLimits,
+    pub(crate) timeout_ms: Option<u64>,
+    pub(crate) rollout_material: Option<SandboxModuleArtifactRolloutMaterialOptions>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SandboxModuleArtifactRolloutMaterialOptions {
+    pub(crate) candidate_bundle_path: PathBuf,
+    pub(crate) module_id: sinomo_runtime::module::ModuleId,
+    pub(crate) active_artifact_id: sinomo_runtime::module::ArtifactId,
+    pub(crate) rollout_plan_id: Option<sinomo_runtime::core::Id>,
+    pub(crate) policy_decision_id: Option<sinomo_runtime::core::Id>,
+    pub(crate) module_version: String,
+    pub(crate) module_owner: String,
+    pub(crate) evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SandboxModuleReplayRunOptions {
+    pub(crate) fixture_path: PathBuf,
+    pub(crate) report_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -375,6 +421,12 @@ pub(crate) fn parse_sandbox_command(args: &[String]) -> Result<SandboxCliCommand
             parse_sandbox_doctor_options(rest)?,
         )),
         Some((command, rest)) if command == "policy" => parse_sandbox_policy_command(rest),
+        Some((command, rest)) if command == "module-artifact" => {
+            parse_sandbox_module_artifact_command(rest)
+        }
+        Some((command, rest)) if command == "module-replay" => {
+            parse_sandbox_module_replay_command(rest)
+        }
         Some((command, rest)) if command == "ls" => {
             Ok(SandboxCliCommand::Ls(parse_sandbox_ls_options(rest)?))
         }
@@ -432,6 +484,325 @@ pub(crate) fn parse_sandbox_policy_command(args: &[String]) -> Result<SandboxCli
         )),
         _ => Err(CliError::Usage),
     }
+}
+
+pub(crate) fn parse_sandbox_module_artifact_command(
+    args: &[String],
+) -> Result<SandboxCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "register" => Ok(SandboxCliCommand::ModuleArtifact(
+            SandboxModuleArtifactCliCommand::Register(
+                parse_sandbox_module_artifact_register_options(rest)?,
+            ),
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_sandbox_module_replay_command(
+    args: &[String],
+) -> Result<SandboxCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "run" => Ok(SandboxCliCommand::ModuleReplay(
+            SandboxModuleReplayCliCommand::Run(parse_sandbox_module_replay_run_options(rest)?),
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_sandbox_module_artifact_register_options(
+    args: &[String],
+) -> Result<SandboxModuleArtifactRegisterOptions, CliError> {
+    let mut artifact_id = None;
+    let mut source_path = None;
+    let mut interface_version = None;
+    let mut component_model = false;
+    let mut abi = sinomo_runtime::sandbox::default_sandbox_wasi_abi();
+    let mut sandbox_id = None;
+    let mut argv = Vec::new();
+    let mut cwd = None;
+    let mut env = BTreeMap::new();
+    let mut limits = sinomo_runtime::sandbox::SandboxResourceLimits::default();
+    let mut timeout_ms = None;
+    let mut rollout_material_bundle = None;
+    let mut rollout_material_module_id = None;
+    let mut rollout_material_active_artifact_id = None;
+    let mut rollout_material_rollout_plan_id = None;
+    let mut rollout_material_policy_decision_id = None;
+    let mut rollout_material_module_version = "0.1.0".to_string();
+    let mut rollout_material_module_owner = "sandbox-module-artifact".to_string();
+    let mut rollout_material_evidence_refs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--artifact" | "--artifact-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                artifact_id = Some(parse_module_artifact_id(value)?);
+            }
+            "--interface" | "--interface-version" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                if value.trim().is_empty() {
+                    return Err(CliError::Parse {
+                        detail: "sandbox module artifact interface version must be non-empty"
+                            .to_string(),
+                    });
+                }
+                interface_version = Some(value.clone());
+            }
+            "--component-model" => component_model = true,
+            "--abi" | "--target-abi" => {
+                index += 1;
+                abi = parse_sandbox_wasi_abi(args.get(index))?;
+            }
+            "--sandbox" | "--sandbox-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                sandbox_id = Some(parse_sandbox_id(value)?);
+            }
+            "--argv" | "--arg" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                validate_sandbox_argv_value(value, "sandbox module artifact argv")?;
+                argv.push(value.clone());
+            }
+            "--cwd" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                cwd = Some(parse_sandbox_path(value)?);
+            }
+            "--env" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                let (key, value) = parse_sandbox_env_assignment(value)?;
+                env.insert(key, value);
+            }
+            "--memory-mb" => {
+                index += 1;
+                limits.memory_mb =
+                    parse_nonzero_u64_sandbox_cli_value(args.get(index), "module memory mb")?;
+            }
+            "--wall-time-ms" => {
+                index += 1;
+                limits.wall_time_ms =
+                    parse_nonzero_u64_sandbox_cli_value(args.get(index), "module wall time")?;
+            }
+            "--max-input-bytes" => {
+                index += 1;
+                limits.max_input_bytes =
+                    parse_nonzero_u64_sandbox_cli_value(args.get(index), "module input bytes")?;
+            }
+            "--max-output-bytes" => {
+                index += 1;
+                limits.max_output_bytes =
+                    parse_nonzero_u64_sandbox_cli_value(args.get(index), "module output bytes")?;
+            }
+            "--max-workspace-bytes" => {
+                index += 1;
+                limits.max_workspace_bytes =
+                    parse_nonzero_u64_sandbox_cli_value(args.get(index), "module workspace bytes")?;
+            }
+            "--max-written-bytes-per-command" => {
+                index += 1;
+                limits.max_written_bytes_per_command =
+                    parse_nonzero_u64_sandbox_cli_value(args.get(index), "module written bytes")?;
+            }
+            "--max-file-count" => {
+                index += 1;
+                limits.max_file_count =
+                    parse_nonzero_u64_sandbox_cli_value(args.get(index), "module file count")?;
+            }
+            "--timeout-ms" => {
+                index += 1;
+                timeout_ms = Some(parse_nonzero_u64_sandbox_cli_value(
+                    args.get(index),
+                    "module timeout",
+                )?);
+            }
+            "--rollout-material-bundle" | "--candidate-bundle" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                rollout_material_bundle = Some(PathBuf::from(value));
+            }
+            "--module" | "--module-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                rollout_material_module_id = Some(parse_module_id(value)?);
+            }
+            "--active-artifact" | "--active-artifact-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                rollout_material_active_artifact_id = Some(parse_module_artifact_id(value)?);
+            }
+            "--rollout-plan" | "--rollout-plan-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                rollout_material_rollout_plan_id = Some(parse_sinomo_id(value, "rollout plan")?);
+            }
+            "--policy-decision" | "--policy-decision-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                rollout_material_policy_decision_id =
+                    Some(parse_sinomo_id(value, "policy decision")?);
+            }
+            "--module-version" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                if value.trim().is_empty() {
+                    return Err(CliError::Parse {
+                        detail: "sandbox module artifact rollout material module version must be non-empty".to_string(),
+                    });
+                }
+                rollout_material_module_version = value.clone();
+            }
+            "--module-owner" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                if value.trim().is_empty() {
+                    return Err(CliError::Parse {
+                        detail: "sandbox module artifact rollout material module owner must be non-empty".to_string(),
+                    });
+                }
+                rollout_material_module_owner = value.clone();
+            }
+            "--evidence" | "--evidence-ref" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                if value.trim().is_empty() {
+                    return Err(CliError::Parse {
+                        detail: "sandbox module artifact rollout material evidence ref must be non-empty".to_string(),
+                    });
+                }
+                rollout_material_evidence_refs.push(value.clone());
+            }
+            value if value.starts_with('-') => return Err(CliError::Usage),
+            value if source_path.is_none() => source_path = Some(PathBuf::from(value)),
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+
+    if component_model {
+        interface_version = match interface_version {
+            Some(version)
+                if version == sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION =>
+            {
+                Some(version)
+            }
+            Some(version) => {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "component-model sandbox module artifacts currently require interface `{}`; got `{version}`",
+                        sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION
+                    ),
+                });
+            }
+            None => Some(sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string()),
+        };
+    }
+
+    let rollout_material = match (
+        rollout_material_bundle,
+        rollout_material_module_id,
+        rollout_material_active_artifact_id,
+    ) {
+        (None, None, None) => None,
+        (Some(candidate_bundle_path), Some(module_id), Some(active_artifact_id)) => {
+            Some(SandboxModuleArtifactRolloutMaterialOptions {
+                candidate_bundle_path,
+                module_id,
+                active_artifact_id,
+                rollout_plan_id: rollout_material_rollout_plan_id,
+                policy_decision_id: rollout_material_policy_decision_id,
+                module_version: rollout_material_module_version,
+                module_owner: rollout_material_module_owner,
+                evidence_refs: rollout_material_evidence_refs,
+            })
+        }
+        _ => {
+            return Err(CliError::Parse {
+                detail: "sandbox module artifact rollout material requires --rollout-material-bundle, --module, and --active-artifact together".to_string(),
+            });
+        }
+    };
+
+    Ok(SandboxModuleArtifactRegisterOptions {
+        artifact_id: artifact_id.ok_or(CliError::Usage)?,
+        source_path: source_path.ok_or(CliError::Usage)?,
+        interface_version,
+        component_model,
+        abi,
+        sandbox_id,
+        argv,
+        cwd,
+        env,
+        limits,
+        timeout_ms,
+        rollout_material,
+    })
+}
+
+pub(crate) fn parse_sandbox_module_replay_run_options(
+    args: &[String],
+) -> Result<SandboxModuleReplayRunOptions, CliError> {
+    let mut fixture_path = None;
+    let mut report_path = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--fixture" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                fixture_path = Some(PathBuf::from(value));
+            }
+            "--report" | "--output" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                report_path = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => return Err(CliError::Usage),
+            value if fixture_path.is_none() => fixture_path = Some(PathBuf::from(value)),
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(SandboxModuleReplayRunOptions {
+        fixture_path: fixture_path.ok_or(CliError::Usage)?,
+        report_path: report_path.ok_or(CliError::Usage)?,
+    })
 }
 
 pub(crate) fn parse_sandbox_doctor_options(
@@ -1856,6 +2227,8 @@ pub(crate) fn run_sandbox_cli_command(command: SandboxCliCommand) -> Result<(), 
         SandboxCliCommand::Fetch(options) => sandbox_fetch(options),
         SandboxCliCommand::Ls(options) => sandbox_ls(options),
         SandboxCliCommand::Logs(options) => sandbox_logs(options),
+        SandboxCliCommand::ModuleArtifact(command) => sandbox_module_artifact(command),
+        SandboxCliCommand::ModuleReplay(command) => sandbox_module_replay(command),
         SandboxCliCommand::Policy(command) => sandbox_policy(command),
         SandboxCliCommand::ProcessPlan(options) => sandbox_process_plan(options),
         SandboxCliCommand::Reboot(options) => sandbox_reboot(options),
@@ -4437,6 +4810,318 @@ fn sandbox_daemon_large_metadata_rpc_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(15 * 60)
 }
 
+pub(crate) fn sandbox_module_artifact(
+    command: SandboxModuleArtifactCliCommand,
+) -> Result<(), CliError> {
+    match command {
+        SandboxModuleArtifactCliCommand::Register(options) => {
+            sandbox_module_artifact_register(options)
+        }
+    }
+}
+
+pub(crate) fn sandbox_module_artifact_register(
+    options: SandboxModuleArtifactRegisterOptions,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    sandbox_module_artifact_register_with_data_dir(options, &data_dir.root())
+}
+
+pub(crate) fn sandbox_module_artifact_register_with_data_dir(
+    options: SandboxModuleArtifactRegisterOptions,
+    data_dir_root: &Path,
+) -> Result<(), CliError> {
+    let bytes = std::fs::read(&options.source_path).map_err(|source| CliError::Io {
+        path: options.source_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if options.component_model {
+        validate_sandbox_component_artifact_bytes(&bytes)?;
+    }
+    let content_hash = sinomo_runtime::sandbox::sandbox_module_hash(&bytes);
+    let rollout_material = options.rollout_material.clone();
+    let relative_path = sandbox_module_artifact_relative_path(&options.artifact_id);
+    let artifact_path = data_dir_root.join(&relative_path);
+    if let Some(parent) = artifact_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    std::fs::write(&artifact_path, &bytes).map_err(|source| CliError::Io {
+        path: artifact_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+
+    let mut registry =
+        sinomo_runtime::sandbox::read_sandbox_wasm_module_artifact_registry(data_dir_root)?
+            .unwrap_or_default();
+    registry
+        .artifacts
+        .retain(|artifact| artifact.artifact_id != options.artifact_id);
+    registry
+        .artifacts
+        .push(sinomo_runtime::sandbox::SandboxWasmModuleArtifact {
+            artifact_id: options.artifact_id.clone(),
+            wasm_path: relative_path.clone(),
+            content_hash: content_hash.clone(),
+            interface_version: options.interface_version.clone(),
+            component_model: options.component_model,
+            abi: options.abi,
+            sandbox_id: options.sandbox_id,
+            argv: options.argv,
+            cwd: options.cwd,
+            env: options.env,
+            limits: options.limits,
+            timeout_ms: options.timeout_ms,
+        });
+    let registry_path = sinomo_runtime::sandbox::write_sandbox_wasm_module_artifact_registry(
+        data_dir_root,
+        &registry,
+    )?;
+    let rollout_material_path = sandbox_module_artifact_write_rollout_material_if_requested(
+        data_dir_root,
+        &options.artifact_id,
+        &artifact_path,
+        &content_hash,
+        rollout_material.as_ref(),
+    )?;
+
+    println!("artifact: {}", options.artifact_id);
+    println!("path: {}", artifact_path.display());
+    println!("registry: {}", registry_path.display());
+    println!("hash: {content_hash}");
+    if let Some(interface_version) = options.interface_version {
+        println!("interface: {interface_version}");
+    }
+    println!("component-model: {}", options.component_model);
+    if let Some(path) = rollout_material_path {
+        println!("rollout-material: {}", path.display());
+    }
+    Ok(())
+}
+
+fn sandbox_module_artifact_write_rollout_material_if_requested(
+    data_dir_root: &Path,
+    artifact_id: &sinomo_runtime::module::ArtifactId,
+    artifact_path: &Path,
+    content_hash: &str,
+    options: Option<&SandboxModuleArtifactRolloutMaterialOptions>,
+) -> Result<Option<PathBuf>, CliError> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    let bundle = read_sandbox_module_candidate_bundle_manifest(&options.candidate_bundle_path)?;
+    let identity = sinomo_runtime::node::load_or_create_main_node_identity(data_dir_root)?;
+    let candidate_bundle_ref = format!("candidate-bundle://{}", bundle.job_id);
+    let registry_candidate_bundle_ref = format!("registry://candidate-bundle/{}", bundle.job_id);
+    let sandbox_artifact_ref = format!("sandbox://module-artifact/{artifact_id}");
+    let material_path =
+        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(&bundle);
+    let mut evidence_refs = options.evidence_refs.clone();
+    evidence_refs.push(candidate_bundle_ref.clone());
+    evidence_refs.push(registry_candidate_bundle_ref);
+    evidence_refs.push(sandbox_artifact_ref.clone());
+    evidence_refs.push(artifact_path.display().to_string());
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
+    let mut artifact = sinomo_runtime::core::ArtifactManifest {
+        artifact_id: artifact_id.clone(),
+        module_id: options.module_id.clone(),
+        target_ring: sinomo_runtime::core::TrustRing::R3SandboxedModule,
+        content_hash: content_hash.to_string(),
+        signature: None,
+        source_workspace: None,
+        source_revision: None,
+        module_manifest: sinomo_runtime::core::ModuleManifest::r3_wasm(
+            options.module_id.clone(),
+            options.module_version.clone(),
+            options.module_owner.clone(),
+        ),
+        provenance: sinomo_runtime::core::ArtifactProvenance {
+            produced_by: sinomo_runtime::core::ActorRef {
+                kind: sinomo_runtime::core::ActorKind::Operator,
+                id: "sinomo sandbox module-artifact register".to_string(),
+            },
+            source_event_id: None,
+            build_log_artifact_id: None,
+            attestations: evidence_refs.clone(),
+        },
+    };
+    artifact.signature = Some(
+        sinomo_runtime::module::sign_artifact_manifest_with_node_identity(&artifact, &identity)
+            .map_err(|source| CliError::Parse {
+                detail: format!("failed to sign sandbox module artifact manifest: {source}"),
+            })?,
+    );
+    let material = sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord {
+        candidate_bundle_job_id: bundle.job_id.clone(),
+        artifact: artifact.clone(),
+        policy_decision: sinomo_runtime::core::PolicyDecision {
+            decision_id: options.policy_decision_id.clone().unwrap_or_else(|| {
+                sinomo_runtime::core::Id::derived(
+                    "sinomo.sandbox.module-artifact.policy-decision",
+                    format!("{}:{artifact_id}", bundle.job_id),
+                )
+            }),
+            target_ring: artifact.target_ring.clone(),
+            target_artifact_id: artifact.artifact_id.clone(),
+            action: sinomo_runtime::core::PolicyAction::Allow,
+            capability_diff: sinomo_runtime::core::CapabilityDiff::default(),
+            required_additional_evals: Vec::new(),
+            max_rollout_weight_bps: Some(500),
+            reason: "sandbox module artifact registration prepared low-risk rollout material"
+                .to_string(),
+        },
+        rollout_plan: sinomo_runtime::core::RolloutPlan {
+            rollout_plan_id: options.rollout_plan_id.clone().unwrap_or_else(|| {
+                sinomo_runtime::core::Id::derived(
+                    "sinomo.sandbox.module-artifact.rollout-plan",
+                    format!("{}:{artifact_id}", bundle.job_id),
+                )
+            }),
+            artifact_id: artifact.artifact_id.clone(),
+            module_id: artifact.module_id.clone(),
+            target_ring: artifact.target_ring.clone(),
+            strategy: sinomo_runtime::core::RolloutStrategy::Shadow,
+            target_nodes: Vec::new(),
+            initial_weight_bps: 0,
+            promotion_steps_bps: vec![500],
+            rollback_policy: sinomo_runtime::core::RollbackPolicy::default(),
+        },
+        active_artifact_id: options.active_artifact_id.clone(),
+        evidence_refs,
+        registered_at: OffsetDateTime::now_utc(),
+    };
+    if let Some(parent) = material_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let content = serde_json::to_string_pretty(&material).map_err(|source| CliError::Json {
+        path: material_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    std::fs::write(&material_path, content).map_err(|source| CliError::Io {
+        path: material_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(Some(material_path))
+}
+
+fn read_sandbox_module_candidate_bundle_manifest(
+    path: &Path,
+) -> Result<sinomo_runtime::core::CandidateBundleManifest, CliError> {
+    let manifest_path = if path.is_dir() {
+        path.join("manifest.json")
+    } else {
+        path.to_path_buf()
+    };
+    let content = std::fs::read_to_string(&manifest_path).map_err(|source| CliError::Io {
+        path: manifest_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: manifest_path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn sandbox_module_artifact_relative_path(
+    artifact_id: &sinomo_runtime::module::ArtifactId,
+) -> PathBuf {
+    PathBuf::from("sandbox")
+        .join("module-artifacts")
+        .join(format!("{artifact_id}.wasm"))
+}
+
+#[cfg(feature = "sandbox")]
+fn validate_sandbox_component_artifact_bytes(bytes: &[u8]) -> Result<(), CliError> {
+    sinomo_runtime::sandbox::validate_sinomo_module_v1_component_contract(bytes).map_err(|source| {
+        CliError::Parse {
+            detail: format!("invalid sinomo-module-v1 component artifact: {source}"),
+        }
+    })
+}
+
+#[cfg(not(feature = "sandbox"))]
+fn validate_sandbox_component_artifact_bytes(_bytes: &[u8]) -> Result<(), CliError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
+pub(crate) fn sandbox_module_replay(
+    command: SandboxModuleReplayCliCommand,
+) -> Result<(), CliError> {
+    match command {
+        SandboxModuleReplayCliCommand::Run(options) => sandbox_module_replay_run(options),
+    }
+}
+
+pub(crate) fn sandbox_module_replay_run(
+    options: SandboxModuleReplayRunOptions,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    sandbox_module_replay_run_with_data_dir(options, &data_dir.root())
+}
+
+#[cfg(feature = "sandbox")]
+pub(crate) fn sandbox_module_replay_run_with_data_dir(
+    options: SandboxModuleReplayRunOptions,
+    data_dir_root: &Path,
+) -> Result<(), CliError> {
+    let bytes = std::fs::read(&options.fixture_path).map_err(|source| CliError::Io {
+        path: options.fixture_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let fixture: sinomo_runtime::module::ModuleReplayFixture = serde_json::from_slice(&bytes)
+        .map_err(|source| CliError::Json {
+            path: options.fixture_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let report =
+        sinomo_runtime::sandbox::run_sandbox_wasm_module_replay_fixture(data_dir_root, &fixture)
+            .map_err(|source| CliError::Parse {
+                detail: format!("sandbox module replay failed: {source}"),
+            })?;
+    if let Some(parent) = options.report_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+    }
+    let report_json = serde_json::to_vec_pretty(&report).map_err(|source| CliError::Json {
+        path: options.report_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    std::fs::write(&options.report_path, report_json).map_err(|source| CliError::Io {
+        path: options.report_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    println!("fixture: {}", report.fixture_id);
+    println!("module: {}", report.module_id);
+    println!("cases: {}", report.cases.len());
+    println!("missing-routes: {}", report.missing_route_count);
+    println!("primary-errors: {}", report.primary_error_count);
+    println!("shadow-errors: {}", report.shadow_error_count);
+    println!("shadow-mismatches: {}", report.shadow_mismatch_count);
+    println!("report: {}", options.report_path.display());
+    Ok(())
+}
+
+#[cfg(not(feature = "sandbox"))]
+pub(crate) fn sandbox_module_replay_run_with_data_dir(
+    _options: SandboxModuleReplayRunOptions,
+    _data_dir_root: &Path,
+) -> Result<(), CliError> {
+    Err(sandbox_runtime_not_compiled_error())
+}
+
 pub(crate) fn daemon_run_toolchain_request(
     sandbox_id: sinomo_runtime::sandbox::SandboxId,
     command_name: String,
@@ -6626,6 +7311,30 @@ pub(crate) fn sandbox_toolchain_store_from_data_dir(
     )
 }
 
+fn parse_module_artifact_id(value: &str) -> Result<sinomo_runtime::module::ArtifactId, CliError> {
+    sinomo_runtime::module::ArtifactId::new(value.to_string())
+        .or_else(|_| sinomo_runtime::module::ArtifactId::from_legacy_named(value))
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid module artifact id `{value}`: {source}"),
+        })
+}
+
+fn parse_module_id(value: &str) -> Result<sinomo_runtime::module::ModuleId, CliError> {
+    sinomo_runtime::module::ModuleId::new(value.to_string())
+        .or_else(|_| sinomo_runtime::module::ModuleId::from_legacy_named(value))
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid module id `{value}`: {source}"),
+        })
+}
+
+fn parse_sinomo_id(value: &str, label: &str) -> Result<sinomo_runtime::core::Id, CliError> {
+    sinomo_runtime::core::Id::new(value.to_string())
+        .or_else(|_| sinomo_runtime::core::Id::from_legacy_named(value))
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid {label} id `{value}`: {source}"),
+        })
+}
+
 fn parse_sandbox_id(value: &str) -> Result<sinomo_runtime::sandbox::SandboxId, CliError> {
     sinomo_runtime::sandbox::SandboxId::new(value.to_string()).map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox id `{value}`: {source}"),
@@ -6680,6 +7389,15 @@ fn validate_sandbox_env_value(name: &str, value: &str) -> Result<(), CliError> {
     if value.contains('\0') {
         return Err(CliError::Parse {
             detail: format!("sandbox env `{name}` contains an embedded NUL byte"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sandbox_argv_value(value: &str, context: &str) -> Result<(), CliError> {
+    if value.contains('\0') {
+        return Err(CliError::Parse {
+            detail: format!("{context} contains an embedded NUL byte"),
         });
     }
     Ok(())

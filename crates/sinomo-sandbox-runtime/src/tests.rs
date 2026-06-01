@@ -15,6 +15,7 @@ type WorkspaceId = Id;
 mod event_tests;
 mod http_tests;
 mod instance_filesystem_tests;
+mod module_runner_tests;
 mod policy_tests;
 mod posixtestsuite_tests;
 mod runtime_tests;
@@ -45,6 +46,7 @@ fn sandbox_run_passes_when_scope_and_commands_pass() {
                 expected_exit_code: 0,
                 gate: EvaluationGate::ReplayTests,
             }],
+            module_replay_reports: Vec::new(),
         },
         recovery: sinomo_core::RecoveryPlan::default(),
         scope: EvolutionScope {

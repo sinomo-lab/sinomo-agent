@@ -12,6 +12,10 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
             "node-local cache for compiled sandbox WASM modules",
         ),
         (
+            "sandbox/module-artifacts",
+            "node-local registered WASM and component artifacts for module replay",
+        ),
+        (
             "sandbox/runtime",
             "node-local sandbox runtime supervision state",
         ),
@@ -27,5 +31,15 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
             reason,
         )?;
     }
+    layout.register_sinomo_object(
+        SANDBOX_STORAGE_MODULE,
+        StorageRing::R1,
+        "sandbox/module-wasm-artifacts.sobj",
+        sinomo_storage::ObjectSchema::new(
+            "SandboxWasmModuleArtifactRegistry",
+            sinomo_storage::STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("artifacts", "Vec<SandboxWasmModuleArtifact>"),
+    )?;
     Ok(())
 }

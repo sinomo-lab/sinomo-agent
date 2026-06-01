@@ -1,7 +1,12 @@
 use crate::process::{MainExitKind, MainExitObservation};
-use crate::{RolloutError, SelfRolloutPaths, executable_name};
+use crate::{
+    RolloutAction, RolloutDecision, RolloutError, RolloutRuntimeState, RolloutStage,
+    SelfRolloutPaths, executable_name,
+};
 use serde::{Deserialize, Serialize};
-use sinomo_core::ClusterNodeRolloutStatus;
+use sinomo_core::{ClusterNodeRolloutStatus, HotSwapState, Id};
+use sinomo_events::EventSequence;
+use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext};
 use std::fs;
 use std::io;
@@ -70,6 +75,83 @@ pub struct RolloutMainExitRecord {
     pub observed_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RolloutTransitionRecord {
+    pub record_id: Id,
+    pub node_id: NodeId,
+    pub rollout_plan_id: Id,
+    pub artifact_id: Id,
+    pub module_id: Id,
+    pub action: RolloutAction,
+    pub stage: RolloutStage,
+    pub current_weight_bps: u16,
+    pub active_artifact_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_artifact_id: Option<Id>,
+    #[serde(default = "default_transition_hot_swap_state")]
+    pub hot_swap_state: HotSwapState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggering_evidence_refs: Vec<String>,
+    pub reason: String,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RolloutTelemetryAdvanceState {
+    pub rollout_plan_id: Id,
+    pub module_id: Id,
+    pub candidate_artifact_id: Id,
+    #[serde(default = "default_rollout_telemetry_kind")]
+    pub telemetry_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_consumed_sequence: Option<EventSequence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_record_id: Option<Id>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RolloutTelemetryGateConfig {
+    #[serde(default = "default_automatic_promotion_enabled")]
+    pub automatic_promotion_enabled: bool,
+    #[serde(default = "default_rollout_telemetry_event_limit")]
+    pub event_limit: usize,
+    #[serde(default = "default_rollout_telemetry_minimum_event_count")]
+    pub minimum_event_count: u64,
+    #[serde(default = "default_maximum_automatic_weight_bps")]
+    pub maximum_automatic_weight_bps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_candidate_latency_p95_ms: Option<u64>,
+}
+
+impl Default for RolloutTelemetryGateConfig {
+    fn default() -> Self {
+        Self {
+            automatic_promotion_enabled: default_automatic_promotion_enabled(),
+            event_limit: default_rollout_telemetry_event_limit(),
+            minimum_event_count: default_rollout_telemetry_minimum_event_count(),
+            maximum_automatic_weight_bps: default_maximum_automatic_weight_bps(),
+            maximum_candidate_latency_p95_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedRolloutTransition {
+    pub record: RolloutTransitionRecord,
+    pub path: PathBuf,
+}
+
 pub trait PendingShadowRolloutContext {
     fn activation(&self) -> &RolloutMainActivation;
     fn main_binary(&self) -> &Path;
@@ -88,6 +170,22 @@ pub fn rollout_shadow_finalize_path(paths: &SelfRolloutPaths) -> PathBuf {
 
 pub fn rollout_main_exit_path(paths: &SelfRolloutPaths) -> PathBuf {
     paths.root.join("last-main-exit.sobj")
+}
+
+pub fn rollout_transition_history_dir(paths: &SelfRolloutPaths) -> PathBuf {
+    paths.root.join("history")
+}
+
+pub fn rollout_runtime_state_path(paths: &SelfRolloutPaths) -> PathBuf {
+    paths.root.join("runtime-state.sobj")
+}
+
+pub fn rollout_telemetry_advance_state_path(paths: &SelfRolloutPaths) -> PathBuf {
+    paths.root.join("telemetry-advance-state.sobj")
+}
+
+pub fn rollout_telemetry_gate_config_path(paths: &SelfRolloutPaths) -> PathBuf {
+    paths.root.join("telemetry-gates.sobj")
 }
 
 pub fn rollout_staging_dir(paths: &SelfRolloutPaths) -> PathBuf {
@@ -132,6 +230,11 @@ pub fn rollout_diagnostics_report(
         &mut output,
         "pending shadow",
         &rollout_shadow_finalize_path(rollout_paths),
+    )?;
+    append_rollout_diagnostic_file(
+        &mut output,
+        "runtime state",
+        &rollout_runtime_state_path(rollout_paths),
     )?;
     append_rollout_main_exit_diagnostic(&mut output, rollout_paths)?;
 
@@ -446,6 +549,69 @@ pub fn write_rollout_status(
     write_object(&rollout_paths.state, status)
 }
 
+pub fn read_rollout_runtime_state(
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<Option<RolloutRuntimeState>, RolloutError> {
+    let path = rollout_runtime_state_path(rollout_paths);
+    if !path.exists() {
+        return Ok(None);
+    }
+    match read_object(&path) {
+        Ok(state) => Ok(Some(state)),
+        Err(RolloutError::Object { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn write_rollout_runtime_state(
+    rollout_paths: &SelfRolloutPaths,
+    state: &RolloutRuntimeState,
+) -> Result<(), RolloutError> {
+    write_object(&rollout_runtime_state_path(rollout_paths), state)
+}
+
+pub fn read_rollout_telemetry_advance_state(
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<Option<RolloutTelemetryAdvanceState>, RolloutError> {
+    let path = rollout_telemetry_advance_state_path(rollout_paths);
+    if !path.exists() {
+        return Ok(None);
+    }
+    match read_object(&path) {
+        Ok(state) => Ok(Some(state)),
+        Err(RolloutError::Object { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn write_rollout_telemetry_advance_state(
+    rollout_paths: &SelfRolloutPaths,
+    state: &RolloutTelemetryAdvanceState,
+) -> Result<(), RolloutError> {
+    write_object(&rollout_telemetry_advance_state_path(rollout_paths), state)
+}
+
+pub fn read_rollout_telemetry_gate_config(
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<Option<RolloutTelemetryGateConfig>, RolloutError> {
+    let path = rollout_telemetry_gate_config_path(rollout_paths);
+    if !path.exists() {
+        return Ok(None);
+    }
+    match read_object(&path) {
+        Ok(config) => Ok(Some(config)),
+        Err(RolloutError::Object { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn write_rollout_telemetry_gate_config(
+    rollout_paths: &SelfRolloutPaths,
+    config: &RolloutTelemetryGateConfig,
+) -> Result<(), RolloutError> {
+    write_object(&rollout_telemetry_gate_config_path(rollout_paths), config)
+}
+
 pub fn read_rollout_main_exit(
     rollout_paths: &SelfRolloutPaths,
 ) -> Result<Option<RolloutMainExitRecord>, RolloutError> {
@@ -471,6 +637,100 @@ pub fn record_rollout_main_exit(
             observed_at: format_now(),
         },
     )
+}
+
+pub fn record_rollout_transition(
+    rollout_paths: &SelfRolloutPaths,
+    node_id: &NodeId,
+    decision: &RolloutDecision,
+    triggering_evidence_refs: impl IntoIterator<Item = String>,
+) -> Result<RecordedRolloutTransition, RolloutError> {
+    let record = rollout_transition_record(node_id, decision, triggering_evidence_refs);
+    let path = rollout_transition_record_path(rollout_paths, &record);
+    write_json(&path, &record)?;
+    Ok(RecordedRolloutTransition { record, path })
+}
+
+pub fn rollout_transition_record(
+    node_id: &NodeId,
+    decision: &RolloutDecision,
+    triggering_evidence_refs: impl IntoIterator<Item = String>,
+) -> RolloutTransitionRecord {
+    let promoted_artifact_id = (decision.action == RolloutAction::Promote)
+        .then(|| decision.state.plan.artifact_id.clone());
+    let failed_artifact_id = (decision.action == RolloutAction::RollBack)
+        .then(|| decision.state.plan.artifact_id.clone());
+    let restored_artifact_id = (decision.action == RolloutAction::RollBack)
+        .then(|| decision.state.loader_state.active_artifact_id.clone());
+    RolloutTransitionRecord {
+        record_id: Id::generate(),
+        node_id: node_id.clone(),
+        rollout_plan_id: decision.state.plan.rollout_plan_id.clone(),
+        artifact_id: decision.state.plan.artifact_id.clone(),
+        module_id: decision.state.plan.module_id.clone(),
+        action: decision.action.clone(),
+        stage: decision.state.stage.clone(),
+        current_weight_bps: decision.state.current_weight_bps,
+        active_artifact_id: decision.state.loader_state.active_artifact_id.clone(),
+        previous_artifact_id: decision.state.loader_state.previous_artifact_id.clone(),
+        candidate_artifact_id: decision.state.loader_state.candidate_artifact_id.clone(),
+        shadow_artifact_id: decision.state.loader_state.shadow_artifact_id.clone(),
+        hot_swap_state: decision.state.loader_state.hot_swap_state.clone(),
+        promoted_artifact_id,
+        failed_artifact_id,
+        restored_artifact_id,
+        triggering_evidence_refs: triggering_evidence_refs.into_iter().collect(),
+        reason: decision.reason.clone(),
+        recorded_at: format_now(),
+    }
+}
+
+fn default_transition_hot_swap_state() -> HotSwapState {
+    HotSwapState::Stable
+}
+
+fn default_automatic_promotion_enabled() -> bool {
+    true
+}
+
+fn default_rollout_telemetry_event_limit() -> usize {
+    1_000
+}
+
+fn default_rollout_telemetry_kind() -> String {
+    "module.shadow.decision".to_string()
+}
+
+fn default_rollout_telemetry_minimum_event_count() -> u64 {
+    1
+}
+
+fn default_maximum_automatic_weight_bps() -> Option<u16> {
+    Some(500)
+}
+
+fn rollout_transition_record_path(
+    rollout_paths: &SelfRolloutPaths,
+    record: &RolloutTransitionRecord,
+) -> PathBuf {
+    rollout_transition_history_dir(rollout_paths).join(format!(
+        "{}-{}-{}-{}.json",
+        OffsetDateTime::now_utc().unix_timestamp_nanos(),
+        record.rollout_plan_id,
+        record.record_id,
+        rollout_action_file_label(&record.action)
+    ))
+}
+
+fn rollout_action_file_label(action: &RolloutAction) -> &'static str {
+    match action {
+        RolloutAction::StayShadow => "stay-shadow",
+        RolloutAction::AdvanceCanary => "advance-canary",
+        RolloutAction::Promote => "promote",
+        RolloutAction::GuardR1Activation => "guard-r1-activation",
+        RolloutAction::RollBack => "rollback",
+        RolloutAction::Quarantine => "quarantine",
+    }
 }
 
 pub fn write_object<T: Serialize>(path: &Path, value: &T) -> Result<(), RolloutError> {

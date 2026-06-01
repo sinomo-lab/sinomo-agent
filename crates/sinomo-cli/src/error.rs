@@ -329,6 +329,14 @@ impl From<sinomo_evolution::EvolutionError> for CliError {
     }
 }
 
+impl From<sinomo_runtime::registry::RegistryError> for CliError {
+    fn from(error: sinomo_runtime::registry::RegistryError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl From<sinomo_evolution::EvolutionPersistenceError> for CliError {
     fn from(error: sinomo_evolution::EvolutionPersistenceError) -> Self {
         match error {
@@ -401,6 +409,7 @@ impl From<RolloutError> for CliError {
                 stderr,
             },
             RolloutError::MissingArtifact { artifact } => Self::MissingArtifact { artifact },
+            RolloutError::InvalidTransition { detail } => Self::Parse { detail },
         }
     }
 }

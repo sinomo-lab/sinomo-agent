@@ -2,33 +2,58 @@
 
 use crate::{
     EvolutionJobId, EvolutionPaths, EvolutionPersistenceError, RecordedCandidateDecision,
-    RecordedCandidateVerification, StoredEvolutionJob, WorkspaceId, record_candidate_decision,
-    record_candidate_verification,
+    RecordedCandidateVerification, StoredEvolutionJob, WorkspaceId,
+    record_candidate_decision_with_preflight, record_candidate_verification, write_bundle_manifest,
+    write_stored_job,
 };
 use serde::{Deserialize, Deserializer, Serialize};
+use sinomo_agent::{
+    Agent, AgentConfig, AgentContextBudget, AgentEvolutionContext, AgentLoopInput, AgentModelEvent,
+    AgentPolicyBundle, AgentRole, AgentStoragePaths, AgentToolRegistry, BoundedContext,
+    FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
+    user_interaction_input_event,
+};
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
     CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig, CodexCliProvider,
     GeminiConfig, GeminiProvider, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
     GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError, LanguageModelInvocation,
-    LanguageModelMessage, LanguageModelProvider, LanguageModelRequest, LanguageModelResponseFormat,
-    LanguageModelRole, NvidiaConfig, NvidiaProvider, OpenAiConfig, OpenAiProvider,
-    PROVIDER_DEFAULT_MODEL, codex_provider_for_model, model_or_default,
-    normalize_model_id_for_provider, normalize_model_provider,
+    LanguageModelMessage, LanguageModelProvider, LanguageModelRequest, LanguageModelResponse,
+    LanguageModelResponseFormat, LanguageModelRole, NvidiaConfig, NvidiaProvider, OpenAiConfig,
+    OpenAiProvider, PROVIDER_DEFAULT_MODEL, codex_provider_for_model,
+    complete_configured_model_request, model_or_default, normalize_model_id_for_provider,
+    normalize_model_provider,
 };
 use sinomo_runtime::core::{
-    CandidateBundleManifest, CandidateDecisionOutcome, CommandLogRef, Confidence, EditScope,
-    EvaluationGate, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, EvolutionJob,
-    EvolutionJobStatus, EvolutionScope, FileExcerpt, LatencyClass, MutationOutputContract,
-    MutationPacket, PrivacyClass, RecoveryPlan, RollbackPolicy, RoutingHint, RoutingMetadata,
-    RoutingScope, Salience, Source, TrustRing, VerificationCommand, VerificationPlan,
+    CandidateApprovalPreflightCheck, CandidateApprovalPreflightReport, CandidateBundleAttestation,
+    CandidateBundleContentManifest, CandidateBundleFileDigest, CandidateBundleManifest,
+    CandidateBundlePredicate, CandidateBundleSubject, CandidateDecisionOutcome, CommandLogRef,
+    Confidence, ContextPacket, EditScope, EvaluationGate, EvaluationMetric, EvaluationOutcome,
+    EvaluationScorecard, EventEnvelope, EventKind, EvolutionJob, EvolutionJobStatus,
+    EvolutionScope, FileExcerpt, LatencyClass, MetricValue, ModuleReplayReportRef,
+    MutationOutputContract, MutationPacket, PrivacyClass, RecoveryPlan, RollbackPolicy,
+    RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing, VerificationCommand,
+    VerificationPlan,
 };
 use sinomo_runtime::eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
-use sinomo_runtime::events::EventId;
+use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::module::ModuleId;
+use sinomo_runtime::module::{
+    MODULE_CRASH_EVENT_KIND, MODULE_INVOCATION_DECISION_EVENT_KIND,
+    MODULE_POLICY_BLOCKED_EVENT_KIND, MODULE_TIMEOUT_EVENT_KIND, MODULE_USER_CORRECTION_EVENT_KIND,
+    ModuleId,
+};
 use sinomo_runtime::node::NodeId;
+use sinomo_runtime::registry::{
+    ArtifactRegistry, CANDIDATE_BUNDLE_VERIFIED_ROLLOUT_MATERIAL_RELATIVE_PATH,
+    CandidateBundleRegistryRecord, read_candidate_bundle_verified_rollout_material,
+    read_trusted_artifact_signers, validate_verified_candidate_rollout_material,
+    verify_and_write_verified_candidate_rollout_material, verify_candidate_bundle_integrity,
+};
+use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
@@ -51,6 +76,35 @@ pub struct EvolutionOpportunity {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum EvolutionOpportunitySignalKind {
+    ModuleTimeout,
+    ModuleCrash,
+    ModulePolicyBlocked,
+    ModuleUserCorrection,
+    MetricRegression,
+    ReplayFailure,
+    StaleScorecard,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EvolutionOpportunityDetectionPolicy {
+    pub workspace_id: WorkspaceId,
+    pub default_target_ring: TrustRing,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_allowed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_forbidden_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DetectedEvolutionOpportunity {
+    pub signal_kind: EvolutionOpportunitySignalKind,
+    pub opportunity: EvolutionOpportunity,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CandidateWorkspacePlan {
     pub job_id: EvolutionJobId,
     pub workspace_id: WorkspaceId,
@@ -69,12 +123,107 @@ pub struct EvolutionRequest {
     pub intended_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification_commands: Vec<VerificationCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benchmark_gates: Vec<BenchmarkGateRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_replay_reports: Vec<ModuleReplayReportRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BenchmarkGateRequest {
+    pub name: String,
+    #[serde(default)]
+    pub expected_exit_code: i32,
+    pub kind: BenchmarkGateKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum BenchmarkGateKind {
+    SweBench {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        provider: String,
+        model: String,
+        max_steps: usize,
+        #[serde(default)]
+        evaluate: bool,
+    },
+    Command {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        results_dir: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BenchmarkGateReport {
+    pub name: String,
+    pub command: String,
+    pub expected_exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub outcome: EvaluationOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<EvaluationMetric>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_verdict: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BenchmarkSummaryVerdict {
+    outcome: EvaluationOutcome,
+    summary: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceUsageConfidence {
+    Exact,
+    ProviderReported,
+    Estimated,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateResourceUsageRecord {
+    pub resource: String,
+    pub units: u64,
+    pub unit: String,
+    pub confidence: ResourceUsageConfidence,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateResourceUsageSummary {
+    pub job_id: EvolutionJobId,
+    pub generated_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<CandidateResourceUsageRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduler_estimates: Vec<ResourceUsageEstimate>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -130,6 +279,10 @@ pub struct EvolutionRequestInput {
     pub intended_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benchmark_specs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_replay_report_specs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,6 +425,8 @@ pub struct EvolutionIterationResult {
     pub task_id: String,
     pub result_kind: EvolutionResultKind,
     pub status: EvolutionIterationStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_usage: Vec<ResourceUsageEstimate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,11 +621,20 @@ pub fn prepare_evolution_request(
             gate: EvaluationGate::StaticChecks,
         })
         .collect();
+    let benchmark_gates = parse_benchmark_gate_specs(
+        &input.benchmark_specs,
+        &provider,
+        model.as_deref().unwrap_or(PROVIDER_DEFAULT_MODEL),
+    )?;
+    let module_replay_reports =
+        parse_module_replay_report_specs(&input.module_replay_report_specs)?;
     let request = EvolutionRequest {
         objective: input.objective,
         target_ring: input.target_ring,
         intended_paths: input.intended_paths,
         verification_commands,
+        benchmark_gates,
+        module_replay_reports,
         model_provider: Some(provider.clone()),
         model: model.clone(),
         dry_run: input.dry_run,
@@ -480,6 +644,136 @@ pub fn prepare_evolution_request(
         request,
         provider,
         model: model.unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string()),
+    })
+}
+
+pub fn parse_module_replay_report_specs(
+    specs: &[String],
+) -> Result<Vec<ModuleReplayReportRef>, EvolutionInputParseError> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| parse_module_replay_report_spec(index + 1, spec))
+        .collect()
+}
+
+fn parse_module_replay_report_spec(
+    index: usize,
+    spec: &str,
+) -> Result<ModuleReplayReportRef, EvolutionInputParseError> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err(EvolutionInputParseError::Invalid {
+            detail: "module replay report spec cannot be empty".to_string(),
+        });
+    }
+    let (name, report_path) = if let Some((name, report_path)) = trimmed.split_once('=') {
+        let name = name.trim();
+        let report_path = report_path.trim();
+        if name.is_empty() || report_path.is_empty() {
+            return Err(EvolutionInputParseError::Invalid {
+                detail: format!(
+                    "module replay report spec `{spec}` must look like `name=path` or `path`"
+                ),
+            });
+        }
+        (name.to_string(), report_path.to_string())
+    } else {
+        (format!("module-replay-{index}"), trimmed.to_string())
+    };
+    Ok(ModuleReplayReportRef {
+        name,
+        report_path,
+        baseline_artifact_id: None,
+        candidate_artifact_id: None,
+    })
+}
+
+pub fn parse_benchmark_gate_specs(
+    specs: &[String],
+    provider: &str,
+    model: &str,
+) -> Result<Vec<BenchmarkGateRequest>, EvolutionInputParseError> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| parse_benchmark_gate_spec(index + 1, spec, provider, model))
+        .collect()
+}
+
+fn parse_benchmark_gate_spec(
+    index: usize,
+    spec: &str,
+    provider: &str,
+    model: &str,
+) -> Result<BenchmarkGateRequest, EvolutionInputParseError> {
+    if spec == "swebench" {
+        return Ok(BenchmarkGateRequest {
+            name: format!("benchmark-swebench-{index}"),
+            expected_exit_code: 0,
+            kind: BenchmarkGateKind::SweBench {
+                instance_id: None,
+                limit: Some(1),
+                provider: provider.to_string(),
+                model: model.to_string(),
+                max_steps: 20,
+                evaluate: true,
+            },
+        });
+    }
+    if let Some(value) = spec.strip_prefix("swebench:") {
+        let (instance_id, limit) = if let Some(limit) = value.strip_prefix("limit=") {
+            let limit =
+                limit
+                    .parse::<usize>()
+                    .map_err(|source| EvolutionInputParseError::Invalid {
+                        detail: format!("invalid SWE-bench limit `{limit}`: {source}"),
+                    })?;
+            if limit == 0 {
+                return Err(EvolutionInputParseError::Invalid {
+                    detail: "SWE-bench limit must be at least 1".to_string(),
+                });
+            }
+            (None, Some(limit))
+        } else if value.trim().is_empty() {
+            (None, Some(1))
+        } else {
+            (Some(value.to_string()), None)
+        };
+        return Ok(BenchmarkGateRequest {
+            name: format!("benchmark-swebench-{index}"),
+            expected_exit_code: 0,
+            kind: BenchmarkGateKind::SweBench {
+                instance_id,
+                limit,
+                provider: provider.to_string(),
+                model: model.to_string(),
+                max_steps: 20,
+                evaluate: true,
+            },
+        });
+    }
+    if let Some(command) = spec.strip_prefix("command:") {
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(EvolutionInputParseError::Invalid {
+                detail: "benchmark command spec cannot be empty".to_string(),
+            });
+        }
+        return Ok(BenchmarkGateRequest {
+            name: format!("benchmark-command-{index}"),
+            expected_exit_code: 0,
+            kind: BenchmarkGateKind::Command {
+                command: command.to_string(),
+                summary_path: None,
+                results_dir: None,
+            },
+        });
+    }
+    Err(EvolutionInputParseError::Invalid {
+        detail: format!(
+            "unsupported benchmark spec `{spec}`; expected `swebench`, `swebench:<instance_id>`, `swebench:limit=N`, or `command:<shell command>`"
+        ),
     })
 }
 
@@ -1480,11 +1774,22 @@ pub fn plan_background_scheduling_tick(
     };
     let concurrency_cap = request.max_concurrent_campaigns.max(1);
     let workload_concurrency_cap = request.max_concurrent_workloads.max(concurrency_cap).max(1);
-    let mut shared_resources = if request.reset_window_open {
-        reset_resources_for_background_tick(&request.resources)
+    let base_resources = if request.resources.is_empty() {
+        background_resource_classes_from_campaign_reserve_floors(
+            &request.campaigns,
+            "derived from campaign reserve floors for background scheduler",
+        )
     } else {
         request.resources.clone()
     };
+    let mut shared_resources = if request.reset_window_open {
+        reset_resources_for_background_tick(&base_resources)
+    } else {
+        base_resources
+    };
+    if !request.reset_window_open {
+        apply_campaign_iteration_usage_to_resources(&mut shared_resources, &request.campaigns);
+    }
     let mut campaigns = Vec::new();
     let mut external_workloads = Vec::new();
     let mut active_campaigns = Vec::new();
@@ -2023,6 +2328,92 @@ pub fn parse_external_workload_status(
     }
 }
 
+pub fn candidate_resource_usage_estimates_for_report(
+    campaign: &EvolutionCampaign,
+    task_id: &str,
+    report: &EvolutionReport,
+) -> Result<Vec<ResourceUsageEstimate>, EvolutionInputParseError> {
+    let Some(path) = &report.bundle.resource_usage_path else {
+        return Ok(Vec::new());
+    };
+    let content = fs::read_to_string(path).map_err(|source| EvolutionInputParseError::Invalid {
+        detail: format!("could not read candidate resource usage `{path}`: {source}"),
+    })?;
+    let summary =
+        serde_json::from_str::<CandidateResourceUsageSummary>(&content).map_err(|source| {
+            EvolutionInputParseError::Invalid {
+                detail: format!("could not parse candidate resource usage `{path}`: {source}"),
+            }
+        })?;
+    Ok(candidate_resource_usage_estimates(
+        campaign, task_id, &summary,
+    ))
+}
+
+pub fn candidate_resource_usage_estimates(
+    campaign: &EvolutionCampaign,
+    task_id: &str,
+    summary: &CandidateResourceUsageSummary,
+) -> Vec<ResourceUsageEstimate> {
+    if !summary.scheduler_estimates.is_empty() {
+        return summary
+            .scheduler_estimates
+            .iter()
+            .cloned()
+            .map(|mut estimate| {
+                estimate.task_id = task_id.to_string();
+                estimate
+            })
+            .collect();
+    }
+    if summary.records.is_empty() {
+        return Vec::new();
+    }
+    let resource = campaign
+        .budget_policy
+        .reserve_floors
+        .first()
+        .map(|floor| floor.resource.clone())
+        .unwrap_or_else(|| "local-agent-wall-time".to_string());
+    let estimated_units = campaign
+        .near_term_tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .map(|_| 10)
+        .unwrap_or(10);
+    vec![ResourceUsageEstimate {
+        task_id: task_id.to_string(),
+        resource,
+        estimated_units,
+        actual_units: Some(candidate_scheduler_usage_units(summary)),
+    }]
+}
+
+fn candidate_scheduler_usage_units(summary: &CandidateResourceUsageSummary) -> u64 {
+    let input_tokens = usage_record_units(summary, "agent-input-tokens");
+    let output_tokens = usage_record_units(summary, "agent-output-tokens");
+    let token_units = input_tokens
+        .saturating_add(output_tokens)
+        .saturating_add(999)
+        / 1000;
+    let model_turn_units = usage_record_units(summary, "agent-model-turns");
+    let local_minutes =
+        usage_record_units(summary, "local-compute-ms").saturating_add(59_999) / 60_000;
+    token_units
+        .saturating_add(model_turn_units)
+        .saturating_add(local_minutes)
+        .max(1)
+}
+
+fn usage_record_units(summary: &CandidateResourceUsageSummary, resource: &str) -> u64 {
+    summary
+        .records
+        .iter()
+        .filter(|record| record.resource == resource)
+        .map(|record| record.units)
+        .sum()
+}
+
 #[derive(Debug, Error)]
 pub enum EvolutionInputParseError {
     #[error("{detail}")]
@@ -2177,6 +2568,37 @@ fn apply_granted_usage_to_resources(
     }
 }
 
+fn apply_campaign_iteration_usage_to_resources(
+    resources: &mut [ResourceClassDefinition],
+    campaigns: &[EvolutionCampaign],
+) {
+    for usage in campaigns
+        .iter()
+        .flat_map(|campaign| &campaign.iteration_results)
+        .flat_map(|result| &result.resource_usage)
+    {
+        let used_units = usage.actual_units.unwrap_or(usage.estimated_units);
+        if used_units == 0 {
+            continue;
+        }
+        if let Some(resource) = resources
+            .iter_mut()
+            .find(|resource| resource.resource_id == usage.resource)
+        {
+            resource.used_units = resource
+                .used_units
+                .saturating_add(used_units)
+                .min(resource.total_units);
+            if !resource.notes.contains("iteration usage") {
+                resource.notes = format!(
+                    "{}; includes previous campaign iteration usage in current window",
+                    resource.notes
+                );
+            }
+        }
+    }
+}
+
 fn default_resource_classes(campaign: &EvolutionCampaign) -> Vec<ResourceClassDefinition> {
     if campaign.budget_policy.reserve_floors.is_empty() {
         return vec![ResourceClassDefinition {
@@ -2299,6 +2721,8 @@ pub fn prepare_scheduled_iteration(
         target_ring: campaign.target_ring.clone(),
         intended_paths,
         verification_commands,
+        benchmark_gates: Vec::new(),
+        module_replay_reports: Vec::new(),
         model_provider: None,
         model: None,
         dry_run: request.dry_run,
@@ -2357,6 +2781,9 @@ pub fn record_scheduled_iteration_result(
     if let Some(changed_files_path) = &report.bundle.changed_files_path {
         evidence.push(format!("changed-files:{changed_files_path}"));
     }
+    if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
+        evidence.push(format!("resource-usage:{resource_usage_path}"));
+    }
     for usage in &resource_usage {
         evidence.push(format!(
             "resource-usage:{} estimated={} actual={}",
@@ -2385,6 +2812,7 @@ pub fn record_scheduled_iteration_result(
         task_id: task_id.to_string(),
         result_kind: task_kind,
         status: status.clone(),
+        resource_usage: resource_usage.clone(),
         evidence: evidence.clone(),
         summary,
     });
@@ -2602,6 +3030,9 @@ fn campaign_iteration_evidence_refs(
     }
     if let Some(changed_files_path) = &report.bundle.changed_files_path {
         evidence.push(format!("changed-files:{changed_files_path}"));
+    }
+    if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
+        evidence.push(format!("resource-usage:{resource_usage_path}"));
     }
     for usage in resource_usage {
         evidence.push(format!(
@@ -3711,9 +4142,18 @@ impl CandidateBundleStore for LocalCandidateBundleStore {
                 .to_string(),
             job_path: Some(bundle_path.join("job.json").display().to_string()),
             model_output_path: None,
+            agent_run_path: None,
+            agent_summary_path: None,
+            benchmark_results_path: None,
+            resource_usage_path: None,
+            content_manifest_path: None,
+            attestation_path: None,
+            registry_record_path: None,
+            bundle_content_hash: None,
             changed_files_path: None,
             diff_path: None,
             scorecard_path: None,
+            candidate_summary_path: None,
             decision_path: None,
             command_logs: Vec::new(),
         };
@@ -3767,6 +4207,7 @@ pub trait MutationModel {
         &self,
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
+        bundle: Option<&CandidateBundleManifest>,
     ) -> Result<ModelMutationResult, MutationModelError>;
 }
 
@@ -3806,6 +4247,24 @@ pub struct ModelMutationResult {
     pub tool_results: Vec<EvolutionToolResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_turns: Vec<MutationModelTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_summary: Option<AgentMutationSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_resource_usage: Option<CandidateResourceUsageSummary>,
+    #[serde(skip)]
+    pub agent_run: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentMutationSummary {
+    pub stop_reason: String,
+    pub model_turns: usize,
+    pub tool_results: usize,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    pub final_text: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -3911,6 +4370,7 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
         &self,
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
+        _bundle: Option<&CandidateBundleManifest>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         let info = self.provider.info();
         let direct_edit =
@@ -4055,6 +4515,9 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
             structured_output,
             tool_results: all_tool_results,
             model_turns,
+            agent_summary: None,
+            agent_resource_usage: None,
+            agent_run: None,
         })
     }
 }
@@ -4071,6 +4534,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
         &self,
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
+        _bundle: Option<&CandidateBundleManifest>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         match self.provider.as_str() {
             GitHubCopilotProvider::PROVIDER_ID => {
@@ -4089,7 +4553,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     token_store_path: Some(credentials_path),
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             GitHubCopilotCliProvider::PROVIDER_ID => {
                 let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
@@ -4097,7 +4561,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     ..GitHubCopilotCliConfig::default()
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             CodexCliProvider::PROVIDER_ID => {
                 let provider = CodexCliProvider::new(CodexCliConfig {
@@ -4106,12 +4570,12 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     ..CodexCliConfig::default()
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             CODEX_PROVIDER_ID => {
                 let provider = codex_provider_for_model(&self.model);
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
                 let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
@@ -4120,7 +4584,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     ..ClaudeCodeConfig::default()
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             AnthropicProvider::PROVIDER_ID | "claude" => {
                 let credentials_path = self
@@ -4135,7 +4599,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     ..AnthropicConfig::default()
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             OpenAiProvider::PROVIDER_ID | "openai-api" => {
                 let credentials_path = self
@@ -4150,7 +4614,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     ..OpenAiConfig::default()
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             GeminiProvider::PROVIDER_ID | "google-gemini" => {
                 let credentials_path = self
@@ -4165,7 +4629,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     ..GeminiConfig::default()
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             NvidiaProvider::PROVIDER_ID => {
                 let credentials_path = self
@@ -4181,7 +4645,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     credentials_path: Some(credentials_path),
                 });
                 LanguageModelMutationBridge::new(provider, self.model.clone())
-                    .mutate(packet, workspace)
+                    .mutate(packet, workspace, None)
             }
             _ => Err(MutationModelError::LanguageModel(
                 LanguageModelError::ProviderInvocationFailed {
@@ -4192,6 +4656,343 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
             )),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct EvolutionAgentMutationModel {
+    pub provider: String,
+    pub model: String,
+    pub data_dir: SinomoDataDir,
+    pub max_steps: Option<usize>,
+}
+
+impl MutationModel for EvolutionAgentMutationModel {
+    fn mutate(
+        &self,
+        packet: &MutationPacket,
+        workspace: &CandidateWorkspace,
+        bundle: Option<&CandidateBundleManifest>,
+    ) -> Result<ModelMutationResult, MutationModelError> {
+        let model = ConfiguredEvolutionAgentModel {
+            data_dir: self.data_dir.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            working_dir: workspace.path.clone(),
+        };
+        AgentMutationWorker::new(model, self.provider.clone(), self.model.clone())
+            .with_max_steps(self.max_steps)
+            .mutate(packet, workspace, bundle)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentMutationWorker<M> {
+    interaction_model: M,
+    provider: String,
+    model: String,
+    max_steps: Option<usize>,
+}
+
+impl<M> AgentMutationWorker<M> {
+    pub fn new(
+        interaction_model: M,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            interaction_model,
+            provider: provider.into(),
+            model: model.into(),
+            max_steps: None,
+        }
+    }
+
+    pub fn with_max_steps(mut self, max_steps: Option<usize>) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+}
+
+impl<M> MutationModel for AgentMutationWorker<M>
+where
+    M: InteractionModel + Clone,
+{
+    fn mutate(
+        &self,
+        packet: &MutationPacket,
+        workspace: &CandidateWorkspace,
+        bundle: Option<&CandidateBundleManifest>,
+    ) -> Result<ModelMutationResult, MutationModelError> {
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_evolution_agent").expect("valid evolution node id"),
+            InteractionSurface::new("evolution.mutation", InteractionSurfaceKind::CommandLine),
+        );
+        let storage_paths = AgentStoragePaths::new(agent_storage_root(workspace, bundle));
+        let mut workspace_config = LocalWorkspaceAgentConfig::new(&workspace.path)
+            .allowing_shell_commands(true)
+            .allowing_file_writes(true)
+            .with_agent_storage(&storage_paths, &session.session_id);
+        workspace_config.max_read_bytes = 256 * 1024;
+        workspace_config.max_command_output_bytes = 128 * 1024;
+        workspace_config.max_search_matches = 300;
+
+        let mut config = AgentConfig::new(self.provider.clone(), self.model.clone())
+            .with_workspace_root(&workspace.path)
+            .with_context_budget(AgentContextBudget::for_loaded_model(
+                &self.provider,
+                &self.model,
+                None,
+            ))
+            .with_max_model_repair_attempts(2);
+        if let Some(max_steps) = self.max_steps {
+            config = config.with_max_steps(max_steps);
+        }
+
+        let agent = Agent::new(
+            self.interaction_model.clone(),
+            self.provider.clone(),
+            self.model.clone(),
+        )
+        .with_config(config)
+        .with_policy(AgentPolicyBundle::default_for_role(AgentRole::Evolution))
+        .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
+            workspace_config,
+        ))
+        .with_trace_store(FileAgentTraceStore::new(
+            storage_paths.trace_path_for_session(&session.session_id),
+        ));
+        let prompt = render_agent_mutation_prompt(packet, workspace);
+        let latest_event = user_interaction_input_event(&session, &prompt);
+        let input = AgentLoopInput {
+            context: BoundedContext {
+                session_id: session.session_id.clone(),
+                events: Vec::new(),
+                packet: ContextPacket::default(),
+            },
+            session,
+            latest_event,
+            async_update: None,
+            evolution_context: Some(AgentEvolutionContext {
+                job: None,
+                mutation_packet: Some(packet.clone()),
+                candidate_bundle: bundle.cloned(),
+                verification_results: Vec::new(),
+                candidate_evidence: Vec::new(),
+            }),
+            tool_specs: default_coding_agent_tools(),
+        };
+        let run = agent
+            .run(&input)
+            .map_err(|source| MutationModelError::Agent {
+                detail: source.to_string(),
+            })?;
+        let final_text = run.final_decision.text.clone();
+        let (input_tokens, output_tokens) = agent_model_usage_totals(&run.model_events);
+        let agent_summary = AgentMutationSummary {
+            stop_reason: agent_stop_reason_label(&run.stop_reason),
+            model_turns: run.model_turns.len(),
+            tool_results: run.tool_results.len(),
+            input_tokens,
+            output_tokens,
+            final_text: final_text.clone(),
+        };
+        let agent_resource_usage = agent_resource_usage_summary(
+            packet.job_id.clone(),
+            input_tokens,
+            output_tokens,
+            run.model_turns.len(),
+            run.tool_results.len(),
+        );
+        let agent_run =
+            serde_json::to_value(&run).map_err(|source| MutationModelError::Serialization {
+                detail: source.to_string(),
+            })?;
+        Ok(ModelMutationResult {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            raw_output: final_text.clone(),
+            parsed_patch: None,
+            summary: non_empty_string(final_text),
+            structured_output: None,
+            tool_results: Vec::new(),
+            model_turns: Vec::new(),
+            agent_summary: Some(agent_summary),
+            agent_resource_usage: Some(agent_resource_usage),
+            agent_run: Some(agent_run),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConfiguredEvolutionAgentModel {
+    data_dir: SinomoDataDir,
+    provider: String,
+    model: String,
+    working_dir: PathBuf,
+}
+
+impl InteractionModel for ConfiguredEvolutionAgentModel {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        complete_configured_model_request(
+            &self.data_dir,
+            &self.provider,
+            &self.model,
+            Some(self.working_dir.clone()),
+            request,
+        )
+    }
+}
+
+fn agent_storage_root(
+    workspace: &CandidateWorkspace,
+    bundle: Option<&CandidateBundleManifest>,
+) -> PathBuf {
+    if let Some(bundle) = bundle {
+        return PathBuf::from(&bundle.bundle_path).join("agent");
+    }
+    workspace
+        .path
+        .parent()
+        .unwrap_or(&workspace.path)
+        .join("agent-artifacts")
+        .join(workspace.job_id.as_str())
+}
+
+fn agent_stop_reason_label(reason: &sinomo_agent::AgentStopReason) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{reason:?}"))
+}
+
+fn agent_model_usage_totals(events: &[AgentModelEvent]) -> (u64, u64) {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentModelEvent::Usage {
+                usage: Some(usage), ..
+            } => Some(usage),
+            _ => None,
+        })
+        .fold((0u64, 0u64), |(input, output), usage| {
+            (
+                input.saturating_add(usage.input_tokens.unwrap_or(0)),
+                output.saturating_add(usage.output_tokens.unwrap_or(0)),
+            )
+        })
+}
+
+fn agent_resource_usage_summary(
+    job_id: EvolutionJobId,
+    input_tokens: u64,
+    output_tokens: u64,
+    model_turns: usize,
+    tool_results: usize,
+) -> CandidateResourceUsageSummary {
+    let mut records = Vec::new();
+    if input_tokens > 0 {
+        records.push(resource_usage_record(
+            "agent-input-tokens",
+            input_tokens,
+            "tokens",
+            ResourceUsageConfidence::ProviderReported,
+            "AgentRun.model_events usage input_tokens",
+        ));
+    }
+    if output_tokens > 0 {
+        records.push(resource_usage_record(
+            "agent-output-tokens",
+            output_tokens,
+            "tokens",
+            ResourceUsageConfidence::ProviderReported,
+            "AgentRun.model_events usage output_tokens",
+        ));
+    }
+    if model_turns > 0 {
+        records.push(resource_usage_record(
+            "agent-model-turns",
+            model_turns as u64,
+            "turns",
+            ResourceUsageConfidence::Exact,
+            "AgentRun.model_turns",
+        ));
+    }
+    if tool_results > 0 {
+        records.push(resource_usage_record(
+            "agent-tool-results",
+            tool_results as u64,
+            "tool-results",
+            ResourceUsageConfidence::Exact,
+            "AgentRun.tool_results",
+        ));
+    }
+    CandidateResourceUsageSummary {
+        job_id,
+        generated_at: now_rfc3339(),
+        records,
+        scheduler_estimates: Vec::new(),
+    }
+}
+
+fn resource_usage_record(
+    resource: impl Into<String>,
+    units: u64,
+    unit: impl Into<String>,
+    confidence: ResourceUsageConfidence,
+    source: impl Into<String>,
+) -> CandidateResourceUsageRecord {
+    CandidateResourceUsageRecord {
+        resource: resource.into(),
+        units,
+        unit: unit.into(),
+        confidence,
+        source: source.into(),
+    }
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string())
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+pub fn render_agent_mutation_prompt(
+    packet: &MutationPacket,
+    workspace: &CandidateWorkspace,
+) -> String {
+    let mut prompt = render_mutation_prompt(packet);
+    prompt.push_str("\n## Candidate Workspace\n");
+    prompt.push_str(&format!("path: {}\n", workspace.path.display()));
+    prompt.push_str(&format!("branch: {}\n", workspace.branch_name));
+    if let Some(revision) = &workspace.source_revision {
+        prompt.push_str(&format!("source_revision: {revision}\n"));
+    }
+    prompt.push_str(
+        "Treat this workspace as the only mutation target. The running Sinomo instance may be using the source workspace separately.\n",
+    );
+    prompt.push_str("\n## Agent Harness Instructions\n");
+    prompt.push_str(
+        "Use the available workspace tools to inspect and edit files directly. Do not ask for approval; any visible tool or resource is already available under the active sandbox.\n",
+    );
+    prompt.push_str(
+        "Keep changes scoped to the intended edit scope unless repository evidence shows a supporting file must also change. Run the requested verification commands when practical; the orchestrator will run them again after you finish.\n",
+    );
+    prompt.push_str(
+        "When the candidate is ready, return a concise final summary with changed files and verification status. Leave all source changes in the candidate workspace.\n",
+    );
+    prompt
 }
 
 pub fn render_mutation_prompt(packet: &MutationPacket) -> String {
@@ -4217,6 +5018,15 @@ pub fn render_mutation_prompt(packet: &MutationPacket) -> String {
             "- {}: `{}` expects exit {} ({:?})\n",
             command.name, command.command, command.expected_exit_code, command.gate
         ));
+    }
+    if !packet.verification.module_replay_reports.is_empty() {
+        prompt.push_str("\n## Module Replay Reports\n");
+        for report in &packet.verification.module_replay_reports {
+            prompt.push_str(&format!(
+                "- {}: `{}` contributes replay/shadow gates\n",
+                report.name, report.report_path
+            ));
+        }
     }
     prompt.push_str("\n## Relevant Files\n");
     if packet.relevant_files.is_empty() {
@@ -4424,14 +5234,35 @@ where
         self.bundles
             .write_json(&bundle, "mutation-packet.json", &packet)?;
 
+        let mut mutation_result = None;
         if request.dry_run {
             // Dry-run proposals only prepare candidate artifacts and verification evidence.
         } else if let Some(model) = model {
-            let result = model.mutate(&packet, &candidate_workspace)?;
+            let result = model.mutate(&packet, &candidate_workspace, Some(&bundle))?;
             self.bundles
                 .write_text(&bundle, "model-output.txt", &result.raw_output)?;
             self.bundles
                 .write_json(&bundle, "model-result.json", &result)?;
+            if let Some(agent_run) = &result.agent_run {
+                self.bundles
+                    .write_json(&bundle, "agent-run.json", agent_run)?;
+                bundle.agent_run_path = Some(
+                    PathBuf::from(&bundle.bundle_path)
+                        .join("agent-run.json")
+                        .display()
+                        .to_string(),
+                );
+            }
+            if let Some(agent_summary) = &result.agent_summary {
+                self.bundles
+                    .write_json(&bundle, "agent-summary.json", agent_summary)?;
+                bundle.agent_summary_path = Some(
+                    PathBuf::from(&bundle.bundle_path)
+                        .join("agent-summary.json")
+                        .display()
+                        .to_string(),
+                );
+            }
             if let Some(patch) = &result.parsed_patch {
                 self.bundles.write_text(&bundle, "model.patch", patch)?;
             }
@@ -4452,6 +5283,7 @@ where
                     .display()
                     .to_string(),
             );
+            mutation_result = Some(result);
         }
 
         let changed_files = self.workspace.changed_files(&candidate_workspace)?;
@@ -4472,13 +5304,47 @@ where
                 .to_string(),
         );
 
-        let (scorecard, command_results) = self
+        let benchmark_executions = prepare_benchmark_gate_executions(&request, &bundle);
+        let mut verification_plan = job.verification.clone();
+        verification_plan.commands.extend(
+            benchmark_executions
+                .iter()
+                .map(|execution| execution.command.clone()),
+        );
+        let (mut scorecard, command_results) = self
             .evaluator
-            .run_verification_plan(job.verification.clone(), &candidate_workspace.path)?;
+            .run_verification_plan(verification_plan, &candidate_workspace.path)?;
         for result in &command_results {
             let log_ref = write_command_log_via_store(&self.bundles, &bundle, result)?;
             bundle.command_logs.push(log_ref);
         }
+        let benchmark_reports =
+            finalize_benchmark_gate_reports(benchmark_executions, &command_results, &bundle);
+        apply_benchmark_reports_to_scorecard(&mut scorecard, &benchmark_reports);
+        if !benchmark_reports.is_empty() {
+            self.bundles
+                .write_json(&bundle, "benchmark-results.json", &benchmark_reports)?;
+            bundle.benchmark_results_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("benchmark-results.json")
+                    .display()
+                    .to_string(),
+            );
+        }
+        let resource_usage_summary = candidate_resource_usage_summary(
+            &job,
+            mutation_result.as_ref(),
+            &command_results,
+            &benchmark_reports,
+        );
+        self.bundles
+            .write_json(&bundle, "resource-usage.json", &resource_usage_summary)?;
+        bundle.resource_usage_path = Some(
+            PathBuf::from(&bundle.bundle_path)
+                .join("resource-usage.json")
+                .display()
+                .to_string(),
+        );
         self.bundles
             .write_json(&bundle, "scorecard.json", &scorecard)?;
         bundle.scorecard_path = Some(
@@ -4488,6 +5354,14 @@ where
                 .to_string(),
         );
 
+        finalize_candidate_bundle_integrity(
+            &mut bundle,
+            &job,
+            &candidate_workspace,
+            mutation_result.as_ref(),
+            scorecard.outcome.clone(),
+            &changed_files,
+        )?;
         self.bundles.write_json(&bundle, "manifest.json", &bundle)?;
 
         Ok(EvolutionReport {
@@ -4503,6 +5377,670 @@ where
     }
 }
 
+fn finalize_candidate_bundle_integrity(
+    bundle: &mut CandidateBundleManifest,
+    job: &EvolutionJob,
+    workspace: &CandidateWorkspace,
+    mutation_result: Option<&ModelMutationResult>,
+    verification_outcome: EvaluationOutcome,
+    changed_files: &[String],
+) -> Result<(), BundleError> {
+    let bundle_root = PathBuf::from(&bundle.bundle_path);
+    let content_manifest = build_candidate_bundle_content_manifest(&bundle_root)?;
+    let content_manifest_path = bundle_root.join("bundle-content-manifest.json");
+    write_json_file_for_bundle(&content_manifest_path, &content_manifest)?;
+    bundle.content_manifest_path = Some(content_manifest_path.display().to_string());
+    bundle.bundle_content_hash = Some(content_manifest.bundle_content_hash.clone());
+
+    let attestation = build_candidate_bundle_attestation(
+        bundle,
+        job,
+        workspace,
+        mutation_result,
+        verification_outcome,
+        changed_files,
+        &content_manifest,
+    );
+    let attestation_path = bundle_root.join("bundle-attestation.json");
+    write_json_file_for_bundle(&attestation_path, &attestation)?;
+    bundle.attestation_path = Some(attestation_path.display().to_string());
+    Ok(())
+}
+
+fn build_candidate_bundle_content_manifest(
+    bundle_root: &Path,
+) -> Result<CandidateBundleContentManifest, BundleError> {
+    let mut files = Vec::new();
+    collect_candidate_bundle_file_digests(bundle_root, bundle_root, &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let bundle_content_hash = bundle_content_hash(&files);
+    Ok(CandidateBundleContentManifest {
+        bundle_path: bundle_root.display().to_string(),
+        generated_at: now_rfc3339(),
+        bundle_content_hash,
+        hash_algorithm: "blake3".to_string(),
+        files,
+    })
+}
+
+fn collect_candidate_bundle_file_digests(
+    bundle_root: &Path,
+    path: &Path,
+    files: &mut Vec<CandidateBundleFileDigest>,
+) -> Result<(), BundleError> {
+    let entries = fs::read_dir(path).map_err(|source| BundleError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| BundleError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_candidate_bundle_file_digests(bundle_root, &entry_path, files)?;
+        } else if entry_path.is_file() {
+            let relative = bundle_relative_path(bundle_root, &entry_path);
+            if is_bundle_integrity_control_file(&relative) {
+                continue;
+            }
+            files.push(file_digest(&entry_path, relative)?);
+        }
+    }
+    Ok(())
+}
+
+fn bundle_relative_path(bundle_root: &Path, path: &Path) -> String {
+    path.strip_prefix(bundle_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn is_bundle_integrity_control_file(path: &str) -> bool {
+    matches!(
+        path,
+        "manifest.json"
+            | "job.json"
+            | "record.json"
+            | "bundle-content-manifest.json"
+            | "bundle-attestation.json"
+            | "candidate-bundle-registry-record.json"
+            | "candidate-summary.md"
+            | "approval-decision.json"
+    )
+}
+
+fn file_digest(path: &Path, relative: String) -> Result<CandidateBundleFileDigest, BundleError> {
+    let mut file = fs::File::open(path).map_err(|source| BundleError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| BundleError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    Ok(CandidateBundleFileDigest {
+        path: relative,
+        bytes,
+        digest: format!("blake3:{}", hasher.finalize().to_hex()),
+    })
+}
+
+fn bundle_content_hash(files: &[CandidateBundleFileDigest]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for file in files {
+        hasher.update(file.path.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(file.digest.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(file.bytes.to_string().as_bytes());
+        hasher.update(&[0]);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn build_candidate_bundle_attestation(
+    bundle: &CandidateBundleManifest,
+    job: &EvolutionJob,
+    workspace: &CandidateWorkspace,
+    mutation_result: Option<&ModelMutationResult>,
+    verification_outcome: EvaluationOutcome,
+    changed_files: &[String],
+    content_manifest: &CandidateBundleContentManifest,
+) -> CandidateBundleAttestation {
+    let mutation_worker = mutation_result
+        .map(|result| {
+            if result.agent_run.is_some() {
+                "agent-loop"
+            } else {
+                "legacy-bridge"
+            }
+        })
+        .unwrap_or("dry-run")
+        .to_string();
+    let artifact_refs = candidate_bundle_artifact_refs(bundle);
+    CandidateBundleAttestation {
+        statement_type: "https://in-toto.io/Statement/v1".to_string(),
+        predicate_type: "https://sinomo.net/attestations/evolution-candidate-bundle/v1".to_string(),
+        subject: CandidateBundleSubject {
+            name: format!("candidate-bundle:{}", job.job_id),
+            digest: content_manifest.bundle_content_hash.clone(),
+        },
+        predicate: CandidateBundlePredicate {
+            job_id: job.job_id.clone(),
+            objective: job.objective.clone(),
+            target_ring: job.target_ring.clone(),
+            produced_by: "sinomo-evolution".to_string(),
+            mutation_worker,
+            provider: mutation_result.map(|result| result.provider.clone()),
+            model: mutation_result.map(|result| result.model.clone()),
+            source_workspace: job.edit_scope.workspace_root.clone(),
+            candidate_worktree: workspace.path.display().to_string(),
+            candidate_branch: workspace.branch_name.clone(),
+            source_revision: workspace.source_revision.clone(),
+            verification_outcome: Some(verification_outcome.clone()),
+            changed_files: changed_files.to_vec(),
+            artifact_refs,
+            generated_at: now_rfc3339(),
+        },
+    }
+}
+
+fn candidate_bundle_artifact_refs(bundle: &CandidateBundleManifest) -> Vec<String> {
+    let mut refs = vec![bundle.mutation_packet_path.clone()];
+    refs.extend(bundle.job_path.iter().cloned());
+    refs.extend(bundle.model_output_path.iter().cloned());
+    refs.extend(bundle.agent_run_path.iter().cloned());
+    refs.extend(bundle.agent_summary_path.iter().cloned());
+    refs.extend(bundle.benchmark_results_path.iter().cloned());
+    refs.extend(bundle.resource_usage_path.iter().cloned());
+    refs.extend(bundle.changed_files_path.iter().cloned());
+    refs.extend(bundle.diff_path.iter().cloned());
+    refs.extend(bundle.scorecard_path.iter().cloned());
+    refs.extend(bundle.command_logs.iter().map(|log| log.log_path.clone()));
+    let rollout_material_path =
+        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(bundle);
+    if rollout_material_path.exists() {
+        refs.push(rollout_material_path.display().to_string());
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn write_json_file_for_bundle<T: Serialize>(path: &Path, value: &T) -> Result<(), BundleError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| BundleError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|source| BundleError::Serialize(source.to_string()))?;
+    fs::write(path, content).map_err(|source| BundleError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn candidate_resource_usage_summary(
+    job: &EvolutionJob,
+    mutation_result: Option<&ModelMutationResult>,
+    command_results: &[CommandRunResult],
+    benchmark_reports: &[BenchmarkGateReport],
+) -> CandidateResourceUsageSummary {
+    let mut records = mutation_result
+        .and_then(|result| result.agent_resource_usage.as_ref())
+        .map(|usage| usage.records.clone())
+        .unwrap_or_default();
+
+    let benchmark_names: BTreeSet<&str> = benchmark_reports
+        .iter()
+        .map(|report| report.name.as_str())
+        .collect();
+    let benchmark_wall_ms = benchmark_reports
+        .iter()
+        .filter_map(|report| report.duration_ms)
+        .sum::<u64>();
+    let verification_wall_ms = command_results
+        .iter()
+        .filter(|result| !benchmark_names.contains(result.name.as_str()))
+        .map(|result| result.duration_ms)
+        .sum::<u64>();
+    if verification_wall_ms > 0 {
+        records.push(resource_usage_record(
+            "verification-command-wall-ms",
+            verification_wall_ms,
+            "ms",
+            ResourceUsageConfidence::Exact,
+            "verification command wall time",
+        ));
+    }
+    if benchmark_wall_ms > 0 {
+        records.push(resource_usage_record(
+            "benchmark-wall-ms",
+            benchmark_wall_ms,
+            "ms",
+            ResourceUsageConfidence::Exact,
+            "benchmark command wall time",
+        ));
+    }
+    let local_compute_ms = verification_wall_ms.saturating_add(benchmark_wall_ms);
+    if local_compute_ms > 0 {
+        records.push(resource_usage_record(
+            "local-compute-ms",
+            local_compute_ms,
+            "ms",
+            ResourceUsageConfidence::Estimated,
+            "wall time proxy for local compute cost",
+        ));
+    }
+    CandidateResourceUsageSummary {
+        job_id: job.job_id.clone(),
+        generated_at: now_rfc3339(),
+        scheduler_estimates: Vec::new(),
+        records,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BenchmarkGateExecution {
+    command: VerificationCommand,
+    report: BenchmarkGateReport,
+}
+
+fn prepare_benchmark_gate_executions(
+    request: &EvolutionRequest,
+    bundle: &CandidateBundleManifest,
+) -> Vec<BenchmarkGateExecution> {
+    request
+        .benchmark_gates
+        .iter()
+        .enumerate()
+        .map(|(index, gate)| prepare_benchmark_gate_execution(index + 1, gate, bundle))
+        .collect()
+}
+
+fn prepare_benchmark_gate_execution(
+    index: usize,
+    gate: &BenchmarkGateRequest,
+    bundle: &CandidateBundleManifest,
+) -> BenchmarkGateExecution {
+    let name = if gate.name.trim().is_empty() {
+        format!("benchmark-{index}")
+    } else {
+        gate.name.clone()
+    };
+    let safe_name = bundle_safe_file_stem(&name);
+    let (command, summary_path, results_dir) = match &gate.kind {
+        BenchmarkGateKind::SweBench {
+            instance_id,
+            limit,
+            provider,
+            model,
+            max_steps,
+            evaluate,
+        } => {
+            let results_dir = PathBuf::from(&bundle.bundle_path)
+                .join("benchmarks")
+                .join(&safe_name);
+            let summary_path = results_dir.join("summary.json");
+            let mut args = vec![
+                "python3".to_string(),
+                "crates/sinomo-benchmarks/swebench/run_swebench_verified.py".to_string(),
+                "--mode".to_string(),
+                "sinomo".to_string(),
+                "--provider".to_string(),
+                provider.clone(),
+                "--model".to_string(),
+                model.clone(),
+                "--max-steps".to_string(),
+                max_steps.to_string(),
+                "--results-dir".to_string(),
+                results_dir.display().to_string(),
+                "--summary-out".to_string(),
+                summary_path.display().to_string(),
+                "--run-id".to_string(),
+                safe_name.clone(),
+            ];
+            if let Some(instance_id) = instance_id {
+                args.extend(["--instance-id".to_string(), instance_id.clone()]);
+            }
+            if let Some(limit) = limit {
+                args.extend(["--limit".to_string(), limit.to_string()]);
+            }
+            if *evaluate {
+                args.push("--evaluate".to_string());
+            }
+            (
+                shell_join(&args),
+                Some(summary_path.display().to_string()),
+                Some(results_dir.display().to_string()),
+            )
+        }
+        BenchmarkGateKind::Command {
+            command,
+            summary_path,
+            results_dir,
+        } => (command.clone(), summary_path.clone(), results_dir.clone()),
+    };
+    BenchmarkGateExecution {
+        command: VerificationCommand {
+            name: name.clone(),
+            command: command.clone(),
+            expected_exit_code: gate.expected_exit_code,
+            gate: EvaluationGate::PrivateRegressionEvals,
+        },
+        report: BenchmarkGateReport {
+            name,
+            command,
+            expected_exit_code: gate.expected_exit_code,
+            exit_code: None,
+            duration_ms: None,
+            outcome: EvaluationOutcome::Inconclusive,
+            summary_path,
+            results_dir,
+            command_log_path: None,
+            metrics: Vec::new(),
+            summary: None,
+            summary_error: None,
+            summary_verdict: None,
+        },
+    }
+}
+
+fn finalize_benchmark_gate_reports(
+    executions: Vec<BenchmarkGateExecution>,
+    command_results: &[CommandRunResult],
+    bundle: &CandidateBundleManifest,
+) -> Vec<BenchmarkGateReport> {
+    executions
+        .into_iter()
+        .map(|execution| {
+            let mut report = execution.report;
+            if let Some(result) = command_results
+                .iter()
+                .find(|result| result.name == execution.command.name)
+            {
+                report.exit_code = Some(result.exit_code);
+                report.duration_ms = Some(result.duration_ms);
+                report.outcome = if result.passed() {
+                    EvaluationOutcome::Passed
+                } else {
+                    EvaluationOutcome::Failed
+                };
+                report.command_log_path = bundle
+                    .command_logs
+                    .iter()
+                    .find(|log| log.name == result.name)
+                    .map(|log| log.log_path.clone());
+            }
+            enrich_benchmark_report_from_summary(&mut report);
+            report
+        })
+        .collect()
+}
+
+fn enrich_benchmark_report_from_summary(report: &mut BenchmarkGateReport) {
+    let Some(summary_path) = report.summary_path.clone() else {
+        return;
+    };
+    let path = PathBuf::from(&summary_path);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(source) => {
+            report.summary_error = Some(format!(
+                "could not read benchmark summary `{}`: {source}",
+                path.display()
+            ));
+            if report.outcome == EvaluationOutcome::Passed {
+                report.outcome = EvaluationOutcome::Inconclusive;
+            }
+            return;
+        }
+    };
+    let summary = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(summary) => summary,
+        Err(source) => {
+            report.summary_error = Some(format!(
+                "could not parse benchmark summary `{}`: {source}",
+                path.display()
+            ));
+            if report.outcome == EvaluationOutcome::Passed {
+                report.outcome = EvaluationOutcome::Inconclusive;
+            }
+            return;
+        }
+    };
+    report.metrics = benchmark_metrics_from_summary(&summary);
+    if let Some(verdict) = benchmark_summary_verdict(&summary) {
+        let verdict_outcome = verdict.outcome.clone();
+        report.summary_verdict = Some(verdict.summary);
+        match verdict_outcome {
+            EvaluationOutcome::Failed => report.outcome = EvaluationOutcome::Failed,
+            EvaluationOutcome::Inconclusive => {
+                if report.outcome == EvaluationOutcome::Passed {
+                    report.outcome = EvaluationOutcome::Inconclusive;
+                }
+            }
+            EvaluationOutcome::Passed => {}
+        }
+    }
+    report.summary = Some(summary);
+}
+
+fn benchmark_metrics_from_summary(summary: &serde_json::Value) -> Vec<EvaluationMetric> {
+    let mut metrics = Vec::new();
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_total_instances",
+        summary,
+        &[&["total_instances"], &["suite", "total_instances"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_resolved_instances",
+        summary,
+        &[
+            &["resolved_instances"],
+            &["official_evaluation", "resolved_instances"],
+            &["sinomo", "resolved_instances"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_error_instances",
+        summary,
+        &[
+            &["error_instances"],
+            &["official_evaluation", "error_instances"],
+            &["sinomo", "error_instances"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_unresolved_instances",
+        summary,
+        &[
+            &["unresolved_instances"],
+            &["sinomo", "unresolved_instances"],
+            &["official_evaluation", "unresolved_instances"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_model_turns",
+        summary,
+        &[&["agent_model_turns"], &["sinomo", "agent_model_turns"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_tool_results",
+        summary,
+        &[&["agent_tool_results"], &["sinomo", "agent_tool_results"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_input_tokens",
+        summary,
+        &[&["agent_input_tokens"], &["sinomo", "agent_input_tokens"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_output_tokens",
+        summary,
+        &[&["agent_output_tokens"], &["sinomo", "agent_output_tokens"]],
+    );
+    metrics
+}
+
+fn benchmark_summary_verdict(summary: &serde_json::Value) -> Option<BenchmarkSummaryVerdict> {
+    let benchmark = summary.get("benchmark").and_then(|value| value.as_str());
+    if benchmark != Some("swebench") {
+        return None;
+    }
+
+    let total = summary_integer_at(summary, &["total_instances"])
+        .or_else(|| summary_integer_at(summary, &["suite", "total_instances"]));
+    let resolved = summary_integer_at(summary, &["resolved_instances"])
+        .or_else(|| summary_integer_at(summary, &["official_evaluation", "resolved_instances"]))
+        .or_else(|| summary_integer_at(summary, &["sinomo", "resolved_instances"]));
+    let errors = [
+        summary_integer_at(summary, &["error_instances"]),
+        summary_integer_at(summary, &["official_evaluation", "error_instances"]),
+        summary_integer_at(summary, &["sinomo", "error_instances"]),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0);
+
+    let Some(total) = total else {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Inconclusive,
+            summary: "SWE-bench summary did not report total_instances".to_string(),
+        });
+    };
+    let Some(resolved) = resolved else {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Inconclusive,
+            summary: "SWE-bench summary did not report resolved_instances".to_string(),
+        });
+    };
+    if total <= 0 {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Inconclusive,
+            summary: format!("SWE-bench summary reported invalid total_instances={total}"),
+        });
+    }
+    if errors > 0 {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Failed,
+            summary: format!("SWE-bench reported {errors} error instance(s)"),
+        });
+    }
+    if resolved < total {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Failed,
+            summary: format!("SWE-bench resolved {resolved}/{total} instance(s)"),
+        });
+    }
+    Some(BenchmarkSummaryVerdict {
+        outcome: EvaluationOutcome::Passed,
+        summary: format!("SWE-bench resolved {resolved}/{total} instance(s)"),
+    })
+}
+
+fn push_summary_integer_metric(
+    metrics: &mut Vec<EvaluationMetric>,
+    name: &str,
+    summary: &serde_json::Value,
+    paths: &[&[&str]],
+) {
+    if let Some(value) = paths
+        .iter()
+        .find_map(|path| summary_integer_at(summary, path))
+    {
+        metrics.push(EvaluationMetric {
+            name: name.to_string(),
+            value: MetricValue::Integer(value),
+            sample_count: None,
+        });
+    }
+}
+
+fn summary_integer_at(summary: &serde_json::Value, path: &[&str]) -> Option<i64> {
+    let mut value = summary;
+    for segment in path {
+        value = value.get(*segment)?;
+    }
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+}
+
+fn apply_benchmark_reports_to_scorecard(
+    scorecard: &mut EvaluationScorecard,
+    reports: &[BenchmarkGateReport],
+) {
+    if reports.is_empty() {
+        return;
+    }
+    scorecard.metrics.push(EvaluationMetric {
+        name: "benchmark_count".to_string(),
+        value: MetricValue::Integer(reports.len() as i64),
+        sample_count: Some(reports.len() as u64),
+    });
+    for report in reports {
+        scorecard.metrics.extend(report.metrics.clone());
+        if let Some(summary_error) = &report.summary_error {
+            scorecard
+                .gates
+                .push(sinomo_runtime::core::EvaluationGateResult {
+                    gate: EvaluationGate::PrivateRegressionEvals,
+                    outcome: EvaluationOutcome::Inconclusive,
+                    summary: format!(
+                        "benchmark `{}` summary evidence is incomplete: {summary_error}",
+                        report.name
+                    ),
+                });
+            if scorecard.outcome == EvaluationOutcome::Passed {
+                scorecard.outcome = EvaluationOutcome::Inconclusive;
+            }
+        }
+        if let Some(summary_verdict) = &report.summary_verdict {
+            scorecard
+                .gates
+                .push(sinomo_runtime::core::EvaluationGateResult {
+                    gate: EvaluationGate::PrivateRegressionEvals,
+                    outcome: report.outcome.clone(),
+                    summary: format!("benchmark `{}` verdict: {summary_verdict}", report.name),
+                });
+        }
+        if report.outcome == EvaluationOutcome::Failed {
+            scorecard.outcome = EvaluationOutcome::Failed;
+        } else if report.outcome == EvaluationOutcome::Inconclusive
+            && scorecard.outcome == EvaluationOutcome::Passed
+        {
+            scorecard.outcome = EvaluationOutcome::Inconclusive;
+        }
+    }
+}
+
 fn create_bootstrap_job(request: &EvolutionRequest, source_root: &Path) -> EvolutionJob {
     let job_id = EvolutionJobId::generate();
     let commands = if request.verification_commands.is_empty() {
@@ -4515,10 +6053,18 @@ fn create_bootstrap_job(request: &EvolutionRequest, source_root: &Path) -> Evolu
     } else {
         request.verification_commands.clone()
     };
-    let required_gates = commands
+    let mut required_gates: Vec<EvaluationGate> = commands
         .iter()
         .map(|command| command.gate.clone())
         .collect();
+    if !request.module_replay_reports.is_empty() {
+        if !required_gates.contains(&EvaluationGate::ReplayTests) {
+            required_gates.push(EvaluationGate::ReplayTests);
+        }
+        if !required_gates.contains(&EvaluationGate::ShadowMode) {
+            required_gates.push(EvaluationGate::ShadowMode);
+        }
+    }
     EvolutionJob {
         job_id,
         objective: request.objective.clone(),
@@ -4529,7 +6075,10 @@ fn create_bootstrap_job(request: &EvolutionRequest, source_root: &Path) -> Evolu
             intended_paths: request.intended_paths.clone(),
             notes: "bootstrap supervised self-evolution iteration".to_string(),
         },
-        verification: VerificationPlan { commands },
+        verification: VerificationPlan {
+            commands,
+            module_replay_reports: request.module_replay_reports.clone(),
+        },
         recovery: RecoveryPlan::default(),
         scope: EvolutionScope {
             allowed_paths: request.intended_paths.clone(),
@@ -4690,6 +6239,35 @@ fn bundle_safe_file_stem(value: &str) -> String {
     stem.trim_matches('-').to_string().if_empty("command")
 }
 
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(not(windows))]
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('"', "`\""))
+}
+
 trait IfEmpty {
     fn if_empty(self, fallback: &str) -> String;
 }
@@ -4716,6 +6294,32 @@ pub fn verify_stored_evolution_job<R: CommandRunner>(
     record_candidate_verification(paths, record, &scorecard, &results).map_err(Into::into)
 }
 
+pub fn refresh_stored_candidate_bundle_integrity(
+    paths: &EvolutionPaths,
+    record: &mut StoredEvolutionJob,
+) -> Result<(), EvolutionError> {
+    let verification_outcome = record
+        .verification_outcome
+        .clone()
+        .unwrap_or(EvaluationOutcome::Inconclusive);
+    finalize_candidate_bundle_integrity(
+        &mut record.bundle,
+        &record.job,
+        &record.candidate_workspace,
+        None,
+        verification_outcome,
+        &record.changed_files,
+    )?;
+    write_bundle_manifest(record)?;
+    write_stored_job(paths, record)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CandidateDecisionOptions {
+    pub override_preflight: bool,
+}
+
 pub fn decide_stored_evolution_job(
     paths: &EvolutionPaths,
     record: StoredEvolutionJob,
@@ -4723,11 +6327,457 @@ pub fn decide_stored_evolution_job(
     decided_by: impl Into<String>,
     note: impl Into<String>,
 ) -> Result<RecordedCandidateDecision, EvolutionError> {
-    let recorded = record_candidate_decision(paths, record, outcome.clone(), decided_by, note)?;
+    decide_stored_evolution_job_with_options(
+        paths,
+        record,
+        outcome,
+        decided_by,
+        note,
+        CandidateDecisionOptions::default(),
+    )
+}
+
+pub fn decide_stored_evolution_job_with_options(
+    paths: &EvolutionPaths,
+    mut record: StoredEvolutionJob,
+    outcome: CandidateDecisionOutcome,
+    decided_by: impl Into<String>,
+    note: impl Into<String>,
+    options: CandidateDecisionOptions,
+) -> Result<RecordedCandidateDecision, EvolutionError> {
+    let note = note.into();
+    let approval_preflight = if outcome == CandidateDecisionOutcome::Approved {
+        let report = approval_preflight_report(paths, &record, options.override_preflight)?;
+        if !report.passed && !options.override_preflight {
+            return Err(EvolutionError::ApprovalPreflight {
+                detail: failed_preflight_summary(&report),
+            });
+        }
+        let mut rollout_material_path = None;
+        if preflight_check_passed(&report, "candidate-bundle-integrity") {
+            let registry_record = write_candidate_bundle_registry_record(paths, &mut record)?;
+            if preflight_check_passed(&report, "candidate-verified-rollout-material") {
+                rollout_material_path = write_candidate_verified_rollout_material_if_present(
+                    paths,
+                    &record,
+                    &registry_record,
+                )?;
+            }
+        }
+        let candidate_summary_path =
+            write_candidate_summary(&record, &report, rollout_material_path.as_deref())?;
+        record.bundle.candidate_summary_path = Some(candidate_summary_path.display().to_string());
+        Some(report)
+    } else {
+        None
+    };
+    let recorded = record_candidate_decision_with_preflight(
+        paths,
+        record,
+        outcome.clone(),
+        decided_by,
+        note,
+        approval_preflight,
+    )?;
     if outcome == CandidateDecisionOutcome::Approved {
         commit_and_fast_forward_approved_candidate(&recorded.record)?;
     }
     Ok(recorded)
+}
+
+fn preflight_check_passed(report: &CandidateApprovalPreflightReport, name: &str) -> bool {
+    report
+        .checks
+        .iter()
+        .any(|check| check.name == name && check.outcome == EvaluationOutcome::Passed)
+}
+
+fn approval_preflight_report(
+    paths: &EvolutionPaths,
+    record: &StoredEvolutionJob,
+    override_used: bool,
+) -> Result<CandidateApprovalPreflightReport, EvolutionError> {
+    let diff_summary = candidate_diff_summary(record);
+    let benchmark_outcome = stored_benchmark_outcome(record);
+    let mut checks = Vec::new();
+    checks.push(CandidateApprovalPreflightCheck {
+        name: "verification-passed".to_string(),
+        outcome: if record.verification_outcome == Some(EvaluationOutcome::Passed) {
+            EvaluationOutcome::Passed
+        } else {
+            EvaluationOutcome::Failed
+        },
+        summary: match &record.verification_outcome {
+            Some(outcome) => format!("candidate verification outcome is {outcome:?}"),
+            None => "candidate has no recorded verification outcome".to_string(),
+        },
+    });
+    checks.push(candidate_diff_preflight_check(record));
+    checks.push(candidate_bundle_integrity_preflight_check(record));
+    checks.push(candidate_verified_rollout_material_preflight_check(
+        paths, record,
+    ));
+    checks.push(source_clean_preflight_check(record));
+    checks.push(source_fast_forward_preflight_check(record));
+    let passed = checks
+        .iter()
+        .all(|check| check.outcome == EvaluationOutcome::Passed);
+    Ok(CandidateApprovalPreflightReport {
+        objective: record.job.objective.clone(),
+        verification_outcome: record.verification_outcome.clone(),
+        benchmark_outcome,
+        diff_summary,
+        override_used,
+        passed,
+        checks,
+        recovery_note: record.job.recovery.note.clone(),
+    })
+}
+
+fn candidate_bundle_integrity_preflight_check(
+    record: &StoredEvolutionJob,
+) -> CandidateApprovalPreflightCheck {
+    match verify_candidate_bundle_integrity(&record.bundle) {
+        Ok(report) if report.is_valid() => CandidateApprovalPreflightCheck {
+            name: "candidate-bundle-integrity".to_string(),
+            outcome: EvaluationOutcome::Passed,
+            summary: format!(
+                "bundle integrity verified with {} checks; content hash {}",
+                report.checks.len(),
+                report
+                    .recomputed_content_hash
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            ),
+        },
+        Ok(report) => CandidateApprovalPreflightCheck {
+            name: "candidate-bundle-integrity".to_string(),
+            outcome: EvaluationOutcome::Failed,
+            summary: format!(
+                "bundle integrity verification failed: {}",
+                report
+                    .failed_checks()
+                    .join(", ")
+                    .if_empty("unknown failure")
+            ),
+        },
+        Err(error) => CandidateApprovalPreflightCheck {
+            name: "candidate-bundle-integrity".to_string(),
+            outcome: EvaluationOutcome::Failed,
+            summary: format!("bundle integrity verification could not run: {error}"),
+        },
+    }
+}
+
+fn candidate_verified_rollout_material_preflight_check(
+    paths: &EvolutionPaths,
+    record: &StoredEvolutionJob,
+) -> CandidateApprovalPreflightCheck {
+    let material = match read_candidate_bundle_verified_rollout_material(&record.bundle) {
+        Ok(Some(material)) => material,
+        Ok(None) => {
+            return CandidateApprovalPreflightCheck {
+                name: "candidate-verified-rollout-material".to_string(),
+                outcome: EvaluationOutcome::Passed,
+                summary: format!(
+                    "candidate bundle does not contain `{}`",
+                    CANDIDATE_BUNDLE_VERIFIED_ROLLOUT_MATERIAL_RELATIVE_PATH
+                ),
+            };
+        }
+        Err(error) => {
+            return CandidateApprovalPreflightCheck {
+                name: "candidate-verified-rollout-material".to_string(),
+                outcome: EvaluationOutcome::Failed,
+                summary: format!("candidate rollout material could not be read: {error}"),
+            };
+        }
+    };
+
+    let mut registry = ArtifactRegistry::new();
+    let candidate_bundle = match registry.register_verified_candidate_bundle(&record.bundle) {
+        Ok(candidate_bundle) => candidate_bundle.clone(),
+        Err(error) => {
+            return CandidateApprovalPreflightCheck {
+                name: "candidate-verified-rollout-material".to_string(),
+                outcome: EvaluationOutcome::Failed,
+                summary: format!(
+                    "candidate rollout material cannot be validated until bundle integrity passes: {error}"
+                ),
+            };
+        }
+    };
+    let trusted_signers = match read_trusted_artifact_signers(&paths.data_dir) {
+        Ok(signers) => signers,
+        Err(error) => {
+            return CandidateApprovalPreflightCheck {
+                name: "candidate-verified-rollout-material".to_string(),
+                outcome: EvaluationOutcome::Failed,
+                summary: format!("trusted artifact signers could not be read: {error}"),
+            };
+        }
+    };
+    let report = validate_verified_candidate_rollout_material(
+        &material,
+        &candidate_bundle,
+        &trusted_signers,
+    );
+    CandidateApprovalPreflightCheck {
+        name: "candidate-verified-rollout-material".to_string(),
+        outcome: if report.is_valid() {
+            EvaluationOutcome::Passed
+        } else {
+            EvaluationOutcome::Failed
+        },
+        summary: if report.is_valid() {
+            format!(
+                "verified rollout material is valid for artifact {} and rollout plan {}",
+                report.artifact_id, report.rollout_plan_id
+            )
+        } else {
+            format!(
+                "verified rollout material failed validation: {}",
+                report.failed_checks().join(", ")
+            )
+        },
+    }
+}
+
+fn candidate_diff_preflight_check(record: &StoredEvolutionJob) -> CandidateApprovalPreflightCheck {
+    let diff_has_content = record
+        .bundle
+        .diff_path
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|diff| !diff.trim().is_empty());
+    let has_diff = diff_has_content || !record.changed_files.is_empty();
+    CandidateApprovalPreflightCheck {
+        name: "candidate-diff-present".to_string(),
+        outcome: if has_diff {
+            EvaluationOutcome::Passed
+        } else {
+            EvaluationOutcome::Failed
+        },
+        summary: if has_diff {
+            candidate_diff_summary(record)
+        } else {
+            "candidate has no recorded diff or changed files".to_string()
+        },
+    }
+}
+
+fn source_clean_preflight_check(record: &StoredEvolutionJob) -> CandidateApprovalPreflightCheck {
+    let source_root = Path::new(&record.job.edit_scope.workspace_root);
+    match run_git_command(source_root, &["status", "--porcelain"]) {
+        Ok(status) if status.trim().is_empty() => CandidateApprovalPreflightCheck {
+            name: "source-worktree-clean".to_string(),
+            outcome: EvaluationOutcome::Passed,
+            summary: "source worktree is clean".to_string(),
+        },
+        Ok(status) => CandidateApprovalPreflightCheck {
+            name: "source-worktree-clean".to_string(),
+            outcome: EvaluationOutcome::Failed,
+            summary: format!("source worktree has uncommitted changes: {}", status.trim()),
+        },
+        Err(error) => CandidateApprovalPreflightCheck {
+            name: "source-worktree-clean".to_string(),
+            outcome: EvaluationOutcome::Failed,
+            summary: error.to_string(),
+        },
+    }
+}
+
+fn source_fast_forward_preflight_check(
+    record: &StoredEvolutionJob,
+) -> CandidateApprovalPreflightCheck {
+    let source_root = Path::new(&record.job.edit_scope.workspace_root);
+    let branch = record.candidate_workspace.branch_name.as_str();
+    match run_git_command(
+        source_root,
+        &["merge-base", "--is-ancestor", "HEAD", branch],
+    ) {
+        Ok(_) => CandidateApprovalPreflightCheck {
+            name: "source-fast-forward".to_string(),
+            outcome: EvaluationOutcome::Passed,
+            summary: format!("source HEAD can fast-forward to `{branch}`"),
+        },
+        Err(error) => CandidateApprovalPreflightCheck {
+            name: "source-fast-forward".to_string(),
+            outcome: EvaluationOutcome::Failed,
+            summary: format!("source HEAD cannot fast-forward to `{branch}`: {error}"),
+        },
+    }
+}
+
+fn candidate_diff_summary(record: &StoredEvolutionJob) -> String {
+    if record.changed_files.is_empty() {
+        return "0 changed files".to_string();
+    }
+    let mut paths = record.changed_files.clone();
+    paths.sort();
+    let shown = paths.iter().take(8).cloned().collect::<Vec<_>>();
+    let suffix = if paths.len() > shown.len() {
+        format!(" and {} more", paths.len() - shown.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "{} changed file(s): {}{}",
+        paths.len(),
+        shown.join(", "),
+        suffix
+    )
+}
+
+fn stored_benchmark_outcome(record: &StoredEvolutionJob) -> Option<EvaluationOutcome> {
+    let scorecard_path = record.bundle.scorecard_path.as_ref()?;
+    let scorecard = fs::read_to_string(scorecard_path).ok()?;
+    let scorecard: EvaluationScorecard = serde_json::from_str(&scorecard).ok()?;
+    let benchmark_outcomes = scorecard
+        .gates
+        .iter()
+        .filter(|gate| gate.gate == EvaluationGate::PrivateRegressionEvals)
+        .map(|gate| gate.outcome.clone())
+        .collect::<Vec<_>>();
+    if benchmark_outcomes.is_empty() {
+        None
+    } else if benchmark_outcomes
+        .iter()
+        .any(|outcome| outcome == &EvaluationOutcome::Failed)
+    {
+        Some(EvaluationOutcome::Failed)
+    } else if benchmark_outcomes
+        .iter()
+        .any(|outcome| outcome == &EvaluationOutcome::Inconclusive)
+    {
+        Some(EvaluationOutcome::Inconclusive)
+    } else {
+        Some(EvaluationOutcome::Passed)
+    }
+}
+
+fn failed_preflight_summary(report: &CandidateApprovalPreflightReport) -> String {
+    report
+        .checks
+        .iter()
+        .filter(|check| check.outcome != EvaluationOutcome::Passed)
+        .map(|check| format!("{}: {}", check.name, check.summary))
+        .collect::<Vec<_>>()
+        .join("; ")
+        .if_empty("approval preflight failed")
+}
+
+fn write_candidate_bundle_registry_record(
+    paths: &EvolutionPaths,
+    record: &mut StoredEvolutionJob,
+) -> Result<CandidateBundleRegistryRecord, EvolutionError> {
+    let mut registry = ArtifactRegistry::new();
+    let registry_record = registry
+        .register_verified_candidate_bundle(&record.bundle)?
+        .clone();
+    let path =
+        PathBuf::from(&record.bundle.bundle_path).join("candidate-bundle-registry-record.json");
+    write_json_file_for_bundle(&path, &registry_record)?;
+    sinomo_runtime::registry::write_candidate_bundle_registry_record(
+        &paths.data_dir,
+        &registry_record,
+    )?;
+    record.bundle.registry_record_path = Some(path.display().to_string());
+    Ok(registry_record)
+}
+
+fn write_candidate_verified_rollout_material_if_present(
+    paths: &EvolutionPaths,
+    record: &StoredEvolutionJob,
+    candidate_bundle: &CandidateBundleRegistryRecord,
+) -> Result<Option<PathBuf>, EvolutionError> {
+    let Some(mut material) = read_candidate_bundle_verified_rollout_material(&record.bundle)?
+    else {
+        return Ok(None);
+    };
+    material.registered_at = OffsetDateTime::now_utc();
+    material.evidence_refs = candidate_verified_rollout_material_evidence_refs(
+        material.evidence_refs,
+        &record.bundle,
+        candidate_bundle,
+    );
+    let trusted_signers = read_trusted_artifact_signers(&paths.data_dir)?;
+    let (path, _report) = verify_and_write_verified_candidate_rollout_material(
+        &paths.data_dir,
+        &material,
+        candidate_bundle,
+        &trusted_signers,
+    )?;
+    Ok(Some(path))
+}
+
+fn candidate_verified_rollout_material_evidence_refs(
+    mut refs: Vec<String>,
+    bundle: &CandidateBundleManifest,
+    candidate_bundle: &CandidateBundleRegistryRecord,
+) -> Vec<String> {
+    refs.push(format!(
+        "registry://candidate-bundle/{}",
+        candidate_bundle.job_id
+    ));
+    refs.push(
+        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(bundle)
+            .display()
+            .to_string(),
+    );
+    refs.extend(candidate_bundle.evidence_refs.iter().cloned());
+    refs.extend(bundle.registry_record_path.iter().cloned());
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn write_candidate_summary(
+    record: &StoredEvolutionJob,
+    report: &CandidateApprovalPreflightReport,
+    rollout_material_path: Option<&Path>,
+) -> Result<PathBuf, EvolutionError> {
+    let path = PathBuf::from(&record.bundle.bundle_path).join("candidate-summary.md");
+    let changed_files = if record.changed_files.is_empty() {
+        "none recorded".to_string()
+    } else {
+        record.changed_files.join("\n")
+    };
+    let checks = report
+        .checks
+        .iter()
+        .map(|check| format!("- {}: {:?} - {}", check.name, check.outcome, check.summary))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let registry_record = record
+        .bundle
+        .registry_record_path
+        .as_deref()
+        .unwrap_or("not recorded");
+    let rollout_material = rollout_material_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not recorded".to_string());
+    let summary = format!(
+        "# Candidate Summary\n\njob: {}\nstatus: awaiting approval\nobjective: {}\nverification: {:?}\nbenchmark: {:?}\noverride_used: {}\nregistry_record: {}\nverified_rollout_material: {}\n\n## Diff\n{}\n\n## Changed Files\n{}\n\n## Approval Preflight\n{}\n\n## Recovery\n{}\n",
+        record.job.job_id,
+        record.job.objective,
+        record.verification_outcome,
+        report.benchmark_outcome,
+        report.override_used,
+        registry_record,
+        rollout_material,
+        report.diff_summary,
+        changed_files,
+        checks,
+        report.recovery_note
+    );
+    fs::write(&path, summary).map_err(|source| {
+        EvolutionError::Bundle(BundleError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+    })?;
+    Ok(path)
 }
 
 #[derive(Debug, Error)]
@@ -4742,6 +6792,10 @@ pub enum EvolutionError {
     Eval(#[from] sinomo_runtime::eval::EvalError),
     #[error(transparent)]
     MutationModel(#[from] MutationModelError),
+    #[error("approval preflight failed: {detail}")]
+    ApprovalPreflight { detail: String },
+    #[error(transparent)]
+    Registry(#[from] sinomo_runtime::registry::RegistryError),
 }
 
 #[derive(Debug, Error)]
@@ -4766,6 +6820,10 @@ pub enum BundleError {
 pub enum MutationModelError {
     #[error(transparent)]
     LanguageModel(#[from] LanguageModelError),
+    #[error("agent mutation failed: {detail}")]
+    Agent { detail: String },
+    #[error("failed to serialize mutation artifact: {detail}")]
+    Serialization { detail: String },
     #[error("mutation tool `{tool}` failed: {detail}")]
     ToolExecution { tool: String, detail: String },
     #[error("mutation bridge exceeded max tool rounds ({max_rounds})")]
@@ -4775,6 +6833,190 @@ pub enum MutationModelError {
 #[derive(Clone, Debug)]
 pub struct EvolutionPlanner {
     node_id: NodeId,
+}
+
+pub fn detect_evolution_opportunities_from_events(
+    events: &[EventEnvelope],
+    policy: &EvolutionOpportunityDetectionPolicy,
+) -> Vec<DetectedEvolutionOpportunity> {
+    let mut seen_events = BTreeSet::new();
+    let mut opportunities = Vec::new();
+    for event in events {
+        if !seen_events.insert(event.event_id.clone()) {
+            continue;
+        }
+        let Some(signal_kind) = opportunity_signal_kind(event) else {
+            continue;
+        };
+        opportunities.push(DetectedEvolutionOpportunity {
+            evidence_refs: opportunity_evidence_refs(event),
+            opportunity: EvolutionOpportunity {
+                observed_event_id: Some(event.event_id.clone()),
+                target_ring: opportunity_target_ring(event, policy),
+                target_module_id: event_module_id(event),
+                objective: opportunity_objective(event, &signal_kind),
+                workspace_id: opportunity_workspace_id(event, policy),
+                allowed_paths: opportunity_allowed_paths(event, policy),
+                forbidden_paths: opportunity_forbidden_paths(event, policy),
+                priority: event.salience.get().max(0.5),
+            },
+            signal_kind,
+        });
+    }
+    opportunities
+}
+
+fn opportunity_signal_kind(event: &EventEnvelope) -> Option<EvolutionOpportunitySignalKind> {
+    match event.kind.as_str() {
+        MODULE_TIMEOUT_EVENT_KIND => Some(EvolutionOpportunitySignalKind::ModuleTimeout),
+        MODULE_CRASH_EVENT_KIND => Some(EvolutionOpportunitySignalKind::ModuleCrash),
+        MODULE_POLICY_BLOCKED_EVENT_KIND => {
+            Some(EvolutionOpportunitySignalKind::ModulePolicyBlocked)
+        }
+        MODULE_USER_CORRECTION_EVENT_KIND => {
+            Some(EvolutionOpportunitySignalKind::ModuleUserCorrection)
+        }
+        MODULE_INVOCATION_DECISION_EVENT_KIND => match event
+            .payload
+            .get("primary_error_kind")
+            .and_then(|value| value.as_str())
+        {
+            Some("timeout") => Some(EvolutionOpportunitySignalKind::ModuleTimeout),
+            Some("policy-blocked") => Some(EvolutionOpportunitySignalKind::ModulePolicyBlocked),
+            Some("runtime-error") => Some(EvolutionOpportunitySignalKind::ModuleCrash),
+            _ => None,
+        },
+        "evolution.metric.regression" => Some(EvolutionOpportunitySignalKind::MetricRegression),
+        "evolution.replay.failure" => Some(EvolutionOpportunitySignalKind::ReplayFailure),
+        "evolution.scorecard.stale" => Some(EvolutionOpportunitySignalKind::StaleScorecard),
+        _ => None,
+    }
+}
+
+fn opportunity_objective(
+    event: &EventEnvelope,
+    signal_kind: &EvolutionOpportunitySignalKind,
+) -> String {
+    if let Some(objective) = event
+        .payload
+        .get("objective")
+        .and_then(|value| value.as_str())
+    {
+        if !objective.trim().is_empty() {
+            return objective.trim().to_string();
+        }
+    }
+    let target = event
+        .payload
+        .get("module_id")
+        .and_then(|value| value.as_str())
+        .map(|module_id| format!("module `{module_id}`"))
+        .unwrap_or_else(|| "the affected component".to_string());
+    match signal_kind {
+        EvolutionOpportunitySignalKind::ModuleTimeout => {
+            format!("Reduce timeout failures for {target} without broadening capabilities")
+        }
+        EvolutionOpportunitySignalKind::ModuleCrash => {
+            format!("Harden {target} after runtime failure telemetry")
+        }
+        EvolutionOpportunitySignalKind::ModulePolicyBlocked => {
+            format!("Reduce policy-blocked behavior for {target} without weakening sandbox policy")
+        }
+        EvolutionOpportunitySignalKind::ModuleUserCorrection => {
+            format!("Reduce user corrections for {target} using replay-backed evidence")
+        }
+        EvolutionOpportunitySignalKind::MetricRegression => {
+            "Investigate and improve the regressed metric with scoped verification".to_string()
+        }
+        EvolutionOpportunitySignalKind::ReplayFailure => {
+            "Fix replay failure with a bounded candidate and preserved reproduction evidence"
+                .to_string()
+        }
+        EvolutionOpportunitySignalKind::StaleScorecard => {
+            "Refresh stale scorecard evidence and improve the failing target if needed".to_string()
+        }
+    }
+}
+
+fn event_module_id(event: &EventEnvelope) -> Option<ModuleId> {
+    event
+        .payload
+        .get("module_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<ModuleId>().ok())
+}
+
+fn opportunity_target_ring(
+    event: &EventEnvelope,
+    policy: &EvolutionOpportunityDetectionPolicy,
+) -> TrustRing {
+    event
+        .payload
+        .get("target_ring")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_else(|| {
+            if event_module_id(event).is_some() {
+                TrustRing::R3SandboxedModule
+            } else {
+                policy.default_target_ring.clone()
+            }
+        })
+}
+
+fn opportunity_workspace_id(
+    event: &EventEnvelope,
+    policy: &EvolutionOpportunityDetectionPolicy,
+) -> WorkspaceId {
+    event
+        .payload
+        .get("workspace_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<WorkspaceId>().ok())
+        .unwrap_or_else(|| policy.workspace_id.clone())
+}
+
+fn opportunity_allowed_paths(
+    event: &EventEnvelope,
+    policy: &EvolutionOpportunityDetectionPolicy,
+) -> Vec<String> {
+    payload_string_array(event, "allowed_paths")
+        .or_else(|| payload_string_array(event, "suggested_paths"))
+        .unwrap_or_else(|| policy.default_allowed_paths.clone())
+}
+
+fn opportunity_forbidden_paths(
+    event: &EventEnvelope,
+    policy: &EvolutionOpportunityDetectionPolicy,
+) -> Vec<String> {
+    payload_string_array(event, "forbidden_paths")
+        .unwrap_or_else(|| policy.default_forbidden_paths.clone())
+}
+
+fn opportunity_evidence_refs(event: &EventEnvelope) -> Vec<String> {
+    let mut refs = vec![format!("event://{}", event.event_id)];
+    refs.extend(payload_string_array(event, "evidence_refs").unwrap_or_default());
+    refs.extend(
+        event
+            .evidence
+            .refs
+            .iter()
+            .map(|evidence| evidence.uri.clone()),
+    );
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn payload_string_array(event: &EventEnvelope, key: &str) -> Option<Vec<String>> {
+    let array = event.payload.get(key)?.as_array()?;
+    let values = array
+        .iter()
+        .filter_map(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
 }
 
 impl EvolutionPlanner {
@@ -4808,6 +7050,7 @@ impl EvolutionPlanner {
                         gate: gate.clone(),
                     })
                     .collect(),
+                module_replay_reports: Vec::new(),
             },
             recovery: sinomo_runtime::core::RecoveryPlan::default(),
             scope: EvolutionScope {
@@ -4899,7 +7142,7 @@ fn trust_ring_hint(target_ring: &TrustRing) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::read_stored_job;
+    use crate::{read_stored_job, write_stored_job};
     use sinomo_lm::{
         LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
         PROVIDER_DEFAULT_MODEL,
@@ -5119,6 +7362,8 @@ mod tests {
             target_ring: TrustRing::R1TrustedRuntime,
             intended_paths: vec!["crates/sinomo-evolution".to_string()],
             verification_commands: vec!["cargo test -p sinomo-evolution".to_string()],
+            benchmark_specs: vec!["swebench:psf__requests-1142".to_string()],
+            module_replay_report_specs: vec!["trigger=reports/trigger-replay.json".to_string()],
             provider: None,
             model: None,
             default_provider: Some("google-gemini".to_string()),
@@ -5140,6 +7385,40 @@ mod tests {
             prepared.request.verification_commands[0].gate,
             EvaluationGate::StaticChecks
         );
+        assert_eq!(prepared.request.benchmark_gates.len(), 1);
+        assert!(matches!(
+            &prepared.request.benchmark_gates[0].kind,
+            BenchmarkGateKind::SweBench {
+                instance_id: Some(instance_id),
+                provider,
+                model,
+                evaluate,
+                ..
+            } if instance_id == "psf__requests-1142"
+                && provider == GeminiProvider::PROVIDER_ID
+                && model == "gemini-2.5-pro"
+                && *evaluate
+        ));
+        assert_eq!(prepared.request.module_replay_reports.len(), 1);
+        assert_eq!(prepared.request.module_replay_reports[0].name, "trigger");
+        assert_eq!(
+            prepared.request.module_replay_reports[0].report_path,
+            "reports/trigger-replay.json"
+        );
+    }
+
+    #[test]
+    fn module_replay_report_specs_accept_named_and_default_refs() {
+        let refs = parse_module_replay_report_specs(&[
+            "trigger=reports/trigger.json".to_string(),
+            "reports/default.json".to_string(),
+        ])
+        .expect("module replay specs");
+
+        assert_eq!(refs[0].name, "trigger");
+        assert_eq!(refs[0].report_path, "reports/trigger.json");
+        assert_eq!(refs[1].name, "module-replay-2");
+        assert_eq!(refs[1].report_path, "reports/default.json");
     }
 
     #[test]
@@ -5149,6 +7428,8 @@ mod tests {
             target_ring: TrustRing::R1TrustedRuntime,
             intended_paths: Vec::new(),
             verification_commands: Vec::new(),
+            benchmark_specs: Vec::new(),
+            module_replay_report_specs: Vec::new(),
             provider: Some("unknown-provider".to_string()),
             model: None,
             default_provider: None,
@@ -5371,6 +7652,7 @@ mod tests {
             relevant_files: Vec::new(),
             verification: VerificationPlan {
                 commands: Vec::new(),
+                module_replay_reports: Vec::new(),
             },
             output_contract: MutationOutputContract::default(),
             recovery: RecoveryPlan::default(),
@@ -5382,7 +7664,7 @@ mod tests {
         };
 
         let error = model
-            .mutate(&packet, &candidate_workspace(&root))
+            .mutate(&packet, &candidate_workspace(&root), None)
             .expect_err("unknown provider should fail");
 
         assert!(matches!(
@@ -5533,6 +7815,70 @@ mod tests {
     }
 
     #[test]
+    fn candidate_resource_usage_maps_agent_trace_to_campaign_budget_estimate() {
+        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "account for real agent usage in the campaign scheduler".to_string(),
+            horizon: "30 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R1TrustedRuntime,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        });
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let summary = CandidateResourceUsageSummary {
+            job_id: EvolutionJobId::generate(),
+            generated_at: "2026-05-02T00:00:00Z".to_string(),
+            records: vec![
+                resource_usage_record(
+                    "agent-input-tokens",
+                    1_100,
+                    "tokens",
+                    ResourceUsageConfidence::ProviderReported,
+                    "test",
+                ),
+                resource_usage_record(
+                    "agent-output-tokens",
+                    400,
+                    "tokens",
+                    ResourceUsageConfidence::ProviderReported,
+                    "test",
+                ),
+                resource_usage_record(
+                    "agent-model-turns",
+                    3,
+                    "turns",
+                    ResourceUsageConfidence::Exact,
+                    "test",
+                ),
+                resource_usage_record(
+                    "local-compute-ms",
+                    61_000,
+                    "ms",
+                    ResourceUsageConfidence::Estimated,
+                    "test",
+                ),
+            ],
+            scheduler_estimates: Vec::new(),
+        };
+
+        let usage = candidate_resource_usage_estimates(&campaign, &task_id, &summary);
+
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].task_id, task_id);
+        assert_eq!(usage[0].resource, "coding-plan-weekly");
+        assert_eq!(usage[0].estimated_units, 10);
+        assert_eq!(usage[0].actual_units, Some(7));
+    }
+
+    #[test]
     fn scheduled_iteration_prepares_dry_run_agent_handoff_from_approved_campaign() {
         let mut campaign = propose_evolution_campaign(CampaignProposalRequest {
             objective:
@@ -5657,6 +8003,7 @@ mod tests {
                 },
                 verification: VerificationPlan {
                     commands: plan.evolution_request.verification_commands.clone(),
+                    module_replay_reports: plan.evolution_request.module_replay_reports.clone(),
                 },
                 recovery: RecoveryPlan::default(),
                 scope: EvolutionScope {
@@ -5686,11 +8033,20 @@ mod tests {
                 model_output_path: Some(
                     "/tmp/sinomo-candidate-bundle/model-output.json".to_string(),
                 ),
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: Some(
                     "/tmp/sinomo-candidate-bundle/changed-files.json".to_string(),
                 ),
                 diff_path: Some("/tmp/sinomo-candidate-bundle/diff.patch".to_string()),
                 scorecard_path: Some("/tmp/sinomo-candidate-bundle/scorecard.json".to_string()),
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -5723,6 +8079,11 @@ mod tests {
         assert_eq!(
             updated.iteration_results[0].status,
             EvolutionIterationStatus::AwaitingRolloutApproval
+        );
+        assert_eq!(updated.iteration_results[0].resource_usage.len(), 1);
+        assert_eq!(
+            updated.iteration_results[0].resource_usage[0].actual_units,
+            Some(8)
         );
         assert!(
             updated.iteration_results[0]
@@ -5784,6 +8145,7 @@ mod tests {
             task_id: task_id.clone(),
             result_kind: EvolutionResultKind::Patch,
             status: EvolutionIterationStatus::Adapted,
+            resource_usage: Vec::new(),
             evidence: vec!["scorecard:/tmp/previous-scorecard.json".to_string()],
             summary: Some("previous attempt failed".to_string()),
         });
@@ -5957,6 +8319,66 @@ mod tests {
     }
 
     #[test]
+    fn background_scheduler_accounts_previous_iteration_usage_before_granting_new_lease() {
+        let mut campaign = sample_approved_campaign("budget repeated campaign iterations");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        campaign.iteration_results.push(EvolutionIterationResult {
+            iteration_id: "iter_previous".to_string(),
+            task_id: task_id.clone(),
+            result_kind: EvolutionResultKind::Patch,
+            status: EvolutionIterationStatus::AwaitingRolloutApproval,
+            resource_usage: vec![ResourceUsageEstimate {
+                task_id: task_id.clone(),
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: Some(65),
+            }],
+            evidence: vec!["resource-usage:/tmp/resource-usage.json".to_string()],
+            summary: Some("previous iteration consumed budget".to_string()),
+        });
+
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: vec![campaign.clone()],
+            external_workloads: Vec::new(),
+            resources: background_resource_classes_from_campaign_reserve_floors(
+                &[campaign.clone()],
+                "test resources",
+            ),
+            task_estimates: vec![ResourceUsageEstimate {
+                task_id: task_id.clone(),
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: None,
+            }],
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T00:20:00Z".to_string(),
+        });
+
+        assert_eq!(
+            plan.campaigns[0].action,
+            BackgroundSchedulingAction::PauseForBudget
+        );
+        assert_eq!(
+            plan.campaigns[0].campaign.status,
+            EvolutionCampaignStatus::PausedBudget
+        );
+        assert_eq!(plan.campaigns[0].evidence_refs.len(), 1);
+        assert!(plan.campaigns[0].evidence_refs[0].contains("reserve floor"));
+        let resource = plan
+            .cluster_resources_after_tick
+            .iter()
+            .find(|resource| resource.resource_id == "coding-plan-weekly")
+            .expect("resource");
+        assert_eq!(resource.used_units, 65);
+    }
+
+    #[test]
     fn background_scheduler_holds_external_workloads_at_human_checkpoints() {
         let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
             scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
@@ -6103,6 +8525,7 @@ mod tests {
                 },
                 verification: VerificationPlan {
                     commands: plan.evolution_request.verification_commands.clone(),
+                    module_replay_reports: plan.evolution_request.module_replay_reports.clone(),
                 },
                 recovery: RecoveryPlan::default(),
                 scope: EvolutionScope {
@@ -6132,11 +8555,20 @@ mod tests {
                 model_output_path: Some(
                     "/tmp/sinomo-candidate-bundle/model-output.json".to_string(),
                 ),
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: Some(
                     "/tmp/sinomo-candidate-bundle/changed-files.json".to_string(),
                 ),
                 diff_path: Some("/tmp/sinomo-candidate-bundle/diff.patch".to_string()),
                 scorecard_path: Some("/tmp/sinomo-candidate-bundle/scorecard.json".to_string()),
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -6179,6 +8611,116 @@ mod tests {
     }
 
     #[test]
+    fn opportunity_detector_scopes_module_timeout_event_to_r3_candidate_job() {
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let workspace_id =
+            WorkspaceId::from_legacy_named("workspace_self_evolution").expect("workspace");
+        let event = opportunity_detection_event(
+            MODULE_INVOCATION_DECISION_EVENT_KIND,
+            serde_json::json!({
+                "module_id": module_id.as_str(),
+                "primary_error_kind": "timeout",
+                "suggested_paths": ["modules/trigger/**"],
+                "evidence_refs": ["module-telemetry://timeout-window"]
+            }),
+        );
+        let detections = detect_evolution_opportunities_from_events(
+            std::slice::from_ref(&event),
+            &EvolutionOpportunityDetectionPolicy {
+                workspace_id: workspace_id.clone(),
+                default_target_ring: TrustRing::R2TrustedService,
+                default_allowed_paths: vec!["crates/sinomo-module/**".to_string()],
+                default_forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
+            },
+        );
+
+        assert_eq!(detections.len(), 1);
+        let detection = &detections[0];
+        assert_eq!(
+            detection.signal_kind,
+            EvolutionOpportunitySignalKind::ModuleTimeout
+        );
+        assert_eq!(
+            detection.opportunity.observed_event_id,
+            Some(event.event_id)
+        );
+        assert_eq!(
+            detection.opportunity.target_ring,
+            TrustRing::R3SandboxedModule
+        );
+        assert_eq!(
+            detection.opportunity.target_module_id.as_ref(),
+            Some(&module_id)
+        );
+        assert_eq!(detection.opportunity.workspace_id, workspace_id);
+        assert_eq!(
+            detection.opportunity.allowed_paths,
+            vec!["modules/trigger/**".to_string()]
+        );
+        assert!(
+            detection
+                .evidence_refs
+                .iter()
+                .any(|evidence| evidence == "module-telemetry://timeout-window")
+        );
+
+        let planner =
+            EvolutionPlanner::new(NodeId::from_legacy_named("node_desktop").expect("node"));
+        let (job, _workspace) = planner.scope_job(detection.opportunity.clone());
+        assert_eq!(job.target_ring, TrustRing::R3SandboxedModule);
+        assert!(job.required_gates.contains(&EvaluationGate::ReplayTests));
+        assert!(
+            !job.required_gates
+                .contains(&EvaluationGate::ContinuityChecks)
+        );
+    }
+
+    #[test]
+    fn opportunity_detector_ignores_successful_invocation_events() {
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let event = opportunity_detection_event(
+            MODULE_INVOCATION_DECISION_EVENT_KIND,
+            serde_json::json!({
+                "module_id": module_id.as_str(),
+                "primary_error_kind": null,
+                "primary_lane": "active"
+            }),
+        );
+        let detections = detect_evolution_opportunities_from_events(
+            &[event],
+            &EvolutionOpportunityDetectionPolicy {
+                workspace_id: WorkspaceId::from_legacy_named("workspace_self_evolution")
+                    .expect("workspace"),
+                default_target_ring: TrustRing::R3SandboxedModule,
+                default_allowed_paths: vec!["modules/trigger/**".to_string()],
+                default_forbidden_paths: Vec::new(),
+            },
+        );
+
+        assert!(detections.is_empty());
+    }
+
+    fn opportunity_detection_event(kind: &str, payload: serde_json::Value) -> EventEnvelope {
+        EventEnvelope::new(
+            EventId::generate(),
+            OffsetDateTime::now_utc(),
+            NodeId::from_legacy_named("node_desktop").expect("node"),
+            Source::new("module.live").expect("source"),
+            EventKind::new(kind).expect("kind"),
+            Salience::new(0.83).expect("salience"),
+            Confidence::new(0.96).expect("confidence"),
+            RoutingMetadata::new(
+                RoutingScope::TrustedNetwork,
+                LatencyClass::Background,
+                PrivacyClass::Derived,
+            ),
+        )
+        .with_payload(payload)
+    }
+
+    #[test]
     fn git_status_parser_handles_modified_untracked_and_renamed_paths() {
         let paths = parse_git_status_paths(
             " M crates/a.rs\nM agent-target.md\n?? docs/new.md\nR  old.rs -> new.rs\n",
@@ -6215,6 +8757,7 @@ mod tests {
                     expected_exit_code: 0,
                     gate: EvaluationGate::StaticChecks,
                 }],
+                module_replay_reports: Vec::new(),
             },
             output_contract: MutationOutputContract::default(),
             recovery: RecoveryPlan::default(),
@@ -6245,6 +8788,7 @@ mod tests {
             relevant_files: Vec::new(),
             verification: VerificationPlan {
                 commands: Vec::new(),
+                module_replay_reports: Vec::new(),
             },
             output_contract: MutationOutputContract::default(),
             recovery: RecoveryPlan::default(),
@@ -6324,6 +8868,8 @@ mod tests {
                 target_ring: TrustRing::R1TrustedRuntime,
                 intended_paths: vec!["crates/example/**".to_string()],
                 verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
                 model_provider: None,
                 model: None,
                 dry_run: true,
@@ -6387,12 +8933,13 @@ mod tests {
             relevant_files: Vec::new(),
             verification: VerificationPlan {
                 commands: Vec::new(),
+                module_replay_reports: Vec::new(),
             },
             output_contract: MutationOutputContract::default(),
             recovery: RecoveryPlan::default(),
         };
 
-        let result = bridge.mutate(&packet, &workspace).expect("mutate");
+        let result = bridge.mutate(&packet, &workspace, None).expect("mutate");
 
         assert_eq!(
             requests.borrow()[0].response_format,
@@ -6452,12 +8999,13 @@ mod tests {
             relevant_files: Vec::new(),
             verification: VerificationPlan {
                 commands: Vec::new(),
+                module_replay_reports: Vec::new(),
             },
             output_contract: MutationOutputContract::default(),
             recovery: RecoveryPlan::default(),
         };
 
-        let result = bridge.mutate(&packet, &workspace).expect("mutate");
+        let result = bridge.mutate(&packet, &workspace, None).expect("mutate");
 
         assert_eq!(requests.borrow().len(), 2);
         assert!(requests.borrow()[0].metadata["target_ring"].is_null());
@@ -6518,12 +9066,13 @@ mod tests {
             relevant_files: Vec::new(),
             verification: VerificationPlan {
                 commands: Vec::new(),
+                module_replay_reports: Vec::new(),
             },
             output_contract: MutationOutputContract::default(),
             recovery: RecoveryPlan::default(),
         };
 
-        let result = bridge.mutate(&packet, &workspace).expect("mutation");
+        let result = bridge.mutate(&packet, &workspace, None).expect("mutation");
 
         let request = &requests.borrow()[0];
         assert_eq!(request.metadata["direct_edit"], false);
@@ -6578,12 +9127,15 @@ mod tests {
             relevant_files: Vec::new(),
             verification: VerificationPlan {
                 commands: Vec::new(),
+                module_replay_reports: Vec::new(),
             },
             output_contract: MutationOutputContract::default(),
             recovery: RecoveryPlan::default(),
         };
 
-        let error = bridge.mutate(&packet, &workspace).expect_err("bad patch");
+        let error = bridge
+            .mutate(&packet, &workspace, None)
+            .expect_err("bad patch");
 
         assert!(matches!(error, MutationModelError::ToolExecution { .. }));
         let _ = fs::remove_dir_all(root);
@@ -6599,6 +9151,8 @@ mod tests {
                 target_ring: TrustRing::R1TrustedRuntime,
                 intended_paths: Vec::new(),
                 verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
                 model_provider: None,
                 model: None,
                 dry_run: true,
@@ -6643,6 +9197,8 @@ mod tests {
                         expected_exit_code: 0,
                         gate: EvaluationGate::StaticChecks,
                     }],
+                    benchmark_gates: Vec::new(),
+                    module_replay_reports: Vec::new(),
                     model_provider: None,
                     model: None,
                     dry_run: true,
@@ -6687,6 +9243,8 @@ mod tests {
                         expected_exit_code: 0,
                         gate: EvaluationGate::StaticChecks,
                     }],
+                    benchmark_gates: Vec::new(),
+                    module_replay_reports: Vec::new(),
                     model_provider: None,
                     model: None,
                     dry_run: false,
@@ -6704,6 +9262,407 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_writes_agent_run_artifacts() {
+        let root = temp_dir("orchestrator-agent-evidence");
+        let candidate = root.join("candidate");
+        fs::create_dir_all(&candidate).expect("candidate dir");
+        let orchestrator = EvolutionOrchestrator::new(
+            FakeWorkspace {
+                root: root.clone(),
+                candidate: candidate.clone(),
+            },
+            ExecutingEvalHarness::new(LocalCommandRunner::new()),
+            LocalCandidateBundleStore::new(root.join("jobs")),
+        );
+        let model = FakeAgentArtifactMutationModel;
+
+        let report = orchestrator
+            .propose(
+                EvolutionRequest {
+                    objective: "write agent evidence".to_string(),
+                    target_ring: TrustRing::R1TrustedRuntime,
+                    intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                    verification_commands: Vec::new(),
+                    benchmark_gates: Vec::new(),
+                    module_replay_reports: Vec::new(),
+                    model_provider: None,
+                    model: None,
+                    dry_run: false,
+                },
+                Some(&model),
+            )
+            .expect("propose");
+        let bundle = PathBuf::from(&report.bundle.bundle_path);
+
+        assert!(bundle.join("agent-run.json").exists());
+        assert!(bundle.join("agent-summary.json").exists());
+        assert!(bundle.join("resource-usage.json").exists());
+        assert!(bundle.join("bundle-content-manifest.json").exists());
+        assert!(bundle.join("bundle-attestation.json").exists());
+        let expected_agent_run_path = bundle.join("agent-run.json").display().to_string();
+        let expected_agent_summary_path = bundle.join("agent-summary.json").display().to_string();
+        let expected_resource_usage_path = bundle.join("resource-usage.json").display().to_string();
+        let expected_content_manifest_path = bundle
+            .join("bundle-content-manifest.json")
+            .display()
+            .to_string();
+        let expected_attestation_path =
+            bundle.join("bundle-attestation.json").display().to_string();
+        assert_eq!(
+            report.bundle.agent_run_path.as_deref(),
+            Some(expected_agent_run_path.as_str())
+        );
+        assert_eq!(
+            report.bundle.agent_summary_path.as_deref(),
+            Some(expected_agent_summary_path.as_str())
+        );
+        assert_eq!(
+            report.bundle.resource_usage_path.as_deref(),
+            Some(expected_resource_usage_path.as_str())
+        );
+        assert_eq!(
+            report.bundle.content_manifest_path.as_deref(),
+            Some(expected_content_manifest_path.as_str())
+        );
+        assert_eq!(
+            report.bundle.attestation_path.as_deref(),
+            Some(expected_attestation_path.as_str())
+        );
+        assert!(
+            report
+                .bundle
+                .bundle_content_hash
+                .as_deref()
+                .is_some_and(|hash| hash.starts_with("blake3:"))
+        );
+        let usage: CandidateResourceUsageSummary =
+            serde_json::from_str(&fs::read_to_string(bundle.join("resource-usage.json")).unwrap())
+                .expect("resource usage");
+        assert!(usage.records.iter().any(|record| {
+            record.resource == "agent-input-tokens"
+                && record.units == 5
+                && record.confidence == ResourceUsageConfidence::ProviderReported
+        }));
+        let content_manifest: CandidateBundleContentManifest = serde_json::from_str(
+            &fs::read_to_string(bundle.join("bundle-content-manifest.json")).unwrap(),
+        )
+        .expect("content manifest");
+        assert_eq!(
+            report.bundle.bundle_content_hash.as_deref(),
+            Some(content_manifest.bundle_content_hash.as_str())
+        );
+        assert!(
+            content_manifest
+                .files
+                .iter()
+                .any(|file| file.path == "agent-run.json" && file.digest.starts_with("blake3:"))
+        );
+        assert!(
+            !content_manifest
+                .files
+                .iter()
+                .any(|file| file.path == "manifest.json")
+        );
+        let attestation: CandidateBundleAttestation = serde_json::from_str(
+            &fs::read_to_string(bundle.join("bundle-attestation.json")).unwrap(),
+        )
+        .expect("attestation");
+        assert_eq!(
+            attestation.subject.digest,
+            content_manifest.bundle_content_hash
+        );
+        assert_eq!(attestation.predicate.mutation_worker, "agent-loop");
+        assert!(
+            attestation
+                .predicate
+                .artifact_refs
+                .iter()
+                .any(|reference| reference.ends_with("agent-run.json"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orchestrator_records_benchmark_summary_metrics() {
+        let root = temp_dir("orchestrator-benchmark-evidence");
+        let candidate = root.join("candidate");
+        fs::create_dir_all(&candidate).expect("candidate dir");
+        let summary_path = candidate.join("benchmark-summary.json");
+        let summary_json = serde_json::json!({
+            "benchmark": "swebench",
+            "total_instances": 1,
+            "sinomo": {
+                "resolved_instances": 1,
+                "error_instances": 0,
+                "agent_model_turns": 3,
+                "agent_tool_results": 5,
+                "agent_input_tokens": 11,
+                "agent_output_tokens": 7
+            }
+        })
+        .to_string();
+        let benchmark_command = format!(
+            "printf %s {} > {}",
+            shell_quote(&summary_json),
+            shell_quote(&summary_path.display().to_string())
+        );
+        let orchestrator = EvolutionOrchestrator::new(
+            FakeWorkspace {
+                root: root.clone(),
+                candidate: candidate.clone(),
+            },
+            ExecutingEvalHarness::new(LocalCommandRunner::new()),
+            LocalCandidateBundleStore::new(root.join("jobs")),
+        );
+        let model = FakeAgentArtifactMutationModel;
+
+        let report = orchestrator
+            .propose(
+                EvolutionRequest {
+                    objective: "write benchmark evidence".to_string(),
+                    target_ring: TrustRing::R1TrustedRuntime,
+                    intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                    verification_commands: vec![VerificationCommand {
+                        name: "success".to_string(),
+                        command: "exit 0".to_string(),
+                        expected_exit_code: 0,
+                        gate: EvaluationGate::StaticChecks,
+                    }],
+                    benchmark_gates: vec![BenchmarkGateRequest {
+                        name: "swebench-smoke".to_string(),
+                        expected_exit_code: 0,
+                        kind: BenchmarkGateKind::Command {
+                            command: benchmark_command,
+                            summary_path: Some(summary_path.display().to_string()),
+                            results_dir: Some(candidate.display().to_string()),
+                        },
+                    }],
+                    module_replay_reports: Vec::new(),
+                    model_provider: None,
+                    model: None,
+                    dry_run: false,
+                },
+                Some(&model),
+            )
+            .expect("propose");
+        let benchmark_results_path = report
+            .bundle
+            .benchmark_results_path
+            .as_ref()
+            .map(PathBuf::from)
+            .expect("benchmark results path");
+        let benchmark_reports: Vec<BenchmarkGateReport> = serde_json::from_str(
+            &fs::read_to_string(&benchmark_results_path).expect("benchmark results"),
+        )
+        .expect("benchmark report json");
+        let scorecard = report.scorecard.as_ref().expect("scorecard");
+
+        assert_eq!(scorecard.outcome, EvaluationOutcome::Passed);
+        assert_eq!(benchmark_reports.len(), 1);
+        assert_eq!(benchmark_reports[0].outcome, EvaluationOutcome::Passed);
+        assert_eq!(
+            benchmark_reports[0].summary_verdict.as_deref(),
+            Some("SWE-bench resolved 1/1 instance(s)")
+        );
+        assert!(benchmark_reports[0].command_log_path.is_some());
+        assert!(scorecard.metrics.iter().any(|metric| {
+            metric.name == "swebench_total_instances" && metric.value == MetricValue::Integer(1)
+        }));
+        assert!(scorecard.metrics.iter().any(|metric| {
+            metric.name == "agent_input_tokens" && metric.value == MetricValue::Integer(11)
+        }));
+        assert!(benchmark_results_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orchestrator_fails_unresolved_swebench_summary() {
+        let root = temp_dir("orchestrator-benchmark-unresolved");
+        let candidate = root.join("candidate");
+        fs::create_dir_all(&candidate).expect("candidate dir");
+        let summary_path = candidate.join("benchmark-summary.json");
+        let summary_json = serde_json::json!({
+            "benchmark": "swebench",
+            "total_instances": 1,
+            "sinomo": {
+                "resolved_instances": 0,
+                "error_instances": 0
+            }
+        })
+        .to_string();
+        let benchmark_command = format!(
+            "printf %s {} > {}",
+            shell_quote(&summary_json),
+            shell_quote(&summary_path.display().to_string())
+        );
+        let orchestrator = EvolutionOrchestrator::new(
+            FakeWorkspace {
+                root: root.clone(),
+                candidate: candidate.clone(),
+            },
+            ExecutingEvalHarness::new(LocalCommandRunner::new()),
+            LocalCandidateBundleStore::new(root.join("jobs")),
+        );
+        let model = FakeAgentArtifactMutationModel;
+
+        let report = orchestrator
+            .propose(
+                EvolutionRequest {
+                    objective: "write benchmark evidence".to_string(),
+                    target_ring: TrustRing::R1TrustedRuntime,
+                    intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                    verification_commands: vec![VerificationCommand {
+                        name: "success".to_string(),
+                        command: "exit 0".to_string(),
+                        expected_exit_code: 0,
+                        gate: EvaluationGate::StaticChecks,
+                    }],
+                    benchmark_gates: vec![BenchmarkGateRequest {
+                        name: "swebench-smoke".to_string(),
+                        expected_exit_code: 0,
+                        kind: BenchmarkGateKind::Command {
+                            command: benchmark_command,
+                            summary_path: Some(summary_path.display().to_string()),
+                            results_dir: Some(candidate.display().to_string()),
+                        },
+                    }],
+                    module_replay_reports: Vec::new(),
+                    model_provider: None,
+                    model: None,
+                    dry_run: false,
+                },
+                Some(&model),
+            )
+            .expect("propose");
+        let benchmark_results_path = report
+            .bundle
+            .benchmark_results_path
+            .as_ref()
+            .map(PathBuf::from)
+            .expect("benchmark results path");
+        let benchmark_reports: Vec<BenchmarkGateReport> = serde_json::from_str(
+            &fs::read_to_string(&benchmark_results_path).expect("benchmark results"),
+        )
+        .expect("benchmark report json");
+        let scorecard = report.scorecard.as_ref().expect("scorecard");
+
+        assert_eq!(scorecard.outcome, EvaluationOutcome::Failed);
+        assert_eq!(benchmark_reports.len(), 1);
+        assert_eq!(benchmark_reports[0].outcome, EvaluationOutcome::Failed);
+        assert_eq!(
+            benchmark_reports[0].summary_verdict.as_deref(),
+            Some("SWE-bench resolved 0/1 instance(s)")
+        );
+        assert!(scorecard.gates.iter().any(|gate| {
+            gate.gate == EvaluationGate::PrivateRegressionEvals
+                && gate.outcome == EvaluationOutcome::Failed
+                && gate.summary.contains("resolved 0/1")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
+        let root = temp_dir("agent-mutation-worker");
+        fs::create_dir_all(&root).expect("workspace dir");
+        fs::write(root.join("hello.txt"), "old\n").expect("fixture");
+        let job = create_bootstrap_job(
+            &EvolutionRequest {
+                objective: "replace hello fixture".to_string(),
+                target_ring: TrustRing::R2TrustedService,
+                intended_paths: vec!["hello.txt".to_string()],
+                verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: false,
+            },
+            &root,
+        );
+        let workspace = CandidateWorkspace {
+            job_id: job.job_id.clone(),
+            path: root.clone(),
+            branch_name: "codex/evolve/agent-worker".to_string(),
+            source_revision: Some("test".to_string()),
+        };
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle");
+        let bundle = CandidateBundleManifest {
+            job_id: job.job_id.clone(),
+            bundle_path: bundle_dir.display().to_string(),
+            created_at: OffsetDateTime::now_utc(),
+            mutation_packet_path: bundle_dir
+                .join("mutation-packet.json")
+                .display()
+                .to_string(),
+            job_path: None,
+            model_output_path: None,
+            agent_run_path: None,
+            agent_summary_path: None,
+            benchmark_results_path: None,
+            resource_usage_path: None,
+            content_manifest_path: None,
+            attestation_path: None,
+            registry_record_path: None,
+            bundle_content_hash: None,
+            changed_files_path: None,
+            diff_path: None,
+            scorecard_path: None,
+            candidate_summary_path: None,
+            decision_path: None,
+            command_logs: Vec::new(),
+        };
+        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
+        let model = FakeInteractionModel::new([
+            serde_json::json!({
+                "response_mode": "defer",
+                "text": "Applying the requested source edit.",
+                "tool_calls": [{
+                    "tool": "apply_patch",
+                    "input": { "patch": patch },
+                    "async": false,
+                    "summary": "Update hello fixture."
+                }],
+                "maid_handoff": null,
+                "next_state": "waiting"
+            })
+            .to_string(),
+            serde_json::json!({
+                "response_mode": "answer",
+                "text": "Changed hello.txt from old to new. Verification not requested.",
+                "tool_calls": [],
+                "maid_handoff": null,
+                "next_state": "listening"
+            })
+            .to_string(),
+        ]);
+        let worker = AgentMutationWorker::new(model, "fake", "fake").with_max_steps(Some(4));
+
+        let result = worker
+            .mutate(&mutation_packet_for_job(&job), &workspace, Some(&bundle))
+            .expect("agent mutation");
+
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).expect("fixture"),
+            "new\n"
+        );
+        assert!(result.agent_run.is_some());
+        assert_eq!(
+            result
+                .agent_summary
+                .as_ref()
+                .map(|summary| summary.tool_results),
+            Some(1)
+        );
+        assert_eq!(
+            result.summary.as_deref(),
+            Some("Changed hello.txt from old to new. Verification not requested.")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn git_workspace_adapter_places_worktree_inside_job_folder() {
         let source = git_repo("git-workspace-layout-source");
         fs::write(source.join("README.md"), "# source\n").expect("readme");
@@ -6716,6 +9675,8 @@ mod tests {
                 target_ring: TrustRing::R1TrustedRuntime,
                 intended_paths: vec!["README.md".to_string()],
                 verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
                 model_provider: None,
                 model: None,
                 dry_run: true,
@@ -6761,6 +9722,8 @@ mod tests {
                     expected_exit_code: 0,
                     gate: EvaluationGate::StaticChecks,
                 }],
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
                 model_provider: None,
                 model: None,
                 dry_run: true,
@@ -6782,9 +9745,18 @@ mod tests {
                 mutation_packet_path: String::new(),
                 job_path: None,
                 model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: None,
                 diff_path: None,
                 scorecard_path: None,
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -6830,6 +9802,8 @@ mod tests {
                 target_ring: TrustRing::R1TrustedRuntime,
                 intended_paths: vec!["README.md".to_string()],
                 verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
                 model_provider: None,
                 model: None,
                 dry_run: true,
@@ -6853,9 +9827,18 @@ mod tests {
                 mutation_packet_path: String::new(),
                 job_path: None,
                 model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: None,
                 diff_path: None,
                 scorecard_path: None,
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -6882,6 +9865,336 @@ mod tests {
     }
 
     #[test]
+    fn approve_refuses_failed_preflight_without_override() {
+        let (source, jobs_root, data_root, record) =
+            approval_record_fixture("approve-refuses-preflight", EvaluationOutcome::Failed);
+        let error = decide_stored_evolution_job(
+            &EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root)),
+            record.clone(),
+            CandidateDecisionOutcome::Approved,
+            "test-reviewer",
+            "",
+        )
+        .expect_err("approval preflight fails");
+
+        assert!(matches!(error, EvolutionError::ApprovalPreflight { .. }));
+        assert!(
+            !PathBuf::from(&record.bundle.bundle_path)
+                .join("approval-decision.json")
+                .exists()
+        );
+        let _ = run_in(
+            &source,
+            &format!(
+                "git worktree remove --force {}",
+                record.candidate_workspace.path.display()
+            ),
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(jobs_root);
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn approve_refuses_tampered_bundle_integrity_without_override() {
+        let (source, jobs_root, data_root, record) =
+            approval_record_fixture("approve-refuses-tampered-bundle", EvaluationOutcome::Passed);
+        fs::write(
+            &record.bundle.mutation_packet_path,
+            "{\"objective\":\"tampered after attestation\"}\n",
+        )
+        .expect("tamper mutation packet");
+
+        let error = decide_stored_evolution_job(
+            &EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root)),
+            record.clone(),
+            CandidateDecisionOutcome::Approved,
+            "test-reviewer",
+            "",
+        )
+        .expect_err("approval preflight fails");
+
+        assert!(matches!(error, EvolutionError::ApprovalPreflight { .. }));
+        let detail = error.to_string();
+        assert!(detail.contains("candidate-bundle-integrity"));
+        assert!(
+            !PathBuf::from(&record.bundle.bundle_path)
+                .join("approval-decision.json")
+                .exists()
+        );
+        let _ = run_in(
+            &source,
+            &format!(
+                "git worktree remove --force {}",
+                record.candidate_workspace.path.display()
+            ),
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(jobs_root);
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn approve_override_records_preflight_and_candidate_summary() {
+        let (source, jobs_root, data_root, record) =
+            approval_record_fixture("approve-override-preflight", EvaluationOutcome::Failed);
+        let paths = EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root));
+
+        let recorded = decide_stored_evolution_job_with_options(
+            &paths,
+            record.clone(),
+            CandidateDecisionOutcome::Approved,
+            "test-reviewer",
+            "accepting known verification failure for test",
+            CandidateDecisionOptions {
+                override_preflight: true,
+            },
+        )
+        .expect("override approval");
+
+        let decision = recorded.record.decision.as_ref().expect("decision");
+        let preflight = decision
+            .approval_preflight
+            .as_ref()
+            .expect("approval preflight");
+        assert!(preflight.override_used);
+        assert!(!preflight.passed);
+        assert!(preflight.checks.iter().any(|check| {
+            check.name == "verification-passed" && check.outcome == EvaluationOutcome::Failed
+        }));
+        assert!(preflight.checks.iter().any(|check| {
+            check.name == "candidate-bundle-integrity" && check.outcome == EvaluationOutcome::Passed
+        }));
+        let registry_record_path = recorded
+            .record
+            .bundle
+            .registry_record_path
+            .as_ref()
+            .map(PathBuf::from)
+            .expect("registry record path");
+        assert!(registry_record_path.exists());
+        let registry_record =
+            fs::read_to_string(&registry_record_path).expect("registry record artifact");
+        assert!(registry_record.contains("\"bundle_content_hash\""));
+        let durable_registry_record_path =
+            sinomo_runtime::registry::candidate_bundle_registry_record_path(
+                &data_root,
+                &record.job.job_id,
+            );
+        assert!(durable_registry_record_path.exists());
+        assert!(
+            fs::read_to_string(&durable_registry_record_path)
+                .expect("durable registry record")
+                .contains("\"bundle_content_hash\"")
+        );
+        let summary_path = recorded
+            .record
+            .bundle
+            .candidate_summary_path
+            .as_ref()
+            .map(PathBuf::from)
+            .expect("candidate summary path");
+        assert!(summary_path.exists());
+        assert!(
+            fs::read_to_string(&summary_path)
+                .expect("candidate summary")
+                .contains("candidate-bundle-integrity")
+        );
+        assert!(
+            fs::read_to_string(&summary_path)
+                .expect("candidate summary")
+                .contains("candidate-bundle-registry-record.json")
+        );
+        assert!(
+            fs::read_to_string(recorded.decision_path)
+                .expect("decision")
+                .contains("\"approval_preflight\"")
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("README.md")).expect("source readme"),
+            "# source\n\napproved\n"
+        );
+        let _ = run_in(
+            &source,
+            &format!(
+                "git worktree remove --force {}",
+                record.candidate_workspace.path.display()
+            ),
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(jobs_root);
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn approve_materializes_verified_rollout_material_from_candidate_bundle() {
+        let (source, jobs_root, data_root, mut record) =
+            approval_record_fixture("approve-rollout-material", EvaluationOutcome::Passed);
+        let paths = EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root));
+        let (material, signer) =
+            rollout_material_fixture(&data_root, &record.job.job_id, "approval-rollout-signer");
+        sinomo_runtime::registry::write_trusted_artifact_signers(
+            &data_root,
+            std::slice::from_ref(&signer),
+        )
+        .expect("write trusted signer");
+        let material_path =
+            sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(
+                &record.bundle,
+            );
+        fs::write(
+            &material_path,
+            serde_json::to_string_pretty(&material).expect("material json"),
+        )
+        .expect("write candidate rollout material");
+        finalize_candidate_bundle_integrity(
+            &mut record.bundle,
+            &record.job,
+            &record.candidate_workspace,
+            None,
+            EvaluationOutcome::Passed,
+            &record.changed_files,
+        )
+        .expect("refresh bundle integrity");
+
+        let recorded = decide_stored_evolution_job(
+            &paths,
+            record.clone(),
+            CandidateDecisionOutcome::Approved,
+            "test-reviewer",
+            "approve rollout material",
+        )
+        .expect("approve candidate with rollout material");
+
+        let durable_material_path =
+            sinomo_runtime::registry::verified_candidate_rollout_material_path(
+                &data_root,
+                &record.job.job_id,
+            );
+        assert!(durable_material_path.exists());
+        let durable_material = sinomo_runtime::registry::read_verified_candidate_rollout_material(
+            &data_root,
+            &record.job.job_id,
+        )
+        .expect("read durable material")
+        .expect("durable material");
+        assert_eq!(durable_material.candidate_bundle_job_id, record.job.job_id);
+        assert_eq!(
+            durable_material.artifact.artifact_id,
+            material.artifact.artifact_id
+        );
+        assert!(
+            durable_material
+                .evidence_refs
+                .iter()
+                .any(|evidence| evidence
+                    == &format!("registry://candidate-bundle/{}", record.job.job_id))
+        );
+        let preflight = recorded
+            .record
+            .decision
+            .as_ref()
+            .and_then(|decision| decision.approval_preflight.as_ref())
+            .expect("approval preflight");
+        assert!(preflight.checks.iter().any(|check| {
+            check.name == "candidate-verified-rollout-material"
+                && check.outcome == EvaluationOutcome::Passed
+        }));
+        let summary_path = recorded
+            .record
+            .bundle
+            .candidate_summary_path
+            .as_ref()
+            .map(PathBuf::from)
+            .expect("candidate summary");
+        assert!(
+            fs::read_to_string(summary_path)
+                .expect("candidate summary")
+                .contains(&durable_material_path.display().to_string())
+        );
+        let _ = run_in(
+            &source,
+            &format!(
+                "git worktree remove --force {}",
+                record.candidate_workspace.path.display()
+            ),
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(jobs_root);
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn approve_override_skips_invalid_rollout_material_materialization() {
+        let (source, jobs_root, data_root, mut record) = approval_record_fixture(
+            "approve-invalid-rollout-material",
+            EvaluationOutcome::Passed,
+        );
+        let paths = EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root));
+        let (material, _signer) =
+            rollout_material_fixture(&data_root, &record.job.job_id, "approval-untrusted-signer");
+        let material_path =
+            sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(
+                &record.bundle,
+            );
+        fs::write(
+            &material_path,
+            serde_json::to_string_pretty(&material).expect("material json"),
+        )
+        .expect("write candidate rollout material");
+        finalize_candidate_bundle_integrity(
+            &mut record.bundle,
+            &record.job,
+            &record.candidate_workspace,
+            None,
+            EvaluationOutcome::Passed,
+            &record.changed_files,
+        )
+        .expect("refresh bundle integrity");
+
+        let recorded = decide_stored_evolution_job_with_options(
+            &paths,
+            record.clone(),
+            CandidateDecisionOutcome::Approved,
+            "test-reviewer",
+            "approving source candidate but not invalid rollout material",
+            CandidateDecisionOptions {
+                override_preflight: true,
+            },
+        )
+        .expect("override invalid rollout material");
+
+        let preflight = recorded
+            .record
+            .decision
+            .as_ref()
+            .and_then(|decision| decision.approval_preflight.as_ref())
+            .expect("approval preflight");
+        assert!(preflight.checks.iter().any(|check| {
+            check.name == "candidate-verified-rollout-material"
+                && check.outcome == EvaluationOutcome::Failed
+        }));
+        assert!(
+            sinomo_runtime::registry::read_verified_candidate_rollout_material(
+                &data_root,
+                &record.job.job_id,
+            )
+            .expect("read durable material")
+            .is_none()
+        );
+        let _ = run_in(
+            &source,
+            &format!(
+                "git worktree remove --force {}",
+                record.candidate_workspace.path.display()
+            ),
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(jobs_root);
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
     fn approved_candidate_commit_fast_forwards_source_checkout() {
         let source = git_repo("approved-candidate-source");
         fs::write(source.join("README.md"), "# source\n").expect("readme");
@@ -6894,6 +10207,8 @@ mod tests {
                 target_ring: TrustRing::R1TrustedRuntime,
                 intended_paths: vec!["README.md".to_string()],
                 verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
                 model_provider: None,
                 model: None,
                 dry_run: true,
@@ -6917,9 +10232,18 @@ mod tests {
                 mutation_packet_path: String::new(),
                 job_path: None,
                 model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: None,
                 diff_path: None,
                 scorecard_path: None,
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -6963,6 +10287,8 @@ mod tests {
                 target_ring: TrustRing::R1TrustedRuntime,
                 intended_paths: vec!["README.md".to_string()],
                 verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
                 model_provider: None,
                 model: None,
                 dry_run: true,
@@ -6987,9 +10313,18 @@ mod tests {
                 mutation_packet_path: String::new(),
                 job_path: None,
                 model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
                 changed_files_path: None,
                 diff_path: None,
                 scorecard_path: None,
+                candidate_summary_path: None,
                 decision_path: None,
                 command_logs: Vec::new(),
             },
@@ -7345,6 +10680,7 @@ index 3b18e51..6320cd2 100644
             &self,
             _packet: &MutationPacket,
             _workspace: &CandidateWorkspace,
+            _bundle: Option<&CandidateBundleManifest>,
         ) -> Result<ModelMutationResult, MutationModelError> {
             let tool_result = EvolutionToolResult {
                 tool: "read_file".to_string(),
@@ -7378,6 +10714,93 @@ index 3b18e51..6320cd2 100644
                     }),
                     tool_results: vec![tool_result],
                 }],
+                agent_summary: None,
+                agent_resource_usage: None,
+                agent_run: None,
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeAgentArtifactMutationModel;
+
+    impl MutationModel for FakeAgentArtifactMutationModel {
+        fn mutate(
+            &self,
+            _packet: &MutationPacket,
+            _workspace: &CandidateWorkspace,
+            _bundle: Option<&CandidateBundleManifest>,
+        ) -> Result<ModelMutationResult, MutationModelError> {
+            Ok(ModelMutationResult {
+                provider: "fake".to_string(),
+                model: "fake-model".to_string(),
+                raw_output: "agent completed".to_string(),
+                parsed_patch: None,
+                summary: Some("agent completed".to_string()),
+                structured_output: None,
+                tool_results: Vec::new(),
+                model_turns: Vec::new(),
+                agent_summary: Some(AgentMutationSummary {
+                    stop_reason: "final-decision".to_string(),
+                    model_turns: 2,
+                    tool_results: 1,
+                    input_tokens: 5,
+                    output_tokens: 7,
+                    final_text: "agent completed".to_string(),
+                }),
+                agent_resource_usage: Some(agent_resource_usage_summary(
+                    _packet.job_id.clone(),
+                    5,
+                    7,
+                    2,
+                    1,
+                )),
+                agent_run: Some(serde_json::json!({
+                    "final_decision": {
+                        "text": "agent completed"
+                    },
+                    "stop_reason": "final-decision"
+                })),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeInteractionModel {
+        responses: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl FakeInteractionModel {
+        fn new(responses: impl IntoIterator<Item = impl Into<String>>) -> Self {
+            Self {
+                responses: Rc::new(RefCell::new(
+                    responses.into_iter().map(Into::into).collect(),
+                )),
+            }
+        }
+    }
+
+    impl InteractionModel for FakeInteractionModel {
+        fn complete(
+            &self,
+            _request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            let mut responses = self.responses.borrow_mut();
+            if responses.is_empty() {
+                return Err(LanguageModelError::ProviderInvocationFailed {
+                    provider: "fake".to_string(),
+                    model: "fake".to_string(),
+                    detail: "no fake response queued".to_string(),
+                });
+            }
+            let response = responses.remove(0);
+            Ok(LanguageModelResponse {
+                provider: "fake".to_string(),
+                model: "fake".to_string(),
+                content: response,
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
             })
         }
     }
@@ -7436,6 +10859,174 @@ index 3b18e51..6320cd2 100644
             branch_name: "codex/evolve/tools".to_string(),
             source_revision: Some("test".to_string()),
         }
+    }
+
+    fn approval_record_fixture(
+        name: &str,
+        verification_outcome: EvaluationOutcome,
+    ) -> (PathBuf, PathBuf, PathBuf, StoredEvolutionJob) {
+        let source = git_repo(&format!("{name}-source"));
+        fs::write(source.join("README.md"), "# source\n").expect("readme");
+        run_in(&source, "git add README.md").expect("git add");
+        run_in(&source, "git commit -m init").expect("git commit");
+        let jobs_root = temp_dir(&format!("{name}-jobs"));
+        let data_root = temp_dir(&format!("{name}-data"));
+        let paths = EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root));
+        paths.ensure().expect("paths");
+        let job = create_bootstrap_job(
+            &EvolutionRequest {
+                objective: "apply approved candidate".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["README.md".to_string()],
+                verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            &source,
+        );
+        let adapter = GitWorkspaceAdapter::new(&source, &jobs_root);
+        let workspace = adapter.prepare_candidate(&job).expect("candidate");
+        fs::write(workspace.path.join("README.md"), "# source\n\napproved\n").expect("candidate");
+        let bundle_dir = paths.job_dir(&job.job_id).join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle");
+        let mutation_packet_path = bundle_dir.join("mutation-packet.json");
+        fs::write(
+            &mutation_packet_path,
+            "{\"objective\":\"apply approved candidate\"}\n",
+        )
+        .expect("mutation packet");
+        let diff_path = bundle_dir.join("diff.patch");
+        fs::write(
+            &diff_path,
+            "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@\n approved\n",
+        )
+        .expect("diff");
+        let mut record = StoredEvolutionJob {
+            job: job.clone(),
+            candidate_workspace: workspace,
+            bundle: CandidateBundleManifest {
+                job_id: job.job_id.clone(),
+                bundle_path: bundle_dir.display().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+                mutation_packet_path: mutation_packet_path.display().to_string(),
+                job_path: None,
+                model_output_path: None,
+                agent_run_path: None,
+                agent_summary_path: None,
+                benchmark_results_path: None,
+                resource_usage_path: None,
+                content_manifest_path: None,
+                attestation_path: None,
+                registry_record_path: None,
+                bundle_content_hash: None,
+                changed_files_path: None,
+                diff_path: Some(diff_path.display().to_string()),
+                scorecard_path: None,
+                candidate_summary_path: None,
+                decision_path: None,
+                command_logs: Vec::new(),
+            },
+            verification_outcome: Some(verification_outcome.clone()),
+            changed_files: vec!["README.md".to_string()],
+            decision: None,
+        };
+        finalize_candidate_bundle_integrity(
+            &mut record.bundle,
+            &record.job,
+            &record.candidate_workspace,
+            None,
+            verification_outcome,
+            &record.changed_files,
+        )
+        .expect("bundle integrity");
+        write_stored_job(&paths, &record).expect("stored record");
+        (source, jobs_root, data_root, record)
+    }
+
+    fn rollout_material_fixture(
+        root: &Path,
+        job_id: &EvolutionJobId,
+        signer_id: &str,
+    ) -> (
+        sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord,
+        sinomo_runtime::registry::TrustedArtifactSigner,
+    ) {
+        let identity_path = root.join(format!("{signer_id}.identity.sobj"));
+        let identity =
+            sinomo_runtime::node::load_or_create_node_identity(&identity_path).expect("identity");
+        let module_id =
+            sinomo_runtime::module::ModuleId::from_legacy_named("module.trigger.silence_policy")
+                .expect("module");
+        let artifact_id =
+            sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_rollout_candidate")
+                .expect("artifact");
+        let active_artifact_id =
+            Id::from_legacy_named("artifact_rollout_active").expect("active artifact");
+        let mut artifact = sinomo_runtime::core::ArtifactManifest {
+            artifact_id: artifact_id.clone(),
+            module_id: module_id.clone(),
+            target_ring: TrustRing::R3SandboxedModule,
+            content_hash: "blake3:candidate-rollout".to_string(),
+            signature: None,
+            source_workspace: None,
+            source_revision: None,
+            module_manifest: sinomo_runtime::core::ModuleManifest::r3_wasm(
+                module_id.clone(),
+                "0.1.0",
+                "trigger",
+            ),
+            provenance: sinomo_runtime::core::ArtifactProvenance {
+                produced_by: sinomo_runtime::core::ActorRef {
+                    kind: sinomo_runtime::core::ActorKind::EvolutionOrchestrator,
+                    id: "sinomo-evolution-test".to_string(),
+                },
+                source_event_id: None,
+                build_log_artifact_id: None,
+                attestations: Vec::new(),
+            },
+        };
+        artifact.signature = Some(
+            sinomo_runtime::module::sign_artifact_manifest_with_node_identity(&artifact, &identity)
+                .expect("sign artifact"),
+        );
+        let signer = sinomo_runtime::registry::TrustedArtifactSigner::local_ed25519(
+            signer_id,
+            identity.public_key,
+            "approval test signer",
+        );
+        let material = sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord {
+            candidate_bundle_job_id: job_id.clone(),
+            artifact: artifact.clone(),
+            policy_decision: sinomo_runtime::core::PolicyDecision {
+                decision_id: Id::from_legacy_named("policy_rollout_material").expect("policy"),
+                target_ring: artifact.target_ring.clone(),
+                target_artifact_id: artifact.artifact_id.clone(),
+                action: sinomo_runtime::core::PolicyAction::Allow,
+                capability_diff: sinomo_runtime::core::CapabilityDiff::default(),
+                required_additional_evals: Vec::new(),
+                max_rollout_weight_bps: Some(500),
+                reason: "approved low-risk module candidate".to_string(),
+            },
+            rollout_plan: sinomo_runtime::core::RolloutPlan {
+                rollout_plan_id: Id::from_legacy_named("rollout_material_approval")
+                    .expect("rollout"),
+                artifact_id,
+                module_id,
+                target_ring: artifact.target_ring.clone(),
+                strategy: sinomo_runtime::core::RolloutStrategy::Shadow,
+                target_nodes: Vec::new(),
+                initial_weight_bps: 0,
+                promotion_steps_bps: vec![500],
+                rollback_policy: RollbackPolicy::default(),
+            },
+            active_artifact_id,
+            evidence_refs: vec![format!("candidate-bundle://{job_id}")],
+            registered_at: OffsetDateTime::now_utc(),
+        };
+        (material, signer)
     }
 
     fn git_repo(name: &str) -> PathBuf {

@@ -116,7 +116,7 @@ pub fn swebench_verified_10_plan() -> BenchmarkHarnessPlan {
             "cargo build -p sinomo-benchmarks --bin sinomo-swebench-agent".to_string(),
             "sinomo --local providers test deepseek".to_string(),
         ],
-        run_command: "python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py --mode both --provider deepseek --model deepseek-v4-flash --baseline-model deepseek/deepseek-v4-flash"
+        run_command: "python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py --mode both --provider deepseek --model deepseek-v4-flash --baseline-model deepseek/deepseek-v4-flash --evaluate --summary-out benchmark-results/swebench/summary.json"
             .to_string(),
         required_tools: default_coding_agent_tools()
             .into_iter()

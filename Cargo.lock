@@ -5753,8 +5753,10 @@ dependencies = [
  "sinomo-models",
  "sinomo-pytorch",
  "sinomo-runtime",
+ "sinomo-sandbox-runtime",
  "time",
  "tokenizers",
+ "wat",
 ]
 
 [[package]]
@@ -5784,8 +5786,10 @@ dependencies = [
  "sinomo-events",
  "sinomo-kv",
  "sinomo-local",
+ "sinomo-module",
  "sinomo-network",
  "sinomo-node",
+ "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
  "sinomo-sandbox-runtime",
@@ -5872,8 +5876,10 @@ dependencies = [
 name = "sinomo-evolution"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
+ "sinomo-agent",
  "sinomo-lm",
  "sinomo-runtime",
  "thiserror 2.0.18",
@@ -5967,11 +5973,15 @@ dependencies = [
 name = "sinomo-module"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "ring",
  "serde",
  "serde_json",
  "sinomo-core",
  "sinomo-events",
  "sinomo-node",
+ "sinomo-object",
+ "sinomo-storage",
  "thiserror 2.0.18",
  "time",
 ]
@@ -6050,10 +6060,14 @@ dependencies = [
 name = "sinomo-registry"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
  "sinomo-core",
+ "sinomo-kv",
  "sinomo-module",
+ "sinomo-node",
+ "sinomo-storage",
  "thiserror 2.0.18",
  "time",
 ]
@@ -6070,6 +6084,7 @@ dependencies = [
  "sinomo-module",
  "sinomo-node",
  "sinomo-object",
+ "sinomo-registry",
  "sinomo-storage",
  "time",
 ]

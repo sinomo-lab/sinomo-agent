@@ -705,22 +705,17 @@ pub fn send_iroh_daemon_rpc_raw(
         &ClusterId::from_legacy_named("cluster_iroh_dial_placeholder").expect("static cluster id"),
         &NodeId::from_legacy_named("node_iroh_dial_placeholder").expect("static node id"),
     )?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| NetworkError::Io {
-            operation: "start iroh client runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let response = runtime.block_on(async {
-        tokio::time::timeout(
+    block_on_daemon_rpc(async move {
+        match tokio::time::timeout(
             timeout.saturating_add(Duration::from_millis(250)),
             send_iroh_daemon_rpc_raw_async(record, command, auth, request, timeout),
         )
         .await
-    });
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    response.unwrap_or_else(|_| Err(iroh_daemon_command_timeout_error(timeout)))
+        {
+            Ok(response) => response,
+            Err(_) => Err(iroh_daemon_command_timeout_error(timeout)),
+        }
+    })
 }
 
 #[cfg(not(feature = "iroh-transport"))]
@@ -940,13 +935,23 @@ pub fn send_daemon_rpc_to_cluster_endpoint(
     }
 }
 
-pub fn send_daemon_rpc_raw(
-    address: &str,
-    command: &str,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeout: Duration,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
+/// Drive a daemon-RPC future to completion from synchronous code, whether or not the
+/// caller is already inside a Tokio runtime.
+///
+/// These helpers are synchronous wrappers over async I/O. They are called both with no
+/// ambient runtime (e.g. the CLI) and from within one: the daemon's service-seam adapter
+/// drives handlers via `block_on`, and a handler may then make a synchronous
+/// daemon-to-daemon RPC. Building a fresh runtime and calling `block_on` inline panics
+/// ("cannot start a runtime from within a runtime") when nested. So when an ambient
+/// runtime exists we drive the future on it via `block_in_place` (the daemon adapter's
+/// runtime is multi-threaded); otherwise we spin up a short-lived current-thread runtime.
+fn block_on_daemon_rpc<F, T>(future: F) -> Result<T, NetworkError>
+where
+    F: std::future::Future<Output = Result<T, NetworkError>>,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return tokio::task::block_in_place(|| handle.block_on(future));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -954,11 +959,21 @@ pub fn send_daemon_rpc_raw(
             operation: "start daemon control runtime".to_string(),
             detail: source.to_string(),
         })?;
-    let response = runtime.block_on(send_daemon_rpc_raw_async(
-        address, command, auth, request, timeout,
-    ));
+    let output = runtime.block_on(future);
     runtime.shutdown_timeout(Duration::from_millis(250));
-    response
+    output
+}
+
+pub fn send_daemon_rpc_raw(
+    address: &str,
+    command: &str,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
+    timeout: Duration,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    block_on_daemon_rpc(send_daemon_rpc_raw_async(
+        address, command, auth, request, timeout,
+    ))
 }
 
 pub async fn send_daemon_rpc_raw_async(

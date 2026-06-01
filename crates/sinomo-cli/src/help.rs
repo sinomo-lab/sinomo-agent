@@ -141,6 +141,16 @@ pub(super) fn print_rollout_help() {
     println!(
         "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then activate through shadow supervision or the main-only shadow bootstrap path."
     );
+    println!(
+        "  sinomo rollout advance [--node <node-id>] [--scorecard <path> | --module-replay-report <path> | --shadow-telemetry [--shadow-telemetry-limit <n>]] [--incident <event-id>] [--user-corrections <n>] [--rollback-trigger <trigger>] [--evidence <ref>]"
+    );
+    println!(
+        "      Read the persisted candidate rollout state, record the next promotion or rollback decision from scorecard, replay, live shadow telemetry, or incident evidence, and update rollout runtime state."
+    );
+    println!(
+        "  sinomo rollout telemetry-gates show|set [--enable-auto-promotion|--disable-auto-promotion] [--event-limit <n>] [--min-events <n>] [--max-auto-weight-bps <n|unlimited>] [--max-candidate-latency-p95-ms <n|unlimited>]"
+    );
+    println!("      Inspect or update the daemon's automatic shadow-telemetry promotion gates.");
     println!("  sinomo rollout diagnostics [--target <host:port>]");
     println!(
         "      Fetch rollout state, build logs, and candidate stdout/stderr tails from a daemon."
@@ -250,6 +260,16 @@ pub(super) fn print_sandbox_help() {
     );
     println!(
         "      Import a real Sinomo-maintained BusyBox WASIX module as the default toolchain applets; --daemon stores it in SIFS."
+    );
+    println!(
+        "  sinomo sandbox module-artifact register --artifact <artifact-id> [--interface <version>] [--component-model] [--abi preview1|wasix] [--sandbox <sandbox-id>] [--argv <arg>] [--cwd <path>] [--env NAME=VALUE] [--timeout-ms <ms>] [--candidate-bundle <bundle-dir> --module <module-id> --active-artifact <artifact-id>] <module.wasm>"
+    );
+    println!(
+        "      Register a sandbox-backed module artifact in the local data dir; with candidate-bundle flags, also write verified-rollout-material.json for approval."
+    );
+    println!("  sinomo sandbox module-replay run --fixture <fixture.json> --report <report.json>");
+    println!(
+        "      Run a module replay fixture against registered sandbox module artifacts and write a replay report."
     );
     println!(
         "  sinomo sandbox toolchain import-package [--daemon] [--into <toolchain-id>] <package.json>"
@@ -397,7 +417,7 @@ pub(super) fn print_evolve_help() {
     println!("  sinomo evolve");
     println!("      Show evolution commands.");
     println!(
-        "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"]"
+        "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"] [--benchmark swebench:<instance_id>] [--module-replay-report [name=]<path>]"
     );
     println!(
         "      With --dry-run or --pause-after-proposal, write a phase-0 campaign bundle under $SINOMO_DATA_DIR/evolution/campaigns/."
@@ -412,10 +432,10 @@ pub(super) fn print_evolve_help() {
         "      Write phase-1 resource-ledger, lease request/decision, scheduler dry-run, and pause/schedule decision artifacts."
     );
     println!(
-        "  sinomo evolve iterate <campaign> --dry-run [--task <task_id>] [--path <glob>] [--verify \"<command>\"]"
+        "  sinomo evolve iterate <campaign>|--campaign <id> [--dry-run] [--task <task_id>] [--repo <path>] [--provider <provider>] [--model <model>] [--path <glob>] [--verify \"<command>\"] [--benchmark <spec>] [--module-replay-report [name=]<path>]"
     );
     println!(
-        "      Write phase-2 scheduled-iteration handoff artifacts without starting an implementation agent."
+        "      Without --dry-run, dispatch the selected task through the agent mutation worker, verify it, and attach stage/iteration evidence to the campaign."
     );
     println!(
         "  sinomo evolve evaluate <campaign> --job <evojob_...> --task <task_id> [--failure-class <class>] [--root-cause <text>] [--learned <text>] [--usage <resource:estimated[:actual]>]"
@@ -429,7 +449,8 @@ pub(super) fn print_evolve_help() {
     println!(
         "      Write phase-4 background scheduler plan/status/event artifacts and dry-run iteration handoffs without autonomous execution."
     );
-    println!("  sinomo evolve approve [--job evojob_...] [--note <note>]");
+    println!("  sinomo evolve approve [--job evojob_...] [--note <note>] [--override]");
+    println!("      --override requires a non-empty --note and records failed preflight checks.");
     println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve status [--job evojob_...]");
@@ -438,6 +459,10 @@ pub(super) fn print_evolve_help() {
     println!("  sinomo evolve packet [--job evojob_...]");
     println!("  sinomo evolve cleanup [--job evojob_...]");
     println!("  sinomo evolve job create \"<objective>\" [--repo <path>]");
+    println!("  sinomo evolve trusted-signers list [--json] | publish | hydrate");
+    println!(
+        "      Manage registry trusted artifact signers; clustered nodes use cluster KV unless --local is set."
+    );
     println!("  sinomo evolve models ...");
     println!("      Compatibility alias for `sinomo models ...`.");
 }

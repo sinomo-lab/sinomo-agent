@@ -22,6 +22,9 @@ pub enum RolloutError {
     MissingArtifact {
         artifact: String,
     },
+    InvalidTransition {
+        detail: String,
+    },
 }
 
 impl fmt::Display for RolloutError {
@@ -43,8 +46,20 @@ impl fmt::Display for RolloutError {
             Self::MissingArtifact { artifact } => {
                 write!(formatter, "{artifact} has not been written")
             }
+            Self::InvalidTransition { detail } => {
+                write!(formatter, "invalid rollout transition: {detail}")
+            }
         }
     }
 }
 
 impl std::error::Error for RolloutError {}
+
+impl From<sinomo_events::EventStoreError> for RolloutError {
+    fn from(error: sinomo_events::EventStoreError) -> Self {
+        Self::Object {
+            path: "events/event-log.jsonl".to_string(),
+            detail: error.to_string(),
+        }
+    }
+}

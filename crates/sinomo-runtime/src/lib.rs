@@ -57,7 +57,9 @@ pub mod r1 {
             sinomo_network::register_storage_paths(&mut layout)?;
             sinomo_kv::register_storage_paths(&mut layout)?;
             sinomo_daemon::register_storage_paths(&mut layout)?;
+            sinomo_module::register_storage_paths(&mut layout)?;
             sinomo_rollout::register_storage_paths(&mut layout)?;
+            sinomo_registry::register_storage_paths(&mut layout)?;
             sinomo_node::register_storage_paths(&mut layout)?;
             sinomo_dfs::register_storage_paths(&mut layout)?;
             sinomo_sandbox::register_storage_paths(&mut layout)?;
@@ -124,6 +126,15 @@ mod tests {
                 "dfs/metadata/root/records/filesystems/root/object.sobj",
                 "dfs/metadata-replication-cursors/01kr4w089vqgdxpb84t6bq1qxn/root.json",
                 "sandbox/runtime/active.sobj",
+                "sandbox/module-artifacts/artifact_candidate.wasm",
+                "sandbox/module-wasm-artifacts.sobj",
+                "module/loader-state/01kr3d54d45zkm0p0xgps8k7mt.sobj",
+                "module/local-command-artifacts.sobj",
+                "rollout/runtime-state.sobj",
+                "rollout/telemetry-advance-state.sobj",
+                "rollout/telemetry-gates.sobj",
+                "registry/trusted-artifact-signers.json",
+                "registry/candidate-bundles/evojob_verified_candidate.json",
                 "bin/sinomo",
                 "startup/sinomo-daemon.service",
             ])

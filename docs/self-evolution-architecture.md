@@ -2,196 +2,91 @@
 
 ## Purpose
 
-Sinomo should be able to mutate its own live runtime autonomously without bringing down the system. The design below treats self-evolution as controlled live mutation: observe behavior, propose bounded improvements, implement candidates in isolated workspaces, evaluate them against verifiable gates, hot-swap or roll them out module-by-module and node-by-node, and roll back automatically when evidence gets worse.
+Self-evolution is Sinomo's controlled live-mutation loop. The system observes
+runtime behavior, proposes bounded improvements, implements candidates in
+isolated workspaces, evaluates them against replayable evidence, rolls approved
+artifacts out progressively, and rolls back when evidence degrades.
 
-This complements the existing event-centric distributed architecture in [architecture.md](architecture.md). The self-evolution system is another background control plane that consumes events, workspaces, traces, evaluation results, and policy incidents, then emits versioned artifacts and rollout events.
+This document defines the stable architecture and invariants. Implementation
+status, phase tracking, and near-term work belong in
+[plans/self-evolution-implementation-roadmap.md](plans/self-evolution-implementation-roadmap.md).
+The long-horizon campaign layer is described in
+[plans/human-guided-long-horizon-evolution.md](plans/human-guided-long-horizon-evolution.md).
 
-The long-horizon human-guided campaign layer is detailed in [plans/human-guided-long-horizon-evolution.md](plans/human-guided-long-horizon-evolution.md). That plan treats `sinomo evolve propose` as a durable scheduled campaign: a human gives an objective, Sinomo proposes staged evaluation targets and near-term tasks, schedules work around renewable resource budgets, delegates open-ended implementation agents, evaluates candidate bundles, rolls out evidence-backed changes through gates, and adapts failed work into easier or more diagnostic next tasks. Capability notes may be useful evidence records, but the campaign framework must remain flexible enough to drop them, revise its own abstractions, or improve the distributed foundation when the objective exposes deeper blockers.
+Self-evolution complements the event-centric distributed runtime in
+[architecture.md](architecture.md). It is another control plane: it consumes
+events, traces, metrics, workspaces, scorecards, policy decisions, and rollout
+telemetry, then emits candidate bundles, artifacts, desired-state changes, and
+audit events.
 
-## Research Takeaways
+## Design Goals
 
-- WebAssembly is a good default isolation boundary for extension modules because Wasm guests only access host functionality through explicit imports, and WASI adds capability-oriented filesystem access. Wasmtime documents memory isolation, checked control flow, explicit imports/exports, and WASI capability-based filesystem access as core sandbox properties. See [Wasmtime security](https://docs.wasmtime.dev/security.html).
-- The WebAssembly Component Model fits Sinomo's modularity goal because it uses typed interfaces and WIT worlds to define what a component provides and depends on. See [Bytecode Alliance Component Model concepts](https://component-model.bytecodealliance.org/design/component-model-concepts.html).
-- Iterative LLM improvement works best when feedback is grounded. Self-Refine uses generate-feedback-refine loops without model training, while Reflexion stores language reflections from task feedback in memory for later attempts. See [Self-Refine](https://arxiv.org/abs/2303.17651) and [Reflexion](https://arxiv.org/abs/2303.11366).
-- Self-evolving code agents are moving toward generation-verification loops rather than unconstrained rewriting. ReVeal emphasizes iterative generation-verification with tool feedback, and Live-SWE-agent explores runtime scaffold evolution while solving software tasks. See [ReVeal](https://www.microsoft.com/en-us/research/publication/reveal-self-evolving-code-agents-via-reliable-self-verification/) and [Live-SWE-agent](https://huggingface.co/papers/2511.13646).
-- Evaluation must stay fresh and task-relevant. SWE-bench demonstrates reproducible software-agent evaluation with Docker, while OpenAI's 2026 analysis warns that SWE-bench Verified no longer measures frontier coding progress well because of contamination and test issues. Use fixed public benchmarks only as coarse regression signals; Sinomo needs private, rotating, replay-derived evals. See [SWE-bench](https://www.swebench.com/SWE-bench/) and [OpenAI on SWE-bench Verified](https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/).
-- Rollout should borrow from progressive delivery. Kubernetes rolling updates use availability budgets and revisions; Argo Rollouts can abort canaries when analysis fails. Sinomo should apply the same idea at module and node granularity. See [Kubernetes Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) and [Argo canary analysis](https://argo-rollouts.readthedocs.io/en/stable/features/canary/).
-- Artifact integrity matters because an autonomous loop is now part of the supply chain. SLSA provides a framework for provenance and supply-chain integrity, and in-toto attestations define verifiable claims about how software was produced. See [SLSA](https://slsa.dev/) and [in-toto attestations](https://github.com/in-toto/attestation).
-- Policy should be externalized from the mutating code. OPA's policy model decouples policy decisions from enforcement and evaluates structured input against policy as code. Sinomo does not need to adopt OPA immediately, but should use the same separation. See [Open Policy Agent](https://www.openpolicyagent.org/docs).
+- Keep Sinomo running while it changes itself.
+- Make every mutation scoped, replayable, inspectable, and reversible.
+- Let models propose and implement changes, but never grant them direct
+  authority over the live runtime.
+- Prefer R3 sandboxed modules as the first autonomous mutation target.
+- Preserve R0/R1 continuity with standby, handoff, checkpoints, and rollback
+  before any trusted-runtime mutation can activate.
+- Treat evaluation evidence, policy, provenance, and node-local loader checks as
+  the authority for promotion.
 
-## Design Position
+## Non-Goals
 
-The system should not let arbitrary generated code directly overwrite the trusted control plane. Instead, split Sinomo into continuity-aware trust rings where mutation authority belongs to the autonomous evolution, policy, registry, loader, and rollback machinery:
+- No direct in-place patching of trusted running code by a model.
+- No promotion based only on model self-review or generated tests.
+- No weakening of sandbox, policy, registry, or rollback gates to make a
+  candidate easier to ship.
+- No assumption that a public benchmark is sufficient evidence for real
+  improvement.
 
-| Ring | Contents | Evolution rule |
+## Trust Rings
+
+Self-evolution is constrained by trust rings. Lower rings have more continuity
+responsibility and therefore require stronger gates.
+
+| Ring | Contents | Mutation Rule |
 |---|---|---|
-| R0 continuity root | event envelope, ID contracts, artifact verifier, policy verifier, rollback loader, emergency stop | autonomous mutation only through dual-root/standby handoff and strongest gates |
-| R1 trusted runtime | node supervisor, event store, DFS metadata, sandbox host, rollout controller | autonomous live mutation with redundancy, shadowing, local health checks, and rollback |
-| R2 trusted services | perception, memory, trigger, agent, deliberation, action services | autonomous live mutation after strong evaluation |
-| R3 sandboxed modules | skills, tools, evaluators, adapters, prompts, planners, local policies | primary auto-evolution target |
-| R4 disposable workspaces | mutation branches, test sandboxes, generated fixtures, traces | fully automated but isolated |
-| R5 model providers | local or remote LLMs used for proposal, implementation, review, critique | no direct authority; only produce artifacts or judgments |
+| R0 continuity root | event envelope, ID contracts, artifact verifier, policy verifier, rollback loader, emergency stop | Mutate only through dual-root or equivalent standby handoff with strongest continuity gates. |
+| R1 trusted runtime | node supervisor, event store, DFS metadata, sandbox host, rollout controller | Mutate through standby execution, state handoff, health checks, activation checkpoints, and rollback checkpoints. |
+| R2 trusted services | perception, memory, trigger, agent, deliberation, action services | Mutate through strong evaluation, canary, and rollback gates. |
+| R3 sandboxed modules | skills, tools, evaluators, adapters, prompts, planners, local policies | Primary autonomous mutation target. |
+| R4 disposable workspaces | candidate branches, test sandboxes, generated fixtures, traces | Fully automated, isolated, and disposable. |
+| R5 model providers | local or remote LLMs used for proposal, implementation, critique, review | No direct authority; can only produce artifacts or judgments. |
 
-Early self-evolution should prove the full autonomous loop on R3 first while designing R1 for live replacement from day one. R1 mutation should arrive through standby instances, state handoff, activation checkpoints, and rollback rather than direct in-process patching. R0 should stay tiny and continuity-focused so even its future mutation can use a dual-root/standby handoff.
+## Control Plane
 
-## Runtime Components
+The self-evolution control plane is a delivery pipeline.
 
 ```text
-Event Log / Metrics / Incidents / Workspaces
-  -> Evolution Orchestrator
-  -> Candidate Planner
-  -> Mutation Worker Pool
-  -> Sandbox Build + Test Harness
-  -> Evaluation Board
-  -> Policy Gate
-  -> Artifact Registry
-  -> Rollout Controller
-  -> Node-local Module Loaders
+events / metrics / incidents / traces / scorecards
+  -> opportunity detector
+  -> evolution planner
+  -> mutation worker
+  -> build and evaluation harness
+  -> policy gate
+  -> artifact registry
+  -> rollout controller
+  -> node-local loader
+  -> telemetry and rollback
 ```
 
-### `sinomo-evolution`
+Core responsibilities:
 
-Owns the lifecycle of evolution jobs.
+- Detect improvement opportunities from incidents, regressions, replay failures,
+  stale scorecards, and user corrections.
+- Convert each opportunity into a scoped evolution job.
+- Run mutation in an isolated candidate workspace.
+- Preserve complete candidate evidence.
+- Evaluate candidate behavior against fixed and trace-derived gates.
+- Approve or deny promotion through policy.
+- Register approved artifacts with provenance.
+- Roll out by module and node under local policy.
+- Convert failures into rollback, new replay cases, and future opportunities.
 
-Responsibilities:
+## Lifecycle
 
-- Detect improvement opportunities from metrics, incidents, replay failures, user corrections, code TODOs, and stale module scorecards.
-- Create `EvolutionJob` records with strict scope, allowed write set, target module, evaluation suite, and rollback policy.
-- Coordinate proposal, implementation, autonomous review, build, evaluation, policy decision, hot-swap, rollout, rollback, and archival.
-- Emit `evolution.*` events for every state transition.
-
-### `sinomo-registry`
-
-Stores versioned module artifacts and provenance.
-
-Responsibilities:
-
-- Track module manifests, semantic versions, content hashes, signatures, compatibility constraints, and node rollout state.
-- Store in-toto-like attestations for who or what produced the artifact, which source revision was used, which tests ran, and which policies approved it.
-- Expose immutable artifact references to node-local loaders.
-
-### `sinomo-sandbox`
-
-Executes candidate modules and test jobs in constrained environments.
-
-Responsibilities:
-
-- Run Wasm components through Wasmtime for R3 modules.
-- Run non-Wasm build/test jobs in disposable process or container sandboxes until they can be narrowed into Wasm.
-- Enforce CPU, memory, wall-clock, filesystem, network, secret, and device capability limits.
-- Redact terminal control sequences and normalize logs before showing them to LLMs or operators.
-
-### `sinomo-eval`
-
-Owns evaluation definitions and scorecards.
-
-Responsibilities:
-
-- Run static checks, unit tests, integration tests, replay tests, simulation tests, regression suites, red-team probes, and canary analysis.
-- Keep private rotating evals derived from Sinomo's own event traces and failure cases.
-- Prevent candidate-generated tests from being the only gate. LLM-generated tests are useful as evidence, not authority.
-- Produce machine-readable scorecards with pass/fail gates and weighted metrics.
-
-### `sinomo-rollout`
-
-Promotes approved artifacts across modules and nodes.
-
-Responsibilities:
-
-- Support shadow, canary, blue/green, rolling, and immediate rollback strategies.
-- Roll out by module, node role, trust domain, device class, session, or user opt-in group.
-- Keep old versions hot enough for fast rollback.
-- Support live hot-swap with drain, quiesce, activation checkpoint, and rollback checkpoint.
-- Stop promotion when canary analysis, policy incidents, crash rate, latency, or user corrections regress.
-
-## Module Capsule
-
-Every evolvable module should be packaged as a capsule: code artifact plus manifest plus policy plus provenance.
-
-```toml
-[module]
-id = "module.trigger.silence_policy"
-kind = "wasm-component"
-version = "0.3.7"
-api_version = "sinomo-module-v1"
-owner = "sinomo-trigger"
-
-[artifact]
-content_hash = "sha256:..."
-signature = "sigstore-or-local-dev-signature"
-source_workspace = "workspace_repo_sinomo_agent"
-source_revision = "git:..."
-
-[capabilities]
-imports = [
-  "event.read.session",
-  "memory.read.hot",
-  "metrics.emit",
-]
-exports = [
-  "trigger.evaluate",
-]
-
-[limits]
-cpu_ms = 50
-memory_mb = 64
-wall_time_ms = 100
-network = "deny"
-filesystem = "none"
-
-[rollout]
-strategy = "canary"
-initial_weight = 0.05
-promotion_steps = [0.05, 0.25, 0.50, 1.0]
-rollback_on = ["panic", "latency_p95_regression", "policy_incident", "score_regression"]
-```
-
-The manifest is part of the signed artifact. A candidate cannot grant itself new powers by editing code; capability requests are visible manifest changes and must pass policy.
-
-## Component Protocol
-
-R3 modules should converge on Wasm Component Model interfaces. Exact WIT can evolve, but the boundary should be typed and capability-oriented.
-
-```wit
-package sinomo:module-v1;
-
-interface events {
-  record event-ref {
-    event-id: string,
-    kind: string,
-  }
-
-  record event-envelope {
-    event-id: string,
-    origin-node-id: string,
-    session-id: option<string>,
-    kind: string,
-    payload-json: string,
-  }
-}
-
-interface module {
-  record module-context {
-    node-id: string,
-    module-id: string,
-    module-version: string,
-    budget-ms: u64,
-    capabilities-json: string,
-  }
-
-  record module-result {
-    status: string,
-    events-json: list<string>,
-    metrics-json: string,
-  }
-
-  run: func(context: module-context, input-json: string) -> module-result;
-}
-```
-
-Use JSON inside the first WIT boundary only where schemas are still unstable. As contracts settle, promote frequent payloads into typed records.
-
-## Evolution State Machine
+Each candidate moves through a small state machine:
 
 ```text
 observed
@@ -207,7 +102,7 @@ observed
   -> promoted
 ```
 
-Failure paths:
+Failure paths are normal and must preserve evidence:
 
 ```text
 proposed -> rejected
@@ -219,180 +114,142 @@ canary -> rolled-back
 promoted -> reverted
 ```
 
-Each transition appends an event. The event log is the audit trail and the debugging substrate.
+Every state transition appends an event. The event log is both the audit trail
+and the debugging substrate.
 
-## Event Families
+## Candidate Bundle
 
-Add these open event families to the existing event model:
+A candidate bundle is the immutable evidence package for one attempted change.
+It should contain or reference:
 
-- `evolution.opportunity.detected`
-- `evolution.job.scoped`
-- `evolution.proposal.created`
-- `evolution.proposal.reviewed`
-- `evolution.candidate.implemented`
-- `evolution.candidate.built`
-- `evolution.eval.started`
-- `evolution.eval.completed`
-- `evolution.policy.approved`
-- `evolution.policy.denied`
-- `evolution.artifact.registered`
-- `evolution.rollout.started`
-- `evolution.rollout.progressed`
-- `evolution.rollout.paused`
-- `evolution.rollout.promoted`
-- `evolution.rollback.started`
-- `evolution.rollback.completed`
-- `evolution.lesson.recorded`
+- objective and mutation packet,
+- target ring and module,
+- allowed and forbidden edit scope,
+- candidate workspace identity and source revision,
+- model/provider metadata and agent trace,
+- changed files and diff,
+- build logs and command logs,
+- benchmark and replay artifacts,
+- scorecards,
+- resource usage,
+- manifest and capability diffs,
+- policy decision,
+- provenance attestations,
+- rollout material when applicable,
+- recovery and rollback notes.
 
-Example payload:
-
-```json
-{
-  "job_id": "task_01...",
-  "target_module_id": "module.trigger.silence_policy",
-  "target_ring": "r3-sandboxed-module",
-  "scope": {
-    "allowed_paths": ["crates/sinomo-trigger/**", "modules/trigger/**"],
-    "forbidden_paths": ["crates/sinomo-core/**", "docs/security/**"]
-  },
-  "objective": "Reduce false positive interruptions during low-salience screen changes",
-  "baseline": {
-    "scorecard_id": "score_2026_04_24_trigger_baseline",
-    "latency_p95_ms": 41,
-    "false_interrupt_rate": 0.081
-  },
-  "gates": [
-    "cargo-test-workspace",
-    "trigger-replay-private-v3",
-    "latency-no-regression",
-    "policy-no-new-capabilities"
-  ]
-}
-```
+Candidate bundles are supply-chain artifacts. They need stable content hashes,
+attestations, and registry-verifiable provenance. Mutable bookkeeping should not
+invalidate the provenance payload.
 
 ## Mutation Protocol
 
-The mutation protocol is intentionally narrow. A coding LLM receives a mutation packet, not general authority over the repo.
+The mutation worker receives a mutation packet, not general authority over the
+repository or runtime.
 
-Mutation packet:
+A mutation packet includes:
 
-- Target module and ring.
-- Problem statement and objective metric.
-- Allowed files or DFS workspace mount.
-- Forbidden files and capabilities.
-- Relevant traces, incidents, failing evals, and examples.
-- Baseline scorecard.
-- Required verification commands.
-- Output contract: patch, manifest diff, self-review, test notes, risk notes.
+- target ring and module,
+- objective and success criteria,
+- allowed workspace and write set,
+- forbidden paths and capabilities,
+- relevant traces, incidents, examples, and failing evals,
+- baseline scorecard,
+- required verification,
+- output contract and risk notes.
 
-Mutation worker steps:
+Mutation workers must:
 
-1. Create a DFS snapshot or branch workspace.
-2. Generate a proposal before editing.
-3. Apply edits only inside the allowed write set.
-4. Add or update tests when useful.
-5. Run required local checks in a sandbox.
-6. Produce a structured self-review and risk summary.
-7. Emit an immutable candidate bundle.
+1. Work only in the candidate workspace.
+2. Edit only within the allowed scope.
+3. Use available tools under the active sandbox.
+4. Capture tool, command, and model evidence.
+5. Run required checks when practical.
+6. Produce a candidate bundle.
 
-No mutation worker can directly overwrite the live registry or active module loader. Live mutation happens when the autonomous evolution controller publishes a verified desired-state change and each node-local loader accepts, shadows, hot-swaps, rejects, quarantines, or rolls back under local policy.
+Mutation workers must not:
 
-## Debugging Protocol
+- write the live registry,
+- change active loader state,
+- bypass policy,
+- self-approve,
+- directly roll out their own artifact.
 
-Every candidate must be debugged through replayable evidence:
+## Module Capsule
 
-- Build logs and test logs are captured as artifacts.
-- Failed evals attach minimized reproduction inputs when possible.
-- Event replay tests reference event ranges, not opaque screenshots or transcripts alone.
-- LLM reviewers receive reduced traces, relevant code, scorecard deltas, and policy output.
-- Debugging attempts create child candidates rather than rewriting history.
-- Repeated failures produce `evolution.lesson.recorded` events for procedural memory.
+Evolvable runtime behavior should converge on module capsules:
 
-For runtime failures:
+```text
+capsule =
+  executable artifact
+  + manifest
+  + capability declaration
+  + resource limits
+  + compatibility contract
+  + provenance
+  + rollout policy
+```
 
-- The node-local loader emits `module.crash`, `module.timeout`, or `module.policy.blocked`.
-- The rollout controller pauses or rolls back depending on policy.
-- The evaluator creates a replay test from the failing live trace if privacy allows.
+The manifest is part of the signed artifact. A candidate cannot grant itself new
+powers by editing code; capability changes are explicit manifest changes and
+must pass policy.
 
-## Evaluation Gates
+R3 modules should use Wasm components where possible. The first boundary may use
+JSON for unstable payloads, but stable contracts should move toward typed WIT
+records.
 
-Evaluation should be layered from cheap to expensive:
+## Evaluation
 
-| Gate | Purpose | Blocks promotion? |
+Evaluation is layered from cheap local checks to live rollout evidence.
+
+| Gate | Purpose | Blocks Promotion |
 |---|---|---|
 | Manifest validation | schema, capability diff, compatibility | yes |
-| Static checks | formatting, linting, dependency audit, forbidden API scan | yes |
-| Unit tests | local correctness | yes |
-| Integration tests | service boundary correctness | yes |
-| Replay tests | old event traces still behave | yes |
+| Static checks | formatting, linting, dependency and forbidden API scans | yes |
+| Unit and integration tests | local and boundary correctness | yes |
+| Replay tests | old traces and incidents still behave | yes |
 | Private regression evals | prevent overfitting to public benchmarks | yes |
-| Generated adversarial tests | find candidate-specific weaknesses | usually |
+| Public benchmark smoke | coarse harness regression signal | usually |
+| Generated adversarial tests | candidate-specific weakness discovery | usually |
 | Shadow mode | compare candidate decisions without acting | yes for risky modules |
-| Canary analysis | live traffic subset and node subset | yes |
-| Post-promotion audit | delayed regressions and user corrections | triggers revert |
+| Canary analysis | limited live traffic and node subset | yes |
+| Post-promotion audit | delayed regressions and corrections | triggers revert |
 
-Scorecards should include:
+Scorecards should capture:
 
-- correctness pass/fail,
+- pass/fail gates,
+- correctness metrics,
 - latency p50/p95/p99,
-- memory and CPU budget use,
-- action success/failure rates,
+- resource usage,
+- action success and failure rates,
 - sandbox block rate,
 - crash and timeout counts,
 - user correction rate,
 - policy incidents,
 - module-specific quality metrics,
-- confidence interval or sample count.
+- sample count or confidence.
 
-Promotion requires absolute gates plus relative improvement. For example: no new policy incidents, no correctness regression, latency p95 within budget, and at least one target metric improves beyond noise.
+Promotion requires absolute safety gates plus relative improvement or maintained
+quality. A candidate that improves one metric while regressing policy, resource
+usage, or rollback readiness should not promote automatically.
 
-## Rollout and Rollback
+## Policy
 
-Rollout is local-authority-first, matching Sinomo's distributed safety model.
+Policy decisions are made by trusted policy code, not by candidate code.
 
-Rules:
+Policy inputs include:
 
-- A home registry may approve an artifact, but each node decides whether it can load it under local policy.
-- A node keeps the previous stable version until the new version passes local health checks.
-- R3 modules support shadow mode by default when their output can be compared without action.
-- Action-capable modules canary more slowly than pure analysis modules.
-- Mobile, desktop, server, and sensor nodes can have different promotion schedules.
-- A rollback is just a new signed desired-state event pointing back to a known-good artifact.
-
-Rollback triggers:
-
-- build or load failure,
-- module panic,
-- timeout threshold,
-- resource budget violation,
-- new denied capability request,
-- policy incident,
-- canary score regression,
-- operator emergency stop,
-- user correction spike,
-- node health degradation correlated with the rollout.
-
-Rollback events must include the failed artifact, restored artifact, triggering evidence, affected nodes, and whether the rollback is local, session-wide, trust-domain-wide, or global.
-
-## Policy Model
-
-Policy decisions should be made by a trusted policy engine, not by candidate code.
-
-Policy inputs:
-
-- target ring,
-- target module,
-- manifest diff,
-- capability diff,
-- source diff summary,
-- dependency diff,
-- evaluation scorecard,
+- target ring and module,
+- manifest and capability diff,
+- source and dependency diff summary,
+- scorecards,
 - rollout plan,
-- node trust domain,
+- node trust domain and role,
 - module blast radius,
-- recent incidents.
+- recent incidents,
+- requested autonomy level.
 
-Policy outputs:
+Policy outputs include:
 
 - allow, deny, defer, quarantine, require more evidence, or emergency stop,
 - maximum rollout weight,
@@ -401,131 +258,100 @@ Policy outputs:
 - required shadow duration,
 - rollback thresholds.
 
-Default policy:
+Default posture:
 
-- R0 changes require dual-root/standby handoff, strongest replay suites, continuity checks, and emergency rollback.
-- R1 changes require standby execution, state handoff tests, shadow traffic when possible, activation checkpoints, rollback checkpoints, and local node acceptance.
-- R2 changes require strong evaluation, canary machinery, and rollback before broad rollout.
-- R3 changes may auto-promote with passing scorecards, compatible manifests, and acceptable capability diffs.
-- Any new filesystem, network, process, secret, or device capability requires explicit autonomous policy review and additional evidence gates.
-- Any mutation touching policy code, artifact verification, registry trust, rollback logic, or sandbox host code requires redundant evaluation and a staged R1-style live handoff.
+- R0/R1 changes need continuity-specific gates and standby handoff.
+- R2 changes need strong evaluation and canary rollback.
+- R3 changes may auto-promote only when scorecards, manifests, capabilities, and
+  rollout telemetry stay inside policy.
+- New filesystem, network, process, secret, or device capability requests need
+  extra evidence.
+- Changes touching policy, registry trust, artifact verification, rollback, or
+  sandbox host code are treated as high-risk trusted-runtime changes.
+
+## Rollout And Rollback
+
+Rollout is local-authority-first. A registry can approve an artifact, but each
+node decides whether it can load and run that artifact under local policy.
+
+Rollout rules:
+
+- Keep the previous stable artifact available for rollback.
+- Start with shadow mode when candidate output can be compared safely.
+- Canary action-capable modules more slowly than pure analysis modules.
+- Promote independently by module, node role, trust domain, device class, or
+  user/session cohort.
+- Pause or roll back on degraded scorecards, policy incidents, crashes,
+  timeouts, user correction spikes, resource regressions, or node health
+  degradation.
+
+A rollback is a signed desired-state change back to a known-good artifact.
+Rollback events must include the failed artifact, restored artifact, triggering
+evidence, affected scope, and whether rollback was local, session-wide,
+trust-domain-wide, or global.
+
+Disconnected nodes keep running their last stable approved artifact. They may
+apply missed mutations after reconnecting only through the same policy, health,
+compatibility, and rollback checks as online nodes.
 
 ## Distributed Operation
 
-Self-evolution should exploit Sinomo's distributed shape:
+Self-evolution should use the cluster deliberately:
 
-- Workstation nodes run heavy builds, local UI replays, and desktop action simulations.
-- Server nodes run long evals, private benchmark rotation, artifact registry, and provenance storage.
-- Mobile nodes run only modules relevant to their role and can participate in shadow/canary for mobile-specific behavior.
-- Sensor nodes receive conservative updates and mostly run signed stable artifacts.
+- Workstation nodes run heavy local builds, UI replays, and desktop simulations.
+- Server nodes run long evals, private benchmark rotation, registry, and
+  provenance storage.
+- Mobile nodes participate only in relevant mobile shadow/canary paths.
+- Sensor nodes receive conservative stable artifacts.
 
-Node-by-node flow:
+Node-local loaders enforce final authority for artifact compatibility, local
+resource limits, local trust state, and rollback readiness. This keeps a single
+bad approval from forcing every node into the same failure mode.
 
-1. Registry publishes `evolution.rollout.started` with desired artifact and rollout plan.
-2. Candidate nodes check artifact signature, manifest compatibility, local policy, and resource limits.
-3. Nodes load the candidate beside the stable module.
-4. Shadow decisions are emitted as `module.shadow.decision` events.
-5. Canary nodes route a small percentage of eligible work to the candidate.
-6. Rollout controller compares stable and candidate scorecards.
-7. Promotion advances, pauses, or rolls back.
+## Event Families
 
-Disconnected nodes keep running their last stable approved artifact. They may apply missed mutations after reconnecting only through the same policy, health, compatibility, and rollback checks as online nodes.
+The event model should remain open, but these families are foundational:
 
-## Data Model Additions
+- `evolution.opportunity.detected`
+- `evolution.job.scoped`
+- `evolution.proposal.created`
+- `evolution.candidate.implemented`
+- `evolution.eval.started`
+- `evolution.eval.completed`
+- `evolution.policy.approved`
+- `evolution.policy.denied`
+- `evolution.artifact.registered`
+- `evolution.rollout.started`
+- `evolution.rollout.progressed`
+- `evolution.rollout.promoted`
+- `evolution.rollout.paused`
+- `evolution.rollback.started`
+- `evolution.rollback.completed`
+- `evolution.lesson.recorded`
+- `module.shadow.decision`
+- `module.invocation.decision`
+- `module.user.correction`
+- `module.crash`
+- `module.timeout`
+- `module.policy.blocked`
+- `rollout.transition.completed`
 
-Initial R0/R1 types can live in `sinomo-core` as serializable placeholders, then move behavior into R1 service crates. The crate boundary is explicit: every workspace crate declares `[package.metadata.sinomo] ring = "..."`, `sinomo-runtime` aggregates only R0/R1 crates, and architecture tests reject any R0/R1 dependency on R2 service or application crates. R2 evolution services may call into this boundary, but R0/R1 crates must not depend back on model providers, perception, memory, agent, deliberation, action, or CLI/application crates.
+Events should include enough structured evidence to reconstruct why a candidate
+was created, why it was approved or denied, what changed during rollout, and why
+promotion or rollback happened.
 
-```rust
-pub struct ModuleId(String);
-pub struct ArtifactId(String);
-pub struct EvolutionJobId(TaskId);
+## Lessons And Memory
 
-pub struct ModuleManifest {
-    pub module_id: ModuleId,
-    pub version: String,
-    pub kind: ModuleKind,
-    pub api_version: String,
-    pub imports: Vec<CapabilityName>,
-    pub exports: Vec<CapabilityName>,
-    pub limits: ResourceLimits,
-}
+Failed candidates are useful. The system should preserve:
 
-pub struct EvolutionJob {
-    pub job_id: TaskId,
-    pub target_module_id: ModuleId,
-    pub target_ring: TrustRing,
-    pub objective: String,
-    pub status: EvolutionStatus,
-}
+- minimized reproductions,
+- replay fixtures,
+- root cause summaries,
+- failed assumptions,
+- policy denial reasons,
+- rollback evidence,
+- suggested smaller or prerequisite follow-up tasks.
 
-pub struct EvaluationScorecard {
-    pub scorecard_id: String,
-    pub artifact_id: ArtifactId,
-    pub gates: Vec<EvaluationGateResult>,
-    pub metrics: serde_json::Value,
-}
-
-pub struct RolloutPlan {
-    pub artifact_id: ArtifactId,
-    pub strategy: RolloutStrategy,
-    pub target_nodes: Vec<NodeId>,
-    pub rollback_policy: RollbackPolicy,
-}
-```
-
-Use open string-backed IDs if these need to settle before hard prefix decisions.
-
-## MVP Implementation Plan
-
-### Phase SE-0: Documentation and Contracts
-
-- Add this design document.
-- Add `evolution.*` and `module.*` event examples to docs.
-- Add placeholder domain types for module manifests, scorecards, and evolution jobs.
-
-### Phase SE-1: Offline Evolution Harness
-
-- Add `sinomo-eval` with local command-based scorecards.
-- Add private replay fixture format using existing `EventEnvelope`.
-- Add `sinomo-evolution` job records backed by the in-memory event store first.
-- Make candidate generation autonomous but scoped; no candidate can directly apply itself.
-
-### Phase SE-2: Registry and Provenance
-
-- Add artifact registry metadata.
-- Store candidate bundles with content hashes.
-- Add in-toto-style attestation JSON.
-- Add signature verification in the loader path.
-
-### Phase SE-3: Sandboxed R3 Modules
-
-- Add `sinomo-sandbox` with Wasmtime.
-- Define the first WIT module interface for a low-risk module.
-- Convert one policy-like or evaluator-like module to a Wasm component.
-- Run it in shadow mode against replay traces.
-
-### Phase SE-4: Progressive Rollout
-
-- Add rollout desired-state records and node-local loader state.
-- Support shadow and canary for one module family.
-- Implement automatic rollback on timeout, panic, score regression, or policy incident.
-
-### Phase SE-5: Autonomous Live Mutation Loop
-
-- Allow the evolution orchestrator to open candidate jobs from metrics and incidents.
-- Keep implementation and promotion autonomous but evidence-gated.
-- Require stronger autonomous gates for new capabilities, R2 changes, and policy-sensitive diffs.
-- Add guarded R1 trials using standby instances, state handoff, activation checkpoints, and automatic rollback.
-
-## Near-Term Recommendation
-
-Start with R3 modules and private replay evals, but exercise the same live-mutation path that R1 will eventually use. The first useful demo should be:
-
-1. A low-risk trigger or evaluator module packaged as a Wasm component.
-2. A replay suite built from synthetic or captured `EventEnvelope` fixtures.
-3. A mutation job that improves the module or its prompt/config.
-4. A scorecard showing baseline versus candidate.
-5. Shadow rollout and hot-swap on one local node.
-6. Automatic rollback when an intentionally bad candidate is introduced.
-
-That proves the core live-mutation mechanism on a low-risk target before applying the same autonomous path to R1 foundation components.
+Repeated failures should create procedural memory and future evaluation gates.
+Self-evolution should improve both runtime behavior and its own ability to
+debug, evaluate, and schedule future attempts.

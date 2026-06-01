@@ -80,7 +80,8 @@ pub use control::{
     handle_daemon_sandbox_status, handle_daemon_sandbox_toolchain_add_artifact,
     handle_daemon_sandbox_toolchain_add_command, handle_daemon_sandbox_toolchain_import_package,
     handle_daemon_sandbox_update, handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service,
-    run_daemon_control_loop, write_daemon_rpc_response_frame,
+    run_daemon_control_loop, run_daemon_module_rollout_desired_reconciliation_tick,
+    run_daemon_rollout_telemetry_maintenance_tick, write_daemon_rpc_response_frame,
 };
 pub use dfs::{
     DaemonDfsEndpointTransport, DaemonDfsMetadataReplicationOutcome,

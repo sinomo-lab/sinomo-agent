@@ -1,0 +1,38 @@
+package sinomo:module-v1;
+
+interface events {
+  record event-ref {
+    event-id: string,
+    kind: string,
+  }
+
+  record event-envelope {
+    event-id: string,
+    origin-node-id: string,
+    session-id: option<string>,
+    kind: string,
+    payload-json: string,
+  }
+}
+
+interface module {
+  record module-context {
+    node-id: string,
+    module-id: string,
+    module-version: string,
+    budget-ms: u64,
+    capabilities-json: string,
+  }
+
+  record module-result {
+    status: string,
+    events-json: list<string>,
+    metrics-json: string,
+  }
+
+  run: func(context: module-context, input-json: string) -> module-result;
+}
+
+world sinomo-module-v1 {
+  export module;
+}

@@ -218,6 +218,14 @@ impl From<sinomo_events::EventStoreError> for DaemonError {
     }
 }
 
+impl From<sinomo_registry::RegistryError> for DaemonError {
+    fn from(error: sinomo_registry::RegistryError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl From<sinomo_rollout::RolloutError> for DaemonError {
     fn from(error: sinomo_rollout::RolloutError) -> Self {
         Self::Io {

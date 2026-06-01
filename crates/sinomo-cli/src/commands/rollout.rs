@@ -9,6 +9,9 @@ pub(crate) enum RolloutCliCommand {
     ApplyExternal(RolloutOptions),
     Apply(RolloutOptions),
     Cluster(RolloutOptions),
+    Advance(RolloutAdvanceOptions),
+    TelemetryGatesShow,
+    TelemetryGatesSet(RolloutTelemetryGateSetOptions),
     Diagnostics(RolloutOptions),
     Status,
 }
@@ -40,6 +43,27 @@ impl Default for RolloutOptions {
             remote_build: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub(crate) struct RolloutAdvanceOptions {
+    pub(crate) node_id: Option<NodeId>,
+    pub(crate) scorecard: Option<PathBuf>,
+    pub(crate) module_replay_report: Option<PathBuf>,
+    pub(crate) shadow_telemetry_limit: Option<usize>,
+    pub(crate) incident_event_ids: Vec<EventId>,
+    pub(crate) user_correction_count: u32,
+    pub(crate) rollback_triggers: Vec<RollbackTrigger>,
+    pub(crate) evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub(crate) struct RolloutTelemetryGateSetOptions {
+    pub(crate) automatic_promotion_enabled: Option<bool>,
+    pub(crate) event_limit: Option<usize>,
+    pub(crate) minimum_event_count: Option<u64>,
+    pub(crate) maximum_automatic_weight_bps: Option<Option<u16>>,
+    pub(crate) maximum_candidate_latency_p95_ms: Option<Option<u64>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -120,6 +144,14 @@ pub(crate) fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand
         Some((command, rest)) if matches!(command.as_str(), "cluster" | "apply-cluster") => {
             Ok(RolloutCliCommand::Cluster(parse_rollout_options(rest)?))
         }
+        Some((command, rest)) if command == "advance" => Ok(RolloutCliCommand::Advance(
+            parse_rollout_advance_options(rest)?,
+        )),
+        Some((command, rest))
+            if matches!(command.as_str(), "telemetry-gates" | "telemetry-gate") =>
+        {
+            parse_rollout_telemetry_gates_command(rest)
+        }
         Some((command, rest)) if matches!(command.as_str(), "diagnostics" | "diag") => {
             Ok(RolloutCliCommand::Diagnostics(parse_rollout_options(rest)?))
         }
@@ -195,6 +227,248 @@ pub(crate) fn parse_rollout_options(args: &[String]) -> Result<RolloutOptions, C
     Ok(options)
 }
 
+pub(crate) fn parse_rollout_advance_options(
+    args: &[String],
+) -> Result<RolloutAdvanceOptions, CliError> {
+    let mut options = RolloutAdvanceOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--node" | "--node-id" => {
+                index += 1;
+                let Some(node_id) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.node_id = Some(parse_rollout_node_id(node_id)?);
+            }
+            "--scorecard" => {
+                index += 1;
+                let Some(scorecard) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.scorecard = Some(PathBuf::from(scorecard));
+            }
+            "--module-replay-report" => {
+                index += 1;
+                let Some(report) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.module_replay_report = Some(PathBuf::from(report));
+            }
+            "--shadow-telemetry" => {
+                options
+                    .shadow_telemetry_limit
+                    .get_or_insert(DEFAULT_SHADOW_TELEMETRY_LIMIT);
+            }
+            "--shadow-telemetry-limit" => {
+                index += 1;
+                let Some(limit) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                let limit = limit.parse::<usize>().map_err(|source| CliError::Parse {
+                    detail: format!("invalid rollout shadow telemetry limit `{limit}`: {source}"),
+                })?;
+                if limit == 0 {
+                    return Err(CliError::Parse {
+                        detail: "rollout shadow telemetry limit must be non-zero".to_string(),
+                    });
+                }
+                options.shadow_telemetry_limit = Some(limit);
+            }
+            "--incident" | "--incident-event" => {
+                index += 1;
+                let Some(event_id) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options
+                    .incident_event_ids
+                    .push(parse_rollout_event_id(event_id)?);
+            }
+            "--user-corrections" | "--user-correction-count" => {
+                index += 1;
+                let Some(count) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.user_correction_count =
+                    count.parse::<u32>().map_err(|source| CliError::Parse {
+                        detail: format!("invalid user correction count `{count}`: {source}"),
+                    })?;
+            }
+            "--rollback-trigger" => {
+                index += 1;
+                let Some(trigger) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options
+                    .rollback_triggers
+                    .push(parse_rollout_rollback_trigger(trigger)?);
+            }
+            "--evidence" => {
+                index += 1;
+                let Some(reference) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                if reference.trim().is_empty() {
+                    return Err(CliError::Parse {
+                        detail: "rollout evidence reference cannot be empty".to_string(),
+                    });
+                }
+                options.evidence_refs.push(reference.clone());
+            }
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+pub(crate) fn parse_rollout_telemetry_gates_command(
+    args: &[String],
+) -> Result<RolloutCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(RolloutCliCommand::TelemetryGatesShow),
+        Some((command, [])) if command == "show" => Ok(RolloutCliCommand::TelemetryGatesShow),
+        Some((command, rest)) if command == "set" => Ok(RolloutCliCommand::TelemetryGatesSet(
+            parse_rollout_telemetry_gate_set_options(rest)?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_rollout_telemetry_gate_set_options(
+    args: &[String],
+) -> Result<RolloutTelemetryGateSetOptions, CliError> {
+    let mut options = RolloutTelemetryGateSetOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--enable-auto-promotion" => {
+                options.automatic_promotion_enabled = Some(true);
+            }
+            "--disable-auto-promotion" => {
+                options.automatic_promotion_enabled = Some(false);
+            }
+            "--event-limit" => {
+                index += 1;
+                let Some(limit) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                let limit = parse_nonzero_usize("rollout telemetry event limit", limit)?;
+                options.event_limit = Some(limit);
+            }
+            "--min-events" | "--minimum-event-count" => {
+                index += 1;
+                let Some(count) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                let count = count.parse::<u64>().map_err(|source| CliError::Parse {
+                    detail: format!(
+                        "invalid rollout telemetry minimum event count `{count}`: {source}"
+                    ),
+                })?;
+                if count == 0 {
+                    return Err(CliError::Parse {
+                        detail: "rollout telemetry minimum event count must be non-zero"
+                            .to_string(),
+                    });
+                }
+                options.minimum_event_count = Some(count);
+            }
+            "--max-auto-weight-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.maximum_automatic_weight_bps = Some(parse_optional_bps(value)?);
+            }
+            "--max-candidate-latency-p95-ms" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.maximum_candidate_latency_p95_ms =
+                    Some(parse_optional_u64("candidate latency p95", value)?);
+            }
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_nonzero_usize(label: &str, value: &str) -> Result<usize, CliError> {
+    let value = value.parse::<usize>().map_err(|source| CliError::Parse {
+        detail: format!("invalid {label} `{value}`: {source}"),
+    })?;
+    if value == 0 {
+        return Err(CliError::Parse {
+            detail: format!("{label} must be non-zero"),
+        });
+    }
+    Ok(value)
+}
+
+fn parse_optional_bps(value: &str) -> Result<Option<u16>, CliError> {
+    if matches!(value, "none" | "off" | "unlimited") {
+        return Ok(None);
+    }
+    let weight = value.parse::<u16>().map_err(|source| CliError::Parse {
+        detail: format!("invalid rollout telemetry max automatic weight `{value}`: {source}"),
+    })?;
+    if weight > 10_000 {
+        return Err(CliError::Parse {
+            detail: "rollout telemetry max automatic weight must be <= 10000 bps".to_string(),
+        });
+    }
+    Ok(Some(weight))
+}
+
+fn parse_optional_u64(label: &str, value: &str) -> Result<Option<u64>, CliError> {
+    if matches!(value, "none" | "off" | "unlimited") {
+        return Ok(None);
+    }
+    let parsed = value.parse::<u64>().map_err(|source| CliError::Parse {
+        detail: format!("invalid rollout telemetry {label} `{value}`: {source}"),
+    })?;
+    if parsed == 0 {
+        return Err(CliError::Parse {
+            detail: format!("rollout telemetry {label} must be non-zero"),
+        });
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_rollout_node_id(value: &str) -> Result<NodeId, CliError> {
+    NodeId::new(value.to_string()).map_err(|source| CliError::Parse {
+        detail: format!("invalid rollout node id `{value}`: {source}"),
+    })
+}
+
+fn parse_rollout_event_id(value: &str) -> Result<EventId, CliError> {
+    EventId::new(value.to_string()).map_err(|source| CliError::Parse {
+        detail: format!("invalid rollout incident event id `{value}`: {source}"),
+    })
+}
+
+fn parse_rollout_rollback_trigger(value: &str) -> Result<RollbackTrigger, CliError> {
+    match value {
+        "build-failure" => Ok(RollbackTrigger::BuildFailure),
+        "load-failure" => Ok(RollbackTrigger::LoadFailure),
+        "panic" => Ok(RollbackTrigger::Panic),
+        "timeout" => Ok(RollbackTrigger::Timeout),
+        "resource-budget-violation" => Ok(RollbackTrigger::ResourceBudgetViolation),
+        "new-denied-capability-request" => Ok(RollbackTrigger::NewDeniedCapabilityRequest),
+        "policy-incident" => Ok(RollbackTrigger::PolicyIncident),
+        "score-regression" => Ok(RollbackTrigger::ScoreRegression),
+        "emergency-stop" => Ok(RollbackTrigger::EmergencyStop),
+        "user-correction-spike" => Ok(RollbackTrigger::UserCorrectionSpike),
+        "node-health-degradation" => Ok(RollbackTrigger::NodeHealthDegradation),
+        _ => Err(CliError::Parse {
+            detail: format!("invalid rollback trigger `{value}`"),
+        }),
+    }
+}
+
 pub(crate) fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), CliError> {
     match command {
         RolloutCliCommand::Help => {
@@ -207,6 +481,9 @@ pub(crate) fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), 
         RolloutCliCommand::ApplyExternal(options) => rollout_apply_external(options),
         RolloutCliCommand::Apply(options) => rollout_apply(options),
         RolloutCliCommand::Cluster(options) => rollout_cluster(options),
+        RolloutCliCommand::Advance(options) => rollout_advance(options),
+        RolloutCliCommand::TelemetryGatesShow => rollout_telemetry_gates_show(),
+        RolloutCliCommand::TelemetryGatesSet(options) => rollout_telemetry_gates_set(options),
         RolloutCliCommand::Diagnostics(options) => rollout_diagnostics(options),
         RolloutCliCommand::Status => rollout_status(),
     }
@@ -256,6 +533,265 @@ pub(crate) fn rollout_apply_external(options: RolloutOptions) -> Result<(), CliE
     let mut apply_options = options;
     apply_options.repo = None;
     rollout_apply(apply_options)
+}
+
+pub(crate) fn rollout_advance(options: RolloutAdvanceOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let applied = rollout_advance_with_data_dir(&data_dir, options)?;
+    println!("rollout action: {:?}", applied.transition.action);
+    println!("stage: {:?}", applied.transition.stage);
+    println!("weight bps: {}", applied.transition.current_weight_bps);
+    println!("record: {}", applied.transition_path.display());
+    println!("module state: {}", applied.module_state_path.display());
+    Ok(())
+}
+
+pub(crate) fn rollout_advance_with_data_dir(
+    data_dir: &SinomoDataDir,
+    options: RolloutAdvanceOptions,
+) -> Result<AppliedRolloutTransition, CliError> {
+    data_dir.ensure_root_layout()?;
+    let paths = SelfRolloutPaths::new(&data_dir.root());
+    let node_id = resolve_rollout_controller_node_id(data_dir, options.node_id.clone())?;
+    let runtime_state =
+        if options.module_replay_report.is_some() || options.shadow_telemetry_limit.is_some() {
+            read_rollout_runtime_state(&paths).map_err(CliError::from)?
+        } else {
+            None
+        };
+    let data_dir_root = data_dir.root();
+    let (observation, evidence_refs) =
+        rollout_observation_from_advance_options(&data_dir_root, options, runtime_state.as_ref())?;
+    let controller = RolloutController::new(node_id);
+    let recorded = controller
+        .advance_recorded_rollout(&paths, observation, evidence_refs)
+        .map_err(CliError::from)?;
+    controller
+        .apply_recorded_transition(data_dir.root(), &recorded)
+        .map_err(Into::into)
+}
+
+pub(crate) fn rollout_telemetry_gates_show() -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = SelfRolloutPaths::new(&data_dir.root());
+    let config = read_rollout_telemetry_gate_config(&paths)?.unwrap_or_default();
+    println!(
+        "automatic promotion: {}",
+        config.automatic_promotion_enabled
+    );
+    println!("event limit: {}", config.event_limit);
+    println!("minimum events: {}", config.minimum_event_count);
+    println!(
+        "max automatic weight bps: {}",
+        config
+            .maximum_automatic_weight_bps
+            .map(|weight| weight.to_string())
+            .unwrap_or_else(|| "unlimited".to_string())
+    );
+    println!(
+        "max candidate latency p95 ms: {}",
+        config
+            .maximum_candidate_latency_p95_ms
+            .map(|latency| latency.to_string())
+            .unwrap_or_else(|| "unlimited".to_string())
+    );
+    Ok(())
+}
+
+pub(crate) fn rollout_telemetry_gates_set(
+    options: RolloutTelemetryGateSetOptions,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let config = rollout_telemetry_gates_set_with_data_dir(&data_dir, options)?;
+    println!("rollout telemetry gates updated");
+    println!(
+        "automatic promotion: {}",
+        config.automatic_promotion_enabled
+    );
+    println!("event limit: {}", config.event_limit);
+    println!("minimum events: {}", config.minimum_event_count);
+    println!(
+        "max automatic weight bps: {}",
+        config
+            .maximum_automatic_weight_bps
+            .map(|weight| weight.to_string())
+            .unwrap_or_else(|| "unlimited".to_string())
+    );
+    println!(
+        "max candidate latency p95 ms: {}",
+        config
+            .maximum_candidate_latency_p95_ms
+            .map(|latency| latency.to_string())
+            .unwrap_or_else(|| "unlimited".to_string())
+    );
+    Ok(())
+}
+
+pub(crate) fn rollout_telemetry_gates_set_with_data_dir(
+    data_dir: &SinomoDataDir,
+    options: RolloutTelemetryGateSetOptions,
+) -> Result<RolloutTelemetryGateConfig, CliError> {
+    data_dir.ensure_root_layout()?;
+    let paths = SelfRolloutPaths::new(&data_dir.root());
+    let mut config = read_rollout_telemetry_gate_config(&paths)?.unwrap_or_default();
+    if let Some(enabled) = options.automatic_promotion_enabled {
+        config.automatic_promotion_enabled = enabled;
+    }
+    if let Some(limit) = options.event_limit {
+        config.event_limit = limit;
+    }
+    if let Some(count) = options.minimum_event_count {
+        config.minimum_event_count = count;
+    }
+    if let Some(maximum_weight) = options.maximum_automatic_weight_bps {
+        config.maximum_automatic_weight_bps = maximum_weight;
+    }
+    if let Some(maximum_latency) = options.maximum_candidate_latency_p95_ms {
+        config.maximum_candidate_latency_p95_ms = maximum_latency;
+    }
+    write_rollout_telemetry_gate_config(&paths, &config)?;
+    Ok(config)
+}
+
+fn rollout_observation_from_advance_options(
+    data_dir_root: &Path,
+    options: RolloutAdvanceOptions,
+    runtime_state: Option<&RolloutRuntimeState>,
+) -> Result<(RolloutObservation, Vec<String>), CliError> {
+    let RolloutAdvanceOptions {
+        node_id: _,
+        scorecard,
+        module_replay_report,
+        shadow_telemetry_limit,
+        incident_event_ids,
+        user_correction_count,
+        rollback_triggers,
+        mut evidence_refs,
+    } = options;
+    let evidence_source_count = usize::from(scorecard.is_some())
+        + usize::from(module_replay_report.is_some())
+        + usize::from(shadow_telemetry_limit.is_some());
+    if evidence_source_count > 1 {
+        return Err(CliError::Parse {
+            detail: "rollout advance accepts only one of --scorecard, --module-replay-report, or --shadow-telemetry".to_string(),
+        });
+    }
+    let scorecard = if let Some(path) = scorecard {
+        evidence_refs.push(format!("scorecard:{}", path.display()));
+        Some(read_rollout_scorecard(&path)?)
+    } else if let Some(path) = module_replay_report {
+        evidence_refs.push(format!("module-replay-report:{}", path.display()));
+        Some(read_rollout_module_replay_scorecard(&path, runtime_state)?)
+    } else if let Some(limit) = shadow_telemetry_limit {
+        evidence_refs.push(format!(
+            "module-shadow-telemetry:events/event-log.jsonl?limit={limit}"
+        ));
+        Some(read_rollout_shadow_telemetry_scorecard(
+            data_dir_root,
+            limit,
+            runtime_state,
+        )?)
+    } else {
+        None
+    };
+    Ok((
+        RolloutObservation {
+            scorecard,
+            incident_event_ids,
+            user_correction_count,
+            rollback_triggers,
+        },
+        evidence_refs,
+    ))
+}
+
+fn read_rollout_scorecard(path: &Path) -> Result<EvaluationScorecard, CliError> {
+    let content = fs::read_to_string(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn read_rollout_module_replay_scorecard(
+    path: &Path,
+    runtime_state: Option<&RolloutRuntimeState>,
+) -> Result<EvaluationScorecard, CliError> {
+    let content = fs::read_to_string(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let report: ModuleReplayReport =
+        serde_json::from_str(&content).map_err(|source| CliError::Json {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if let Some(state) = runtime_state
+        && report.module_id != state.plan.module_id
+    {
+        return Err(CliError::Parse {
+            detail: format!(
+                "module replay report {} targets module {}, but rollout state targets {}",
+                path.display(),
+                report.module_id,
+                state.plan.module_id
+            ),
+        });
+    }
+
+    let baseline_artifact_id =
+        runtime_state.map(|state| state.loader_state.active_artifact_id.clone());
+    let candidate_artifact_id = runtime_state.and_then(|state| {
+        state
+            .loader_state
+            .candidate_artifact_id
+            .clone()
+            .or_else(|| state.loader_state.shadow_artifact_id.clone())
+            .or_else(|| Some(state.plan.artifact_id.clone()))
+    });
+    Ok(report.scorecard(baseline_artifact_id, candidate_artifact_id))
+}
+
+fn read_rollout_shadow_telemetry_scorecard(
+    data_dir_root: &Path,
+    limit: usize,
+    runtime_state: Option<&RolloutRuntimeState>,
+) -> Result<EvaluationScorecard, CliError> {
+    let state = runtime_state.ok_or_else(|| CliError::Parse {
+        detail: "rollout shadow telemetry requires persisted rollout runtime state".to_string(),
+    })?;
+    let event_store = JsonlEventStore::new(data_dir_root.join("events").join("event-log.jsonl"));
+    Ok(shadow_telemetry_scorecard_from_event_store(
+        state,
+        &event_store,
+        limit,
+    )?)
+}
+
+fn resolve_rollout_controller_node_id(
+    data_dir: &SinomoDataDir,
+    explicit_node_id: Option<NodeId>,
+) -> Result<NodeId, CliError> {
+    if let Some(node_id) = explicit_node_id {
+        return Ok(node_id);
+    }
+    if let Some(status) = daemon_default_main_daemon_status(DAEMON_PROBE_TIMEOUT)?
+        && let Some(cluster) = status.cluster
+    {
+        return Ok(cluster.node_id);
+    }
+    let cluster_paths = ClusterPaths::new(data_dir);
+    if let Ok(state) = daemon_read_local_cluster_state(&cluster_paths) {
+        return Ok(state.local_node_id);
+    }
+    let identity = load_or_create_main_node_identity(&data_dir.root())?;
+    Ok(NodeId::derived(
+        "sinomo.rollout.local-node",
+        identity.public_key.as_bytes(),
+    ))
 }
 
 pub(crate) fn rollout_status() -> Result<(), CliError> {

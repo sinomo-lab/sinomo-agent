@@ -3,17 +3,19 @@
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
     Confidence, EvaluationGate, EvaluationGateResult, EvaluationMetric, EvaluationOutcome,
-    EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass, MetricValue, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, Source, VerificationCommand, VerificationPlan,
+    EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass, MetricValue,
+    ModuleReplayReportRef, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
+    VerificationCommand, VerificationPlan,
 };
 use sinomo_events::{EventId, ReplayQuery};
-use sinomo_module::ArtifactId;
+use sinomo_module::{ArtifactId, ModuleReplayReport};
 use sinomo_node::NodeId;
 use sinomo_rollout::ScorecardId;
 use std::{
     collections::BTreeMap,
+    fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -592,26 +594,27 @@ impl<R: CommandRunner> ExecutingEvalHarness<R> {
         plan: VerificationPlan,
         cwd: &Path,
     ) -> Result<(EvaluationScorecard, Vec<CommandRunResult>), EvalError> {
-        if plan.commands.is_empty() {
+        if plan.commands.is_empty() && plan.module_replay_reports.is_empty() {
             return Err(EvalError::EmptyVerificationPlan);
         }
 
-        let mut gates = Vec::with_capacity(plan.commands.len());
+        let mut gates =
+            Vec::with_capacity(plan.commands.len() + plan.module_replay_reports.len() * 2);
         let mut results = Vec::with_capacity(plan.commands.len());
-        let mut passed = 0;
+        let mut outcome = EvaluationOutcome::Passed;
 
         for command in &plan.commands {
             let result = self.runner.run(command, cwd)?;
-            let outcome = if result.passed() {
-                passed += 1;
+            let command_outcome = if result.passed() {
                 EvaluationOutcome::Passed
             } else {
                 EvaluationOutcome::Failed
             };
+            merge_outcome(&mut outcome, &command_outcome);
 
             gates.push(EvaluationGateResult {
                 gate: command.gate.clone(),
-                outcome,
+                outcome: command_outcome,
                 summary: format!(
                     "`{}` exited {}, expected {} in {}ms",
                     command.command,
@@ -623,12 +626,50 @@ impl<R: CommandRunner> ExecutingEvalHarness<R> {
             results.push(result);
         }
 
-        let outcome = if passed == results.len() {
-            EvaluationOutcome::Passed
-        } else {
-            EvaluationOutcome::Failed
-        };
+        let mut module_replay_metrics = Vec::new();
+        for report_ref in &plan.module_replay_reports {
+            let report = read_module_replay_report(cwd, report_ref)?;
+            let replay_scorecard = report.scorecard(
+                report_ref.baseline_artifact_id.clone(),
+                report_ref.candidate_artifact_id.clone(),
+            );
+            merge_outcome(&mut outcome, &replay_scorecard.outcome);
+            gates.extend(
+                replay_scorecard
+                    .gates
+                    .into_iter()
+                    .map(|gate| EvaluationGateResult {
+                        gate: gate.gate,
+                        outcome: gate.outcome,
+                        summary: format!(
+                            "module replay `{}` from `{}`: {}",
+                            report_ref.name, report_ref.report_path, gate.summary
+                        ),
+                    }),
+            );
+            module_replay_metrics.extend(replay_scorecard.metrics);
+        }
         let total_duration_ms = results.iter().map(|result| result.duration_ms).sum::<u64>();
+        let mut metrics = vec![
+            EvaluationMetric {
+                name: "command_count".to_string(),
+                value: MetricValue::Integer(results.len() as i64),
+                sample_count: Some(results.len() as u64),
+            },
+            EvaluationMetric {
+                name: "command_duration_ms".to_string(),
+                value: MetricValue::Integer(total_duration_ms as i64),
+                sample_count: Some(results.len() as u64),
+            },
+        ];
+        if !plan.module_replay_reports.is_empty() {
+            metrics.push(EvaluationMetric {
+                name: "module_replay_report_count".to_string(),
+                value: MetricValue::Integer(plan.module_replay_reports.len() as i64),
+                sample_count: Some(plan.module_replay_reports.len() as u64),
+            });
+            metrics.extend(module_replay_metrics);
+        }
 
         Ok((
             EvaluationScorecard {
@@ -637,21 +678,46 @@ impl<R: CommandRunner> ExecutingEvalHarness<R> {
                 candidate_artifact_id: None,
                 outcome,
                 gates,
-                metrics: vec![
-                    EvaluationMetric {
-                        name: "command_count".to_string(),
-                        value: MetricValue::Integer(results.len() as i64),
-                        sample_count: Some(results.len() as u64),
-                    },
-                    EvaluationMetric {
-                        name: "command_duration_ms".to_string(),
-                        value: MetricValue::Integer(total_duration_ms as i64),
-                        sample_count: Some(results.len() as u64),
-                    },
-                ],
+                metrics,
             },
             results,
         ))
+    }
+}
+
+fn read_module_replay_report(
+    cwd: &Path,
+    report_ref: &ModuleReplayReportRef,
+) -> Result<ModuleReplayReport, EvalError> {
+    let path = resolve_verification_path(cwd, &report_ref.report_path);
+    let content =
+        fs::read_to_string(&path).map_err(|source| EvalError::ModuleReplayReportRead {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    serde_json::from_str(&content).map_err(|source| EvalError::ModuleReplayReportParse {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn resolve_verification_path(cwd: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn merge_outcome(current: &mut EvaluationOutcome, next: &EvaluationOutcome) {
+    match (&*current, next) {
+        (EvaluationOutcome::Failed, _) | (_, EvaluationOutcome::Passed) => {}
+        (_, EvaluationOutcome::Failed) => *current = EvaluationOutcome::Failed,
+        (EvaluationOutcome::Passed, EvaluationOutcome::Inconclusive) => {
+            *current = EvaluationOutcome::Inconclusive;
+        }
+        (EvaluationOutcome::Inconclusive, EvaluationOutcome::Inconclusive) => {}
     }
 }
 
@@ -751,8 +817,12 @@ impl LocalEvalHarness {
 pub enum EvalError {
     #[error("evaluation suite must contain at least one command spec")]
     EmptySuite,
-    #[error("verification plan must contain at least one command")]
+    #[error("verification plan must contain at least one command or module replay report")]
     EmptyVerificationPlan,
+    #[error("failed to read module replay report `{path}`: {detail}")]
+    ModuleReplayReportRead { path: String, detail: String },
+    #[error("failed to parse module replay report `{path}`: {detail}")]
+    ModuleReplayReportParse { path: String, detail: String },
     #[error("failed to spawn command `{command}`: {message}")]
     CommandSpawnFailed { command: String, message: String },
     #[error("failed to wait for command `{command}`: {message}")]
@@ -824,6 +894,7 @@ mod tests {
             .run_verification_plan(
                 VerificationPlan {
                     commands: vec![verification_command("success", success_command(), 0)],
+                    module_replay_reports: Vec::new(),
                 },
                 &env::current_dir().expect("cwd"),
             )
@@ -841,6 +912,7 @@ mod tests {
             .run_verification_plan(
                 VerificationPlan {
                     commands: vec![verification_command("failure", failure_command(), 0)],
+                    module_replay_reports: Vec::new(),
                 },
                 &env::current_dir().expect("cwd"),
             )
@@ -852,12 +924,68 @@ mod tests {
     }
 
     #[test]
+    fn executing_harness_ingests_module_replay_report() {
+        let root = temp_dir("module-replay-report");
+        fs::create_dir_all(&root).expect("temp dir");
+        let report_path = root.join("module-replay-report.json");
+        let report = ModuleReplayReport {
+            fixture_id: Id::from_legacy_named("fixture_module_replay").expect("fixture"),
+            module_id: Id::from_legacy_named("module_trigger").expect("module"),
+            cases: vec![sinomo_module::ModuleReplayCaseOutcome {
+                case_id: "case-1".to_string(),
+                route_key: "case-1".to_string(),
+                source_event_id: None,
+                outcome: None,
+                shadow_matched: Some(true),
+            }],
+            replay_event_count: 1,
+            missing_route_count: 0,
+            primary_error_count: 0,
+            shadow_error_count: 0,
+            shadow_mismatch_count: 0,
+            events: Vec::new(),
+        };
+        fs::write(
+            &report_path,
+            serde_json::to_string_pretty(&report).expect("report json"),
+        )
+        .expect("write report");
+
+        let harness = ExecutingEvalHarness::new(LocalCommandRunner::new());
+        let (scorecard, results) = harness
+            .run_verification_plan(
+                VerificationPlan {
+                    commands: Vec::new(),
+                    module_replay_reports: vec![ModuleReplayReportRef {
+                        name: "trigger replay".to_string(),
+                        report_path: "module-replay-report.json".to_string(),
+                        baseline_artifact_id: None,
+                        candidate_artifact_id: None,
+                    }],
+                },
+                &root,
+            )
+            .expect("verification plan");
+
+        assert!(results.is_empty());
+        assert_eq!(scorecard.outcome, EvaluationOutcome::Passed);
+        assert!(scorecard.gates.iter().any(|gate| {
+            gate.gate == EvaluationGate::ReplayTests
+                && gate.summary.contains("module replay `trigger replay`")
+        }));
+        assert!(scorecard.metrics.iter().any(|metric| {
+            metric.name == "module_replay_report_count" && metric.value == MetricValue::Integer(1)
+        }));
+    }
+
+    #[test]
     fn local_command_runner_captures_stdout_and_stderr() {
         let harness = ExecutingEvalHarness::new(LocalCommandRunner::new());
         let (_scorecard, results) = harness
             .run_verification_plan(
                 VerificationPlan {
                     commands: vec![verification_command("output", output_command(), 0)],
+                    module_replay_reports: Vec::new(),
                 },
                 &env::current_dir().expect("cwd"),
             )
@@ -1034,5 +1162,13 @@ mod tests {
     #[cfg(not(windows))]
     fn output_command() -> String {
         "printf 'sinomo-stdout\\n'; printf 'sinomo-stderr\\n' >&2".to_string()
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .abs()
+            .to_string();
+        env::temp_dir().join(format!("sinomo-eval-{name}-{stamp}"))
     }
 }

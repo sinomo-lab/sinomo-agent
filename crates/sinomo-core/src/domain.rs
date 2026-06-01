@@ -527,6 +527,8 @@ pub struct EvolutionScope {
 pub struct VerificationPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<VerificationCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_replay_reports: Vec<ModuleReplayReportRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -535,6 +537,16 @@ pub struct VerificationCommand {
     pub command: String,
     pub expected_exit_code: i32,
     pub gate: EvaluationGate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleReplayReportRef {
+    pub name: String,
+    pub report_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_artifact_id: Option<Id>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -619,15 +631,89 @@ pub struct CandidateBundleManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_output_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_run_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_summary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_results_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_usage_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_record_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed_files_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scorecard_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_summary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_logs: Vec<CommandLogRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateBundleContentManifest {
+    pub bundle_path: String,
+    pub generated_at: String,
+    pub bundle_content_hash: String,
+    pub hash_algorithm: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<CandidateBundleFileDigest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateBundleFileDigest {
+    pub path: String,
+    pub bytes: u64,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CandidateBundleAttestation {
+    pub statement_type: String,
+    pub predicate_type: String,
+    pub subject: CandidateBundleSubject,
+    pub predicate: CandidateBundlePredicate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateBundleSubject {
+    pub name: String,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CandidateBundlePredicate {
+    pub job_id: Id,
+    pub objective: String,
+    pub target_ring: TrustRing,
+    pub produced_by: String,
+    pub mutation_worker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub source_workspace: String,
+    pub candidate_worktree: String,
+    pub candidate_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_outcome: Option<EvaluationOutcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
+    pub generated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -687,6 +773,8 @@ pub struct CandidateDecision {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_files: Vec<String>,
     pub recovery: RecoveryPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_preflight: Option<CandidateApprovalPreflightReport>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
 }
@@ -714,9 +802,32 @@ impl CandidateDecision {
             verification_outcome,
             changed_files,
             recovery: job.recovery.clone(),
+            approval_preflight: None,
             note: note.into(),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateApprovalPreflightReport {
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_outcome: Option<EvaluationOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_outcome: Option<EvaluationOutcome>,
+    pub diff_summary: String,
+    pub override_used: bool,
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CandidateApprovalPreflightCheck>,
+    pub recovery_note: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateApprovalPreflightCheck {
+    pub name: String,
+    pub outcome: EvaluationOutcome,
+    pub summary: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -780,6 +891,7 @@ impl Default for RollbackPolicy {
                 RollbackTrigger::Timeout,
                 RollbackTrigger::PolicyIncident,
                 RollbackTrigger::ScoreRegression,
+                RollbackTrigger::UserCorrectionSpike,
             ],
             restore_artifact_id: None,
         }
@@ -914,6 +1026,7 @@ mod tests {
                     expected_exit_code: 0,
                     gate: EvaluationGate::UnitTests,
                 }],
+                module_replay_reports: Vec::new(),
             },
             recovery: RecoveryPlan {
                 strategy: RecoveryStrategy::VmSnapshotRestore,
@@ -966,6 +1079,7 @@ mod tests {
                     expected_exit_code: 0,
                     gate: EvaluationGate::StaticChecks,
                 }],
+                module_replay_reports: Vec::new(),
             },
             output_contract: MutationOutputContract::default(),
             recovery: RecoveryPlan::default(),

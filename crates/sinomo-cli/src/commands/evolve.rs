@@ -1,4 +1,5 @@
 use super::*;
+use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub(crate) enum EvolveCliCommand {
@@ -15,7 +16,21 @@ pub(crate) enum EvolveCliCommand {
     Packet(Vec<String>),
     Cleanup(Vec<String>),
     Job(Vec<String>),
+    TrustedSigners(TrustedSignersCliCommand),
     Models(ModelsCliCommand),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum TrustedSignersCliCommand {
+    Help,
+    List(TrustedSignersListOptions),
+    Publish,
+    Hydrate,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub(crate) struct TrustedSignersListOptions {
+    pub(crate) json: bool,
 }
 
 pub(crate) fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, CliError> {
@@ -59,11 +74,52 @@ pub(crate) fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, 
             Ok(EvolveCliCommand::Cleanup(rest.to_vec()))
         }
         Some((command, rest)) if command == "job" => Ok(EvolveCliCommand::Job(rest.to_vec())),
+        Some((command, rest))
+            if matches!(command.as_str(), "trusted-signers" | "trust-signers") =>
+        {
+            Ok(EvolveCliCommand::TrustedSigners(
+                parse_trusted_signers_command(rest)?,
+            ))
+        }
         Some((command, rest)) if command == "models" => {
             Ok(EvolveCliCommand::Models(parse_models_command(rest)?))
         }
         _ => Err(CliError::Usage),
     }
+}
+
+pub(crate) fn parse_trusted_signers_command(
+    args: &[String],
+) -> Result<TrustedSignersCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(TrustedSignersCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(TrustedSignersCliCommand::Help)
+        }
+        Some((command, rest)) if command == "list" => Ok(TrustedSignersCliCommand::List(
+            parse_trusted_signers_list_options(rest)?,
+        )),
+        Some((command, [])) if matches!(command.as_str(), "publish" | "push" | "sync") => {
+            Ok(TrustedSignersCliCommand::Publish)
+        }
+        Some((command, [])) if matches!(command.as_str(), "hydrate" | "pull") => {
+            Ok(TrustedSignersCliCommand::Hydrate)
+        }
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_trusted_signers_list_options(
+    args: &[String],
+) -> Result<TrustedSignersListOptions, CliError> {
+    let mut options = TrustedSignersListOptions::default();
+    for arg in args {
+        match arg.as_str() {
+            "--json" => options.json = true,
+            _ => return Err(CliError::Usage),
+        }
+    }
+    Ok(options)
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +130,8 @@ pub(crate) struct ProposeOptions {
     pub(crate) repo: Option<PathBuf>,
     pub(crate) allow: Vec<String>,
     pub(crate) verify: Vec<String>,
+    pub(crate) benchmark: Vec<String>,
+    pub(crate) module_replay_report: Vec<String>,
     pub(crate) target_ring: TrustRing,
     pub(crate) dry_run: bool,
     pub(crate) horizon: Option<String>,
@@ -92,6 +150,8 @@ pub(crate) fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, C
     let mut repo = None;
     let mut allow = Vec::new();
     let mut verify = Vec::new();
+    let mut benchmark = Vec::new();
+    let mut module_replay_report = Vec::new();
     let mut target_ring = TrustRing::R1TrustedRuntime;
     let mut dry_run = false;
     let mut horizon = None;
@@ -130,6 +190,18 @@ pub(crate) fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, C
                 index += 1;
                 if let Some(value) = args.get(index) {
                     verify.push(value.clone());
+                }
+            }
+            "--benchmark" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    benchmark.push(value.clone());
+                }
+            }
+            "--module-replay-report" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    module_replay_report.push(value.clone());
                 }
             }
             "--target-ring" => {
@@ -183,6 +255,8 @@ pub(crate) fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, C
         repo,
         allow,
         verify,
+        benchmark,
+        module_replay_report,
         target_ring,
         dry_run,
         horizon,
@@ -223,8 +297,13 @@ pub(crate) struct BackgroundTickOptions {
 pub(crate) struct IterationOptions {
     pub(crate) campaign_id: String,
     pub(crate) task_id: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) repo: Option<PathBuf>,
     pub(crate) intended_paths: Vec<String>,
     pub(crate) verification_commands: Vec<String>,
+    pub(crate) benchmark: Vec<String>,
+    pub(crate) module_replay_report: Vec<String>,
     pub(crate) dry_run: bool,
 }
 
@@ -327,16 +406,49 @@ pub(crate) fn parse_stage_evaluation_options(
 pub(crate) fn parse_iteration_options(args: &[String]) -> Result<IterationOptions, CliError> {
     let mut campaign_id = None;
     let mut task_id = None;
+    let mut provider = None;
+    let mut model = None;
+    let mut repo = None;
     let mut intended_paths = Vec::new();
     let mut verification_commands = Vec::new();
+    let mut benchmark = Vec::new();
+    let mut module_replay_report = Vec::new();
     let mut dry_run = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--campaign" => {
+                index += 1;
+                campaign_id = args.get(index).cloned();
+                if campaign_id.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
             "--task" => {
                 index += 1;
                 task_id = args.get(index).cloned();
                 if task_id.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--provider" => {
+                index += 1;
+                provider = args.get(index).cloned();
+                if provider.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--model" => {
+                index += 1;
+                model = args.get(index).cloned();
+                if model.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--repo" => {
+                index += 1;
+                repo = args.get(index).map(PathBuf::from);
+                if repo.is_none() {
                     return Err(CliError::Usage);
                 }
             }
@@ -352,6 +464,22 @@ pub(crate) fn parse_iteration_options(args: &[String]) -> Result<IterationOption
                 index += 1;
                 if let Some(value) = args.get(index) {
                     verification_commands.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--benchmark" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    benchmark.push(value.clone());
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--module-replay-report" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    module_replay_report.push(value.clone());
                 } else {
                     return Err(CliError::Usage);
                 }
@@ -372,8 +500,13 @@ pub(crate) fn parse_iteration_options(args: &[String]) -> Result<IterationOption
     Ok(IterationOptions {
         campaign_id: campaign_id.ok_or(CliError::Usage)?,
         task_id,
+        provider,
+        model,
+        repo,
         intended_paths,
         verification_commands,
+        benchmark,
+        module_replay_report,
         dry_run,
     })
 }
@@ -659,8 +792,232 @@ pub(crate) fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), Cl
         EvolveCliCommand::Packet(args) => evolve_show_packet(&args),
         EvolveCliCommand::Cleanup(args) => evolve_cleanup(&args),
         EvolveCliCommand::Job(args) => evolve_job(&args),
+        EvolveCliCommand::TrustedSigners(command) => evolve_trusted_signers(command),
         EvolveCliCommand::Models(command) => run_models_command(command),
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TrustedSignersListView {
+    source: String,
+    count: usize,
+    signers: Vec<sinomo_runtime::registry::TrustedArtifactSigner>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedSignersSyncReport {
+    pub(crate) source: String,
+    pub(crate) destination: String,
+    pub(crate) count: usize,
+}
+
+fn evolve_trusted_signers(command: TrustedSignersCliCommand) -> Result<(), CliError> {
+    match command {
+        TrustedSignersCliCommand::Help => {
+            print_evolve_help();
+            Ok(())
+        }
+        TrustedSignersCliCommand::List(options) => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let (source, signers) = read_trusted_signers_for_node(&data_dir)?;
+            if options.json {
+                print_json(
+                    "<trusted-signers>",
+                    &TrustedSignersListView {
+                        source,
+                        count: signers.len(),
+                        signers,
+                    },
+                )?;
+            } else {
+                println!("trusted signers: {}", signers.len());
+                println!("source: {source}");
+                for signer in signers {
+                    println!(
+                        "  {} [{:?}] {}",
+                        signer.signer_id, signer.status, signer.public_key
+                    );
+                    if !signer.reason.trim().is_empty() {
+                        println!("    reason: {}", signer.reason);
+                    }
+                }
+            }
+            Ok(())
+        }
+        TrustedSignersCliCommand::Publish => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let report = publish_trusted_signers_to_cluster(&data_dir)?;
+            println!("trusted signers published: {}", report.count);
+            println!("source: {}", report.source);
+            println!("destination: {}", report.destination);
+            Ok(())
+        }
+        TrustedSignersCliCommand::Hydrate => {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let report = hydrate_trusted_signers_from_cluster(&data_dir)?;
+            println!("trusted signers hydrated: {}", report.count);
+            println!("source: {}", report.source);
+            println!("destination: {}", report.destination);
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn registry_trust_uses_cluster(data_dir: &SinomoDataDir) -> bool {
+    if cli_force_local_mode() {
+        return false;
+    }
+    network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
+}
+
+pub(crate) fn read_trusted_signers_for_node(
+    data_dir: &SinomoDataDir,
+) -> Result<(String, Vec<sinomo_runtime::registry::TrustedArtifactSigner>), CliError> {
+    if registry_trust_uses_cluster(data_dir) {
+        let entries = registry_trusted_signer_cluster_entries(data_dir)?;
+        let signers = sinomo_runtime::registry::trusted_artifact_signers_from_kv_entries(&entries)?;
+        return Ok((
+            sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX.to_string(),
+            signers,
+        ));
+    }
+    let path = sinomo_runtime::registry::trusted_artifact_signers_path(data_dir.root());
+    let signers = sinomo_runtime::registry::read_trusted_artifact_signers(data_dir.root())?;
+    Ok((path.display().to_string(), signers))
+}
+
+pub(crate) fn publish_trusted_signers_to_cluster(
+    data_dir: &SinomoDataDir,
+) -> Result<TrustedSignersSyncReport, CliError> {
+    if !registry_trust_uses_cluster(data_dir) {
+        return Err(CliError::DaemonNotRunning {
+            detail:
+                "trusted signer publish requires cluster mode; use `sinomo evolve trusted-signers list` for local records"
+                    .to_string(),
+        });
+    }
+    let signers = sinomo_runtime::registry::read_trusted_artifact_signers(data_dir.root())?;
+    let txn = sinomo_runtime::registry::trusted_artifact_signers_kv_txn(&signers)?;
+    commit_registry_trust_cluster_txn(data_dir, txn)?;
+    Ok(TrustedSignersSyncReport {
+        source: sinomo_runtime::registry::trusted_artifact_signers_path(data_dir.root())
+            .display()
+            .to_string(),
+        destination: sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX.to_string(),
+        count: signers.len(),
+    })
+}
+
+pub(crate) fn hydrate_trusted_signers_from_cluster(
+    data_dir: &SinomoDataDir,
+) -> Result<TrustedSignersSyncReport, CliError> {
+    if !registry_trust_uses_cluster(data_dir) {
+        return Err(CliError::DaemonNotRunning {
+            detail:
+                "trusted signer hydrate requires cluster mode; use `sinomo --local evolve trusted-signers list` for local records"
+                    .to_string(),
+        });
+    }
+    let entries = registry_trusted_signer_cluster_entries(data_dir)?;
+    let signers = sinomo_runtime::registry::trusted_artifact_signers_from_kv_entries(&entries)?;
+    let path = sinomo_runtime::registry::write_trusted_artifact_signers(data_dir.root(), &signers)?;
+    Ok(TrustedSignersSyncReport {
+        source: sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX.to_string(),
+        destination: path.display().to_string(),
+        count: signers.len(),
+    })
+}
+
+fn registry_trusted_signer_cluster_entries(
+    data_dir: &SinomoDataDir,
+) -> Result<Vec<KvEntry>, CliError> {
+    let paths = ClusterPaths::new(data_dir);
+    let snapshot = registry_trust_cluster_snapshot(&paths)?;
+    let store = InProcessKvStore::restore(snapshot);
+    Ok(store.range_prefix(sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX))
+}
+
+fn registry_trust_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
+    let _ = paths;
+    if let Some(status) = default_main_daemon_status()?
+        && let Ok(snapshot) =
+            daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
+    {
+        return Ok(snapshot);
+    }
+    #[cfg(test)]
+    {
+        return network::read_cluster_kv_snapshot(paths).map_err(Into::into);
+    }
+    #[cfg(not(test))]
+    {
+        Err(CliError::DaemonNotRunning {
+            detail: "clustered trusted signer registry requires the local daemon".to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+fn commit_registry_trust_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
+    let daemon_paths = DaemonPaths::new(data_dir);
+    daemon_handle_daemon_cluster_kv_txn_request(&daemon_paths, txn)?;
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn commit_registry_trust_cluster_txn(
+    _data_dir: &SinomoDataDir,
+    txn: KvTxn,
+) -> Result<(), CliError> {
+    let Some(status) = default_main_daemon_status()? else {
+        return Err(CliError::DaemonNotRunning {
+            detail: "clustered trusted signer registry writes require the local daemon".to_string(),
+        });
+    };
+    let request = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_KV_TXN_ROUTE,
+        network::CLUSTER_KV_RPC_CATEGORY,
+        &txn,
+    )
+    .map_err(CliError::from)?;
+    let response = sinomo_runtime::daemon::send_daemon_rpc(
+        &status.address,
+        &request,
+        DAEMON_CLUSTER_KV_TXN_TIMEOUT,
+    )?;
+    let _: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
+    Ok(())
+}
+
+fn resolve_evolution_repo(
+    data_dir: &SinomoDataDir,
+    selected_repo: Option<PathBuf>,
+) -> Result<PathBuf, CliError> {
+    if let Some(repo) = selected_repo {
+        return Ok(repo);
+    }
+    let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+    ensure_rollout_layout(&rollout_paths)?;
+    let current_repo = env::current_dir().map_err(|source| CliError::Io {
+        path: ".".to_string(),
+        detail: source.to_string(),
+    })?;
+    ensure_rollout_source_repo(&rollout_paths, Some(&current_repo))?;
+    Ok(rollout_paths.source_repo)
+}
+
+fn resolve_requested_evolution_model(
+    provider: Option<String>,
+    model: Option<String>,
+    default_provider: String,
+    default_model: String,
+) -> Result<(String, String), CliError> {
+    let provider = provider.unwrap_or(default_provider);
+    let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
+        detail: format!("unknown provider `{provider}`"),
+    })?;
+    let model = normalize_model_id_for_provider(&provider, &model.unwrap_or(default_model));
+    Ok((provider, model))
 }
 
 pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
@@ -679,22 +1036,13 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     });
     let default_model =
         resolve_default_model(Some(&model_config), evolution_model_config.as_ref())?;
-    let repo = if let Some(repo) = options
-        .repo
-        .clone()
-        .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.repo)))
-    {
-        repo
-    } else {
-        let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
-        ensure_rollout_layout(&rollout_paths)?;
-        let current_repo = env::current_dir().map_err(|source| CliError::Io {
-            path: ".".to_string(),
-            detail: source.to_string(),
-        })?;
-        ensure_rollout_source_repo(&rollout_paths, Some(&current_repo))?;
-        rollout_paths.source_repo
-    };
+    let repo = resolve_evolution_repo(
+        &data_dir,
+        options
+            .repo
+            .clone()
+            .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.repo))),
+    )?;
 
     if options.dry_run || options.pause_after_proposal {
         let request = prepare_campaign_proposal_request(CampaignProposalInput {
@@ -721,6 +1069,8 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
         target_ring: options.target_ring,
         intended_paths: options.allow,
         verification_commands: options.verify,
+        benchmark_specs: options.benchmark,
+        module_replay_report_specs: options.module_replay_report,
         provider: options.provider,
         model: options.model,
         default_provider: Some(default_model.provider),
@@ -734,10 +1084,11 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
         LocalCandidateBundleStore::new(&paths.jobs),
     );
-    let model_runner = EvolutionLanguageModelMutationModel {
+    let model_runner = EvolutionAgentMutationModel {
         provider: prepared.provider,
         model: prepared.model,
         data_dir: data_dir.clone(),
+        max_steps: None,
     };
     let report = if request.dry_run {
         orchestrator.propose(request, None)?
@@ -775,24 +1126,96 @@ pub(crate) fn evolve_schedule(args: &[String]) -> Result<(), CliError> {
 pub(crate) fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
     let options = parse_iteration_options(args)?;
     let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
-    if !options.dry_run {
-        return Err(CliError::Usage);
-    }
+    let config = read_config(&paths).ok();
     let mut campaign = read_campaign(&paths, &options.campaign_id)?;
-    let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+    let mut plan = prepare_scheduled_iteration(ScheduledIterationRequest {
         campaign: campaign.clone(),
         task_id: options.task_id.clone(),
         intended_paths: options.intended_paths.clone(),
         extra_verification_commands: options.verification_commands.clone(),
-        dry_run: true,
+        dry_run: options.dry_run,
     })
     .map_err(|source| CliError::Parse {
         detail: source.to_string(),
     })?;
-    let bundle = write_campaign_iteration_dry_run(&paths, &mut campaign, &plan)?;
-    println_iteration_dry_run(&plan, &bundle);
+    if options.dry_run {
+        let bundle = write_campaign_iteration_dry_run(&paths, &mut campaign, &plan)?;
+        println_iteration_dry_run(&plan, &bundle);
+        return Ok(());
+    }
+
+    let (model_config, _) = load_model_config_for_node(&data_dir)?;
+    let evolution_model_config = config.as_ref().map(|config| sinomo_lm::ModelConfig {
+        default_provider: config.default_provider.clone(),
+        default_account: None,
+        default_model: config.default_model.clone(),
+        accounts: Vec::new(),
+    });
+    let default_model =
+        resolve_default_model(Some(&model_config), evolution_model_config.as_ref())?;
+    let (provider, model) = resolve_requested_evolution_model(
+        options.provider.clone(),
+        options.model.clone(),
+        default_model.provider,
+        default_model.configured_model,
+    )?;
+    let repo = resolve_evolution_repo(
+        &data_dir,
+        options
+            .repo
+            .clone()
+            .or_else(|| campaign.source_repo.as_ref().map(PathBuf::from))
+            .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.repo))),
+    )?;
+
+    plan.evolution_request.model_provider = Some(provider.clone());
+    plan.evolution_request.model = Some(model.clone());
+    plan.evolution_request.benchmark_gates =
+        parse_benchmark_gate_specs(&options.benchmark, &provider, &model)?;
+    plan.evolution_request.module_replay_reports =
+        parse_module_replay_report_specs(&options.module_replay_report)?;
+
+    let orchestrator = EvolutionOrchestrator::new(
+        GitWorkspaceAdapter::new(&repo, &paths.jobs),
+        ExecutingEvalHarness::new(LocalCommandRunner::new()),
+        LocalCandidateBundleStore::new(&paths.jobs),
+    );
+    let model_runner = EvolutionAgentMutationModel {
+        provider,
+        model,
+        data_dir: data_dir.clone(),
+        max_steps: None,
+    };
+    let report = orchestrator.propose(plan.evolution_request.clone(), Some(&model_runner))?;
+    write_report_record(&paths, &report)?;
+    let resource_usage =
+        candidate_resource_usage_estimates_for_report(&campaign, &plan.task.task_id, &report)?;
+
+    let update = evaluate_campaign_stage(StageEvaluationRequest {
+        campaign,
+        task_id: plan.task.task_id.clone(),
+        report: report.clone(),
+        resource_usage,
+        failure_class: None,
+        root_cause_summary: None,
+        what_was_learned: Vec::new(),
+    });
+    let bundle = write_campaign_iteration_evaluation(&paths, &plan, &update)?;
+    println_report(&report);
+    println!("campaign: {}", update.campaign.campaign_id);
+    println!("iteration: {}", plan.iteration_id);
+    println!("task: {}", plan.task.task_id);
+    println!("stage scorecard: {}", bundle.stage_scorecard_json.display());
+    println!(
+        "iteration result: {}",
+        bundle.iteration_result_json.display()
+    );
+    if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
+        println!("resource usage: {resource_usage_path}");
+    }
     Ok(())
 }
 
@@ -862,7 +1285,25 @@ pub(crate) fn evolve_decide(
     let (paths, record) = resolve_job_from_args(args, true)?;
     ensure_stored_job_awaiting_approval(&record)?;
     let note = flag_value(args, "--note").unwrap_or_default();
-    let recorded = decide_stored_evolution_job(&paths, record, outcome, "cli-supervisor", note)?;
+    let override_preflight = has_flag(args, "--override");
+    if outcome == CandidateDecisionOutcome::Approved && override_preflight && note.trim().is_empty()
+    {
+        return Err(CliError::Parse {
+            detail: "`sinomo evolve approve --override` requires a non-empty --note".to_string(),
+        });
+    }
+    let recorded = if outcome == CandidateDecisionOutcome::Approved {
+        decide_stored_evolution_job_with_options(
+            &paths,
+            record,
+            outcome,
+            "cli-supervisor",
+            note,
+            CandidateDecisionOptions { override_preflight },
+        )?
+    } else {
+        decide_stored_evolution_job(&paths, record, outcome, "cli-supervisor", note)?
+    };
     println!("job: {}", recorded.record.job.job_id);
     println!("status: {}", job_status_label(&recorded.record.job.status));
     println!(

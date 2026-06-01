@@ -12,22 +12,25 @@ use sinomo_evolution::EvolutionJobId;
 use sinomo_evolution::is_terminal_status;
 use sinomo_evolution::{
     BackgroundSchedulerPaths, BackgroundSchedulingPlan, BackgroundSchedulingRequest,
-    CampaignBundlePaths, CampaignProposalInput, EvolutionCampaign, EvolutionFailureClass,
-    EvolutionJobSelectionMode, EvolutionLanguageModelMutationModel, EvolutionOrchestrator,
-    EvolutionPaths, EvolutionReport, EvolutionRequestInput, GitWorkspaceAdapter,
-    LocalCandidateBundleStore, ResourceSchedulerDryRun, ResourceSchedulerDryRunRequest,
-    ResourceUsageEstimate, ScheduledIterationPlan, ScheduledIterationRequest,
-    StageEvaluationRequest, StageEvaluationUpdate, StoredEvolutionJob, StoredJobArtifactKind,
-    decide_stored_evolution_job, decision_outcome_label, dry_run_resource_scheduler,
-    ensure_stored_job_awaiting_approval, evaluate_campaign_stage, evolution_report_from_record,
-    job_status_label, list_job_records, parse_background_tick_estimates,
-    parse_background_tick_external_workloads, parse_background_tick_resources, parse_failure_class,
-    parse_schedule_estimates, parse_schedule_resources, parse_stage_resource_usage,
-    plan_background_scheduling_tick, prepare_campaign_proposal_request, prepare_evolution_request,
-    prepare_scheduled_iteration, propose_evolution_campaign, read_background_tick_campaigns,
-    read_campaign, read_config, read_stored_job, read_stored_job_artifact, select_stored_job,
-    verify_stored_evolution_job, write_background_scheduling_plan, write_campaign_bundle,
-    write_campaign_iteration_dry_run, write_campaign_schedule_dry_run,
+    CampaignBundlePaths, CampaignProposalInput, CandidateDecisionOptions,
+    EvolutionAgentMutationModel, EvolutionCampaign, EvolutionFailureClass,
+    EvolutionJobSelectionMode, EvolutionOrchestrator, EvolutionPaths, EvolutionReport,
+    EvolutionRequestInput, GitWorkspaceAdapter, LocalCandidateBundleStore, ResourceSchedulerDryRun,
+    ResourceSchedulerDryRunRequest, ResourceUsageEstimate, ScheduledIterationPlan,
+    ScheduledIterationRequest, StageEvaluationRequest, StageEvaluationUpdate, StoredEvolutionJob,
+    StoredJobArtifactKind, candidate_resource_usage_estimates_for_report,
+    decide_stored_evolution_job, decide_stored_evolution_job_with_options, decision_outcome_label,
+    dry_run_resource_scheduler, ensure_stored_job_awaiting_approval, evaluate_campaign_stage,
+    evolution_report_from_record, job_status_label, list_job_records,
+    parse_background_tick_estimates, parse_background_tick_external_workloads,
+    parse_background_tick_resources, parse_benchmark_gate_specs, parse_failure_class,
+    parse_module_replay_report_specs, parse_schedule_estimates, parse_schedule_resources,
+    parse_stage_resource_usage, plan_background_scheduling_tick, prepare_campaign_proposal_request,
+    prepare_evolution_request, prepare_scheduled_iteration, propose_evolution_campaign,
+    read_background_tick_campaigns, read_campaign, read_config, read_stored_job,
+    read_stored_job_artifact, select_stored_job, verify_stored_evolution_job,
+    write_background_scheduling_plan, write_campaign_bundle, write_campaign_iteration_dry_run,
+    write_campaign_iteration_evaluation, write_campaign_schedule_dry_run,
     write_campaign_stage_evaluation, write_report_record,
 };
 use sinomo_lm::{
@@ -56,7 +59,8 @@ use sinomo_runtime::core::EvolutionJobStatus;
 use sinomo_runtime::core::{
     CandidateDecisionOutcome, ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite,
     ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
-    ClusterNodeRole, ClusterNodeRolloutStatus, EvaluationOutcome, EventEnvelope, TrustRing,
+    ClusterNodeRole, ClusterNodeRolloutStatus, EvaluationOutcome, EvaluationScorecard,
+    EventEnvelope, RollbackTrigger, TrustRing,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::read_cluster_kv_snapshot as daemon_read_cluster_kv_snapshot;
@@ -201,21 +205,22 @@ use sinomo_runtime::dfs::{
     LocalJsonMetadataBackend, LocalShardedMetadataBackend,
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
-use sinomo_runtime::events::SessionId;
+use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
-use sinomo_runtime::kv::{InProcessKvStore, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{
+    InProcessKvStore, KvEntry, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
+};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::module::ModuleReplayReport;
 use sinomo_runtime::network::ClusterId;
 #[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationRequest;
 #[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationResponse;
 use sinomo_runtime::network::{self, ClusterPaths};
-use sinomo_runtime::node::NodeId;
-#[cfg(test)]
-use sinomo_runtime::node::load_or_create_main_node_identity;
 #[cfg(test)]
 use sinomo_runtime::node::shadow_daemon_node_id;
+use sinomo_runtime::node::{NodeId, load_or_create_main_node_identity};
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;
 #[cfg(test)]
@@ -223,14 +228,16 @@ use sinomo_runtime::rollout::rollout_main_activation_path;
 #[cfg(test)]
 use sinomo_runtime::rollout::write_rollout_status;
 use sinomo_runtime::rollout::{
-    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    ManagedSourceStatus, RolloutError, RolloutMainActivation, SelfRolloutPaths,
-    ensure_rollout_layout, ensure_rollout_source_repo, install_current_executable,
-    managed_source_status, prepare_cluster_rollout_binary_request,
-    prepare_cluster_rollout_build_request, prepare_local_rollout_artifacts,
-    prepare_rollout_dev_binary, prepare_rollout_source_bundle, rollout_source_head,
-    rollout_status_view, source_heads_match, sync_external_repo_from_managed,
-    unique_rollout_targets,
+    AppliedRolloutTransition, ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
+    ClusterRolloutBuildRequest, DEFAULT_SHADOW_TELEMETRY_LIMIT, ManagedSourceStatus,
+    RolloutController, RolloutError, RolloutMainActivation, RolloutObservation,
+    RolloutRuntimeState, RolloutTelemetryGateConfig, SelfRolloutPaths, ensure_rollout_layout,
+    ensure_rollout_source_repo, install_current_executable, managed_source_status,
+    prepare_cluster_rollout_binary_request, prepare_cluster_rollout_build_request,
+    prepare_local_rollout_artifacts, prepare_rollout_dev_binary, prepare_rollout_source_bundle,
+    read_rollout_runtime_state, read_rollout_telemetry_gate_config, rollout_source_head,
+    rollout_status_view, shadow_telemetry_scorecard_from_event_store, source_heads_match,
+    sync_external_repo_from_managed, unique_rollout_targets, write_rollout_telemetry_gate_config,
 };
 use std::cell::Cell;
 use std::env;

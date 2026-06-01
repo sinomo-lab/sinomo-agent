@@ -6,7 +6,8 @@ use sinomo_core::{
     ClusterEndpointSource, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
     ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
     ClusterTransportKind, Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, Source,
+    RollbackPolicy, RolloutPlan, RolloutStrategy, RoutingMetadata, RoutingScope, Salience, Source,
+    TrustRing,
 };
 use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
@@ -3032,6 +3033,213 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         .expect("async open");
     assert_eq!(async_node.node_id(), &state.local_node_id);
 
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_module_rollout_status_syncs_to_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-module-rollout-status-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_module_rollout_status").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_module_rollout_status").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "module rollout status",
+        node_id.clone(),
+        "network node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
+
+    let module_id =
+        sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
+    let record = ClusterModuleRolloutStatusRecord {
+        cluster_id,
+        node_id: node_id.clone(),
+        rollout_plan_id: sinomo_core::Id::from_legacy_named("rollout_candidate").expect("rollout"),
+        module_id: module_id.clone(),
+        artifact_id: sinomo_core::Id::from_legacy_named("artifact_candidate").expect("artifact"),
+        stage: "canary".to_string(),
+        current_weight_bps: 500,
+        active_artifact_id: sinomo_core::Id::from_legacy_named("artifact_active").expect("active"),
+        previous_artifact_id: None,
+        candidate_artifact_id: Some(
+            sinomo_core::Id::from_legacy_named("artifact_candidate").expect("candidate"),
+        ),
+        shadow_artifact_id: None,
+        hot_swap_state: "active-candidate".to_string(),
+        telemetry_kind: Some("module.invocation.decision".to_string()),
+        telemetry_last_consumed_sequence: Some(sinomo_events::EventSequence(12)),
+        last_transition_record_id: Some(
+            sinomo_core::Id::from_legacy_named("transition_candidate").expect("transition"),
+        ),
+        updated_at: now,
+    };
+
+    sync_cluster_module_rollout_node_to_kv(&paths, &record).expect("sync module rollout status");
+    let statuses = read_cluster_module_rollout_statuses_from_kv(&paths).expect("statuses");
+
+    assert_eq!(statuses, vec![record]);
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("cluster kv store")
+            .get(&cluster_module_rollout_node_key(&node_id, &module_id))
+            .is_some()
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_module_rollout_desired_syncs_to_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-module-rollout-desired-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_module_rollout_desired").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_module_rollout_desired").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "module rollout desired",
+        node_id.clone(),
+        "network node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
+
+    let module_id =
+        sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
+    let rollout_plan_id =
+        sinomo_core::Id::from_legacy_named("rollout_desired_candidate").expect("rollout");
+    let desired = ClusterModuleRolloutDesiredRecord {
+        cluster_id,
+        state: "active".to_string(),
+        rollout_plan: RolloutPlan {
+            rollout_plan_id: rollout_plan_id.clone(),
+            artifact_id: sinomo_core::Id::from_legacy_named("artifact_candidate")
+                .expect("artifact"),
+            module_id: module_id.clone(),
+            target_ring: TrustRing::R3SandboxedModule,
+            strategy: RolloutStrategy::Shadow,
+            target_nodes: vec![node_id.clone()],
+            initial_weight_bps: 0,
+            promotion_steps_bps: vec![500, 2_500],
+            rollback_policy: RollbackPolicy::default(),
+        },
+        requested_by_node_id: node_id,
+        candidate_bundle_job_id: Some(
+            sinomo_core::Id::from_legacy_named("candidate_bundle_job").expect("job"),
+        ),
+        bundle_content_hash: Some("blake3:candidate".to_string()),
+        evidence_refs: vec!["registry://candidate-bundle/candidate_bundle_job".to_string()],
+        requested_at: Some("2026-06-01T00:00:00Z".to_string()),
+        updated_at: now,
+    };
+
+    sync_cluster_module_rollout_desired_to_kv(&paths, &desired)
+        .expect("sync module rollout desired");
+    let desired_records = read_cluster_module_rollout_desired_from_kv(&paths).expect("desired");
+
+    assert_eq!(desired_records, vec![desired]);
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("cluster kv store")
+            .get(&cluster_module_rollout_desired_key(
+                &module_id,
+                &rollout_plan_id
+            ))
+            .is_some()
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_module_rollout_reconciliation_syncs_to_kv() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-module-rollout-reconcile-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_module_rollout_reconcile").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_module_rollout_reconcile").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "module rollout reconcile",
+        node_id.clone(),
+        "network node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
+
+    let module_id =
+        sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
+    let rollout_plan_id =
+        sinomo_core::Id::from_legacy_named("rollout_reconcile_candidate").expect("rollout");
+    let record = ClusterModuleRolloutReconciliationRecord {
+        cluster_id,
+        node_id: node_id.clone(),
+        rollout_plan_id: rollout_plan_id.clone(),
+        module_id: module_id.clone(),
+        artifact_id: sinomo_core::Id::from_legacy_named("artifact_candidate").expect("artifact"),
+        state: "blocked".to_string(),
+        reason: "candidate bundle is not available locally".to_string(),
+        candidate_bundle_job_id: Some(
+            sinomo_core::Id::from_legacy_named("candidate_bundle_job").expect("job"),
+        ),
+        bundle_content_hash: Some("blake3:candidate".to_string()),
+        local_runtime_stage: None,
+        updated_at: now,
+    };
+
+    sync_cluster_module_rollout_reconciliation_to_kv(&paths, &record)
+        .expect("sync module rollout reconciliation");
+    let records =
+        read_cluster_module_rollout_reconciliations_from_kv(&paths).expect("reconciliations");
+
+    assert_eq!(records, vec![record]);
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("cluster kv store")
+            .get(&cluster_module_rollout_reconcile_key(
+                &node_id,
+                &module_id,
+                &rollout_plan_id
+            ))
+            .is_some()
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

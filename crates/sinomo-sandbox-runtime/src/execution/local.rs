@@ -218,7 +218,7 @@ impl LocalStagedSandboxCommandRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_module_with_stdin_limits_preopens_output_sink_abi_and_env(
+    pub(crate) fn run_module_with_stdin_limits_preopens_output_sink_abi_and_env(
         &self,
         store: &LocalSandboxInstanceStore,
         sandbox_id: &SandboxId,
