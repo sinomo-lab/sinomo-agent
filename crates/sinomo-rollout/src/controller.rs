@@ -74,7 +74,7 @@ impl Default for RolloutTelemetryAdvanceOptions {
         Self {
             event_limit: DEFAULT_SHADOW_TELEMETRY_LIMIT,
             minimum_event_count: 1,
-            automatic_promotion_enabled: true,
+            automatic_promotion_enabled: false,
             maximum_automatic_weight_bps: Some(500),
             maximum_candidate_latency_p95_ms: None,
         }
@@ -451,6 +451,92 @@ fn rollout_telemetry_evidence_ref(
     )
 }
 
+struct RolloutTelemetryEvidenceInputs<'a> {
+    evidence_kind: &'a str,
+    telemetry_kind: &'a str,
+    after_sequence: Option<EventSequence>,
+    through_sequence: Option<EventSequence>,
+    limit: usize,
+    observed_event_count: u64,
+    ignored_event_count: u64,
+    state: &'a RolloutRuntimeState,
+    observation: &'a RolloutObservation,
+    active_rollback_triggers: &'a [RollbackTrigger],
+}
+
+fn rollout_telemetry_evidence_refs(inputs: RolloutTelemetryEvidenceInputs<'_>) -> Vec<String> {
+    let after = inputs
+        .after_sequence
+        .map(|sequence| sequence.0)
+        .unwrap_or(0);
+    let through = inputs
+        .through_sequence
+        .map(|sequence| sequence.0.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let mut refs = vec![
+        rollout_telemetry_evidence_ref(
+            inputs.evidence_kind,
+            inputs.after_sequence,
+            inputs.through_sequence,
+            inputs.limit,
+            inputs.observed_event_count,
+        ),
+        format!("rollout-telemetry://kind/{}", inputs.telemetry_kind),
+        format!(
+            "rollout-telemetry://window?after={after}&through={through}&limit={}",
+            inputs.limit
+        ),
+        format!(
+            "rollout-telemetry://counts?observed={}&ignored={}&incidents={}&user_corrections={}&observed_rollback_triggers={}&active_rollback_triggers={}",
+            inputs.observed_event_count,
+            inputs.ignored_event_count,
+            inputs.observation.incident_event_ids.len(),
+            inputs.observation.user_correction_count,
+            inputs.observation.rollback_triggers.len(),
+            inputs.active_rollback_triggers.len()
+        ),
+        format!(
+            "rollout-telemetry://stage/{}",
+            rollout_stage_label(&inputs.state.stage)
+        ),
+        format!(
+            "rollout-telemetry://artifact?active={}&candidate={}",
+            inputs.state.loader_state.active_artifact_id,
+            inputs
+                .state
+                .loader_state
+                .candidate_artifact_id
+                .as_ref()
+                .or(inputs.state.loader_state.shadow_artifact_id.as_ref())
+                .map(|artifact| artifact.as_str())
+                .unwrap_or("none")
+        ),
+    ];
+
+    for event_id in &inputs.observation.incident_event_ids {
+        refs.push(format!("rollout-telemetry://incident-event/{event_id}"));
+    }
+    if inputs.observation.user_correction_count > 0 {
+        refs.push(format!(
+            "rollout-telemetry://user-corrections?count={}",
+            inputs.observation.user_correction_count
+        ));
+    }
+    for trigger in &inputs.observation.rollback_triggers {
+        refs.push(format!(
+            "rollout-telemetry://observed-rollback-trigger/{}",
+            rollback_trigger_label(trigger)
+        ));
+    }
+    for trigger in inputs.active_rollback_triggers {
+        refs.push(format!(
+            "rollout-telemetry://active-rollback-trigger/{}",
+            rollback_trigger_label(trigger)
+        ));
+    }
+    refs
+}
+
 fn rollout_telemetry_result(
     status: RolloutTelemetryAdvanceStatus,
     observed_event_count: u64,
@@ -722,6 +808,14 @@ impl RolloutController {
     }
 
     pub fn decision_event(&self, decision: &RolloutDecision) -> EventEnvelope {
+        self.decision_event_with_evidence(decision, &[])
+    }
+
+    fn decision_event_with_evidence(
+        &self,
+        decision: &RolloutDecision,
+        triggering_evidence_refs: &[String],
+    ) -> EventEnvelope {
         EventEnvelope::new(
             EventId::generate(),
             OffsetDateTime::now_utc(),
@@ -746,9 +840,16 @@ impl RolloutController {
             "rollout_plan_id": decision.state.plan.rollout_plan_id,
             "artifact_id": decision.state.plan.artifact_id,
             "module_id": decision.state.plan.module_id,
+            "target_ring": decision.state.plan.target_ring,
             "action": decision.action,
             "stage": decision.state.stage,
             "current_weight_bps": decision.state.current_weight_bps,
+            "active_artifact_id": decision.state.loader_state.active_artifact_id,
+            "previous_artifact_id": decision.state.loader_state.previous_artifact_id,
+            "candidate_artifact_id": decision.state.loader_state.candidate_artifact_id,
+            "shadow_artifact_id": decision.state.loader_state.shadow_artifact_id,
+            "hot_swap_state": decision.state.loader_state.hot_swap_state,
+            "triggering_evidence_refs": triggering_evidence_refs,
             "reason": decision.reason,
         }))
     }
@@ -762,7 +863,10 @@ impl RolloutController {
         let recorded =
             record_rollout_transition(paths, &self.node_id, decision, triggering_evidence_refs)?;
         write_rollout_runtime_state(paths, &decision.state)?;
-        append_rollout_transition_event(paths, self.decision_event(decision))?;
+        append_rollout_transition_event(
+            paths,
+            self.decision_event_with_evidence(decision, &recorded.record.triggering_evidence_refs),
+        )?;
         Ok(recorded)
     }
 
@@ -979,24 +1083,28 @@ impl RolloutController {
             ));
         }
 
-        let evidence_refs = vec![rollout_telemetry_evidence_ref(
+        let observation = RolloutObservation {
+            scorecard: Some(scorecard),
+            incident_event_ids,
+            user_correction_count,
+            rollback_triggers,
+        };
+        let active_rollback_triggers = active_rollback_triggers(&state, &observation);
+        let evidence_refs = rollout_telemetry_evidence_refs(RolloutTelemetryEvidenceInputs {
             evidence_kind,
-            checkpoint
+            telemetry_kind,
+            after_sequence: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.last_consumed_sequence),
-            last_event_sequence,
-            options.event_limit.max(1),
+            through_sequence: last_event_sequence,
+            limit: options.event_limit.max(1),
             observed_event_count,
-        )];
-        let decision = self.advance(
-            state.clone(),
-            RolloutObservation {
-                scorecard: Some(scorecard),
-                incident_event_ids,
-                user_correction_count,
-                rollback_triggers,
-            },
-        );
+            ignored_event_count,
+            state: &state,
+            observation: &observation,
+            active_rollback_triggers: &active_rollback_triggers,
+        });
+        let decision = self.advance(state.clone(), observation);
         if rollout_telemetry_promotion_is_blocked(&decision, &options) {
             return Ok(rollout_telemetry_result(
                 RolloutTelemetryAdvanceStatus::PromotionGateBlocked,
@@ -1434,7 +1542,10 @@ mod tests {
                 &root,
                 &paths,
                 &event_store,
-                RolloutTelemetryAdvanceOptions::default(),
+                RolloutTelemetryAdvanceOptions {
+                    automatic_promotion_enabled: true,
+                    ..RolloutTelemetryAdvanceOptions::default()
+                },
             )
             .expect("advance from telemetry");
 
@@ -1466,7 +1577,10 @@ mod tests {
                 &root,
                 &paths,
                 &event_store,
-                RolloutTelemetryAdvanceOptions::default(),
+                RolloutTelemetryAdvanceOptions {
+                    automatic_promotion_enabled: true,
+                    ..RolloutTelemetryAdvanceOptions::default()
+                },
             )
             .expect("second telemetry tick");
 
@@ -1476,6 +1590,61 @@ mod tests {
         );
         assert_eq!(second.observed_event_count, 0);
         assert!(second.applied_transition.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shadow_telemetry_default_blocks_promotion_until_explicitly_enabled() {
+        let root = unique_temp("sinomo-rollout-telemetry-default-blocks-promotion");
+        let paths = SelfRolloutPaths::new(&root);
+        let node = NodeId::from_legacy_named("node_desktop").expect("node");
+        let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
+        let active_artifact_id = ArtifactId::from_legacy_named("artifact_active").expect("active");
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let controller = RolloutController::new(node.clone());
+        let state = controller.initial_state(
+            rollout_plan(&node, &artifact_id, &module_id),
+            active_artifact_id.clone(),
+        );
+        crate::write_rollout_runtime_state(&paths, &state).expect("runtime state");
+        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        event_store
+            .append(module_shadow_decision_event(
+                &node,
+                &module_id,
+                &active_artifact_id,
+                &artifact_id,
+                true,
+            ))
+            .expect("append shadow event");
+
+        let result = controller
+            .advance_rollout_from_shadow_telemetry(
+                &root,
+                &paths,
+                &event_store,
+                RolloutTelemetryAdvanceOptions::default(),
+            )
+            .expect("advance from telemetry");
+
+        assert_eq!(
+            result.status,
+            RolloutTelemetryAdvanceStatus::PromotionGateBlocked
+        );
+        assert_eq!(result.observed_event_count, 1);
+        assert!(result.applied_transition.is_none());
+        assert!(
+            crate::read_rollout_telemetry_advance_state(&paths)
+                .expect("checkpoint")
+                .is_none()
+        );
+        assert_eq!(
+            crate::read_rollout_runtime_state(&paths)
+                .expect("runtime state")
+                .expect("runtime state"),
+            state
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1514,6 +1683,7 @@ mod tests {
                 &paths,
                 &event_store,
                 RolloutTelemetryAdvanceOptions {
+                    automatic_promotion_enabled: true,
                     maximum_automatic_weight_bps: Some(2_500),
                     ..RolloutTelemetryAdvanceOptions::default()
                 },
@@ -1605,6 +1775,19 @@ mod tests {
         let applied = result.applied_transition.as_ref().expect("applied");
         assert_eq!(applied.transition.action, RolloutAction::RollBack);
         assert!(applied.transition.reason.contains("user-correction-spike"));
+        let evidence_refs = &applied.transition.triggering_evidence_refs;
+        assert!(
+            evidence_refs
+                .iter()
+                .any(|reference| reference == "rollout-telemetry://kind/module.invocation.decision")
+        );
+        assert!(
+            evidence_refs
+                .iter()
+                .any(|reference| reference == "rollout-telemetry://user-corrections?count=1")
+        );
+        assert!(evidence_refs.iter().any(|reference| reference
+            == "rollout-telemetry://active-rollback-trigger/user-correction-spike"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1658,6 +1841,28 @@ mod tests {
         let applied = result.applied_transition.as_ref().expect("applied");
         assert_eq!(applied.transition.action, RolloutAction::RollBack);
         assert!(applied.transition.reason.contains("timeout"));
+        let evidence_refs = &applied.transition.triggering_evidence_refs;
+        assert!(
+            evidence_refs
+                .iter()
+                .any(|reference| reference == "rollout-telemetry://kind/module.invocation.decision")
+        );
+        assert!(
+            evidence_refs
+                .iter()
+                .any(|reference| reference
+                    == "rollout-telemetry://observed-rollback-trigger/timeout")
+        );
+        assert!(
+            evidence_refs
+                .iter()
+                .any(|reference| reference == "rollout-telemetry://active-rollback-trigger/timeout")
+        );
+        assert!(
+            evidence_refs
+                .iter()
+                .any(|reference| reference.starts_with("rollout-telemetry://counts?observed=0&"))
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1845,6 +2050,7 @@ mod tests {
                 &paths,
                 &event_store,
                 RolloutTelemetryAdvanceOptions {
+                    automatic_promotion_enabled: true,
                     maximum_automatic_weight_bps: Some(250),
                     ..RolloutTelemetryAdvanceOptions::default()
                 },
@@ -2036,6 +2242,10 @@ mod tests {
         let event_log = root.join("events").join("event-log.jsonl");
         let event_log = std::fs::read_to_string(&event_log).expect("rollout event log");
         assert_eq!(event_log.matches("rollout.transition.completed").count(), 2);
+        assert!(event_log.contains("scorecard://promotion-pass"));
+        assert!(event_log.contains("scorecard://rollback-fail"));
+        assert!(event_log.contains("triggering_evidence_refs"));
+        assert!(event_log.contains("active_artifact_id"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2131,6 +2341,8 @@ mod tests {
         let event_log = std::fs::read_to_string(root.join("events").join("event-log.jsonl"))
             .expect("event log");
         assert!(event_log.contains("rollout.transition.completed"));
+        assert!(event_log.contains("scorecard://recorded-pass"));
+        assert!(event_log.contains("triggering_evidence_refs"));
 
         let applied = controller
             .apply_recorded_transition(&root, &recorded)

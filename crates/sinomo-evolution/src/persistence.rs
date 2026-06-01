@@ -1,17 +1,23 @@
+use crate::engine::proposed_regression_gates_from_candidate_evidence;
 use crate::{
-    BackgroundCampaignUpdate, BackgroundSchedulingAction, BackgroundSchedulingPlan,
+    BackgroundCampaignUpdate, BackgroundOpportunityIntake, BackgroundSchedulingAction,
+    BackgroundSchedulingPlan, CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
+    CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH, CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
     CampaignDecision, CampaignDecisionKind, CampaignScheduleDecision,
     CandidateApprovalPreflightReport, CandidateBundleManifest, CandidateDecision,
-    CandidateDecisionOutcome, EvolutionCampaign, EvolutionCampaignStatus, EvolutionJob,
-    EvolutionJobId, EvolutionJobStatus, EvolutionReport, ResourceSchedulerDryRun,
-    ScheduledIterationPlan, StageEvaluationUpdate,
+    CandidateDecisionOutcome, CandidateEvolutionLessonRecord, CandidateRegressionEvidenceSummary,
+    EvolutionCampaign, EvolutionCampaignStatus, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
+    EvolutionLessonMemoryRecord, EvolutionRegressionGateMemoryRecord, EvolutionReport,
+    ResourceSchedulerDryRun, ScheduledIterationPlan, StageEvaluationUpdate,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::local::SinomoDataDir;
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -64,6 +70,9 @@ pub enum StoredJobArtifactKind {
     Scorecard,
     Decision,
     MutationPacket,
+    RegressionEvidence,
+    EvolutionLesson,
+    EvidenceSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +81,11 @@ pub struct EvolutionPaths {
     pub root: PathBuf,
     pub jobs: PathBuf,
     pub campaigns: PathBuf,
+    pub memory: PathBuf,
+    pub lesson_memory_dir: PathBuf,
+    pub lesson_memory_jsonl: PathBuf,
+    pub proposed_regression_gate_memory_dir: PathBuf,
+    pub proposed_regression_gate_memory_jsonl: PathBuf,
     pub logs: PathBuf,
     pub config: PathBuf,
 }
@@ -84,6 +98,15 @@ impl EvolutionPaths {
             data_dir: data_dir_root,
             jobs: root.join("jobs"),
             campaigns: root.join("campaigns"),
+            memory: root.join("memory"),
+            lesson_memory_dir: root.join("memory").join("lessons"),
+            lesson_memory_jsonl: root.join("memory").join("lessons.jsonl"),
+            proposed_regression_gate_memory_dir: root
+                .join("memory")
+                .join("proposed-regression-gates"),
+            proposed_regression_gate_memory_jsonl: root
+                .join("memory")
+                .join("proposed-regression-gates.jsonl"),
             logs: root.join("logs"),
             config: root.join("config.json"),
             root,
@@ -91,7 +114,15 @@ impl EvolutionPaths {
     }
 
     pub fn ensure(&self) -> Result<(), EvolutionPersistenceError> {
-        for path in [&self.root, &self.jobs, &self.campaigns, &self.logs] {
+        for path in [
+            &self.root,
+            &self.jobs,
+            &self.campaigns,
+            &self.memory,
+            &self.lesson_memory_dir,
+            &self.proposed_regression_gate_memory_dir,
+            &self.logs,
+        ] {
             fs::create_dir_all(path).map_err(|source| EvolutionPersistenceError::Io {
                 path: path.display().to_string(),
                 detail: source.to_string(),
@@ -123,6 +154,8 @@ pub struct BackgroundSchedulerPaths {
     pub plan_json: PathBuf,
     pub status_json: PathBuf,
     pub events_jsonl: PathBuf,
+    pub opportunity_intake_json: PathBuf,
+    pub opportunity_intakes_jsonl: PathBuf,
 }
 
 impl BackgroundSchedulerPaths {
@@ -132,6 +165,8 @@ impl BackgroundSchedulerPaths {
             plan_json: root.join("scheduler-plan.json"),
             status_json: root.join("background-status.json"),
             events_jsonl: root.join("scheduler-events.jsonl"),
+            opportunity_intake_json: root.join("opportunity-intake.json"),
+            opportunity_intakes_jsonl: root.join("opportunity-intakes.jsonl"),
             root,
         }
     }
@@ -165,6 +200,9 @@ pub struct CampaignBundlePaths {
     pub stage_scorecards_jsonl: PathBuf,
     pub adaptation_json: PathBuf,
     pub adaptations_jsonl: PathBuf,
+    pub background_opportunity_intake_json: PathBuf,
+    pub background_scoped_job_json: PathBuf,
+    pub background_workspace_plan_json: PathBuf,
     pub approval_checkpoint_json: PathBuf,
     pub decisions_jsonl: PathBuf,
 }
@@ -191,6 +229,9 @@ impl CampaignBundlePaths {
             stage_scorecards_jsonl: root.join("stage-scorecards.jsonl"),
             adaptation_json: root.join("adaptation.json"),
             adaptations_jsonl: root.join("adaptations.jsonl"),
+            background_opportunity_intake_json: root.join("background-opportunity-intake.json"),
+            background_scoped_job_json: root.join("background-scoped-job.json"),
+            background_workspace_plan_json: root.join("background-workspace-plan.json"),
             approval_checkpoint_json: root.join("approval-checkpoint.json"),
             decisions_jsonl: root.join("decisions.jsonl"),
             root,
@@ -217,7 +258,165 @@ pub fn write_report_record(
     if let Some(job_path) = &record.bundle.job_path {
         write_json(Path::new(job_path), &record.job)?;
     }
+    write_candidate_evolution_memory(paths, report)?;
     Ok(())
+}
+
+pub fn write_candidate_evolution_memory(
+    paths: &EvolutionPaths,
+    report: &EvolutionReport,
+) -> Result<(), EvolutionPersistenceError> {
+    let bundle_root = PathBuf::from(&report.bundle.bundle_path);
+    let lesson_path = bundle_root.join(CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH);
+    if !lesson_path.exists() {
+        return Ok(());
+    }
+    let lesson: CandidateEvolutionLessonRecord = read_json_file(&lesson_path)?;
+    let regression_evidence_path = bundle_root.join(CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH);
+    let regression_evidence: Option<CandidateRegressionEvidenceSummary> =
+        if regression_evidence_path.exists() {
+            Some(read_json_file(&regression_evidence_path)?)
+        } else {
+            None
+        };
+    let proposed_regression_gates = proposed_regression_gates_from_candidate_evidence(
+        report.job.job_id.as_str(),
+        regression_evidence.as_ref(),
+    );
+    let proposed_regression_gate_ids = proposed_regression_gates
+        .iter()
+        .map(|gate| gate.gate_id.clone())
+        .collect::<Vec<_>>();
+    let mut evidence_refs = vec![
+        format!("bundle:{}", report.bundle.bundle_path),
+        format!("evolution-lesson:{}", lesson_path.display()),
+    ];
+    if regression_evidence_path.exists() {
+        evidence_refs.push(format!(
+            "regression-evidence:{}",
+            regression_evidence_path.display()
+        ));
+    }
+    if let Some(scorecard_path) = &report.bundle.scorecard_path {
+        evidence_refs.push(format!("scorecard:{scorecard_path}"));
+    }
+    if let Some(diff_path) = &report.bundle.diff_path {
+        evidence_refs.push(format!("diff:{diff_path}"));
+    }
+    evidence_refs.extend(
+        lesson
+            .reusable_evidence_refs
+            .iter()
+            .map(|evidence| format!("reusable-evidence:{evidence}")),
+    );
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
+    let memory_id = format!("candidate_lesson_memory_{}", report.job.job_id.as_str());
+    let lesson_record = EvolutionLessonMemoryRecord {
+        memory_id: memory_id.clone(),
+        campaign_id: "standalone-candidate".to_string(),
+        adaptation_id: format!("candidate_{}", report.job.job_id.as_str()),
+        stage_id: "standalone-candidate".to_string(),
+        failed_iteration_id: report.job.job_id.to_string(),
+        failed_task_id: report.job.job_id.to_string(),
+        failure_class: lesson.failure_class.clone(),
+        root_cause_summary: lesson.root_cause_summary.clone(),
+        what_was_learned: candidate_lesson_memory_items(&lesson),
+        next_task_simplification: lesson
+            .suggested_follow_up_tasks
+            .first()
+            .cloned()
+            .unwrap_or_else(|| {
+                "create a smaller diagnostic task before retrying the candidate".to_string()
+            }),
+        new_eval_or_diagnostic: regression_evidence
+            .as_ref()
+            .map(|evidence| {
+                if evidence
+                    .replay_minimization
+                    .candidate_gate_commands
+                    .is_empty()
+                {
+                    "candidate regression evidence needs a minimized private gate".to_string()
+                } else {
+                    "candidate regression evidence includes reusable gate commands".to_string()
+                }
+            })
+            .unwrap_or_else(|| "candidate lesson did not include regression evidence".to_string()),
+        foundation_issue_detected: false,
+        budget_adjustment:
+            "no scheduler authority change; future dispatch still requires normal leases"
+                .to_string(),
+        human_attention_needed: true,
+        replacement_task_candidate: None,
+        proposed_regression_gate_ids,
+        evidence_refs: evidence_refs.clone(),
+        campaign_bundle_path: report.bundle.bundle_path.clone(),
+        recorded_at: lesson.recorded_at.clone(),
+    };
+    let lesson_memory_path = paths
+        .lesson_memory_dir
+        .join(format!("{}.json", safe_memory_path_component(&memory_id)));
+    let new_lesson_record = !lesson_memory_path.exists();
+    write_json(&lesson_memory_path, &lesson_record)?;
+    if new_lesson_record {
+        append_jsonl(&paths.lesson_memory_jsonl, &lesson_record)?;
+    }
+
+    for gate in proposed_regression_gates {
+        let gate_record = EvolutionRegressionGateMemoryRecord {
+            memory_id: format!(
+                "candidate_gate_memory_{}_{}",
+                report.job.job_id.as_str(),
+                gate.gate_id
+            ),
+            campaign_id: "standalone-candidate".to_string(),
+            adaptation_id: format!("candidate_{}", report.job.job_id.as_str()),
+            stage_id: "standalone-candidate".to_string(),
+            failed_task_id: report.job.job_id.to_string(),
+            status: "proposed".to_string(),
+            proposed_gate: gate,
+            evidence_refs: evidence_refs.clone(),
+            campaign_bundle_path: report.bundle.bundle_path.clone(),
+            recorded_at: lesson.recorded_at.clone(),
+        };
+        let gate_memory_path = paths.proposed_regression_gate_memory_dir.join(format!(
+            "{}.json",
+            safe_memory_path_component(&gate_record.memory_id)
+        ));
+        let new_gate_record = !gate_memory_path.exists();
+        write_json(&gate_memory_path, &gate_record)?;
+        if new_gate_record {
+            append_jsonl(&paths.proposed_regression_gate_memory_jsonl, &gate_record)?;
+        }
+    }
+    Ok(())
+}
+
+fn candidate_lesson_memory_items(lesson: &CandidateEvolutionLessonRecord) -> Vec<String> {
+    let mut learned = Vec::new();
+    learned.extend(
+        lesson
+            .failed_assumptions
+            .iter()
+            .map(|assumption| format!("failed assumption: {assumption}")),
+    );
+    learned.extend(
+        lesson
+            .suggested_follow_up_tasks
+            .iter()
+            .map(|task| format!("candidate follow-up: {task}")),
+    );
+    learned.extend(
+        lesson
+            .rollback_evidence
+            .iter()
+            .map(|evidence| format!("rollback evidence: {evidence}")),
+    );
+    learned.sort();
+    learned.dedup();
+    learned
 }
 
 pub fn write_bundle_manifest(record: &StoredEvolutionJob) -> Result<(), EvolutionPersistenceError> {
@@ -418,6 +617,24 @@ pub fn stored_job_artifact_path(
         StoredJobArtifactKind::Scorecard => record.bundle.scorecard_path.clone(),
         StoredJobArtifactKind::Decision => record.bundle.decision_path.clone(),
         StoredJobArtifactKind::MutationPacket => Some(record.bundle.mutation_packet_path.clone()),
+        StoredJobArtifactKind::RegressionEvidence => Some(
+            PathBuf::from(&record.bundle.bundle_path)
+                .join(CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH)
+                .display()
+                .to_string(),
+        ),
+        StoredJobArtifactKind::EvolutionLesson => Some(
+            PathBuf::from(&record.bundle.bundle_path)
+                .join(CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH)
+                .display()
+                .to_string(),
+        ),
+        StoredJobArtifactKind::EvidenceSummary => Some(
+            PathBuf::from(&record.bundle.bundle_path)
+                .join(CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH)
+                .display()
+                .to_string(),
+        ),
     }
     .ok_or_else(|| EvolutionPersistenceError::MissingArtifact {
         artifact: format!("{artifact:?}"),
@@ -661,8 +878,133 @@ pub fn write_campaign_stage_evaluation(
     if let Some(adaptation) = &update.adaptation {
         write_json(&bundle.adaptation_json, adaptation)?;
         append_jsonl(&bundle.adaptations_jsonl, adaptation)?;
+        write_evolution_lesson_memory(paths, update, &bundle)?;
     }
     Ok(bundle)
+}
+
+pub fn write_evolution_lesson_memory(
+    paths: &EvolutionPaths,
+    update: &StageEvaluationUpdate,
+    bundle: &CampaignBundlePaths,
+) -> Result<(), EvolutionPersistenceError> {
+    let Some(adaptation) = &update.adaptation else {
+        return Ok(());
+    };
+    let proposed_regression_gate_ids = adaptation
+        .proposed_regression_gates
+        .iter()
+        .map(|gate| gate.gate_id.clone())
+        .collect::<Vec<_>>();
+    let lesson_record = EvolutionLessonMemoryRecord {
+        memory_id: format!("lesson_memory_{}", adaptation.adaptation_id),
+        campaign_id: adaptation.campaign_id.clone(),
+        adaptation_id: adaptation.adaptation_id.clone(),
+        stage_id: adaptation.stage_id.clone(),
+        failed_iteration_id: adaptation.failed_iteration_id.clone(),
+        failed_task_id: adaptation.failed_task_id.clone(),
+        failure_class: adaptation.failure_class.clone(),
+        root_cause_summary: adaptation.root_cause_summary.clone(),
+        what_was_learned: adaptation.what_was_learned.clone(),
+        next_task_simplification: adaptation.next_task_simplification.clone(),
+        new_eval_or_diagnostic: adaptation.new_eval_or_diagnostic.clone(),
+        foundation_issue_detected: adaptation.foundation_issue_detected,
+        budget_adjustment: adaptation.budget_adjustment.clone(),
+        human_attention_needed: adaptation.human_attention_needed,
+        replacement_task_candidate: adaptation.replacement_task_candidate.clone(),
+        proposed_regression_gate_ids,
+        evidence_refs: adaptation.evidence_refs.clone(),
+        campaign_bundle_path: bundle.root.display().to_string(),
+        recorded_at: adaptation.recorded_at.clone(),
+    };
+    let lesson_path = paths.lesson_memory_dir.join(format!(
+        "{}.json",
+        safe_memory_path_component(&lesson_record.memory_id)
+    ));
+    let new_lesson_record = !lesson_path.exists();
+    write_json(&lesson_path, &lesson_record)?;
+    if new_lesson_record {
+        append_jsonl(&paths.lesson_memory_jsonl, &lesson_record)?;
+    }
+
+    for gate in &adaptation.proposed_regression_gates {
+        let gate_record = EvolutionRegressionGateMemoryRecord {
+            memory_id: format!("gate_memory_{}_{}", adaptation.adaptation_id, gate.gate_id),
+            campaign_id: adaptation.campaign_id.clone(),
+            adaptation_id: adaptation.adaptation_id.clone(),
+            stage_id: adaptation.stage_id.clone(),
+            failed_task_id: adaptation.failed_task_id.clone(),
+            status: "proposed".to_string(),
+            proposed_gate: gate.clone(),
+            evidence_refs: adaptation.evidence_refs.clone(),
+            campaign_bundle_path: bundle.root.display().to_string(),
+            recorded_at: adaptation.recorded_at.clone(),
+        };
+        let gate_path = paths.proposed_regression_gate_memory_dir.join(format!(
+            "{}.json",
+            safe_memory_path_component(&gate_record.memory_id)
+        ));
+        let new_gate_record = !gate_path.exists();
+        write_json(&gate_path, &gate_record)?;
+        if new_gate_record {
+            append_jsonl(&paths.proposed_regression_gate_memory_jsonl, &gate_record)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn read_recent_evolution_lesson_memory(
+    paths: &EvolutionPaths,
+    limit: usize,
+) -> Result<Vec<EvolutionLessonMemoryRecord>, EvolutionPersistenceError> {
+    read_recent_jsonl(&paths.lesson_memory_jsonl, limit)
+}
+
+pub fn read_recent_proposed_regression_gate_memory(
+    paths: &EvolutionPaths,
+    limit: usize,
+) -> Result<Vec<EvolutionRegressionGateMemoryRecord>, EvolutionPersistenceError> {
+    read_recent_jsonl(&paths.proposed_regression_gate_memory_jsonl, limit)
+}
+
+fn read_recent_jsonl<T: DeserializeOwned>(
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<T>, EvolutionPersistenceError> {
+    if limit == 0 || !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(path).map_err(|source| EvolutionPersistenceError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut values = content
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(limit)
+        .map(|line| {
+            serde_json::from_str(line).map_err(|source| EvolutionPersistenceError::Json {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    values.reverse();
+    Ok(values)
+}
+
+fn safe_memory_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub fn write_background_scheduling_plan(
@@ -676,13 +1018,34 @@ pub fn write_background_scheduling_plan(
     for event in &plan.timer_events {
         append_jsonl(&background_paths.events_jsonl, event)?;
     }
+    if !plan.opportunity_intake.is_empty() {
+        write_json(
+            &background_paths.opportunity_intake_json,
+            &plan.opportunity_intake,
+        )?;
+        for intake in &plan.opportunity_intake {
+            append_jsonl(&background_paths.opportunity_intakes_jsonl, intake)?;
+        }
+    }
     for update in &plan.campaigns {
         let mut campaign = update.campaign.clone();
         campaign.updated_at = plan.generated_at.clone();
+        let intake = plan
+            .opportunity_intake
+            .iter()
+            .find(|intake| intake.campaign_id == update.campaign.campaign_id);
         campaign
             .decisions
-            .push(background_campaign_decision(plan, update));
+            .push(background_campaign_decision(plan, update, intake));
         let bundle = write_campaign_bundle(paths, &campaign)?;
+        if let Some(intake) = intake {
+            write_json(&bundle.background_opportunity_intake_json, intake)?;
+            write_json(&bundle.background_scoped_job_json, &intake.scoped_job)?;
+            write_json(
+                &bundle.background_workspace_plan_json,
+                &intake.workspace_plan,
+            )?;
+        }
         if let Some(iteration) = &update.scheduled_iteration {
             write_json(&bundle.iteration_plan_json, iteration)?;
             write_json(&bundle.iteration_request_json, &iteration.evolution_request)?;
@@ -695,9 +1058,19 @@ pub fn write_background_scheduling_plan(
 pub fn background_campaign_decision(
     plan: &BackgroundSchedulingPlan,
     update: &BackgroundCampaignUpdate,
+    intake: Option<&BackgroundOpportunityIntake>,
 ) -> CampaignDecision {
     let kind = match update.action {
         BackgroundSchedulingAction::PauseForBudget => CampaignDecisionKind::Paused,
+        BackgroundSchedulingAction::DispatchIteration
+            if matches!(
+                update.previous_status,
+                EvolutionCampaignStatus::PausedBudget
+            ) =>
+        {
+            CampaignDecisionKind::Resumed
+        }
+        BackgroundSchedulingAction::DispatchIteration => CampaignDecisionKind::TaskSelected,
         BackgroundSchedulingAction::DispatchIterationDryRun
             if matches!(
                 update.previous_status,
@@ -710,16 +1083,43 @@ pub fn background_campaign_decision(
         BackgroundSchedulingAction::HoldHumanCheckpoint => CampaignDecisionKind::Paused,
         _ => CampaignDecisionKind::ResourcePolicySelected,
     };
+    let mut evidence_refs = vec![
+        "background-scheduler/scheduler-plan.json".to_string(),
+        "background-scheduler/scheduler-events.jsonl".to_string(),
+    ];
+    if intake.is_some() {
+        evidence_refs.extend([
+            "background-scheduler/opportunity-intake.json".to_string(),
+            "background-scheduler/opportunity-intakes.jsonl".to_string(),
+            format!(
+                "campaigns/{}/background-opportunity-intake.json",
+                update.campaign.campaign_id
+            ),
+            format!(
+                "campaigns/{}/background-scoped-job.json",
+                update.campaign.campaign_id
+            ),
+            format!(
+                "campaigns/{}/background-workspace-plan.json",
+                update.campaign.campaign_id
+            ),
+        ]);
+    }
+    evidence_refs.extend(update.evidence_refs.clone());
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
     CampaignDecision {
         decision_id: format!("decision_{}", update.campaign.decisions.len() + 1),
         kind,
         summary: format!("Background scheduler action: {:?}", update.action),
         rationale: update.reason.clone(),
-        evidence_refs: vec![
-            "background-scheduler/scheduler-plan.json".to_string(),
-            "background-scheduler/scheduler-events.jsonl".to_string(),
-        ],
-        decided_by: "sinomo evolve tick --dry-run".to_string(),
+        evidence_refs,
+        decided_by: if plan.dry_run {
+            "sinomo evolve tick --dry-run".to_string()
+        } else {
+            "sinomo evolve tick --dispatch-approved".to_string()
+        },
         decided_at: plan.generated_at.clone(),
     }
 }
@@ -757,6 +1157,66 @@ pub fn read_background_tick_campaigns(
         left.campaign_id.cmp(&right.campaign_id)
     });
     Ok(campaigns)
+}
+
+pub fn read_background_opportunity_intake_event_ids(
+    paths: &EvolutionPaths,
+) -> Result<BTreeSet<String>, EvolutionPersistenceError> {
+    let background_paths = BackgroundSchedulerPaths::new(paths);
+    let mut event_ids = BTreeSet::new();
+    if background_paths.opportunity_intake_json.exists() {
+        let intakes: Vec<BackgroundOpportunityIntake> =
+            read_json_file(&background_paths.opportunity_intake_json)?;
+        for intake in &intakes {
+            collect_background_opportunity_intake_event_id(&mut event_ids, intake);
+        }
+    }
+    if background_paths.opportunity_intakes_jsonl.exists() {
+        let file =
+            fs::File::open(&background_paths.opportunity_intakes_jsonl).map_err(|source| {
+                EvolutionPersistenceError::Io {
+                    path: background_paths
+                        .opportunity_intakes_jsonl
+                        .display()
+                        .to_string(),
+                    detail: source.to_string(),
+                }
+            })?;
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(|source| EvolutionPersistenceError::Io {
+                path: format!(
+                    "{}:{}",
+                    background_paths.opportunity_intakes_jsonl.display(),
+                    index + 1
+                ),
+                detail: source.to_string(),
+            })?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let intake: BackgroundOpportunityIntake =
+                serde_json::from_str(line).map_err(|source| EvolutionPersistenceError::Json {
+                    path: format!(
+                        "{}:{}",
+                        background_paths.opportunity_intakes_jsonl.display(),
+                        index + 1
+                    ),
+                    detail: source.to_string(),
+                })?;
+            collect_background_opportunity_intake_event_id(&mut event_ids, &intake);
+        }
+    }
+    Ok(event_ids)
+}
+
+fn collect_background_opportunity_intake_event_id(
+    event_ids: &mut BTreeSet<String>,
+    intake: &BackgroundOpportunityIntake,
+) {
+    if let Some(event_id) = &intake.detection.opportunity.observed_event_id {
+        event_ids.insert(event_id.to_string());
+    }
 }
 
 pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), EvolutionPersistenceError> {
@@ -834,7 +1294,12 @@ mod tests {
     use crate::{
         CandidateWorkspace, EditScope, EvolutionScope, RecoveryPlan, VerificationPlan, WorkspaceId,
     };
-    use sinomo_runtime::core::{EvaluationGate, Id, RollbackPolicy, TrustRing};
+    use sinomo_runtime::core::{
+        Confidence, EvaluationGate, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass,
+        RollbackPolicy, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
+    };
+    use sinomo_runtime::events::EventId;
+    use sinomo_runtime::node::NodeId;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     type ScorecardId = Id;
@@ -1282,6 +1747,366 @@ mod tests {
                 .expect("stage scorecards jsonl")
                 .contains(&stored.campaign_id)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_campaign_stage_evaluation_indexes_lessons_and_proposed_gates_as_memory() {
+        let root = temp_dir("campaign-lesson-memory");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let campaign = crate::propose_evolution_campaign(crate::CampaignProposalRequest {
+            objective: "make failed campaign attempts reusable".to_string(),
+            horizon: "14 days".to_string(),
+            budget_policy: "free-and-prepaid".to_string(),
+            reserve_floors: Vec::new(),
+            approval_policy: "stage-rollout".to_string(),
+            max_wall_time: Some("10m".to_string()),
+            pause_after_proposal: false,
+            dry_run: true,
+            approved: true,
+            target_ring: TrustRing::R2TrustedService,
+            source_repo: Some(root.display().to_string()),
+        });
+        let stage_id = campaign.stages[0].stage_id.clone();
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let update = crate::StageEvaluationUpdate {
+            campaign: campaign.clone(),
+            stage_scorecard: crate::CampaignStageScorecard {
+                scorecard_id: ScorecardId::generate().to_string(),
+                campaign_id: campaign.campaign_id.clone(),
+                stage_id: stage_id.clone(),
+                task_id: task_id.clone(),
+                iteration_id: "stage_eval_failed".to_string(),
+                outcome: EvaluationOutcome::Failed,
+                declared_metrics: Vec::new(),
+                met_metrics: Vec::new(),
+                missing_metrics: Vec::new(),
+                regression_gates: Vec::new(),
+                evidence_refs: vec!["scorecard:/tmp/scorecard.json".to_string()],
+                promotion: crate::StagePromotionDecision::HoldFailed,
+                summary: "stage failed and should create memory".to_string(),
+                recorded_at: "2026-05-02T03:00:00Z".to_string(),
+            },
+            adaptation: Some(crate::CampaignAdaptationRecord {
+                adaptation_id: "adapt_memory_1".to_string(),
+                campaign_id: campaign.campaign_id.clone(),
+                stage_id: stage_id.clone(),
+                failed_iteration_id: "iter_failed_1".to_string(),
+                failed_task_id: task_id.clone(),
+                failure_class: crate::EvolutionFailureClass::EvalRegression,
+                root_cause_summary: "timeout replay still reproduces".to_string(),
+                what_was_learned: vec!["replay needs minimization".to_string()],
+                next_task_simplification: "create smaller replay".to_string(),
+                new_eval_or_diagnostic: "metric-specific regression fixture".to_string(),
+                foundation_issue_detected: false,
+                proposed_regression_gates: vec![crate::CampaignProposedRegressionGate {
+                    gate_id: "gate_timeout_replay".to_string(),
+                    gate: EvaluationGate::ReplayTests,
+                    source: "module-replay-report".to_string(),
+                    evidence_ref: "replays/timeout-replay.json".to_string(),
+                    command: Some(
+                        "cargo test -p sinomo-evolution timeout_replay_fixture".to_string(),
+                    ),
+                    rationale: "keep timeout replay as a private gate".to_string(),
+                }],
+                replacement_task_candidate: None,
+                budget_adjustment: "keep scheduler gate".to_string(),
+                human_attention_needed: false,
+                evidence_refs: vec![
+                    "regression-evidence:/tmp/bundle/regression-evidence.json".to_string(),
+                ],
+                recorded_at: "2026-05-02T03:00:00Z".to_string(),
+            }),
+        };
+
+        let bundle = write_campaign_stage_evaluation(&paths, &update).expect("stage evaluation");
+        write_campaign_stage_evaluation(&paths, &update).expect("idempotent memory rewrite");
+
+        assert!(bundle.adaptation_json.exists());
+        assert!(paths.lesson_memory_jsonl.exists());
+        assert!(paths.proposed_regression_gate_memory_jsonl.exists());
+        let lesson_lines = fs::read_to_string(&paths.lesson_memory_jsonl)
+            .expect("lesson memory jsonl")
+            .lines()
+            .count();
+        assert_eq!(lesson_lines, 1);
+        let gate_lines = fs::read_to_string(&paths.proposed_regression_gate_memory_jsonl)
+            .expect("gate memory jsonl")
+            .lines()
+            .count();
+        assert_eq!(gate_lines, 1);
+        let lesson_path = paths
+            .lesson_memory_dir
+            .join("lesson_memory_adapt_memory_1.json");
+        assert!(lesson_path.exists());
+        let lesson: crate::EvolutionLessonMemoryRecord =
+            read_json_file(&lesson_path).expect("lesson memory");
+        assert_eq!(lesson.adaptation_id, "adapt_memory_1");
+        assert_eq!(
+            lesson.proposed_regression_gate_ids,
+            vec!["gate_timeout_replay".to_string()]
+        );
+        let gate_path = paths
+            .proposed_regression_gate_memory_dir
+            .join("gate_memory_adapt_memory_1_gate_timeout_replay.json");
+        assert!(gate_path.exists());
+        let gate: crate::EvolutionRegressionGateMemoryRecord =
+            read_json_file(&gate_path).expect("gate memory");
+        assert_eq!(gate.status, "proposed");
+        assert_eq!(gate.proposed_gate.gate, EvaluationGate::ReplayTests);
+        assert_eq!(
+            gate.proposed_gate.evidence_ref,
+            "replays/timeout-replay.json"
+        );
+        let recent_lessons =
+            read_recent_evolution_lesson_memory(&paths, 8).expect("recent lessons");
+        let recent_gates =
+            read_recent_proposed_regression_gate_memory(&paths, 8).expect("recent gates");
+        assert_eq!(recent_lessons.len(), 1);
+        assert_eq!(recent_gates.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_report_record_indexes_failed_candidate_lesson_as_memory() {
+        let root = temp_dir("candidate-lesson-memory");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let mut record = stored_record_fixture(&root, EvolutionJobStatus::AwaitingApproval);
+        let bundle_dir = PathBuf::from(&record.bundle.bundle_path);
+        fs::create_dir_all(&bundle_dir).expect("bundle dir");
+        let command_log_path = bundle_dir.join("command-logs/focused-replay.log");
+        fs::create_dir_all(command_log_path.parent().expect("parent")).expect("log dir");
+        fs::write(&command_log_path, "timeout replay still fails").expect("command log");
+        let scorecard_path = bundle_dir.join("scorecard.json");
+        record.bundle.scorecard_path = Some(scorecard_path.display().to_string());
+        record.changed_files = vec!["modules/trigger/silence_policy.wat".to_string()];
+        let evidence = crate::CandidateRegressionEvidenceSummary {
+            job_id: record.job.job_id.clone(),
+            objective: record.job.objective.clone(),
+            target_ring: record.job.target_ring.clone(),
+            outcome: EvaluationOutcome::Failed,
+            bundle_path: record.bundle.bundle_path.clone(),
+            scorecard_path: record.bundle.scorecard_path.clone(),
+            diff_path: None,
+            changed_files: record.changed_files.clone(),
+            failed_gates: vec![crate::RegressionGateEvidence {
+                gate: EvaluationGate::ReplayTests,
+                outcome: EvaluationOutcome::Failed,
+                summary: "timeout replay still fails".to_string(),
+            }],
+            failed_commands: vec![crate::RegressionCommandFailure {
+                name: "focused-replay".to_string(),
+                command: "cargo test -p sinomo-evolution timeout_replay_fixture".to_string(),
+                expected_exit_code: 0,
+                exit_code: 1,
+                duration_ms: 420,
+                command_log_path: Some(command_log_path.display().to_string()),
+                stdout_excerpt: String::new(),
+                stderr_excerpt: "timeout replay still fails".to_string(),
+                rerun_command: "cargo test -p sinomo-evolution timeout_replay_fixture"
+                    .to_string(),
+            }],
+            failed_benchmarks: Vec::new(),
+            trace_fixtures: vec![crate::TraceDerivedRegressionFixture {
+                name: "timeout-replay".to_string(),
+                source: "module-replay-report".to_string(),
+                report_path: "replays/timeout-replay.json".to_string(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+                minimization_hint:
+                    "reduce timeout replay to the shortest trace that still fails".to_string(),
+                suggested_gate: EvaluationGate::ReplayTests,
+            }],
+            replay_minimization: crate::ReplayMinimizationPlan {
+                status: "ready-for-minimization".to_string(),
+                retained_evidence_refs: vec!["replays/timeout-replay.json".to_string()],
+                minimization_steps: vec![
+                    "reduce replays/timeout-replay.json before retry".to_string()
+                ],
+                candidate_gate_commands: vec![
+                    "cargo test -p sinomo-evolution timeout_replay_fixture".to_string()
+                ],
+            },
+            reusable_gate_suggestions: vec![
+                "keep replay fixture `timeout-replay` at `replays/timeout-replay.json` as a ReplayTests gate"
+                    .to_string(),
+            ],
+            generated_at: "2026-05-02T04:00:00Z".to_string(),
+        };
+        let lesson = crate::CandidateEvolutionLessonRecord {
+            lesson_id: "lesson_candidate_timeout".to_string(),
+            job_id: record.job.job_id.clone(),
+            objective: record.job.objective.clone(),
+            outcome: EvaluationOutcome::Failed,
+            failure_class: crate::EvolutionFailureClass::EvalRegression,
+            root_cause_summary: "timeout replay still reproduces".to_string(),
+            failed_assumptions: vec!["candidate would satisfy replay gate".to_string()],
+            rollback_evidence: vec!["no runtime rollout attempted".to_string()],
+            suggested_follow_up_tasks: vec![
+                "minimize timeout replay before another implementation attempt".to_string(),
+            ],
+            reusable_evidence_refs: vec!["replays/timeout-replay.json".to_string()],
+            recorded_at: "2026-05-02T04:00:00Z".to_string(),
+        };
+        write_json(
+            &bundle_dir.join(CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH),
+            &evidence,
+        )
+        .expect("regression evidence");
+        write_json(
+            &bundle_dir.join(CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH),
+            &lesson,
+        )
+        .expect("lesson");
+        let scorecard = EvaluationScorecard {
+            scorecard_id: ScorecardId::generate(),
+            baseline_artifact_id: None,
+            candidate_artifact_id: None,
+            outcome: EvaluationOutcome::Failed,
+            gates: Vec::new(),
+            metrics: Vec::new(),
+        };
+        let report = EvolutionReport {
+            job: record.job.clone(),
+            candidate_workspace: record.candidate_workspace.clone(),
+            bundle: record.bundle.clone(),
+            scorecard: Some(scorecard),
+            changed_files: record.changed_files.clone(),
+        };
+
+        write_report_record(&paths, &report).expect("write report");
+        write_report_record(&paths, &report).expect("idempotent memory rewrite");
+
+        let recent_lessons =
+            read_recent_evolution_lesson_memory(&paths, 8).expect("recent candidate lessons");
+        let recent_gates =
+            read_recent_proposed_regression_gate_memory(&paths, 8).expect("recent candidate gates");
+        assert_eq!(recent_lessons.len(), 1);
+        let lesson_memory = &recent_lessons[0];
+        assert_eq!(lesson_memory.campaign_id, "standalone-candidate");
+        assert!(lesson_memory.human_attention_needed);
+        assert_eq!(
+            lesson_memory.root_cause_summary,
+            "timeout replay still reproduces"
+        );
+        assert!(
+            lesson_memory
+                .evidence_refs
+                .iter()
+                .any(|evidence| evidence.contains("evolution-lesson:"))
+        );
+        assert!(recent_gates.iter().any(|gate| {
+            gate.proposed_gate.command.as_deref()
+                == Some("cargo test -p sinomo-evolution timeout_replay_fixture")
+        }));
+        assert!(recent_gates.iter().any(|gate| {
+            gate.proposed_gate.gate == EvaluationGate::ReplayTests
+                && gate.proposed_gate.evidence_ref == "replays/timeout-replay.json"
+        }));
+        assert_eq!(
+            fs::read_to_string(&paths.lesson_memory_jsonl)
+                .expect("lesson jsonl")
+                .lines()
+                .count(),
+            1
+        );
+        let gate_jsonl_count = fs::read_to_string(&paths.proposed_regression_gate_memory_jsonl)
+            .expect("gate jsonl")
+            .lines()
+            .count();
+        assert_eq!(gate_jsonl_count, recent_gates.len());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_background_scheduling_plan_persists_opportunity_intake_artifacts() {
+        let root = temp_dir("background-opportunity-intake");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let event = EventEnvelope::new(
+            EventId::generate(),
+            OffsetDateTime::now_utc(),
+            NodeId::from_legacy_named("node_desktop").expect("node"),
+            Source::new("module.live").expect("source"),
+            EventKind::new("module.timeout").expect("kind"),
+            Salience::new(0.83).expect("salience"),
+            Confidence::new(0.96).expect("confidence"),
+            RoutingMetadata::new(
+                RoutingScope::TrustedNetwork,
+                LatencyClass::Background,
+                PrivacyClass::Derived,
+            ),
+        )
+        .with_payload(serde_json::json!({
+            "module_id": "module.trigger.silence_policy",
+            "suggested_paths": ["modules/trigger/**"],
+            "evidence_refs": ["module-telemetry://timeout-window"]
+        }));
+        let event_id = event.event_id.clone();
+        let plan = crate::plan_background_scheduling_tick(crate::BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: Vec::new(),
+            opportunity_events: vec![event],
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: Some(crate::EvolutionOpportunityDetectionPolicy {
+                workspace_id: WorkspaceId::from_legacy_named("workspace_self_evolution")
+                    .expect("workspace"),
+                default_target_ring: TrustRing::R2TrustedService,
+                default_allowed_paths: vec!["crates/sinomo-module/**".to_string()],
+                default_forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
+            }),
+            opportunity_planner_node_id: Some(
+                NodeId::from_legacy_named("node_desktop").expect("node"),
+            ),
+            external_workloads: Vec::new(),
+            resources: Vec::new(),
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T01:30:00Z".to_string(),
+        });
+        assert_eq!(plan.opportunity_intake.len(), 1);
+        let intake = plan.opportunity_intake[0].clone();
+        let background_paths =
+            write_background_scheduling_plan(&paths, &plan).expect("background plan");
+
+        assert!(background_paths.opportunity_intake_json.exists());
+        assert!(background_paths.opportunity_intakes_jsonl.exists());
+        let persisted_intake: Vec<crate::BackgroundOpportunityIntake> =
+            read_json_file(&background_paths.opportunity_intake_json).expect("intake json");
+        assert_eq!(persisted_intake[0].campaign_id, intake.campaign_id);
+        assert!(
+            fs::read_to_string(&background_paths.opportunity_intakes_jsonl)
+                .expect("intake jsonl")
+                .contains("ModuleTimeout")
+        );
+        let intaken_event_ids =
+            read_background_opportunity_intake_event_ids(&paths).expect("intake event ids");
+        assert!(intaken_event_ids.contains(event_id.as_str()));
+
+        let bundle = CampaignBundlePaths::new(&paths, &intake.campaign_id);
+        assert!(bundle.background_opportunity_intake_json.exists());
+        assert!(bundle.background_scoped_job_json.exists());
+        assert!(bundle.background_workspace_plan_json.exists());
+        let scoped_job: EvolutionJob =
+            read_json_file(&bundle.background_scoped_job_json).expect("scoped job");
+        assert_eq!(scoped_job.job_id, intake.scoped_job.job_id);
+        let stored_campaign: EvolutionCampaign =
+            read_json_file(&bundle.campaign_json).expect("campaign");
+        assert!(stored_campaign.decisions.iter().any(|decision| {
+            decision
+                .evidence_refs
+                .iter()
+                .any(|evidence| evidence.ends_with("background-scoped-job.json"))
+        }));
         let _ = fs::remove_dir_all(root);
     }
 

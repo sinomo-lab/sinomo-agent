@@ -9,13 +9,15 @@ use sinomo_agent::{
 };
 use sinomo_evolution::{
     BackgroundSchedulerPaths, BackgroundSchedulingPlan, BackgroundSchedulingRequest,
-    CampaignBundlePaths, CampaignProposalInput, CandidateDecisionOptions,
-    EvolutionAgentMutationModel, EvolutionCampaign, EvolutionFailureClass,
-    EvolutionJobSelectionMode, EvolutionOrchestrator, EvolutionPaths, EvolutionReport,
-    EvolutionRequestInput, GitWorkspaceAdapter, LocalCandidateBundleStore, ResourceSchedulerDryRun,
+    CampaignBundlePaths, CampaignCheckpointDecision, CampaignProposalInput,
+    CandidateDecisionOptions, EvolutionAgentMutationModel, EvolutionCampaign,
+    EvolutionFailureClass, EvolutionJobSelectionMode, EvolutionOpportunityDetectionPolicy,
+    EvolutionOrchestrator, EvolutionPaths, EvolutionReport, EvolutionRequestInput,
+    GitWorkspaceAdapter, LocalCandidateBundleStore, ResourceSchedulerDryRun,
     ResourceSchedulerDryRunRequest, ResourceUsageEstimate, ScheduledIterationPlan,
     ScheduledIterationRequest, StageEvaluationRequest, StageEvaluationUpdate, StoredEvolutionJob,
-    StoredJobArtifactKind, candidate_resource_usage_estimates_for_report,
+    StoredJobArtifactKind, attach_evolution_memory_to_scheduled_iteration,
+    candidate_resource_usage_estimates_for_report, decide_campaign_checkpoint,
     decide_stored_evolution_job, decide_stored_evolution_job_with_options, decision_outcome_label,
     dry_run_resource_scheduler, ensure_stored_job_awaiting_approval, evaluate_campaign_stage,
     evolution_report_from_record, job_status_label, list_job_records,
@@ -24,8 +26,9 @@ use sinomo_evolution::{
     parse_module_replay_report_specs, parse_schedule_estimates, parse_schedule_resources,
     parse_stage_resource_usage, plan_background_scheduling_tick, prepare_campaign_proposal_request,
     prepare_evolution_request, prepare_scheduled_iteration, propose_evolution_campaign,
-    read_background_tick_campaigns, read_campaign, read_config, read_stored_job,
-    read_stored_job_artifact, select_stored_job, verify_stored_evolution_job,
+    read_background_opportunity_intake_event_ids, read_background_tick_campaigns, read_campaign,
+    read_config, read_recent_evolution_lesson_memory, read_recent_proposed_regression_gate_memory,
+    read_stored_job, read_stored_job_artifact, select_stored_job, verify_stored_evolution_job,
     write_background_scheduling_plan, write_campaign_bundle, write_campaign_iteration_dry_run,
     write_campaign_iteration_evaluation, write_campaign_schedule_dry_run,
     write_campaign_stage_evaluation, write_report_record,
@@ -203,7 +206,7 @@ use sinomo_runtime::dfs::{
     LocalJsonMetadataBackend, LocalShardedMetadataBackend,
 };
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
-use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
+use sinomo_runtime::events::{EventId, JsonlEventStore, ReplayDirection, ReplayQuery, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
 use sinomo_runtime::kv::{
     InProcessKvStore, KvEntry, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse,

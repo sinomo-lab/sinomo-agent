@@ -2886,6 +2886,14 @@ mod tests {
         let controller = RolloutController::new(node.clone());
         let state = controller.initial_state(plan, active_artifact_id.clone());
         sinomo_rollout::write_rollout_runtime_state(&rollout_paths, &state).expect("runtime state");
+        sinomo_rollout::write_rollout_telemetry_gate_config(
+            &rollout_paths,
+            &sinomo_rollout::RolloutTelemetryGateConfig {
+                automatic_promotion_enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("telemetry gate config");
         let mut event_store =
             sinomo_events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
         event_store
@@ -2953,6 +2961,7 @@ mod tests {
         sinomo_rollout::write_rollout_telemetry_gate_config(
             &rollout_paths,
             &sinomo_rollout::RolloutTelemetryGateConfig {
+                automatic_promotion_enabled: true,
                 maximum_automatic_weight_bps: Some(250),
                 ..Default::default()
             },
@@ -3024,6 +3033,7 @@ mod tests {
         sinomo_rollout::write_rollout_telemetry_gate_config(
             &rollout_paths,
             &sinomo_rollout::RolloutTelemetryGateConfig {
+                automatic_promotion_enabled: true,
                 maximum_automatic_weight_bps: Some(2_500),
                 ..Default::default()
             },

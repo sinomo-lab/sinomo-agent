@@ -58,6 +58,10 @@ use std::process::Command;
 use thiserror::Error;
 use time::OffsetDateTime;
 
+pub const CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH: &str = "regression-evidence.json";
+pub const CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH: &str = "evolution-lesson.json";
+pub const CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH: &str = "candidate-evidence-summary.md";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EvolutionOpportunity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +84,7 @@ pub enum EvolutionOpportunitySignalKind {
     ModuleCrash,
     ModulePolicyBlocked,
     ModuleUserCorrection,
+    RolloutRollback,
     MetricRegression,
     ReplayFailure,
     StaleScorecard,
@@ -223,6 +228,116 @@ pub struct CandidateResourceUsageSummary {
     pub records: Vec<CandidateResourceUsageRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduler_estimates: Vec<ResourceUsageEstimate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateRegressionEvidenceSummary {
+    pub job_id: EvolutionJobId,
+    pub objective: String,
+    pub target_ring: TrustRing,
+    pub outcome: EvaluationOutcome,
+    pub bundle_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorecard_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_gates: Vec<RegressionGateEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_commands: Vec<RegressionCommandFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_benchmarks: Vec<RegressionBenchmarkFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace_fixtures: Vec<TraceDerivedRegressionFixture>,
+    pub replay_minimization: ReplayMinimizationPlan,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reusable_gate_suggestions: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RegressionGateEvidence {
+    pub gate: EvaluationGate,
+    pub outcome: EvaluationOutcome,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RegressionCommandFailure {
+    pub name: String,
+    pub command: String,
+    pub expected_exit_code: i32,
+    pub exit_code: i32,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stdout_excerpt: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr_excerpt: String,
+    pub rerun_command: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RegressionBenchmarkFailure {
+    pub name: String,
+    pub outcome: EvaluationOutcome,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TraceDerivedRegressionFixture {
+    pub name: String,
+    pub source: String,
+    pub report_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_artifact_id: Option<String>,
+    pub minimization_hint: String,
+    pub suggested_gate: EvaluationGate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ReplayMinimizationPlan {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub minimization_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_gate_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateEvolutionLessonRecord {
+    pub lesson_id: String,
+    pub job_id: EvolutionJobId,
+    pub objective: String,
+    pub outcome: EvaluationOutcome,
+    pub failure_class: EvolutionFailureClass,
+    pub root_cause_summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_assumptions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollback_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_follow_up_tasks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reusable_evidence_refs: Vec<String>,
+    pub recorded_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1180,7 +1295,34 @@ pub struct ScheduledIterationPlan {
     pub task: NearTermEvolutionTask,
     pub evolution_request: EvolutionRequest,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_context: Vec<EvolutionIterationMemoryContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operator_notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionIterationMemoryContext {
+    pub memory_id: String,
+    pub source: EvolutionIterationMemorySource,
+    pub campaign_id: String,
+    pub stage_id: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<EvaluationGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum EvolutionIterationMemorySource {
+    Lesson,
+    ProposedRegressionGate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1265,6 +1407,8 @@ pub struct CampaignAdaptationRecord {
     pub next_task_simplification: String,
     pub new_eval_or_diagnostic: String,
     pub foundation_issue_detected: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_regression_gates: Vec<CampaignProposedRegressionGate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_task_candidate: Option<NearTermEvolutionTask>,
     pub budget_adjustment: String,
@@ -1274,11 +1418,72 @@ pub struct CampaignAdaptationRecord {
     pub recorded_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CampaignProposedRegressionGate {
+    pub gate_id: String,
+    pub gate: EvaluationGate,
+    pub source: String,
+    pub evidence_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    pub rationale: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionLessonMemoryRecord {
+    pub memory_id: String,
+    pub campaign_id: String,
+    pub adaptation_id: String,
+    pub stage_id: String,
+    pub failed_iteration_id: String,
+    pub failed_task_id: String,
+    pub failure_class: EvolutionFailureClass,
+    pub root_cause_summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub what_was_learned: Vec<String>,
+    pub next_task_simplification: String,
+    pub new_eval_or_diagnostic: String,
+    pub foundation_issue_detected: bool,
+    pub budget_adjustment: String,
+    pub human_attention_needed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_task_candidate: Option<NearTermEvolutionTask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_regression_gate_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub campaign_bundle_path: String,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionRegressionGateMemoryRecord {
+    pub memory_id: String,
+    pub campaign_id: String,
+    pub adaptation_id: String,
+    pub stage_id: String,
+    pub failed_task_id: String,
+    pub status: String,
+    pub proposed_gate: CampaignProposedRegressionGate,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub campaign_bundle_path: String,
+    pub recorded_at: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BackgroundSchedulingRequest {
     pub scheduler_service_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub campaigns: Vec<EvolutionCampaign>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opportunity_events: Vec<EventEnvelope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previously_intaken_opportunity_event_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opportunity_detection_policy: Option<EvolutionOpportunityDetectionPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opportunity_planner_node_id: Option<NodeId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_workloads: Vec<ClusterLongHorizonWorkload>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1411,6 +1616,10 @@ pub struct BackgroundSchedulingPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_workloads: Vec<ClusterWorkloadUpdate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opportunity_intake: Vec<BackgroundOpportunityIntake>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opportunity_events_skipped: Vec<BackgroundOpportunityEventSkip>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_campaigns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held_campaigns: Vec<String>,
@@ -1438,8 +1647,40 @@ pub struct BackgroundCampaignUpdate {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundOpportunityIntake {
+    pub detection: DetectedEvolutionOpportunity,
+    pub risk_gate: BackgroundOpportunityRiskGate,
+    pub scoped_job: EvolutionJob,
+    pub workspace_plan: CandidateWorkspacePlan,
+    pub campaign_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BackgroundOpportunityEventSkip {
+    pub event_id: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BackgroundOpportunityRiskGate {
+    pub accepted: bool,
+    pub human_checkpoint_required: bool,
+    #[serde(default)]
+    pub dispatch_allowed: bool,
+    pub evidence_gate: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub budget_gate: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub risk_filter: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum BackgroundSchedulingAction {
+    DispatchIteration,
     DispatchIterationDryRun,
     DispatchExternalWorkloadDryRun,
     ResumeAfterReset,
@@ -1508,6 +1749,12 @@ pub enum CampaignScheduleDecision {
     Scheduled,
     Delayed,
     PausedBudget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum CampaignCheckpointDecision {
+    Approve,
+    Reject,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1797,6 +2044,31 @@ pub fn plan_background_scheduling_tick(
     let mut held_workloads = Vec::new();
     let mut human_checkpoints = Vec::new();
     let mut timer_events = Vec::new();
+    let previously_intaken_opportunity_event_ids = request
+        .previously_intaken_opportunity_event_ids
+        .into_iter()
+        .filter(|event_id| !event_id.trim().is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut opportunity_events = Vec::new();
+    let mut opportunity_events_skipped = Vec::new();
+    for event in request.opportunity_events {
+        if previously_intaken_opportunity_event_ids.contains(event.event_id.as_str()) {
+            opportunity_events_skipped.push(BackgroundOpportunityEventSkip {
+                event_id: event.event_id.to_string(),
+                reason: "event already recorded in background opportunity intake history"
+                    .to_string(),
+            });
+        } else {
+            opportunity_events.push(event);
+        }
+    }
+
+    let (opportunity_intake, opportunity_campaigns) = background_opportunity_intake(
+        &opportunity_events,
+        request.opportunity_detection_policy.as_ref(),
+        request.opportunity_planner_node_id.as_ref(),
+        &now,
+    );
 
     if request.reset_window_open {
         timer_events.push(BackgroundTimerEvent {
@@ -1967,7 +2239,12 @@ pub fn plan_background_scheduling_tick(
         });
     }
 
-    for campaign in request.campaigns {
+    for campaign in request
+        .campaigns
+        .into_iter()
+        .chain(opportunity_campaigns.into_iter())
+    {
+        let campaign_context_evidence_refs = background_campaign_context_evidence_refs(&campaign);
         let previous_status = campaign.status.clone();
         if is_terminal_campaign_status(&campaign.status) {
             held_campaigns.push(campaign.campaign_id.clone());
@@ -1979,7 +2256,7 @@ pub fn plan_background_scheduling_tick(
                     .to_string(),
                 schedule_decision: None,
                 scheduled_iteration: None,
-                evidence_refs: Vec::new(),
+                evidence_refs: campaign_context_evidence_refs,
             });
             continue;
         }
@@ -2010,7 +2287,7 @@ pub fn plan_background_scheduling_tick(
                 reason,
                 schedule_decision: None,
                 scheduled_iteration: None,
-                evidence_refs: Vec::new(),
+                evidence_refs: campaign_context_evidence_refs,
             });
             continue;
         }
@@ -2018,6 +2295,13 @@ pub fn plan_background_scheduling_tick(
         if active_campaigns.len() >= concurrency_cap
             || active_workloads.len() >= workload_concurrency_cap
         {
+            let evidence_refs = background_campaign_evidence_refs_with(
+                &campaign,
+                vec![
+                    format!("active campaigns: {}", active_campaigns.join(", ")),
+                    format!("active workloads: {}", active_workloads.join(", ")),
+                ],
+            );
             held_campaigns.push(campaign.campaign_id.clone());
             campaigns.push(BackgroundCampaignUpdate {
                 campaign,
@@ -2026,10 +2310,7 @@ pub fn plan_background_scheduling_tick(
                 reason: format!("cluster scheduler concurrency cap is already occupied; campaign cap {concurrency_cap}, workload cap {workload_concurrency_cap}"),
                 schedule_decision: None,
                 scheduled_iteration: None,
-                evidence_refs: vec![
-                    format!("active campaigns: {}", active_campaigns.join(", ")),
-                    format!("active workloads: {}", active_workloads.join(", ")),
-                ],
+                evidence_refs,
             });
             continue;
         }
@@ -2046,6 +2327,7 @@ pub fn plan_background_scheduling_tick(
                 | EvolutionCampaignStatus::Scheduled
                 | EvolutionCampaignStatus::Running
         ) {
+            let evidence_refs = background_campaign_context_evidence_refs(&schedulable_campaign);
             held_campaigns.push(schedulable_campaign.campaign_id.clone());
             campaigns.push(BackgroundCampaignUpdate {
                 campaign: schedulable_campaign,
@@ -2056,12 +2338,13 @@ pub fn plan_background_scheduling_tick(
                         .to_string(),
                 schedule_decision: None,
                 scheduled_iteration: None,
-                evidence_refs: Vec::new(),
+                evidence_refs,
             });
             continue;
         }
 
         if schedulable_campaign.near_term_tasks.is_empty() {
+            let evidence_refs = background_campaign_context_evidence_refs(&schedulable_campaign);
             held_campaigns.push(schedulable_campaign.campaign_id.clone());
             campaigns.push(BackgroundCampaignUpdate {
                 campaign: schedulable_campaign,
@@ -2070,7 +2353,7 @@ pub fn plan_background_scheduling_tick(
                 reason: "campaign has no near-term tasks to dispatch".to_string(),
                 schedule_decision: None,
                 scheduled_iteration: None,
-                evidence_refs: Vec::new(),
+                evidence_refs,
             });
             continue;
         }
@@ -2085,6 +2368,14 @@ pub fn plan_background_scheduling_tick(
         if dry_run.aggregate_decision != CampaignScheduleDecision::Scheduled {
             let mut paused = schedulable_campaign;
             paused.status = EvolutionCampaignStatus::PausedBudget;
+            let evidence_refs = background_campaign_evidence_refs_with(
+                &paused,
+                dry_run
+                    .lease_decisions
+                    .iter()
+                    .map(|decision| format!("{}: {}", decision.decision_id, decision.reason))
+                    .collect(),
+            );
             held_campaigns.push(paused.campaign_id.clone());
             campaigns.push(BackgroundCampaignUpdate {
                 campaign: paused,
@@ -2095,11 +2386,7 @@ pub fn plan_background_scheduling_tick(
                         .to_string(),
                 schedule_decision: Some(dry_run.aggregate_decision),
                 scheduled_iteration: None,
-                evidence_refs: dry_run
-                    .lease_decisions
-                    .iter()
-                    .map(|decision| format!("{}: {}", decision.decision_id, decision.reason))
-                    .collect(),
+                evidence_refs,
             });
             continue;
         }
@@ -2110,7 +2397,7 @@ pub fn plan_background_scheduling_tick(
             task_id: None,
             intended_paths: Vec::new(),
             extra_verification_commands: Vec::new(),
-            dry_run: true,
+            dry_run: request.dry_run,
         })
         .ok();
         if scheduled_iteration.is_some() {
@@ -2119,21 +2406,35 @@ pub fn plan_background_scheduling_tick(
                 "sinomo-evolution:{}",
                 schedulable_campaign.campaign_id
             ));
-            campaigns.push(BackgroundCampaignUpdate {
-                campaign: schedulable_campaign,
-                previous_status,
-                action: BackgroundSchedulingAction::DispatchIterationDryRun,
-                reason: "cluster scheduler prepared one dry-run evolution iteration handoff; no agent was launched"
-                    .to_string(),
-                schedule_decision: Some(dry_run.aggregate_decision),
-                scheduled_iteration,
-                evidence_refs: dry_run
+            let action = if request.dry_run {
+                BackgroundSchedulingAction::DispatchIterationDryRun
+            } else {
+                BackgroundSchedulingAction::DispatchIteration
+            };
+            let reason = if request.dry_run {
+                "cluster scheduler prepared one dry-run evolution iteration handoff; no agent was launched"
+            } else {
+                "cluster scheduler reserved budget for one approved evolution iteration dispatch; rollout still requires explicit approval"
+            };
+            let evidence_refs = background_campaign_evidence_refs_with(
+                &schedulable_campaign,
+                dry_run
                     .lease_decisions
                     .iter()
                     .map(|decision| format!("{}: {}", decision.decision_id, decision.reason))
                     .collect(),
+            );
+            campaigns.push(BackgroundCampaignUpdate {
+                campaign: schedulable_campaign,
+                previous_status,
+                action,
+                reason: reason.to_string(),
+                schedule_decision: Some(dry_run.aggregate_decision),
+                scheduled_iteration,
+                evidence_refs,
             });
         } else {
+            let evidence_refs = background_campaign_context_evidence_refs(&schedulable_campaign);
             held_campaigns.push(schedulable_campaign.campaign_id.clone());
             campaigns.push(BackgroundCampaignUpdate {
                 campaign: schedulable_campaign,
@@ -2142,7 +2443,7 @@ pub fn plan_background_scheduling_tick(
                 reason: "campaign could not prepare an iteration handoff".to_string(),
                 schedule_decision: Some(dry_run.aggregate_decision),
                 scheduled_iteration: None,
-                evidence_refs: Vec::new(),
+                evidence_refs,
             });
         }
     }
@@ -2166,6 +2467,8 @@ pub fn plan_background_scheduling_tick(
         cluster_resources_after_tick: shared_resources,
         campaigns,
         external_workloads,
+        opportunity_intake,
+        opportunity_events_skipped,
         active_campaigns,
         held_campaigns,
         active_workloads,
@@ -2173,6 +2476,260 @@ pub fn plan_background_scheduling_tick(
         human_checkpoints,
         timer_events,
     }
+}
+
+fn background_campaign_evidence_refs_with(
+    campaign: &EvolutionCampaign,
+    extra: Vec<String>,
+) -> Vec<String> {
+    let mut evidence_refs = background_campaign_context_evidence_refs(campaign);
+    evidence_refs.extend(extra);
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    evidence_refs
+}
+
+fn background_campaign_context_evidence_refs(campaign: &EvolutionCampaign) -> Vec<String> {
+    let mut evidence_refs = Vec::new();
+    evidence_refs.extend(
+        campaign
+            .decisions
+            .iter()
+            .flat_map(|decision| decision.evidence_refs.iter().cloned()),
+    );
+    evidence_refs.extend(
+        campaign
+            .near_term_tasks
+            .iter()
+            .flat_map(|task| task.required_evidence.iter().cloned()),
+    );
+    evidence_refs.extend(
+        campaign
+            .stages
+            .iter()
+            .flat_map(|stage| stage.regression_gates.iter().cloned()),
+    );
+    evidence_refs.extend(
+        campaign
+            .objective_card
+            .constraints
+            .iter()
+            .filter(|constraint| constraint.starts_with("background-"))
+            .cloned(),
+    );
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    evidence_refs
+}
+
+fn background_opportunity_intake(
+    events: &[EventEnvelope],
+    policy: Option<&EvolutionOpportunityDetectionPolicy>,
+    planner_node_id: Option<&NodeId>,
+    now: &str,
+) -> (Vec<BackgroundOpportunityIntake>, Vec<EvolutionCampaign>) {
+    let Some(policy) = policy else {
+        return (Vec::new(), Vec::new());
+    };
+    if events.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let planner =
+        EvolutionPlanner::new(planner_node_id.cloned().unwrap_or_else(|| {
+            NodeId::from_legacy_named("node_background_evolution").expect("node")
+        }));
+    let mut intake = Vec::new();
+    let mut campaigns = Vec::new();
+    for detection in detect_evolution_opportunities_from_events(events, policy) {
+        let risk_gate = background_opportunity_risk_gate(&detection);
+        let (scoped_job, workspace_plan) = planner.scope_job(detection.opportunity.clone());
+        let campaign =
+            background_campaign_for_detected_opportunity(&detection, &risk_gate, &scoped_job, now);
+        let campaign_id = campaign.campaign_id.clone();
+        let evidence_refs = detection.evidence_refs.clone();
+        if risk_gate.accepted {
+            campaigns.push(campaign);
+        }
+        intake.push(BackgroundOpportunityIntake {
+            detection,
+            risk_gate,
+            scoped_job,
+            workspace_plan,
+            campaign_id,
+            evidence_refs,
+        });
+    }
+    (intake, campaigns)
+}
+
+fn background_opportunity_risk_gate(
+    detection: &DetectedEvolutionOpportunity,
+) -> BackgroundOpportunityRiskGate {
+    let accepted = !detection.evidence_refs.is_empty();
+    let trusted_runtime = matches!(
+        detection.opportunity.target_ring,
+        TrustRing::R0ContinuityRoot | TrustRing::R1TrustedRuntime | TrustRing::R2TrustedService
+    );
+    BackgroundOpportunityRiskGate {
+        accepted,
+        human_checkpoint_required: true,
+        dispatch_allowed: false,
+        evidence_gate: if accepted {
+            "detected opportunity carries event or evidence refs".to_string()
+        } else {
+            "detected opportunity has no reusable evidence refs".to_string()
+        },
+        budget_gate:
+            "intake is bounded to a dry-run campaign with max wall time 30m; scheduler leases are still required after human approval"
+                .to_string(),
+        risk_filter: if trusted_runtime {
+            "trusted-runtime target; intake only, no background dispatch".to_string()
+        } else {
+            "sandbox/module target; human checkpoint remains required before dispatch".to_string()
+        },
+        reason: if trusted_runtime {
+            "trusted-runtime opportunity is intake-only until human approval and stronger gates"
+                .to_string()
+        } else {
+            "opportunity is converted to a human-gated campaign; background tick must not promote"
+                .to_string()
+        },
+    }
+}
+
+fn background_campaign_for_detected_opportunity(
+    detection: &DetectedEvolutionOpportunity,
+    risk_gate: &BackgroundOpportunityRiskGate,
+    scoped_job: &EvolutionJob,
+    now: &str,
+) -> EvolutionCampaign {
+    let mut campaign = propose_evolution_campaign(CampaignProposalRequest {
+        objective: format!(
+            "Telemetry opportunity {:?}: {}",
+            detection.signal_kind, detection.opportunity.objective
+        ),
+        horizon: "14 days".to_string(),
+        budget_policy: "background-opportunity".to_string(),
+        reserve_floors: Vec::new(),
+        approval_policy: "human-gated-background-opportunity".to_string(),
+        max_wall_time: Some("30m".to_string()),
+        pause_after_proposal: true,
+        dry_run: true,
+        approved: false,
+        target_ring: detection.opportunity.target_ring.clone(),
+        source_repo: None,
+    });
+    campaign.status = EvolutionCampaignStatus::AwaitingApproval;
+    campaign.updated_at = now.to_string();
+    campaign.approval_checkpoint.required_before =
+        "background opportunity dispatch from telemetry".to_string();
+    campaign.approval_checkpoint.possible_actions = vec![
+        "approve campaign for dry-run scheduling".to_string(),
+        "reject noisy opportunity".to_string(),
+        "edit allowed paths or verification gates".to_string(),
+    ];
+    let risk_evidence = background_opportunity_risk_evidence(risk_gate);
+    let context_evidence = background_opportunity_context_evidence(detection);
+    campaign
+        .objective_card
+        .constraints
+        .extend(risk_evidence.clone());
+    campaign
+        .objective_card
+        .constraints
+        .extend(context_evidence.clone());
+    campaign.objective_card.safety_notes.push(
+        "background telemetry intake may create scoped work, but it does not promote or roll out runtime changes"
+            .to_string(),
+    );
+    if detection.signal_kind == EvolutionOpportunitySignalKind::RolloutRollback {
+        campaign.objective_card.success_metrics.push(
+            "Rollback follow-up produces a minimized replay, regression gate, or explicit no-change diagnosis before any new rollout attempt."
+                .to_string(),
+        );
+        campaign.objective_card.failure_conditions.push(
+            "Rollback evidence is treated as a generic patch request without replay or guard evidence."
+                .to_string(),
+        );
+    }
+    for task in &mut campaign.near_term_tasks {
+        task.required_evidence
+            .extend(detection.evidence_refs.clone());
+        task.required_evidence.extend(risk_evidence.clone());
+        task.required_evidence.extend(context_evidence.clone());
+        task.required_evidence.push(format!(
+            "scoped job {} must remain inspectable before agent dispatch",
+            scoped_job.job_id
+        ));
+        task.required_evidence.sort();
+        task.required_evidence.dedup();
+        task.approval_required = true;
+        if detection.signal_kind == EvolutionOpportunitySignalKind::RolloutRollback {
+            task.expected_result_kind = EvolutionResultKind::RolloutGuard;
+            task.objective = format!(
+                "{} Convert the rollback transition evidence into a minimized replay, regression gate, or explicit no-change diagnosis before proposing another rollout.",
+                task.objective
+            );
+        }
+    }
+    campaign.decisions.push(CampaignDecision {
+        decision_id: generated_id("decision"),
+        kind: CampaignDecisionKind::ProposalCreated,
+        summary: format!(
+            "Background intake created human-gated campaign from {:?}",
+            detection.signal_kind
+        ),
+        rationale: risk_gate.reason.clone(),
+        evidence_refs: detection.evidence_refs.clone(),
+        decided_by: "background-opportunity-intake".to_string(),
+        decided_at: now.to_string(),
+    });
+    campaign
+}
+
+fn background_opportunity_context_evidence(
+    detection: &DetectedEvolutionOpportunity,
+) -> Vec<String> {
+    let mut evidence = match detection.signal_kind {
+        EvolutionOpportunitySignalKind::RolloutRollback => vec![
+            "background-context-signal=rollout-rollback".to_string(),
+            "background-context-required-output=rollout-guard-or-minimized-regression-gate"
+                .to_string(),
+            "background-context-replay-minimization-required=true".to_string(),
+        ],
+        _ => Vec::new(),
+    };
+    evidence.sort();
+    evidence.dedup();
+    evidence
+}
+
+fn background_opportunity_risk_evidence(risk_gate: &BackgroundOpportunityRiskGate) -> Vec<String> {
+    let mut evidence = vec![
+        format!("background-risk-accepted={}", risk_gate.accepted),
+        format!(
+            "background-risk-human-checkpoint-required={}",
+            risk_gate.human_checkpoint_required
+        ),
+        format!(
+            "background-risk-dispatch-allowed-at-intake={}",
+            risk_gate.dispatch_allowed
+        ),
+        format!("background-risk-evidence-gate={}", risk_gate.evidence_gate),
+        format!("background-risk-reason={}", risk_gate.reason),
+    ];
+    if !risk_gate.budget_gate.is_empty() {
+        evidence.push(format!(
+            "background-risk-budget-gate={}",
+            risk_gate.budget_gate
+        ));
+    }
+    if !risk_gate.risk_filter.is_empty() {
+        evidence.push(format!("background-risk-filter={}", risk_gate.risk_filter));
+    }
+    evidence.sort();
+    evidence.dedup();
+    evidence
 }
 
 pub fn cluster_workload_key(workload: &ClusterLongHorizonWorkload) -> String {
@@ -2704,19 +3261,7 @@ pub fn prepare_scheduled_iteration(
     };
     let iteration_id = generated_id("iter");
     let evolution_request = EvolutionRequest {
-        objective: format!(
-            "Campaign {} scheduled iteration {}\nTask {}: {}\n\nTask objective: {}\nRequired evidence: {}",
-            campaign.campaign_id,
-            iteration_id,
-            task.task_id,
-            task.title,
-            task.objective,
-            if task.required_evidence.is_empty() {
-                "none declared".to_string()
-            } else {
-                task.required_evidence.join("; ")
-            }
-        ),
+        objective: scheduled_iteration_objective(&campaign.campaign_id, &iteration_id, &task),
         target_ring: campaign.target_ring.clone(),
         intended_paths,
         verification_commands,
@@ -2726,18 +3271,328 @@ pub fn prepare_scheduled_iteration(
         model: None,
         dry_run: request.dry_run,
     };
+    let mut operator_notes = vec![
+        "resource scheduling must have granted a lease before model or agent dispatch".to_string(),
+        "candidate work happens in an isolated worktree; the active checkout is not mutated"
+            .to_string(),
+    ];
+    if task.expected_result_kind == EvolutionResultKind::RolloutGuard {
+        operator_notes.push(
+            "rollout-guard iterations must produce a minimized replay, regression gate, or explicit no-change diagnosis before proposing another rollout"
+                .to_string(),
+        );
+        operator_notes
+            .push("runtime rollout remains a separate explicit approval/apply step".to_string());
+    }
     Ok(ScheduledIterationPlan {
         campaign_id: campaign.campaign_id,
         iteration_id,
         task,
         evolution_request,
-        operator_notes: vec![
-            "resource scheduling must have granted a lease before model or agent dispatch"
-                .to_string(),
-            "candidate work happens in an isolated worktree; the active checkout is not mutated"
-                .to_string(),
-        ],
+        memory_context: Vec::new(),
+        operator_notes,
     })
+}
+
+fn scheduled_iteration_objective(
+    campaign_id: &str,
+    iteration_id: &str,
+    task: &NearTermEvolutionTask,
+) -> String {
+    let required_evidence = if task.required_evidence.is_empty() {
+        "none declared".to_string()
+    } else {
+        task.required_evidence.join("; ")
+    };
+    let mut objective = format!(
+        "Campaign {campaign_id} scheduled iteration {iteration_id}\nTask {}: {}\n\nTask objective: {}\nRequired evidence: {required_evidence}",
+        task.task_id, task.title, task.objective
+    );
+    if task.expected_result_kind == EvolutionResultKind::RolloutGuard {
+        let rollback_evidence_refs = task
+            .required_evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.starts_with("rollout-telemetry://")
+                    || evidence.starts_with("event://")
+                    || evidence.contains("rollout-rollback")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        objective.push_str(
+            "\n\nRollout guard handoff:\n- Treat this as post-rollback regression mining, not a normal feature patch.\n- Preserve or produce a minimized replay, private regression gate, or explicit no-change diagnosis.\n- Do not request runtime rollout or promotion from this iteration.",
+        );
+        if !rollback_evidence_refs.is_empty() {
+            objective.push_str("\n- Rollback evidence refs: ");
+            objective.push_str(&rollback_evidence_refs.join("; "));
+        }
+    }
+    objective
+}
+
+pub fn attach_evolution_memory_to_scheduled_iteration(
+    mut plan: ScheduledIterationPlan,
+    lessons: &[EvolutionLessonMemoryRecord],
+    gates: &[EvolutionRegressionGateMemoryRecord],
+    limit: usize,
+) -> ScheduledIterationPlan {
+    let contexts = evolution_iteration_memory_contexts(&plan.task.stage_id, lessons, gates, limit);
+    if contexts.is_empty() {
+        return plan;
+    }
+    let rendered = render_iteration_memory_context(&contexts);
+    plan.evolution_request.objective = format!(
+        "{}\n\nPrior self-evolution memory:\n{}",
+        plan.evolution_request.objective, rendered
+    );
+    let applied_gates = apply_memory_regression_gates_to_iteration_plan(&mut plan, &contexts);
+    plan.operator_notes.push(format!(
+        "attached {} prior self-evolution lesson/gate memory item(s) to the model handoff",
+        contexts.len()
+    ));
+    if applied_gates.command_gates > 0 || applied_gates.replay_fixture_gates > 0 {
+        plan.operator_notes.push(format!(
+            "materialized {} memory command gate(s) and {} replay fixture gate(s) into scheduled verification",
+            applied_gates.command_gates, applied_gates.replay_fixture_gates
+        ));
+    }
+    if applied_gates.rollout_telemetry_window_gates > 0 {
+        plan.operator_notes.push(format!(
+            "attached {} rollout telemetry window gate(s) as replay-minimization evidence; convert them to concrete replay fixtures before treating them as executable gates",
+            applied_gates.rollout_telemetry_window_gates
+        ));
+    }
+    if applied_gates.telemetry_trace_evidence_gates > 0 {
+        plan.operator_notes.push(format!(
+            "attached {} telemetry/event trace gate(s) as replay-minimization evidence; convert them to concrete replay fixtures before treating them as executable gates",
+            applied_gates.telemetry_trace_evidence_gates
+        ));
+    }
+    plan.memory_context = contexts;
+    plan
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AppliedMemoryRegressionGates {
+    command_gates: usize,
+    replay_fixture_gates: usize,
+    rollout_telemetry_window_gates: usize,
+    telemetry_trace_evidence_gates: usize,
+}
+
+fn apply_memory_regression_gates_to_iteration_plan(
+    plan: &mut ScheduledIterationPlan,
+    contexts: &[EvolutionIterationMemoryContext],
+) -> AppliedMemoryRegressionGates {
+    let mut applied = AppliedMemoryRegressionGates::default();
+    let mut existing_commands = plan
+        .evolution_request
+        .verification_commands
+        .iter()
+        .map(|command| command.command.clone())
+        .collect::<BTreeSet<_>>();
+    let mut existing_replay_reports = plan
+        .evolution_request
+        .module_replay_reports
+        .iter()
+        .map(|report| report.report_path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut rollout_telemetry_windows = BTreeSet::new();
+    let mut telemetry_trace_evidence_refs = BTreeSet::new();
+
+    for context in contexts
+        .iter()
+        .filter(|context| context.source == EvolutionIterationMemorySource::ProposedRegressionGate)
+    {
+        if let Some(command) = &context.command
+            && existing_commands.insert(command.clone())
+        {
+            plan.evolution_request
+                .verification_commands
+                .push(VerificationCommand {
+                    name: memory_regression_gate_name("memory-gate", context),
+                    command: command.clone(),
+                    expected_exit_code: 0,
+                    gate: context
+                        .gate
+                        .clone()
+                        .unwrap_or(EvaluationGate::PrivateRegressionEvals),
+                });
+            applied.command_gates += 1;
+        }
+
+        if context.gate.as_ref() == Some(&EvaluationGate::ReplayTests)
+            && context.gate_source.as_deref() == Some("module-replay-report")
+            && let Some(report_path) = &context.primary_evidence_ref
+            && existing_replay_reports.insert(report_path.clone())
+        {
+            plan.evolution_request
+                .module_replay_reports
+                .push(ModuleReplayReportRef {
+                    name: memory_regression_gate_name("memory-replay", context),
+                    report_path: report_path.clone(),
+                    baseline_artifact_id: None,
+                    candidate_artifact_id: None,
+                });
+            applied.replay_fixture_gates += 1;
+        }
+
+        if context.gate.as_ref() == Some(&EvaluationGate::ReplayTests)
+            && context.gate_source.as_deref() == Some("rollout-telemetry-window")
+            && let Some(evidence_ref) = &context.primary_evidence_ref
+            && evidence_ref.starts_with("rollout-telemetry://window?")
+            && rollout_telemetry_windows.insert(evidence_ref.clone())
+        {
+            applied.rollout_telemetry_window_gates += 1;
+        }
+
+        if context.gate.as_ref() == Some(&EvaluationGate::ReplayTests)
+            && matches!(
+                context.gate_source.as_deref(),
+                Some("module-telemetry-window") | Some("event-log-signal")
+            )
+            && let Some(evidence_ref) = &context.primary_evidence_ref
+            && telemetry_trace_evidence_refs.insert(evidence_ref.clone())
+        {
+            applied.telemetry_trace_evidence_gates += 1;
+        }
+    }
+
+    if !rollout_telemetry_windows.is_empty() {
+        let rendered_windows = rollout_telemetry_windows
+            .iter()
+            .map(|evidence_ref| {
+                format!(
+                    "- {evidence_ref}: convert this telemetry window into a minimized replay fixture or private ReplayTests gate before relying on another rollout attempt."
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        plan.evolution_request.objective = format!(
+            "{}\n\nPrior rollout telemetry regression windows:\n{}",
+            plan.evolution_request.objective, rendered_windows
+        );
+    }
+    if !telemetry_trace_evidence_refs.is_empty() {
+        let rendered_refs = telemetry_trace_evidence_refs
+            .iter()
+            .map(|evidence_ref| {
+                format!(
+                    "- {evidence_ref}: convert this telemetry/event evidence into a minimized replay fixture or private ReplayTests gate before relying on another attempt."
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        plan.evolution_request.objective = format!(
+            "{}\n\nPrior telemetry regression evidence:\n{}",
+            plan.evolution_request.objective, rendered_refs
+        );
+    }
+
+    applied
+}
+
+fn memory_regression_gate_name(prefix: &str, context: &EvolutionIterationMemoryContext) -> String {
+    let mut name = String::with_capacity(prefix.len() + 1 + context.memory_id.len());
+    name.push_str(prefix);
+    name.push('-');
+    name.extend(context.memory_id.chars().map(|ch| {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            ch
+        } else {
+            '-'
+        }
+    }));
+    name
+}
+
+fn evolution_iteration_memory_contexts(
+    stage_id: &str,
+    lessons: &[EvolutionLessonMemoryRecord],
+    gates: &[EvolutionRegressionGateMemoryRecord],
+    limit: usize,
+) -> Vec<EvolutionIterationMemoryContext> {
+    let limit = limit.max(1);
+    let mut contexts = Vec::new();
+    let selected_lessons = lessons
+        .iter()
+        .rev()
+        .filter(|lesson| lesson.stage_id == stage_id || lesson.human_attention_needed)
+        .collect::<Vec<_>>();
+    let selected_lesson_adaptations = selected_lessons
+        .iter()
+        .map(|lesson| lesson.adaptation_id.clone())
+        .collect::<BTreeSet<_>>();
+    contexts.extend(
+        selected_lessons
+            .iter()
+            .map(|lesson| EvolutionIterationMemoryContext {
+                memory_id: lesson.memory_id.clone(),
+                source: EvolutionIterationMemorySource::Lesson,
+                campaign_id: lesson.campaign_id.clone(),
+                stage_id: lesson.stage_id.clone(),
+                summary: format!("{:?}: {}", lesson.failure_class, lesson.root_cause_summary),
+                gate: None,
+                gate_source: None,
+                primary_evidence_ref: None,
+                command: None,
+                evidence_refs: lesson.evidence_refs.clone(),
+            }),
+    );
+    contexts.extend(
+        gates
+            .iter()
+            .rev()
+            .filter(|gate| {
+                gate.stage_id == stage_id
+                    || selected_lesson_adaptations.contains(&gate.adaptation_id)
+            })
+            .map(|gate| EvolutionIterationMemoryContext {
+                memory_id: gate.memory_id.clone(),
+                source: EvolutionIterationMemorySource::ProposedRegressionGate,
+                campaign_id: gate.campaign_id.clone(),
+                stage_id: gate.stage_id.clone(),
+                summary: gate.proposed_gate.rationale.clone(),
+                gate: Some(gate.proposed_gate.gate.clone()),
+                gate_source: Some(gate.proposed_gate.source.clone()),
+                primary_evidence_ref: Some(gate.proposed_gate.evidence_ref.clone()),
+                command: gate.proposed_gate.command.clone(),
+                evidence_refs: {
+                    let mut evidence_refs = gate.evidence_refs.clone();
+                    evidence_refs.push(gate.proposed_gate.evidence_ref.clone());
+                    evidence_refs.sort();
+                    evidence_refs.dedup();
+                    evidence_refs
+                },
+            }),
+    );
+    let mut seen = BTreeSet::new();
+    contexts.retain(|context| seen.insert(context.memory_id.clone()));
+    contexts.truncate(limit);
+    contexts
+}
+
+fn render_iteration_memory_context(contexts: &[EvolutionIterationMemoryContext]) -> String {
+    contexts
+        .iter()
+        .map(|context| {
+            let mut line = format!(
+                "- {:?} {} [{}]: {}",
+                context.source, context.memory_id, context.stage_id, context.summary
+            );
+            if let Some(gate) = &context.gate {
+                line.push_str(&format!("; gate={gate:?}"));
+            }
+            if let Some(command) = &context.command {
+                line.push_str(&format!("; command=`{command}`"));
+            }
+            if !context.evidence_refs.is_empty() {
+                line.push_str(&format!("; evidence={}", context.evidence_refs.join(", ")));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn record_scheduled_iteration_result(
@@ -2766,34 +3621,7 @@ pub fn record_scheduled_iteration_result(
     } else {
         EvolutionIterationStatus::Evaluating
     };
-    let mut evidence = vec![
-        format!("job:{}", report.job.job_id),
-        format!(
-            "candidate-worktree:{}",
-            report.candidate_workspace.path.display()
-        ),
-        format!("bundle:{}", report.bundle.bundle_path),
-    ];
-    if let Some(scorecard_path) = &report.bundle.scorecard_path {
-        evidence.push(format!("scorecard:{scorecard_path}"));
-    }
-    if let Some(changed_files_path) = &report.bundle.changed_files_path {
-        evidence.push(format!("changed-files:{changed_files_path}"));
-    }
-    if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
-        evidence.push(format!("resource-usage:{resource_usage_path}"));
-    }
-    for usage in &resource_usage {
-        evidence.push(format!(
-            "resource-usage:{} estimated={} actual={}",
-            usage.resource,
-            usage.estimated_units,
-            usage
-                .actual_units
-                .map(|units| units.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        ));
-    }
+    let evidence = campaign_iteration_evidence_refs(report, &resource_usage);
     let summary = match outcome {
         Some(EvaluationOutcome::Passed) => Some(
             "candidate produced and verification passed; waiting for rollout approval".to_string(),
@@ -2944,15 +3772,36 @@ pub fn evaluate_campaign_stage(request: StageEvaluationRequest) -> StageEvaluati
 
     let mut campaign =
         record_scheduled_iteration_result(campaign, &task_id, &report, resource_usage);
+    let candidate_lesson = candidate_evolution_lesson_from_bundle(&report.bundle);
+    let candidate_regression_evidence = candidate_regression_evidence_from_bundle(&report.bundle);
     let adaptation = if outcome == EvaluationOutcome::Failed {
+        let inferred_failure_class = failure_class
+            .or_else(|| {
+                candidate_lesson
+                    .as_ref()
+                    .map(|lesson| lesson.failure_class.clone())
+            })
+            .unwrap_or_else(|| classify_failure_from_report(&report));
+        let inferred_root_cause = root_cause_summary.or_else(|| {
+            candidate_lesson
+                .as_ref()
+                .map(|lesson| lesson.root_cause_summary.clone())
+        });
+        let learned =
+            learned_items_from_candidate_lesson(what_was_learned, candidate_lesson.as_ref());
+        let learned = learned_items_from_candidate_regression_evidence(
+            learned,
+            candidate_regression_evidence.as_ref(),
+        );
         Some(build_campaign_adaptation_record(
             &mut campaign,
             task.as_ref(),
             &stage_id,
             &task_id,
-            failure_class.unwrap_or_else(|| classify_failure_from_report(&report)),
-            root_cause_summary,
-            what_was_learned,
+            inferred_failure_class,
+            inferred_root_cause,
+            learned,
+            candidate_regression_evidence.as_ref(),
             &evidence_refs,
             &now,
         ))
@@ -3033,6 +3882,19 @@ fn campaign_iteration_evidence_refs(
     if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
         evidence.push(format!("resource-usage:{resource_usage_path}"));
     }
+    for (label, relative_path) in [
+        (
+            "regression-evidence",
+            CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
+        ),
+        ("evolution-lesson", CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH),
+        ("evidence-summary", CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH),
+    ] {
+        let path = PathBuf::from(&report.bundle.bundle_path).join(relative_path);
+        if path.exists() {
+            evidence.push(format!("{label}:{}", path.display()));
+        }
+    }
     for usage in resource_usage {
         evidence.push(format!(
             "resource-usage:{} estimated={} actual={}",
@@ -3045,6 +3907,84 @@ fn campaign_iteration_evidence_refs(
         ));
     }
     evidence
+}
+
+fn candidate_evolution_lesson_from_bundle(
+    bundle: &CandidateBundleManifest,
+) -> Option<CandidateEvolutionLessonRecord> {
+    let path = PathBuf::from(&bundle.bundle_path).join(CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH);
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn candidate_regression_evidence_from_bundle(
+    bundle: &CandidateBundleManifest,
+) -> Option<CandidateRegressionEvidenceSummary> {
+    let path = PathBuf::from(&bundle.bundle_path).join(CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH);
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn learned_items_from_candidate_lesson(
+    mut learned: Vec<String>,
+    lesson: Option<&CandidateEvolutionLessonRecord>,
+) -> Vec<String> {
+    let Some(lesson) = lesson else {
+        return learned;
+    };
+    learned.extend(
+        lesson
+            .failed_assumptions
+            .iter()
+            .map(|assumption| format!("failed assumption: {assumption}")),
+    );
+    learned.extend(
+        lesson
+            .suggested_follow_up_tasks
+            .iter()
+            .map(|task| format!("candidate follow-up: {task}")),
+    );
+    learned.extend(
+        lesson
+            .reusable_evidence_refs
+            .iter()
+            .map(|evidence| format!("reusable evidence: {evidence}")),
+    );
+    learned.sort();
+    learned.dedup();
+    learned
+}
+
+fn learned_items_from_candidate_regression_evidence(
+    mut learned: Vec<String>,
+    evidence: Option<&CandidateRegressionEvidenceSummary>,
+) -> Vec<String> {
+    let Some(evidence) = evidence else {
+        return learned;
+    };
+    learned.extend(
+        evidence
+            .reusable_gate_suggestions
+            .iter()
+            .map(|suggestion| format!("candidate gate suggestion: {suggestion}")),
+    );
+    learned.extend(
+        evidence
+            .replay_minimization
+            .minimization_steps
+            .iter()
+            .map(|step| format!("replay minimization: {step}")),
+    );
+    learned.extend(
+        evidence
+            .replay_minimization
+            .retained_evidence_refs
+            .iter()
+            .map(|evidence_ref| format!("retained regression evidence: {evidence_ref}")),
+    );
+    learned.sort();
+    learned.dedup();
+    learned
 }
 
 fn classify_failure_from_report(report: &EvolutionReport) -> EvolutionFailureClass {
@@ -3069,6 +4009,7 @@ fn build_campaign_adaptation_record(
     failure_class: EvolutionFailureClass,
     root_cause_summary: Option<String>,
     what_was_learned: Vec<String>,
+    regression_evidence: Option<&CandidateRegressionEvidenceSummary>,
     evidence_refs: &[String],
     now: &str,
 ) -> CampaignAdaptationRecord {
@@ -3084,6 +4025,9 @@ fn build_campaign_adaptation_record(
         failure_class,
         EvolutionFailureClass::FoundationBlocker | EvolutionFailureClass::AmbiguousMetric
     );
+    let proposed_regression_gates =
+        proposed_regression_gates_from_candidate_evidence(task_id, regression_evidence);
+    attach_proposed_regression_gates_to_stage(campaign, stage_id, &proposed_regression_gates);
     let should_propose_replacement = foundation_issue_detected || repeated_failures >= 2;
     let replacement_task_candidate = if should_propose_replacement {
         Some(adapted_task_for_failure(
@@ -3092,6 +4036,7 @@ fn build_campaign_adaptation_record(
             task_id,
             &failure_class,
             root_cause_summary.as_deref(),
+            &proposed_regression_gates,
         ))
     } else {
         None
@@ -3130,8 +4075,12 @@ fn build_campaign_adaptation_record(
         }),
         what_was_learned,
         next_task_simplification: adaptation_simplification(&failure_class),
-        new_eval_or_diagnostic: adaptation_diagnostic(&failure_class),
+        new_eval_or_diagnostic: adaptation_diagnostic_with_gates(
+            &failure_class,
+            &proposed_regression_gates,
+        ),
         foundation_issue_detected,
+        proposed_regression_gates,
         replacement_task_candidate,
         budget_adjustment: adaptation_budget_adjustment(&failure_class),
         human_attention_needed,
@@ -3146,6 +4095,7 @@ fn adapted_task_for_failure(
     task_id: &str,
     failure_class: &EvolutionFailureClass,
     root_cause: Option<&str>,
+    proposed_regression_gates: &[CampaignProposedRegressionGate],
 ) -> NearTermEvolutionTask {
     let base_title = task
         .map(|task| task.title.clone())
@@ -3174,23 +4124,179 @@ fn adapted_task_for_failure(
             EvolutionResultKind::Instrumentation,
         ),
     };
+    let mut required_evidence = vec![
+        "failed iteration scorecard".to_string(),
+        "focused diagnostic or blocker repro".to_string(),
+    ];
+    required_evidence.extend(proposed_regression_gates.iter().map(|gate| {
+        format!(
+            "proposed {:?} regression gate from {}",
+            gate.gate, gate.evidence_ref
+        )
+    }));
+    required_evidence.sort();
+    required_evidence.dedup();
+
+    let mut verification_commands = task
+        .map(|task| task.verification_commands.clone())
+        .unwrap_or_default();
+    verification_commands.extend(
+        proposed_regression_gates
+            .iter()
+            .filter_map(|gate| gate.command.clone()),
+    );
+    verification_commands.sort();
+    verification_commands.dedup();
+
     NearTermEvolutionTask {
         task_id: generated_id("task"),
         stage_id: stage_id.to_string(),
         title,
         objective,
         rationale: "Phase 3 adaptation requires a failed task family to become easier, more diagnostic, or more foundational before retry.".to_string(),
-        required_evidence: vec![
-            "failed iteration scorecard".to_string(),
-            "focused diagnostic or blocker repro".to_string(),
-        ],
-        verification_commands: task
-            .map(|task| task.verification_commands.clone())
-            .unwrap_or_default(),
+        required_evidence,
+        verification_commands,
         estimated_budget: "smaller diagnostic lease before full implementation retry".to_string(),
         approval_required: true,
         expected_result_kind,
     }
+}
+
+pub(crate) fn proposed_regression_gates_from_candidate_evidence(
+    task_id: &str,
+    evidence: Option<&CandidateRegressionEvidenceSummary>,
+) -> Vec<CampaignProposedRegressionGate> {
+    let Some(evidence) = evidence else {
+        return Vec::new();
+    };
+    let mut gates = Vec::new();
+
+    for failure in &evidence.failed_commands {
+        gates.push(CampaignProposedRegressionGate {
+            gate_id: format!("gate_{}_{}", task_id, gates.len() + 1),
+            gate: EvaluationGate::StaticChecks,
+            source: "failed-command".to_string(),
+            evidence_ref: failure
+                .command_log_path
+                .clone()
+                .or_else(|| evidence.scorecard_path.clone())
+                .unwrap_or_else(|| evidence.bundle_path.clone()),
+            command: Some(failure.rerun_command.clone()),
+            rationale: format!(
+                "Rerun `{}` until the diagnostic task makes the failure reproducible or fixed.",
+                failure.command
+            ),
+        });
+    }
+
+    for failure in &evidence.failed_benchmarks {
+        gates.push(CampaignProposedRegressionGate {
+            gate_id: format!("gate_{}_{}", task_id, gates.len() + 1),
+            gate: EvaluationGate::PrivateRegressionEvals,
+            source: "failed-benchmark".to_string(),
+            evidence_ref: failure
+                .summary_path
+                .clone()
+                .or_else(|| failure.results_dir.clone())
+                .or_else(|| failure.command_log_path.clone())
+                .unwrap_or_else(|| evidence.bundle_path.clone()),
+            command: Some(failure.command.clone()),
+            rationale: format!(
+                "Minimize benchmark `{}` into a private regression gate before retrying the original task.",
+                failure.name
+            ),
+        });
+    }
+
+    for fixture in &evidence.trace_fixtures {
+        gates.push(CampaignProposedRegressionGate {
+            gate_id: format!("gate_{}_{}", task_id, gates.len() + 1),
+            gate: fixture.suggested_gate.clone(),
+            source: fixture.source.clone(),
+            evidence_ref: fixture.report_path.clone(),
+            command: None,
+            rationale: fixture.minimization_hint.clone(),
+        });
+    }
+
+    for failed_gate in &evidence.failed_gates {
+        let evidence_ref = evidence
+            .scorecard_path
+            .clone()
+            .or_else(|| evidence.diff_path.clone())
+            .unwrap_or_else(|| evidence.bundle_path.clone());
+        let already_represented = gates
+            .iter()
+            .any(|gate| gate.gate == failed_gate.gate && gate.evidence_ref == evidence_ref);
+        if !already_represented {
+            gates.push(CampaignProposedRegressionGate {
+                gate_id: format!("gate_{}_{}", task_id, gates.len() + 1),
+                gate: failed_gate.gate.clone(),
+                source: "failed-scorecard-gate".to_string(),
+                evidence_ref,
+                command: None,
+                rationale: format!(
+                    "Preserve failed {:?} scorecard evidence: {}",
+                    failed_gate.gate, failed_gate.summary
+                ),
+            });
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    gates.retain(|gate| {
+        seen.insert((
+            format!("{:?}", gate.gate),
+            gate.source.clone(),
+            gate.evidence_ref.clone(),
+            gate.command.clone(),
+        ))
+    });
+    gates.truncate(8);
+    gates
+}
+
+fn attach_proposed_regression_gates_to_stage(
+    campaign: &mut EvolutionCampaign,
+    stage_id: &str,
+    proposed_regression_gates: &[CampaignProposedRegressionGate],
+) {
+    if proposed_regression_gates.is_empty() {
+        return;
+    }
+    let Some(stage) = campaign
+        .stages
+        .iter_mut()
+        .find(|stage| stage.stage_id == stage_id)
+    else {
+        return;
+    };
+    stage
+        .regression_gates
+        .extend(proposed_regression_gates.iter().map(|gate| {
+            format!(
+                "{:?} gate from {} ({})",
+                gate.gate, gate.evidence_ref, gate.source
+            )
+        }));
+    stage.regression_gates.sort();
+    stage.regression_gates.dedup();
+}
+
+fn adaptation_diagnostic_with_gates(
+    failure_class: &EvolutionFailureClass,
+    proposed_regression_gates: &[CampaignProposedRegressionGate],
+) -> String {
+    let base = adaptation_diagnostic(failure_class);
+    if proposed_regression_gates.is_empty() {
+        return base;
+    }
+    let gates = proposed_regression_gates
+        .iter()
+        .map(|gate| format!("{:?} from {}", gate.gate, gate.evidence_ref))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{base}; proposed reusable gates: {gates}")
 }
 
 fn adaptation_simplification(failure_class: &EvolutionFailureClass) -> String {
@@ -3280,15 +4386,89 @@ pub fn accept_task_replacement_proposal(
     campaign
 }
 
+pub fn decide_campaign_checkpoint(
+    mut campaign: EvolutionCampaign,
+    decision: CampaignCheckpointDecision,
+    note: Option<String>,
+    decided_by: impl Into<String>,
+) -> EvolutionCampaign {
+    let now = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    let decided_by = decided_by.into();
+    let note = note
+        .map(|note| note.trim().to_string())
+        .filter(|note| !note.is_empty());
+
+    match decision {
+        CampaignCheckpointDecision::Approve => {
+            campaign.status = EvolutionCampaignStatus::Scheduled;
+            campaign.approval_checkpoint.status = ApprovalCheckpointStatus::Approved;
+            campaign.approval_checkpoint.required_before =
+                "background scheduler may request a resource lease before dispatch".to_string();
+            campaign.approval_checkpoint.possible_actions = vec![
+                "run background scheduler tick with --dispatch-approved".to_string(),
+                "run explicit iteration with sinomo evolve iterate".to_string(),
+            ];
+            campaign.decisions.push(CampaignDecision {
+                decision_id: generated_id("decision"),
+                kind: CampaignDecisionKind::Approved,
+                summary: "Approved campaign checkpoint for scheduled iteration".to_string(),
+                rationale: note.unwrap_or_else(|| {
+                    "human checkpoint approved; resource scheduler still gates dispatch".to_string()
+                }),
+                evidence_refs: vec![
+                    "campaign.json".to_string(),
+                    "approval-checkpoint.json".to_string(),
+                ],
+                decided_by,
+                decided_at: now.clone(),
+            });
+        }
+        CampaignCheckpointDecision::Reject => {
+            campaign.status = EvolutionCampaignStatus::Cancelled;
+            campaign.approval_checkpoint.status = ApprovalCheckpointStatus::Rejected;
+            campaign.approval_checkpoint.required_before =
+                "campaign was rejected at human checkpoint".to_string();
+            campaign.approval_checkpoint.possible_actions = vec![
+                "inspect campaign bundle".to_string(),
+                "create a narrower replacement campaign".to_string(),
+            ];
+            campaign.decisions.push(CampaignDecision {
+                decision_id: generated_id("decision"),
+                kind: CampaignDecisionKind::Rejected,
+                summary: "Rejected campaign checkpoint".to_string(),
+                rationale: note
+                    .unwrap_or_else(|| "human checkpoint rejected this campaign".to_string()),
+                evidence_refs: vec![
+                    "campaign.json".to_string(),
+                    "approval-checkpoint.json".to_string(),
+                ],
+                decided_by,
+                decided_at: now.clone(),
+            });
+        }
+    }
+
+    campaign.updated_at = now;
+    campaign
+}
+
 fn default_iteration_intended_paths(kind: &EvolutionResultKind) -> Vec<String> {
     match kind {
         EvolutionResultKind::Documentation => vec!["docs/**".to_string()],
         EvolutionResultKind::Evaluator => vec!["crates/sinomo-eval/**".to_string()],
         EvolutionResultKind::TaskReplacementProposal => vec!["docs/plans/**".to_string()],
         EvolutionResultKind::Artifact => vec!["docs/**".to_string(), "crates/**".to_string()],
+        EvolutionResultKind::RolloutGuard => vec![
+            "crates/sinomo-rollout/**".to_string(),
+            "crates/sinomo-module/**".to_string(),
+            "crates/sinomo-evolution/**".to_string(),
+            "crates/sinomo-cli/**".to_string(),
+            "docs/**".to_string(),
+        ],
         EvolutionResultKind::Instrumentation
         | EvolutionResultKind::FoundationRepair
-        | EvolutionResultKind::RolloutGuard
         | EvolutionResultKind::Patch
         | EvolutionResultKind::Other(_) => vec![
             "crates/sinomo-evolution/**".to_string(),
@@ -5364,6 +6544,30 @@ where
                 .display()
                 .to_string(),
         );
+        let regression_evidence = candidate_regression_evidence_summary(
+            &job,
+            &bundle,
+            &request,
+            &scorecard,
+            &changed_files,
+            &command_results,
+            &benchmark_reports,
+        );
+        self.bundles.write_json(
+            &bundle,
+            CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
+            &regression_evidence,
+        )?;
+        self.bundles.write_text(
+            &bundle,
+            CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
+            &render_candidate_evidence_summary(&regression_evidence),
+        )?;
+        if scorecard.outcome != EvaluationOutcome::Passed {
+            let lesson = candidate_evolution_lesson_record(&job, &regression_evidence);
+            self.bundles
+                .write_json(&bundle, CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH, &lesson)?;
+        }
 
         finalize_candidate_bundle_integrity(
             &mut bundle,
@@ -5584,6 +6788,16 @@ fn candidate_bundle_artifact_refs(bundle: &CandidateBundleManifest) -> Vec<Strin
     refs.extend(bundle.diff_path.iter().cloned());
     refs.extend(bundle.scorecard_path.iter().cloned());
     refs.extend(bundle.command_logs.iter().map(|log| log.log_path.clone()));
+    for relative in [
+        CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
+        CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH,
+        CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
+    ] {
+        let path = PathBuf::from(&bundle.bundle_path).join(relative);
+        if path.exists() {
+            refs.push(path.display().to_string());
+        }
+    }
     let rollout_material_path = candidate_bundle_release_material_path(bundle);
     if rollout_material_path.exists() {
         refs.push(rollout_material_path.display().to_string());
@@ -5684,6 +6898,543 @@ fn candidate_resource_usage_summary(
         scheduler_estimates: Vec::new(),
         records,
     }
+}
+
+fn candidate_regression_evidence_summary(
+    job: &EvolutionJob,
+    bundle: &CandidateBundleManifest,
+    request: &EvolutionRequest,
+    scorecard: &EvaluationScorecard,
+    changed_files: &[String],
+    command_results: &[CommandRunResult],
+    benchmark_reports: &[BenchmarkGateReport],
+) -> CandidateRegressionEvidenceSummary {
+    let failed_gates = scorecard
+        .gates
+        .iter()
+        .filter(|gate| gate.outcome != EvaluationOutcome::Passed)
+        .map(|gate| RegressionGateEvidence {
+            gate: gate.gate.clone(),
+            outcome: gate.outcome.clone(),
+            summary: gate.summary.clone(),
+        })
+        .collect::<Vec<_>>();
+    let failed_commands = command_results
+        .iter()
+        .filter(|result| !result.passed())
+        .map(|result| {
+            let command_log_path = bundle
+                .command_logs
+                .iter()
+                .find(|log| log.name == result.name)
+                .map(|log| log.log_path.clone());
+            RegressionCommandFailure {
+                name: result.name.clone(),
+                command: result.command.clone(),
+                expected_exit_code: result.expected_exit_code,
+                exit_code: result.exit_code,
+                duration_ms: result.duration_ms,
+                command_log_path,
+                stdout_excerpt: tail_excerpt(&result.stdout, 4096),
+                stderr_excerpt: tail_excerpt(&result.stderr, 4096),
+                rerun_command: result.command.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let failed_benchmarks = benchmark_reports
+        .iter()
+        .filter(|report| report.outcome != EvaluationOutcome::Passed)
+        .map(|report| RegressionBenchmarkFailure {
+            name: report.name.clone(),
+            outcome: report.outcome.clone(),
+            command: report.command.clone(),
+            summary_path: report.summary_path.clone(),
+            results_dir: report.results_dir.clone(),
+            command_log_path: report.command_log_path.clone(),
+            summary_verdict: report.summary_verdict.clone(),
+            summary_error: report.summary_error.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut trace_fixtures = request
+        .module_replay_reports
+        .iter()
+        .map(|report| TraceDerivedRegressionFixture {
+            name: report.name.clone(),
+            source: "module-replay-report".to_string(),
+            report_path: report.report_path.clone(),
+            baseline_artifact_id: report
+                .baseline_artifact_id
+                .as_ref()
+                .map(ToString::to_string),
+            candidate_artifact_id: report
+                .candidate_artifact_id
+                .as_ref()
+                .map(ToString::to_string),
+            minimization_hint: format!(
+                "minimize `{}` to the smallest replay trace that still reproduces the failed gate",
+                report.report_path
+            ),
+            suggested_gate: EvaluationGate::ReplayTests,
+        })
+        .collect::<Vec<_>>();
+    trace_fixtures.extend(rollout_telemetry_trace_fixtures_from_request(request));
+    trace_fixtures.extend(module_telemetry_trace_fixtures_from_request(request));
+    trace_fixtures.extend(event_log_trace_fixtures_from_request(request));
+    trace_fixtures.sort_by(|left, right| {
+        left.report_path
+            .cmp(&right.report_path)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    trace_fixtures.dedup_by(|left, right| left.report_path == right.report_path);
+    let reusable_gate_suggestions =
+        reusable_gate_suggestions(&failed_commands, &failed_benchmarks, &trace_fixtures);
+    let replay_minimization = replay_minimization_plan(
+        bundle,
+        &failed_commands,
+        &failed_benchmarks,
+        &trace_fixtures,
+        &reusable_gate_suggestions,
+    );
+
+    CandidateRegressionEvidenceSummary {
+        job_id: job.job_id.clone(),
+        objective: job.objective.clone(),
+        target_ring: job.target_ring.clone(),
+        outcome: scorecard.outcome.clone(),
+        bundle_path: bundle.bundle_path.clone(),
+        scorecard_path: bundle.scorecard_path.clone(),
+        diff_path: bundle.diff_path.clone(),
+        changed_files: changed_files.to_vec(),
+        failed_gates,
+        failed_commands,
+        failed_benchmarks,
+        trace_fixtures,
+        replay_minimization,
+        reusable_gate_suggestions,
+        generated_at: now_rfc3339(),
+    }
+}
+
+fn rollout_telemetry_trace_fixtures_from_request(
+    request: &EvolutionRequest,
+) -> Vec<TraceDerivedRegressionFixture> {
+    rollout_telemetry_window_refs_from_text(&request.objective)
+        .into_iter()
+        .enumerate()
+        .map(|(index, evidence_ref)| TraceDerivedRegressionFixture {
+            name: format!("rollout-telemetry-window-{}", index + 1),
+            source: "rollout-telemetry-window".to_string(),
+            report_path: evidence_ref.clone(),
+            baseline_artifact_id: None,
+            candidate_artifact_id: None,
+            minimization_hint: format!(
+                "convert `{evidence_ref}` into the smallest replay or telemetry fixture that still reproduces the rollback trigger"
+            ),
+            suggested_gate: EvaluationGate::ReplayTests,
+        })
+        .collect()
+}
+
+fn module_telemetry_trace_fixtures_from_request(
+    request: &EvolutionRequest,
+) -> Vec<TraceDerivedRegressionFixture> {
+    trace_evidence_refs_from_text(&request.objective, "module-telemetry://")
+        .into_iter()
+        .enumerate()
+        .map(|(index, evidence_ref)| TraceDerivedRegressionFixture {
+            name: format!("module-telemetry-window-{}", index + 1),
+            source: "module-telemetry-window".to_string(),
+            report_path: evidence_ref.clone(),
+            baseline_artifact_id: None,
+            candidate_artifact_id: None,
+            minimization_hint: format!(
+                "convert `{evidence_ref}` into the smallest module replay or telemetry fixture that still reproduces the observed module failure"
+            ),
+            suggested_gate: EvaluationGate::ReplayTests,
+        })
+        .collect()
+}
+
+fn event_log_trace_fixtures_from_request(
+    request: &EvolutionRequest,
+) -> Vec<TraceDerivedRegressionFixture> {
+    trace_evidence_refs_from_text(&request.objective, "event://")
+        .into_iter()
+        .enumerate()
+        .map(|(index, evidence_ref)| TraceDerivedRegressionFixture {
+            name: format!("event-log-signal-{}", index + 1),
+            source: "event-log-signal".to_string(),
+            report_path: evidence_ref.clone(),
+            baseline_artifact_id: None,
+            candidate_artifact_id: None,
+            minimization_hint: format!(
+                "use `{evidence_ref}` to locate the smallest event-log window or replay trace that still reproduces the observed failure"
+            ),
+            suggested_gate: EvaluationGate::ReplayTests,
+        })
+        .collect()
+}
+
+fn rollout_telemetry_window_refs_from_text(text: &str) -> Vec<String> {
+    trace_evidence_refs_from_text(text, "rollout-telemetry://window?")
+}
+
+fn trace_evidence_refs_from_text(text: &str, prefix: &str) -> Vec<String> {
+    let mut refs = text
+        .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"' || ch == '\'')
+        .filter_map(|token| {
+            let token = token.trim_matches(|ch: char| {
+                matches!(ch, '.' | ')' | ']' | '}' | '(' | '[' | '{' | '`')
+            });
+            token.starts_with(prefix).then(|| token.to_string())
+        })
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn reusable_gate_suggestions(
+    failed_commands: &[RegressionCommandFailure],
+    failed_benchmarks: &[RegressionBenchmarkFailure],
+    trace_fixtures: &[TraceDerivedRegressionFixture],
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    suggestions.extend(failed_commands.iter().map(|failure| {
+        format!(
+            "add verification command `{}` for failure `{}`",
+            failure.command, failure.name
+        )
+    }));
+    suggestions.extend(failed_benchmarks.iter().map(|failure| {
+        format!(
+            "promote benchmark `{}` results to a private regression gate",
+            failure.name
+        )
+    }));
+    suggestions.extend(trace_fixtures.iter().map(|fixture| {
+        format!(
+            "keep replay fixture `{}` at `{}` as a ReplayTests gate",
+            fixture.name, fixture.report_path
+        )
+    }));
+    suggestions.sort();
+    suggestions.dedup();
+    suggestions
+}
+
+fn replay_minimization_plan(
+    bundle: &CandidateBundleManifest,
+    failed_commands: &[RegressionCommandFailure],
+    failed_benchmarks: &[RegressionBenchmarkFailure],
+    trace_fixtures: &[TraceDerivedRegressionFixture],
+    reusable_gate_suggestions: &[String],
+) -> ReplayMinimizationPlan {
+    let mut retained_evidence_refs = Vec::new();
+    retained_evidence_refs.extend(bundle.scorecard_path.iter().cloned());
+    retained_evidence_refs.extend(bundle.diff_path.iter().cloned());
+    retained_evidence_refs.extend(bundle.changed_files_path.iter().cloned());
+    retained_evidence_refs.extend(
+        failed_commands
+            .iter()
+            .filter_map(|failure| failure.command_log_path.clone()),
+    );
+    retained_evidence_refs.extend(
+        failed_benchmarks
+            .iter()
+            .filter_map(|failure| failure.summary_path.clone()),
+    );
+    retained_evidence_refs.extend(
+        trace_fixtures
+            .iter()
+            .map(|fixture| fixture.report_path.clone()),
+    );
+    retained_evidence_refs.sort();
+    retained_evidence_refs.dedup();
+
+    let mut minimization_steps = Vec::new();
+    if failed_commands.is_empty() && failed_benchmarks.is_empty() && trace_fixtures.is_empty() {
+        minimization_steps.push(
+            "inspect the scorecard and diff before creating a reusable regression fixture"
+                .to_string(),
+        );
+    }
+    minimization_steps.extend(failed_commands.iter().map(|failure| {
+        format!(
+            "rerun `{}` and reduce inputs until exit {} still reproduces",
+            failure.command, failure.exit_code
+        )
+    }));
+    minimization_steps.extend(failed_benchmarks.iter().map(|failure| {
+        format!(
+            "extract the smallest benchmark case from `{}` that preserves the verdict `{}`",
+            failure.name,
+            failure
+                .summary_verdict
+                .as_deref()
+                .or(failure.summary_error.as_deref())
+                .unwrap_or("failed")
+        )
+    }));
+    minimization_steps.extend(trace_fixtures.iter().map(|fixture| {
+        format!(
+            "reduce `{}` to the shortest replay trace that still fails",
+            fixture.report_path
+        )
+    }));
+
+    let mut candidate_gate_commands = failed_commands
+        .iter()
+        .map(|failure| failure.rerun_command.clone())
+        .collect::<Vec<_>>();
+    candidate_gate_commands.extend(reusable_gate_suggestions.iter().cloned());
+    candidate_gate_commands.sort();
+    candidate_gate_commands.dedup();
+
+    ReplayMinimizationPlan {
+        status: if retained_evidence_refs.is_empty() {
+            "needs-human-triage".to_string()
+        } else {
+            "ready-for-minimization".to_string()
+        },
+        retained_evidence_refs,
+        minimization_steps,
+        candidate_gate_commands,
+    }
+}
+
+fn candidate_evolution_lesson_record(
+    job: &EvolutionJob,
+    evidence: &CandidateRegressionEvidenceSummary,
+) -> CandidateEvolutionLessonRecord {
+    let failure_class = classify_failure_from_regression_evidence(evidence);
+    CandidateEvolutionLessonRecord {
+        lesson_id: generated_id("lesson"),
+        job_id: job.job_id.clone(),
+        objective: job.objective.clone(),
+        outcome: evidence.outcome.clone(),
+        failure_class: failure_class.clone(),
+        root_cause_summary: root_cause_summary_from_regression_evidence(evidence),
+        failed_assumptions: failed_assumptions_from_regression_evidence(evidence),
+        rollback_evidence: vec![
+            "no runtime rollout is attempted by candidate generation".to_string(),
+            format!("recovery strategy: {:?}", job.recovery.strategy),
+            job.recovery.note.clone(),
+        ],
+        suggested_follow_up_tasks: suggested_follow_up_tasks_from_regression_evidence(
+            evidence,
+            &failure_class,
+        ),
+        reusable_evidence_refs: evidence.replay_minimization.retained_evidence_refs.clone(),
+        recorded_at: now_rfc3339(),
+    }
+}
+
+fn classify_failure_from_regression_evidence(
+    evidence: &CandidateRegressionEvidenceSummary,
+) -> EvolutionFailureClass {
+    if !evidence.failed_benchmarks.is_empty()
+        || evidence
+            .failed_gates
+            .iter()
+            .any(|gate| matches!(gate.gate, EvaluationGate::PrivateRegressionEvals))
+    {
+        return EvolutionFailureClass::EvalRegression;
+    }
+    if evidence
+        .failed_gates
+        .iter()
+        .any(|gate| matches!(gate.gate, EvaluationGate::ReplayTests))
+    {
+        return EvolutionFailureClass::EvalRegression;
+    }
+    if evidence.failed_gates.iter().any(|gate| {
+        matches!(
+            gate.gate,
+            EvaluationGate::StaticChecks
+                | EvaluationGate::UnitTests
+                | EvaluationGate::IntegrationTests
+        )
+    }) {
+        return EvolutionFailureClass::BuildTestFailure;
+    }
+    if evidence.changed_files.is_empty() {
+        return EvolutionFailureClass::WrongTaskSelection;
+    }
+    EvolutionFailureClass::InconclusiveEvidence
+}
+
+fn root_cause_summary_from_regression_evidence(
+    evidence: &CandidateRegressionEvidenceSummary,
+) -> String {
+    if let Some(command) = evidence.failed_commands.first() {
+        return format!(
+            "verification command `{}` exited {}, expected {}",
+            command.command, command.exit_code, command.expected_exit_code
+        );
+    }
+    if let Some(benchmark) = evidence.failed_benchmarks.first() {
+        return format!(
+            "benchmark `{}` failed: {}",
+            benchmark.name,
+            benchmark
+                .summary_verdict
+                .as_deref()
+                .or(benchmark.summary_error.as_deref())
+                .unwrap_or("no benchmark summary")
+        );
+    }
+    if let Some(gate) = evidence.failed_gates.first() {
+        return format!("{:?} gate failed: {}", gate.gate, gate.summary);
+    }
+    if evidence.changed_files.is_empty() {
+        return "candidate produced no source diff for a mutation attempt".to_string();
+    }
+    "candidate evidence was inconclusive; inspect scorecard and command logs".to_string()
+}
+
+fn failed_assumptions_from_regression_evidence(
+    evidence: &CandidateRegressionEvidenceSummary,
+) -> Vec<String> {
+    let mut assumptions = Vec::new();
+    if evidence.changed_files.is_empty() {
+        assumptions
+            .push("the selected scope and model run would produce a candidate diff".to_string());
+    }
+    assumptions.extend(evidence.failed_commands.iter().map(|failure| {
+        format!(
+            "verification command `{}` would exit {}",
+            failure.command, failure.expected_exit_code
+        )
+    }));
+    assumptions.extend(
+        evidence
+            .failed_benchmarks
+            .iter()
+            .map(|failure| format!("benchmark `{}` would satisfy its gate", failure.name)),
+    );
+    assumptions.extend(
+        evidence
+            .failed_gates
+            .iter()
+            .map(|gate| format!("{:?} gate would pass: {}", gate.gate, gate.summary)),
+    );
+    assumptions.sort();
+    assumptions.dedup();
+    assumptions
+}
+
+fn suggested_follow_up_tasks_from_regression_evidence(
+    evidence: &CandidateRegressionEvidenceSummary,
+    failure_class: &EvolutionFailureClass,
+) -> Vec<String> {
+    let mut tasks = Vec::new();
+    match failure_class {
+        EvolutionFailureClass::WrongTaskSelection => tasks.push(
+            "create a smaller diagnostic task that first proves the intended edit scope can change"
+                .to_string(),
+        ),
+        EvolutionFailureClass::BuildTestFailure => tasks.push(
+            "add a focused build or unit-test reproduction before retrying the implementation"
+                .to_string(),
+        ),
+        EvolutionFailureClass::EvalRegression => tasks.push(
+            "minimize the replay or benchmark failure into a private regression gate".to_string(),
+        ),
+        _ => tasks.push(
+            "add an analysis-only task that explains the inconclusive evidence before retrying"
+                .to_string(),
+        ),
+    }
+    tasks.extend(
+        evidence
+            .replay_minimization
+            .minimization_steps
+            .iter()
+            .cloned(),
+    );
+    tasks.sort();
+    tasks.dedup();
+    tasks
+}
+
+fn render_candidate_evidence_summary(evidence: &CandidateRegressionEvidenceSummary) -> String {
+    let changed_files = if evidence.changed_files.is_empty() {
+        "none".to_string()
+    } else {
+        evidence.changed_files.join("\n")
+    };
+    let failed_gates = if evidence.failed_gates.is_empty() {
+        "none".to_string()
+    } else {
+        evidence
+            .failed_gates
+            .iter()
+            .map(|gate| format!("- {:?}: {}", gate.gate, gate.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let replay_fixtures = if evidence.trace_fixtures.is_empty() {
+        "none".to_string()
+    } else {
+        evidence
+            .trace_fixtures
+            .iter()
+            .map(|fixture| format!("- {}: {}", fixture.name, fixture.report_path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let minimization_steps = if evidence.replay_minimization.minimization_steps.is_empty() {
+        "none".to_string()
+    } else {
+        evidence
+            .replay_minimization
+            .minimization_steps
+            .iter()
+            .map(|step| format!("- {step}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let reusable_gate_suggestions = if evidence.reusable_gate_suggestions.is_empty() {
+        "none".to_string()
+    } else {
+        evidence
+            .reusable_gate_suggestions
+            .iter()
+            .map(|suggestion| format!("- {suggestion}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "# Candidate Evidence Summary\n\njob: {}\noutcome: {:?}\nobjective: {}\nbundle: {}\nscorecard: {}\ndiff: {}\n\n## Changed Files\n{}\n\n## Failed Gates\n{}\n\n## Trace-Derived Fixtures\n{}\n\n## Replay Minimization\nstatus: {}\n{}\n\n## Reusable Gate Suggestions\n{}\n",
+        evidence.job_id,
+        evidence.outcome,
+        evidence.objective,
+        evidence.bundle_path,
+        evidence.scorecard_path.as_deref().unwrap_or("none"),
+        evidence.diff_path.as_deref().unwrap_or("none"),
+        changed_files,
+        failed_gates,
+        replay_fixtures,
+        evidence.replay_minimization.status,
+        minimization_steps,
+        reusable_gate_suggestions
+    )
+}
+
+fn tail_excerpt(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let tail = value
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("[truncated]\n{tail}")
 }
 
 #[derive(Clone, Debug)]
@@ -6934,11 +8685,24 @@ fn opportunity_signal_kind(event: &EventEnvelope) -> Option<EvolutionOpportunity
             Some("runtime-error") => Some(EvolutionOpportunitySignalKind::ModuleCrash),
             _ => None,
         },
+        "rollout.transition.completed" if rollout_transition_event_is_rollback(event) => {
+            Some(EvolutionOpportunitySignalKind::RolloutRollback)
+        }
         "evolution.metric.regression" => Some(EvolutionOpportunitySignalKind::MetricRegression),
         "evolution.replay.failure" => Some(EvolutionOpportunitySignalKind::ReplayFailure),
         "evolution.scorecard.stale" => Some(EvolutionOpportunitySignalKind::StaleScorecard),
         _ => None,
     }
+}
+
+fn rollout_transition_event_is_rollback(event: &EventEnvelope) -> bool {
+    matches!(
+        event.payload.get("action").and_then(|value| value.as_str()),
+        Some("roll-back") | Some("rollback")
+    ) || matches!(
+        event.payload.get("stage").and_then(|value| value.as_str()),
+        Some("rolled-back")
+    )
 }
 
 fn opportunity_objective(
@@ -6972,6 +8736,9 @@ fn opportunity_objective(
         }
         EvolutionOpportunitySignalKind::ModuleUserCorrection => {
             format!("Reduce user corrections for {target} using replay-backed evidence")
+        }
+        EvolutionOpportunitySignalKind::RolloutRollback => {
+            format!("Investigate rollback of {target} and preserve reusable regression evidence")
         }
         EvolutionOpportunitySignalKind::MetricRegression => {
             "Investigate and improve the regressed metric with scoped verification".to_string()
@@ -7044,6 +8811,7 @@ fn opportunity_forbidden_paths(
 fn opportunity_evidence_refs(event: &EventEnvelope) -> Vec<String> {
     let mut refs = vec![format!("event://{}", event.event_id)];
     refs.extend(payload_string_array(event, "evidence_refs").unwrap_or_default());
+    refs.extend(payload_string_array(event, "triggering_evidence_refs").unwrap_or_default());
     refs.extend(
         event
             .evidence
@@ -8010,6 +9778,398 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_iteration_attaches_prior_memory_to_agent_handoff() {
+        let mut campaign = sample_approved_campaign("reuse prior lesson memory in next attempt");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let stage_id = campaign.near_term_tasks[0].stage_id.clone();
+        let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+            campaign: campaign.clone(),
+            task_id: Some(task_id.clone()),
+            intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+            extra_verification_commands: Vec::new(),
+            dry_run: false,
+        })
+        .expect("iteration plan");
+        let lesson = EvolutionLessonMemoryRecord {
+            memory_id: "lesson_memory_eval_timeout".to_string(),
+            campaign_id: "camp_previous".to_string(),
+            adaptation_id: "adapt_previous".to_string(),
+            stage_id: stage_id.clone(),
+            failed_iteration_id: "iter_previous".to_string(),
+            failed_task_id: task_id.clone(),
+            failure_class: EvolutionFailureClass::EvalRegression,
+            root_cause_summary: "module replay timeout still reproduces".to_string(),
+            what_was_learned: vec!["minimize the replay before retry".to_string()],
+            next_task_simplification: "create narrower replay".to_string(),
+            new_eval_or_diagnostic: "ReplayTests private gate".to_string(),
+            foundation_issue_detected: false,
+            budget_adjustment: "keep scheduler gate".to_string(),
+            human_attention_needed: false,
+            replacement_task_candidate: None,
+            proposed_regression_gate_ids: vec!["gate_timeout_replay".to_string()],
+            evidence_refs: vec!["evolution/memory/lessons/lesson.json".to_string()],
+            campaign_bundle_path: "/tmp/evolution/campaigns/camp_previous".to_string(),
+            recorded_at: "2026-05-02T03:20:00Z".to_string(),
+        };
+        let gate = EvolutionRegressionGateMemoryRecord {
+            memory_id: "gate_memory_timeout_replay".to_string(),
+            campaign_id: "camp_previous".to_string(),
+            adaptation_id: "adapt_previous".to_string(),
+            stage_id,
+            failed_task_id: task_id,
+            status: "proposed".to_string(),
+            proposed_gate: CampaignProposedRegressionGate {
+                gate_id: "gate_timeout_replay".to_string(),
+                gate: EvaluationGate::ReplayTests,
+                source: "module-replay-report".to_string(),
+                evidence_ref: "replays/timeout-replay.json".to_string(),
+                command: Some("cargo test -p sinomo-evolution timeout_replay_fixture".to_string()),
+                rationale: "keep timeout replay as a future private gate".to_string(),
+            },
+            evidence_refs: vec!["evolution/memory/proposed-regression-gates/gate.json".to_string()],
+            campaign_bundle_path: "/tmp/evolution/campaigns/camp_previous".to_string(),
+            recorded_at: "2026-05-02T03:20:00Z".to_string(),
+        };
+
+        let plan = attach_evolution_memory_to_scheduled_iteration(plan, &[lesson], &[gate], 8);
+
+        assert_eq!(plan.memory_context.len(), 2);
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains("Prior self-evolution memory")
+        );
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains("module replay timeout still reproduces")
+        );
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains("timeout_replay_fixture")
+        );
+        assert!(
+            plan.evolution_request
+                .verification_commands
+                .iter()
+                .any(|command| {
+                    command.command == "cargo test -p sinomo-evolution timeout_replay_fixture"
+                        && command.gate == EvaluationGate::ReplayTests
+                })
+        );
+        assert!(
+            plan.evolution_request
+                .module_replay_reports
+                .iter()
+                .any(|report| report.report_path == "replays/timeout-replay.json"
+                    && report.name.contains("gate_memory_timeout_replay"))
+        );
+        assert!(plan.operator_notes.iter().any(|note| {
+            note.contains("attached 2 prior self-evolution lesson/gate memory item")
+        }));
+        assert!(plan.operator_notes.iter().any(|note| {
+            note.contains("materialized 1 memory command gate") && note.contains("1 replay fixture")
+        }));
+    }
+
+    #[test]
+    fn scheduled_iteration_materializes_standalone_candidate_gate_with_selected_lesson() {
+        let mut campaign =
+            sample_approved_campaign("reuse failed standalone candidate gate in campaign");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+            campaign,
+            task_id: Some(task_id),
+            intended_paths: vec!["modules/trigger/**".to_string()],
+            extra_verification_commands: Vec::new(),
+            dry_run: false,
+        })
+        .expect("iteration plan");
+        let lesson = EvolutionLessonMemoryRecord {
+            memory_id: "candidate_lesson_memory_job_timeout".to_string(),
+            campaign_id: "standalone-candidate".to_string(),
+            adaptation_id: "candidate_job_timeout".to_string(),
+            stage_id: "standalone-candidate".to_string(),
+            failed_iteration_id: "job_timeout".to_string(),
+            failed_task_id: "job_timeout".to_string(),
+            failure_class: EvolutionFailureClass::EvalRegression,
+            root_cause_summary: "standalone timeout replay still fails".to_string(),
+            what_was_learned: vec![
+                "candidate follow-up: minimize timeout replay before retry".to_string(),
+            ],
+            next_task_simplification: "minimize timeout replay before retry".to_string(),
+            new_eval_or_diagnostic: "candidate regression evidence includes reusable gate commands"
+                .to_string(),
+            foundation_issue_detected: false,
+            budget_adjustment: "normal scheduler lease still required".to_string(),
+            human_attention_needed: true,
+            replacement_task_candidate: None,
+            proposed_regression_gate_ids: vec!["gate_job_timeout_1".to_string()],
+            evidence_refs: vec!["evolution-lesson:/tmp/bundle/evolution-lesson.json".to_string()],
+            campaign_bundle_path: "/tmp/bundle".to_string(),
+            recorded_at: "2026-05-02T04:00:00Z".to_string(),
+        };
+        let matching_gate = EvolutionRegressionGateMemoryRecord {
+            memory_id: "candidate_gate_memory_job_timeout_gate_1".to_string(),
+            campaign_id: "standalone-candidate".to_string(),
+            adaptation_id: "candidate_job_timeout".to_string(),
+            stage_id: "standalone-candidate".to_string(),
+            failed_task_id: "job_timeout".to_string(),
+            status: "proposed".to_string(),
+            proposed_gate: CampaignProposedRegressionGate {
+                gate_id: "gate_job_timeout_1".to_string(),
+                gate: EvaluationGate::ReplayTests,
+                source: "module-replay-report".to_string(),
+                evidence_ref: "replays/standalone-timeout.json".to_string(),
+                command: Some("cargo test -p sinomo-evolution standalone_timeout".to_string()),
+                rationale: "reuse failed standalone replay gate".to_string(),
+            },
+            evidence_refs: vec![
+                "regression-evidence:/tmp/bundle/regression-evidence.json".to_string(),
+            ],
+            campaign_bundle_path: "/tmp/bundle".to_string(),
+            recorded_at: "2026-05-02T04:00:00Z".to_string(),
+        };
+        let unrelated_gate = EvolutionRegressionGateMemoryRecord {
+            memory_id: "candidate_gate_memory_other_gate_1".to_string(),
+            campaign_id: "standalone-candidate".to_string(),
+            adaptation_id: "candidate_other".to_string(),
+            stage_id: "standalone-candidate".to_string(),
+            failed_task_id: "job_other".to_string(),
+            status: "proposed".to_string(),
+            proposed_gate: CampaignProposedRegressionGate {
+                gate_id: "gate_other_1".to_string(),
+                gate: EvaluationGate::ReplayTests,
+                source: "module-replay-report".to_string(),
+                evidence_ref: "replays/unrelated.json".to_string(),
+                command: Some("cargo test -p sinomo-evolution unrelated".to_string()),
+                rationale: "unrelated standalone gate should not attach without its lesson"
+                    .to_string(),
+            },
+            evidence_refs: Vec::new(),
+            campaign_bundle_path: "/tmp/other-bundle".to_string(),
+            recorded_at: "2026-05-02T04:00:00Z".to_string(),
+        };
+
+        let plan = attach_evolution_memory_to_scheduled_iteration(
+            plan,
+            &[lesson],
+            &[matching_gate, unrelated_gate],
+            8,
+        );
+
+        assert_eq!(plan.memory_context.len(), 2);
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains("standalone timeout replay still fails")
+        );
+        assert!(
+            plan.evolution_request
+                .verification_commands
+                .iter()
+                .any(|command| command.command
+                    == "cargo test -p sinomo-evolution standalone_timeout")
+        );
+        assert!(
+            plan.evolution_request
+                .module_replay_reports
+                .iter()
+                .any(|report| report.report_path == "replays/standalone-timeout.json")
+        );
+        assert!(
+            !plan
+                .evolution_request
+                .verification_commands
+                .iter()
+                .any(|command| command.command.contains("unrelated"))
+        );
+    }
+
+    #[test]
+    fn scheduled_iteration_attaches_rollout_telemetry_window_gate_memory_without_executing_it() {
+        let mut campaign = sample_approved_campaign("reuse rollback telemetry gate memory");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let stage_id = campaign.near_term_tasks[0].stage_id.clone();
+        let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+            campaign,
+            task_id: Some(task_id.clone()),
+            intended_paths: vec!["crates/sinomo-rollout/**".to_string()],
+            extra_verification_commands: Vec::new(),
+            dry_run: false,
+        })
+        .expect("iteration plan");
+        let telemetry_window = "rollout-telemetry://window?after=0&through=42&limit=1000";
+        let lesson = EvolutionLessonMemoryRecord {
+            memory_id: "lesson_memory_rollout_timeout".to_string(),
+            campaign_id: "camp_previous".to_string(),
+            adaptation_id: "adapt_rollout_timeout".to_string(),
+            stage_id: stage_id.clone(),
+            failed_iteration_id: "iter_previous".to_string(),
+            failed_task_id: task_id.clone(),
+            failure_class: EvolutionFailureClass::RolloutFailure,
+            root_cause_summary: "canary rollback timeout still lacks a minimized replay"
+                .to_string(),
+            what_was_learned: vec![
+                "rollout telemetry window must become a private gate before retry".to_string(),
+            ],
+            next_task_simplification: "minimize rollout telemetry window".to_string(),
+            new_eval_or_diagnostic: "ReplayTests telemetry-window gate".to_string(),
+            foundation_issue_detected: false,
+            budget_adjustment: "normal scheduler lease still required".to_string(),
+            human_attention_needed: false,
+            replacement_task_candidate: None,
+            proposed_regression_gate_ids: vec!["gate_rollout_window".to_string()],
+            evidence_refs: vec!["evolution/memory/lessons/rollout.json".to_string()],
+            campaign_bundle_path: "/tmp/evolution/campaigns/camp_previous".to_string(),
+            recorded_at: "2026-05-02T03:20:00Z".to_string(),
+        };
+        let gate = EvolutionRegressionGateMemoryRecord {
+            memory_id: "gate_memory_rollout_window".to_string(),
+            campaign_id: "camp_previous".to_string(),
+            adaptation_id: "adapt_rollout_timeout".to_string(),
+            stage_id,
+            failed_task_id: task_id,
+            status: "proposed".to_string(),
+            proposed_gate: CampaignProposedRegressionGate {
+                gate_id: "gate_rollout_window".to_string(),
+                gate: EvaluationGate::ReplayTests,
+                source: "rollout-telemetry-window".to_string(),
+                evidence_ref: telemetry_window.to_string(),
+                command: None,
+                rationale: "convert timeout rollback telemetry into a minimized replay gate"
+                    .to_string(),
+            },
+            evidence_refs: vec![
+                "regression-evidence:/tmp/bundle/regression-evidence.json".to_string(),
+            ],
+            campaign_bundle_path: "/tmp/evolution/campaigns/camp_previous".to_string(),
+            recorded_at: "2026-05-02T03:20:00Z".to_string(),
+        };
+
+        let plan = attach_evolution_memory_to_scheduled_iteration(plan, &[lesson], &[gate], 8);
+
+        assert_eq!(plan.memory_context.len(), 2);
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains("Prior rollout telemetry regression windows")
+        );
+        assert!(plan.evolution_request.objective.contains(telemetry_window));
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains("convert this telemetry window into a minimized replay fixture")
+        );
+        assert!(plan.evolution_request.module_replay_reports.is_empty());
+        assert!(
+            !plan
+                .evolution_request
+                .verification_commands
+                .iter()
+                .any(|command| command.command.contains("rollout-telemetry://window"))
+        );
+        assert!(plan.operator_notes.iter().any(|note| {
+            note.contains("attached 1 rollout telemetry window gate")
+                && note.contains("before treating them as executable gates")
+        }));
+    }
+
+    #[test]
+    fn scheduled_iteration_attaches_module_telemetry_gate_memory_without_executing_it() {
+        let mut campaign = sample_approved_campaign("reuse module telemetry gate memory");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let stage_id = campaign.near_term_tasks[0].stage_id.clone();
+        let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+            campaign,
+            task_id: Some(task_id.clone()),
+            intended_paths: vec!["crates/sinomo-module/**".to_string()],
+            extra_verification_commands: Vec::new(),
+            dry_run: false,
+        })
+        .expect("iteration plan");
+        let telemetry_ref = "module-telemetry://timeout-window";
+        let lesson = EvolutionLessonMemoryRecord {
+            memory_id: "lesson_memory_module_timeout".to_string(),
+            campaign_id: "camp_previous".to_string(),
+            adaptation_id: "adapt_module_timeout".to_string(),
+            stage_id: stage_id.clone(),
+            failed_iteration_id: "iter_previous".to_string(),
+            failed_task_id: task_id.clone(),
+            failure_class: EvolutionFailureClass::EvalRegression,
+            root_cause_summary: "module timeout telemetry still lacks a minimized replay"
+                .to_string(),
+            what_was_learned: vec![
+                "module telemetry must become a private replay gate before retry".to_string(),
+            ],
+            next_task_simplification: "minimize module timeout telemetry".to_string(),
+            new_eval_or_diagnostic: "ReplayTests telemetry gate".to_string(),
+            foundation_issue_detected: false,
+            budget_adjustment: "normal scheduler lease still required".to_string(),
+            human_attention_needed: false,
+            replacement_task_candidate: None,
+            proposed_regression_gate_ids: vec!["gate_module_timeout_window".to_string()],
+            evidence_refs: vec!["evolution/memory/lessons/module-timeout.json".to_string()],
+            campaign_bundle_path: "/tmp/evolution/campaigns/camp_previous".to_string(),
+            recorded_at: "2026-05-02T03:20:00Z".to_string(),
+        };
+        let gate = EvolutionRegressionGateMemoryRecord {
+            memory_id: "gate_memory_module_timeout_window".to_string(),
+            campaign_id: "camp_previous".to_string(),
+            adaptation_id: "adapt_module_timeout".to_string(),
+            stage_id,
+            failed_task_id: task_id,
+            status: "proposed".to_string(),
+            proposed_gate: CampaignProposedRegressionGate {
+                gate_id: "gate_module_timeout_window".to_string(),
+                gate: EvaluationGate::ReplayTests,
+                source: "module-telemetry-window".to_string(),
+                evidence_ref: telemetry_ref.to_string(),
+                command: None,
+                rationale: "convert module timeout telemetry into a minimized replay gate"
+                    .to_string(),
+            },
+            evidence_refs: vec![
+                "regression-evidence:/tmp/bundle/regression-evidence.json".to_string(),
+            ],
+            campaign_bundle_path: "/tmp/evolution/campaigns/camp_previous".to_string(),
+            recorded_at: "2026-05-02T03:20:00Z".to_string(),
+        };
+
+        let plan = attach_evolution_memory_to_scheduled_iteration(plan, &[lesson], &[gate], 8);
+
+        assert_eq!(plan.memory_context.len(), 2);
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains("Prior telemetry regression evidence")
+        );
+        assert!(plan.evolution_request.objective.contains(telemetry_ref));
+        assert!(
+            plan.evolution_request
+                .objective
+                .contains("convert this telemetry/event evidence into a minimized replay fixture")
+        );
+        assert!(plan.evolution_request.module_replay_reports.is_empty());
+        assert!(
+            !plan
+                .evolution_request
+                .verification_commands
+                .iter()
+                .any(|command| command.command.contains("module-telemetry://"))
+        );
+        assert!(plan.operator_notes.iter().any(|note| {
+            note.contains("attached 1 telemetry/event trace gate")
+                && note.contains("before treating them as executable gates")
+        }));
+    }
+
+    #[test]
     fn scheduled_iteration_result_pauses_campaign_for_rollout_review() {
         let mut campaign = propose_evolution_campaign(CampaignProposalRequest {
             objective: "improve the self-evolution scheduler so it can evaluate one implementation candidate".to_string(),
@@ -8240,6 +10400,246 @@ mod tests {
     }
 
     #[test]
+    fn stage_evaluation_uses_failed_candidate_lesson_for_adaptation() {
+        let root = temp_dir("campaign-lesson-adaptation");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir");
+        let mut campaign = sample_approved_campaign("adapt from candidate lesson evidence");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let mut report = sample_iteration_report(&campaign, &task_id, EvaluationOutcome::Failed);
+        report.bundle.bundle_path = bundle_dir.display().to_string();
+        report.bundle.scorecard_path =
+            Some(bundle_dir.join("scorecard.json").display().to_string());
+        report.bundle.changed_files_path =
+            Some(bundle_dir.join("changed-files.json").display().to_string());
+        let lesson = CandidateEvolutionLessonRecord {
+            lesson_id: "lesson_failed_eval".to_string(),
+            job_id: report.job.job_id.clone(),
+            objective: report.job.objective.clone(),
+            outcome: EvaluationOutcome::Failed,
+            failure_class: EvolutionFailureClass::EvalRegression,
+            root_cause_summary: "module replay timeout still reproduces".to_string(),
+            failed_assumptions: vec![
+                "the replay gate would pass after the candidate patch".to_string(),
+            ],
+            rollback_evidence: vec!["no rollout attempted".to_string()],
+            suggested_follow_up_tasks: vec![
+                "minimize the replay into a private regression gate".to_string(),
+            ],
+            reusable_evidence_refs: vec!["replays/trigger-timeout.json".to_string()],
+            recorded_at: "2026-05-02T01:20:00Z".to_string(),
+        };
+        fs::write(
+            bundle_dir.join(CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH),
+            serde_json::to_string_pretty(&lesson).expect("lesson json"),
+        )
+        .expect("write lesson");
+
+        let update = evaluate_campaign_stage(StageEvaluationRequest {
+            campaign,
+            task_id: task_id.clone(),
+            report,
+            resource_usage: Vec::new(),
+            failure_class: None,
+            root_cause_summary: None,
+            what_was_learned: Vec::new(),
+        });
+
+        let adaptation = update.adaptation.expect("lesson drives adaptation");
+        assert_eq!(adaptation.failed_task_id, task_id);
+        assert_eq!(
+            adaptation.failure_class,
+            EvolutionFailureClass::EvalRegression
+        );
+        assert_eq!(
+            adaptation.root_cause_summary,
+            "module replay timeout still reproduces"
+        );
+        assert!(
+            adaptation
+                .what_was_learned
+                .iter()
+                .any(|learned| learned.contains("failed assumption"))
+        );
+        assert!(
+            adaptation
+                .what_was_learned
+                .iter()
+                .any(|learned| learned.contains("private regression gate"))
+        );
+        assert!(adaptation.evidence_refs.iter().any(|evidence| {
+            evidence.contains("evolution-lesson:") && evidence.contains("evolution-lesson.json")
+        }));
+        assert!(
+            update.campaign.iteration_results[0]
+                .evidence
+                .iter()
+                .any(|evidence| {
+                    evidence.contains("evolution-lesson:")
+                        && evidence.contains("evolution-lesson.json")
+                })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_failed_campaign_iteration_proposes_reusable_regression_gates() {
+        let root = temp_dir("campaign-regression-gate-adaptation");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir");
+        let mut campaign = sample_approved_campaign("adapt repeated failure into private gates");
+        campaign.status = EvolutionCampaignStatus::Scheduled;
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        campaign.iteration_results.push(EvolutionIterationResult {
+            iteration_id: "iter_previous_eval_failure".to_string(),
+            task_id: task_id.clone(),
+            result_kind: EvolutionResultKind::Patch,
+            status: EvolutionIterationStatus::Adapted,
+            resource_usage: Vec::new(),
+            evidence: vec!["scorecard:/tmp/previous-scorecard.json".to_string()],
+            summary: Some("previous eval attempt failed".to_string()),
+        });
+        let mut report = sample_iteration_report(&campaign, &task_id, EvaluationOutcome::Failed);
+        report.bundle.bundle_path = bundle_dir.display().to_string();
+        report.bundle.scorecard_path =
+            Some(bundle_dir.join("scorecard.json").display().to_string());
+        report.bundle.changed_files_path =
+            Some(bundle_dir.join("changed-files.json").display().to_string());
+        let evidence = CandidateRegressionEvidenceSummary {
+            job_id: report.job.job_id.clone(),
+            objective: report.job.objective.clone(),
+            target_ring: report.job.target_ring.clone(),
+            outcome: EvaluationOutcome::Failed,
+            bundle_path: report.bundle.bundle_path.clone(),
+            scorecard_path: report.bundle.scorecard_path.clone(),
+            diff_path: report.bundle.diff_path.clone(),
+            changed_files: report.changed_files.clone(),
+            failed_gates: vec![RegressionGateEvidence {
+                gate: EvaluationGate::ReplayTests,
+                outcome: EvaluationOutcome::Failed,
+                summary: "timeout replay still fails".to_string(),
+            }],
+            failed_commands: vec![RegressionCommandFailure {
+                name: "focused-replay".to_string(),
+                command: "cargo test -p sinomo-evolution timeout_replay_fixture".to_string(),
+                expected_exit_code: 0,
+                exit_code: 101,
+                duration_ms: 1250,
+                command_log_path: Some(
+                    bundle_dir
+                        .join("command-logs/focused-replay.log")
+                        .display()
+                        .to_string(),
+                ),
+                stdout_excerpt: String::new(),
+                stderr_excerpt: "timeout replay still fails".to_string(),
+                rerun_command: "cargo test -p sinomo-evolution timeout_replay_fixture"
+                    .to_string(),
+            }],
+            failed_benchmarks: Vec::new(),
+            trace_fixtures: vec![TraceDerivedRegressionFixture {
+                name: "timeout-replay".to_string(),
+                source: "module-replay-report".to_string(),
+                report_path: "replays/timeout-replay.json".to_string(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+                minimization_hint:
+                    "reduce timeout replay to the shortest trace that still times out".to_string(),
+                suggested_gate: EvaluationGate::ReplayTests,
+            }],
+            replay_minimization: ReplayMinimizationPlan {
+                status: "ready-for-minimization".to_string(),
+                retained_evidence_refs: vec!["replays/timeout-replay.json".to_string()],
+                minimization_steps: vec![
+                    "reduce `replays/timeout-replay.json` to the shortest replay trace that still fails"
+                        .to_string(),
+                ],
+                candidate_gate_commands: vec![
+                    "cargo test -p sinomo-evolution timeout_replay_fixture".to_string(),
+                ],
+            },
+            reusable_gate_suggestions: vec![
+                "keep replay fixture `timeout-replay` at `replays/timeout-replay.json` as a ReplayTests gate"
+                    .to_string(),
+            ],
+            generated_at: "2026-05-02T02:00:00Z".to_string(),
+        };
+        fs::write(
+            bundle_dir.join(CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH),
+            serde_json::to_string_pretty(&evidence).expect("evidence json"),
+        )
+        .expect("write regression evidence");
+
+        let update = evaluate_campaign_stage(StageEvaluationRequest {
+            campaign,
+            task_id: task_id.clone(),
+            report,
+            resource_usage: Vec::new(),
+            failure_class: Some(EvolutionFailureClass::EvalRegression),
+            root_cause_summary: None,
+            what_was_learned: Vec::new(),
+        });
+
+        let adaptation = update
+            .adaptation
+            .expect("repeated failed eval creates adaptation");
+        assert!(
+            adaptation
+                .proposed_regression_gates
+                .iter()
+                .any(|gate| gate.source == "failed-command"
+                    && gate.command.as_deref()
+                        == Some("cargo test -p sinomo-evolution timeout_replay_fixture"))
+        );
+        assert!(
+            adaptation
+                .proposed_regression_gates
+                .iter()
+                .any(|gate| gate.gate == EvaluationGate::ReplayTests
+                    && gate.evidence_ref == "replays/timeout-replay.json")
+        );
+        assert!(
+            adaptation
+                .new_eval_or_diagnostic
+                .contains("proposed reusable gates")
+        );
+        assert!(
+            adaptation
+                .what_was_learned
+                .iter()
+                .any(|learned| learned.contains("candidate gate suggestion"))
+        );
+        let replacement = adaptation
+            .replacement_task_candidate
+            .expect("repeated failure proposes diagnostic task");
+        assert!(
+            replacement
+                .required_evidence
+                .iter()
+                .any(|evidence| evidence.contains("ReplayTests"))
+        );
+        assert!(
+            replacement.verification_commands.iter().any(|command| {
+                command == "cargo test -p sinomo-evolution timeout_replay_fixture"
+            })
+        );
+        assert_eq!(
+            update.campaign.near_term_tasks[0].task_id,
+            replacement.task_id
+        );
+        assert!(
+            update
+                .campaign
+                .stages
+                .iter()
+                .flat_map(|stage| stage.regression_gates.iter())
+                .any(|gate| gate.contains("replays/timeout-replay.json"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn background_scheduler_resumes_budget_paused_campaign_after_reset() {
         let mut campaign = sample_approved_campaign("make campaign scheduling durable");
         campaign.status = EvolutionCampaignStatus::PausedBudget;
@@ -8248,6 +10648,10 @@ mod tests {
         let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
             scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
             campaigns: vec![campaign.clone()],
+            opportunity_events: Vec::new(),
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: None,
+            opportunity_planner_node_id: None,
             external_workloads: Vec::new(),
             resources: vec![ResourceClassDefinition {
                 resource_id: "coding-plan-weekly".to_string(),
@@ -8294,6 +10698,91 @@ mod tests {
     }
 
     #[test]
+    fn campaign_checkpoint_approval_enables_scheduled_background_dispatch() {
+        let campaign = propose_evolution_campaign(CampaignProposalRequest {
+            objective: "review telemetry-created opportunity before dispatch".to_string(),
+            horizon: "14 days".to_string(),
+            budget_policy: "background-opportunity".to_string(),
+            reserve_floors: vec![ReserveFloor {
+                resource: "coding-plan-weekly".to_string(),
+                floor_percent: 30,
+            }],
+            approval_policy: "human-gated-background-opportunity".to_string(),
+            max_wall_time: Some("30m".to_string()),
+            pause_after_proposal: true,
+            dry_run: true,
+            approved: false,
+            target_ring: TrustRing::R2TrustedService,
+            source_repo: Some("/workspace/sinomo".to_string()),
+        });
+        assert_eq!(campaign.status, EvolutionCampaignStatus::AwaitingApproval);
+
+        let campaign = decide_campaign_checkpoint(
+            campaign,
+            CampaignCheckpointDecision::Approve,
+            Some("operator reviewed scoped telemetry evidence".to_string()),
+            "test-operator",
+        );
+        assert_eq!(campaign.status, EvolutionCampaignStatus::Scheduled);
+        assert_eq!(
+            campaign.approval_checkpoint.status,
+            ApprovalCheckpointStatus::Approved
+        );
+        assert!(campaign.decisions.iter().any(|decision| {
+            decision.kind == CampaignDecisionKind::Approved
+                && decision.rationale.contains("operator reviewed")
+        }));
+
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: vec![campaign.clone()],
+            opportunity_events: Vec::new(),
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: None,
+            opportunity_planner_node_id: None,
+            external_workloads: Vec::new(),
+            resources: vec![ResourceClassDefinition {
+                resource_id: "coding-plan-weekly".to_string(),
+                unit: "percent".to_string(),
+                total_units: 100,
+                used_units: 0,
+                reserve_floor_percent: 30,
+                reset_window: "weekly".to_string(),
+                notes: "test dispatch budget".to_string(),
+            }],
+            task_estimates: vec![ResourceUsageEstimate {
+                task_id,
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: None,
+            }],
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: false,
+            now: "2026-05-02T00:05:00Z".to_string(),
+        });
+
+        assert!(!plan.dry_run);
+        assert_eq!(
+            plan.campaigns[0].action,
+            BackgroundSchedulingAction::DispatchIteration
+        );
+        let scheduled = plan.campaigns[0]
+            .scheduled_iteration
+            .as_ref()
+            .expect("approved campaign receives dispatch plan");
+        assert!(!scheduled.evolution_request.dry_run);
+        assert!(
+            plan.campaigns[0]
+                .reason
+                .contains("rollout still requires explicit approval")
+        );
+    }
+
+    #[test]
     fn background_scheduler_budgets_external_workloads_and_evolution_campaigns_together() {
         let mut campaign = sample_approved_campaign("share scheduler budget with other systems");
         campaign.status = EvolutionCampaignStatus::Scheduled;
@@ -8302,6 +10791,10 @@ mod tests {
         let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
             scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
             campaigns: vec![campaign.clone()],
+            opportunity_events: Vec::new(),
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: None,
+            opportunity_planner_node_id: None,
             external_workloads: vec![ClusterLongHorizonWorkload {
                 workload_id: "backup-index-01".to_string(),
                 system: "backup".to_string(),
@@ -8389,6 +10882,10 @@ mod tests {
         let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
             scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
             campaigns: vec![campaign.clone()],
+            opportunity_events: Vec::new(),
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: None,
+            opportunity_planner_node_id: None,
             external_workloads: Vec::new(),
             resources: background_resource_classes_from_campaign_reserve_floors(
                 &[campaign.clone()],
@@ -8416,8 +10913,12 @@ mod tests {
             plan.campaigns[0].campaign.status,
             EvolutionCampaignStatus::PausedBudget
         );
-        assert_eq!(plan.campaigns[0].evidence_refs.len(), 1);
-        assert!(plan.campaigns[0].evidence_refs[0].contains("reserve floor"));
+        assert!(
+            plan.campaigns[0]
+                .evidence_refs
+                .iter()
+                .any(|evidence| evidence.contains("reserve floor"))
+        );
         let resource = plan
             .cluster_resources_after_tick
             .iter()
@@ -8431,6 +10932,10 @@ mod tests {
         let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
             scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
             campaigns: Vec::new(),
+            opportunity_events: Vec::new(),
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: None,
+            opportunity_planner_node_id: None,
             external_workloads: vec![ClusterLongHorizonWorkload {
                 workload_id: "dataset-curation-42".to_string(),
                 system: "memory".to_string(),
@@ -8493,6 +10998,10 @@ mod tests {
         let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
             scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
             campaigns: vec![first, second, checkpoint],
+            opportunity_events: Vec::new(),
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: None,
+            opportunity_planner_node_id: None,
             external_workloads: Vec::new(),
             resources: vec![ResourceClassDefinition {
                 resource_id: "coding-plan-weekly".to_string(),
@@ -8721,6 +11230,534 @@ mod tests {
         assert!(
             !job.required_gates
                 .contains(&EvaluationGate::ContinuityChecks)
+        );
+    }
+
+    #[test]
+    fn opportunity_detector_scopes_rollout_rollback_event_with_transition_evidence() {
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let workspace_id =
+            WorkspaceId::from_legacy_named("workspace_self_evolution").expect("workspace");
+        let event = opportunity_detection_event(
+            "rollout.transition.completed",
+            serde_json::json!({
+                "module_id": module_id.as_str(),
+                "action": "roll-back",
+                "stage": "rolled-back",
+                "triggering_evidence_refs": [
+                    "rollout-telemetry://active-rollback-trigger/timeout",
+                    "rollout-telemetry://window?after=0&through=42&limit=1000"
+                ]
+            }),
+        );
+        let event_ref = format!("event://{}", event.event_id);
+        let detections = detect_evolution_opportunities_from_events(
+            std::slice::from_ref(&event),
+            &EvolutionOpportunityDetectionPolicy {
+                workspace_id: workspace_id.clone(),
+                default_target_ring: TrustRing::R2TrustedService,
+                default_allowed_paths: vec!["modules/trigger/**".to_string()],
+                default_forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
+            },
+        );
+
+        assert_eq!(detections.len(), 1);
+        let detection = &detections[0];
+        assert_eq!(
+            detection.signal_kind,
+            EvolutionOpportunitySignalKind::RolloutRollback
+        );
+        assert_eq!(
+            detection.opportunity.target_module_id.as_ref(),
+            Some(&module_id)
+        );
+        assert_eq!(
+            detection.opportunity.target_ring,
+            TrustRing::R3SandboxedModule
+        );
+        assert!(
+            detection
+                .opportunity
+                .objective
+                .contains("Investigate rollback")
+        );
+        assert!(detection.evidence_refs.contains(&event_ref));
+        assert!(
+            detection.evidence_refs.iter().any(|evidence| {
+                evidence == "rollout-telemetry://active-rollback-trigger/timeout"
+            })
+        );
+        assert!(detection.evidence_refs.iter().any(|evidence| {
+            evidence == "rollout-telemetry://window?after=0&through=42&limit=1000"
+        }));
+        assert_eq!(
+            detection.opportunity.allowed_paths,
+            vec!["modules/trigger/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn background_tick_turns_rollout_rollback_into_guard_follow_up() {
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let workspace_id =
+            WorkspaceId::from_legacy_named("workspace_self_evolution").expect("workspace");
+        let event = opportunity_detection_event(
+            "rollout.transition.completed",
+            serde_json::json!({
+                "module_id": module_id.as_str(),
+                "target_ring": "r3-sandboxed-module",
+                "action": "roll-back",
+                "stage": "rolled-back",
+                "triggering_evidence_refs": [
+                    "rollout-telemetry://active-rollback-trigger/timeout",
+                    "rollout-telemetry://window?after=0&through=42&limit=1000"
+                ]
+            }),
+        );
+        let event_ref = format!("event://{}", event.event_id);
+
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: Vec::new(),
+            opportunity_events: vec![event],
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: Some(EvolutionOpportunityDetectionPolicy {
+                workspace_id,
+                default_target_ring: TrustRing::R2TrustedService,
+                default_allowed_paths: vec!["modules/trigger/**".to_string()],
+                default_forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
+            }),
+            opportunity_planner_node_id: Some(
+                NodeId::from_legacy_named("node_desktop").expect("node"),
+            ),
+            external_workloads: Vec::new(),
+            resources: Vec::new(),
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T00:35:00Z".to_string(),
+        });
+
+        assert_eq!(plan.opportunity_intake.len(), 1);
+        let intake = &plan.opportunity_intake[0];
+        assert_eq!(
+            intake.detection.signal_kind,
+            EvolutionOpportunitySignalKind::RolloutRollback
+        );
+        assert!(intake.evidence_refs.contains(&event_ref));
+        assert!(
+            intake.evidence_refs.iter().any(|evidence| {
+                evidence == "rollout-telemetry://active-rollback-trigger/timeout"
+            })
+        );
+
+        let campaign_update = &plan.campaigns[0];
+        assert_eq!(
+            campaign_update.action,
+            BackgroundSchedulingAction::HoldHumanCheckpoint
+        );
+        assert_eq!(
+            campaign_update.campaign.status,
+            EvolutionCampaignStatus::AwaitingApproval
+        );
+        assert!(
+            campaign_update
+                .campaign
+                .objective_card
+                .constraints
+                .iter()
+                .any(|constraint| constraint == "background-context-signal=rollout-rollback")
+        );
+        assert!(
+            campaign_update
+                .campaign
+                .objective_card
+                .success_metrics
+                .iter()
+                .any(|metric| metric.contains("minimized replay"))
+        );
+        let task = &campaign_update.campaign.near_term_tasks[0];
+        assert_eq!(task.expected_result_kind, EvolutionResultKind::RolloutGuard);
+        assert!(task.objective.contains("minimized replay"));
+        assert!(task.required_evidence.iter().any(|evidence| {
+            evidence
+                == "background-context-required-output=rollout-guard-or-minimized-regression-gate"
+        }));
+        assert!(task.required_evidence.iter().any(|evidence| {
+            evidence == "rollout-telemetry://window?after=0&through=42&limit=1000"
+        }));
+        assert!(task.approval_required);
+        assert!(campaign_update.scheduled_iteration.is_none());
+
+        let approved_campaign = decide_campaign_checkpoint(
+            campaign_update.campaign.clone(),
+            CampaignCheckpointDecision::Approve,
+            Some("operator reviewed rollback transition evidence".to_string()),
+            "test-operator",
+        );
+        let task_id = approved_campaign.near_term_tasks[0].task_id.clone();
+        let dispatch_plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: vec![approved_campaign],
+            opportunity_events: Vec::new(),
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: None,
+            opportunity_planner_node_id: None,
+            external_workloads: Vec::new(),
+            resources: vec![ResourceClassDefinition {
+                resource_id: "coding-plan-weekly".to_string(),
+                unit: "percent".to_string(),
+                total_units: 100,
+                used_units: 0,
+                reserve_floor_percent: 30,
+                reset_window: "weekly".to_string(),
+                notes: "test dispatch budget".to_string(),
+            }],
+            task_estimates: vec![ResourceUsageEstimate {
+                task_id,
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: None,
+            }],
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: false,
+            now: "2026-05-02T00:40:00Z".to_string(),
+        });
+
+        let dispatch_update = &dispatch_plan.campaigns[0];
+        assert_eq!(
+            dispatch_update.action,
+            BackgroundSchedulingAction::DispatchIteration
+        );
+        let scheduled = dispatch_update
+            .scheduled_iteration
+            .as_ref()
+            .expect("approved rollback guard gets scheduled handoff");
+        assert!(
+            scheduled
+                .evolution_request
+                .objective
+                .contains("Rollout guard handoff")
+        );
+        assert!(
+            scheduled
+                .evolution_request
+                .objective
+                .contains("post-rollback regression mining")
+        );
+        assert!(
+            scheduled
+                .evolution_request
+                .objective
+                .contains("rollout-telemetry://active-rollback-trigger/timeout")
+        );
+        assert!(
+            scheduled
+                .evolution_request
+                .intended_paths
+                .contains(&"crates/sinomo-rollout/**".to_string())
+        );
+        assert!(
+            scheduled
+                .operator_notes
+                .iter()
+                .any(|note| note.contains("rollout-guard iterations"))
+        );
+    }
+
+    #[test]
+    fn background_tick_intakes_opportunity_events_as_human_gated_campaigns() {
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let workspace_id =
+            WorkspaceId::from_legacy_named("workspace_self_evolution").expect("workspace");
+        let event = opportunity_detection_event(
+            MODULE_TIMEOUT_EVENT_KIND,
+            serde_json::json!({
+                "module_id": module_id.as_str(),
+                "suggested_paths": ["modules/trigger/**"],
+                "evidence_refs": ["module-telemetry://timeout-window"]
+            }),
+        );
+        let event_ref = format!("event://{}", event.event_id);
+
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: Vec::new(),
+            opportunity_events: vec![event],
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: Some(EvolutionOpportunityDetectionPolicy {
+                workspace_id: workspace_id.clone(),
+                default_target_ring: TrustRing::R2TrustedService,
+                default_allowed_paths: vec!["crates/sinomo-module/**".to_string()],
+                default_forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
+            }),
+            opportunity_planner_node_id: Some(
+                NodeId::from_legacy_named("node_desktop").expect("node"),
+            ),
+            external_workloads: Vec::new(),
+            resources: Vec::new(),
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T00:35:00Z".to_string(),
+        });
+
+        assert_eq!(plan.opportunity_intake.len(), 1);
+        let intake = &plan.opportunity_intake[0];
+        assert_eq!(
+            intake.detection.signal_kind,
+            EvolutionOpportunitySignalKind::ModuleTimeout
+        );
+        assert_eq!(
+            intake.detection.opportunity.target_ring,
+            TrustRing::R3SandboxedModule
+        );
+        assert_eq!(intake.detection.opportunity.workspace_id, workspace_id);
+        assert!(intake.risk_gate.accepted);
+        assert!(intake.risk_gate.human_checkpoint_required);
+        assert!(!intake.risk_gate.dispatch_allowed);
+        assert!(intake.risk_gate.evidence_gate.contains("event"));
+        assert!(intake.risk_gate.budget_gate.contains("30m"));
+        assert!(intake.risk_gate.risk_filter.contains("human checkpoint"));
+        assert_eq!(intake.scoped_job.target_ring, TrustRing::R3SandboxedModule);
+        assert!(
+            intake
+                .scoped_job
+                .required_gates
+                .contains(&EvaluationGate::ReplayTests)
+        );
+        assert!(intake.evidence_refs.contains(&event_ref));
+        assert!(
+            intake
+                .evidence_refs
+                .contains(&"module-telemetry://timeout-window".to_string())
+        );
+
+        assert_eq!(plan.campaigns.len(), 1);
+        let campaign_update = &plan.campaigns[0];
+        assert_eq!(
+            campaign_update.action,
+            BackgroundSchedulingAction::HoldHumanCheckpoint
+        );
+        assert_eq!(
+            campaign_update.campaign.status,
+            EvolutionCampaignStatus::AwaitingApproval
+        );
+        assert!(campaign_update.scheduled_iteration.is_none());
+        assert!(plan.active_campaigns.is_empty());
+        assert!(
+            plan.human_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.campaign_id == intake.campaign_id)
+        );
+        assert!(
+            campaign_update
+                .campaign
+                .near_term_tasks
+                .iter()
+                .all(|task| task.approval_required)
+        );
+        assert!(
+            campaign_update
+                .campaign
+                .objective_card
+                .constraints
+                .iter()
+                .any(|constraint| {
+                    constraint == "background-risk-dispatch-allowed-at-intake=false"
+                })
+        );
+        assert!(
+            campaign_update
+                .campaign
+                .objective_card
+                .constraints
+                .iter()
+                .any(|constraint| constraint.contains("background-risk-evidence-gate="))
+        );
+        assert!(campaign_update.campaign.near_term_tasks.iter().any(|task| {
+            task.required_evidence.contains(&event_ref)
+                && task
+                    .required_evidence
+                    .iter()
+                    .any(|evidence| evidence.contains("background-risk-filter="))
+        }));
+        assert!(
+            campaign_update.evidence_refs.contains(&event_ref)
+                && campaign_update.evidence_refs.iter().any(|evidence| {
+                    evidence.contains("background-risk-human-checkpoint-required=true")
+                })
+        );
+    }
+
+    #[test]
+    fn background_tick_skips_previously_intaken_opportunity_events() {
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let event = opportunity_detection_event(
+            MODULE_TIMEOUT_EVENT_KIND,
+            serde_json::json!({
+                "module_id": module_id.as_str(),
+                "evidence_refs": ["module-telemetry://timeout-window"]
+            }),
+        );
+        let event_id = event.event_id.to_string();
+
+        let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: Vec::new(),
+            opportunity_events: vec![event],
+            previously_intaken_opportunity_event_ids: vec![event_id.clone()],
+            opportunity_detection_policy: Some(EvolutionOpportunityDetectionPolicy {
+                workspace_id: WorkspaceId::from_legacy_named("workspace_self_evolution")
+                    .expect("workspace"),
+                default_target_ring: TrustRing::R2TrustedService,
+                default_allowed_paths: vec!["crates/sinomo-module/**".to_string()],
+                default_forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
+            }),
+            opportunity_planner_node_id: Some(
+                NodeId::from_legacy_named("node_desktop").expect("node"),
+            ),
+            external_workloads: Vec::new(),
+            resources: Vec::new(),
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T00:36:00Z".to_string(),
+        });
+
+        assert!(plan.opportunity_intake.is_empty());
+        assert!(plan.campaigns.is_empty());
+        assert_eq!(
+            plan.opportunity_events_skipped,
+            vec![BackgroundOpportunityEventSkip {
+                event_id,
+                reason: "event already recorded in background opportunity intake history"
+                    .to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn approved_background_opportunity_dispatch_preserves_risk_and_telemetry_evidence() {
+        let module_id =
+            ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
+        let workspace_id =
+            WorkspaceId::from_legacy_named("workspace_self_evolution").expect("workspace");
+        let event = opportunity_detection_event(
+            MODULE_TIMEOUT_EVENT_KIND,
+            serde_json::json!({
+                "module_id": module_id.as_str(),
+                "suggested_paths": ["modules/trigger/**"],
+                "evidence_refs": ["module-telemetry://timeout-window"]
+            }),
+        );
+        let event_ref = format!("event://{}", event.event_id);
+
+        let intake_plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: Vec::new(),
+            opportunity_events: vec![event],
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: Some(EvolutionOpportunityDetectionPolicy {
+                workspace_id,
+                default_target_ring: TrustRing::R2TrustedService,
+                default_allowed_paths: vec!["crates/sinomo-module/**".to_string()],
+                default_forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
+            }),
+            opportunity_planner_node_id: Some(
+                NodeId::from_legacy_named("node_desktop").expect("node"),
+            ),
+            external_workloads: Vec::new(),
+            resources: Vec::new(),
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: true,
+            now: "2026-05-02T00:35:00Z".to_string(),
+        });
+        let campaign = decide_campaign_checkpoint(
+            intake_plan.campaigns[0].campaign.clone(),
+            CampaignCheckpointDecision::Approve,
+            Some("operator reviewed telemetry evidence".to_string()),
+            "test-operator",
+        );
+        let task_id = campaign.near_term_tasks[0].task_id.clone();
+
+        let dispatch_plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+            scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+            campaigns: vec![campaign],
+            opportunity_events: Vec::new(),
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: None,
+            opportunity_planner_node_id: None,
+            external_workloads: Vec::new(),
+            resources: vec![ResourceClassDefinition {
+                resource_id: "coding-plan-weekly".to_string(),
+                unit: "percent".to_string(),
+                total_units: 100,
+                used_units: 0,
+                reserve_floor_percent: 30,
+                reset_window: "weekly".to_string(),
+                notes: "test dispatch budget".to_string(),
+            }],
+            task_estimates: vec![ResourceUsageEstimate {
+                task_id,
+                resource: "coding-plan-weekly".to_string(),
+                estimated_units: 10,
+                actual_units: None,
+            }],
+            max_concurrent_campaigns: 1,
+            max_concurrent_workloads: 1,
+            idle_window_open: true,
+            reset_window_open: false,
+            dry_run: false,
+            now: "2026-05-02T00:40:00Z".to_string(),
+        });
+
+        let update = &dispatch_plan.campaigns[0];
+        assert_eq!(update.action, BackgroundSchedulingAction::DispatchIteration);
+        assert!(update.evidence_refs.contains(&event_ref));
+        assert!(
+            update
+                .evidence_refs
+                .contains(&"module-telemetry://timeout-window".to_string())
+        );
+        assert!(update.evidence_refs.iter().any(|evidence| {
+            evidence.contains("background-risk-dispatch-allowed-at-intake=false")
+        }));
+        let scheduled = update
+            .scheduled_iteration
+            .as_ref()
+            .expect("approved opportunity dispatch gets scheduled iteration");
+        assert!(
+            scheduled
+                .evolution_request
+                .objective
+                .contains("background-risk-evidence-gate=")
+        );
+        assert!(
+            scheduled
+                .evolution_request
+                .objective
+                .contains("module-telemetry://timeout-window")
         );
     }
 
@@ -9607,6 +12644,436 @@ mod tests {
                 && gate.summary.contains("resolved 0/1")
         }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orchestrator_writes_reusable_regression_evidence_and_lesson_for_failed_candidate() {
+        let root = temp_dir("orchestrator-regression-evidence");
+        let candidate = root.join("candidate");
+        fs::create_dir_all(&candidate).expect("candidate dir");
+        let orchestrator = EvolutionOrchestrator::new(
+            FakeWorkspace {
+                root: root.clone(),
+                candidate: candidate.clone(),
+            },
+            ExecutingEvalHarness::new(LocalCommandRunner::new()),
+            LocalCandidateBundleStore::new(root.join("jobs")),
+        );
+
+        let report = orchestrator
+            .propose(
+                EvolutionRequest {
+                    objective: "capture failed regression evidence".to_string(),
+                    target_ring: TrustRing::R2TrustedService,
+                    intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                    verification_commands: vec![VerificationCommand {
+                        name: "failing-static-check".to_string(),
+                        command: "printf failure-details >&2; exit 7".to_string(),
+                        expected_exit_code: 0,
+                        gate: EvaluationGate::StaticChecks,
+                    }],
+                    benchmark_gates: Vec::new(),
+                    module_replay_reports: Vec::new(),
+                    model_provider: None,
+                    model: None,
+                    dry_run: true,
+                },
+                None,
+            )
+            .expect("failed candidate still records evidence");
+        let bundle = PathBuf::from(&report.bundle.bundle_path);
+        let evidence_path = bundle.join(CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH);
+        let lesson_path = bundle.join(CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH);
+        let summary_path = bundle.join(CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH);
+        assert!(evidence_path.exists());
+        assert!(lesson_path.exists());
+        assert!(summary_path.exists());
+
+        let evidence: CandidateRegressionEvidenceSummary =
+            serde_json::from_str(&fs::read_to_string(&evidence_path).expect("evidence json"))
+                .expect("regression evidence");
+        assert_eq!(evidence.outcome, EvaluationOutcome::Failed);
+        assert_eq!(evidence.failed_commands.len(), 1);
+        assert_eq!(evidence.failed_commands[0].exit_code, 7);
+        assert!(
+            evidence.failed_commands[0]
+                .stderr_excerpt
+                .contains("failure-details")
+        );
+        assert!(
+            evidence
+                .replay_minimization
+                .candidate_gate_commands
+                .iter()
+                .any(|command| command.contains("exit 7"))
+        );
+
+        let lesson: CandidateEvolutionLessonRecord =
+            serde_json::from_str(&fs::read_to_string(&lesson_path).expect("lesson json"))
+                .expect("lesson");
+        assert_eq!(
+            lesson.failure_class,
+            EvolutionFailureClass::BuildTestFailure
+        );
+        assert!(lesson.root_cause_summary.contains("verification command"));
+        assert!(
+            lesson
+                .suggested_follow_up_tasks
+                .iter()
+                .any(|task| task.contains("focused build"))
+        );
+
+        let content_manifest: CandidateBundleContentManifest = serde_json::from_str(
+            &fs::read_to_string(bundle.join("bundle-content-manifest.json")).unwrap(),
+        )
+        .expect("content manifest");
+        assert!(content_manifest.files.iter().any(|file| {
+            file.path == CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH
+                && file.digest.starts_with("blake3:")
+        }));
+        assert!(content_manifest.files.iter().any(|file| {
+            file.path == CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH
+                && file.digest.starts_with("blake3:")
+        }));
+        assert!(
+            fs::read_to_string(summary_path)
+                .expect("summary")
+                .contains("Replay Minimization")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regression_evidence_summary_preserves_trace_fixture_refs_for_future_gates() {
+        let job_id = EvolutionJobId::generate();
+        let job = EvolutionJob {
+            job_id: job_id.clone(),
+            objective: "reuse replay evidence".to_string(),
+            target_ring: TrustRing::R3SandboxedModule,
+            target_module_id: None,
+            edit_scope: EditScope {
+                workspace_root: "/workspace/sinomo".to_string(),
+                intended_paths: vec!["modules/trigger/**".to_string()],
+                notes: String::new(),
+            },
+            verification: VerificationPlan::default(),
+            recovery: RecoveryPlan::default(),
+            scope: EvolutionScope {
+                allowed_paths: vec!["modules/trigger/**".to_string()],
+                forbidden_paths: Vec::new(),
+                workspace_id: None,
+            },
+            status: EvolutionJobStatus::Evaluated,
+            required_gates: vec![EvaluationGate::ReplayTests],
+            rollback_policy: RollbackPolicy::default(),
+        };
+        let bundle = CandidateBundleManifest {
+            job_id: job_id.clone(),
+            bundle_path: "/tmp/bundle".to_string(),
+            created_at: OffsetDateTime::now_utc(),
+            mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
+            job_path: None,
+            model_output_path: None,
+            agent_run_path: None,
+            agent_summary_path: None,
+            benchmark_results_path: None,
+            resource_usage_path: None,
+            content_manifest_path: None,
+            attestation_path: None,
+            registry_record_path: None,
+            bundle_content_hash: None,
+            changed_files_path: Some("/tmp/bundle/changed-files.json".to_string()),
+            diff_path: Some("/tmp/bundle/diff.patch".to_string()),
+            scorecard_path: Some("/tmp/bundle/scorecard.json".to_string()),
+            candidate_summary_path: None,
+            decision_path: None,
+            command_logs: Vec::new(),
+        };
+        let request = EvolutionRequest {
+            objective: job.objective.clone(),
+            target_ring: job.target_ring.clone(),
+            intended_paths: job.edit_scope.intended_paths.clone(),
+            verification_commands: Vec::new(),
+            benchmark_gates: Vec::new(),
+            module_replay_reports: vec![ModuleReplayReportRef {
+                name: "trigger-timeout-replay".to_string(),
+                report_path: "replays/trigger-timeout.json".to_string(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+            }],
+            model_provider: None,
+            model: None,
+            dry_run: false,
+        };
+        let scorecard = EvaluationScorecard {
+            scorecard_id: ScorecardId::generate(),
+            baseline_artifact_id: None,
+            candidate_artifact_id: None,
+            outcome: EvaluationOutcome::Failed,
+            gates: vec![sinomo_runtime::core::EvaluationGateResult {
+                gate: EvaluationGate::ReplayTests,
+                outcome: EvaluationOutcome::Failed,
+                summary: "module replay trigger-timeout failed".to_string(),
+            }],
+            metrics: Vec::new(),
+        };
+
+        let evidence = candidate_regression_evidence_summary(
+            &job,
+            &bundle,
+            &request,
+            &scorecard,
+            &["modules/trigger/src/lib.rs".to_string()],
+            &[],
+            &[],
+        );
+
+        assert_eq!(evidence.trace_fixtures.len(), 1);
+        assert_eq!(
+            evidence.trace_fixtures[0].report_path,
+            "replays/trigger-timeout.json"
+        );
+        assert!(
+            evidence
+                .replay_minimization
+                .retained_evidence_refs
+                .contains(&"replays/trigger-timeout.json".to_string())
+        );
+        assert!(
+            evidence
+                .reusable_gate_suggestions
+                .iter()
+                .any(|suggestion| suggestion.contains("ReplayTests"))
+        );
+    }
+
+    #[test]
+    fn regression_evidence_summary_turns_rollout_telemetry_windows_into_trace_fixtures() {
+        let job_id = EvolutionJobId::generate();
+        let job = EvolutionJob {
+            job_id: job_id.clone(),
+            objective: "mine rollback evidence".to_string(),
+            target_ring: TrustRing::R3SandboxedModule,
+            target_module_id: None,
+            edit_scope: EditScope {
+                workspace_root: "/workspace/sinomo".to_string(),
+                intended_paths: vec!["crates/sinomo-rollout/**".to_string()],
+                notes: String::new(),
+            },
+            verification: VerificationPlan::default(),
+            recovery: RecoveryPlan::default(),
+            scope: EvolutionScope {
+                allowed_paths: vec!["crates/sinomo-rollout/**".to_string()],
+                forbidden_paths: Vec::new(),
+                workspace_id: None,
+            },
+            status: EvolutionJobStatus::Evaluated,
+            required_gates: vec![EvaluationGate::ReplayTests],
+            rollback_policy: RollbackPolicy::default(),
+        };
+        let bundle = CandidateBundleManifest {
+            job_id: job_id.clone(),
+            bundle_path: "/tmp/bundle".to_string(),
+            created_at: OffsetDateTime::now_utc(),
+            mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
+            job_path: None,
+            model_output_path: None,
+            agent_run_path: None,
+            agent_summary_path: None,
+            benchmark_results_path: None,
+            resource_usage_path: None,
+            content_manifest_path: None,
+            attestation_path: None,
+            registry_record_path: None,
+            bundle_content_hash: None,
+            changed_files_path: Some("/tmp/bundle/changed-files.json".to_string()),
+            diff_path: Some("/tmp/bundle/diff.patch".to_string()),
+            scorecard_path: Some("/tmp/bundle/scorecard.json".to_string()),
+            candidate_summary_path: None,
+            decision_path: None,
+            command_logs: Vec::new(),
+        };
+        let telemetry_window = "rollout-telemetry://window?after=0&through=42&limit=1000";
+        let request = EvolutionRequest {
+            objective: format!(
+                "Rollout guard handoff\nRollback evidence refs: event://evt_1; rollout-telemetry://active-rollback-trigger/timeout; {telemetry_window}"
+            ),
+            target_ring: job.target_ring.clone(),
+            intended_paths: job.edit_scope.intended_paths.clone(),
+            verification_commands: Vec::new(),
+            benchmark_gates: Vec::new(),
+            module_replay_reports: Vec::new(),
+            model_provider: None,
+            model: None,
+            dry_run: false,
+        };
+        let scorecard = EvaluationScorecard {
+            scorecard_id: ScorecardId::generate(),
+            baseline_artifact_id: None,
+            candidate_artifact_id: None,
+            outcome: EvaluationOutcome::Failed,
+            gates: vec![sinomo_runtime::core::EvaluationGateResult {
+                gate: EvaluationGate::ReplayTests,
+                outcome: EvaluationOutcome::Failed,
+                summary: "rollback telemetry still reproduces timeout".to_string(),
+            }],
+            metrics: Vec::new(),
+        };
+
+        let evidence = candidate_regression_evidence_summary(
+            &job,
+            &bundle,
+            &request,
+            &scorecard,
+            &["crates/sinomo-rollout/src/controller.rs".to_string()],
+            &[],
+            &[],
+        );
+
+        assert_eq!(evidence.trace_fixtures.len(), 2);
+        assert!(evidence.trace_fixtures.iter().any(|fixture| {
+            fixture.source == "rollout-telemetry-window" && fixture.report_path == telemetry_window
+        }));
+        assert!(evidence.trace_fixtures.iter().any(|fixture| {
+            fixture.source == "event-log-signal" && fixture.report_path == "event://evt_1"
+        }));
+        assert!(
+            evidence
+                .trace_fixtures
+                .iter()
+                .all(|fixture| fixture.suggested_gate == EvaluationGate::ReplayTests)
+        );
+        assert!(
+            evidence
+                .replay_minimization
+                .retained_evidence_refs
+                .contains(&telemetry_window.to_string())
+        );
+        assert!(
+            evidence
+                .replay_minimization
+                .minimization_steps
+                .iter()
+                .any(|step| step.contains("shortest replay trace")
+                    && step.contains(telemetry_window))
+        );
+        let summary = render_candidate_evidence_summary(&evidence);
+        assert!(summary.contains("rollout-telemetry-window-1"));
+        assert!(summary.contains(telemetry_window));
+    }
+
+    #[test]
+    fn regression_evidence_summary_preserves_telemetry_and_event_refs_as_trace_fixtures() {
+        let job_id = EvolutionJobId::generate();
+        let job = EvolutionJob {
+            job_id: job_id.clone(),
+            objective: "preserve telemetry-backed regression evidence".to_string(),
+            target_ring: TrustRing::R3SandboxedModule,
+            target_module_id: None,
+            edit_scope: EditScope {
+                workspace_root: "/workspace/sinomo".to_string(),
+                intended_paths: vec!["crates/sinomo-module/**".to_string()],
+                notes: String::new(),
+            },
+            verification: VerificationPlan::default(),
+            recovery: RecoveryPlan::default(),
+            scope: EvolutionScope {
+                allowed_paths: vec!["crates/sinomo-module/**".to_string()],
+                forbidden_paths: Vec::new(),
+                workspace_id: None,
+            },
+            status: EvolutionJobStatus::Evaluated,
+            required_gates: vec![EvaluationGate::ReplayTests],
+            rollback_policy: RollbackPolicy::default(),
+        };
+        let bundle = CandidateBundleManifest {
+            job_id: job_id.clone(),
+            bundle_path: "/tmp/bundle".to_string(),
+            created_at: OffsetDateTime::now_utc(),
+            mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
+            job_path: None,
+            model_output_path: None,
+            agent_run_path: None,
+            agent_summary_path: None,
+            benchmark_results_path: None,
+            resource_usage_path: None,
+            content_manifest_path: None,
+            attestation_path: None,
+            registry_record_path: None,
+            bundle_content_hash: None,
+            changed_files_path: Some("/tmp/bundle/changed-files.json".to_string()),
+            diff_path: Some("/tmp/bundle/diff.patch".to_string()),
+            scorecard_path: Some("/tmp/bundle/scorecard.json".to_string()),
+            candidate_summary_path: None,
+            decision_path: None,
+            command_logs: Vec::new(),
+        };
+        let module_ref = "module-telemetry://timeout-window";
+        let event_ref = "event://evt_module_timeout";
+        let request = EvolutionRequest {
+            objective: format!(
+                "Task objective: reduce timeout failures\nRequired evidence: {module_ref}; {event_ref}"
+            ),
+            target_ring: job.target_ring.clone(),
+            intended_paths: job.edit_scope.intended_paths.clone(),
+            verification_commands: Vec::new(),
+            benchmark_gates: Vec::new(),
+            module_replay_reports: Vec::new(),
+            model_provider: None,
+            model: None,
+            dry_run: false,
+        };
+        let scorecard = EvaluationScorecard {
+            scorecard_id: ScorecardId::generate(),
+            baseline_artifact_id: None,
+            candidate_artifact_id: None,
+            outcome: EvaluationOutcome::Failed,
+            gates: vec![sinomo_runtime::core::EvaluationGateResult {
+                gate: EvaluationGate::ReplayTests,
+                outcome: EvaluationOutcome::Failed,
+                summary: "telemetry-backed replay is not minimized yet".to_string(),
+            }],
+            metrics: Vec::new(),
+        };
+
+        let evidence = candidate_regression_evidence_summary(
+            &job,
+            &bundle,
+            &request,
+            &scorecard,
+            &["crates/sinomo-module/src/lib.rs".to_string()],
+            &[],
+            &[],
+        );
+
+        assert_eq!(evidence.trace_fixtures.len(), 2);
+        assert!(evidence.trace_fixtures.iter().any(|fixture| {
+            fixture.source == "module-telemetry-window" && fixture.report_path == module_ref
+        }));
+        assert!(evidence.trace_fixtures.iter().any(|fixture| {
+            fixture.source == "event-log-signal" && fixture.report_path == event_ref
+        }));
+        assert!(
+            evidence
+                .replay_minimization
+                .retained_evidence_refs
+                .contains(&module_ref.to_string())
+        );
+        assert!(
+            evidence
+                .replay_minimization
+                .retained_evidence_refs
+                .contains(&event_ref.to_string())
+        );
+        assert!(
+            evidence
+                .reusable_gate_suggestions
+                .iter()
+                .any(|suggestion| suggestion.contains(module_ref))
+        );
+        let summary = render_candidate_evidence_summary(&evidence);
+        assert!(summary.contains("module-telemetry-window-1"));
+        assert!(summary.contains("event-log-signal-1"));
     }
 
     #[test]

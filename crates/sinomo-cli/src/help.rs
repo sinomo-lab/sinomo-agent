@@ -443,18 +443,24 @@ pub(super) fn print_evolve_help() {
     println!(
         "      Write phase-3 stage scorecard/adaptation artifacts and update campaign state after candidate evaluation."
     );
+    println!("  sinomo evolve campaign approve|reject <campaign> [--note <note>]");
     println!(
-        "  sinomo evolve tick --dry-run [--scheduler-service <service_id>] [--campaign <campaign>] [--workload <system:id:status[:title]>] [--workload-estimate <system:id:resource:units>] [--resource <resource:used/total[:window]>] [--estimate <task:resource:units>] [--max-concurrent <n>] [--max-concurrent-workloads <n>] [--idle-window-open] [--reset-window-open]"
+        "      Record the human checkpoint decision that lets approved background campaigns reach scheduler-gated dispatch."
     );
     println!(
-        "      Write phase-4 background scheduler plan/status/event artifacts and dry-run iteration handoffs without autonomous execution."
+        "  sinomo evolve tick --dry-run|--dispatch-approved [--scheduler-service <service_id>] [--campaign <campaign>] [--opportunity-policy <policy.json>] [--opportunity-events <events.json|jsonl>] [--opportunity-event-log <path|local>] [--opportunity-event-limit <n>] [--workload <system:id:status[:title]>] [--workload-estimate <system:id:resource:units>] [--resource <resource:used/total[:window]>] [--estimate <task:resource:units>] [--max-concurrent <n>] [--max-concurrent-workloads <n>] [--idle-window-open] [--reset-window-open]"
+    );
+    println!(
+        "      Write phase-4 background scheduler artifacts; --dispatch-approved may run approved agent-backed iterations, but never rollout."
     );
     println!("  sinomo evolve approve [--job evojob_...] [--note <note>] [--override]");
     println!("      --override requires a non-empty --note and records failed preflight checks.");
     println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
     println!("  sinomo evolve status [--job evojob_...]");
-    println!("  sinomo evolve show [--diff|--scorecard|--decision|--packet] [--job evojob_...]");
+    println!(
+        "  sinomo evolve show [--diff|--scorecard|--decision|--packet|--regression-evidence|--lesson|--evidence-summary] [--job evojob_...]"
+    );
     println!("  sinomo evolve verify [--job evojob_...]");
     println!("  sinomo evolve packet [--job evojob_...]");
     println!("  sinomo evolve cleanup [--job evojob_...]");

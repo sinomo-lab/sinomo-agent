@@ -42,10 +42,11 @@ use super::{
     handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
     invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
-    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
-    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    managed_source_status, merge_benchmark_gate_requests, merge_module_replay_report_refs,
+    model_config_uses_cluster, models_default_with_data_dir, normalize_model_provider,
+    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_models_list_options, parse_models_runtime_command, parse_propose_options,
     parse_provider_command, parse_rollout_command, parse_sandbox_command, parse_slash_command,
     parse_uninstall_options, parse_usage_options, push_unique_introducer, quickjs_setup_script,
@@ -14439,6 +14440,16 @@ fn evolve_tick_parser_accepts_phase_four_background_flags() {
         "coding-plan-weekly:75/100:weekly".to_string(),
         "--estimate".to_string(),
         "coding-plan-weekly:10".to_string(),
+        "--opportunity-policy".to_string(),
+        "opportunity-policy.json".to_string(),
+        "--opportunity-events".to_string(),
+        "opportunity-events.jsonl".to_string(),
+        "--opportunity-event-log".to_string(),
+        "local".to_string(),
+        "--opportunity-event-limit".to_string(),
+        "25".to_string(),
+        "--opportunity-planner-node".to_string(),
+        "node_background_evolution".to_string(),
         "--reset-window-open".to_string(),
         "--idle-window-open".to_string(),
     ])
@@ -14463,17 +14474,42 @@ fn evolve_tick_parser_accepts_phase_four_background_flags() {
         "coding-plan-weekly:75/100:weekly".to_string(),
         "--estimate".to_string(),
         "coding-plan-weekly:10".to_string(),
+        "--opportunity-policy".to_string(),
+        "opportunity-policy.json".to_string(),
+        "--opportunity-events".to_string(),
+        "opportunity-events.jsonl".to_string(),
+        "--opportunity-event-log".to_string(),
+        "local".to_string(),
+        "--opportunity-event-limit".to_string(),
+        "25".to_string(),
+        "--opportunity-planner-node".to_string(),
+        "node_background_evolution".to_string(),
         "--reset-window-open".to_string(),
         "--idle-window-open".to_string(),
     ])
     .expect("tick options");
 
     assert!(options.dry_run);
+    assert!(!options.dispatch_approved);
     assert_eq!(options.scheduler_service_id, "sinomo-cluster-scheduler");
     assert_eq!(options.max_concurrent_campaigns, 1);
     assert_eq!(options.max_concurrent_workloads, 4);
     assert_eq!(options.resources, vec!["coding-plan-weekly:75/100:weekly"]);
     assert_eq!(options.estimates, vec!["coding-plan-weekly:10"]);
+    assert_eq!(
+        options.opportunity_policy,
+        Some(PathBuf::from("opportunity-policy.json"))
+    );
+    assert_eq!(
+        options.opportunity_event_files,
+        vec![PathBuf::from("opportunity-events.jsonl")]
+    );
+    assert_eq!(options.opportunity_event_log, Some(PathBuf::from("local")));
+    assert_eq!(options.opportunity_event_limit, 25);
+    assert_eq!(
+        options.opportunity_planner_node_id,
+        Some(NodeId::from_legacy_named("node_background_evolution").expect("node"))
+    );
     assert_eq!(
         options.external_workloads,
         vec!["backup:backup-index-01:ready:Backup index"]
@@ -14502,6 +14538,212 @@ fn evolve_tick_parser_accepts_phase_four_background_flags() {
     assert!(workloads[1].human_checkpoint_required);
     assert!(options.reset_window_open);
     assert!(options.idle_window_open);
+}
+
+#[test]
+fn evolve_tick_parser_accepts_explicit_approved_dispatch_mode() {
+    let options = super::parse_background_tick_options(&[
+        "--dispatch-approved".to_string(),
+        "--campaign".to_string(),
+        "camp_background".to_string(),
+        "--idle-window-open".to_string(),
+    ])
+    .expect("dispatch options");
+
+    assert!(options.dispatch_approved);
+    assert!(!options.dry_run);
+    assert_eq!(options.campaign_ids, vec!["camp_background"]);
+
+    let conflict = super::parse_background_tick_options(&[
+        "--dry-run".to_string(),
+        "--dispatch-approved".to_string(),
+    ]);
+    assert!(conflict.is_err());
+}
+
+#[test]
+fn evolve_campaign_parser_accepts_checkpoint_decisions() {
+    let approve = super::parse_evolve_command(&[
+        "campaign".to_string(),
+        "approve".to_string(),
+        "camp_background".to_string(),
+        "--note".to_string(),
+        "operator reviewed telemetry evidence".to_string(),
+    ])
+    .expect("campaign approve command");
+    assert!(matches!(
+        approve,
+        super::EvolveCliCommand::Campaign(super::CampaignCliCommand::Approve(_))
+    ));
+
+    let reject = super::parse_campaign_command(&[
+        "reject".to_string(),
+        "--campaign".to_string(),
+        "camp_background".to_string(),
+    ])
+    .expect("campaign reject command");
+    assert!(matches!(
+        reject,
+        super::CampaignCliCommand::Reject(super::CampaignDecisionCliOptions {
+            campaign_id,
+            ..
+        }) if campaign_id == "camp_background"
+    ));
+}
+
+#[test]
+fn evolve_tick_opportunity_inputs_load_local_event_log_and_scope_human_gated_campaign() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-opportunity-tick-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let mut event_store = JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
+    let module_id = "module.trigger.silence_policy";
+    let event = EventEnvelope::new(
+        EventId::generate(),
+        OffsetDateTime::now_utc(),
+        NodeId::from_legacy_named("node_desktop").expect("node"),
+        Source::new("module.live").expect("source"),
+        EventKind::new("module.timeout").expect("kind"),
+        Salience::new(0.83).expect("salience"),
+        Confidence::new(0.96).expect("confidence"),
+        RoutingMetadata::new(
+            RoutingScope::TrustedNetwork,
+            LatencyClass::Background,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_payload(serde_json::json!({
+        "module_id": module_id,
+        "suggested_paths": ["modules/trigger/**"],
+        "evidence_refs": ["module-telemetry://timeout-window"]
+    }));
+    event_store.append(event.clone()).expect("append event");
+
+    let policy_path = root.join("opportunity-policy.json");
+    let policy = sinomo_evolution::EvolutionOpportunityDetectionPolicy {
+        workspace_id: sinomo_evolution::WorkspaceId::from_legacy_named("workspace_self_evolution")
+            .expect("workspace"),
+        default_target_ring: TrustRing::R2TrustedService,
+        default_allowed_paths: vec!["crates/sinomo-module/**".to_string()],
+        default_forbidden_paths: vec!["crates/sinomo-policy/**".to_string()],
+    };
+    std::fs::write(
+        &policy_path,
+        serde_json::to_string_pretty(&policy).expect("policy json"),
+    )
+    .expect("write policy");
+
+    let options = super::BackgroundTickOptions {
+        scheduler_service_id: "sinomo-cluster-scheduler".to_string(),
+        campaign_ids: Vec::new(),
+        opportunity_event_files: Vec::new(),
+        opportunity_event_log: None,
+        opportunity_event_limit: 10,
+        opportunity_policy: Some(policy_path),
+        opportunity_planner_node_id: Some(NodeId::from_legacy_named("node_desktop").expect("node")),
+        external_workloads: Vec::new(),
+        external_workload_estimates: Vec::new(),
+        external_human_checkpoints: Vec::new(),
+        resources: Vec::new(),
+        estimates: Vec::new(),
+        max_concurrent_campaigns: 1,
+        max_concurrent_workloads: 1,
+        idle_window_open: true,
+        reset_window_open: false,
+        dispatch_approved: false,
+        dry_run: true,
+    };
+    let (events, loaded_policy, planner_node_id) =
+        super::read_background_tick_opportunity_inputs(&data_dir, &options)
+            .expect("opportunity inputs");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_id, event.event_id);
+    assert_eq!(loaded_policy, Some(policy.clone()));
+    assert_eq!(
+        planner_node_id,
+        Some(NodeId::from_legacy_named("node_desktop").expect("node"))
+    );
+
+    let plan = sinomo_evolution::plan_background_scheduling_tick(
+        sinomo_evolution::BackgroundSchedulingRequest {
+            scheduler_service_id: options.scheduler_service_id.clone(),
+            campaigns: Vec::new(),
+            opportunity_events: events,
+            previously_intaken_opportunity_event_ids: Vec::new(),
+            opportunity_detection_policy: loaded_policy,
+            opportunity_planner_node_id: planner_node_id,
+            external_workloads: Vec::new(),
+            resources: Vec::new(),
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: options.max_concurrent_campaigns,
+            max_concurrent_workloads: options.max_concurrent_workloads,
+            idle_window_open: options.idle_window_open,
+            reset_window_open: options.reset_window_open,
+            dry_run: true,
+            now: "2026-05-02T01:10:00Z".to_string(),
+        },
+    );
+
+    assert_eq!(plan.opportunity_intake.len(), 1);
+    assert_eq!(
+        plan.campaigns[0].action,
+        sinomo_evolution::BackgroundSchedulingAction::HoldHumanCheckpoint
+    );
+    assert!(plan.campaigns[0].scheduled_iteration.is_none());
+    assert!(plan.active_campaigns.is_empty());
+    assert!(
+        plan.opportunity_intake[0]
+            .risk_gate
+            .budget_gate
+            .contains("30m")
+    );
+    assert!(
+        plan.opportunity_intake[0]
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == "module-telemetry://timeout-window")
+    );
+
+    let paths = sinomo_evolution::EvolutionPaths::new(&data_dir);
+    paths.ensure().expect("evolution paths");
+    sinomo_evolution::write_background_scheduling_plan(&paths, &plan)
+        .expect("persist background plan");
+    let previously_intaken_opportunity_event_ids =
+        sinomo_evolution::read_background_opportunity_intake_event_ids(&paths)
+            .expect("intake event ids")
+            .into_iter()
+            .collect();
+    let repeated_plan = sinomo_evolution::plan_background_scheduling_tick(
+        sinomo_evolution::BackgroundSchedulingRequest {
+            scheduler_service_id: options.scheduler_service_id,
+            campaigns: Vec::new(),
+            opportunity_events: vec![event],
+            previously_intaken_opportunity_event_ids,
+            opportunity_detection_policy: Some(policy),
+            opportunity_planner_node_id: options.opportunity_planner_node_id,
+            external_workloads: Vec::new(),
+            resources: Vec::new(),
+            task_estimates: Vec::new(),
+            max_concurrent_campaigns: options.max_concurrent_campaigns,
+            max_concurrent_workloads: options.max_concurrent_workloads,
+            idle_window_open: options.idle_window_open,
+            reset_window_open: options.reset_window_open,
+            dry_run: true,
+            now: "2026-05-02T01:11:00Z".to_string(),
+        },
+    );
+    assert!(repeated_plan.opportunity_intake.is_empty());
+    assert_eq!(repeated_plan.opportunity_events_skipped.len(), 1);
+    assert_eq!(
+        repeated_plan.opportunity_events_skipped[0].reason,
+        "event already recorded in background opportunity intake history"
+    );
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -14679,6 +14921,88 @@ fn evolve_iterate_parser_accepts_agent_execution_flags() {
     );
     assert_eq!(options.intended_paths, vec!["crates/sinomo-agent/**"]);
     assert!(!options.dry_run);
+}
+
+#[test]
+fn campaign_iteration_execution_overrides_preserve_memory_derived_gates() {
+    let mut replay_reports = vec![ModuleReplayReportRef {
+        name: "memory-replay-timeout".to_string(),
+        report_path: "replays/timeout.json".to_string(),
+        baseline_artifact_id: None,
+        candidate_artifact_id: None,
+    }];
+    merge_module_replay_report_refs(
+        &mut replay_reports,
+        vec![
+            ModuleReplayReportRef {
+                name: "cli-replay-policy".to_string(),
+                report_path: "replays/policy.json".to_string(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+            },
+            ModuleReplayReportRef {
+                name: "duplicate-memory-replay".to_string(),
+                report_path: "replays/timeout.json".to_string(),
+                baseline_artifact_id: None,
+                candidate_artifact_id: None,
+            },
+        ],
+    );
+    assert_eq!(replay_reports.len(), 2);
+    assert!(replay_reports.iter().any(|report| {
+        report.name == "memory-replay-timeout" && report.report_path == "replays/timeout.json"
+    }));
+    assert!(replay_reports.iter().any(|report| {
+        report.name == "cli-replay-policy" && report.report_path == "replays/policy.json"
+    }));
+
+    let mut benchmark_gates = vec![sinomo_evolution::BenchmarkGateRequest {
+        name: "memory-private-smoke".to_string(),
+        expected_exit_code: 0,
+        kind: sinomo_evolution::BenchmarkGateKind::Command {
+            command: "cargo test -p sinomo-evolution memory_gate".to_string(),
+            summary_path: None,
+            results_dir: None,
+        },
+    }];
+    let duplicate_memory_benchmark = benchmark_gates[0].clone();
+    merge_benchmark_gate_requests(
+        &mut benchmark_gates,
+        vec![
+            sinomo_evolution::BenchmarkGateRequest {
+                name: "swebench-requests".to_string(),
+                expected_exit_code: 0,
+                kind: sinomo_evolution::BenchmarkGateKind::SweBench {
+                    instance_id: Some("psf__requests-1142".to_string()),
+                    limit: None,
+                    provider: "deepseek".to_string(),
+                    model: "deepseek-v4-pro".to_string(),
+                    max_steps: 80,
+                    evaluate: true,
+                },
+            },
+            duplicate_memory_benchmark,
+        ],
+    );
+    assert_eq!(benchmark_gates.len(), 2);
+    assert!(benchmark_gates.iter().any(|gate| {
+        gate.name == "memory-private-smoke"
+            && matches!(
+                &gate.kind,
+                sinomo_evolution::BenchmarkGateKind::Command { command, .. }
+                    if command.contains("memory_gate")
+            )
+    }));
+    assert!(benchmark_gates.iter().any(|gate| {
+        gate.name == "swebench-requests"
+            && matches!(
+                &gate.kind,
+                sinomo_evolution::BenchmarkGateKind::SweBench {
+                    instance_id: Some(instance_id),
+                    ..
+                } if instance_id == "psf__requests-1142"
+            )
+    }));
 }
 
 #[test]

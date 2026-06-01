@@ -690,7 +690,7 @@ fn default_transition_hot_swap_state() -> HotSwapState {
 }
 
 fn default_automatic_promotion_enabled() -> bool {
-    true
+    false
 }
 
 fn default_rollout_telemetry_event_limit() -> usize {

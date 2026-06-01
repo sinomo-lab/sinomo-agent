@@ -821,6 +821,11 @@ pub(crate) fn println_background_tick(
         "external workload updates: {}",
         plan.external_workloads.len()
     );
+    println!("opportunity intake: {}", plan.opportunity_intake.len());
+    println!(
+        "opportunity events skipped: {}",
+        plan.opportunity_events_skipped.len()
+    );
     println!("active campaigns: {}", plan.active_campaigns.len());
     println!("held campaigns: {}", plan.held_campaigns.len());
     println!("active workloads: {}", plan.active_workloads.len());
@@ -830,6 +835,16 @@ pub(crate) fn println_background_tick(
     println!("scheduler plan: {}", paths.plan_json.display());
     println!("scheduler status: {}", paths.status_json.display());
     println!("scheduler events: {}", paths.events_jsonl.display());
+    if !plan.opportunity_intake.is_empty() {
+        println!(
+            "opportunity intake json: {}",
+            paths.opportunity_intake_json.display()
+        );
+        println!(
+            "opportunity intake log: {}",
+            paths.opportunity_intakes_jsonl.display()
+        );
+    }
     for update in &plan.campaigns {
         println!(
             "campaign {}: {:?} ({})",
@@ -840,6 +855,16 @@ pub(crate) fn println_background_tick(
         println!(
             "workload {}:{}: {:?} ({})",
             update.workload.system, update.workload.workload_id, update.action, update.reason
+        );
+    }
+    for intake in &plan.opportunity_intake {
+        println!(
+            "opportunity {}: {:?} accepted={} dispatch_allowed={} ({})",
+            intake.campaign_id,
+            intake.detection.signal_kind,
+            intake.risk_gate.accepted,
+            intake.risk_gate.dispatch_allowed,
+            intake.risk_gate.reason
         );
     }
 }

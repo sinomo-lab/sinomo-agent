@@ -1,5 +1,9 @@
 use super::*;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::collections::BTreeSet;
+
+const EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(crate) enum EvolveCliCommand {
@@ -8,6 +12,7 @@ pub(crate) enum EvolveCliCommand {
     Schedule(Vec<String>),
     Iterate(Vec<String>),
     Evaluate(Vec<String>),
+    Campaign(CampaignCliCommand),
     Tick(Vec<String>),
     Decide(CandidateDecisionOutcome, Vec<String>),
     Status(Vec<String>),
@@ -18,6 +23,18 @@ pub(crate) enum EvolveCliCommand {
     Job(Vec<String>),
     TrustedSigners(TrustedSignersCliCommand),
     Models(ModelsCliCommand),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CampaignCliCommand {
+    Approve(CampaignDecisionCliOptions),
+    Reject(CampaignDecisionCliOptions),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CampaignDecisionCliOptions {
+    pub(crate) campaign_id: String,
+    pub(crate) note: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -50,6 +67,9 @@ pub(crate) fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, 
         }
         Some((command, rest)) if command == "evaluate" => {
             Ok(EvolveCliCommand::Evaluate(rest.to_vec()))
+        }
+        Some((command, rest)) if command == "campaign" => {
+            Ok(EvolveCliCommand::Campaign(parse_campaign_command(rest)?))
         }
         Some((command, rest)) if matches!(command.as_str(), "tick" | "run-background") => {
             Ok(EvolveCliCommand::Tick(rest.to_vec()))
@@ -86,6 +106,56 @@ pub(crate) fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, 
         }
         _ => Err(CliError::Usage),
     }
+}
+
+pub(crate) fn parse_campaign_command(args: &[String]) -> Result<CampaignCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "approve" => Ok(CampaignCliCommand::Approve(
+            parse_campaign_decision_options(rest)?,
+        )),
+        Some((command, rest)) if command == "reject" => Ok(CampaignCliCommand::Reject(
+            parse_campaign_decision_options(rest)?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_campaign_decision_options(
+    args: &[String],
+) -> Result<CampaignDecisionCliOptions, CliError> {
+    let mut campaign_id = None;
+    let mut note = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--campaign" => {
+                index += 1;
+                campaign_id = args.get(index).cloned();
+                if campaign_id.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--note" => {
+                index += 1;
+                note = args.get(index).cloned();
+                if note.is_none() {
+                    return Err(CliError::Usage);
+                }
+            }
+            value if value.starts_with("--") => return Err(CliError::Usage),
+            value => {
+                if campaign_id.is_some() {
+                    return Err(CliError::Usage);
+                }
+                campaign_id = Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    Ok(CampaignDecisionCliOptions {
+        campaign_id: campaign_id.ok_or(CliError::Usage)?,
+        note,
+    })
 }
 
 pub(crate) fn parse_trusted_signers_command(
@@ -281,6 +351,11 @@ pub(crate) struct ScheduleOptions {
 pub(crate) struct BackgroundTickOptions {
     pub(crate) scheduler_service_id: String,
     pub(crate) campaign_ids: Vec<String>,
+    pub(crate) opportunity_event_files: Vec<PathBuf>,
+    pub(crate) opportunity_event_log: Option<PathBuf>,
+    pub(crate) opportunity_event_limit: usize,
+    pub(crate) opportunity_policy: Option<PathBuf>,
+    pub(crate) opportunity_planner_node_id: Option<NodeId>,
     pub(crate) external_workloads: Vec<String>,
     pub(crate) external_workload_estimates: Vec<String>,
     pub(crate) external_human_checkpoints: Vec<String>,
@@ -290,6 +365,7 @@ pub(crate) struct BackgroundTickOptions {
     pub(crate) max_concurrent_workloads: usize,
     pub(crate) idle_window_open: bool,
     pub(crate) reset_window_open: bool,
+    pub(crate) dispatch_approved: bool,
     pub(crate) dry_run: bool,
 }
 
@@ -516,6 +592,11 @@ pub(crate) fn parse_background_tick_options(
 ) -> Result<BackgroundTickOptions, CliError> {
     let mut scheduler_service_id = "sinomo-cluster-scheduler".to_string();
     let mut campaign_ids = Vec::new();
+    let mut opportunity_event_files = Vec::new();
+    let mut opportunity_event_log = None;
+    let mut opportunity_event_limit = 200usize;
+    let mut opportunity_policy = None;
+    let mut opportunity_planner_node_id = None;
     let mut external_workloads = Vec::new();
     let mut external_workload_estimates = Vec::new();
     let mut external_human_checkpoints = Vec::new();
@@ -525,6 +606,7 @@ pub(crate) fn parse_background_tick_options(
     let mut max_concurrent_workloads = 1usize;
     let mut idle_window_open = false;
     let mut reset_window_open = false;
+    let mut dispatch_approved = false;
     let mut dry_run = false;
     let mut index = 0;
     while index < args.len() {
@@ -553,6 +635,52 @@ pub(crate) fn parse_background_tick_options(
                 } else {
                     return Err(CliError::Usage);
                 }
+            }
+            "--opportunity-events" | "--opportunity-event-file" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    opportunity_event_files.push(PathBuf::from(value));
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--opportunity-event-log" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    opportunity_event_log = Some(PathBuf::from(value));
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--opportunity-event-limit" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                opportunity_event_limit =
+                    value.parse::<usize>().map_err(|source| CliError::Parse {
+                        detail: format!("invalid opportunity event limit `{value}`: {source}"),
+                    })?;
+                if opportunity_event_limit == 0 {
+                    return Err(CliError::Parse {
+                        detail: "opportunity event limit must be at least 1".to_string(),
+                    });
+                }
+            }
+            "--opportunity-policy" => {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    opportunity_policy = Some(PathBuf::from(value));
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+            "--opportunity-planner-node" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                opportunity_planner_node_id = Some(parse_node_id_cli(value)?);
             }
             "--workload" | "--external-workload" => {
                 index += 1;
@@ -631,15 +759,26 @@ pub(crate) fn parse_background_tick_options(
             }
             "--idle-window-open" => idle_window_open = true,
             "--reset-window-open" => reset_window_open = true,
+            "--dispatch-approved" => dispatch_approved = true,
             "--dry-run" | "--preview" => dry_run = true,
             value if value.starts_with("--") => return Err(CliError::Usage),
             value => campaign_ids.push(value.to_string()),
         }
         index += 1;
     }
+    if dry_run && dispatch_approved {
+        return Err(CliError::Parse {
+            detail: "--dry-run and --dispatch-approved are mutually exclusive".to_string(),
+        });
+    }
     Ok(BackgroundTickOptions {
         scheduler_service_id,
         campaign_ids,
+        opportunity_event_files,
+        opportunity_event_log,
+        opportunity_event_limit,
+        opportunity_policy,
+        opportunity_planner_node_id,
         external_workloads,
         external_workload_estimates,
         external_human_checkpoints,
@@ -649,7 +788,18 @@ pub(crate) fn parse_background_tick_options(
         max_concurrent_workloads,
         idle_window_open,
         reset_window_open,
+        dispatch_approved,
         dry_run,
+    })
+}
+
+fn parse_node_id_cli(value: &str) -> Result<NodeId, CliError> {
+    value.parse::<NodeId>().or_else(|parse_error| {
+        NodeId::from_legacy_named(value).map_err(|legacy_error| CliError::Parse {
+            detail: format!(
+                "invalid opportunity planner node id `{value}`: {parse_error}; legacy name fallback failed: {legacy_error}"
+            ),
+        })
     })
 }
 
@@ -769,6 +919,47 @@ pub(crate) fn println_iteration_dry_run(
     );
 }
 
+fn attach_persisted_memory_to_iteration_plan(
+    paths: &EvolutionPaths,
+    plan: ScheduledIterationPlan,
+) -> Result<ScheduledIterationPlan, CliError> {
+    let lessons =
+        read_recent_evolution_lesson_memory(paths, EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT)?;
+    let gates = read_recent_proposed_regression_gate_memory(
+        paths,
+        EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT,
+    )?;
+    Ok(attach_evolution_memory_to_scheduled_iteration(
+        plan,
+        &lessons,
+        &gates,
+        EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT,
+    ))
+}
+
+fn attach_persisted_memory_to_background_plan(
+    paths: &EvolutionPaths,
+    plan: &mut BackgroundSchedulingPlan,
+) -> Result<(), CliError> {
+    let lessons =
+        read_recent_evolution_lesson_memory(paths, EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT)?;
+    let gates = read_recent_proposed_regression_gate_memory(
+        paths,
+        EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT,
+    )?;
+    for update in &mut plan.campaigns {
+        if let Some(iteration) = update.scheduled_iteration.take() {
+            update.scheduled_iteration = Some(attach_evolution_memory_to_scheduled_iteration(
+                iteration,
+                &lessons,
+                &gates,
+                EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT,
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
     run_evolve_cli_command(parse_evolve_command(args)?)
@@ -784,6 +975,7 @@ pub(crate) fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), Cl
         EvolveCliCommand::Schedule(args) => evolve_schedule(&args),
         EvolveCliCommand::Iterate(args) => evolve_iterate(&args),
         EvolveCliCommand::Evaluate(args) => evolve_evaluate(&args),
+        EvolveCliCommand::Campaign(command) => evolve_campaign(command),
         EvolveCliCommand::Tick(args) => evolve_tick(&args),
         EvolveCliCommand::Decide(outcome, args) => evolve_decide(&args, outcome),
         EvolveCliCommand::Status(args) => evolve_status(&args),
@@ -1131,7 +1323,7 @@ pub(crate) fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
     paths.ensure()?;
     let config = read_config(&paths).ok();
     let mut campaign = read_campaign(&paths, &options.campaign_id)?;
-    let mut plan = prepare_scheduled_iteration(ScheduledIterationRequest {
+    let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
         campaign: campaign.clone(),
         task_id: options.task_id.clone(),
         intended_paths: options.intended_paths.clone(),
@@ -1141,14 +1333,57 @@ pub(crate) fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
     .map_err(|source| CliError::Parse {
         detail: source.to_string(),
     })?;
+    let plan = attach_persisted_memory_to_iteration_plan(&paths, plan)?;
     if options.dry_run {
         let bundle = write_campaign_iteration_dry_run(&paths, &mut campaign, &plan)?;
         println_iteration_dry_run(&plan, &bundle);
         return Ok(());
     }
 
+    let (report, update, bundle) = execute_campaign_iteration_plan(
+        &data_dir,
+        &paths,
+        config.as_ref(),
+        campaign,
+        plan,
+        IterationExecutionOverrides {
+            provider: options.provider.clone(),
+            model: options.model.clone(),
+            repo: options.repo.clone(),
+            benchmark: options.benchmark.clone(),
+            module_replay_report: options.module_replay_report.clone(),
+        },
+    )?;
+    println_report(&report);
+    println!("campaign: {}", update.campaign.campaign_id);
+    println!("iteration: {}", bundle.iteration_plan_json.display());
+    println!("task result: {}", bundle.iteration_result_json.display());
+    println!("stage scorecard: {}", bundle.stage_scorecard_json.display());
+    if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
+        println!("resource usage: {resource_usage_path}");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+struct IterationExecutionOverrides {
+    provider: Option<String>,
+    model: Option<String>,
+    repo: Option<PathBuf>,
+    benchmark: Vec<String>,
+    module_replay_report: Vec<String>,
+}
+
+fn execute_campaign_iteration_plan(
+    data_dir: &SinomoDataDir,
+    paths: &EvolutionPaths,
+    config: Option<&sinomo_evolution::EvolutionConfig>,
+    campaign: EvolutionCampaign,
+    mut plan: ScheduledIterationPlan,
+    overrides: IterationExecutionOverrides,
+) -> Result<(EvolutionReport, StageEvaluationUpdate, CampaignBundlePaths), CliError> {
     let (model_config, _) = load_model_config_for_node(&data_dir)?;
-    let evolution_model_config = config.as_ref().map(|config| sinomo_lm::ModelConfig {
+    let evolution_model_config = config.map(|config| sinomo_lm::ModelConfig {
         default_provider: config.default_provider.clone(),
         default_account: None,
         default_model: config.default_model.clone(),
@@ -1157,26 +1392,30 @@ pub(crate) fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
     let default_model =
         resolve_default_model(Some(&model_config), evolution_model_config.as_ref())?;
     let (provider, model) = resolve_requested_evolution_model(
-        options.provider.clone(),
-        options.model.clone(),
+        overrides.provider.clone(),
+        overrides.model.clone(),
         default_model.provider,
         default_model.configured_model,
     )?;
     let repo = resolve_evolution_repo(
         &data_dir,
-        options
+        overrides
             .repo
             .clone()
             .or_else(|| campaign.source_repo.as_ref().map(PathBuf::from))
-            .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.repo))),
+            .or_else(|| config.map(|config| PathBuf::from(&config.repo))),
     )?;
 
     plan.evolution_request.model_provider = Some(provider.clone());
     plan.evolution_request.model = Some(model.clone());
-    plan.evolution_request.benchmark_gates =
-        parse_benchmark_gate_specs(&options.benchmark, &provider, &model)?;
-    plan.evolution_request.module_replay_reports =
-        parse_module_replay_report_specs(&options.module_replay_report)?;
+    merge_benchmark_gate_requests(
+        &mut plan.evolution_request.benchmark_gates,
+        parse_benchmark_gate_specs(&overrides.benchmark, &provider, &model)?,
+    );
+    merge_module_replay_report_refs(
+        &mut plan.evolution_request.module_replay_reports,
+        parse_module_replay_report_specs(&overrides.module_replay_report)?,
+    );
 
     let orchestrator = EvolutionOrchestrator::new(
         GitWorkspaceAdapter::new(&repo, &paths.jobs),
@@ -1204,19 +1443,45 @@ pub(crate) fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
         what_was_learned: Vec::new(),
     });
     let bundle = write_campaign_iteration_evaluation(&paths, &plan, &update)?;
-    println_report(&report);
-    println!("campaign: {}", update.campaign.campaign_id);
-    println!("iteration: {}", plan.iteration_id);
-    println!("task: {}", plan.task.task_id);
-    println!("stage scorecard: {}", bundle.stage_scorecard_json.display());
-    println!(
-        "iteration result: {}",
-        bundle.iteration_result_json.display()
-    );
-    if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
-        println!("resource usage: {resource_usage_path}");
+    Ok((report, update, bundle))
+}
+
+pub(crate) fn merge_benchmark_gate_requests(
+    existing: &mut Vec<sinomo_evolution::BenchmarkGateRequest>,
+    additional: Vec<sinomo_evolution::BenchmarkGateRequest>,
+) {
+    let mut seen = existing
+        .iter()
+        .map(benchmark_gate_request_key)
+        .collect::<BTreeSet<_>>();
+    for gate in additional {
+        if seen.insert(benchmark_gate_request_key(&gate)) {
+            existing.push(gate);
+        }
     }
-    Ok(())
+}
+
+fn benchmark_gate_request_key(gate: &sinomo_evolution::BenchmarkGateRequest) -> String {
+    format!("{}:{}:{:?}", gate.name, gate.expected_exit_code, gate.kind)
+}
+
+pub(crate) fn merge_module_replay_report_refs(
+    existing: &mut Vec<sinomo_evolution::ModuleReplayReportRef>,
+    additional: Vec<sinomo_evolution::ModuleReplayReportRef>,
+) {
+    let mut seen = existing
+        .iter()
+        .map(module_replay_report_ref_key)
+        .collect::<BTreeSet<_>>();
+    for report in additional {
+        if seen.insert(module_replay_report_ref_key(&report)) {
+            existing.push(report);
+        }
+    }
+}
+
+fn module_replay_report_ref_key(report: &sinomo_evolution::ModuleReplayReportRef) -> String {
+    report.report_path.clone()
 }
 
 pub(crate) fn evolve_evaluate(args: &[String]) -> Result<(), CliError> {
@@ -1241,14 +1506,191 @@ pub(crate) fn evolve_evaluate(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+pub(crate) fn evolve_campaign(command: CampaignCliCommand) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let paths = EvolutionPaths::new(&data_dir);
+    paths.ensure()?;
+    let (options, decision) = match command {
+        CampaignCliCommand::Approve(options) => (options, CampaignCheckpointDecision::Approve),
+        CampaignCliCommand::Reject(options) => (options, CampaignCheckpointDecision::Reject),
+    };
+    let campaign = read_campaign(&paths, &options.campaign_id)?;
+    let campaign =
+        decide_campaign_checkpoint(campaign, decision, options.note, "sinomo evolve campaign");
+    let bundle = write_campaign_bundle(&paths, &campaign)?;
+    println_campaign_proposal(&campaign, &bundle);
+    Ok(())
+}
+
+pub(crate) fn read_background_tick_opportunity_inputs(
+    data_dir: &SinomoDataDir,
+    options: &BackgroundTickOptions,
+) -> Result<
+    (
+        Vec<EventEnvelope>,
+        Option<EvolutionOpportunityDetectionPolicy>,
+        Option<NodeId>,
+    ),
+    CliError,
+> {
+    let policy = options
+        .opportunity_policy
+        .as_ref()
+        .map(|path| read_json_cli::<EvolutionOpportunityDetectionPolicy>(path))
+        .transpose()?;
+    let has_explicit_event_source =
+        !options.opportunity_event_files.is_empty() || options.opportunity_event_log.is_some();
+    if policy.is_none() && has_explicit_event_source {
+        return Err(CliError::Parse {
+            detail:
+                "opportunity event intake requires --opportunity-policy so events can be scoped safely"
+                    .to_string(),
+        });
+    }
+
+    let mut events = Vec::new();
+    let event_log_path = options
+        .opportunity_event_log
+        .as_ref()
+        .map(|path| resolve_background_tick_event_log_path(data_dir, path))
+        .or_else(|| {
+            policy
+                .is_some()
+                .then(|| data_dir.root().join("events").join("event-log.jsonl"))
+        });
+    if let Some(path) = event_log_path {
+        if path.exists() {
+            events.extend(read_background_tick_event_log(
+                &path,
+                options.opportunity_event_limit,
+            )?);
+        } else if options.opportunity_event_log.is_some() {
+            return Err(CliError::Io {
+                path: path.display().to_string(),
+                detail: "opportunity event log does not exist".to_string(),
+            });
+        }
+    }
+    for path in &options.opportunity_event_files {
+        events.extend(read_background_tick_event_file(path)?);
+    }
+    dedup_events_by_id(&mut events);
+    Ok((events, policy, options.opportunity_planner_node_id.clone()))
+}
+
+fn resolve_background_tick_event_log_path(data_dir: &SinomoDataDir, path: &Path) -> PathBuf {
+    if path == Path::new("default") || path == Path::new("local") {
+        data_dir.root().join("events").join("event-log.jsonl")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn read_json_cli<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
+    let content = fs::read_to_string(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    serde_json::from_str(&content).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn read_background_tick_event_log(
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<EventEnvelope>, CliError> {
+    let store = JsonlEventStore::new(path);
+    let stored = store.replay(ReplayQuery {
+        direction: ReplayDirection::Reverse,
+        limit: Some(limit),
+        ..ReplayQuery::all()
+    })?;
+    Ok(stored.into_iter().map(|stored| stored.event).collect())
+}
+
+fn read_background_tick_event_file(path: &Path) -> Result<Vec<EventEnvelope>, CliError> {
+    let content = fs::read_to_string(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        return events_from_json_value(
+            path,
+            serde_json::from_str(trimmed).map_err(|source| CliError::Json {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?,
+        );
+    }
+    let mut events = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(line).map_err(|source| CliError::Json {
+            path: format!("{}:{}", path.display(), index + 1),
+            detail: source.to_string(),
+        })?;
+        events.extend(events_from_json_value(path, value)?);
+    }
+    Ok(events)
+}
+
+fn events_from_json_value(
+    path: &Path,
+    value: serde_json::Value,
+) -> Result<Vec<EventEnvelope>, CliError> {
+    if let Some(array) = value.as_array() {
+        return array
+            .iter()
+            .cloned()
+            .map(|value| event_from_json_value(path, value))
+            .collect();
+    }
+    if let Some(events) = value.get("events").and_then(|events| events.as_array()) {
+        return events
+            .iter()
+            .cloned()
+            .map(|value| event_from_json_value(path, value))
+            .collect();
+    }
+    event_from_json_value(path, value).map(|event| vec![event])
+}
+
+fn event_from_json_value(path: &Path, value: serde_json::Value) -> Result<EventEnvelope, CliError> {
+    let event_value = match value {
+        serde_json::Value::Object(mut object) => object
+            .remove("event")
+            .unwrap_or(serde_json::Value::Object(object)),
+        other => other,
+    };
+    serde_json::from_value(event_value).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn dedup_events_by_id(events: &mut Vec<EventEnvelope>) {
+    let mut seen = BTreeSet::new();
+    events.retain(|event| seen.insert(event.event_id.clone()));
+}
+
 pub(crate) fn evolve_tick(args: &[String]) -> Result<(), CliError> {
     let options = parse_background_tick_options(args)?;
-    if !options.dry_run {
+    if !options.dry_run && !options.dispatch_approved {
         return Err(CliError::Usage);
     }
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
+    let config = read_config(&paths).ok();
     let campaigns = read_background_tick_campaigns(&paths, &options.campaign_ids)?;
     let external_workloads = parse_background_tick_external_workloads(
         &options.external_workloads,
@@ -1257,12 +1699,22 @@ pub(crate) fn evolve_tick(args: &[String]) -> Result<(), CliError> {
     )?;
     let resources = parse_background_tick_resources(&options.resources, &campaigns)?;
     let task_estimates = parse_background_tick_estimates(&options.estimates, &campaigns)?;
+    let (opportunity_events, opportunity_detection_policy, opportunity_planner_node_id) =
+        read_background_tick_opportunity_inputs(&data_dir, &options)?;
+    let previously_intaken_opportunity_event_ids =
+        read_background_opportunity_intake_event_ids(&paths)?
+            .into_iter()
+            .collect();
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown-time".to_string());
-    let plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
+    let mut plan = plan_background_scheduling_tick(BackgroundSchedulingRequest {
         scheduler_service_id: options.scheduler_service_id,
         campaigns,
+        opportunity_events,
+        previously_intaken_opportunity_event_ids,
+        opportunity_detection_policy,
+        opportunity_planner_node_id,
         external_workloads,
         resources,
         task_estimates,
@@ -1270,11 +1722,45 @@ pub(crate) fn evolve_tick(args: &[String]) -> Result<(), CliError> {
         max_concurrent_workloads: options.max_concurrent_workloads,
         idle_window_open: options.idle_window_open,
         reset_window_open: options.reset_window_open,
-        dry_run: true,
+        dry_run: options.dry_run,
         now,
     });
+    attach_persisted_memory_to_background_plan(&paths, &mut plan)?;
     let background_paths = write_background_scheduling_plan(&paths, &plan)?;
     println_background_tick(&plan, &background_paths);
+    if !plan.opportunity_events_skipped.is_empty() {
+        println!(
+            "opportunity events skipped as already intaken: {}",
+            plan.opportunity_events_skipped.len()
+        );
+    }
+    if options.dispatch_approved {
+        for update in &plan.campaigns {
+            if update.action != sinomo_evolution::BackgroundSchedulingAction::DispatchIteration {
+                continue;
+            }
+            let Some(iteration_plan) = &update.scheduled_iteration else {
+                continue;
+            };
+            let campaign = read_campaign(&paths, &update.campaign.campaign_id)?;
+            let (report, execution_update, bundle) = execute_campaign_iteration_plan(
+                &data_dir,
+                &paths,
+                config.as_ref(),
+                campaign,
+                iteration_plan.clone(),
+                IterationExecutionOverrides::default(),
+            )?;
+            println_report(&report);
+            println!("campaign: {}", execution_update.campaign.campaign_id);
+            println!("background iteration: {}", iteration_plan.iteration_id);
+            println!("stage scorecard: {}", bundle.stage_scorecard_json.display());
+            println!(
+                "iteration result: {}",
+                bundle.iteration_result_json.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1347,6 +1833,12 @@ pub(crate) fn evolve_show(args: &[String]) -> Result<(), CliError> {
         StoredJobArtifactKind::Decision
     } else if has_flag(args, "--packet") {
         StoredJobArtifactKind::MutationPacket
+    } else if has_flag(args, "--regression-evidence") {
+        StoredJobArtifactKind::RegressionEvidence
+    } else if has_flag(args, "--lesson") {
+        StoredJobArtifactKind::EvolutionLesson
+    } else if has_flag(args, "--evidence-summary") {
+        StoredJobArtifactKind::EvidenceSummary
     } else {
         StoredJobArtifactKind::Diff
     };
