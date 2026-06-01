@@ -477,12 +477,6 @@ pub(crate) fn require_cluster_bootstrap_state() -> Result<ClusterBootstrapState,
     read_cluster_state(&paths)
 }
 
-pub(crate) fn require_cluster_runtime_quorum() -> Result<(), CliError> {
-    let paths = cluster_paths_from_defaults()?;
-    let daemon = default_main_daemon_status()?;
-    require_cluster_runtime_quorum_with_paths_and_daemon(&paths, daemon.as_ref())
-}
-
 pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
     paths: &ClusterPaths,
     daemon: Option<&DaemonStatus>,

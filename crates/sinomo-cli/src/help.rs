@@ -17,7 +17,9 @@ pub fn print_usage() {
     println!("  sinomo evolve");
     println!();
     println!("Global flags:");
-    println!("  --local                    Force local file-backed mode and ignore cluster KV.");
+    println!(
+        "  --local                    Force local file-backed mode; skip daemon/cluster probes and ignore cluster KV."
+    );
     println!();
     println!("Run `sinomo <subcommand> help` for detailed commands.");
     println!();
@@ -25,6 +27,7 @@ pub fn print_usage() {
     println!(
         "  Run `sinomo` with no arguments to connect the command-line user interface to the local daemon when available."
     );
+    println!("  Run `sinomo --local` to start without probing the daemon or cluster.");
     println!("  Inside the CUI, prefix any CLI command with `/`, for example `/models list`.");
     println!("  Use `/quit` or `/exit` to end the session.");
     println!();

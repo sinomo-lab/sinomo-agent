@@ -21,6 +21,12 @@ pub(crate) enum SlashCompletionKind {
     Hint,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlashCommandCompletionLayer {
+    Standard,
+    Tui,
+}
+
 #[derive(Clone, Debug)]
 struct CommandSpec {
     word: &'static str,
@@ -195,12 +201,23 @@ const THINKING_CHOICES: &[ValueChoice] = &[
 ];
 
 pub(crate) fn slash_completions(input: &str, cursor: usize) -> Option<SlashCompletionSet> {
+    slash_completions_for_layer(input, cursor, SlashCommandCompletionLayer::Standard)
+}
+
+pub(crate) fn slash_completions_for_layer(
+    input: &str,
+    cursor: usize,
+    layer: SlashCommandCompletionLayer,
+) -> Option<SlashCompletionSet> {
     if cursor > input.len() || !input.is_char_boundary(cursor) || !input.starts_with('/') {
         return None;
     }
 
     let (tokens, replace_start, replace_end, prefix) = completion_tokens(input, cursor)?;
-    let registry = slash_command_registry();
+    let mut registry = slash_command_registry();
+    if layer == SlashCommandCompletionLayer::Tui {
+        apply_tui_slash_command_layer(&mut registry);
+    }
     let (node, command_consumed) = resolve_command_node(&registry, &tokens);
     let tokens_before_current = tokens_before_current(&tokens, replace_start);
     let options = available_options(&registry, node);
@@ -797,6 +814,20 @@ fn slash_command_registry() -> CommandSpec {
         vec![option("--local", "force local file-backed mode", None)],
         vec![],
     )
+}
+
+fn apply_tui_slash_command_layer(registry: &mut CommandSpec) {
+    registry.children.extend(tui_slash_command_layer());
+}
+
+fn tui_slash_command_layer() -> Vec<CommandSpec> {
+    vec![cmd(
+        "files",
+        "open the local TUI file browser",
+        vec![],
+        vec![],
+        vec![value("path", "directory or file to open", &[])],
+    )]
 }
 
 fn dfs_children() -> Vec<CommandSpec> {
@@ -1614,12 +1645,22 @@ mod tests {
         assert_eq!(completions.replace_start, 1);
         assert_eq!(completions.replace_end, 1);
         assert!(completions.items.iter().any(|item| item.label == "cluster"));
+        assert!(!completions.items.iter().any(|item| item.label == "files"));
         assert!(
             completions
                 .items
                 .iter()
                 .any(|item| item.label == "thinking")
         );
+    }
+
+    #[test]
+    fn tui_slash_completion_adds_tui_only_commands() {
+        let completions = slash_completions_for_layer("/", 1, SlashCommandCompletionLayer::Tui)
+            .expect("completions");
+
+        assert!(completions.items.iter().any(|item| item.label == "files"));
+        assert!(completions.items.iter().any(|item| item.label == "cluster"));
     }
 
     #[test]

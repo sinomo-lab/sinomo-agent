@@ -27,10 +27,12 @@ use tokenizers::Tokenizer;
 const RUST_MINICPM_V46_PROVIDER_ID: &str = "sinomo-models";
 #[cfg(feature = "native-models")]
 const DEFAULT_RUST_MINICPM_V46_CACHE_SUBDIR: &str = "openbmb--MiniCPM-V-4_6";
+const FILE_BROWSER_PREVIEW_MAX_BYTES: u64 = 64 * 1024;
+const FILE_BROWSER_PREVIEW_MAX_LINES: usize = 200;
 
 pub fn run_cui() -> Result<(), CliError> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        let daemon = default_main_daemon_status()?;
+        let daemon = cui_default_daemon_status()?;
         let (handler, daemon) = main_agent_handler_for_cui(daemon)?;
         return run_cui_tui_with_handler_and_daemon(handler, daemon);
     }
@@ -41,8 +43,15 @@ pub fn run_cui() -> Result<(), CliError> {
 }
 
 pub fn run_cui_with_io<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Result<(), CliError> {
-    let daemon = default_main_daemon_status()?;
+    let daemon = cui_default_daemon_status()?;
     run_cui_with_io_and_daemon_probe(&mut reader, &mut writer, daemon)
+}
+
+pub(crate) fn cui_default_daemon_status() -> Result<Option<DaemonStatus>, CliError> {
+    if cli_force_local_mode() {
+        return Ok(None);
+    }
+    default_main_daemon_status()
 }
 
 pub(super) fn run_cui_with_io_and_daemon_probe<R: BufRead, W: Write>(
@@ -250,6 +259,13 @@ fn submit_tui_input<H: InteractionEventHandler>(
     terminal: &mut TuiTerminalSession,
     line: String,
 ) -> Result<(), CliError> {
+    if let Some(command) = parse_tui_slash_command(&line)? {
+        state.begin_submission(&line);
+        state.apply_tui_slash_command(command);
+        terminal.draw(state)?;
+        return Ok(());
+    }
+
     state.begin_submission(&line);
     terminal.draw(state)?;
 
@@ -332,6 +348,273 @@ struct TuiCompletionState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum CuiTuiViewMode {
+    Chat,
+    Files,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FileBrowserEntryKind {
+    Parent,
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+impl FileBrowserEntryKind {
+    fn sort_rank(&self) -> u8 {
+        match self {
+            Self::Parent => 0,
+            Self::Directory => 1,
+            Self::File => 2,
+            Self::Symlink => 3,
+            Self::Other => 4,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Parent => "[up]",
+            Self::Directory => "[dir]",
+            Self::File => "[file]",
+            Self::Symlink => "[link]",
+            Self::Other => "[item]",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileBrowserEntry {
+    name: String,
+    path: PathBuf,
+    kind: FileBrowserEntryKind,
+    size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileBrowserPreview {
+    title: String,
+    lines: Vec<String>,
+}
+
+impl FileBrowserPreview {
+    fn new(title: impl Into<String>, lines: Vec<String>) -> Self {
+        Self {
+            title: title.into(),
+            lines,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileBrowserState {
+    current_dir: PathBuf,
+    entries: Vec<FileBrowserEntry>,
+    selected: usize,
+    preview: FileBrowserPreview,
+}
+
+impl FileBrowserState {
+    fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        let path = if path.as_os_str().is_empty() {
+            env::current_dir().map_err(|error| format!("cannot read current directory: {error}"))?
+        } else {
+            path
+        };
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        let (current_dir, selected_path) = if metadata.is_dir() {
+            (path, None)
+        } else {
+            let parent = path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            (parent, Some(path))
+        };
+        let current_dir = current_dir.canonicalize().unwrap_or(current_dir);
+        let selected_path = selected_path.map(|path| path.canonicalize().unwrap_or(path));
+        let mut browser = Self {
+            current_dir,
+            entries: Vec::new(),
+            selected: 0,
+            preview: FileBrowserPreview::new("Preview", Vec::new()),
+        };
+        browser.refresh_select(selected_path.as_deref())?;
+        Ok(browser)
+    }
+
+    fn refresh(&mut self) -> Result<(), String> {
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        self.refresh_select(selected_path.as_deref())
+    }
+
+    fn refresh_select(&mut self, selected_path: Option<&Path>) -> Result<(), String> {
+        self.entries = load_file_browser_entries(&self.current_dir)?;
+        if let Some(selected_path) = selected_path
+            && let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.path == selected_path)
+        {
+            self.selected = index;
+        } else if self.entries.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(self.entries.len() - 1);
+        }
+        self.update_preview();
+        Ok(())
+    }
+
+    fn selected_entry(&self) -> Option<&FileBrowserEntry> {
+        self.entries.get(self.selected)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let last = self.entries.len() - 1;
+        self.selected = if delta.is_negative() {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.selected.saturating_add(delta as usize).min(last)
+        };
+        self.update_preview();
+    }
+
+    fn open_selected(&mut self) -> Result<String, String> {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return Ok("no file selected".to_string());
+        };
+        if entry.kind == FileBrowserEntryKind::Parent {
+            self.go_parent()?;
+            return Ok(format!("opened {}", self.current_dir.display()));
+        }
+        if entry.kind == FileBrowserEntryKind::Directory || entry.path.is_dir() {
+            self.current_dir = entry.path;
+            self.refresh_select(None)?;
+            return Ok(format!("opened {}", self.current_dir.display()));
+        }
+        self.update_preview();
+        Ok(format!("previewing {}", entry.name))
+    }
+
+    fn go_parent(&mut self) -> Result<String, String> {
+        let Some(parent) = self.current_dir.parent().map(Path::to_path_buf) else {
+            return Ok("already at filesystem root".to_string());
+        };
+        let previous = self.current_dir.clone();
+        self.current_dir = parent;
+        self.refresh_select(Some(&previous))?;
+        Ok(format!("opened {}", self.current_dir.display()))
+    }
+
+    fn create_file(&mut self, name: &str) -> Result<String, String> {
+        let path = file_browser_child_path(&self.current_dir, name)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("cannot create file {}: {error}", path.display()))?;
+        self.refresh_select(Some(&path))?;
+        Ok(format!("created file {}", file_browser_display_name(&path)))
+    }
+
+    fn create_dir(&mut self, name: &str) -> Result<String, String> {
+        let path = file_browser_child_path(&self.current_dir, name)?;
+        fs::create_dir(&path)
+            .map_err(|error| format!("cannot create directory {}: {error}", path.display()))?;
+        self.refresh_select(Some(&path))?;
+        Ok(format!(
+            "created directory {}",
+            file_browser_display_name(&path)
+        ))
+    }
+
+    fn rename_selected(&mut self, target_name: &str) -> Result<String, String> {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return Err("no file selected".to_string());
+        };
+        if entry.kind == FileBrowserEntryKind::Parent {
+            return Err("cannot rename parent directory entry".to_string());
+        }
+        let target = file_browser_child_path(&self.current_dir, target_name)?;
+        fs::rename(&entry.path, &target).map_err(|error| {
+            format!(
+                "cannot rename {} to {}: {error}",
+                entry.path.display(),
+                target.display()
+            )
+        })?;
+        self.refresh_select(Some(&target))?;
+        Ok(format!(
+            "renamed {} to {}",
+            entry.name,
+            file_browser_display_name(&target)
+        ))
+    }
+
+    fn delete_selected(&mut self, confirmation: &str) -> Result<String, String> {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return Err("no file selected".to_string());
+        };
+        if entry.kind == FileBrowserEntryKind::Parent {
+            return Err("cannot delete parent directory entry".to_string());
+        }
+        if confirmation.trim() != "DELETE" {
+            return Err(format!("type DELETE to remove {}", entry.name));
+        }
+        match entry.kind {
+            FileBrowserEntryKind::Directory => fs::remove_dir(&entry.path).map_err(|error| {
+                format!(
+                    "cannot delete directory {}: {error}; only empty directories can be deleted",
+                    entry.path.display()
+                )
+            })?,
+            _ => fs::remove_file(&entry.path)
+                .map_err(|error| format!("cannot delete file {}: {error}", entry.path.display()))?,
+        }
+        self.refresh()?;
+        Ok(format!("deleted {}", entry.name))
+    }
+
+    fn update_preview(&mut self) {
+        self.preview = match self.selected_entry() {
+            Some(entry) => file_browser_preview(entry),
+            None => FileBrowserPreview::new("Empty", vec!["directory has no entries".to_string()]),
+        };
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FileBrowserPrompt {
+    NewFile,
+    NewDirectory,
+    Rename,
+    Delete,
+}
+
+impl FileBrowserPrompt {
+    fn title(&self) -> &'static str {
+        match self {
+            Self::NewFile => "New File",
+            Self::NewDirectory => "New Directory",
+            Self::Rename => "Rename To",
+            Self::Delete => "Confirm Delete",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TuiSlashCommand {
+    Files { target: PathBuf },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum TuiMessageKind {
     User,
     Command,
@@ -353,6 +636,9 @@ struct CuiTuiState {
     node_id: String,
     daemon_label: String,
     cluster_label: Option<String>,
+    view_mode: CuiTuiViewMode,
+    file_browser: Option<FileBrowserState>,
+    file_prompt: Option<FileBrowserPrompt>,
     input: String,
     input_cursor: usize,
     messages: Vec<TuiMessage>,
@@ -376,6 +662,9 @@ impl CuiTuiState {
             node_id: session.node_id.to_string(),
             daemon_label,
             cluster_label,
+            view_mode: CuiTuiViewMode::Chat,
+            file_browser: None,
+            file_prompt: None,
             input: String::new(),
             input_cursor: 0,
             messages: Vec::new(),
@@ -398,6 +687,11 @@ impl CuiTuiState {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 TuiInputAction::Exit
             }
+            KeyCode::F(2) => {
+                self.toggle_file_browser();
+                TuiInputAction::None
+            }
+            _ if self.view_mode == CuiTuiViewMode::Files => self.apply_file_browser_key_event(key),
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.clear();
                 self.input_cursor = 0;
@@ -469,6 +763,264 @@ impl CuiTuiState {
             }
             _ => TuiInputAction::None,
         }
+    }
+
+    fn apply_file_browser_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
+        if self.file_prompt.is_some() {
+            return match key.code {
+                KeyCode::Esc => {
+                    self.clear_file_prompt();
+                    TuiInputAction::None
+                }
+                KeyCode::Enter => {
+                    self.submit_file_prompt();
+                    TuiInputAction::None
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    TuiInputAction::None
+                }
+                KeyCode::Backspace => {
+                    self.backspace();
+                    TuiInputAction::None
+                }
+                KeyCode::Delete => {
+                    self.delete();
+                    TuiInputAction::None
+                }
+                KeyCode::Left => {
+                    self.move_cursor_left();
+                    TuiInputAction::None
+                }
+                KeyCode::Right => {
+                    self.move_cursor_right();
+                    TuiInputAction::None
+                }
+                KeyCode::Home => {
+                    self.input_cursor = 0;
+                    TuiInputAction::None
+                }
+                KeyCode::End => {
+                    self.input_cursor = self.input.len();
+                    TuiInputAction::None
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.input.insert(self.input_cursor, character);
+                    self.input_cursor += character.len_utf8();
+                    TuiInputAction::None
+                }
+                _ => TuiInputAction::None,
+            };
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_file_browser();
+                TuiInputAction::None
+            }
+            KeyCode::Enter => {
+                self.with_file_browser(|browser| browser.open_selected());
+                TuiInputAction::None
+            }
+            KeyCode::Backspace => {
+                self.with_file_browser(|browser| browser.go_parent());
+                TuiInputAction::None
+            }
+            KeyCode::Up => {
+                if let Some(browser) = self.file_browser.as_mut() {
+                    browser.move_selection(-1);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Down => {
+                if let Some(browser) = self.file_browser.as_mut() {
+                    browser.move_selection(1);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::PageUp => {
+                if let Some(browser) = self.file_browser.as_mut() {
+                    browser.move_selection(-8);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::PageDown => {
+                if let Some(browser) = self.file_browser.as_mut() {
+                    browser.move_selection(8);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Home => {
+                if let Some(browser) = self.file_browser.as_mut() {
+                    browser.selected = 0;
+                    browser.update_preview();
+                }
+                TuiInputAction::None
+            }
+            KeyCode::End => {
+                if let Some(browser) = self.file_browser.as_mut()
+                    && !browser.entries.is_empty()
+                {
+                    browser.selected = browser.entries.len() - 1;
+                    browser.update_preview();
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Char('n') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_file_prompt(FileBrowserPrompt::NewFile);
+                TuiInputAction::None
+            }
+            KeyCode::Char('m') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_file_prompt(FileBrowserPrompt::NewDirectory);
+                TuiInputAction::None
+            }
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_file_prompt(FileBrowserPrompt::Rename);
+                TuiInputAction::None
+            }
+            KeyCode::Char('x') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_file_prompt(FileBrowserPrompt::Delete);
+                TuiInputAction::None
+            }
+            _ => TuiInputAction::None,
+        }
+    }
+
+    fn toggle_file_browser(&mut self) {
+        if self.view_mode == CuiTuiViewMode::Files {
+            self.close_file_browser();
+        } else {
+            self.open_file_browser_current_dir();
+        }
+    }
+
+    fn apply_tui_slash_command(&mut self, command: TuiSlashCommand) {
+        match command {
+            TuiSlashCommand::Files { target } => self.open_file_browser_at(target),
+        }
+    }
+
+    fn open_file_browser_current_dir(&mut self) {
+        let target = match env::current_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("file browser error: {error}");
+                return;
+            }
+        };
+        self.open_file_browser_at(target);
+    }
+
+    fn open_file_browser_at(&mut self, target: PathBuf) {
+        match FileBrowserState::open(target) {
+            Ok(browser) => {
+                let current_dir = browser.current_dir.display().to_string();
+                self.view_mode = CuiTuiViewMode::Files;
+                self.file_browser = Some(browser);
+                self.file_prompt = None;
+                self.input.clear();
+                self.input_cursor = 0;
+                self.completions = None;
+                self.status = format!("browsing {current_dir}");
+            }
+            Err(error) => {
+                self.status = format!("file browser error: {error}");
+            }
+        }
+    }
+
+    fn close_file_browser(&mut self) {
+        self.view_mode = CuiTuiViewMode::Chat;
+        self.file_prompt = None;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.completions = None;
+        self.status = "listening".to_string();
+    }
+
+    fn with_file_browser(
+        &mut self,
+        action: impl FnOnce(&mut FileBrowserState) -> Result<String, String>,
+    ) {
+        let Some(browser) = self.file_browser.as_mut() else {
+            self.status = "file browser is not open".to_string();
+            return;
+        };
+        self.status = match action(browser) {
+            Ok(message) => message,
+            Err(error) => format!("file browser error: {error}"),
+        };
+    }
+
+    fn start_file_prompt(&mut self, prompt: FileBrowserPrompt) {
+        if matches!(
+            prompt,
+            FileBrowserPrompt::Rename | FileBrowserPrompt::Delete
+        ) {
+            let Some(entry) = self
+                .file_browser
+                .as_ref()
+                .and_then(FileBrowserState::selected_entry)
+            else {
+                self.status = "no file selected".to_string();
+                return;
+            };
+            if entry.kind == FileBrowserEntryKind::Parent {
+                self.status = "select a file or directory first".to_string();
+                return;
+            }
+        }
+        self.file_prompt = Some(prompt);
+        self.input.clear();
+        self.input_cursor = 0;
+        self.completions = None;
+        self.status = match self.file_prompt {
+            Some(FileBrowserPrompt::NewFile) => "enter new file name".to_string(),
+            Some(FileBrowserPrompt::NewDirectory) => "enter new directory name".to_string(),
+            Some(FileBrowserPrompt::Rename) => "enter new name".to_string(),
+            Some(FileBrowserPrompt::Delete) => "type DELETE to remove selected item".to_string(),
+            None => self.status.clone(),
+        };
+    }
+
+    fn clear_file_prompt(&mut self) {
+        self.file_prompt = None;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.status = "browsing files".to_string();
+    }
+
+    fn submit_file_prompt(&mut self) {
+        let Some(prompt) = self.file_prompt.take() else {
+            return;
+        };
+        let value = std::mem::take(&mut self.input);
+        self.input_cursor = 0;
+        self.with_file_browser(|browser| match prompt {
+            FileBrowserPrompt::NewFile => browser.create_file(&value),
+            FileBrowserPrompt::NewDirectory => browser.create_dir(&value),
+            FileBrowserPrompt::Rename => browser.rename_selected(&value),
+            FileBrowserPrompt::Delete => browser.delete_selected(&value),
+        });
+    }
+
+    fn input_title(&self) -> &'static str {
+        if self.view_mode == CuiTuiViewMode::Files {
+            return self
+                .file_prompt
+                .as_ref()
+                .map(FileBrowserPrompt::title)
+                .unwrap_or("Files");
+        }
+        "Message"
+    }
+
+    fn accepts_text_input(&self) -> bool {
+        self.view_mode == CuiTuiViewMode::Chat || self.file_prompt.is_some()
     }
 
     fn request_exit(&mut self) {
@@ -576,6 +1128,9 @@ impl CuiTuiState {
     }
 
     fn insert_str(&mut self, text: &str) {
+        if self.view_mode == CuiTuiViewMode::Files && self.file_prompt.is_none() {
+            return;
+        }
         for character in text.chars() {
             if character != '\n' && character != '\r' {
                 self.insert_char(character);
@@ -636,13 +1191,21 @@ impl CuiTuiState {
     }
 
     fn refresh_completions(&mut self) {
-        self.completions =
-            slash_completions(&self.input, self.input_cursor).map(|set| TuiCompletionState {
-                replace_start: set.replace_start,
-                replace_end: set.replace_end,
-                selected: None,
-                items: set.items,
-            });
+        if self.view_mode != CuiTuiViewMode::Chat {
+            self.completions = None;
+            return;
+        }
+        self.completions = slash_completions_for_layer(
+            &self.input,
+            self.input_cursor,
+            SlashCommandCompletionLayer::Tui,
+        )
+        .map(|set| TuiCompletionState {
+            replace_start: set.replace_start,
+            replace_end: set.replace_end,
+            selected: None,
+            items: set.items,
+        });
     }
 
     fn select_next_completion(&mut self) {
@@ -739,8 +1302,254 @@ impl CuiTuiState {
     }
 }
 
+fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliError> {
+    let Some(args) = parse_slash_command(line)? else {
+        return Ok(None);
+    };
+    match args.as_slice() {
+        [command] if command == "files" => {
+            let target = env::current_dir().map_err(|error| CliError::Parse {
+                detail: format!("cannot read current directory: {error}"),
+            })?;
+            Ok(Some(TuiSlashCommand::Files { target }))
+        }
+        [command, path] if command == "files" => Ok(Some(TuiSlashCommand::Files {
+            target: PathBuf::from(path),
+        })),
+        [command, ..] if command == "files" => Err(CliError::Parse {
+            detail: "usage: /files [path]".to_string(),
+        }),
+        _ => Ok(None),
+    }
+}
+
+fn load_file_browser_entries(current_dir: &Path) -> Result<Vec<FileBrowserEntry>, String> {
+    let mut entries = Vec::new();
+    if let Some(parent) = current_dir.parent() {
+        entries.push(FileBrowserEntry {
+            name: "..".to_string(),
+            path: parent.to_path_buf(),
+            kind: FileBrowserEntryKind::Parent,
+            size: None,
+        });
+    }
+
+    let read_dir = fs::read_dir(current_dir)
+        .map_err(|error| format!("cannot list {}: {error}", current_dir.display()))?;
+    for entry in read_dir {
+        let entry = entry
+            .map_err(|error| format!("cannot read entry in {}: {error}", current_dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        let metadata = entry.metadata().ok();
+        let kind = if file_type.is_dir() {
+            FileBrowserEntryKind::Directory
+        } else if file_type.is_file() {
+            FileBrowserEntryKind::File
+        } else if file_type.is_symlink() {
+            FileBrowserEntryKind::Symlink
+        } else {
+            FileBrowserEntryKind::Other
+        };
+        let size = metadata
+            .as_ref()
+            .filter(|_| kind == FileBrowserEntryKind::File)
+            .map(|metadata| metadata.len());
+        entries.push(FileBrowserEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path,
+            kind,
+            size,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.kind
+            .sort_rank()
+            .cmp(&right.kind.sort_rank())
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
+}
+
+fn file_browser_child_path(current_dir: &Path, input: &str) -> Result<PathBuf, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err("use a relative name inside the current directory".to_string());
+    }
+
+    let mut has_name = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => has_name = true,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err("name cannot leave the current directory".to_string());
+            }
+        }
+    }
+    if !has_name {
+        return Err("name cannot be empty".to_string());
+    }
+    Ok(current_dir.join(path))
+}
+
+fn file_browser_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn file_browser_preview(entry: &FileBrowserEntry) -> FileBrowserPreview {
+    match entry.kind {
+        FileBrowserEntryKind::Parent => {
+            FileBrowserPreview::new("Parent", vec![format!("open {}", entry.path.display())])
+        }
+        FileBrowserEntryKind::Directory => file_browser_directory_preview(entry),
+        FileBrowserEntryKind::Symlink if entry.path.is_dir() => {
+            file_browser_directory_preview(entry)
+        }
+        _ => file_browser_file_preview(entry),
+    }
+}
+
+fn file_browser_directory_preview(entry: &FileBrowserEntry) -> FileBrowserPreview {
+    match fs::read_dir(&entry.path) {
+        Ok(read_dir) => {
+            let mut count = 0usize;
+            for item in read_dir {
+                if item.is_ok() {
+                    count = count.saturating_add(1);
+                }
+            }
+            FileBrowserPreview::new(
+                format!("Directory {}", entry.name),
+                vec![
+                    format!("path: {}", entry.path.display()),
+                    format!("entries: {count}"),
+                ],
+            )
+        }
+        Err(error) => FileBrowserPreview::new(
+            format!("Directory {}", entry.name),
+            vec![format!("cannot read directory: {error}")],
+        ),
+    }
+}
+
+fn file_browser_file_preview(entry: &FileBrowserEntry) -> FileBrowserPreview {
+    let file = match fs::File::open(&entry.path) {
+        Ok(file) => file,
+        Err(error) => {
+            return FileBrowserPreview::new(
+                format!("Preview {}", entry.name),
+                vec![format!("cannot open file: {error}")],
+            );
+        }
+    };
+    let mut bytes = Vec::new();
+    let mut reader = file.take(FILE_BROWSER_PREVIEW_MAX_BYTES + 1);
+    if let Err(error) = std::io::Read::read_to_end(&mut reader, &mut bytes) {
+        return FileBrowserPreview::new(
+            format!("Preview {}", entry.name),
+            vec![format!("cannot read file: {error}")],
+        );
+    }
+    let truncated_bytes = bytes.len() > FILE_BROWSER_PREVIEW_MAX_BYTES as usize;
+    if truncated_bytes {
+        bytes.truncate(FILE_BROWSER_PREVIEW_MAX_BYTES as usize);
+    }
+    if bytes.iter().any(|byte| *byte == 0) {
+        return FileBrowserPreview::new(
+            format!("Binary {}", entry.name),
+            vec![format!(
+                "binary file; preview disabled after {}",
+                format_file_size(bytes.len() as u64)
+            )],
+        );
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            return FileBrowserPreview::new(
+                format!("Binary {}", entry.name),
+                vec![format!(
+                    "non UTF-8 file; preview disabled after {}",
+                    format_file_size(error.as_bytes().len() as u64)
+                )],
+            );
+        }
+    };
+
+    let mut lines = if text.is_empty() {
+        vec!["empty file".to_string()]
+    } else {
+        text.lines()
+            .take(FILE_BROWSER_PREVIEW_MAX_LINES)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+    if text.lines().count() > FILE_BROWSER_PREVIEW_MAX_LINES {
+        lines.push(format!(
+            "... truncated after {FILE_BROWSER_PREVIEW_MAX_LINES} lines"
+        ));
+    }
+    if truncated_bytes {
+        lines.push(format!(
+            "... truncated after {}",
+            format_file_size(FILE_BROWSER_PREVIEW_MAX_BYTES)
+        ));
+    }
+    FileBrowserPreview::new(format!("Preview {}", entry.name), lines)
+}
+
+fn format_file_size(size: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if size >= GIB {
+        format!("{:.1} GiB", size as f64 / GIB as f64)
+    } else if size >= MIB {
+        format!("{:.1} MiB", size as f64 / MIB as f64)
+    } else if size >= KIB {
+        format!("{:.1} KiB", size as f64 / KIB as f64)
+    } else {
+        format!("{size} B")
+    }
+}
+
 fn render_cui_tui(frame: &mut Frame<'_>, state: &CuiTuiState) {
     let area = frame.area();
+    if state.view_mode == CuiTuiViewMode::Files {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Min(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        render_tui_header(frame, chunks[0], state);
+        render_tui_file_browser(frame, chunks[1], state);
+        render_tui_input(frame, chunks[2], state);
+        render_tui_status(frame, chunks[3], state);
+        return;
+    }
+
     let completion_height = state
         .completions
         .as_ref()
@@ -880,6 +1689,111 @@ fn render_tui_completions(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
+fn render_tui_file_browser(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
+    let Some(browser) = &state.file_browser else {
+        let block = Block::default()
+            .title("Files")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red));
+        frame.render_widget(
+            Paragraph::new("file browser is not open").block(block),
+            area,
+        );
+        return;
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+    render_tui_file_entries(frame, chunks[0], browser);
+    render_tui_file_preview(frame, chunks[1], browser);
+}
+
+fn render_tui_file_entries(frame: &mut Frame<'_>, area: Rect, browser: &FileBrowserState) {
+    let visible_height = usize::from(area.height.saturating_sub(2));
+    let (visible_start, visible_end) = completion_visible_range(
+        browser.entries.len(),
+        Some(browser.selected),
+        visible_height,
+    );
+    let lines = browser
+        .entries
+        .iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(visible_end.saturating_sub(visible_start))
+        .map(|(index, entry)| {
+            let selected = browser.selected == index;
+            let entry_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if entry.kind == FileBrowserEntryKind::Directory {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let detail_style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let marker = if selected { "> " } else { "  " };
+            let size = entry.size.map(format_file_size).unwrap_or_else(String::new);
+            Line::from(vec![
+                Span::styled(marker, entry_style),
+                Span::styled(entry.kind.label(), detail_style),
+                Span::styled(" ", detail_style),
+                Span::styled(entry.name.clone(), entry_style),
+                Span::styled(
+                    if size.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {size}")
+                    },
+                    detail_style,
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let title = if visible_start > 0 || visible_end < browser.entries.len() {
+        format!(
+            "Files {}-{}/{}  {}",
+            visible_start + 1,
+            visible_end,
+            browser.entries.len(),
+            browser.current_dir.display()
+        )
+    } else {
+        format!("Files  {}", browser.current_dir.display())
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+fn render_tui_file_preview(frame: &mut Frame<'_>, area: Rect, browser: &FileBrowserState) {
+    let lines = browser
+        .preview
+        .lines
+        .iter()
+        .map(|line| Line::from(Span::raw(line.clone())))
+        .collect::<Vec<_>>();
+    let block = Block::default()
+        .title(browser.preview.title.clone())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn completion_visible_range(
     item_count: usize,
     selected: Option<usize>,
@@ -903,11 +1817,11 @@ fn render_tui_input(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
     let display_width = inner_width.saturating_sub(1).max(1);
     let (input, cursor_column) = state.input_view(display_width);
     let block = Block::default()
-        .title("Message")
+        .title(state.input_title())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
     frame.render_widget(Paragraph::new(input).block(block), area);
-    if area.width > 2 && area.height > 2 {
+    if state.accepts_text_input() && area.width > 2 && area.height > 2 {
         let cursor_x = area
             .x
             .saturating_add(1)
@@ -918,11 +1832,36 @@ fn render_tui_input(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
 }
 
 fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
-    let status_style = match state.status.as_str() {
-        "working" | "streaming" => Style::default().fg(Color::Yellow),
-        "ending session" => Style::default().fg(Color::Red),
-        _ => Style::default().fg(Color::Green),
-    };
+    let status_style =
+        if state.status.starts_with("file browser error:") || state.status == "ending session" {
+            Style::default().fg(Color::Red)
+        } else {
+            match state.status.as_str() {
+                "working" | "streaming" => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::Green),
+            }
+        };
+    if state.view_mode == CuiTuiViewMode::Files {
+        let line = Line::from(vec![
+            Span::styled(
+                state.status.clone(),
+                status_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("Up/Down", Style::default().fg(Color::DarkGray)),
+            Span::raw(" move   "),
+            Span::styled("Enter", Style::default().fg(Color::DarkGray)),
+            Span::raw(" open   "),
+            Span::styled("Backspace", Style::default().fg(Color::DarkGray)),
+            Span::raw(" parent   "),
+            Span::styled("n/m/r/x", Style::default().fg(Color::DarkGray)),
+            Span::raw(" new/mkdir/rename/delete   "),
+            Span::styled("F2/Esc", Style::default().fg(Color::DarkGray)),
+            Span::raw(" chat"),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let line = Line::from(vec![
         Span::styled(
             state.status.clone(),
@@ -1002,6 +1941,24 @@ mod tui_tests {
         CuiTuiState::new(&session, None)
     }
 
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn temp_file_browser_root(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "sinomo-tui-file-browser-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp root");
+        root
+    }
+
     #[test]
     fn tui_state_edits_input_at_cursor() {
         let mut state = fixture_tui_state();
@@ -1065,6 +2022,7 @@ mod tui_tests {
             .map(|item| item.label.clone())
             .collect::<Vec<_>>();
         assert!(initial_labels.contains(&"cluster".to_string()));
+        assert!(initial_labels.contains(&"files".to_string()));
 
         while state.input != "/cluster " {
             state.select_next_completion();
@@ -1123,6 +2081,106 @@ mod tui_tests {
         assert_eq!(completion_visible_range(20, Some(7), 6), (4, 10));
         assert_eq!(completion_visible_range(20, Some(19), 6), (14, 20));
         assert_eq!(completion_visible_range(4, Some(3), 6), (0, 4));
+    }
+
+    #[test]
+    fn file_browser_loads_directory_and_previews_text_file() {
+        let root = temp_file_browser_root("preview");
+        fs::create_dir(root.join("src")).expect("dir");
+        fs::write(root.join("note.txt"), "hello\nworld\n").expect("file");
+
+        let mut browser = FileBrowserState::open(&root).expect("browser");
+        let parent_index = browser
+            .entries
+            .iter()
+            .position(|entry| entry.kind == FileBrowserEntryKind::Parent)
+            .expect("parent");
+        let dir_index = browser
+            .entries
+            .iter()
+            .position(|entry| entry.name == "src")
+            .expect("dir");
+        let file_index = browser
+            .entries
+            .iter()
+            .position(|entry| entry.name == "note.txt")
+            .expect("file");
+        assert!(parent_index < dir_index);
+        assert!(dir_index < file_index);
+
+        browser.selected = file_index;
+        browser.update_preview();
+        assert!(browser.preview.lines.iter().any(|line| line == "hello"));
+        assert!(browser.preview.lines.iter().any(|line| line == "world"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn file_browser_manages_files_with_guarded_delete() {
+        let root = temp_file_browser_root("manage");
+        let mut browser = FileBrowserState::open(&root).expect("browser");
+
+        browser.create_file("alpha.txt").expect("create file");
+        assert!(root.join("alpha.txt").is_file());
+        browser.rename_selected("beta.txt").expect("rename file");
+        assert!(!root.join("alpha.txt").exists());
+        assert!(root.join("beta.txt").is_file());
+        assert!(browser.delete_selected("no").is_err());
+        assert!(root.join("beta.txt").exists());
+        browser.delete_selected("DELETE").expect("delete file");
+        assert!(!root.join("beta.txt").exists());
+
+        browser.create_dir("docs").expect("create dir");
+        assert!(root.join("docs").is_dir());
+        assert!(browser.create_file("../escape.txt").is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_state_file_browser_prompt_creates_file_and_closes() {
+        let root = temp_file_browser_root("state");
+        let mut state = fixture_tui_state();
+
+        state.open_file_browser_at(root.clone());
+        assert_eq!(state.view_mode, CuiTuiViewMode::Files);
+        assert!(state.completions.is_none());
+
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Char('n'))),
+            TuiInputAction::None
+        );
+        assert_eq!(state.file_prompt, Some(FileBrowserPrompt::NewFile));
+        state.insert_str("made.txt");
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Enter)),
+            TuiInputAction::None
+        );
+        assert!(root.join("made.txt").is_file());
+        assert!(state.file_prompt.is_none());
+        assert!(state.status.contains("created file"));
+
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Esc)),
+            TuiInputAction::None
+        );
+        assert_eq!(state.view_mode, CuiTuiViewMode::Chat);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_files_command_accepts_optional_target() {
+        assert_eq!(
+            parse_tui_slash_command("/files \"two words\"")
+                .expect("parse")
+                .expect("target"),
+            TuiSlashCommand::Files {
+                target: PathBuf::from("two words")
+            }
+        );
+        assert!(parse_tui_slash_command("/help").expect("parse").is_none());
     }
 }
 

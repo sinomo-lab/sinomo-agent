@@ -1,24 +1,26 @@
 use super::{
-    AgentCliCommand, AgentRunOptions, CliCommand, CliError, ClusterCliCommand, ClusterInitOptions,
-    ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths,
-    ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
-    DaemonCliCommand, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
-    DaemonStatus, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
-    DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths, InstallLayout, InstallOptions,
-    InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, MainAgentInteractionHandler, ModelBackedInteractionHandler,
-    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
-    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
-    RolloutMainActivation, RolloutOptions, RolloutTelemetryGateSetOptions, SandboxCliCommand,
-    SandboxToolchainVerifyMakeOptions, SandboxToolchainVerifyMakepkgOptions,
-    SandboxToolchainVerifyTccOptions, SelfRolloutPaths, UninstallOptions,
-    advertised_peer_route_targets, apply_cluster_node_role, apply_cluster_raft_role,
-    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
-    cli_command_requires_cluster_state, cluster_connectivity_sync_ops, cluster_doctor_findings,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_publish_targets,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
-    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
-    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
+    AgentCliCommand, AgentRunOptions, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
+    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
+    ClusterPaths, ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions,
+    ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
+    DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths,
+    InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, MainAgentInteractionHandler,
+    ModelBackedInteractionHandler, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
+    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
+    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
+    RolloutTelemetryGateSetOptions, SandboxCliCommand, SandboxToolchainVerifyMakeOptions,
+    SandboxToolchainVerifyMakepkgOptions, SandboxToolchainVerifyTccOptions, SelfRolloutPaths,
+    UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    apply_cluster_raft_role, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
+    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
+    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
+    cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
+    cui_default_daemon_status, daemon_advertised_endpoints_for_state,
     daemon_handle_daemon_sandbox_checkpoint, daemon_handle_daemon_sandbox_create,
     daemon_handle_daemon_sandbox_destroy, daemon_handle_daemon_sandbox_http_fetch,
     daemon_handle_daemon_sandbox_http_fetch_to_file, daemon_handle_daemon_sandbox_import_busybox,
@@ -7522,12 +7524,78 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
     assert!(!cli_command_requires_cluster_state(&CliCommand::Dfs(
         DfsCliCommand::Help
     )));
+    assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
+        DfsCliCommand::Status(DfsCommonOptions {
+            cluster: true,
+            ..DfsCommonOptions::default()
+        })
+    )));
+    assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
+        DfsCliCommand::Services { json: false }
+    )));
+    assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
+        DfsCliCommand::MetadataPublish { json: false }
+    )));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Models(
         ModelsCliCommand::Help
     )));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(
         ProviderCliCommand::Help
     )));
+}
+
+#[test]
+fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
+    let models = CliCommand::Models(ModelsCliCommand::Help);
+    assert!(cli_command_supports_degraded_local_mode(&models));
+    assert!(cli_invocation_force_local_mode(
+        CliRuntimeOptions::default(),
+        &models,
+        false,
+        None
+    ));
+    assert!(cli_invocation_force_local_mode(
+        CliRuntimeOptions::default(),
+        &models,
+        true,
+        Some(false)
+    ));
+    assert!(!cli_invocation_force_local_mode(
+        CliRuntimeOptions::default(),
+        &models,
+        true,
+        Some(true)
+    ));
+
+    let dfs_local = CliCommand::Dfs(DfsCliCommand::Status(DfsCommonOptions::default()));
+    assert!(cli_command_supports_degraded_local_mode(&dfs_local));
+    assert!(cli_invocation_force_local_mode(
+        CliRuntimeOptions::default(),
+        &dfs_local,
+        false,
+        None
+    ));
+
+    let dfs_cluster = CliCommand::Dfs(DfsCliCommand::Status(DfsCommonOptions {
+        cluster: true,
+        ..DfsCommonOptions::default()
+    }));
+    assert!(!cli_command_supports_degraded_local_mode(&dfs_cluster));
+    assert!(!cli_invocation_force_local_mode(
+        CliRuntimeOptions::default(),
+        &dfs_cluster,
+        false,
+        None
+    ));
+
+    let evolve = CliCommand::Evolve(super::EvolveCliCommand::Help);
+    assert!(!cli_command_supports_degraded_local_mode(&evolve));
+    assert!(!cli_invocation_force_local_mode(
+        CliRuntimeOptions::default(),
+        &evolve,
+        false,
+        None
+    ));
 }
 
 #[test]
@@ -15380,6 +15448,26 @@ fn captured_cli_command_collects_stdout_for_embedded_callers() {
     assert!(captured.output.stderr.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn captured_cli_command_collects_raw_stdio_for_embedded_callers() {
+    let captured = super::run_cli_closure_with_capture(|| {
+        std::io::stdout()
+            .write_all(b"raw stdout from dependency\n")
+            .expect("write raw stdout");
+        std::io::stderr()
+            .write_all(b"raw stderr warning from dependency\n")
+            .expect("write raw stderr");
+        Ok(())
+    });
+
+    assert!(captured.result.is_ok());
+    let stdout = String::from_utf8_lossy(&captured.output.stdout);
+    let stderr = String::from_utf8_lossy(&captured.output.stderr);
+    assert!(stdout.contains("raw stdout from dependency"));
+    assert!(stderr.contains("raw stderr warning from dependency"));
+}
+
 #[test]
 fn slash_command_returns_captured_cli_output_as_interaction_lines() {
     let session = InteractionSession::new(
@@ -15411,6 +15499,45 @@ fn slash_command_returns_captured_cli_output_as_interaction_lines() {
             super::InteractionOutput::Line(line) if line == "completed command: /help"
         )
     }));
+}
+
+#[test]
+fn files_slash_command_is_tui_only() {
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_files_tui_only_test").expect("session"),
+        NodeId::from_legacy_named("node_files_tui_only_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        MainAgentInteractionHandler::new(
+            MainAgentFixtureModel,
+            "fixture-provider",
+            "fixture-model",
+        ),
+        session,
+    );
+
+    let outputs = runtime.ingest_user_input("/files").expect("slash files");
+
+    assert!(outputs.iter().any(|output| {
+        matches!(
+            output,
+            super::InteractionOutput::Line(line) if line.starts_with("command failed:")
+        )
+    }));
+    assert!(!outputs.iter().any(|output| {
+        matches!(
+            output,
+            super::InteractionOutput::Line(line) if line.contains("file browser is available in the TUI")
+        )
+    }));
+    let events = runtime.store().replay(ReplayQuery::all()).expect("events");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event.kind.as_str() != "interaction.file_browser.requested")
+    );
 }
 
 #[test]
@@ -15733,6 +15860,14 @@ fn cui_entry_starts_without_daemon_using_local_runtime_config() {
     assert!(output.contains("ending session"));
 
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cui_local_mode_skips_default_daemon_probe() {
+    let daemon = with_cli_force_local_mode(true, cui_default_daemon_status)
+        .expect("local mode daemon status");
+
+    assert!(daemon.is_none());
 }
 
 #[test]
@@ -16097,6 +16232,66 @@ fn local_mode_forces_model_config_to_local_file_on_clustered_node() {
     .expect("write local model defaults");
 
     assert!(model_config_uses_cluster(&data_dir));
+    let config_path = root.join("config").join("models.json");
+    let config = serde_json::from_str::<sinomo_lm::ModelConfig>(
+        &std::fs::read_to_string(&config_path).expect("model config"),
+    )
+    .expect("model config json");
+    assert_eq!(config.default_provider.as_deref(), Some("openai"));
+    assert_eq!(config.default_account.as_deref(), Some("local"));
+    assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
+
+    let store = sinomo_runtime::kv::InProcessKvStore::restore(
+        sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
+    );
+    assert!(store.get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY).is_none());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn daemonless_cli_model_defaults_use_local_file_on_clustered_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-daemonless-models-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("daemonless_models").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("daemonless_models_node").expect("node")),
+            name: "daemonless models".to_string(),
+        },
+        &cluster_paths,
+    )
+    .expect("cluster init");
+    assert!(model_config_uses_cluster(&data_dir));
+
+    let command = CliCommand::Models(ModelsCliCommand::Default(super::ModelDefaultOptions {
+        provider: "openai".to_string(),
+        account: "local".to_string(),
+        model: "gpt-5.5".to_string(),
+    }));
+    let force_local =
+        cli_invocation_force_local_mode(CliRuntimeOptions::default(), &command, false, None);
+    assert!(force_local);
+
+    with_cli_force_local_mode(force_local, || {
+        models_default_with_data_dir(
+            super::ModelDefaultOptions {
+                provider: "openai".to_string(),
+                account: "local".to_string(),
+                model: "gpt-5.5".to_string(),
+            },
+            &data_dir,
+        )
+    })
+    .expect("write daemonless local model defaults");
+
     let config_path = root.join("config").join("models.json");
     let config = serde_json::from_str::<sinomo_lm::ModelConfig>(
         &std::fs::read_to_string(&config_path).expect("model config"),

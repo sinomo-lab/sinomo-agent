@@ -277,8 +277,14 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
+#[cfg(unix)]
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -305,6 +311,9 @@ thread_local! {
     static CLI_FORCE_LOCAL_MODE: Cell<bool> = const { Cell::new(false) };
     static CLI_OUTPUT_CAPTURE: RefCell<Option<CliOutputBuffer>> = const { RefCell::new(None) };
 }
+
+#[cfg(unix)]
+static PROCESS_STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct CliCommandOutput {
@@ -405,27 +414,344 @@ struct CliCommandCaptureExecution {
 }
 
 fn run_cli_command_with_capture(args: &[String]) -> CliCommandCaptureExecution {
+    run_cli_closure_with_capture(|| run_cli_command(args))
+}
+
+fn run_cli_closure_with_capture(
+    f: impl FnOnce() -> Result<(), CliError>,
+) -> CliCommandCaptureExecution {
     let previous = CLI_OUTPUT_CAPTURE.with(|capture| {
         capture.replace(Some(CliOutputBuffer {
             stdout: Vec::new(),
             stderr: Vec::new(),
         }))
     });
-    let result = run_cli_command(args);
+    let (result, raw_output) = run_with_process_stdio_capture(f);
     let buffer = CLI_OUTPUT_CAPTURE
         .with(|capture| capture.replace(previous))
         .expect("CLI output capture installed");
+    let mut stdout = buffer.stdout;
+    stdout.extend_from_slice(&raw_output.stdout);
+    let mut stderr = buffer.stderr;
+    stderr.extend_from_slice(&raw_output.stderr);
     CliCommandCaptureExecution {
-        output: CliCommandOutput {
-            stdout: buffer.stdout,
-            stderr: buffer.stderr,
-        },
+        output: CliCommandOutput { stdout, stderr },
         result,
     }
 }
 
+fn run_with_process_stdio_capture<T>(f: impl FnOnce() -> T) -> (T, CliOutputBuffer) {
+    #[cfg(unix)]
+    {
+        let _lock = PROCESS_STDIO_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match UnixProcessStdioCapture::start() {
+            Ok(capture) => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                let output = capture.finish().unwrap_or_else(|error| CliOutputBuffer {
+                    stdout: Vec::new(),
+                    stderr: format!("warning: failed to restore captured stdio: {error}\n")
+                        .into_bytes(),
+                });
+                match result {
+                    Ok(result) => (result, output),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            Err(error) => {
+                let result = f();
+                (
+                    result,
+                    CliOutputBuffer {
+                        stdout: Vec::new(),
+                        stderr: format!(
+                            "warning: failed to capture process stdio for embedded command: {error}\n"
+                        )
+                        .into_bytes(),
+                    },
+                )
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        (f(), CliOutputBuffer::default())
+    }
+}
+
+#[cfg(unix)]
+struct UnixProcessStdioCapture {
+    saved_stdout: RawFd,
+    saved_stderr: RawFd,
+    stop_readers: Arc<AtomicBool>,
+    stdout_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stderr_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+}
+
+#[cfg(unix)]
+impl UnixProcessStdioCapture {
+    fn start() -> io::Result<Self> {
+        let saved_stdout = dup_fd(libc::STDOUT_FILENO)?;
+        let saved_stderr = match dup_fd(libc::STDERR_FILENO) {
+            Ok(fd) => fd,
+            Err(error) => {
+                close_fd_quietly(saved_stdout);
+                return Err(error);
+            }
+        };
+        let (stdout_read, stdout_write) = match create_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                close_fd_quietly(saved_stdout);
+                close_fd_quietly(saved_stderr);
+                return Err(error);
+            }
+        };
+        let (stderr_read, stderr_write) = match create_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                close_fd_quietly(stdout_read);
+                close_fd_quietly(stdout_write);
+                close_fd_quietly(saved_stdout);
+                close_fd_quietly(saved_stderr);
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            set_fd_nonblocking(stdout_read).and_then(|()| set_fd_nonblocking(stderr_read))
+        {
+            close_fd_quietly(stdout_read);
+            close_fd_quietly(stdout_write);
+            close_fd_quietly(stderr_read);
+            close_fd_quietly(stderr_write);
+            close_fd_quietly(saved_stdout);
+            close_fd_quietly(saved_stderr);
+            return Err(error);
+        }
+
+        if let Err(error) = dup2_fd(stdout_write, libc::STDOUT_FILENO) {
+            close_fd_quietly(stdout_read);
+            close_fd_quietly(stdout_write);
+            close_fd_quietly(stderr_read);
+            close_fd_quietly(stderr_write);
+            close_fd_quietly(saved_stdout);
+            close_fd_quietly(saved_stderr);
+            return Err(error);
+        }
+        if let Err(error) = dup2_fd(stderr_write, libc::STDERR_FILENO) {
+            let _ = dup2_fd(saved_stdout, libc::STDOUT_FILENO);
+            close_fd_quietly(stdout_read);
+            close_fd_quietly(stdout_write);
+            close_fd_quietly(stderr_read);
+            close_fd_quietly(stderr_write);
+            close_fd_quietly(saved_stdout);
+            close_fd_quietly(saved_stderr);
+            return Err(error);
+        }
+        close_fd_quietly(stdout_write);
+        close_fd_quietly(stderr_write);
+
+        let stop_readers = Arc::new(AtomicBool::new(false));
+        let stdout_reader = spawn_stdio_capture_reader(stdout_read, Arc::clone(&stop_readers));
+        let stderr_reader = spawn_stdio_capture_reader(stderr_read, Arc::clone(&stop_readers));
+
+        Ok(Self {
+            saved_stdout,
+            saved_stderr,
+            stop_readers,
+            stdout_reader,
+            stderr_reader,
+        })
+    }
+
+    fn finish(self) -> io::Result<CliOutputBuffer> {
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        let stdout_restore = dup2_fd(self.saved_stdout, libc::STDOUT_FILENO);
+        let stderr_restore = dup2_fd(self.saved_stderr, libc::STDERR_FILENO);
+        close_fd_quietly(self.saved_stdout);
+        close_fd_quietly(self.saved_stderr);
+
+        self.stop_readers.store(true, Ordering::SeqCst);
+        let stdout = join_stdio_capture_reader(self.stdout_reader)?;
+        let stderr = join_stdio_capture_reader(self.stderr_reader)?;
+
+        stdout_restore?;
+        stderr_restore?;
+
+        Ok(CliOutputBuffer { stdout, stderr })
+    }
+}
+
+#[cfg(unix)]
+fn create_pipe() -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` points to two valid `RawFd` slots for libc to initialize.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
+#[cfg(unix)]
+fn dup_fd(fd: RawFd) -> io::Result<RawFd> {
+    // SAFETY: `dup` does not take ownership of `fd`; it returns a new descriptor or -1.
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(duplicated)
+    }
+}
+
+#[cfg(unix)]
+fn dup2_fd(from: RawFd, to: RawFd) -> io::Result<()> {
+    // SAFETY: `dup2` atomically duplicates `from` onto descriptor number `to`.
+    if unsafe { libc::dup2(from, to) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fcntl` reads and updates flags for a valid file descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fcntl` writes the updated flag bitset back to the same descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn close_fd_quietly(fd: RawFd) {
+    // SAFETY: closing an owned descriptor is safe; errors are intentionally ignored here.
+    let _ = unsafe { libc::close(fd) };
+}
+
+#[cfg(unix)]
+fn spawn_stdio_capture_reader(
+    fd: RawFd,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            // SAFETY: `buffer` is valid for writes and `fd` is owned by this reader thread.
+            let read =
+                unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
+            if read > 0 {
+                output.extend_from_slice(&buffer[..read as usize]);
+                continue;
+            }
+            if read == 0 {
+                close_fd_quietly(fd);
+                return Ok(output);
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(code)
+                    if code == libc::EINTR || code == libc::EAGAIN || code == libc::EWOULDBLOCK =>
+                {
+                    if stop.load(Ordering::SeqCst)
+                        && matches!(
+                            error.raw_os_error(),
+                            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
+                        )
+                    {
+                        close_fd_quietly(fd);
+                        return Ok(output);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => {
+                    close_fd_quietly(fd);
+                    return Err(error);
+                }
+            }
+        }
+    })
+}
+
+#[cfg(unix)]
+fn join_stdio_capture_reader(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+) -> io::Result<Vec<u8>> {
+    reader.join().unwrap_or_else(|payload| {
+        std::panic::resume_unwind(payload);
+    })
+}
+
 pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
-    matches!(command, CliCommand::Evolve(_))
+    match command {
+        CliCommand::Evolve(_) => true,
+        CliCommand::Dfs(command) => dfs_command_requires_cluster_state(command),
+        _ => false,
+    }
+}
+
+pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> bool {
+    match command {
+        CliCommand::Cui
+        | CliCommand::Models(_)
+        | CliCommand::Providers(_)
+        | CliCommand::Agent(_) => true,
+        CliCommand::Dfs(command) => !dfs_command_requires_cluster_state(command),
+        _ => false,
+    }
+}
+
+fn cli_command_needs_daemon_probe(command: &CliCommand) -> bool {
+    cli_command_requires_cluster_state(command) || cli_command_supports_degraded_local_mode(command)
+}
+
+fn cli_command_enters_degraded_local_mode(
+    command: &CliCommand,
+    daemon_available: bool,
+    local_cluster_quorum: Option<bool>,
+) -> bool {
+    cli_command_supports_degraded_local_mode(command)
+        && (!daemon_available || local_cluster_quorum == Some(false))
+}
+
+pub(crate) fn cli_invocation_force_local_mode(
+    options: CliRuntimeOptions,
+    command: &CliCommand,
+    daemon_available: bool,
+    local_cluster_quorum: Option<bool>,
+) -> bool {
+    options.force_local
+        || cli_command_enters_degraded_local_mode(command, daemon_available, local_cluster_quorum)
+}
+
+fn cli_local_cluster_quorum_if_relevant(
+    command: &CliCommand,
+    daemon: Option<&DaemonStatus>,
+) -> Result<Option<bool>, CliError> {
+    if daemon.is_none() || !cli_command_supports_degraded_local_mode(command) {
+        return Ok(None);
+    }
+    let paths = cluster_paths_from_defaults()?;
+    match read_cluster_state(&paths) {
+        Ok(state) => Ok(Some(cluster_has_local_quorum(&paths, &state))),
+        Err(CliError::ClusterOrphan) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn dfs_command_requires_cluster_state(command: &DfsCliCommand) -> bool {
+    match command {
+        DfsCliCommand::Status(options) => options.cluster,
+        DfsCliCommand::Services { .. } | DfsCliCommand::MetadataPublish { .. } => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -943,11 +1269,28 @@ fn run_cli_command(args: &[String]) -> Result<(), CliError> {
 }
 
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
-    let _guard = enter_cli_force_local_mode(invocation.options.force_local);
     let command = invocation.command;
+    let daemon = if invocation.options.force_local || !cli_command_needs_daemon_probe(&command) {
+        None
+    } else {
+        default_main_daemon_status()?
+    };
+    let local_cluster_quorum = if invocation.options.force_local {
+        None
+    } else {
+        cli_local_cluster_quorum_if_relevant(&command, daemon.as_ref())?
+    };
+    let force_local = cli_invocation_force_local_mode(
+        invocation.options,
+        &command,
+        daemon.is_some(),
+        local_cluster_quorum,
+    );
+    let _guard = enter_cli_force_local_mode(force_local);
 
     if !cli_force_local_mode() && cli_command_requires_cluster_state(&command) {
-        require_cluster_runtime_quorum()?;
+        let paths = cluster_paths_from_defaults()?;
+        require_cluster_runtime_quorum_with_paths_and_daemon(&paths, daemon.as_ref())?;
     }
 
     match command {
