@@ -6095,6 +6095,7 @@ dependencies = [
  "sinomo-rollout",
  "sinomo-sandbox",
  "sinomo-sandbox-runtime",
+ "sinomo-service",
  "sinomo-storage",
  "sinomo-supervision",
  "sinomo-sync",

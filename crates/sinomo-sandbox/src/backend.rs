@@ -118,6 +118,16 @@ pub trait SandboxBackend: Send {
         &mut self,
         request: SandboxImportToolchainPackageFromPathRequest,
     ) -> Result<SandboxImportToolchainPackageResponse, SandboxBackendError>;
+
+    fn run_toolchain(
+        &mut self,
+        request: SandboxRunToolchainRequest,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError>;
+
+    fn run_process_plan(
+        &mut self,
+        request: SandboxRunProcessPlanRequest,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError>;
 }
 
 /// Daemonless sandbox backend backed by the local filesystem store. Works with no cluster
@@ -356,6 +366,20 @@ impl SandboxBackend for LocalSandboxBackend {
         _request: SandboxImportToolchainPackageFromPathRequest,
     ) -> Result<SandboxImportToolchainPackageResponse, SandboxBackendError> {
         Err(local_mode_unsupported("toolchain import-package-from-path"))
+    }
+
+    fn run_toolchain(
+        &mut self,
+        _request: SandboxRunToolchainRequest,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
+        Err(local_mode_unsupported("toolchain execution"))
+    }
+
+    fn run_process_plan(
+        &mut self,
+        _request: SandboxRunProcessPlanRequest,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
+        Err(local_mode_unsupported("process-plan execution"))
     }
 }
 

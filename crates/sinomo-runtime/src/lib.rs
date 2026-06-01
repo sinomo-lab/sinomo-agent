@@ -45,6 +45,7 @@ pub mod r1 {
     pub use sinomo_sandbox as sandbox;
     #[cfg(feature = "sandbox")]
     pub use sinomo_sandbox_runtime as sandbox;
+    pub use sinomo_service as service;
     pub use sinomo_supervision as supervision;
     pub use sinomo_sync as sync;
 
@@ -93,7 +94,7 @@ pub mod r1 {
 pub use r0::core;
 pub use r1::{
     api, daemon, device, dfs, eval, events, kv, local, module, network, node, policy, registry,
-    rollout, sandbox, storage, supervision, sync,
+    rollout, sandbox, service, storage, supervision, sync,
 };
 
 #[cfg(test)]
