@@ -14,6 +14,7 @@
 //! mediated HTTP; these delegate to `LocalSandboxBackend` (which reports them unsupported).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use sinomo_node::NodeId;
 use time::OffsetDateTime;
@@ -48,6 +49,37 @@ impl RuntimeSandboxBackend {
             cache_root: cache_root.into(),
             node_id,
         })
+    }
+
+    /// Run a toolchain command with **live output streaming** via `output_sink`, against
+    /// caller-provided stores (which may be custom — e.g. tests) under the caller's `node_id`
+    /// and `policy`. For in-process hosts (the CLI) that stream stdout/stderr as the command
+    /// runs; the unary [`SandboxBackend::run_toolchain`] buffers and uses a default policy.
+    ///
+    /// Returns the runner's native [`SandboxCommandExecutionError`] (not the flattened
+    /// [`SandboxBackendError`]) so callers keep their typed error mapping (e.g. policy-denied,
+    /// quota) intact.
+    pub fn run_toolchain_command_streaming(
+        store: &LocalSandboxInstanceStore,
+        toolchain_store: &LocalSandboxToolchainStore,
+        request: SandboxRunToolchainRequest,
+        node_id: &NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Arc<dyn SandboxOutputSink>,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        LocalStagedSandboxCommandRunner::new()?
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                store,
+                toolchain_store,
+                &request.sandbox_id,
+                &request.command_name,
+                request.argv,
+                request.stdin,
+                request.timeout_ms,
+                node_id,
+                policy,
+                Some(output_sink),
+            )
     }
 }
 
