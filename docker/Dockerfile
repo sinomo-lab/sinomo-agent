@@ -18,7 +18,14 @@ RUN apt-get update \
 # and committed so the in-container managed source repo + build.rs commit stamp work.
 WORKDIR /sinomo-src
 COPY . /sinomo-src
-RUN git config --global user.email "dev@sinomo.local" \
+# A normal clone ships a real .git directory, which we preserve so build.rs stamps the
+# real commit. A git *worktree* instead ships a .git *file* pointing at an external
+# gitdir absent from the image; git then hard-fails repo discovery on that dangling
+# pointer for EVERY command -- even `config --global` -- so it must be dropped up front,
+# before any git runs. We only remove a .git that is not a real directory (preserving a
+# clone's), then the fallback inits a fresh baseline when no real repo remains.
+RUN { [ -d .git ] || rm -rf .git; } \
+    && git config --global user.email "dev@sinomo.local" \
     && git config --global user.name "sinomo-dev" \
     && git config --global init.defaultBranch main \
     && if [ ! -d .git ]; then git init -q && git add -A && git commit -qm "dev-cluster baseline"; fi
