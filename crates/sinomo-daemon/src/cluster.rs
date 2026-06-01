@@ -1493,8 +1493,12 @@ impl ClusterNetworkMaintenance {
         let timestamp = now
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string());
+        // Seed the in-memory probe cache from the merged graph (KV + the local probe store,
+        // local-authoritative for our own edges) rather than KV alone: a learner cannot commit
+        // its connectivity edges to KV, so seeding from KV would discard our own last-known
+        // reachability and force a full re-convergence on every restart.
         if self.connectivity.is_empty()
-            && let Ok(records) = sinomo_network::read_cluster_connectivity_graph_from_kv(paths)
+            && let Ok(records) = sinomo_network::read_cluster_connectivity_graph(paths)
         {
             for record in records
                 .into_iter()
@@ -1528,6 +1532,10 @@ impl ClusterNetworkMaintenance {
                         || (probe.record.state != sinomo_network::ClusterConnectivityState::Healthy
                             && probe.record.consecutive_failures
                                 < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD)
+                        // Re-probe promptly after ANY recent failure, including a link still
+                        // reported Healthy under the single-failure grace below, so a real
+                        // outage is confirmed (and drops out of routing) within a couple ticks.
+                        || probe.record.consecutive_failures > 0
                 })
             })
             .cloned()
@@ -1615,7 +1623,19 @@ impl ClusterNetworkMaintenance {
                                         None
                                     }
                                 });
-                                let state_label = if observed_failures
+                                let previously_healthy =
+                                    previous.as_ref().is_some_and(|record| {
+                                        record.state
+                                            == sinomo_network::ClusterConnectivityState::Healthy
+                                    });
+                                let state_label = if previously_healthy && observed_failures == 1 {
+                                    // Single-failure grace: a confirmed-healthy link survives one
+                                    // transient probe failure as Healthy (stays routable through a
+                                    // blip). The probe-selection clause re-probes it next tick, so
+                                    // a real outage still drops it to Degraded within two cycles. A
+                                    // never-confirmed link gets no grace.
+                                    sinomo_network::ClusterConnectivityState::Healthy
+                                } else if observed_failures
                                     >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
                                 {
                                     sinomo_network::ClusterConnectivityState::Unreachable

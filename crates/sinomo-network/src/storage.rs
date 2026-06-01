@@ -683,11 +683,9 @@ pub fn cluster_connectivity_record(
     observed_at: OffsetDateTime,
     ttl_seconds: i64,
 ) -> ClusterConnectivityRecord {
-    let expires_in = if matches!(connectivity_state, ClusterConnectivityState::Healthy) {
-        ttl_seconds
-    } else {
-        ttl_seconds / 2
-    };
+    // The caller passes an explicit per-state TTL (e.g. CLUSTER_CONNECTIVITY_TTL_SECONDS for
+    // healthy/degraded, CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS for unreachable); honor it
+    // directly rather than silently halving non-healthy lifetimes.
     ClusterConnectivityRecord {
         cluster_id: state.cluster_id.clone(),
         source_node_id: state.local_node_id.clone(),
@@ -701,7 +699,7 @@ pub fn cluster_connectivity_record(
         last_success_at,
         last_failure_at,
         observed_at,
-        expires_at: observed_at + time::Duration::seconds(expires_in),
+        expires_at: observed_at + time::Duration::seconds(ttl_seconds),
     }
 }
 
