@@ -25,7 +25,8 @@ use sinomo_network::{
     CLUSTER_RAFT_VOTE_ROUTE, ClusterPaths, ClusterRaftAppendRequest, ClusterRaftVoteRequest,
     DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DFS_PROTOCOL_FRAME_ROUTE, DFS_SMOKE_ROUTE,
     DaemonControlStream, ObjectRpcRequest, ObjectRpcResponse, ROLLOUT_BINARY_ROUTE,
-    ROLLOUT_BUILD_ROUTE, read_cluster_kv_entry, read_cluster_kv_prefix_entries,
+    ROLLOUT_BUILD_ROUTE, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+    read_cluster_kv_entry, read_cluster_kv_prefix_entries,
 };
 use sinomo_rollout::ClusterRolloutBinaryResponse;
 use sinomo_sandbox::{
@@ -37,8 +38,10 @@ use sinomo_sandbox::{
     SandboxHttpRequest, SandboxHttpResponse, SandboxImportBusyBoxToolchainRequest,
     SandboxImportBusyBoxToolchainResponse, SandboxImportToolchainPackageFromPathRequest,
     SandboxImportToolchainPackageRequest, SandboxImportToolchainPackageResponse, SandboxListRequest,
-    SandboxListResponse, SandboxReadRequest, SandboxReadResponse, SandboxRebootRequest,
-    SandboxRebootResponse, SandboxResumeRequest, SandboxResumeResponse, SandboxStatusRequest,
+    SandboxListResponse, SandboxLocalCommandOutcome, SandboxProcessPlanOutcome, SandboxReadRequest,
+    SandboxReadResponse, SandboxRebootRequest, SandboxRebootResponse, SandboxResumeRequest,
+    SandboxResumeResponse, SandboxRunProcessPlanRequest, SandboxRunToolchainRequest,
+    SandboxStatusRequest,
     SandboxStatusResponse, SandboxUpdateInstanceRequest, SandboxUpdateInstanceResponse,
     SandboxWriteRequest, SandboxWriteResponse,
 };
@@ -60,7 +63,9 @@ use crate::control::{
     handle_daemon_sandbox_create, handle_daemon_sandbox_destroy, handle_daemon_sandbox_http_fetch,
     handle_daemon_sandbox_http_fetch_to_file, handle_daemon_sandbox_import_busybox,
     handle_daemon_sandbox_list, handle_daemon_sandbox_read, handle_daemon_sandbox_reboot,
-    handle_daemon_sandbox_resume, handle_daemon_sandbox_status,
+    handle_daemon_sandbox_resume, handle_daemon_sandbox_run_process_plan,
+    handle_daemon_sandbox_run_process_plan_stream, handle_daemon_sandbox_run_toolchain,
+    handle_daemon_sandbox_run_toolchain_stream, handle_daemon_sandbox_status,
     handle_daemon_sandbox_toolchain_add_artifact, handle_daemon_sandbox_toolchain_add_command,
     handle_daemon_sandbox_toolchain_import_package,
     handle_daemon_sandbox_toolchain_import_package_from_path, handle_daemon_sandbox_update,
@@ -497,6 +502,20 @@ impl SandboxBackend for DaemonSandboxBackend {
         handle_daemon_sandbox_toolchain_import_package_from_path(&self.paths, request)
             .map_err(daemon_sandbox_error)
     }
+
+    fn run_toolchain(
+        &mut self,
+        request: SandboxRunToolchainRequest,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
+        handle_daemon_sandbox_run_toolchain(&self.paths, request).map_err(daemon_sandbox_error)
+    }
+
+    fn run_process_plan(
+        &mut self,
+        request: SandboxRunProcessPlanRequest,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
+        handle_daemon_sandbox_run_process_plan(&self.paths, request).map_err(daemon_sandbox_error)
+    }
 }
 
 /// Selects the sandbox backend by context: the daemon's clustered SIFS-over-DFS store when
@@ -568,6 +587,33 @@ impl ResponseSink for BufferSink {
     }
 }
 
+/// The streaming sandbox-execution routes write `SandboxRun*StreamFrame`s to the connection
+/// in real time during long-running, `sandbox`-feature-gated execution. That stream-coupled
+/// I/O model is owned by the daemon's own stream handlers (and cannot run daemonless), so we
+/// serve them here directly rather than through the unary, host-agnostic service registry.
+fn try_dispatch_sandbox_stream(
+    request: &ObjectRpcRequest,
+    stream: &mut DaemonControlStream,
+    paths: &DaemonPaths,
+) -> Option<Result<bool, DaemonError>> {
+    let result = match request.route.as_str() {
+        SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE => request
+            .decode_body()
+            .map_err(DaemonError::from)
+            .and_then(|payload| handle_daemon_sandbox_run_toolchain_stream(paths, payload, stream)),
+        SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE => {
+            request
+                .decode_body()
+                .map_err(DaemonError::from)
+                .and_then(|payload| {
+                    handle_daemon_sandbox_run_process_plan_stream(paths, payload, stream)
+                })
+        }
+        _ => return None,
+    };
+    Some(result.map(|()| false))
+}
+
 /// If the request's route is owned by the service registry, serve it and return the
 /// outcome (`Ok(true)` ⇒ the daemon should stop). Returns `None` for routes the registry
 /// does not own, so the caller falls through to the daemon's own dispatch.
@@ -578,6 +624,9 @@ pub(crate) fn try_dispatch_via_registry(
     paths: &DaemonPaths,
 ) -> Option<Result<bool, DaemonError>> {
     let request = rpc_request.as_ref()?;
+    if let Some(result) = try_dispatch_sandbox_stream(request, stream, paths) {
+        return Some(result);
+    }
     let registry = daemon_service_registry(paths, authenticated);
     if !registry.owns(&request.route) {
         return None;

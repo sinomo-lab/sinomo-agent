@@ -14,7 +14,8 @@ use sinomo_network::{
     ObjectRpcRequest, ObjectRpcResponse, SANDBOX_CHECKPOINT_ROUTE, SANDBOX_CREATE_ROUTE,
     SANDBOX_DESTROY_ROUTE, SANDBOX_HTTP_FETCH_ROUTE, SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
     SANDBOX_IMPORT_BUSYBOX_ROUTE, SANDBOX_LIST_ROUTE, SANDBOX_READ_ROUTE, SANDBOX_REBOOT_ROUTE,
-    SANDBOX_RESUME_ROUTE, SANDBOX_STATUS_ROUTE, SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
+    SANDBOX_RESUME_ROUTE, SANDBOX_RUN_PROCESS_PLAN_ROUTE, SANDBOX_RUN_TOOLCHAIN_ROUTE,
+    SANDBOX_STATUS_ROUTE, SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
     SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE, SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
     SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE, SANDBOX_UPDATE_ROUTE, SANDBOX_WRITE_ROUTE,
 };
@@ -84,6 +85,8 @@ impl Service for SandboxService {
             SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
             SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
             SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
+            SANDBOX_RUN_TOOLCHAIN_ROUTE,
+            SANDBOX_RUN_PROCESS_PLAN_ROUTE,
         ]
     }
 
@@ -187,6 +190,20 @@ impl Service for SandboxService {
                         &backend.import_toolchain_package_from_path(payload)?,
                     )?
                 }
+                SANDBOX_RUN_TOOLCHAIN_ROUTE => {
+                    let payload = request.decode_body()?;
+                    ObjectRpcResponse::encode_body(
+                        SANDBOX_RUN_TOOLCHAIN_ROUTE,
+                        &backend.run_toolchain(payload)?,
+                    )?
+                }
+                SANDBOX_RUN_PROCESS_PLAN_ROUTE => {
+                    let payload = request.decode_body()?;
+                    ObjectRpcResponse::encode_body(
+                        SANDBOX_RUN_PROCESS_PLAN_ROUTE,
+                        &backend.run_process_plan(payload)?,
+                    )?
+                }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
@@ -240,7 +257,7 @@ mod tests {
         let service = SandboxService::new(Arc::new(UnavailableFactory));
         assert_eq!(service.name(), "sandbox");
         assert!(service.routes().contains(&SANDBOX_STATUS_ROUTE));
-        assert_eq!(service.routes().len(), 17);
+        assert_eq!(service.routes().len(), 19);
     }
 
     /// The service is registered, owns the route, opens a backend via the factory, and

@@ -5,6 +5,7 @@
 //! pulled in only when the `sandbox` feature is enabled by a downstream crate, so
 //! the default build never compiles the wasm runtime.
 
+mod backend;
 mod execution;
 mod internal;
 mod runtime;
@@ -13,6 +14,7 @@ mod runtime;
 // modules keep resolving contract types via `crate::<Type>` (their original paths).
 pub use sinomo_sandbox::*;
 
+pub use backend::RuntimeSandboxBackend;
 pub use execution::*;
 pub use runtime::LocalWasiCommandRunner;
 

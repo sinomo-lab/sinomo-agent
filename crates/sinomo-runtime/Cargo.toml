@@ -32,6 +32,7 @@ sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-sandbox-runtime = { path = "../sinomo-sandbox-runtime", optional = true }
+sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 sinomo-supervision = { path = "../sinomo-supervision" }
 sinomo-sync = { path = "../sinomo-sync" }
