@@ -47,7 +47,7 @@ pub fn cluster_route_next_hop(
     queue.push_back(vec![local.clone()]);
     while let Some(path) = queue.pop_front() {
         let current = path.last().expect("BFS path is never empty");
-        for next in graph.reachable_targets(current) {
+        for next in graph.healthy_targets(current) {
             if !seen.insert(next.clone()) {
                 continue;
             }
@@ -89,7 +89,7 @@ pub fn cluster_route_first_hop_best_effort(
     if let Some(route) = cluster_route_next_hop(graph, local, target) {
         return Some(route.next_hop);
     }
-    graph.reachable_targets(local).into_iter().find(|candidate| {
+    graph.healthy_targets(local).into_iter().find(|candidate| {
         candidate != target && candidate != local && !excluded.contains(candidate)
     })
 }
@@ -259,11 +259,23 @@ mod tests {
         let (a, b, c) = (nid("node_a"), nid("node_b"), nid("node_c"));
         let g = graph(vec![
             edge(&a, &b, ClusterConnectivityState::Healthy),
-            edge(&b, &c, ClusterConnectivityState::Degraded),
+            edge(&b, &c, ClusterConnectivityState::Healthy),
         ]);
         let route = cluster_route_next_hop(&g, &a, &c).expect("route");
         assert_eq!(route.next_hop, b);
         assert_eq!(route.path, vec![a, b, c]);
+    }
+
+    #[test]
+    fn next_hop_excludes_degraded_edges() {
+        // Routing only traverses HEALTHY links: a Degraded hop is not a usable direct hop
+        // (it may be a never-reachable peer mid-convergence), so no route is found.
+        let (a, b, c) = (nid("node_a"), nid("node_b"), nid("node_c"));
+        let g = graph(vec![
+            edge(&a, &b, ClusterConnectivityState::Healthy),
+            edge(&b, &c, ClusterConnectivityState::Degraded),
+        ]);
+        assert_eq!(cluster_route_next_hop(&g, &a, &c), None);
     }
 
     #[test]

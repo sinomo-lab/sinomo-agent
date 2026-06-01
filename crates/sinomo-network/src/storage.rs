@@ -493,11 +493,19 @@ impl ClusterConnectivityGraph {
                 endpoint.endpoint_id.clone(),
             ))
             .or_else(|| {
+                // Fall back to matching on (source, target, address): the network address is
+                // the stable identity of an endpoint. The same address can be derived with a
+                // different `endpoint_id` or transport classification across code paths (the
+                // probe uses member endpoints; routing queries with command-target endpoints),
+                // which previously caused a silent miss -- so this no longer requires the
+                // transport to match and normalizes the address.
                 self.records.values().find(|record| {
                     record.source_node_id == self.source_node_id
                         && record.target_node_id == endpoint.node_id
-                        && record.transport == endpoint.transport
-                        && record.address == endpoint.address
+                        && cluster_endpoint_addresses_equivalent(
+                            &record.address,
+                            &endpoint.address,
+                        )
                 })
             })
     }
@@ -532,6 +540,70 @@ impl ClusterConnectivityGraph {
             .map(|record| record.target_node_id.clone())
             .collect()
     }
+
+    /// Node ids `source` has a CURRENTLY-HEALTHY connectivity record to (over any endpoint),
+    /// excluding `source`. Unlike [`reachable_targets`], `Degraded` does NOT count: a routing
+    /// first hop must be a link we can dial reliably *now*, so a never-reachable peer that is
+    /// merely mid-convergence (transiently `Degraded`) is not treated as a direct hop. This is
+    /// the adjacency multi-hop route discovery in [`crate::route`] walks.
+    pub fn healthy_targets(&self, source: &NodeId) -> std::collections::BTreeSet<NodeId> {
+        self.records
+            .values()
+            .filter(|record| {
+                &record.source_node_id == source
+                    && record.target_node_id != *source
+                    && record.state == ClusterConnectivityState::Healthy
+            })
+            .map(|record| record.target_node_id.clone())
+            .collect()
+    }
+
+    /// A dialable endpoint to reach `target` from `source` over a currently-healthy link, or
+    /// `None` if no healthy record exists. Built straight from the connectivity record (which
+    /// holds the exact address+transport last probed healthy), so it is immune to the
+    /// endpoint-object matching in [`Self::record_for_endpoint`]; among several healthy
+    /// endpoints it prefers the lowest observed latency. Used to pick the reachable link of a
+    /// multi-homed bridge for relaying.
+    pub fn best_healthy_endpoint(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+    ) -> Option<ClusterEndpointRecord> {
+        self.records
+            .values()
+            .filter(|record| {
+                &record.source_node_id == source
+                    && &record.target_node_id == target
+                    && record.state == ClusterConnectivityState::Healthy
+            })
+            .min_by_key(|record| record.latency_ms.unwrap_or(u64::MAX))
+            .map(|record| ClusterEndpointRecord {
+                endpoint_id: record.endpoint_id.clone(),
+                node_id: record.target_node_id.clone(),
+                transport: record.transport.clone(),
+                address: record.address.clone(),
+                source: ClusterEndpointSource::Observed,
+                privacy: ClusterEndpointPrivacy::Lan,
+                priority: 0,
+                last_observed_latency_ms: record
+                    .latency_ms
+                    .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
+            })
+    }
+}
+
+/// Whether two endpoint address strings denote the same network address. Compares the raw
+/// strings, then a normalized `SocketAddr` parse so equivalent spellings still match. Used by
+/// connectivity-record lookup, where the same address may be derived slightly differently
+/// across code paths (probe targets vs command targets).
+fn cluster_endpoint_addresses_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    matches!(
+        (left.parse::<SocketAddr>(), right.parse::<SocketAddr>()),
+        (Ok(l), Ok(r)) if l == r
+    )
 }
 
 pub fn build_cluster_network_info_record(

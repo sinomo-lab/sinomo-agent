@@ -112,11 +112,12 @@ pub fn send_daemon_rpc_to_endpoint(
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
     let command = daemon_rpc_command(&request.route);
-    // If our own connectivity graph already knows this endpoint is unreachable (e.g. a
-    // cross-segment voter), skip the direct dial -- it would otherwise burn the entire timeout
-    // on a connect that cannot succeed, often past the caller's patience -- and relay straight
-    // away through a reachable bridge.
-    if !crate::cluster::cluster_endpoint_is_known_unreachable(endpoint) {
+    // If we have no healthy direct edge to this endpoint but DO have a healthy relay route
+    // (e.g. a cross-segment voter reachable only through a bridge), skip the direct dial -- it
+    // would otherwise burn the entire timeout on a connect that cannot succeed, often past the
+    // caller's patience -- and relay straight away. Unprobed peers (no route known) still try a
+    // direct dial first.
+    if !crate::cluster::cluster_endpoint_prefers_relay(endpoint) {
         match sinomo_network::send_daemon_rpc_to_cluster_endpoint(
             endpoint,
             &command,
