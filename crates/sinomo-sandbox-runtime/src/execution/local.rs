@@ -322,8 +322,9 @@ impl LocalStagedSandboxCommandRunner {
                     "/root" | "/home" | "/tmp" | "/work" | "/var" | "/logs" | "/artifacts"
                 )
             });
-            let workspace_fs =
-                Arc::new(std::sync::Mutex::new(LocalSandboxFileSystem::new(layout.clone())));
+            let workspace_fs = Arc::new(std::sync::Mutex::new(LocalSandboxFileSystem::new(
+                layout.clone(),
+            )));
             wasi_options.virtual_preopened_dirs.extend(
                 runtime::wasix_sandbox_workspace_filesystem_preopens(
                     workspace_fs.clone(),

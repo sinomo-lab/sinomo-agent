@@ -46,7 +46,14 @@ fn record_object_file_mark(
     modified: Option<SystemTime>,
 ) {
     if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-        cache.insert(path.clone(), ObjectFileWriteMark { hash, len, modified });
+        cache.insert(
+            path.clone(),
+            ObjectFileWriteMark {
+                hash,
+                len,
+                modified,
+            },
+        );
     }
 }
 
@@ -1882,7 +1889,11 @@ pub fn cluster_state_sync_txn(
         .and_then(|entry| entry.decode::<ClusterIdentityRecord>().ok())
         .is_some_and(|stored| cluster_identity_record_stable_eq(&stored, &new_identity));
     if !identity_unchanged {
-        success.push(KvOp::put_serde(cluster_identity_key(), &new_identity, None)?);
+        success.push(KvOp::put_serde(
+            cluster_identity_key(),
+            &new_identity,
+            None,
+        )?);
     }
 
     let config_unchanged = current_config_entry
@@ -1890,7 +1901,11 @@ pub fn cluster_state_sync_txn(
         .and_then(|entry| entry.decode::<ClusterRaftConfigRecord>().ok())
         .is_some_and(|stored| cluster_raft_config_record_stable_eq(&stored, &new_config));
     if !config_unchanged {
-        success.push(KvOp::put_serde(cluster_raft_config_key(), &new_config, None)?);
+        success.push(KvOp::put_serde(
+            cluster_raft_config_key(),
+            &new_config,
+            None,
+        )?);
     }
 
     for member in &state.members {
@@ -1947,9 +1962,10 @@ pub fn cluster_state_sync_txn(
 /// True when applying `op` (a Put) would change the stored value for its key.
 fn kv_put_changes_store(store: &InProcessKvStore, op: &KvOp) -> bool {
     match op {
-        KvOp::Put { key, value, .. } => {
-            store.get(key).map(|entry| &entry.value != value).unwrap_or(true)
-        }
+        KvOp::Put { key, value, .. } => store
+            .get(key)
+            .map(|entry| &entry.value != value)
+            .unwrap_or(true),
         _ => true,
     }
 }
@@ -2044,10 +2060,7 @@ pub fn build_cluster_raft_append_request_from_next_index(
         // uses for its own saved snapshots — entries/leases/revision are unchanged,
         // only the best-effort watch-replay tail is trimmed.
         let mut kv = node.store().snapshot();
-        sinomo_kv::compact_kv_snapshot_event_history(
-            &mut kv,
-            MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
-        );
+        sinomo_kv::compact_kv_snapshot_event_history(&mut kv, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
         let snapshot = RaftSnapshot {
             last_included_index: node.applied_index(),
             last_included_term: node.term_at(node.applied_index()).unwrap_or(1),

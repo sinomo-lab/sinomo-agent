@@ -1,4 +1,3 @@
-use crate::DaemonSignerAuthority;
 use crate::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeRequest, ClusterNetworkMaintenance,
     DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonDfsEndpointTransport, DaemonError,
@@ -7,17 +6,10 @@ use crate::{
     ensure_daemon_status_cluster, ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
-    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
-    handle_daemon_cluster_member_publish_request, handle_daemon_cluster_raft_append_request,
-    handle_daemon_cluster_raft_vote_request, handle_daemon_dfs_expose_config,
-    handle_daemon_dfs_inspection, handle_daemon_dfs_metadata_journal_batch,
-    handle_daemon_dfs_metadata_snapshot_install, handle_daemon_dfs_protocol_frame,
-    handle_daemon_dfs_status, handle_daemon_finalize_shadow_rollout,
-    handle_daemon_rollout_binary_request, handle_daemon_rollout_build_request,
-    handle_daemon_rollout_diagnostics, handle_forwarded_daemon_cluster_kv_txn_request,
-    prune_local_cluster_raft_uncommitted_tail, read_daemon_status, run_daemon_dfs_maintenance_tick,
-    run_daemon_dfs_smoke, start_daemon_iroh_proxy_if_clustered,
+    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
+    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_member_publish_request,
+    handle_daemon_finalize_shadow_rollout, prune_local_cluster_raft_uncommitted_tail,
+    read_daemon_status, run_daemon_dfs_maintenance_tick, start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
 use sinomo_rollout::{SelfRolloutPaths, read_rollout_status};
@@ -37,7 +29,7 @@ pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const DAEMON_ACCEPT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
-const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
+pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 // The sandbox concurrency tracker is only exercised by the sandbox-exec RPC
 // handlers below, which are gated on the `sandbox` feature. Gate it to match so
@@ -375,75 +367,18 @@ pub fn handle_daemon_connection(
     paths: &DaemonPaths,
 ) -> Result<bool, DaemonError> {
     handle_authenticated_daemon_connection(stream, paths, |authenticated, rpc_request, stream| {
+        // Routes owned by the host-agnostic service registry are served there; the rest
+        // fall through to the daemon's own dispatch below.
+        if let Some(result) = crate::service_adapter::try_dispatch_via_registry(
+            &authenticated,
+            &rpc_request,
+            stream,
+            paths,
+        ) {
+            return result;
+        }
         let command = authenticated.command.as_str();
         match command {
-            command if command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DAEMON_STATUS_ROUTE,
-                    sinomo_network::DAEMON_RPC_CATEGORY,
-                )?;
-                let _: () = request.decode_body().map_err(DaemonError::from)?;
-                let status = daemon_status_response(paths)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DAEMON_STATUS_ROUTE,
-                    &status,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::DAEMON_SHUTDOWN_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DAEMON_SHUTDOWN_ROUTE,
-                    sinomo_network::DAEMON_RPC_CATEGORY,
-                )?;
-                let _: () = request.decode_body().map_err(DaemonError::from)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DAEMON_SHUTDOWN_ROUTE,
-                    &"sinomo daemon stopping".to_string(),
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(true)
-            }
-            command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_SNAPSHOT_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::CLUSTER_KV_SNAPSHOT_ROUTE,
-                    sinomo_network::CLUSTER_KV_RPC_CATEGORY,
-                )?;
-                let _: () = request.decode_body().map_err(DaemonError::from)?;
-                let snapshot = handle_daemon_cluster_kv_snapshot(paths)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::CLUSTER_KV_SNAPSHOT_ROUTE,
-                    &snapshot,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_TXN_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::CLUSTER_KV_TXN_ROUTE,
-                    sinomo_network::CLUSTER_KV_RPC_CATEGORY,
-                )?;
-                let txn = request.decode_body().map_err(DaemonError::from)?;
-                let result = if authenticated.signer == DaemonSignerAuthority::Local {
-                    handle_daemon_cluster_kv_txn_request(paths, txn)
-                } else {
-                    handle_forwarded_daemon_cluster_kv_txn_request(paths, txn)
-                }?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::CLUSTER_KV_TXN_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
             command
                 if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_RANGE_PREFIX_ROUTE) =>
             {
@@ -510,435 +445,6 @@ pub fn handle_daemon_connection(
                 let response = handle_daemon_finalize_shadow_rollout(paths)?;
                 let response = sinomo_network::ObjectRpcResponse::encode_body(
                     sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE,
-                    sinomo_network::ROLLOUT_RPC_CATEGORY,
-                )?;
-                let _: () = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_rollout_diagnostics(paths)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::DFS_EXPOSE_CONFIG_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DFS_EXPOSE_CONFIG_ROUTE,
-                    sinomo_network::DFS_RPC_CATEGORY,
-                )?;
-                let _: () = request.decode_body().map_err(DaemonError::from)?;
-                let result = handle_daemon_dfs_expose_config(paths)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DFS_EXPOSE_CONFIG_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::DFS_STATUS_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DFS_STATUS_ROUTE,
-                    sinomo_network::DFS_RPC_CATEGORY,
-                )?;
-                let _: () = request.decode_body().map_err(DaemonError::from)?;
-                let result = handle_daemon_dfs_status(paths)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DFS_STATUS_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::DFS_INSPECTION_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DFS_INSPECTION_ROUTE,
-                    sinomo_network::DFS_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let result = handle_daemon_dfs_inspection(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DFS_INSPECTION_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::DFS_SMOKE_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DFS_SMOKE_ROUTE,
-                    sinomo_network::DFS_RPC_CATEGORY,
-                )?;
-                let _: () = request.decode_body().map_err(DaemonError::from)?;
-                let result = run_daemon_dfs_smoke(paths)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DFS_SMOKE_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command
-                if command
-                    == daemon_rpc_command(sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE) =>
-            {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE,
-                    sinomo_network::DFS_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let result = handle_daemon_dfs_metadata_journal_batch(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command
-                if command
-                    == daemon_rpc_command(sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE) =>
-            {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-                    sinomo_network::DFS_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let result = handle_daemon_dfs_metadata_snapshot_install(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::DFS_PROTOCOL_FRAME_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::DFS_PROTOCOL_FRAME_ROUTE,
-                    sinomo_network::DFS_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let result = handle_daemon_dfs_protocol_frame(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::DFS_PROTOCOL_FRAME_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_HTTP_FETCH_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_HTTP_FETCH_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_http_fetch(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_HTTP_FETCH_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command
-                if command
-                    == daemon_rpc_command(sinomo_network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE) =>
-            {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_http_fetch_to_file(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_CREATE_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_CREATE_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_create(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_CREATE_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_STATUS_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_STATUS_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_status(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_STATUS_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_UPDATE_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_UPDATE_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_update(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_UPDATE_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_CHECKPOINT_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_CHECKPOINT_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_checkpoint(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_CHECKPOINT_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_RESUME_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_RESUME_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_resume(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_RESUME_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_REBOOT_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_REBOOT_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_reboot(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_REBOOT_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_DESTROY_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_DESTROY_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_destroy(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_DESTROY_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_LIST_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_LIST_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_list(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_LIST_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_READ_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_READ_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_read(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_READ_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::SANDBOX_WRITE_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_WRITE_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_write(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_WRITE_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command
-                if command == daemon_rpc_command(sinomo_network::SANDBOX_IMPORT_BUSYBOX_ROUTE) =>
-            {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_IMPORT_BUSYBOX_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_import_busybox(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_IMPORT_BUSYBOX_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command
-                if command
-                    == daemon_rpc_command(
-                        sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
-                    ) =>
-            {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_toolchain_import_package(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command
-                if command
-                    == daemon_rpc_command(
-                        sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
-                    ) =>
-            {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request: sinomo_sandbox::SandboxImportToolchainPackageFromPathRequest =
-                    request.decode_body().map_err(DaemonError::from)?;
-                let response =
-                    handle_daemon_sandbox_toolchain_import_package_from_path(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command
-                if command
-                    == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE) =>
-            {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_toolchain_add_command(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command
-                if command
-                    == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE) =>
-            {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
-                    sinomo_network::SANDBOX_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = handle_daemon_sandbox_toolchain_add_artifact(paths, request)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
                     &response,
                 )
                 .map_err(DaemonError::from)?;
@@ -1066,23 +572,6 @@ pub fn handle_daemon_connection(
                 write_daemon_rpc_response_frame(stream, response)?;
                 Ok(false)
             }
-            command if command == daemon_rpc_command(sinomo_network::CLUSTER_RAFT_APPEND_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::CLUSTER_RAFT_APPEND_ROUTE,
-                    sinomo_network::CLUSTER_RAFT_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let result =
-                    handle_daemon_cluster_raft_append_request(paths, request, &authenticated)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::CLUSTER_RAFT_APPEND_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
             command
                 if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_EVENTS_ROUTE) =>
             {
@@ -1101,97 +590,12 @@ pub fn handle_daemon_connection(
                 write_daemon_rpc_response_frame(stream, response)?;
                 Ok(false)
             }
-            command if command == daemon_rpc_command(sinomo_network::CLUSTER_RAFT_VOTE_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::CLUSTER_RAFT_VOTE_ROUTE,
-                    sinomo_network::CLUSTER_RAFT_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let result =
-                    handle_daemon_cluster_raft_vote_request(paths, request, &authenticated)?;
-                let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::CLUSTER_RAFT_VOTE_ROUTE,
-                    &result,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, response)?;
-                Ok(false)
-            }
-            command if command == daemon_rpc_command(sinomo_network::ROLLOUT_BINARY_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::ROLLOUT_BINARY_ROUTE,
-                    sinomo_network::ROLLOUT_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = match handle_daemon_rollout_binary_request(paths, request) {
-                    Ok(response) => response,
-                    Err(error) => sinomo_rollout::ClusterRolloutBinaryResponse {
-                        status: "failed".to_string(),
-                        detail: error.to_string(),
-                        main_binary: PathBuf::new(),
-                        shadow_binary: PathBuf::new(),
-                        source_head: None,
-                    },
-                };
-                let rpc_response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::ROLLOUT_BINARY_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, rpc_response)?;
-                stream.flush().map_err(|source| DaemonError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-                stream.shutdown_write();
-                let should_stop = accepted_rollout_should_stop_current_daemon(paths, &response);
-                if should_stop {
-                    thread::sleep(ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE);
-                }
-                Ok(should_stop)
-            }
-            command if command == daemon_rpc_command(sinomo_network::ROLLOUT_BUILD_ROUTE) => {
-                let request = require_daemon_rpc_request(
-                    rpc_request,
-                    sinomo_network::ROLLOUT_BUILD_ROUTE,
-                    sinomo_network::ROLLOUT_RPC_CATEGORY,
-                )?;
-                let request = request.decode_body().map_err(DaemonError::from)?;
-                let response = match handle_daemon_rollout_build_request(paths, request) {
-                    Ok(response) => response,
-                    Err(error) => sinomo_rollout::ClusterRolloutBinaryResponse {
-                        status: "failed".to_string(),
-                        detail: error.to_string(),
-                        main_binary: PathBuf::new(),
-                        shadow_binary: PathBuf::new(),
-                        source_head: None,
-                    },
-                };
-                let rpc_response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::ROLLOUT_BUILD_ROUTE,
-                    &response,
-                )
-                .map_err(DaemonError::from)?;
-                write_daemon_rpc_response_frame(stream, rpc_response)?;
-                stream.flush().map_err(|source| DaemonError::Network {
-                    address: "daemon client".to_string(),
-                    detail: source.to_string(),
-                })?;
-                stream.shutdown_write();
-                let should_stop = accepted_rollout_should_stop_current_daemon(paths, &response);
-                if should_stop {
-                    thread::sleep(ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE);
-                }
-                Ok(should_stop)
-            }
             _ => Ok(false),
         }
     })
 }
 
-fn accepted_rollout_should_stop_current_daemon(
+pub(crate) fn accepted_rollout_should_stop_current_daemon(
     paths: &DaemonPaths,
     response: &sinomo_rollout::ClusterRolloutBinaryResponse,
 ) -> bool {
@@ -2939,7 +2343,7 @@ pub fn open_daemon_sandbox_dfs_service(
     Ok(dfs)
 }
 
-fn daemon_data_dir_path(paths: &DaemonPaths) -> Result<PathBuf, DaemonError> {
+pub(crate) fn daemon_data_dir_path(paths: &DaemonPaths) -> Result<PathBuf, DaemonError> {
     paths
         .root
         .parent()
@@ -3076,7 +2480,9 @@ where
     Ok(None)
 }
 
-fn daemon_status_response(paths: &DaemonPaths) -> Result<crate::DaemonStatus, DaemonError> {
+pub(crate) fn daemon_status_response(
+    paths: &DaemonPaths,
+) -> Result<crate::DaemonStatus, DaemonError> {
     let mut status = read_daemon_status(paths)?;
     ensure_daemon_status_cluster(paths, &mut status)?;
     if let Some(data_dir) = paths.root.parent() {

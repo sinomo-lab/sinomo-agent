@@ -198,15 +198,21 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
     }
 
     fn serialize_u16(self, v: u16) -> Result<ElementType> {
-        self.builtin(TypeId::Uint16, |out| out.extend_from_slice(&v.to_le_bytes()))
+        self.builtin(TypeId::Uint16, |out| {
+            out.extend_from_slice(&v.to_le_bytes())
+        })
     }
 
     fn serialize_u32(self, v: u32) -> Result<ElementType> {
-        self.builtin(TypeId::Uint32, |out| out.extend_from_slice(&v.to_le_bytes()))
+        self.builtin(TypeId::Uint32, |out| {
+            out.extend_from_slice(&v.to_le_bytes())
+        })
     }
 
     fn serialize_u64(self, v: u64) -> Result<ElementType> {
-        self.builtin(TypeId::Uint64, |out| out.extend_from_slice(&v.to_le_bytes()))
+        self.builtin(TypeId::Uint64, |out| {
+            out.extend_from_slice(&v.to_le_bytes())
+        })
     }
 
     fn serialize_f32(self, v: f32) -> Result<ElementType> {
@@ -214,7 +220,9 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
     }
 
     fn serialize_f64(self, v: f64) -> Result<ElementType> {
-        self.builtin(TypeId::Double, |out| out.extend_from_slice(&v.to_le_bytes()))
+        self.builtin(TypeId::Double, |out| {
+            out.extend_from_slice(&v.to_le_bytes())
+        })
     }
 
     fn serialize_char(self, v: char) -> Result<ElementType> {
@@ -529,7 +537,11 @@ impl<'a> SerializeMap for ByteMapSerializer<'a> {
 
     fn end(self) -> Result<ElementType> {
         let end = self.length_offset + self.mode.width();
-        patch_length(&mut self.out[self.length_offset..end], self.mode, self.count)?;
+        patch_length(
+            &mut self.out[self.length_offset..end],
+            self.mode,
+            self.count,
+        )?;
         Ok(ElementType::Object)
     }
 }
@@ -1811,7 +1823,6 @@ fn common_element_type(values: &[Value]) -> Result<ElementType> {
     }
 }
 
-
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
@@ -1947,7 +1958,10 @@ mod streaming_tests {
         // would allocate hundreds of MiB; streaming keeps it ~O(data).
         let data: Vec<u8> = (0..4_000_000_u32).map(|i| i as u8).collect();
         let encoded = to_bytes(&data, 1, LengthMode::U32).expect("encode");
-        assert!(encoded.len() < data.len() + 64, "expected compact list<uint8>");
+        assert!(
+            encoded.len() < data.len() + 64,
+            "expected compact list<uint8>"
+        );
         let decoded: Vec<u8> = from_bytes(&encoded).expect("decode");
         assert_eq!(decoded, data);
     }

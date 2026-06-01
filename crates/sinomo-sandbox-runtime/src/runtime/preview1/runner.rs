@@ -1,7 +1,7 @@
-use crate::internal::sandbox_wasi_error_from_wasmtime;
 use super::extensions::add_sinomo_sandbox_wasi_extensions;
 use super::output::spawn_output_watcher;
 use super::state::LocalWasiState;
+use crate::internal::sandbox_wasi_error_from_wasmtime;
 use crate::{
     LocalWasiVirtualDeviceDir, SANDBOX_UNLIMITED_WALL_TIME_MS, SandboxCommandId,
     SandboxCommandRequest, SandboxCommandResponse, SandboxLocalCommandOutcome, SandboxMountMode,
@@ -351,7 +351,8 @@ impl LocalWasiCommandRunner {
             &mut state.wasi
         })
         .map_err(sandbox_wasi_error_from_wasmtime)?;
-        add_sinomo_sandbox_wasi_extensions(&mut linker).map_err(sandbox_wasi_error_from_wasmtime)?;
+        add_sinomo_sandbox_wasi_extensions(&mut linker)
+            .map_err(sandbox_wasi_error_from_wasmtime)?;
 
         let done = Arc::new(AtomicBool::new(false));
         let timed_out = Arc::new(AtomicBool::new(false));

@@ -10,18 +10,18 @@ use sinomo_core::{
 };
 use sinomo_dfs::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-    DfsDistributedWriteResult, DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
-    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsMetadataSnapshotInstallResult, DfsNodeAdvertisement, DfsObjectVersionRecord,
-    DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
-    DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReplicationPolicy,
-    DfsSubtreePolicy, DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend,
-    LocalShardedMetadataBackend, NetworkedDfsService, NetworkedDfsServiceEvent,
-    content_service_key, content_services_prefix, default_dfs_metadata_shards_root,
-    distributed_sifs, distributed_sifs_bootstrap_objects, fallback_dfs_node_id,
-    file_system_config_key, metadata_service_key, metadata_shard_key, sifs_node_files_path,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsDistributedWriteResult,
+    DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNodeAdvertisement,
+    DfsObjectVersionRecord, DfsOperatorInspector, DfsProtocolFrameCommand,
+    DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy, DfsWriteOptions,
+    LocalContentStore, LocalJsonMetadataBackend, LocalShardedMetadataBackend, NetworkedDfsService,
+    NetworkedDfsServiceEvent, content_service_key, content_services_prefix,
+    default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
+    fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
+    sifs_node_files_path,
 };
 use sinomo_kv::{KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
@@ -221,52 +221,8 @@ pub struct DaemonDfsSmokeAttempt {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum DaemonDfsInspectionRequest {
-    Status,
-    FileSystem {
-        file_system_id: sinomo_dfs::DfsFileSystemId,
-    },
-    Path {
-        file_system_id: sinomo_dfs::DfsFileSystemId,
-        path: String,
-    },
-    Object {
-        object_id: sinomo_dfs::DfsObjectId,
-    },
-    Conflicts {
-        file_system_id: Option<sinomo_dfs::DfsFileSystemId>,
-        object_id: Option<sinomo_dfs::DfsObjectId>,
-    },
-    Repair {
-        file_system_id: Option<sinomo_dfs::DfsFileSystemId>,
-        object_id: Option<sinomo_dfs::DfsObjectId>,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum DaemonDfsInspectionResponse {
-    Status {
-        status: DfsOperatorStatus,
-    },
-    FileSystem {
-        file_system: Option<DfsOperatorFileSystemView>,
-    },
-    Path {
-        object: Option<DfsOperatorObjectView>,
-    },
-    Object {
-        object: Option<DfsOperatorObjectView>,
-    },
-    Conflicts {
-        conflicts: Vec<sinomo_dfs::DfsConflictRecord>,
-    },
-    Repair {
-        repairs: Vec<DfsOperatorRepairView>,
-    },
-}
+// `DaemonDfsInspectionRequest` / `DaemonDfsInspectionResponse` now live in `sinomo-dfs`
+// (host-agnostic DFS contract); they are re-exported from this crate for clients.
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct LegacyDaemonDfsMetadataReplicationCursor {

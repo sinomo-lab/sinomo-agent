@@ -51,10 +51,10 @@ pub use namespace::{
     sifs_node_path,
 };
 pub use operator::{
-    DfsAgentFileSystemSummary, DfsAgentObjectState, DfsAgentObjectSummary,
-    DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
-    DfsOperatorStatus, DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError,
-    LocalDfsPinStore,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAgentFileSystemSummary,
+    DfsAgentObjectState, DfsAgentObjectSummary, DfsOperatorFileSystemView, DfsOperatorInspector,
+    DfsOperatorObjectView, DfsOperatorRepairView, DfsOperatorStatus, DfsPinAddRequest, DfsPinMode,
+    DfsPinRecord, DfsPinStoreError, LocalDfsPinStore,
 };
 pub use posix::{DfsDirEntry, DfsPosixError, DfsStat, DfsWriteOptions};
 pub use protocol::{

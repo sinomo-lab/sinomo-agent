@@ -34,6 +34,8 @@ sinomo-node = { path = "../sinomo-node" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-sandbox-runtime = { path = "../sinomo-sandbox-runtime", optional = true }
+sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true
 time.workspace = true
+tokio = { version = "1.44", features = ["rt-multi-thread"] }

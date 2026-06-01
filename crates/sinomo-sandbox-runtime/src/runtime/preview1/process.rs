@@ -1,4 +1,3 @@
-use crate::internal::sandbox_wasi_error_from_wasmtime;
 use super::{
     guest::{
         read_guest_cstring_array, read_guest_env_array, read_guest_optional_string,
@@ -14,6 +13,7 @@ use super::{
     runner::{guest_path_for_wasi, run_wasi_start},
     state::LocalWasiState,
 };
+use crate::internal::sandbox_wasi_error_from_wasmtime;
 use crate::{SandboxMountMode, SandboxPath, SandboxWasiError, SandboxWasiPreopen};
 use std::{collections::BTreeMap, fs, sync::atomic::Ordering};
 

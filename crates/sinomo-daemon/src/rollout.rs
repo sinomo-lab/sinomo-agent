@@ -1169,7 +1169,12 @@ fn ensure_shadow_supervisor_running(
             shadow_port,
         )
         .and_then(|()| {
-            wait_for_shadow_rollout_health(data_dir, shadow_host, shadow_port, Duration::from_secs(5))
+            wait_for_shadow_rollout_health(
+                data_dir,
+                shadow_host,
+                shadow_port,
+                Duration::from_secs(5),
+            )
         });
         match attempt {
             Ok(()) => return Ok(()),

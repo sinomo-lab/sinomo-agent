@@ -519,6 +519,41 @@ pub trait NetworkTransport {
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
 }
 
+/// Core event-ingest step used by the [`NetworkService`] actor's inbound dispatch:
+/// dedups on `(origin_node_id, event_id)` and, for a new event, appends it to `store`.
+/// A store-level `DuplicateEventId` is folded into the same idempotent dedup result.
+fn ingest_event<S: EventStore>(
+    seen_events: &mut BTreeSet<(NodeId, EventId)>,
+    store: &mut S,
+    delivery_id: RouteDeliveryId,
+    event: &EventEnvelope,
+) -> Result<InboundOutcome, NetworkError> {
+    let key = (event.origin_node_id.clone(), event.event_id.clone());
+    if seen_events.contains(&key) {
+        return Ok(InboundOutcome::EventDuplicate {
+            delivery_id,
+            event_id: event.event_id.clone(),
+        });
+    }
+    match store.append(event.clone()) {
+        Ok(_) => {
+            seen_events.insert(key);
+            Ok(InboundOutcome::EventAccepted {
+                delivery_id,
+                event_id: event.event_id.clone(),
+            })
+        }
+        Err(EventStoreError::DuplicateEventId { .. }) => {
+            seen_events.insert(key);
+            Ok(InboundOutcome::EventDuplicate {
+                delivery_id,
+                event_id: event.event_id.clone(),
+            })
+        }
+        Err(error) => Err(NetworkError::EventStore(error)),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct NetworkStreamId(pub u64);
 
@@ -696,19 +731,15 @@ impl<T: NetworkTransport> NetworkService<T> {
         self
     }
 
-    pub fn registry(&self) -> &PeerRegistry {
+    fn registry(&self) -> &PeerRegistry {
         self.router.registry()
     }
 
-    pub fn registry_mut(&mut self) -> &mut PeerRegistry {
-        self.router.registry_mut()
-    }
-
-    pub fn ledger(&self) -> &DeliveryLedger {
+    fn ledger(&self) -> &DeliveryLedger {
         &self.ledger
     }
 
-    pub fn enqueue_event(
+    fn enqueue_event(
         &mut self,
         stored_event: &StoredEvent,
     ) -> Result<Vec<RouteDelivery>, NetworkError> {
@@ -728,7 +759,7 @@ impl<T: NetworkTransport> NetworkService<T> {
         Ok(accepted)
     }
 
-    pub fn pump_outbound(&mut self) -> Result<usize, NetworkError> {
+    fn pump_outbound(&mut self) -> Result<usize, NetworkError> {
         let mut sent = 0;
         let delivery_ids = self.ledger.ready_delivery_ids();
 
@@ -766,7 +797,7 @@ impl<T: NetworkTransport> NetworkService<T> {
         Ok(sent)
     }
 
-    pub fn process_incoming<S: EventStore>(
+    fn process_incoming<S: EventStore>(
         &mut self,
         store: &mut S,
     ) -> Result<Vec<InboundOutcome>, NetworkError> {
@@ -776,33 +807,8 @@ impl<T: NetworkTransport> NetworkService<T> {
         for inbound in inbound_frames {
             match inbound.frame.message.body {
                 MeshMessageBody::Event { delivery_id, event } => {
-                    let key = (event.origin_node_id.clone(), event.event_id.clone());
-                    let duplicate = self.seen_events.contains(&key);
-
-                    if !duplicate {
-                        match store.append((*event).clone()) {
-                            Ok(_) => {
-                                self.seen_events.insert(key);
-                                outcomes.push(InboundOutcome::EventAccepted {
-                                    delivery_id,
-                                    event_id: event.event_id.clone(),
-                                });
-                            }
-                            Err(EventStoreError::DuplicateEventId { .. }) => {
-                                self.seen_events.insert(key);
-                                outcomes.push(InboundOutcome::EventDuplicate {
-                                    delivery_id,
-                                    event_id: event.event_id.clone(),
-                                });
-                            }
-                            Err(error) => return Err(NetworkError::EventStore(error)),
-                        }
-                    } else {
-                        outcomes.push(InboundOutcome::EventDuplicate {
-                            delivery_id,
-                            event_id: event.event_id.clone(),
-                        });
-                    }
+                    let outcome = ingest_event(&mut self.seen_events, store, delivery_id, &event)?;
+                    outcomes.push(outcome);
 
                     let ack = DeliveryAck {
                         delivery_id,
@@ -845,11 +851,7 @@ impl<T: NetworkTransport> NetworkService<T> {
         Ok(outcomes)
     }
 
-    pub fn send_heartbeat(
-        &mut self,
-        target_node_id: &NodeId,
-        tick: u64,
-    ) -> Result<(), NetworkError> {
+    fn send_heartbeat(&mut self, target_node_id: &NodeId, tick: u64) -> Result<(), NetworkError> {
         let heartbeat = Heartbeat {
             node_id: self.transport.local_node_id().clone(),
             tick,
@@ -910,6 +912,117 @@ impl<T: NetworkTransport> NetworkService<T> {
         self.next_frame_id += 1;
         self.next_message_id += 1;
         frame
+    }
+}
+
+/// Bounded command-queue depth for a spawned [`NetworkService`] actor. Once this many
+/// commands are in flight, [`NetworkServiceHandle`] methods await room (backpressure).
+const NETWORK_SERVICE_QUEUE_CAPACITY: usize = 256;
+
+/// A unit of work run on the actor's owned [`NetworkService`] and event store.
+type NetworkServiceJob<T, S> = Box<dyn FnOnce(&mut NetworkService<T>, &mut S) + Send>;
+
+impl<T: NetworkTransport + Send + 'static> NetworkService<T> {
+    /// Run this service as an asynchronous actor. The actor owns the transport, mesh
+    /// state, and event `store`, and serially drains/dispatches inbound frames, sends
+    /// acks, and flushes outbound deliveries in its own task. All interaction goes
+    /// through the returned [`NetworkServiceHandle`] over a bounded command queue —
+    /// this is the single message path for the service.
+    pub fn spawn<S: EventStore + Send + 'static>(self, store: S) -> NetworkServiceHandle<T, S> {
+        let (commands, mut requests) =
+            tokio::sync::mpsc::channel::<NetworkServiceJob<T, S>>(NETWORK_SERVICE_QUEUE_CAPACITY);
+        let task = tokio::spawn(async move {
+            let mut service = self;
+            let mut store = store;
+            while let Some(job) = requests.recv().await {
+                job(&mut service, &mut store);
+            }
+            store
+        });
+        NetworkServiceHandle { commands, task }
+    }
+}
+
+/// Handle to a [`NetworkService`] running as an async actor (see
+/// [`NetworkService::spawn`]). The actor processes commands — and the inbound frames it
+/// drains from the transport — serially in its own task, so the shared mesh state needs
+/// no locking. Each method enqueues one command on the bounded queue and awaits its
+/// reply; backpressure falls out of the bounded queue when commands outpace the actor.
+pub struct NetworkServiceHandle<T, S> {
+    commands: tokio::sync::mpsc::Sender<NetworkServiceJob<T, S>>,
+    task: tokio::task::JoinHandle<S>,
+}
+
+impl<T, S> NetworkServiceHandle<T, S>
+where
+    T: NetworkTransport + Send + 'static,
+    S: EventStore + Send + 'static,
+{
+    async fn run_job<R, F>(&self, job: F) -> Result<R, NetworkError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut NetworkService<T>, &mut S) -> R + Send + 'static,
+    {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let request: NetworkServiceJob<T, S> = Box::new(move |service, store| {
+            let _ = reply.send(job(service, store));
+        });
+        self.commands
+            .send(request)
+            .await
+            .map_err(|_| network_service_stopped())?;
+        response.await.map_err(|_| network_service_stopped())
+    }
+
+    /// Route `stored_event` to its targets and accept the resulting deliveries.
+    pub async fn enqueue_event(
+        &self,
+        stored_event: StoredEvent,
+    ) -> Result<Vec<RouteDelivery>, NetworkError> {
+        self.run_job(move |service, _store| service.enqueue_event(&stored_event))
+            .await?
+    }
+
+    /// Flush ready outbound deliveries through the transport, returning the count sent.
+    pub async fn pump_outbound(&self) -> Result<usize, NetworkError> {
+        self.run_job(|service, _store| service.pump_outbound())
+            .await?
+    }
+
+    /// Drain the transport and dispatch every pending inbound frame (events, acks,
+    /// heartbeats, protocol), returning the outcomes in arrival order.
+    pub async fn process_incoming(&self) -> Result<Vec<InboundOutcome>, NetworkError> {
+        self.run_job(|service, store| service.process_incoming(store))
+            .await?
+    }
+
+    /// Send a heartbeat to `target_node_id`.
+    pub async fn send_heartbeat(
+        &self,
+        target_node_id: NodeId,
+        tick: u64,
+    ) -> Result<(), NetworkError> {
+        self.run_job(move |service, _store| service.send_heartbeat(&target_node_id, tick))
+            .await?
+    }
+
+    /// Snapshot the delivery-ledger records.
+    pub async fn ledger_records(&self) -> Result<Vec<DeliveryRecord>, NetworkError> {
+        self.run_job(|service, _store| service.ledger().records().into_iter().cloned().collect())
+            .await
+    }
+
+    /// Stop the actor and return the owned event store for inspection.
+    pub async fn shutdown(self) -> S {
+        drop(self.commands);
+        self.task.await.expect("network service actor panicked")
+    }
+}
+
+fn network_service_stopped() -> NetworkError {
+    NetworkError::Io {
+        operation: "network-service-command".to_string(),
+        detail: "network service actor is no longer running".to_string(),
     }
 }
 

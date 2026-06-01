@@ -9,6 +9,7 @@ mod install;
 mod paths;
 mod process;
 mod rollout;
+mod service_adapter;
 mod status;
 
 pub use auth::{
@@ -37,14 +38,13 @@ pub use cluster::{
     CLUSTER_HEALTH_PROBE_TIMEOUT, CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterConnectivityProbeState,
     ClusterDoctorFinding, ClusterHealthRow, ClusterJoinReconciliation, ClusterMemberRemoval,
     ClusterNetworkMaintenance, ClusterNodeRoleUpdate, ClusterRaftRoleUpdate,
-    NodeStatusPublishOutcome,
     DAEMON_CLUSTER_DISCOVERY_INTERVAL, DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,
     DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT, DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL,
     DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_RPC_TIMEOUT, DAEMON_CLUSTER_TICK_INTERVAL,
-    advertise_daemon_iroh_endpoint, assign_local_node_public_keys, build_cluster_join_invite,
-    cluster_doctor_findings, cluster_has_local_quorum, cluster_health_rows,
-    cluster_invite_publish_targets, cluster_paths_from_daemon_paths, cluster_peer_members,
-    cluster_reachable_voter_count, commit_cluster_kv_txn_with_quorum,
+    NodeStatusPublishOutcome, advertise_daemon_iroh_endpoint, assign_local_node_public_keys,
+    build_cluster_join_invite, cluster_doctor_findings, cluster_has_local_quorum,
+    cluster_health_rows, cluster_invite_publish_targets, cluster_paths_from_daemon_paths,
+    cluster_peer_members, cluster_reachable_voter_count, commit_cluster_kv_txn_with_quorum,
     commit_cluster_raft_command_with_quorum, daemon_cluster_registration_if_initialized,
     daemon_cluster_status_from_local_state, default_cluster_invite_introducers,
     elect_cluster_raft_leader, ensure_daemon_status_cluster, expire_cluster_network_records_in_kv,
@@ -83,10 +83,9 @@ pub use control::{
     run_daemon_control_loop, write_daemon_rpc_response_frame,
 };
 pub use dfs::{
-    DaemonDfsEndpointTransport, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
-    DaemonDfsMetadataReplicationOutcome, DaemonDfsMetadataReplicationReport, DaemonDfsSmokeReport,
-    ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
-    handle_daemon_dfs_expose_config, handle_daemon_dfs_inspection,
+    DaemonDfsEndpointTransport, DaemonDfsMetadataReplicationOutcome,
+    DaemonDfsMetadataReplicationReport, DaemonDfsSmokeReport, ensure_default_distributed_dfs,
+    ensure_default_local_dfs_expose, handle_daemon_dfs_expose_config, handle_daemon_dfs_inspection,
     handle_daemon_dfs_metadata_journal_batch, handle_daemon_dfs_metadata_snapshot_install,
     handle_daemon_dfs_protocol_frame, handle_daemon_dfs_status,
     log_dfs_metadata_replication_report, publish_default_dfs_metadata_journal,
@@ -142,13 +141,13 @@ pub use rollout::{
     wait_for_main_daemon_health, wait_for_shadow_rollout_health,
     write_rollout_main_failure_diagnostics,
 };
+pub use sinomo_dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 pub use status::{
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE,
-    DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonLock,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST,
-    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
-    authenticated_signer_matches_cluster_node, cluster_node_status_from_daemon_status,
-    current_shadow_daemon_options,
+    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DaemonClusterProcess,
+    DaemonClusterRegistration, DaemonClusterStatus, DaemonLock, DaemonProbeStatus,
+    DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
+    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, authenticated_signer_matches_cluster_node,
+    cluster_node_status_from_daemon_status, current_shadow_daemon_options,
     daemon_advertised_endpoints_for_state, daemon_advertised_endpoints_from_ips,
     daemon_bind_address, daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
     daemon_cluster_registration, daemon_cluster_status, daemon_cluster_status_matches,

@@ -1,6 +1,6 @@
 use crate::{
-    AuthenticatedDaemonCommand, DaemonError, DaemonPaths, DaemonSignerAuthority,
-    IdleStatsSnapshot, send_daemon_rpc,
+    AuthenticatedDaemonCommand, DaemonError, DaemonPaths, DaemonSignerAuthority, IdleStatsSnapshot,
+    send_daemon_rpc,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};

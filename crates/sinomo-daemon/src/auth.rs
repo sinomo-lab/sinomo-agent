@@ -740,8 +740,8 @@ fn remember_daemon_auth_nonce(
 ) -> Result<(), DaemonError> {
     let now = OffsetDateTime::now_utc();
     // The signing timestamp is the nonce's freshness anchor; reject malformed ones.
-    let signed_at =
-        OffsetDateTime::parse(&envelope.timestamp, &Rfc3339).map_err(|_| DaemonError::AuthDenied)?;
+    let signed_at = OffsetDateTime::parse(&envelope.timestamp, &Rfc3339)
+        .map_err(|_| DaemonError::AuthDenied)?;
     let mut guard = DAEMON_AUTH_NONCES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()

@@ -1270,6 +1270,46 @@ mod tests {
         cleanup(&root);
     }
 
+    #[test]
+    fn concurrent_identical_object_version_writes_are_idempotent() {
+        let root = temp_root("concurrent-identical-writes");
+        let store = std::sync::Arc::new(LocalContentStore::new(&root).expect("store"));
+        let bytes = b"the same content written by every racer".to_vec();
+        let expected_hash = content_hash(&bytes);
+
+        // Several threads write the identical (object, version, bytes) at once. Only
+        // one wins the create-new manifest link; the rest hit AlreadyExists, re-read
+        // the manifest, and must return the same content-addressed result (not error).
+        let threads = 8usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let store = store.clone();
+            let bytes = bytes.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .put_object_version("obj_shared", "version_1", &bytes)
+                    .expect("concurrent identical write must succeed")
+            }));
+        }
+        for handle in handles {
+            let manifest = handle.join().expect("writer thread");
+            assert_eq!(
+                manifest.content_hash, expected_hash,
+                "every racer must observe the same content-addressed manifest"
+            );
+        }
+
+        assert_eq!(
+            store.read_blob(&expected_hash).expect("read blob"),
+            bytes,
+            "the stored blob must match the written content"
+        );
+        cleanup(&root);
+    }
+
     fn temp_root(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)

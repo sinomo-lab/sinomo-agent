@@ -2937,6 +2937,17 @@ struct MetadataWriteLock {
     _file: fs::File,
 }
 
+/// In-process mutual exclusion for metadata writes, keyed by backend root. Two
+/// `LocalJsonMetadataBackend` handles on the same `root` (e.g. several threads, or
+/// the main + shadow daemon in one process) serialize here; handles on different
+/// roots never contend (distinct keys). Cross-process exclusion is layered on top
+/// via the `journal/write.lock` flock in `metadata_write_lock`.
+///
+/// `Drop` calls `notify_all` on the shared condvar: correct, but a thundering herd
+/// since one condvar backs every root, so every release wakes waiters on unrelated
+/// roots too. Acceptable because the guard is held only briefly (around a single
+/// metadata write) and contention is bounded by the number of in-process handles;
+/// a per-root condvar map would add shared state for marginal gain.
 #[derive(Debug)]
 struct MetadataPathWriteGuard {
     path: PathBuf,
@@ -6846,6 +6857,88 @@ mod tests {
                 .len(),
             writer_count * writes_per_writer,
             "concurrent materialization must not lose object indexes"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_readers_never_observe_torn_metadata_during_writes() {
+        let root = temp_root("local_backend_readers_during_writes");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        drop(backend);
+
+        let total_writes = 256usize;
+        let reader_count = 4usize;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Start readers and the writer together so the reads genuinely overlap the
+        // appends rather than racing thread startup.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(reader_count + 1));
+
+        // Readers use their own backend handle and read continuously while a writer
+        // appends. The read path (`current_tables_snapshot`) is lock-free, so this
+        // exercises its torn-tail safety: every read must succeed and never observe
+        // more objects than the writer has committed.
+        let mut readers = Vec::new();
+        for _ in 0..reader_count {
+            let root = root.clone();
+            let stop = stop.clone();
+            let barrier = barrier.clone();
+            readers.push(std::thread::spawn(move || {
+                let backend =
+                    LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                        .expect("reader backend");
+                barrier.wait();
+                // Read at least once, then keep reading until the writer signals stop.
+                let mut reads = 0u64;
+                loop {
+                    let objects = backend
+                        .objects_for_file_system(&file_system_id())
+                        .expect("read must never fail on a torn tail");
+                    assert!(
+                        objects.len() <= total_writes,
+                        "reader saw {} objects, more than the {total_writes} ever written",
+                        objects.len()
+                    );
+                    reads += 1;
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                reads
+            }));
+        }
+
+        let mut writer =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("writer backend");
+        barrier.wait();
+        for i in 0..total_writes {
+            let mut object = object(version("version_1"));
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_reader_race_{i}")).expect("object id");
+            object.path = format!("/docs/reader-race-{i}.md");
+            writer.put_object(&object).expect("write object");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for reader in readers {
+            let reads = reader.join().expect("reader thread");
+            assert!(reads > 0, "reader must have completed at least one read");
+        }
+
+        let backend = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen");
+        assert_eq!(
+            backend
+                .objects_for_file_system(&file_system_id())
+                .expect("final objects")
+                .len(),
+            total_writes,
+            "every committed write must be visible after the race"
         );
 
         cleanup(&root);
